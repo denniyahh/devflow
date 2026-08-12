@@ -29,13 +29,17 @@ use crate::pipeline_outcomes::{
 };
 use crate::preflight::{ensure_agent_binary, run_preflight, worktree_writable_roots};
 use devflow_core::config::{GitFlowConfig, capture_retention};
+use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, canary, events, lock, mode, monitor, verify, workflow};
-use std::path::Path;
+use devflow_core::{
+    agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
+};
+use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
 /// and spawning the monitor. (25b, D-03: this function no longer performs
@@ -314,6 +318,101 @@ pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool
     env && !flag
 }
 
+/// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
+/// [`commands::start`](crate::commands::start).
+pub(crate) const AUTO_CHAIN_REPAIR_FROM_START: &str = "start";
+/// Entry-point name recorded by [`resume`].
+pub(crate) const AUTO_CHAIN_REPAIR_FROM_RESUME: &str = "resume";
+
+/// Repair a leaked `workflow._auto_chain_active` before this launch spawns
+/// anything, and say so on both channels when it found one (35.1 D-01/D-03).
+///
+/// **One helper, two call sites**, for the reason
+/// [`apply_legacy_launch_opt_out`] gives about its own pair: `start` and
+/// `resume` must not be able to drift into repairing on different terms, and a
+/// second copy of the emit/print block is exactly how that drift happens.
+///
+/// `35.1 D-01` — why the repair exists at all: the in-process `AutoChainGuard`
+/// covers a normal return, a `?` early-return and a panic-unwind, and
+/// structurally cannot cover a `SIGKILL`, because `Drop` never runs. Repairing
+/// forward at both launch entry points is the second, independent mechanism.
+/// `start`'s call is the one that catches a leak that already reached
+/// `develop`, since a freshly forked worktree inherits whatever the base branch
+/// carries; `resume`'s is the one that catches a leak a killed run left behind
+/// in its own worktree.
+///
+/// `35.1 D-03` — why it is loud: a stale flag is EVIDENCE that a previous run
+/// for this phase was killed before it could clean up. Repairing it quietly
+/// would discard that signal. The notice therefore says what the stale value
+/// means, not merely that a value changed.
+///
+/// **These are 35.1's own `D-` numbers**, a different decision namespace from
+/// phase 31's `D-11` cited a few lines above in `commands.rs` — the two
+/// sequences must not be read as one.
+///
+/// A clean launch — nothing repaired and nothing refused — makes no notice, no
+/// event and no write. Loudness is about repairs, not about launches.
+///
+/// Never fails the launch. A config DevFlow cannot parse warns and proceeds
+/// here; `35.1-03`'s preflight is the layer where an unlaunchable shape becomes
+/// a refusal.
+pub(crate) fn repair_leaked_auto_chain_flag(
+    project_root: &Path,
+    launch_root: &Path,
+    phase: PhaseId,
+    entry_point: &'static str,
+) {
+    let outcome = match gsd_config::force_clear_auto_chain(launch_root) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            println!(
+                "warning: could not certify phase {phase}'s GSD chain flag clear at {} \
+                 ({err}) — launching without the repair",
+                gsd_config::config_path(launch_root).display()
+            );
+            return;
+        }
+    };
+
+    if !outcome.repaired_anything() && outcome.commit_refused.is_none() {
+        return;
+    }
+
+    events::emit(
+        project_root,
+        phase,
+        "auto_chain_flag_repaired",
+        serde_json::json!({
+            "entry_point": entry_point,
+            "working_tree_repaired": outcome.working_tree_repaired,
+            "committed_tree_repaired": outcome.committed_tree_repaired,
+            "commit_refused": outcome.commit_refused,
+        }),
+    );
+
+    if outcome.repaired_anything() {
+        println!(
+            "note: devflow {entry_point} found phase {phase}'s GSD chain flag \
+             (workflow._auto_chain_active) still set — a previous run for this phase \
+             was killed before it could clear it. Cleared before launching \
+             (working tree: {}, this branch's tip: {})",
+            repaired_word(outcome.working_tree_repaired),
+            repaired_word(outcome.committed_tree_repaired),
+        );
+    }
+    if let Some(reason) = &outcome.commit_refused {
+        println!("warning: {reason}");
+    }
+}
+
+fn repaired_word(repaired: bool) -> &'static str {
+    if repaired {
+        "repaired"
+    } else {
+        "already clear"
+    }
+}
+
 /// The D-15 gate: run the delivery canary at most once per run, record what it
 /// found, and refuse to launch when it did not confirm.
 ///
@@ -576,8 +675,123 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// directly, so it never consults this predicate at all. That is a
 /// pre-existing, deliberate legacy route (see `MonitorLaunch::Legacy`'s own
 /// doc), recorded rather than silently covered.
-fn claude_stream_launch_enabled(agent: AgentKind, stage: Stage, legacy_opt_out: bool) -> bool {
+pub(crate) fn claude_stream_launch_enabled(
+    agent: AgentKind,
+    stage: Stage,
+    legacy_opt_out: bool,
+) -> bool {
     !legacy_opt_out && agent == AgentKind::Claude && STREAM_JSON_STAGES.contains(&stage)
+}
+
+/// The stages whose launch may set GSD's `workflow._auto_chain_active` flag
+/// (D-05, `35.1-CONTEXT.md`). One element, deliberately.
+///
+/// **[`STREAM_JSON_STAGES`] above is the shape precedent and an IMPERFECT
+/// analogy.** That constant lists all five stages because its effect is purely
+/// a DevFlow-internal transport choice with no upstream consequence: whichever
+/// stage it names, the only thing that changes is how DevFlow talks to the
+/// child. This flag is not like that. It has *different upstream effects per
+/// stage*:
+///
+/// - At `Stage::Code` it is harmless. `execute-phase.md` reads the flag only to
+///   decide whether to auto-approve an ordinary `gate="blocking"` checkpoint;
+///   it never chains from it.
+/// - At `Stage::Plan` it CHAINS. `plan-phase.md:1564` launches
+///   `gsd-execute-phase` when the flag is set, which double-executes the Code
+///   stage and misattributes its commits.
+///
+/// **So "completing" this list toward `Stage::Plan` is a defect, not a
+/// finished job.** D-04 spent an adversarial-review round ruling exactly that
+/// out, and ROADMAP criterion 3 forbids it. The flag GSD uses for "approve this
+/// checkpoint" and the flag it uses for "chain to the next workflow step" are
+/// the same boolean upstream; the fix is a gsd-core change splitting them in
+/// two — tracked as **G-01** — not a widening of this list. If you arrived here
+/// intending to add a stage, that ticket is what you actually want.
+///
+/// **Why one element and not a `(Stage, FixType)` table (F-6):** the
+/// Validate→Code loop-back changes only the prompt text, at the same
+/// `state.stage == Stage::Code`. `select_loop_back_fix` returns a `FixType` and
+/// never touches `Stage`, and `Stage` has no gaps-only variant — so gaps-only
+/// and full-execute are already covered by this single entry, and a keyed table
+/// would encode a distinction the source does not have.
+const AUTO_CHAIN_ELIGIBLE_STAGES: &[Stage] = &[Stage::Code];
+
+/// Whether this launch may set GSD's chain flag.
+///
+/// `Mode::Auto` is half the predicate, and it is not incidental (F-1): the
+/// flag's whole effect is to let the agent approve checkpoints with no human
+/// present. Doing that on a run the operator explicitly chose to SUPERVISE
+/// would be a silent behaviour change to an already-shipped mode that nobody
+/// asked for. `preflight_interactivity_check` is the file's existing precedent
+/// for gating on `state.mode == Mode::Auto` for exactly this reason.
+fn auto_chain_flag_eligible(stage: Stage, mode: Mode) -> bool {
+    mode == Mode::Auto && AUTO_CHAIN_ELIGIBLE_STAGES.contains(&stage)
+}
+
+/// Holds GSD's `workflow._auto_chain_active` at a chosen value for the
+/// lifetime of a supervised child, and returns it to `false` on the way out.
+///
+/// **Symmetric by design (F-3).** [`Self::engage`] takes the value the launch
+/// requires — `true` when eligible, `false` when not — so an INELIGIBLE launch
+/// does not merely leave whatever it finds: it actively asserts `false`. That
+/// is what closes the hole opened by sending the flag-preserving token on every
+/// Code prompt, which disables GSD's own sync-clear safety net: a stale `true`
+/// leaked by a previously-interrupted run is overwritten by DevFlow before the
+/// agent starts, rather than left for GSD to notice.
+///
+/// The write is conditional on the value differing
+/// ([`gsd_config::set_auto_chain_active`] reads before it writes), so the
+/// ineligible path is a genuine no-op on an already-`false` file and does not
+/// dirty a tracked file on every stage launch.
+///
+/// **Diverges from `LegacyEnvOverride` deliberately.** That guard restores a
+/// caller-supplied PRIOR value, because the env var it owns may have had a
+/// meaningful pre-existing state. This one does not restore anything: `false`
+/// is always the correct value on exit (D-06). A run that ends with the flag
+/// still set is the failure mode this type exists to prevent, and "put back
+/// whatever was there" would reproduce it exactly whenever what was there was a
+/// leaked `true`.
+///
+/// Errors are logged, never propagated. A hand-edited or absent
+/// `.planning/config.json` must not abort a long unattended run — the guard
+/// declines to engage and the stage proceeds without checkpoint auto-approval,
+/// which is the conservative direction (T-35.1-03).
+struct AutoChainGuard {
+    config_root: PathBuf,
+}
+
+impl AutoChainGuard {
+    fn engage(config_root: &Path, active: bool) -> Self {
+        match gsd_config::set_auto_chain_active(config_root, active) {
+            Ok(changed) => {
+                if changed {
+                    info!(
+                        "GSD chain flag set to {active} for this stage at {}",
+                        gsd_config::config_path(config_root).display()
+                    );
+                }
+            }
+            Err(err) => warn!(
+                "could not set the GSD chain flag at {}: {err} — proceeding without \
+                 checkpoint auto-approval",
+                gsd_config::config_path(config_root).display()
+            ),
+        }
+        Self {
+            config_root: config_root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for AutoChainGuard {
+    fn drop(&mut self) {
+        if let Err(err) = gsd_config::set_auto_chain_active(&self.config_root, false) {
+            warn!(
+                "could not clear the GSD chain flag at {}: {err}",
+                gsd_config::config_path(&self.config_root).display()
+            );
+        }
+    }
 }
 
 /// The detached pipe-owning monitor's own process body (Phase 31): supervise
@@ -609,6 +823,43 @@ pub(crate) fn run_monitor(
         return Err(CliError::Message(
             "monitor was given no child program to supervise".to_string(),
         ));
+    };
+
+    // D-01/D-06: hold GSD's `workflow._auto_chain_active` at the value this
+    // launch requires for as long as the child runs, and return it to `false`
+    // when this function returns — by `?` on the monitor's `Err` OR by falling
+    // through to `advance` below. Both exits are covered because the guard is
+    // bound to a named variable in THIS scope; `let _ = ...` would drop it
+    // immediately and the flag's true-window would collapse to nothing.
+    //
+    // The target is `workdir`, not `project_root`: `.planning/config.json` is a
+    // tracked file inside the worktree the agent's cwd is set to, and that copy
+    // is the one GSD's `check auto-mode` reads.
+    //
+    // F-4 — no agent or launch-shape condition belongs in the predicate.
+    // `run_monitor` is the body of the hidden `__monitor` subcommand, which
+    // `monitor::spawn_monitor` re-execs ONLY on its `MonitorLaunch::PipeOwning`
+    // arm. Being inside this function already implies a Claude + stream launch,
+    // so re-checking `state.agent` or `state.legacy_claude_launch` here would
+    // be a second, driftable notion of the same fact. The consequence — a
+    // Legacy-arm or non-Claude launch never gets the flag — is accepted and is
+    // turned into a loud preflight refusal by plan `35.1-03`, not left silent.
+    //
+    // A state that will not load is NOT fatal here: warn, skip the guard, and
+    // let `advance` surface the real state error afterwards with its own
+    // context.
+    let _auto_chain_guard = match workflow::load_state(project_root, phase) {
+        Ok(state) => Some(AutoChainGuard::engage(
+            workdir,
+            auto_chain_flag_eligible(state.stage, state.mode),
+        )),
+        Err(err) => {
+            warn!(
+                "monitor could not load state for phase {phase} ({err}) — running \
+                 without the GSD chain-flag guard"
+            );
+            None
+        }
     };
 
     monitor::run_pipe_owning_monitor(
@@ -886,6 +1137,25 @@ pub(crate) fn resume(
              (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
         );
     }
+    // 35.1 D-01, `resume`'s half: this is the entry point that catches a leak a
+    // SIGKILLed run left behind in its own worktree — the case the in-process
+    // guard structurally cannot cover, because `Drop` never runs on a kill.
+    // Placed after `load_state` (the state is what names the launch root) and
+    // before the `save_state` below, so the repair is complete before anything
+    // is spawned. Root resolved with the same
+    // `worktree_path.unwrap_or(project_root)` idiom `spawn_monitor` uses for
+    // `--workdir` (F-11) — a second spelling here would repair a different copy
+    // of the file from the one the agent reads.
+    let launch_root = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+    repair_leaked_auto_chain_flag(
+        project_root,
+        &launch_root,
+        phase,
+        AUTO_CHAIN_REPAIR_FROM_RESUME,
+    );
     workflow::save_state(&state)?;
     launch_stage(&mut state, None, None)
 }
@@ -1133,6 +1403,137 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
 
+    /// D-04/D-05/F-1: the chain flag is engaged for `Stage::Code` under
+    /// `Mode::Auto` and for nothing else.
+    ///
+    /// Every `Stage` variant is named EXPLICITLY rather than iterated over a
+    /// slice. That is the point: adding a variant to `Stage` must become a
+    /// compile error here — forcing whoever adds it to decide, on the record,
+    /// whether the new stage may auto-approve checkpoints — instead of a
+    /// silently-unexercised case that the iteration would have swallowed.
+    #[test]
+    fn auto_chain_eligibility_is_code_and_auto_mode_only() {
+        // The one eligible combination.
+        assert!(auto_chain_flag_eligible(Stage::Code, Mode::Auto));
+
+        // Right stage, wrong mode. A run the operator chose to SUPERVISE must
+        // never have its checkpoints auto-approved (F-1).
+        assert!(!auto_chain_flag_eligible(Stage::Code, Mode::Supervise));
+
+        // Every other stage, under the mode that would otherwise qualify.
+        // `Stage::Plan` is the load-bearing one: the same flag makes
+        // `plan-phase.md` chain into `execute-phase.md` (ROADMAP criterion 3).
+        assert!(!auto_chain_flag_eligible(Stage::Define, Mode::Auto));
+        assert!(!auto_chain_flag_eligible(Stage::Plan, Mode::Auto));
+        assert!(!auto_chain_flag_eligible(Stage::Validate, Mode::Auto));
+        assert!(!auto_chain_flag_eligible(Stage::Ship, Mode::Auto));
+
+        // Exhaustiveness tripwire: this match names all five variants with no
+        // wildcard arm, so a new `Stage` fails to compile here rather than
+        // slipping past the five assertions above.
+        for stage in [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ] {
+            let expected = match stage {
+                Stage::Code => true,
+                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => false,
+            };
+            assert_eq!(auto_chain_flag_eligible(stage, Mode::Auto), expected);
+        }
+    }
+
+    /// A real-shape `.planning/config.json` under `root`, committed, with the
+    /// chain flag seeded either way.
+    fn seed_gsd_config(root: &Path, active: bool) {
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(
+            root.join(".planning/config.json"),
+            format!(
+                "{{\n  \"commit_docs\": true,\n  \"workflow\": {{\n    \
+                 \"granularity\": \"medium\",\n    \"auto_advance\": true,\n    \
+                 \"_auto_chain_active\": {active}\n  }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let ok = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["add", ".planning/config.json"]);
+        git(&["commit", "-q", "-m", "add gsd config"]);
+    }
+
+    /// Every `auto_chain_flag_repaired` line in a project's event log.
+    fn repair_events(root: &Path) -> Vec<serde_json::Value> {
+        let path = devflow_core::events::events_path(root);
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["event"] == "auto_chain_flag_repaired")
+            .collect()
+    }
+
+    /// D-03: a genuine repair announces itself in `.devflow/events.jsonl`, and
+    /// the payload names WHICH entry point found the leak — without that, a
+    /// reader cannot tell a leak inherited from `develop` by a fresh worktree
+    /// (`start`) from one a killed run left in its own worktree (`resume`).
+    #[test]
+    fn auto_chain_flag_repaired_event_names_the_entry_point_that_found_the_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        seed_gsd_config(root, true);
+        assert!(
+            gsd_config::auto_chain_active(root).unwrap(),
+            "the fixture must actually carry the leak, or this test is vacuous"
+        );
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(81), "resume");
+
+        let events = repair_events(root);
+        assert_eq!(events.len(), 1, "exactly one repair event: {events:?}");
+        assert_eq!(events[0]["entry_point"], "resume");
+        assert_eq!(events[0]["working_tree_repaired"], true);
+        assert!(
+            !gsd_config::auto_chain_active(root).unwrap(),
+            "the repair must actually clear the flag, not merely report it"
+        );
+    }
+
+    /// THE CONTROL. Without it, an implementation that emitted on every launch
+    /// would satisfy the test above — the event would be there either way, and
+    /// "emitted for the right reason" and "emits unconditionally" would be
+    /// indistinguishable.
+    ///
+    /// D-03 is about repairs, not about launches: an ordinary clean launch must
+    /// write no event at all.
+    #[test]
+    fn auto_chain_flag_repaired_event_is_absent_on_a_clean_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        seed_gsd_config(root, false);
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(82), "start");
+
+        assert!(
+            repair_events(root).is_empty(),
+            "a launch that found nothing to repair must write no event: {:?}",
+            repair_events(root)
+        );
+    }
+
     /// 18b: after `launch_stage` spawns a monitor, the persisted state file
     /// for that phase carries the monitor's pid — `transition()` saves state
     /// BEFORE calling `launch_stage`, so the pid must be saved again inside
@@ -1157,7 +1558,20 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(65);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // `Mode::Supervise`, and the mode is now load-bearing (35.1-03): the
+        // legacy opt-out set below makes this a launch shape whose Code stage
+        // cannot bound the chain flag's lifetime, and
+        // `preflight_unattended_launch_check` refuses exactly that combination
+        // in `Mode::Auto`. This test's subject — pid persistence — is
+        // mode-independent, so supervise keeps the premise the 34-06 note
+        // below establishes without asking the preflight to permit a launch
+        // D-07 exists to refuse.
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         // Not because this test wants legacy behaviour, but because its
         // subject is orthogonal to the launch path (34-06).
         state.legacy_claude_launch = true;
@@ -1321,7 +1735,17 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(67);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // `Mode::Supervise` for the same 35.1-03 reason as
+        // `launch_stage_persists_monitor_pid_for_reload` above: the legacy
+        // opt-out set below is refused in `Mode::Auto` by
+        // `preflight_unattended_launch_check`, and this test's subject — the
+        // unfired `stop_until` cap surviving a resume — is mode-independent.
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         // Current stage is earlier than the cap (Define < Plan), and the
         // phase was NOT stopped by the cap — this is the rate-limit/infra
         // recovery shape, not the "cap already fired" shape.
@@ -1397,7 +1821,15 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(68);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // `Mode::Supervise` for the same 35.1-03 reason as the two tests
+        // above — the legacy opt-out below is refused in `Mode::Auto`, and the
+        // absence of a `stop_until` cap is mode-independent.
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         state.stop_until = None;
         state.stopped = false;
         state.stop_reason = None;

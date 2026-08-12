@@ -136,6 +136,89 @@ pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: PhaseId) 
         .any(|contents| contents.contains(HUMAN_BLOCKING_GATE))
 }
 
+/// The two checkpoint markers GSD will not auto-approve in ANY mode, each
+/// assembled from the attribute name, an equals sign and the quoted value
+/// exactly as GSD writes it onto a `<task>` opening tag.
+///
+/// - `gate="blocking-human"` — `checkpoints.md` rule 6: "a checkpoint carrying
+///   this gate stops for a human in *every* mode, including auto-mode,
+///   regardless of its type. Rule 5 does not apply to it."
+/// - `type="checkpoint:human-action"` — `checkpoints.md` rule 5, which
+///   auto-approves human-verify and auto-selects decision but says
+///   "human-action still stops (auth gates cannot be automated)". The type
+///   alone is sufficient; such a task need carry no `gate` attribute.
+///
+/// The CLOSING QUOTE is load-bearing on the first literal. Without it the
+/// match would fire on the ordinary `gate="blocking"` — precisely the
+/// checkpoint class phase 35.1 exists to make auto-approvable — and every
+/// unattended launch of a phase planning one would be refused.
+const HUMAN_ONLY_CHECKPOINT_MARKERS: [&str; 2] = [
+    concat!("gate=", "\"", "blocking-human", "\""),
+    concat!("type=", "\"", "checkpoint:human-action", "\""),
+];
+
+/// The opening bytes of a task element, the anchor every marker match must
+/// also satisfy.
+const TASK_ELEMENT_OPENING: &str = "<task";
+
+/// Return `true` if any plan declared for `phase` DECLARES a checkpoint task
+/// that GSD will not auto-approve in any mode.
+///
+/// **The match is anchored to a task element's own opening tag**, and that is
+/// the whole difference between this function and
+/// [`phase_has_blocking_human_checkpoint`] above: a marker qualifies only on a
+/// line that also opens a `<task`. A plan that merely *discusses* a marker — in
+/// a findings section, in a table, in a fenced example — has not declared one.
+///
+/// The concrete failures the anchoring prevents (F-14) were measured against
+/// this repository's own plan files, not assumed: `34-04-PLAN.md:245` and
+/// `33-02-PLAN.md:109` each quote `gate="blocking-human"` inside a sentence
+/// while declaring no such task. Under an unanchored whole-file `contains`,
+/// `preflight.rs`'s unattended-launch check reads phases 33 and 34 as carrying a
+/// checkpoint no mode can approve and refuses an overnight run that was fine. A
+/// false refusal has no in-product recovery (D-09), so a false positive here is
+/// not a cosmetic defect. (F-14 itself names `35.1-03-PLAN.md` as the instance;
+/// that file describes the markers only in English and never writes either
+/// literal, so it would not match an unanchored scan either. The finding stands;
+/// the example it cited does not.)
+///
+/// **Known limit, pinned by `human_only_checkpoint_still_matches_a_task_tag_
+/// inside_a_fenced_example`:** the anchor is line-level and has no notion of
+/// markdown fences, so a plan documenting a COMPLETE example `<task ...>` tag
+/// inside a fenced block still matches. No plan file in this repository has that
+/// shape today.
+///
+/// **[`phase_has_blocking_human_checkpoint`] is deliberately left alone, and the
+/// pair is not an accident.** That function serves the plan-28-03 auto-decide
+/// route, where a looser, over-inclusive match fails SAFE — it routes more
+/// checkpoints to a human. Here an over-inclusive match fails toward refusing a
+/// launch. Different consequence, different predicate; widening the older one to
+/// serve both would silently change the behaviour its seven tests pin.
+///
+/// Returns `false` for a phase with no plan files at all. That is NOT the same
+/// fact as "plans exist and declare no such checkpoint", and a caller that needs
+/// to tell them apart asks [`phase_plan_files`] separately rather than reading a
+/// third state out of one bit.
+///
+/// **The CALLER owns root resolution**, exactly as for
+/// [`phase_has_blocking_human_checkpoint`]: in worktree mode the phase's plans
+/// live on the feature branch inside the worktree and are absent from the main
+/// checkout (999.76).
+pub fn phase_has_human_only_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
+    phase_plan_files(project_root, phase)
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .any(|contents| contents.lines().any(line_declares_human_only_checkpoint))
+}
+
+/// Whether one line both opens a task element and carries a human-only marker.
+fn line_declares_human_only_checkpoint(line: &str) -> bool {
+    line.contains(TASK_ELEMENT_OPENING)
+        && HUMAN_ONLY_CHECKPOINT_MARKERS
+            .iter()
+            .any(|marker| line.contains(marker))
+}
+
 /// Run one explicitly operator-approved external verification command.
 ///
 /// `sh -c` is intentional because probes may contain pipelines. The caller
@@ -248,6 +331,9 @@ mod tests {
     // the raw `gate="blocking-human"` string (28-01 Task 2 action note).
     const HUMAN_GATE_VALUE: &str = "blocking-human";
     const PLAIN_GATE_VALUE: &str = "blocking";
+    /// The second marker GSD never auto-approves in any mode
+    /// (`checkpoints.md` rule 5: "human-action still stops").
+    const HUMAN_ACTION_TYPE_VALUE: &str = "checkpoint:human-action";
 
     fn write_phase_file(root: &std::path::Path, phase_dir: &str, file_name: &str, contents: &str) {
         let dir = root.join(".planning/phases").join(phase_dir);
@@ -401,6 +487,161 @@ mod tests {
             !phase_has_blocking_human_checkpoint(&empty_sibling, PhaseId::new(91)),
             "opposite-result case: a root without the PLAN must return false, so the \
              assertion above is about which root is read and not about the file existing"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 35.1-03 Task 1: `phase_has_human_only_checkpoint` — the ANCHORED
+    // scan for the two markers GSD never auto-approves in any mode.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn human_only_checkpoint_detects_the_gate_marker_on_a_task_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(92)
+        ));
+    }
+
+    #[test]
+    fn human_only_checkpoint_detects_the_human_action_type_on_a_task_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `gate` attribute at all: `checkpoints.md` rule 5 stops a
+        // human-action checkpoint in auto-mode on its TYPE alone, so the
+        // second marker must be sufficient by itself.
+        let body =
+            format!("---\nphase: 92\n---\n\n<task type=\"{HUMAN_ACTION_TYPE_VALUE}\">\n</task>\n");
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(92)
+        ));
+    }
+
+    /// The control that keeps this function off the checkpoint class phase
+    /// 35.1 exists to make auto-approvable. A substring match that dropped the
+    /// closing quote would match `blocking` inside `blocking-human` and, worse,
+    /// report every ordinary blocking checkpoint as human-only — refusing every
+    /// unattended launch of a phase that plans one.
+    #[test]
+    fn human_only_checkpoint_ignores_an_ordinary_blocking_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{PLAIN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
+            "the ordinary `blocking` gate is exactly the class auto-mode may approve \
+             (checkpoints.md rule 5) — matching it here would refuse launches that are fine"
+        );
+    }
+
+    /// F-14's motivating case, and it is not hypothetical — but the instance is
+    /// NOT the one F-14 names. `35.1-03-PLAN.md` describes the markers only in
+    /// English ("the human-only gate value") and never writes either literal, so
+    /// it would not match even an unanchored scan. The real instances were found
+    /// by scanning this repository's own `*-PLAN.md` files:
+    ///
+    /// - `34-04-PLAN.md:245` — an acceptance-criteria bullet reading
+    ///   ``A phase whose PLAN declaring `gate="blocking-human"` lives only under
+    ///   a worktree-standing-in directory ...``
+    /// - `33-02-PLAN.md:109` — a findings paragraph reading ``... with
+    ///   `gate="blocking-human"` has no mechanism for receiving an operator's
+    ///   answer ...``
+    ///
+    /// Neither declares such a task; an unanchored scan reports both phases NOT
+    /// viable, refusing an unattended launch for a reason that does not exist.
+    /// Three further files (`19-05`, `19-11`, `15-05`) carry the markers on a
+    /// genuine `<task ...>` line, and both implementations agree on those — which
+    /// is what makes the first two the discriminating cases rather than the whole
+    /// scan being over-eager.
+    ///
+    /// The fixture below mirrors those two shapes: an inline-code mention inside
+    /// a sentence, plus a fenced block carrying the bare attribute with no task
+    /// tag on the line.
+    #[test]
+    fn human_only_checkpoint_ignores_a_marker_mentioned_only_in_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n\
+             A phase whose PLAN declares `gate=\"{HUMAN_GATE_VALUE}\"` has no mechanism \
+             for receiving an operator's answer, and the same goes for \
+             `type=\"{HUMAN_ACTION_TYPE_VALUE}\"`.\n\n\
+             ```text\n\
+             gate=\"{HUMAN_GATE_VALUE}\"\n\
+             type=\"{HUMAN_ACTION_TYPE_VALUE}\"\n\
+             ```\n\n\
+             <task type=\"auto\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
+            "a marker discussed in prose is not a marker declared on a task — \
+             34-04-PLAN.md:245 and 33-02-PLAN.md:109 are the real instances (F-14)"
+        );
+    }
+
+    /// The anchoring's KNOWN LIMIT, asserted rather than left to be discovered.
+    ///
+    /// The anchor is a single line: "contains a marker AND opens a task
+    /// element". It has no notion of markdown fences, so a plan that documents
+    /// a complete example `<task ...>` tag inside a fenced block DOES match, and
+    /// the phase is refused. No `*-PLAN.md` in this repository currently has that
+    /// shape — the three that carry a marker on a `<task` line are all genuine
+    /// declarations — so this is a live gap, not a live defect.
+    ///
+    /// Fence tracking was not added: it is materially more parsing than F-14
+    /// asked for, and it fails toward the SAME consequence (a false refusal) if
+    /// the fence detection is itself wrong. This test exists so the limit is
+    /// recorded as a measured property rather than rediscovered by an operator
+    /// whose overnight run refused.
+    #[test]
+    fn human_only_checkpoint_still_matches_a_task_tag_inside_a_fenced_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n\
+             Here is what such a task looks like:\n\n\
+             ```xml\n\
+             <task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+             </task>\n\
+             ```\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(
+            phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
+            "documented limit: line-level anchoring cannot see markdown fences, \
+             so a complete example task tag reads as a declaration"
+        );
+    }
+
+    /// "No plans at all" and "plans that declare no such checkpoint" are
+    /// DIFFERENT facts, and this boolean deliberately reports both as `false`.
+    /// The caller that needs to tell them apart asks [`phase_plan_files`]
+    /// separately rather than reading a third state out of this one bit —
+    /// `preflight.rs`'s unattended-launch check does exactly that, because at
+    /// Define an unplanned phase is pending, not failing.
+    #[test]
+    fn human_only_checkpoint_is_false_for_a_phase_with_no_plans() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(404)
+        ));
+        assert!(
+            phase_plan_files(dir.path(), PhaseId::new(404)).is_empty(),
+            "the companion fact the caller reads to distinguish the two cases"
         );
     }
 }

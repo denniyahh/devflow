@@ -1,15 +1,15 @@
 ---
 schema_version: 1
-open_count: 0
+open_count: 1
 waived_count: 1
 fixed_count: 5
-total_count: 6
-last_updated: 2026-08-07T00:00:00.000Z
+total_count: 7
+last_updated: 2026-08-08T23:33:10.434Z
 ---
 
 # Broken Windows Ledger
 
-> Cross-phase defect register. `/gsd-ship` blocks while `open_count > 0`.
+> Cross-phase defect register. With `workflow.windows_enforce` enabled, `/gsd-ship` blocks while `open_count > 0`.
 > Waive with `gsd-tools windows waive <id> "<reason>"` (reason required).
 > Mark fixed with `gsd-tools windows fixed <id>`.
 
@@ -21,6 +21,7 @@ last_updated: 2026-08-07T00:00:00.000Z
 | 4 | 25 | deviation | crates/devflow-cli/src/preflight.rs |  | 25-18 verification-step-6 re-derivation found a THIRD live leak site beyond the plan's declared two tests: run_preflight_advance_skips_recheck_on_idempotently_failing_check (Advance arm, unconditional launch_stage_inner, working codex+sh stub on PATH) spawns a real detached monitor wrapper, empirically confirmed (pid captured, unreaped). Fixed in the same plan by binding the identical ReapMonitorOnDrop::after_launch guard; not a pre-existing open defect at time of recording. | fixed |  | 2026-07-28T19:32:10.815Z | 2026-07-28T19:32:20.863Z |
 | 5 | 25 | deviation | crates/devflow-cli/src/pipeline_launch.rs |  | SIXTH monitor-wrapper leak site, found by gsd-verifier after round 4 and confirmed by the orchestrator: pipeline_launch.rs::tests::resume_clears_stop_marker_and_advances_past_stop_point stubs a claude binary on PATH and calls resume(root, phase), which reaches launch_stage at pipeline_launch.rs:230 and spawns a real detached monitor wrapper (verifier observed pid 852403 under --nocapture). It binds no ReapMonitorOnDrop guard, so the wrapper outlives the TempDir teardown. resume() is a FOURTH wrapping entry point that neither 25-16's call-site enumeration nor 25-18's three-function reachability grep could see, which falsifies 25-18-SUMMARY.md's claim that no path beyond launch_stage/launch_stage_inner/run_preflight exists. ENUMERATION NOW COMPLETE (orchestrator, transitive sweep over all eight launch-reaching entry points cross-referenced against both agent-stub helpers): exactly 7 tests both reach a launch path and stub an agent binary; 5 are guarded, this one is not, and preflight.rs::run_preflight_loopback_bounds_recursion provably cannot spawn because its recursive run_preflight hits the retry ceiling and aborts, after which launch_stage short-circuits at :190-193 without calling launch_stage_inner. Fix: bind ReapMonitorOnDrop::after_launch(&state) after the resume() call and before the assertions, matching the other five sites. | fixed |  | 2026-07-28T20:01:51.067Z | 2026-07-28T20:13:59.421Z |
 | 6 | 28 | unmet-truth | crates/devflow-core/src/agent_result.rs |  | HUMAN_GATE_VALUE ('blocking-human', matched by blocking_human_checkpoint_reported) is an unconfirmed default per 28-PROBE.md DIVERGENT A1 verdict, not an empirically confirmed literal against a live headless checkpoint render | fixed | A1 CLOSED by a live end-to-end run (2026-07-31). A real devflow start drove a synthetic phase declaring a gate="blocking-human" task through DevFlow own monitor. Two results: (1) the value IS blocking-human, so the constant was correct; (2) the RENDERING was not — the executor emits it as a markdown code span, **Gate:** `blocking-human`, and text_reports_human_gate trimmed only * and space, so the leading backtick left take_while yielding an empty token and the reader returned false. Genuine checkpoints fell through to the generic gate. Fixed in b22e6cf by adding the backtick to both trim sets, with three regression tests built from the verbatim capture (confirmed RED first). Retested live: the checkpoint now routes into auto-decide, emits exactly one checkpoint_auto_decided event carrying a real session_id, relaunches via --resume, and the agent resolves it; zero generic gate fires. Root cause worth keeping: RESEARCH derived the literal by reading the EMITTING source, which gave the value but not the rendering. | 2026-07-31T02:38:49.879Z | 2026-07-31T08:30:00.000Z |
+| 7 | 35.1 | unmet-truth | crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs |  | 35.1-02 D8: no test drives a chain-flag repair followed by a SUCCESSFUL stage launch; the resume step aborts at ensure_agent_binary by design | open |  | 2026-08-08T23:33:10.434Z |  |
 
 ````json
 [
@@ -95,6 +96,18 @@ last_updated: 2026-08-07T00:00:00.000Z
     "reason": "A1 CLOSED by a live end-to-end run (2026-07-31). A real devflow start drove a synthetic phase declaring a gate=\"blocking-human\" task through DevFlow own monitor. Two results: (1) the value IS blocking-human, so the constant was correct; (2) the RENDERING was not — the executor emits it as a markdown code span, **Gate:** `blocking-human`, and text_reports_human_gate trimmed only * and space, so the leading backtick left take_while yielding an empty token and the reader returned false. Genuine checkpoints fell through to the generic gate. Fixed in b22e6cf by adding the backtick to both trim sets, with three regression tests built from the verbatim capture (confirmed RED first). Retested live: the checkpoint now routes into auto-decide, emits exactly one checkpoint_auto_decided event carrying a real session_id, relaunches via --resume, and the agent resolves it; zero generic gate fires. Root cause worth keeping: RESEARCH derived the literal by reading the EMITTING source, which gave the value but not the rendering.",
     "recorded_at": "2026-07-31T02:38:49.879Z",
     "resolved_at": "2026-07-31T08:30:00.000Z"
+  },
+  {
+    "id": 7,
+    "kind": "unmet-truth",
+    "phase": "35.1",
+    "file": "crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs",
+    "line": null,
+    "description": "35.1-02 D8: no test drives a chain-flag repair followed by a SUCCESSFUL stage launch; the resume step aborts at ensure_agent_binary by design",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-08-08T23:33:10.434Z",
+    "resolved_at": null
   }
 ]
 ````

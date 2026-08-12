@@ -28,7 +28,7 @@ those five confirmed fixes down waiting on a harness.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
-| 35.1 | Unattended-Launch Prerequisites | Not started | — |
+| 35.1 | Unattended-Launch Prerequisites | Complete | — |
 | 35.2 | Verification Provenance | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
@@ -104,7 +104,7 @@ Plans:
 
 - [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
 
-### Phase 35.1: Unattended-Launch Prerequisites (999.93)
+### Phase 35.1: Unattended-Launch Prerequisites (999.93 + 999.98 + 999.99 + 999.100)
 
 **Goal**: `devflow start --mode auto` can actually complete a phase with no human present — ordinary
 GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
@@ -151,7 +151,45 @@ gather the live concurrency evidence its criterion 1 demands.
 **Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
 correctness question about *how* an unattended agent decides, separable from *whether* it can
 proceed at all.
-**Plans**: TBD
+
+**Promoted into this phase mid-flight (2026-08-08):** 999.99 and 999.98, both found by dogfooding
+this phase's own Plan stage and both fixed before the plans were executed. Their code landed ahead
+of 35.1's success criteria rather than in service of them, so a reader comparing the criteria
+against the diff will find more than the criteria ask for — that is why, not drift. Both are
+prerequisites in the literal sense: an unattended run cannot be made to work while the monitor
+kills any stage that backgrounds work.
+**Plans**: 3/4 plans executed across 3 waves
+
+Plans:
+
+**Wave 1**
+
+- [x] 35.1-01-PLAN.md — TRACER: the chain-flag lifecycle end to end on one path — `gsd_config` (the
+  sole writer of `workflow._auto_chain_active`), `serde_json`'s `preserve_order`,
+  `AUTO_CHAIN_ELIGIBLE_STAGES` + its eligibility predicate, the RAII guard inside `run_monitor`, and
+  the flag-preserving token on the Code and fix prompts — proven by a real `devflow __monitor` run
+  whose supervised child reports the flag it saw, with a supervise-mode negative control. Closes
+  criterion 3 in full (D-04/D-05/D-06)
+
+**Wave 2** *(both blocked on Wave 1; disjoint file sets, so they run in parallel)*
+
+- [x] 35.1-02-PLAN.md — leak repair: `force_clear_auto_chain` at `start` and `resume`, reaching the
+  committed tree and refusing to sweep an operator's edit, the loud stdout notice plus
+  `auto_chain_flag_repaired` event, and the SIGKILL regression test built on a demonstrated leak
+  (criterion 2, D-01/D-02/D-03)
+
+- [x] 35.1-03-PLAN.md — the fail-closed preflight: three conditions to a four-state report, refusing
+  in `--mode auto` and reporting in `--mode supervise`, with three NOT-viable fixtures each
+  demonstrated failing and no override of any kind (criterion 4, D-07/D-08/D-09)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 35.1-04-PLAN.md — the live drill against a real Claude agent with a real GSD blocking
+  checkpoint and a real `--gaps-only` loop, its supervise-mode negative control, the criterion 6
+  observation recorded in `35.1-DRILL.md`, and the operator guide stating all three known limitations
+  (criteria 5 and 6, D-10/D-11). Completed 2026-08-12 — chain-flag mechanism confirmed working;
+  auto-approval blocked by upstream GSD #3370 (orchestrator conflates `gate="blocking"` with
+  `gate="blocking-human"`); GSD #3370 filed; stale live-run gate rejected.
 
 ### Phase 35.2: Verification Provenance (999.89 / HARDEN-03)
 
@@ -288,7 +326,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | Complete    | 2026-08-07 |
-| 35.1 | — | Not started | — |
+| 35.1 | 4/4 | Complete    | 2026-08-12 |
 | 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
 
@@ -2788,6 +2826,260 @@ can miss it entirely.
 **Priority:** Medium. **Size:** M.
 
 ---
+
+### Phase 999.103: The Gate Notify Hook Has No Home, No Default, and No Way to Tell You It Is Broken (BACKLOG)
+
+**Found:** 2026-08-09, dogfooding Phase 35.1. Three consecutive Code-stage failures fired
+never-silent gates that reached nobody. The gates were correct; the operator simply had no channel.
+`DEVFLOW_GATE_NOTIFY_CMD` was unset, and nothing anywhere would have said so.
+
+**Why it was unset, which is the actual defect.** Four compounding reasons, each verified rather
+than assumed:
+
+1. **No default.** `fire_gate_notify` returns immediately when the variable is unset or empty — a
+   silent no-op, by design. Correct as a default; invisible as a state.
+2. **No config-file home.** `load_config` reads `devflow.toml` into a `DevflowConfig` carrying
+   exactly `capture_retention`, `review_angles`, `external_verify_enabled` and `yes_ship`. The
+   notify command is not among them, so it cannot be set where every other DevFlow setting lives.
+   It is environment-only.
+3. **Nothing in this repo's own setup sets it.** Not `.planning/DEV-SETUP-CHECKLIST.md` — the file
+   that exists precisely so this project's setup can be replicated — not the fish config, not
+   `.devcontainer`, no `.env`, no Makefile. The one variable that makes an unattended run visible
+   is absent from the checklist whose job is exactly that.
+4. **A shell export would not have been enough anyway.** The detached monitor inherits the
+   environment of whatever launched it, so a one-off `export` in another terminal never reaches it.
+   It has to be in persistent shell config to be reliable.
+
+**The trap that makes it worse.** It is a *command string*, not a boolean. Setting it to `true` —
+the obvious guess for "turn notifications on" — executes `/bin/true`, exits 0, and is logged by
+`run_notify_command` as a **successful hook run**. Combined with the deliberate fail-soft posture
+(a non-zero exit or spawn failure is `warn!`-logged and otherwise ignored), a misconfigured hook is
+silent in *both* directions: no notification arrives, and nothing reports that none did. The warning
+goes only to the monitor's log, which is the one place an absent operator is not looking.
+
+**What to add.** Not a transport — DevFlow correctly has none, and shelling out to the operator's
+own `curl`/`notify-send`/webhook is the right design. What is missing is *legibility*:
+
+- Give the hook a home in `devflow.toml` beside the other settings, with the env var still winning,
+  matching `capture_retention`'s existing precedence idiom.
+- Surface configured-or-not in `devflow status` and in the unattended-launch preflight report. An
+  unattended run with no notify channel is a stated risk, not a silent one.
+- Validate at launch rather than at first gate: spawn the hook once with a synthetic payload and
+  report the outcome, so a broken command is found when the operator is present.
+- Add it to `DEV-SETUP-CHECKLIST.md` so a replicated setup gets it.
+
+**Scope of the claim.** This is about discoverability and feedback, not about the hook mechanism,
+which works as designed. The env-var-only decision may well be deliberate; what is not defensible is
+that an operator can run unattended for nine hours believing they are covered.
+
+**Priority:** Medium. **Size:** S–M.
+
+---
+
+### Phase 999.102: The Idle-Timeout Verdict Discards Diagnostics That Are Already Sitting in the Capture (BACKLOG)
+
+**Found:** 2026-08-09, while diagnosing why three stages of Phase 35.1 died with
+`error_during_execution`.
+
+**The gap, in one line:** DevFlow's failure reason says *"the agent's output stream was silent for
+120s"* while the capture it just read contains `terminal_reason`, `errors[]` and `origin` — fields
+that name the actual cause.
+
+**Measured.** The final `result` event of the killed Code stage carried:
+
+```
+terminal_reason : "aborted_tools"
+errors          : ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"]
+origin          : {"kind": "task-notification"}
+```
+
+None of it reached the operator. Three separate failures were investigated as "the agent went
+quiet" before anyone read those keys, and the pattern (999.101) was invisible until they were.
+
+**Same class as 999.98 and 999.100, third instance.** All three are *better information exists in
+the capture than in the verdict*. 999.98: a stale record outranks a success. 999.100: a fresh record
+outranks a better classification. This one: the record is correct but throws away the detail that
+makes it actionable. The idle-timeout verdict is the right verdict here — the process really was mute
+with no work outstanding — it is simply mute itself about why.
+
+**What to add.** Include `terminal_reason` and `errors[]` (and `origin.kind` when present) in the
+idle-timeout reason string and the gate context, when the capture's last `result` event carries
+them. No new infrastructure: the capture is already read, the fields are already parsed as JSON, and
+`IdleTimeoutRecord` already carries free-text. Degrade silently when absent — an older CLI, or a
+child killed before emitting a `result`, must still produce today's message.
+
+**Deliberately not fixed inside Phase 35.1.** The phase already absorbed three unplanned defects
+(999.98, 999.99, 999.100); a fourth would make its scope unreadable against its success criteria.
+
+### Phase 999.101: The Task-Notification Turn Errors Under Parallel-Executor Load, Aborting Its Tools (BACKLOG — upstream Claude Code, not DevFlow)
+
+**Found:** 2026-08-09, dogfooding Phase 35.1. Three of roughly five stages died to the same
+signature: `result` with `is_error: true`, `subtype: "error_during_execution"`,
+`stop_reason: "tool_use"`, then a mute-but-alive process that DevFlow terminated on its idle timer.
+
+**What the evidence says.** On the one capture that still exists, the dying turn carried
+`origin: {"kind": "task-notification"}` and `terminal_reason: "aborted_tools"`. That is the CLI
+waking the session to deliver a background-task completion — **the undocumented mechanism Phase
+30/31 is built on**, and which `canary.rs` already warns "a CLI update can withdraw without any
+announcement". The Code stage that hit it had 43 background tasks and 326 `task_progress` events.
+
+**Scope of the claim, stated because the same mistake was already made once today.** The
+`error_during_execution` signature matched all three failures, but only ONE capture retains the
+diagnostic fields — the other two were archived and overwritten before anyone thought to look. So
+"task-notification turns abort their tools under load" is a hypothesis fitted to a single sample,
+not a measured pattern. 999.102 exists partly so the next occurrence is legible without forensics.
+
+**Why it is filed but not fixed.** It is upstream, inside Claude Code, not DevFlow. DevFlow's
+handling is already correct: the never-silent gate fires, commits are preserved (`32 commit(s) on
+the phase branch, NONE rolled back`), and `devflow resume` recovers. It is a tax on long unattended
+runs, not a blocker — the affected run still completed 3 of 4 plans.
+
+**The consequence worth carrying into Phase 35.1's completion notes.** 35.1's goal is that an
+unattended run can complete a phase with no human present. If the notification-delivery path errors
+under exactly the parallel-executor load that long phases generate, there is a ceiling on unattended
+runs that DevFlow cannot raise from its own side. The phase can meet its success criteria and still
+leave that ceiling in place; saying so up front is better than rediscovering it.
+
+**Where it should be revisited:** Phase 36 (999.83, drain gate concurrency measurement) is already
+about real sub-agent concurrency and already needs a production capture. This belongs in the same
+experiment rather than in its own phase.
+
+### Phase 999.100: A Quota Denial Is Recorded as an Idle Timeout, Turning a Resumable Pause Into a Terminal Verdict (PROMOTED — Phase 35.1)
+
+**Found:** 2026-08-08, when a Code stage of this phase ran out of credits mid-run.
+
+**The defect, in one line:** a rate-limit denial silences the agent, the idle timer fires and writes
+an idle-timeout record, and that record shadows `detect_claude_stream_rate_limit` — which was
+sitting in the same capture with the right answer.
+
+**Why it matters more than it looks.** `AgentStatus::RateLimited` routes to auto-resume.
+`IdleTimeout` reports *"this run is TERMINAL and is not retried automatically."* So a run that
+merely needs to wait for a quota reset halts permanently, and the operator is told the stream went
+silent rather than that they are out of credits until a stated time. **Running out of quota is the
+likeliest way a long unattended run stops**, which makes this the failure an unattended-launch phase
+can least afford to misreport.
+
+**Measured.** `rate_limit_event` with `status: "rejected"`, `rateLimitType: "seven_day"`,
+`overageDisabledReason: "out_of_credits"`. Replaying the classifier's own logic over that capture
+returns the denial — `CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES` is `["rejected"]`, and the eligible
+window held two `rate_limit_event`s with the last one rejected. DevFlow reported `idle_timeout`.
+
+**Shared root, distinct consequence — the reason this is its own entry and not part of 999.98.**
+Both are the side channel's unconditional precedence (`evaluate_layer1`'s first statement, returning
+before anything else reads the capture — T-31-06). 999.98 is a *stale* record outranking a later
+success. This is a *fresh, legitimate* record outranking a better classification of the same event.
+Fixing one does not fix the other.
+
+**Fixed in Phase 35.1.** `fire_idle_timeout` now asks why the stream went quiet before recording a
+verdict about the silence. On an explicit denial it suppresses the record and returns; the child is
+still terminated, since it is wedged either way. Only the verdict changes, and it changes by
+omission — with no record written the cascade reaches the rate-limit classifier. The check delegates
+to the same detector the read path uses, so two notions of "is this a rate limit" cannot drift apart.
+
+**Negative control that matters here.** A healthy `rate_limit_event` carries `status: "allowed"` with
+`overageStatus: "rejected"` one level below it. Matching loosely would suppress the idle timeout on
+every run and silently disable the hang guard entirely — so the test asserts the healthy shape is
+NOT treated as a denial, alongside the positive case.
+
+### Phase 999.99: The Idle Timeout Kills a Stage That Backgrounds Work, Because the Drain Gate Reads an Event the Plan Stage Never Emits (PROMOTED — Phase 35.1)
+
+**Found:** 2026-08-08, dogfooding Phase 35.1's own Plan stage. Two consecutive Plan runs died at
+~8.4 and ~8.8 minutes, ~$4.50 each, producing zero artifacts.
+
+**The defect, in one line:** DevFlow's close rule tracks background tasks by reading
+`background_tasks_changed`, and the Claude CLI does not emit that event — so DevFlow never knows a
+subagent is running, and its 120s idle timeout kills the parent for being correctly quiet.
+
+**Measured, not inferred.** A real Plan capture contained `task_started` ×1, `task_progress` ×61,
+`task_notification` ×1, `task_updated` ×1 — and `background_tasks_changed` ×0. Every occurrence of
+that event name in this repository is a test fixture synthesising it, which is exactly why the
+blindness never surfaced in the suite. **This is 999.83's "the fixture's shape doesn't match what
+production actually emits", with the capture that proves it.**
+
+**CORRECTION (2026-08-08, same day, from a later capture).** The first write-up of this entry — and
+the commit message of the fix — said *"production never emits it"*. **That is false, and the
+overstatement is recorded here rather than quietly edited away.** A Code-stage capture from the same
+phase emitted `background_tasks_changed` twice, carrying real task lists. The accurate scope is
+narrower: the **Plan** stage emits only `task_started`/`task_progress`, so the drain gate is blind
+there; the **Code** stage does announce, so the gate works there. The fix — tracking both
+vocabularies — is still correct and still needed, because the stage that actually got killed was the
+blind one. What was wrong was generalising from a single capture to "production", which is the
+proxy-measurement error this project's own rules exist to catch. The fix commit's body carries the
+original overstatement; it is buried under later commits and was not rewritten, so this note is the
+correction of record.
+
+**How it presents, and why it misleads.** The largest gap in the stream was exactly 120.0s — the
+timeout firing at its deadline, not an organic pause; the next largest was 44.5s. DevFlow killed
+the child, and the CLI then reported the task as `{"status":"killed"}` and the tool use as
+`"The user doesn't want to proceed with this tool use"` with `non_execution_kind: "user-rejected"`.
+That reads like an external failure or an operator action. It is our own signal coming back at us,
+and it cost two misdiagnoses before the timestamps settled it.
+
+**Two consequences, one cause.** `should_close` could release stdin while a subagent was still
+running — the 999.64 orphan shape, reachable through the guard built to prevent it. And the
+idle-timeout arm never consulted task state at all.
+
+**Why the existing design did not cover it.** D-03 rejected an outer wall-clock bound on the
+grounds that "there is no single wall-clock value that is safe for both a hang and a legitimately
+long stage", and relied instead on every stream line resetting the window — "a healthy 47-minute
+stage that keeps emitting is never touched". That reasoning is still right. Its unstated
+assumption is *healthy ⇒ still emitting*, which backgrounding breaks: the parent is correctly
+silent while the child works. The drain gate was supposed to cover that case and could not.
+
+**Fixed in Phase 35.1.** `CloseRule` now tracks open task ids from the vocabulary the CLI really
+emits, and the timeout arm extends rather than kills while work is outstanding. The extension is
+bounded (`MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN`) because an open task is not proof of progress — a
+wedged subagent never reports a terminal status, and an unbounded wait trades a false kill for an
+immortal run. An unrecognised task status leaves the task OPEN: being wrong that way delays a
+stage, being wrong the other way orphans its work.
+
+**Verification note for whoever revisits this.** The fix is proven by test, including a negative
+control that reproduced the real symptom when disabled. It was NOT exercised in production by the
+run during which it was written — that run logged zero extensions because its stream stayed busy.
+Proven in tests, untested live.
+
+---
+
+### Phase 999.98: The Idle-Timeout Verdict Has No Lifetime, So One Attempt's Death Certificate Condemns Every Later Run of That Phase (PROMOTED — Phase 35.1)
+
+**Found:** 2026-08-08, immediately after 999.99, when a relaunched run failed at a stage that had
+demonstrably succeeded.
+
+**The defect, in one line:** `.devflow/phase-NN-idle-timeout` had one writer, one reader, and no
+deleter — nothing in the codebase ever unlinked it — so a verdict about one stage attempt stayed
+authoritative for that phase forever.
+
+**Why the file is authoritative by design.** It is the monitor's death certificate, written
+*before* it kills a silent child so that `evaluate_layer1` cannot later parse the capture and score
+a killed agent as a success. `fire_idle_timeout` is blunt about the stakes: "this completing is the
+ONLY thing that stops Layer 2 from later scoring partial commits as Success". It is read FIRST and
+returns unconditionally (T-31-06) precisely so that nothing can shadow a real timeout. **The
+severity comes from the same property that makes it useful:** anything that outranks all other
+evidence and never expires is a loaded gun.
+
+**Measured.** A record written at 22:48 by a killed Plan stage condemned a Define stage that had
+genuinely succeeded 15 seconds earlier. The gate quoted a 120s silence inside a 22-second stage and
+named an agent pid that had been dead for 14 minutes. Every clause of the diagnostic was false, and
+an operator following it would have run `ps -p 501757` against a dead process. It survived
+`gate reject --note abort` and `devflow start --force`; it had to be removed by hand, twice.
+
+**This is a known defect class through an unguarded door.** `monitor.rs` already documents the same
+shape for a different path — a bogus `IdleTimeout` verdict written over a completed, successful
+stage, which "outranked the real success and could not be recovered from". That door was closed for
+the post-close case. The previous-run case was not.
+
+**Interaction with 999.99, worth recording.** Fixing the drain gate makes this bug *rarer and
+harder to diagnose*: the surviving trigger becomes a genuine timeout, possibly days earlier on
+unrelated work, resurfacing as an inexplicable failure on a healthy run naming a pid that no longer
+exists. The two defects are independent — a perfect drain gate still writes a certificate on a real
+timeout — but they must not be fixed one without the other.
+
+**Fixed in Phase 35.1.** The record now has the same lifetime as the per-attempt agent-pid file,
+which `archive_phase_files_with_stamp` already clears on its first line; it is cleared beside it,
+above the "nothing to archive" early return. Ordering is safe: a stage's verdict is consumed by
+`advance_evaluated` before the next `capture_archived` runs. Deleting rather than archiving loses
+nothing — the verdict is already durable in `advance_evaluated`'s `reason` in `events.jsonl` and in
+the gate context that quotes it.
 
 ### Phase 999.97: DevFlow Cannot Launch Any Phase GSD Numbers With a Decimal (HOTFIX — 2026-08-07)
 

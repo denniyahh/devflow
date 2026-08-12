@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.1
-current_phase_name: Unattended-Launch Prerequisites (999.93)
-status: "999.97 hotfix merged (PR #101); Phase 35.1 context gathered, ready for planning"
-stopped_at: Phase 35.1 context gathered
-last_updated: "2026-08-08T01:44:50.337Z"
-last_activity: 2026-08-07
+current_phase: 35.2
+current_phase_name: verification-provenance
+status: discussed
+stopped_at: Beginning Phase 35.2 — Verification Provenance (999.89 / HARDEN-03)
+last_updated: "2026-08-12T02:30:00.000Z"
+last_activity: 2026-08-12
+last_activity_desc: Phase 35.2 discussion started — loop-back decision knows whether this run's Validate agent authored the verification artifact
 progress:
   total_phases: 4
-  completed_phases: 1
-  total_plans: 6
-  completed_plans: 6
-  percent: 25
-last_activity_desc: Phase 35 complete, transitioned to Phase 35.1
+  completed_phases: 2
+  total_plans: 10
+  completed_plans: 10
+  percent: 50
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.1 of 36 (Unattended-Launch Prerequisites (999.93))
-Plan: Not started
-Status: Phase 35 shipped — PR #99
-Last activity: 2026-08-07
+Phase: 35.1 (unattended-launch-prerequisites) — COMPLETE (4/4 plans)
+Plan: 4 of 4
+Status: Phase 35.1 complete — chain-flag mechanism confirmed working; unattended-launch preflight active; GSD #3370 (orchestrator conflates gate="blocking" with gate="blocking-human") filed upstream
+Last activity: 2026-08-12 — Phase 35.1 complete; drill run + forensic analysis; stale live-run gate rejected
 
 ## Recently Shipped
 

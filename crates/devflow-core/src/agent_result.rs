@@ -1693,6 +1693,40 @@ pub struct IdleTimeoutRecord {
 /// **Nothing here rolls anything back** (D-07, T-31-09). The commits are read
 /// and named, never reverted: an idle timeout may be a false positive, and
 /// destroying real work on a false positive is unrecoverable.
+/// Whether the phase's live capture already carries an explicit quota DENIAL.
+///
+/// Exists for exactly one caller: [`crate::monitor`]'s idle-timeout path, which
+/// must know *why* the stream went quiet before it records a verdict about the
+/// silence.
+///
+/// **The problem this solves.** A quota denial makes the agent go silent — it
+/// has nothing left to say. The monitor's idle timer then fires, writes an
+/// idle-timeout record, and kills the child. Because
+/// [`parse_idle_timeout_side_channel`] is `evaluate_layer1`'s first statement
+/// and returns unconditionally (T-31-06), that record shadows
+/// [`detect_claude_stream_rate_limit`] — which was sitting in the same capture
+/// with the answer. The run is then reported as an idle timeout, "TERMINAL and
+/// not retried automatically", when the truth is `RateLimited`, which
+/// `outcome_policy` routes to auto-resume.
+///
+/// Observed 2026-08-08 on a real Code stage: `rate_limit_event` with
+/// `status: "rejected"`, `rateLimitType: "seven_day"`,
+/// `overageDisabledReason: "out_of_credits"`. Replaying the classifier over that
+/// capture returns the denial; the operator was instead told the stream had been
+/// silent for 120s. Running out of quota is the likeliest way a long unattended
+/// run stops, so it is the failure this phase can least afford to misreport.
+///
+/// Deliberately delegates to the SAME detector the read path uses rather than
+/// re-implementing the check. Two independent notions of "is this a rate limit"
+/// would be free to disagree, and the disagreement would be invisible.
+#[must_use]
+pub fn capture_shows_rate_limit_denial(project_root: &Path, phase: PhaseId) -> bool {
+    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
+        return false;
+    };
+    detect_claude_stream_rate_limit(&ParsedCapture::parse(&raw).events).is_some()
+}
+
 fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     let path = idle_timeout_path(project_root, phase);
     let raw = read_capture(&path)?;
@@ -2641,6 +2675,29 @@ fn archive_phase_files_with_stamp(
     stamp: &str,
 ) -> Result<Option<String>, std::io::Error> {
     let _ = std::fs::remove_file(agent_pid_path(project_root, phase));
+    // The idle-timeout record has the SAME lifetime as the pid file above: it
+    // describes one stage attempt and must not outlive it. Clearing it here was
+    // simply missed when the side channel was introduced (31-02), and the
+    // omission is not benign — [`parse_idle_timeout_side_channel`] is
+    // `evaluate_layer1`'s FIRST statement and returns unconditionally
+    // (T-31-06), by design, so that nothing can shadow a real timeout. A record
+    // that survives its attempt therefore outranks every later stage's real
+    // result, forever, for that phase.
+    //
+    // Observed 2026-08-08: a record written at 22:48 by a killed Plan stage
+    // condemned a Define stage that had succeeded 15s earlier, in a 22-second
+    // stage, with a message quoting a 120s silence and a pid dead for 14
+    // minutes. It survived both `gate reject --note abort` and
+    // `devflow start --force`, because nothing anywhere unlinked it.
+    //
+    // Deleting rather than archiving loses nothing: the verdict is already
+    // durable in `advance_evaluated`'s `reason` in `events.jsonl` and in the
+    // gate context that quotes it.
+    //
+    // This must stay ABOVE the "nothing to archive" early return below — the
+    // case with a stale record and no capture beside it is exactly the one that
+    // needs clearing.
+    let _ = std::fs::remove_file(idle_timeout_path(project_root, phase));
 
     let stdout_src = stdout_path(project_root, phase);
     let exit_src = exit_code_path(project_root, phase);
@@ -6292,6 +6349,139 @@ mod tests {
         .unwrap();
         assert_eq!(result_c.status, AgentStatus::Success);
         assert_eq!(result_c.decided_by_layer, Some(0));
+    }
+
+    /// A quota denial in the capture must be visible to the monitor BEFORE it
+    /// records a verdict about the silence that denial caused.
+    ///
+    /// The positive arm of the 2026-08-08 misclassification: a real `seven_day`
+    /// / `out_of_credits` denial silenced the agent, the idle timer fired, and
+    /// the resulting record shadowed the classifier that had the right answer.
+    #[test]
+    fn a_quota_denial_in_the_capture_is_visible_to_the_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(3);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        std::fs::write(
+            stdout_path(root, phase),
+            format!("{V3_INIT_EVENT}\n{}\n", v3_rate_limit_event("rejected")),
+        )
+        .unwrap();
+
+        assert!(
+            capture_shows_rate_limit_denial(root, phase),
+            "an explicit `rejected` quota denial must be detectable, or the monitor \
+             will record a hang for a pause that is resumable"
+        );
+    }
+
+    /// Negative control, and the more important half: this must NOT fire on an
+    /// ordinary capture, or every genuine hang stops being recorded as one.
+    ///
+    /// The `allowed` arm is the specific trap — the CLI emits `rate_limit_event`
+    /// routinely while healthy, and `overageStatus: "rejected"` sits one level
+    /// below `status: "allowed"`, so any loose nested search matches it.
+    #[test]
+    fn an_ordinary_capture_is_not_mistaken_for_a_quota_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let quiet = PhaseId::new(4);
+        std::fs::write(stdout_path(root, quiet), format!("{V3_INIT_EVENT}\n")).unwrap();
+        assert!(
+            !capture_shows_rate_limit_denial(root, quiet),
+            "a capture with no rate-limit event at all must read as no denial"
+        );
+
+        let healthy = PhaseId::new(5);
+        std::fs::write(
+            stdout_path(root, healthy),
+            format!("{V3_INIT_EVENT}\n{V3_RATE_LIMIT_EVENT_ALLOWED}\n"),
+        )
+        .unwrap();
+        assert!(
+            !capture_shows_rate_limit_denial(root, healthy),
+            "a healthy `status: allowed` event carries `overageStatus: rejected` one \
+             level down — matching it would suppress the idle timeout on every run"
+        );
+
+        let absent = PhaseId::new(6);
+        assert!(
+            !capture_shows_rate_limit_denial(root, absent),
+            "a missing capture must read as no denial, never as one"
+        );
+    }
+
+    /// A stage attempt's idle-timeout verdict must not survive into the next
+    /// attempt.
+    ///
+    /// Reproduces the 2026-08-08 observation directly: a record written by a
+    /// killed Plan stage was still authoritative when the next stage launched,
+    /// and because `evaluate_layer1` consults it FIRST and returns
+    /// unconditionally, it overrode a stage that had genuinely succeeded.
+    #[test]
+    fn archive_clears_a_previous_attempts_idle_timeout_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // A verdict left behind by an earlier, killed attempt.
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            r#"{"status":"idle_timeout","idle_secs":120,"agent_pid":501757,"written_at":1786157328,"commits":[]}"#,
+        )
+        .unwrap();
+        // Precondition, asserted rather than assumed: while it exists it is
+        // authoritative, which is precisely why it must not persist.
+        assert!(
+            evaluate_layer1(root, phase).is_some(),
+            "fixture precondition: the stale record must be readable as a verdict"
+        );
+
+        archive_phase_files(root, root, phase, 5).unwrap();
+
+        assert!(
+            !idle_timeout_path(root, phase).exists(),
+            "a previous attempt's timeout verdict survived a stage launch — it \
+             will now outrank the next stage's real result, for this phase, forever"
+        );
+    }
+
+    /// Negative control for the test above. The clearing happens at stage
+    /// LAUNCH, and it must not be reachable in a way that discards a verdict
+    /// before it has been read: a record with no capture beside it is the
+    /// stale case, but a record is only ever written mid-attempt, after the
+    /// launch that would have cleared it.
+    ///
+    /// This pins the other half — that clearing the file did not neuter the
+    /// mechanism, only its lifetime.
+    #[test]
+    fn a_current_attempts_idle_timeout_verdict_is_still_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // Stage launched (archive ran), THEN the monitor recorded a timeout —
+        // the real ordering within one attempt.
+        archive_phase_files(root, root, phase, 5).unwrap();
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            r#"{"status":"idle_timeout","idle_secs":120,"agent_pid":4242,"written_at":1786159637,"commits":[]}"#,
+        )
+        .unwrap();
+
+        let verdict = evaluate_layer1(root, phase)
+            .expect("a verdict recorded during this attempt must still be honoured");
+        assert_eq!(
+            verdict.status,
+            AgentStatus::IdleTimeout,
+            "the timeout mechanism itself must survive the lifetime fix"
+        );
     }
 
     #[test]

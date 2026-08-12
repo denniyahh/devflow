@@ -97,6 +97,17 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Because the default IS the floor, the value can only ever be raised.
 pub const IDLE_TIMEOUT_FLOOR_SECS: u64 = 120;
 
+/// How many consecutive idle windows the monitor will wait through while a
+/// background task is known to be outstanding, before treating the silence as
+/// a hang after all.
+///
+/// At the 120s default this is a 20-minute ceiling that applies ONLY when the
+/// stream has told us work is in flight; a stage with no open task is still
+/// judged on the first window. The bound exists because an open task is not
+/// proof of progress — a wedged subagent never reports a terminal status, and
+/// an unbounded wait would turn a false kill into an immortal run.
+pub const MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN: u32 = 10;
+
 /// The environment variable that raises the idle timeout above its floor.
 pub const IDLE_TIMEOUT_ENV: &str = "DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS";
 
@@ -550,10 +561,43 @@ enum BackgroundTaskState {
     Unreadable,
 }
 
+/// The task statuses that end a background task's life.
+///
+/// Deliberately an allow-list of TERMINAL states rather than a deny-list of
+/// active ones. An unrecognised status leaves the task OPEN, which blocks
+/// closing and extends the idle window — the same conservative direction
+/// [`BackgroundTaskState::Unreadable`] already takes. Being wrong here delays
+/// a stage; being wrong the other way orphans its work (999.64).
+const TERMINAL_TASK_STATUSES: &[&str] = &[
+    "completed",
+    "killed",
+    "failed",
+    "stopped",
+    "cancelled",
+    "canceled",
+    "error",
+];
+
 #[derive(Default)]
 pub struct CloseRule {
     marker_seen: bool,
     background_tasks: BackgroundTaskState,
+    /// Task ids announced via the per-task event vocabulary and not yet seen
+    /// to reach a terminal status.
+    ///
+    /// **Why this exists alongside [`Self::background_tasks`].** The drain arm
+    /// above reads `background_tasks_changed`, and production does not emit
+    /// that event. Measured on a real Phase 35.1 Plan capture (2026-08-08):
+    /// `task_started` ×1, `task_progress` ×61, `task_notification` ×1,
+    /// `task_updated` ×1, and `background_tasks_changed` ×0. Every occurrence
+    /// of `background_tasks_changed` in this repository is a test fixture
+    /// synthesising it, which is why the blindness never surfaced in the
+    /// suite. This is 999.83's "the fixture's shape doesn't match what
+    /// production actually emits", with the capture to prove it.
+    ///
+    /// The two signals are ANDed, never substituted: whichever one says work
+    /// is pending wins.
+    open_tasks: std::collections::HashSet<String>,
 }
 
 impl CloseRule {
@@ -581,6 +625,72 @@ impl CloseRule {
                 None => BackgroundTaskState::Unreadable,
             };
         }
+
+        self.observe_task_event(&event);
+    }
+
+    /// Fold the per-task event vocabulary the CLI actually emits into
+    /// [`Self::open_tasks`].
+    ///
+    /// `task_started` and `task_progress` both open a task — progress is
+    /// treated as opening, not merely as a heartbeat, so a capture joined
+    /// mid-flight (a resumed monitor, a rotated capture) still learns that
+    /// work is outstanding instead of concluding the stage is quiet.
+    fn observe_task_event(&mut self, event: &serde_json::Value) {
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("system") {
+            return;
+        }
+        let Some(subtype) = event.get("subtype").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(task_id) = event.get("task_id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+
+        match subtype {
+            "task_started" | "task_progress" => {
+                self.open_tasks.insert(task_id.to_string());
+            }
+            "task_notification" | "task_updated" => {
+                // `task_notification` carries `status` at the top level;
+                // `task_updated` carries it inside `patch`. Read both rather
+                // than assuming one shape.
+                let status = event
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        event
+                            .get("patch")
+                            .and_then(|patch| patch.get("status"))
+                            .and_then(serde_json::Value::as_str)
+                    });
+                match status {
+                    Some(status) if TERMINAL_TASK_STATUSES.contains(&status) => {
+                        self.open_tasks.remove(task_id);
+                    }
+                    // A status we do not recognise, or none at all, leaves the
+                    // task open. See TERMINAL_TASK_STATUSES.
+                    _ => {
+                        self.open_tasks.insert(task_id.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether any background task is known to be outstanding.
+    ///
+    /// The idle-timeout arm consults this: a parent that is correctly quiet
+    /// while a subagent works is not idle, and killing it is the defect this
+    /// predicate exists to prevent.
+    #[must_use]
+    pub fn has_open_background_tasks(&self) -> bool {
+        !self.open_tasks.is_empty()
+            || matches!(
+                self.background_tasks,
+                BackgroundTaskState::Pending(1..) | BackgroundTaskState::Unreadable
+            )
     }
 
     /// Whether both arms hold and the child's stdin may be released.
@@ -590,6 +700,7 @@ impl CloseRule {
                 self.background_tasks,
                 BackgroundTaskState::NeverAnnounced | BackgroundTaskState::Pending(0)
             )
+            && self.open_tasks.is_empty()
     }
 }
 
@@ -762,6 +873,7 @@ pub fn run_pipe_owning_monitor(
     // by feeding it lines, with no child process per case.
     let mut rule = CloseRule::default();
     let mut close_signalled = false;
+    let mut idle_extensions: u32 = 0;
 
     loop {
         match line_rx.recv_timeout(idle_timeout) {
@@ -807,6 +919,41 @@ pub fn run_pipe_owning_monitor(
                 // no single wall-clock value that is safe for both a hang and
                 // a legitimately long stage, which is why constraint 5
                 // rejected one.
+                //
+                // That reasoning assumed healthy ⇒ keeps emitting. A stage
+                // that BACKGROUNDS work breaks the assumption: the parent is
+                // correctly silent while a subagent runs, and the subagent's
+                // `task_progress` heartbeat is bursty — a real Phase 35.1 Plan
+                // capture showed organic gaps of 25s, 28s, 42s and 44.5s while
+                // the researcher was demonstrably alive, then one gap that
+                // reached the 120s floor and got the whole run killed. The
+                // drain gate should have covered this and could not: it reads
+                // `background_tasks_changed`, which production never emits.
+                //
+                // So consult the task state before firing. While work is known
+                // to be outstanding, silence is expected and this arm extends
+                // instead of killing. The extension is BOUNDED — a subagent
+                // that wedges leaves its task open forever, so an unbounded
+                // wait would trade a false kill for an immortal run, which is
+                // the failure this project already knows by name.
+                if rule.has_open_background_tasks()
+                    && idle_extensions < MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN
+                {
+                    idle_extensions += 1;
+                    info!(
+                        "no output for {idle_timeout:?}, but background work is still \
+                         outstanding — extending ({idle_extensions}/\
+                         {MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN}) instead of recording a timeout"
+                    );
+                    continue;
+                }
+                if rule.has_open_background_tasks() {
+                    warn!(
+                        "background work still outstanding after \
+                         {MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN} idle extensions \
+                         ({idle_timeout:?} each) — treating as a hang, not as progress"
+                    );
+                }
                 fire_idle_timeout(project_root, phase, workdir, child_pid, idle_timeout);
                 break;
             }
@@ -884,6 +1031,45 @@ fn fire_idle_timeout(
 ) {
     let idle_secs = idle.as_secs();
     warn!("idle timeout: no output from the supervised child for {idle_secs}s");
+
+    // 0. Ask WHY the stream went quiet before recording a verdict about the
+    //    silence. A quota denial silences the agent — it has nothing left to
+    //    say — and the capture already carries the answer in a form
+    //    `detect_claude_stream_rate_limit` classifies as `RateLimited`, which
+    //    `outcome_policy` routes to auto-resume. Writing an idle-timeout record
+    //    here would bury that: `parse_idle_timeout_side_channel` is
+    //    `evaluate_layer1`'s first statement and returns unconditionally
+    //    (T-31-06), so the record outranks the better classification sitting in
+    //    the same capture, and a resumable pause is reported as "TERMINAL and
+    //    not retried automatically".
+    //
+    //    Observed 2026-08-08 on a real Code stage that hit a `seven_day`
+    //    `out_of_credits` denial: the operator was told the stream had been
+    //    silent for 120s. Running out of quota is the likeliest way a long
+    //    unattended run stops.
+    //
+    //    The child is still terminated below — it is wedged either way. Only
+    //    the VERDICT changes, and it changes by omission: with no record
+    //    written, the cascade reaches the rate-limit classifier and returns the
+    //    right answer. Never silent — this is logged loudly and lands in the
+    //    monitor log alongside the kill.
+    if crate::agent_result::capture_shows_rate_limit_denial(project_root, phase) {
+        warn!(
+            "idle timeout after {idle_secs}s, but the capture carries an explicit quota \
+             denial — NOT recording an idle-timeout verdict, so the rate-limit \
+             classifier decides and the run stays resumable"
+        );
+        append_monitor_log(
+            project_root,
+            phase,
+            &format!(
+                "[idle-timeout] suppressed after {idle_secs}s: capture carries a quota \
+                 denial; classified as rate-limited (resumable), not as a hang"
+            ),
+        );
+        terminate_child_group(child_pid);
+        return;
+    }
 
     // 1. Enumerate. A failure degrades to an empty list plus a note; it never
     //    aborts, because a missing commit list must not cost the verdict.
@@ -1208,6 +1394,92 @@ mod tests {
             rule.observe(line);
         }
         rule
+    }
+
+    /// The per-task events the CLI ACTUALLY emits, copied verbatim (minus
+    /// truncated payloads) from a real Phase 35.1 Plan capture on
+    /// 2026-08-08. Not synthesised.
+    ///
+    /// That capture contained `task_started` ×1, `task_progress` ×61,
+    /// `task_notification` ×1, `task_updated` ×1 — and `background_tasks_changed`
+    /// ×0. The drain arm reads only the last of those, which is why it was
+    /// blind in production while every fixture-fed test passed (999.83).
+    const REAL_TASK_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"a5c0bae42941134b0","tool_use_id":"toolu_017H7RUmWejPcfm5Dc1whhdi","description":"Research Phase 35.1","subagent_type":"gsd-phase-researcher","task_type":"local_agent"}"#;
+    const REAL_TASK_PROGRESS: &str = r#"{"type":"system","subtype":"task_progress","task_id":"a5c0bae42941134b0","tool_use_id":"toolu_017H7RUmWejPcfm5Dc1whhdi","description":"Reading CONTEXT.md","subagent_type":"gsd-phase-researcher"}"#;
+    const REAL_TASK_UPDATED_TERMINAL: &str = r#"{"type":"system","subtype":"task_updated","task_id":"a5c0bae42941134b0","patch":{"status":"completed","end_time":1786159637614}}"#;
+
+    /// A marker as it appears in a top-level `result` event.
+    const RESULT_WITH_MARKER: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#;
+
+    /// The regression this whole change exists for: a backgrounding stage must
+    /// be recognised as busy from the events production really sends.
+    #[test]
+    fn open_tasks_are_learned_from_the_events_production_actually_emits() {
+        let busy = observe_all(&[
+            INIT_LINE.to_string(),
+            REAL_TASK_STARTED.to_string(),
+            REAL_TASK_PROGRESS.to_string(),
+            RESULT_WITH_MARKER.to_string(),
+        ]);
+        assert!(
+            busy.has_open_background_tasks(),
+            "a started task must read as outstanding — this is what stops the \
+             idle-timeout arm from killing a healthy backgrounding stage"
+        );
+        assert!(
+            !busy.should_close(),
+            "stdin must stay open while a subagent runs, even once the marker \
+             has landed (999.64 orphan shape)"
+        );
+
+        let drained = observe_all(&[
+            INIT_LINE.to_string(),
+            REAL_TASK_STARTED.to_string(),
+            REAL_TASK_PROGRESS.to_string(),
+            RESULT_WITH_MARKER.to_string(),
+            REAL_TASK_UPDATED_TERMINAL.to_string(),
+        ]);
+        assert!(
+            !drained.has_open_background_tasks(),
+            "a terminal status must close the task"
+        );
+        assert!(
+            drained.should_close(),
+            "marker seen and every task drained — the stage may close"
+        );
+    }
+
+    /// Negative control on the conservative direction: an unknown status must
+    /// not be mistaken for completion.
+    #[test]
+    fn an_unrecognised_task_status_leaves_the_task_open() {
+        let rule = observe_all(&[
+            REAL_TASK_STARTED.to_string(),
+            RESULT_WITH_MARKER.to_string(),
+            r#"{"type":"system","subtype":"task_updated","task_id":"a5c0bae42941134b0","patch":{"status":"reticulating_splines"}}"#.to_string(),
+        ]);
+        assert!(
+            rule.has_open_background_tasks(),
+            "an unrecognised status must leave the task open — being wrong this \
+             way delays a stage, being wrong the other way orphans its work"
+        );
+        assert!(!rule.should_close());
+    }
+
+    /// Negative control on the other side: the fix must not make ordinary,
+    /// non-backgrounding stages hang. Every stage that never dispatches a
+    /// subagent has to close exactly as before.
+    #[test]
+    fn a_stage_that_backgrounds_nothing_is_unaffected() {
+        let rule = observe_all(&[INIT_LINE.to_string(), RESULT_WITH_MARKER.to_string()]);
+        assert!(
+            !rule.has_open_background_tasks(),
+            "no task events means no outstanding work"
+        );
+        assert!(
+            rule.should_close(),
+            "a non-backgrounding stage must still close on its marker alone"
+        );
     }
 
     /// Constraint 4 is an `AND`, and neither arm is sufficient alone. Both
@@ -1548,6 +1820,147 @@ exit 0
         let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
             .expect("the monitor must record the child's exit code");
         assert_eq!(exit.trim(), "0", "exit file contents: {exit:?}");
+    }
+
+    /// Build a stub that goes silent for longer than the idle window, with or
+    /// without first announcing a background task.
+    ///
+    /// The two arms differ in exactly one line. That is the point: it is the
+    /// announcement, and nothing else, that decides whether the silence is
+    /// read as work or as a hang.
+    fn silent_stub(announce_task: bool) -> String {
+        let announce = if announce_task {
+            format!("printf '%s\\n' '{REAL_TASK_STARTED}'")
+        } else {
+            String::from(": # no background task announced")
+        };
+        format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+{announce}
+sleep 3
+printf '%s\n' '{REAL_TASK_UPDATED_TERMINAL}'
+printf '%s\n' '{RESULT_WITH_MARKER}'
+exit 0
+"#
+        )
+    }
+
+    /// The defect this change fixes, end to end: a parent that is correctly
+    /// quiet while a subagent works must not be killed.
+    ///
+    /// Measured shape it reproduces — a real Phase 35.1 Plan run went silent
+    /// for exactly the 120s window while `gsd-phase-researcher` was live, and
+    /// DevFlow killed it. The CLI then reported the task as `killed` and the
+    /// tool use as "user rejected", which reads like an external failure and
+    /// is in fact our own signal coming back at us.
+    #[test]
+    fn idle_timeout_does_not_fire_while_a_background_task_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(51);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), silent_stub(true)],
+            &[],
+        )
+        .expect("the monitor must supervise a backgrounding stub to completion");
+
+        assert_eq!(code, 0, "stub should exit cleanly, not be killed");
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "an idle-timeout verdict was recorded for a stage whose subagent was \
+             demonstrably alive — this is the false kill the extension exists to \
+             prevent, and because evaluate_layer1 reads that side channel FIRST \
+             the bogus verdict would outrank the stage's real success"
+        );
+    }
+
+    /// A quota denial must not be recorded as a hang.
+    ///
+    /// End-to-end counterpart of `capture_shows_rate_limit_denial`'s unit
+    /// tests: the stub announces an explicit `rejected` denial and then goes
+    /// silent, exactly as a real agent does when it runs out of credits. No
+    /// idle-timeout verdict may be written, because that record would outrank
+    /// the rate-limit classifier and turn a resumable pause into "TERMINAL and
+    /// not retried automatically".
+    ///
+    /// Note the stub has NO open background task — this is the arm the
+    /// drain-gate extension does not cover, and the arm a real quota denial
+    /// lands in.
+    #[test]
+    fn a_quota_denial_is_not_recorded_as_an_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(53);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let denial = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1786222800,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"u-rl","session_id":"s-rl"}"#;
+        let script = format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+printf '%s\n' '{denial}'
+sleep 3
+exit 0
+"#
+        );
+
+        let _ = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+        );
+
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "a quota denial was recorded as an idle timeout — the operator is told the \
+             stream went silent when the truth is 'out of credits', and the run is \
+             marked terminal instead of resumable"
+        );
+    }
+
+    /// Negative control for the test above. Same stub, same silence, one line
+    /// removed — the guard must still fire when nothing is outstanding, or it
+    /// has simply been disabled rather than made accurate.
+    #[test]
+    fn idle_timeout_still_fires_when_no_background_task_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(52);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let _ = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), silent_stub(false)],
+            &[],
+        );
+
+        assert!(
+            crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "silence with no outstanding work must still be recorded as a hang; \
+             if this never fires, the idle guard has been removed, not fixed"
+        );
     }
 
     /// Peer review 2026-08-03, CRITICAL: `BufRead::lines()` yields

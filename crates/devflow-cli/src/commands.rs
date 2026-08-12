@@ -352,6 +352,36 @@ pub(crate) fn start(
         }
     }
 
+    // 35.1 D-01, `start`'s half: repair a leaked
+    // `workflow._auto_chain_active` before anything is spawned.
+    //
+    // PLACEMENT IS LOAD-BEARING in both directions. It sits AFTER the
+    // `if worktree { ... }` fork above, because that fork is what creates the
+    // worktree and sets `state.worktree_path` — the repair targets the copy of
+    // `.planning/config.json` the agent will actually read, and before the fork
+    // that copy does not exist (F-10). It sits BEFORE the first
+    // `workflow::save_state` below, matching this function's own
+    // "combine before the first save_state" idiom for `yes_ship` and D-11's
+    // opt-out.
+    //
+    // Why `start` needs this at all, and not just `resume`: a freshly forked
+    // worktree inherits whatever `develop` carries. A leak that already reached
+    // the base branch — through Ship, or any other route — arrives in every new
+    // phase's worktree, and this call site is the one that catches it there.
+    // See `pipeline_launch::repair_leaked_auto_chain_flag` for the D-01/D-03
+    // reasoning in full. (35.1's `D-` numbers, a different sequence from phase
+    // 31's D-11 cited above.)
+    let launch_root: PathBuf = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+    crate::pipeline_launch::repair_leaked_auto_chain_flag(
+        project_root,
+        &launch_root,
+        phase,
+        crate::pipeline_launch::AUTO_CHAIN_REPAIR_FROM_START,
+    );
+
     // 999.79 (35-05, A-05): record what this phase's `{N}-VERIFICATION.md`
     // looked like BEFORE this run's Validate agent has had any opportunity to
     // rewrite it. `handle_validate_outcome`'s loop-back selector compares the
