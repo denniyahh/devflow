@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.2
-current_phase_name: verification-provenance
-status: complete
-stopped_at: Phase 35.2 complete — run-owned verification nonce + branch-naming pin (999.89 / HARDEN-03)
-last_updated: "2026-08-12T12:10:00.000Z"
+current_phase: 35.3
+current_phase_name: drain-gate-concurrency-measurement
+status: discussed
+stopped_at: Beginning Phase 35.3 — Drain Gate Concurrency Measurement (999.83)
+last_updated: "2026-08-12T12:30:00.000Z"
 last_activity: 2026-08-12
-last_activity_desc: Phase 35.2 complete — 2/2 plans, nonce marker gates the loop-back dispatch, branch-naming convention pinned by tests
+last_activity_desc: Phase 35.3 discussion started — measurement of whether the drain gate observes real sub-agent concurrency
 progress:
   total_phases: 4
   completed_phases: 3

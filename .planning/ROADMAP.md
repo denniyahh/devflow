@@ -19,7 +19,7 @@ Supervise-mode gate message reports a resettable streak instead of a cumulative 
 and gates unresolvably), **999.84** (the `GateReview` checkpoint call site's root argument is
 correct by construction but has no regression test), and **999.86** (`release --check`'s
 tag-signing predictor has now false-negatived live twice with the correct key present; replace it
-with a real `ssh-keygen -Y sign` probe). Phase 36 carries **999.83** alone — the drain gate has
+with a real `ssh-keygen -Y sign` probe). Phase 35.3 carries **999.83** alone — the drain gate has
 never observed real sub-agent concurrency, and its fixture's shape doesn't match what production
 actually emits. That item is investigation-shaped (design the right experiment first, same family
 as backlog 999.71's precedent) rather than a quick patch, and bundling it with Phase 35 would slow
@@ -30,7 +30,7 @@ those five confirmed fixes down waiting on a harness.
 | 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
 | 35.1 | Unattended-Launch Prerequisites | Complete | — |
 | 35.2 | Verification Provenance | Complete | — |
-| 36 | Drain Gate Concurrency Measurement | Not started | — |
+| 35.3 | Drain Gate Concurrency Measurement | Not started | — |
 
 ### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
 
@@ -110,7 +110,7 @@ Plans:
 GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
 loudly, when the conditions that make that true do not hold.
 **Depends on**: Phase 35 (whose `phase_validate_failures` accounting is what a stalled unattended run
-currently burns through). Sequenced **before** Phase 36, which needs a working unattended run to
+currently burns through). Sequenced **before** Phase 35.3, which needs a working unattended run to
 gather the live concurrency evidence its criterion 1 demands.
 **Requirements**: HARDEN-07
 **Success Criteria** (what must be TRUE):
@@ -239,14 +239,14 @@ this depend on an upstream change (see `.planning/UPSTREAM-GSD-ISSUES.md`); the 
 run-owned marker is that DevFlow can close this alone.
 **Plans**: TBD
 
-### Phase 36: Drain Gate Concurrency Measurement (999.83)
+### Phase 35.3: Drain Gate Concurrency Measurement (999.83)
 
 **Goal**: Operator has a real, evidence-based answer to whether the drain gate — the safety net
 the v2.4.0 stream-json widening depends on — actually observes real sub-agent concurrency, in
 place of the untested assumption its synthetic fixture currently encodes. This is
 investigation-shaped work: design and run the right experiment, in the same family as backlog
 999.71's precedent, rather than apply a predetermined fix.
-**Depends on**: Nothing structurally — sequenced after Phase 35 only by phase numbering.
+**Depends on**: Nothing structurally — sequenced after Phase 35.2 by phase numbering.
 Deliberately isolated so this investigation does not block Phase 35's five confirmed fixes; it may
 be planned and executed independently of Phase 35's completion.
 **Requirements**: HARDEN-06
@@ -2940,7 +2940,7 @@ under exactly the parallel-executor load that long phases generate, there is a c
 runs that DevFlow cannot raise from its own side. The phase can meet its success criteria and still
 leave that ceiling in place; saying so up front is better than rediscovering it.
 
-**Where it should be revisited:** Phase 36 (999.83, drain gate concurrency measurement) is already
+**Where it should be revisited:** Phase 35.3 (999.83, drain gate concurrency measurement) is already
 about real sub-agent concurrency and already needs a production capture. This belongs in the same
 experiment rather than in its own phase.
 
@@ -3227,7 +3227,7 @@ warn, since a warning in an unattended run is read by nobody.
 (the 999.86 lesson, one phase earlier). Whatever ships must include a fixture where the check
 reports NOT viable.
 
-**Priority:** High — it gates the first real unattended end-to-end run (phase 36). **Size:** S–M.
+**Priority:** High — it gates the first real unattended end-to-end run (phase 35.3). **Size:** S–M.
 
 ---
 
