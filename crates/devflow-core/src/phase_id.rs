@@ -465,16 +465,16 @@ mod tests {
             );
         }
     }
-}
 
-/// Resolves `gsd-tools` from PATH, returning the first match.
-fn which_gsd_tools() -> Option<String> {
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':') {
-        let candidate = std::path::Path::new(dir).join("gsd-tools");
-        if candidate.exists() {
-            return candidate.to_str().map(String::from);
+    /// Resolves `gsd-tools` from PATH, returning the first match.
+    fn which_gsd_tools() -> Option<String> {
+        let path = std::env::var("PATH").ok()?;
+        for dir in path.split(':') {
+            let candidate = std::path::Path::new(dir).join("gsd-tools");
+            if candidate.exists() {
+                return candidate.to_str().map(String::from);
+            }
         }
+        None
     }
-    None
 }
