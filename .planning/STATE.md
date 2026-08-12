@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.1
-current_phase_name: unattended-launch-prerequisites
-status: complete
-stopped_at: Phase 35.1 complete — hand-completed after dogfood Code-stage stall; chain-flag mechanism confirmed working, auto-approval blocked by upstream GSD #3370
-last_updated: "2026-08-12T02:14:49.915Z"
+current_phase: 35.2
+current_phase_name: verification-provenance
+status: discussed
+stopped_at: Beginning Phase 35.2 — Verification Provenance (999.89 / HARDEN-03)
+last_updated: "2026-08-12T02:30:00.000Z"
 last_activity: 2026-08-12
-last_activity_desc: Phase 35.1 complete — 4/4 plans, chain-flag mechanism confirmed, unattended-launch preflight active, GSD #3370 filed
+last_activity_desc: Phase 35.2 discussion started — loop-back decision knows whether this run's Validate agent authored the verification artifact
 progress:
   total_phases: 4
   completed_phases: 2
