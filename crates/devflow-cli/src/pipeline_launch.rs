@@ -142,6 +142,40 @@ pub(crate) fn launch_stage_inner(
     // `save_state` calls — no extra save needed here.
     state.checkpoint_resumes = 0;
 
+    // 35.2 (999.89 / HARDEN-03, P-01/P-02): on a Validate dispatch, stamp the
+    // run-owned nonce and re-observe the artifact baseline into a window
+    // scoped to THIS dispatch rather than to the whole `devflow start` run.
+    //
+    // P-01 — why this site, not commands.rs: the once-per-run capture site
+    // cannot discriminate the second Validate dispatch of a run from the
+    // first, and 999.89's scenario is a checkout landing BETWEEN two Validate
+    // dispatches. `launch_stage_inner` is reached by every Validate dispatch
+    // via `transition()` (pipeline_gate.rs:95, :111).
+    //
+    // The stamp and the re-observation are ONE mechanism — do not separate
+    // them. A stamp without a fresh baseline silently restores the run-wide
+    // observation window; a fresh baseline without a stamp widens it to the
+    // whole Validate stage.
+    if state.stage == Stage::Validate {
+        let evidence_root = state
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&state.project_root);
+        state.verification_run_nonce =
+            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(
+                evidence_root,
+                state.phase,
+            );
+        state.last_verification_mtime_nanos =
+            devflow_core::agent_result::phase_verification_mtime_nanos(
+                evidence_root,
+                state.phase,
+            );
+        state.verification_baseline_captured = true;
+    }
+
     spawn_agent_and_record(
         state,
         program,

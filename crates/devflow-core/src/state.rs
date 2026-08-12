@@ -234,6 +234,33 @@ pub struct State {
     /// written during this run.
     #[serde(default)]
     pub last_verification_mtime_nanos: Option<u64>,
+    /// A run-owned marker stamped per Validate dispatch proving DevFlow itself
+    /// launched the agent whose output this state describes (35.2, 999.89 /
+    /// HARDEN-03, D-01).
+    ///
+    /// `None` means DevFlow never stamped a Validate dispatch for this state,
+    /// which is both the pre-35.2-state-file case and the never-dispatched
+    /// case. Both demand the conservative reading: the artifact's provenance is
+    /// unknown and `verification_authored_this_run` returns `false`.
+    ///
+    /// **Lifetime — replaced wholesale on every Validate dispatch, not
+    /// incremented across runs.** Unlike [`Self::consecutive_failures`] and
+    /// [`Self::phase_validate_failures`], this field is NOT touched by
+    /// `transition()`, and [`State::new`] resets it, so a `--force` restart
+    /// cannot inherit a previous run's stamp. The value is a monotonically
+    /// increasing counter; the predicate consults [`Option::is_some`], never
+    /// the magnitude, so saturation cannot degrade the signal.
+    ///
+    /// The write site is `launch_stage_inner` in `pipeline_launch.rs`, gated
+    /// on `Stage::Validate`, co-located with a fresh fingerprint/mtime
+    /// re-observation — the stamp and the baseline are one mechanism, and
+    /// splitting them silently restores the run-wide observation window.
+    ///
+    /// An actor who can write `.devflow/state-{N}.json` can set `stage` or
+    /// `consecutive_failures` directly; this field adds no attack surface
+    /// beyond what already exists (P-03).
+    #[serde(default)]
+    pub verification_run_nonce: Option<u64>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -404,6 +431,7 @@ impl State {
             last_verification_fingerprint: None,
             verification_baseline_captured: false,
             last_verification_mtime_nanos: None,
+            verification_run_nonce: None,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,

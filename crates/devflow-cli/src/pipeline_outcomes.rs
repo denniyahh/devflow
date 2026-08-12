@@ -361,6 +361,7 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
             state.last_verification_mtime_nanos,
         ),
         state.verification_baseline_captured,
+        state.verification_run_nonce,
     ) {
         // Record the new observation as the baseline, so a SUBSEQUENT
         // loop-back that finds the artifact unchanged is in turn correctly
@@ -445,11 +446,17 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
 /// than 999.79 asks for.
 fn verification_authored_this_run(
     current: (Option<u64>, Option<u64>),
-    run_start_baseline: (Option<u64>, Option<u64>),
+    dispatch_baseline: (Option<u64>, Option<u64>),
     baseline_captured: bool,
+    validate_dispatch_nonce: Option<u64>,
 ) -> bool {
+    // 35.2 D-01: a missing nonce means DevFlow never stamped a Validate
+    // dispatch for this state. Return false so the dispatch is FullExecute.
+    if validate_dispatch_nonce.is_none() {
+        return false;
+    }
     let (current_hash, current_mtime) = current;
-    let (baseline_hash, baseline_mtime) = run_start_baseline;
+    let (baseline_hash, baseline_mtime) = dispatch_baseline;
     // WR-06. Compared ONLY when both readings exist: an mtime is unavailable on
     // a platform without `modified()`, on unreadable metadata, or past year
     // 2554, and `Some != None` would then read as "written since" on every
@@ -3442,6 +3449,7 @@ mod tests {
         // by a binary predating the field — and that is a DIFFERENT scenario
         // (an artifact of unknown provenance) from the one under test here.
         state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         let phase_dir = root
@@ -3521,6 +3529,7 @@ mod tests {
         // by a binary predating the field — and that is a DIFFERENT scenario
         // (an artifact of unknown provenance) from the one under test here.
         state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         // The artifact is written under the WORKTREE only. The bare tempdir
@@ -3792,6 +3801,7 @@ mod tests {
         let run_start =
             devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
         state.last_verification_fingerprint = run_start;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         // This run's Validate agent rewrites it.
@@ -3928,7 +3938,7 @@ mod tests {
         // nothing to have authored. The phase is mid-arc and D-01's original
         // FullExecute answer stands, unchanged by 999.79.
         assert!(
-            !verification_authored_this_run((None, None), (None, None), true),
+            !verification_authored_this_run((None, None), (None, None), true, Some(1)),
             "row 1: an absent artifact is never 'authored this run'"
         );
 
@@ -3936,7 +3946,7 @@ mod tests {
         // a verdict from; grouped with row 1 rather than given its own row
         // because the predicate cannot distinguish them and must not try.
         assert!(
-            !verification_authored_this_run((None, None), (Some(7), Some(100)), true),
+            !verification_authored_this_run((None, None), (Some(7), Some(100)), true, Some(1)),
             "row 1b: an artifact that is absent NOW is never 'authored this run', whatever the \
              baseline recorded"
         );
@@ -3945,7 +3955,7 @@ mod tests {
         // look. The ordinary first-verification case: Validate authored it
         // during this run.
         assert!(
-            verification_authored_this_run((Some(7), Some(100)), (None, None), true),
+            verification_authored_this_run((Some(7), Some(100)), (None, None), true, Some(1)),
             "row 2: an artifact existing where the baseline recorded none was authored this run"
         );
 
@@ -3953,7 +3963,7 @@ mod tests {
         // state written by a binary predating the baseline field. The artifact
         // may be the PREVIOUS run's, so its verdict must not be reused.
         assert!(
-            !verification_authored_this_run((Some(7), Some(100)), (None, None), false),
+            !verification_authored_this_run((Some(7), Some(100)), (None, None), false, Some(1)),
             "row 2b: with no captured baseline the artifact's provenance is unknown, and \
              reading it as this run's is the 999.79 stall reproduced across an upgrade"
         );
@@ -3962,7 +3972,7 @@ mod tests {
         // 999.79 case: inherited from a previous run, its verdict must not be
         // reused.
         assert!(
-            !verification_authored_this_run((Some(7), Some(100)), (Some(7), Some(100)), true),
+            !verification_authored_this_run((Some(7), Some(100)), (Some(7), Some(100)), true, Some(1)),
             "row 3: an artifact whose fingerprint AND mtime equal the run-start baseline is \
              INHERITED, not authored this run"
         );
@@ -3972,7 +3982,7 @@ mod tests {
         // later failing cycle. Hash-only this read as inherited, and every
         // subsequent cycle re-ran every plan in the phase.
         assert!(
-            verification_authored_this_run((Some(7), Some(200)), (Some(7), Some(100)), true),
+            verification_authored_this_run((Some(7), Some(200)), (Some(7), Some(100)), true, Some(1)),
             "row 3b: an IDEMPOTENT rewrite is still a rewrite — unchanged bytes with an \
              advanced mtime were written by this run's agent"
         );
@@ -3981,14 +3991,14 @@ mod tests {
         // falls back to content alone, which is the pre-WR-06 behaviour; a
         // `Some != None` mtime test would instead read EVERY cycle as rewritten.
         assert!(
-            !verification_authored_this_run((Some(7), None), (Some(7), Some(100)), true),
+            !verification_authored_this_run((Some(7), None), (Some(7), Some(100)), true, Some(1)),
             "row 3c: an unavailable mtime must degrade to the content comparison, not \
              manufacture a difference"
         );
 
         // Row 4 — content changed since run start. Validate rewrote it.
         assert!(
-            verification_authored_this_run((Some(7), Some(200)), (Some(8), Some(100)), true),
+            verification_authored_this_run((Some(7), Some(200)), (Some(8), Some(100)), true, Some(1)),
             "row 4: an artifact whose fingerprint differs from the run-start baseline was \
              rewritten during this run"
         );
@@ -4159,6 +4169,7 @@ mod tests {
             state.verification_baseline_captured = true;
             state.last_verification_fingerprint = baseline_hash;
             state.last_verification_mtime_nanos = Some(baseline_mtime);
+        state.verification_run_nonce = Some(1);
             workflow::save_state(&state).unwrap();
 
             {
