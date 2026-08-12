@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.1
+current_phase: 35.3
 current_phase_name: drain-gate-concurrency-measurement
-status: discussed
-stopped_at: Beginning Phase 35.3 — Drain Gate Concurrency Measurement (999.83)
+status: "Phase 35.3 planned — 3 plans in 3 waves, ready to execute"
+stopped_at: Phase 35.3 planned
 last_updated: "2026-08-12T19:37:27.780Z"
 last_activity: 2026-08-12
-last_activity_desc: Phase 35.3 discussion started — measurement of whether the drain gate observes real sub-agent concurrency
+last_activity_desc: Phase 35.3 planning complete
 progress:
   total_phases: 4
   completed_phases: 3
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.1 (unattended-launch-prerequisites) — COMPLETE (4/4 plans)
-Plan: 4 of 4
-Status: Phase 35.1 complete — chain-flag mechanism confirmed working; unattended-launch preflight active; GSD #3370 (orchestrator conflates gate="blocking" with gate="blocking-human") filed upstream
-Last activity: 2026-08-12 — Phase 35.1 complete; drill run + forensic analysis; stale live-run gate rejected
+Phase: 35.3 of 4 (Drain Gate Concurrency Measurement (999.83))
+Plan: 0 of 3 complete (waves 1/2/3)
+Status: Ready to execute
+Last activity: 2026-08-12 — Phase 35.3 planning complete
 
 ## Recently Shipped
 
