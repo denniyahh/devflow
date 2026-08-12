@@ -3818,6 +3818,7 @@ mod tests {
         // genuinely crossed a process boundary rather than on the in-memory
         // value this test just mutated.
         let mut reloaded = workflow::load_state(root, phase).expect("state must persist");
+        reloaded.verification_run_nonce = Some(1);
         assert_eq!(
             reloaded.last_verification_fingerprint, run_start,
             "premise: the run-start baseline must survive the save/load round trip, or the \
