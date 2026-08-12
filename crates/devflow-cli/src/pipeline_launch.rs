@@ -51,15 +51,6 @@ use tracing::{info, warn};
 /// other caller keeps going through [`launch_stage`]'s full path (readiness
 /// resolution, `ensure_agent_binary`, then `run_preflight`).
 ///
-/// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
-/// `prompt_override` — deliberately NOT threaded through as parameters.
-/// They are pure functions of `state` and the prompt override; recomputing
-/// them here (rather than widening `run_preflight`'s signature to carry
-/// them from `launch_stage`'s earlier resolution) keeps this function
-/// callable entirely on its own, which is exactly what `run_preflight`'s
-/// `Advance` arm needs. This does not duplicate `worktree_writable_roots`'s
-/// logic — both call sites call the same shared helper.
-
 /// 35.2 (999.89 / HARDEN-03, P-01/P-02): stamp the run-owned nonce and
 /// re-observe the artifact baseline into a window scoped to THIS Validate
 /// dispatch.
@@ -83,6 +74,14 @@ fn stamp_validate_dispatch_window(state: &mut State) {
     state.verification_baseline_captured = true;
 }
 
+/// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
+/// `prompt_override` — deliberately NOT threaded through as parameters.
+/// They are pure functions of `state` and the prompt override; recomputing
+/// them here (rather than widening `run_preflight`'s signature to carry
+/// them from `launch_stage`'s earlier resolution) keeps this function
+/// callable entirely on its own, which is exactly what `run_preflight`'s
+/// `Advance` arm needs. This does not duplicate `worktree_writable_roots`'s
+/// logic — both call sites call the same shared helper.
 pub(crate) fn launch_stage_inner(
     state: &mut State,
     prompt_override: Option<String>,
