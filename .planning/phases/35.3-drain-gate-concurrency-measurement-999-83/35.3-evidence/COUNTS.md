@@ -63,3 +63,28 @@ and emits `local_agent` only in the per-task `task_started` vocabulary (sub-agen
 The fixture's `local_agent` is faithful to the Phase 30 capture it cites — but the
 current CLI puts `local_bash` inside `background_tasks_changed`, so the fixture models
 a combination the current CLI never produces.
+
+## Real-capture comparison (D-01 validation)
+
+One dedicated `devflow start --no-worktree --until validate` probe on a scaffolded
+single-file phase (CLI 2.1.228, build `6314eff`), 4 stages concatenated. Two sub-agent
+dispatches (Code executor + Validate verifier), both `task_type: "local_agent"`.
+
+| Family | Synthetic A (sub-agent) | Real (sub-agent ×2) | MATCH? |
+|---|---|---|---|
+| `task_started` | 1/run | 2 total | ✅ same family |
+| `task_progress` | 0 | 35 | ✅ same family (real work → more heartbeats) |
+| `task_updated` | 1/run | 2 | ✅ |
+| `task_notification` | 1/run | 2 | ✅ |
+| `background_tasks_changed` | 0 | 0 | ✅ |
+| `run_in_background:true` | 0 | 0 | ✅ (neither synthetic-A nor this real run backgrounds a shell) |
+
+**Verdict:** the synthetic sub-agent mapping is VALIDATED by the real capture — both emit the
+per-task vocabulary (`task_started`/`task_progress`/`task_updated`/`task_notification`) and
+zero `background_tasks_changed`.
+
+**Scope limit (honest):** this real run exercised the **sub-agent path only** — it
+backgrounded no shell (a trivial single-file phase gives the agent no reason to). The
+backgrounded-shell mapping therefore rests on the **synthetic capture alone** (Variant B,
+n=2), which is the first capture of that path anywhere in this repo. A real backgrounded
+shell remains unvalidated against a real run, and is stated as such rather than assumed.
