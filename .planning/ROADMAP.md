@@ -328,7 +328,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35 | 6/6 | Complete    | 2026-08-07 |
 | 35.1 | 4/4 | Complete    | 2026-08-12 |
 | 35.2 | 2/2 | Complete    | 2026-08-12 |
-| 35.3 | 0/3 | Planned | — |
+| 35.3 | 3/3 | Complete    | 2026-08-12 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -2838,14 +2838,17 @@ than assumed:
 
 1. **No default.** `fire_gate_notify` returns immediately when the variable is unset or empty — a
    silent no-op, by design. Correct as a default; invisible as a state.
+
 2. **No config-file home.** `load_config` reads `devflow.toml` into a `DevflowConfig` carrying
    exactly `capture_retention`, `review_angles`, `external_verify_enabled` and `yes_ship`. The
    notify command is not among them, so it cannot be set where every other DevFlow setting lives.
    It is environment-only.
+
 3. **Nothing in this repo's own setup sets it.** Not `.planning/DEV-SETUP-CHECKLIST.md` — the file
    that exists precisely so this project's setup can be replicated — not the fish config, not
    `.devcontainer`, no `.env`, no Makefile. The one variable that makes an unattended run visible
    is absent from the checklist whose job is exactly that.
+
 4. **A shell export would not have been enough anyway.** The detached monitor inherits the
    environment of whatever launched it, so a one-off `export` in another terminal never reaches it.
    It has to be in persistent shell config to be reliable.
@@ -2862,10 +2865,13 @@ own `curl`/`notify-send`/webhook is the right design. What is missing is *legibi
 
 - Give the hook a home in `devflow.toml` beside the other settings, with the env var still winning,
   matching `capture_retention`'s existing precedence idiom.
+
 - Surface configured-or-not in `devflow status` and in the unattended-launch preflight report. An
   unattended run with no notify channel is a stated risk, not a silent one.
+
 - Validate at launch rather than at first gate: spawn the hook once with a synthetic payload and
   report the outcome, so a broken command is found when the operator is present.
+
 - Add it to `DEV-SETUP-CHECKLIST.md` so a replicated setup gets it.
 
 **Scope of the claim.** This is about discoverability and feedback, not about the hook mechanism,

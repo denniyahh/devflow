@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.3
-current_phase_name: Drain Gate Concurrency Measurement (999.83)
-status: executing
-stopped_at: Phase 35.3 planned
-last_updated: "2026-08-12T23:59:42.953Z"
+status: completed
+stopped_at: Phase 35.1 context gathered
+last_updated: "2026-08-13T00:30:19.151Z"
 last_activity: 2026-08-12
 last_activity_desc: Phase 35.3 planning complete
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 15
-  completed_plans: 12
-  percent: 75
+  completed_plans: 15
+  percent: 100
+current_phase_name: Drain Gate Concurrency Measurement (999.83)
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.3 (Drain Gate Concurrency Measurement (999.83)) — EXECUTING
-Plan: 1 of 3
-Status: Executing Phase 35.3
-Last activity: 2026-08-12 — Phase 35.3 execution started
+Phase: 35.3
+Plan: Not started
+Status: All phases complete
+Last activity: 2026-08-12 — Phase 35.3 complete
 
 ## Recently Shipped
 
