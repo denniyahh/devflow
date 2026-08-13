@@ -4,10 +4,10 @@ milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.3
 status: completed
-stopped_at: Phase 35.1 context gathered
+stopped_at: Phase 35.3 complete — drain gate measured, both concurrent-work paths observed
 last_updated: "2026-08-13T00:30:19.151Z"
 last_activity: 2026-08-12
-last_activity_desc: Phase 35.3 planning complete
+last_activity_desc: Phase 35.3 complete — 3/3 plans; drain gate observed via both arms; fixture label CLI-version-pinned
 progress:
   total_phases: 4
   completed_phases: 4
