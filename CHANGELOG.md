@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.5.0 — 2026-08-07
+## 2.5.0 — 2026-08-15
 
 Phase 35 (loop termination and baseline correctness). Four defects that let an unattended
 `devflow start` run **either loop without a bound or stop for the wrong reason**, plus the
@@ -43,6 +43,27 @@ full enumeration.
   through state and lock filenames, branch and worktree names, the `.planning/phases/` artifact
   glob, the event log, and the GSD skill strings the prompt builder emits. Landed as a direct
   hotfix rather than a phase, because Phase 35.1 could not start without it.
+
+- **`devflow start --mode auto` verifies it can finish unattended before it launches
+  (999.93 + 999.98 + 999.99 + 999.100, Phase 35.1).** Define's gate checks three prerequisites —
+  GSD config can hold the chain flag, Code launches on the pipe-owning arm, and no plan declares
+  a human-only checkpoint — and auto-approves only when all three hold. An `AutoChainGuard` sets
+  and clears GSD's `_auto_chain_active` flag around the run, and `scripts/unattended-drill.sh`
+  exercises the full path. (Filed upstream: the GSD orchestrator conflates `gate="blocking"` with
+  `gate="blocking-human"` in auto mode — open-gsd/gsd-core#3370.)
+- **The Code→Validate loop-back now knows who authored the verification artifact (999.89 /
+  HARDEN-03, Phase 35.2).** `State.verification_run_nonce` stamps a run-owned marker at each
+  Validate dispatch. A checkout or worktree merge-back that replaces `{N}-VERIFICATION.md` between
+  dispatches no longer reads as "authored this run", so it dispatches a full execute instead of a
+  `--gaps-only` pass against zero matching plans. A test pins the DevFlow/GSD phase-branch-name
+  convention.
+- **The drain gate has now been *measured*, not just reasoned about (999.83 / HARDEN-06,
+  Phase 35.3).** Live captures on Claude 2.1.228 show sub-agent dispatch emits only the per-task
+  vocabulary (`task_started`/`task_progress`/`task_updated`/`task_notification`, zero
+  `background_tasks_changed`), while a backgrounded shell emits `background_tasks_changed` and the
+  per-task vocabulary. The widened gate observes both paths — through different arms. The synthetic
+  fixture's `local_agent` shape is pinned in-source as a Phase-30 legacy (the current CLI uses
+  `local_bash` there); a comment-only change, with the evidence committed under `35.3-evidence/`.
 
 ### Fixed
 
@@ -155,22 +176,23 @@ Every row below was verified against the source tree, not transcribed from the p
 
 ### Known Issues
 
-- **The verification-freshness rule infers provenance from bytes, not from run identity.** An
-  artifact whose content changes for any reason other than this run's Validate agent — a worktree
-  merge-back, an operator edit — reads as authored-this-run and dispatches `--gaps-only`, which is
-  the failure direction 999.79 exists to prevent, reached by a different route. Tracked as 999.89.
+- **The verification-freshness rule inferred provenance from bytes, not from run identity.**
+  Resolved in this release by Phase 35.2 (`State.verification_run_nonce`, HARDEN-03) — see *What's
+  new* above.
 - **The `setsid` guard on the signing probe's regression test is n=1 per arm, one host, one
   container.** `git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal` was added
   and confirmed to fail (`REGRESSION:` panic) when the `pre_exec` is removed — 999.88 is resolved,
   not open — but the test is timing-based (a pathologically loaded box could false-red it) against
   one OpenSSH build and one encrypted key.
-- **`MAX_PHASE_VALIDATE_FAILURES = 10` is a judgement, not a measurement.** Nothing establishes how
-  many Validate failures a genuinely-converging phase takes.
+- **`MAX_PHASE_VALIDATE_FAILURES = 10` is still a judgement, not a measurement.** Nothing
+  establishes how many Validate failures a genuinely-converging phase takes. Phase 35.3 recorded
+  the first observation — 0, but from a trivial single-file probe — so the figure remains
+  unmeasured by a real multi-wave run.
 - **Two in-source comments (`idle_timeout_result` and a test-module comment) still describe a
   mechanism a previous release replaced.** Carried over from 2.4.0, explicitly out of scope here.
   Tracked as 999.85.
-- **The drain gate still has not been observed to see sub-agent concurrency.** Carried over from
-  2.4.0. Tracked as 999.83.
+- **The drain gate had not been observed to see sub-agent concurrency.** Resolved in this release
+  by Phase 35.3 (HARDEN-06) — the gate was measured to observe both paths; see *What's new* above.
 
 ## 2.4.0 — 2026-08-06
 
