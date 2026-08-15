@@ -7,36 +7,38 @@
 **Declared 2026-08-15, the day v2.5.0 closed.** Replace the thin `AgentAdapter` trait with a
 driver architecture that onboards new agents without agent-specific logic leaking into core — and
 prove it by onboarding **Pi** as the first newly-supported agent. The full modular `AgentDriver`
-refactor (backlog **999.31**, size L) is sequenced *after* the first concrete new driver: Phase 36
-lands Pi on the existing adapter path, Phase 37 lifts the whole surface onto the `AgentDriver`
-contract with Pi as a live second consumer (999.31's D-02 — prove the contract against a second
-native implementation before calling it stable).
+refactor (backlog **999.31**, size L) is the real vehicle: Phase 36 registers Pi as a selectable
+adapter plus release hardening; Phase 37 does the `AgentDriver`/`StageIntent` work that makes Pi
+run end-to-end — the adversarial review showed Pi cannot reach terminal completion until the
+Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 36 | Pi Agent Support + Release-Preflight Hardening | Planned | — |
-| 37 | Modular Agent Driver Architecture (999.31) + Unattended Decision Policy (999.94) | Backlog | — |
+| 36 | Pi Adapter Registration + Release Signing | Planned | — |
+| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94) | Backlog | — |
 
-### Phase 36: Pi Agent Support + Release-Preflight Hardening (Pi + 999.67 + 999.96 + 999.104)
+### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
 
-**Goal**: DevFlow drives **Pi** (the Pi coding-agent harness) end-to-end as a fourth supported
-agent alongside Claude, Codex, and OpenCode — and three small items land in the same phase because
-they sit in code this phase already touches: **999.67** (agent result parsing lets an agent plant
-its own Layer-0 provenance; XS), **999.96** (`release --check` can't catch a forgotten version
-bump; S), and **999.104** (release-signing key workflow; the SPEC settles the one-line-probe vs.
-two-key-model question).
+**Goal**: DevFlow registers **Pi** as a fourth, selectable agent adapter (`AgentKind::Pi` +
+`PiAgent` + a preflight health check distinguishing "installed" from "can execute headless") —
+**not** an end-to-end run, which is Phase 37 — plus two release items: **999.96** (`release --check`
+can't catch a forgotten version bump; S, synthetic fixture) and **999.104** (deterministic release
+signing key: sign with `devflow.releaseSigningKey` in code, remove the signing-viability probe and
+the pre-push fingerprint hook). 999.67 was dropped — already shipped.
 **Depends on**: Nothing (first phase of this milestone).
-**Requirements**: `36-SPEC.md` (drafted before discuss-phase).
+**Requirements**: `36-SPEC.md` (locked post adversarial review).
 **Plans**: TBD
 
-### Phase 37: Modular Agent Driver Architecture (999.31) + Unattended Decision Policy (999.94)
+### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
 
 **Goal**: Promote the full `AgentDriver` contract — capability discovery, driver-owned prompt
 rendering, command building, completion parsing, health probes, and a shared conformance suite —
 so agent-specific semantics stop being scattered across `prompt.rs`, `agents/*.rs`,
-`agent_result.rs`, and `preflight.rs`. Pi (onboarded in Phase 36) is the second native
-implementation that 999.31's D-02 requires. **999.94** (an unattended `decision` checkpoint takes
-the first option without reading it; HIGH) is pencilled here.
+`agent_result.rs`, and `preflight.rs`. This is what makes **Pi** actually run end-to-end: the
+`StageIntent` de-Claude-ification of the Code-stage prompt (dropping the literal
+`/gsd-execute-phase` string), Pi's JSON-mode event unwrapper, and the monitor/`CloseRule`
+integration for non-Claude agents. **999.94** (an unattended `decision` checkpoint takes the
+first option without reading it; HIGH) is pencilled here.
 **Depends on**: Phase 36.
 **Plans**: TBD
 
@@ -3282,7 +3284,13 @@ generated anyway.
 
 ---
 
-### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (BACKLOG — shortlisted for Phase 31)
+### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (RESOLVED — shipped; verified 2026-08-15)
+
+**Resolution note (2026-08-15):** the fix landed in an ancestor commit — `parse_devflow_result`
+now normalizes both parser arms via `normalise_stream_marker_provenance` (`agent_result.rs:166-180`),
+and the mirror regression `generic_marker_cannot_forge_layer0_provenance` exists at
+`agent_result.rs:4343` with the passing counterpart. Verified by two independent code reviewers
+(adversarial review, Phase 36). This entry was stale; the fix is shipped.
 
 **Linear:** [DEN-88](https://linear.app/denniskim/issue/DEN-88/99967-parse-devflow-result-lets-an-agent-plant-its-own-layer-0)
 **Found:** 2026-08-02, Phase 30 plan 30-01 execution (finding F-1). Surfaced *by* the fix for the
