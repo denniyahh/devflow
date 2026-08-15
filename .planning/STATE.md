@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.2
-current_phase_name: verification-provenance
-status: complete
-stopped_at: Phase 35.2 complete — run-owned verification nonce + branch-naming pin (999.89 / HARDEN-03)
-last_updated: "2026-08-12T12:10:00.000Z"
+current_phase: 35.3
+status: completed
+stopped_at: Phase 35.3 complete — drain gate measured, both concurrent-work paths observed
+last_updated: "2026-08-13T00:30:19.151Z"
 last_activity: 2026-08-12
-last_activity_desc: Phase 35.2 complete — 2/2 plans, nonce marker gates the loop-back dispatch, branch-naming convention pinned by tests
+last_activity_desc: Phase 35.3 complete — 3/3 plans; drain gate observed via both arms; fixture label CLI-version-pinned
 progress:
   total_phases: 4
-  completed_phases: 3
-  total_plans: 12
-  completed_plans: 12
-  percent: 75
+  completed_phases: 4
+  total_plans: 15
+  completed_plans: 15
+  percent: 100
+current_phase_name: Drain Gate Concurrency Measurement (999.83)
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.1 (unattended-launch-prerequisites) — COMPLETE (4/4 plans)
-Plan: 4 of 4
-Status: Phase 35.1 complete — chain-flag mechanism confirmed working; unattended-launch preflight active; GSD #3370 (orchestrator conflates gate="blocking" with gate="blocking-human") filed upstream
-Last activity: 2026-08-12 — Phase 35.1 complete; drill run + forensic analysis; stale live-run gate rejected
+Phase: 35.3
+Plan: Not started
+Status: All phases complete
+Last activity: 2026-08-12 — Phase 35.3 complete
 
 ## Recently Shipped
 

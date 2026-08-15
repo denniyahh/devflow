@@ -17,7 +17,11 @@
 # resolves on PATH; there is no project-local `.claude/` requirement, so
 # none is scaffolded here):
 #   - a git repo with `main` + `develop` and one initial commit
-#   - `.planning/{PROJECT.md,ROADMAP.md,STATE.md}`
+#   - `.planning/{PROJECT.md,ROADMAP.md,STATE.md}` (ROADMAP's phase heading must
+#     be `### Phase N:` — three hashes — to satisfy the reachability guard in
+#     `preflight.rs`, and the current preflight also requires a minimal
+#     `.planning/config.json` so the 35.1 unattended-launch chain-flag
+#     prerequisite has somewhere to hold `workflow._auto_chain_active`)
 #   - one phase directory carrying a trivial, already-written plan, so
 #     Define/Plan have a real target instead of inventing scope
 #
@@ -94,7 +98,7 @@ EOF
 cat > "$DEST_ABS/.planning/ROADMAP.md" <<'EOF'
 # Roadmap
 
-## Phase 1: Add PROBE marker file
+### Phase 1: Add PROBE marker file
 
 Goal: create `PROBE.md` at the repo root containing exactly one line,
 proving the pipeline can carry a trivial change from Define through Ship.
@@ -178,6 +182,12 @@ one line: `probe ok`.
 <output>
 Create `.planning/phases/01-add-probe-marker/01-01-SUMMARY.md` when done.
 </output>
+EOF
+
+cat > "$DEST_ABS/.planning/config.json" <<'EOF'
+{
+  "workflow": {}
+}
 EOF
 
 git -C "$DEST_ABS" add -A

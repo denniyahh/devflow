@@ -94,7 +94,8 @@ fi
 
 # Restore .planning/UPSTREAM-GSD-ISSUES.md if it has gone missing.
 #
-# That path is a symlink into the sibling gsd-core checkout, where the ledger is
+# That path is a symlink into the sibling gsd-core-personal-workspace checkout,
+# where the ledger is
 # actually tracked. It is gitignored here (see .gitignore), so `git clean -fdx`
 # deletes it and a fresh clone never has it — which is how it silently vanished
 # before phase 31.
@@ -102,7 +103,8 @@ fi
 # It must NOT be solved by tracking the symlink. `git ls-files` would then list
 # it, and tests/build_provenance.rs copies every tracked path with
 # `std::fs::copy` — which follows symlinks and panics on failure. On CI, or any
-# clone without a gsd-core sibling, the link dangles and the copy panics. That
+# clone without a gsd-core-personal-workspace sibling, the link dangles and
+# the copy panics. That
 # is the exact failure class CLAUDE.md already records.
 #
 # So: recreate it only when the target genuinely resolves, and never leave a
@@ -113,7 +115,7 @@ fi
 # unset on every commit that lands no summary.
 gsd_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
 gsd_link="$gsd_root/.planning/UPSTREAM-GSD-ISSUES.md"
-gsd_target="../../gsd-core/scratch/UPSTREAM-GSD-ISSUES.md"
+gsd_target="../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md"
 if [ ! -e "$gsd_link" ] && [ -e "$gsd_root/.planning/$gsd_target" ]; then
   if ln -sfn "$gsd_target" "$gsd_link" 2>/dev/null; then
     printf '\033[33mpost-commit:\033[0m restored .planning/UPSTREAM-GSD-ISSUES.md symlink\n' >&2

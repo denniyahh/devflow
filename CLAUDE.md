@@ -85,6 +85,22 @@ Legitimate reasons to bypass, all of which should be said out loud rather than a
 Bypassing silently is the thing to avoid. Correcting a command's output by hand is fine; skipping
 the command because hand-editing seemed quicker is not.
 
+## Create a git worktree for every new phase before doing its GSD work
+
+Manual GSD lifecycle work (discuss / plan / execute done as `gsd-*` invocations rather than via
+`devflow start`) must run inside a dedicated worktree, not on the main checkout. The pattern is
+fully deterministic — branch `feature/phase-{N}`, path `.worktrees/phase-{N}`, base `develop`:
+
+```bash
+git worktree add -b feature/phase-35.3 .worktrees/phase-35.3 develop
+```
+
+Reason: phase work leaves the main checkout on a half-finished branch, and a later `git commit`
+(see the branch-check rule above) lands on whatever is checked out. A worktree isolates the phase's
+commits from that accident, the same reason `devflow start` creates one. The only step that cannot
+be scripted is the branch name when a phase is renumbered (e.g. 36 → 35.3) — confirm the branch
+name against `ROADMAP.md`'s current `### Phase N:` heading before running the command.
+
 ## Keep the active milestone's phase headings inside its own window
 
 `gsd-tools`' milestone-scoped parsers (`roadmap.analyze`'s `extractCurrentMilestone`,
@@ -114,10 +130,10 @@ root-cause history.
 ## Where the upstream GSD issue ledger lives
 
 `.planning/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
-sibling gsd-core checkout:
+sibling `gsd-core-personal-workspace` checkout:
 
 ```
-.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core/scratch/UPSTREAM-GSD-ISSUES.md
+.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md
 ```
 
 File new GSD-core defects there, not in a new file here. If the path reads as missing, the

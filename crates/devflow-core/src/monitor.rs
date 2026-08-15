@@ -587,13 +587,21 @@ pub struct CloseRule {
     ///
     /// **Why this exists alongside [`Self::background_tasks`].** The drain arm
     /// above reads `background_tasks_changed`, and production does not emit
-    /// that event. Measured on a real Phase 35.1 Plan capture (2026-08-08):
-    /// `task_started` ×1, `task_progress` ×61, `task_notification` ×1,
-    /// `task_updated` ×1, and `background_tasks_changed` ×0. Every occurrence
-    /// of `background_tasks_changed` in this repository is a test fixture
-    /// synthesising it, which is why the blindness never surfaced in the
-    /// suite. This is 999.83's "the fixture's shape doesn't match what
-    /// production actually emits", with the capture to prove it.
+    /// that event *for sub-agent dispatch*. Measured on a real Phase 35.1 Plan
+    /// capture (2026-08-08) — a sub-agent (researcher) dispatch — `task_started`
+    /// ×1, `task_progress` ×61, `task_notification` ×1, `task_updated` ×1, and
+    /// `background_tasks_changed` ×0. Every occurrence of `background_tasks_changed`
+    /// in this repository's *source* is a test fixture synthesising it, which is
+    /// why the blindness never surfaced in the suite. This is 999.83's "the
+    /// fixture's shape doesn't match what production actually emits", with the
+    /// capture to prove it.
+    ///
+    /// Phase 35.3's measurement (HARDEN-06, 2026-08-12, CLI 2.1.228) later refined
+    /// that: the current CLI DOES emit `background_tasks_changed` — but only for
+    /// backgrounded shells, with `task_type: "local_bash"` — while sub-agent
+    /// dispatch emits only the per-task vocabulary. So the drain arm is not dead;
+    /// it is scoped to the backgrounded-shell path, and `open_tasks` is what
+    /// covers the sub-agent path.
     ///
     /// The two signals are ANDed, never substituted: whichever one says work
     /// is pending wins.
@@ -1342,11 +1350,25 @@ mod tests {
     // the same event with `tasks":[]`, and a coalesced completion carries
     // `origin.kind == "task-notification"` on an ordinary `result`. Volumes
     // and identifiers are generalized; shapes are not.
+    //
+    // CLI-version pin (999.83 / HARDEN-06, measured 2026-08-12 on Claude
+    // 2.1.228): the Phase 30 capture above predates the current CLI. Phase 35.3's
+    // drill measured that the current CLI emits `background_tasks_changed` ONLY
+    // for backgrounded shells — with `task_type: "local_bash"`, not `local_agent` —
+    // while sub-agent dispatch emits the per-task vocabulary (`task_started` with
+    // `task_type: "local_agent"`, then `task_updated`/`task_notification`) and zero
+    // `background_tasks_changed`. `bg_tasks_line` below therefore reproduces a
+    // combination the current CLI never produces: `local_agent` inside
+    // `background_tasks_changed` was a Phase 30 behavior. It is kept as the legacy
+    // drain shape; the current per-task vocabulary is covered by the `REAL_TASK_*`
+    // constants and `observe_task_event`.
 
     const INIT_LINE: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/work","session_id":"s-1","tools":["Task","Bash"],"uuid":"u-init"}"#;
 
     /// A `system`/`background_tasks_changed` event announcing `count` tasks.
-    /// `count == 0` is the DRAINED shape (v3 line 44).
+    /// `count == 0` is the DRAINED shape (v3 line 44). The `local_agent`
+    /// task_type is the Phase 30 shape; the current CLI uses `local_bash` here
+    /// (see the CLI-version pin in the block comment above).
     fn bg_tasks_line(count: usize) -> String {
         let tasks: Vec<String> = (0..count)
             .map(|i| {

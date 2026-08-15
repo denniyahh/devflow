@@ -78,7 +78,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HARDEN-04 | Phase 35 | Complete |
 | HARDEN-05 | Phase 35 | Complete |
 | HARDEN-07 | Phase 35 | Complete |
-| HARDEN-06 | Phase 36 | Pending |
+| HARDEN-06 | Phase 35.3 | Planned |
 
 **Coverage:**
 
