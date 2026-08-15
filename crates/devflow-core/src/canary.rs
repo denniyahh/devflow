@@ -40,6 +40,7 @@ use crate::agent_result;
 use crate::agents::{AgentAdapter, ClaudeAgent};
 use crate::git::hermetic_command;
 use crate::monitor::{self, CloseRule};
+use crate::phase_id::PhaseId;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -281,7 +282,7 @@ impl CanaryLauncher for ClaudeCanaryLauncher {
         // (see `advance`'s `events::emit(project_root, 0, …)`). `exec_command`
         // ignores both the phase and the prompt: under `--input-format
         // stream-json` the prompt travels on stdin, not argv.
-        let (program, args) = ClaudeAgent.exec_command(0, prompt, &[]);
+        let (program, args) = ClaudeAgent.exec_command(PhaseId::new(0), prompt, &[]);
 
         let mut capture_file = std::fs::File::create(capture).map_err(|err| {
             format!(

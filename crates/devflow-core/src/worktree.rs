@@ -5,6 +5,7 @@
 //! `<project_root>/.worktrees/` so they are easy to find and clean up.
 
 use crate::git::git_command;
+use crate::phase_id::PhaseId;
 use std::path::{Path, PathBuf};
 
 /// Errors produced by worktree operations.
@@ -38,13 +39,13 @@ pub fn worktrees_dir(project_root: &Path) -> PathBuf {
 }
 
 /// Worktree path for a phase: `.worktrees/phase-NN`.
-pub fn phase_path(project_root: &Path, phase: u32) -> PathBuf {
-    worktrees_dir(project_root).join(format!("phase-{phase:02}"))
+pub fn phase_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    worktrees_dir(project_root).join(format!("phase-{padded}", padded = phase.padded()))
 }
 
 /// Worktree path for a single agent on a phase: `.worktrees/phase-NN-<agent>`.
-pub fn phase_agent_path(project_root: &Path, phase: u32, agent: &str) -> PathBuf {
-    worktrees_dir(project_root).join(format!("phase-{phase:02}-{agent}"))
+pub fn phase_agent_path(project_root: &Path, phase: PhaseId, agent: &str) -> PathBuf {
+    worktrees_dir(project_root).join(format!("phase-{padded}-{agent}", padded = phase.padded()))
 }
 
 /// Worktree path for the static reference snapshot: `.worktrees/reference`.
@@ -226,9 +227,12 @@ mod tests {
     fn path_helpers_format_phase_numbers() {
         let root = Path::new("/repo");
         assert_eq!(worktrees_dir(root), Path::new("/repo/.worktrees"));
-        assert_eq!(phase_path(root, 7), Path::new("/repo/.worktrees/phase-07"));
         assert_eq!(
-            phase_agent_path(root, 7, "claude"),
+            phase_path(root, PhaseId::new(7)),
+            Path::new("/repo/.worktrees/phase-07")
+        );
+        assert_eq!(
+            phase_agent_path(root, PhaseId::new(7), "claude"),
             Path::new("/repo/.worktrees/phase-07-claude")
         );
         assert_eq!(
@@ -241,7 +245,7 @@ mod tests {
     fn add_creates_worktree_on_new_branch() {
         let repo = init_repo();
         let root = repo.path();
-        let wt = phase_path(root, 7);
+        let wt = phase_path(root, PhaseId::new(7));
 
         add(root, &wt, "feature/phase-07", "develop", true).expect("add");
 
@@ -260,7 +264,7 @@ mod tests {
     fn add_errors_when_path_exists() {
         let repo = init_repo();
         let root = repo.path();
-        let wt = phase_path(root, 7);
+        let wt = phase_path(root, PhaseId::new(7));
         add(root, &wt, "feature/phase-07", "develop", true).expect("add");
 
         let err = add(root, &wt, "feature/phase-07b", "develop", true).unwrap_err();
@@ -276,7 +280,7 @@ mod tests {
 
         add(
             root,
-            &phase_path(root, 1),
+            &phase_path(root, PhaseId::new(1)),
             "feature/phase-01",
             "develop",
             true,
@@ -296,7 +300,7 @@ mod tests {
     fn remove_deletes_the_worktree() {
         let repo = init_repo();
         let root = repo.path();
-        let wt = phase_path(root, 2);
+        let wt = phase_path(root, PhaseId::new(2));
         add(root, &wt, "feature/phase-02", "develop", true).expect("add");
         assert!(wt.exists());
 
@@ -378,7 +382,7 @@ mod tests {
     fn list_resolves_caller_root_under_a_hostile_git_dir() {
         let repo = init_repo();
         let root = repo.path();
-        let wt_path = phase_path(root, 9);
+        let wt_path = phase_path(root, PhaseId::new(9));
         let wt_str = wt_path.to_string_lossy();
         // Fixture setup goes through the already-scrubbed general
         // constructor directly (not the production `add()`, which itself

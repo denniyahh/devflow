@@ -1,25 +1,25 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.4.0
-milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
-status: Awaiting next milestone
-stopped_at: Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
-last_updated: "2026-08-06T11:32:47.141Z"
-last_activity: 2026-08-06
-last_activity_desc: Milestone v2.4.0 completed and archived
+milestone: v2.5.0
+milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
+current_phase: 35.3
+status: completed
+stopped_at: Phase 35.3 complete — drain gate measured, both concurrent-work paths observed
+last_updated: "2026-08-13T00:30:19.151Z"
+last_activity: 2026-08-12
+last_activity_desc: Phase 35.3 complete — 3/3 plans; drain gate observed via both arms; fixture label CLI-version-pinned
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 12
-  completed_plans: 12
+  total_phases: 4
+  completed_phases: 4
+  total_plans: 15
+  completed_plans: 15
   percent: 100
-current_phase: 34
-current_phase_name: stream-json-coverage-and-the-validate-trust-boundary-999-73-
+current_phase_name: Drain Gate Concurrency Measurement (999.83)
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-08-02
+> Last updated: 2026-08-06
 
 ## Deferred Items
 
@@ -88,7 +88,8 @@ regardless — see ROADMAP.md constraints 7 and 8).
 ### Historical — superseded phase notes
 
 The entries below describe earlier phases and are retained for context. They are
-**not** the active phase; the frontmatter `current_phase` above is authoritative.
+**not** the active phase; the frontmatter `status` above (no `current_phase` —
+milestone v2.4.0 is closed, awaiting the next milestone) is authoritative.
 
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
 Claude** — **scoped 2026-07-25.** The goal was the
@@ -153,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v2.4.0 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-06 — Milestone v2.4.0 completed and archived
+Phase: 35.3
+Plan: Not started
+Status: All phases complete
+Last activity: 2026-08-12 — Phase 35.3 complete
 
 ## Recently Shipped
 
@@ -837,16 +838,21 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-06T11:17:31.166Z
-**Stopped at:** Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
-**Resume file:** None
+**Last session:** 2026-08-08T01:44:50.269Z
+**Stopped at:** Phase 35.1 context gathered
+**Resume file:** .planning/phases/35.1-unattended-launch-prerequisites/35.1-CONTEXT.md
 
 ## Operator Next Steps
 
 - Start the next milestone with /gsd-new-milestone
+- **999.86 / DEN-75 (High) must land in the next milestone's phase set** — `release --check`'s
+  tag-signing predictor produced a live false negative during v2.4.0's own release, for the second
+  time across two releases. Fix direction already decided: replace with a real `ssh-keygen -Y sign`
+  probe. Operator confirmed in-scope 2026-08-06.
 
 ## Accumulated Context
 
 ### Roadmap Evolution
 
 - Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in
+- 999.97 filed and hotfixed (2026-08-07), no phase cycle: `devflow start --phase 35.1` was rejected by clap (`invalid digit found in string`) — the phase identifier was `u32` at 182 sites and `prompt.rs` globbed it as `{phase:02}`, so decimal phases could not be launched at all. Briefly filed as Phase 37 via `phase.add` and then withdrawn on the operator's call to fix it directly. Recording the tool defect while it is fresh: `phase.add` again placed the new entry at the document's last `---` (inside archived 999.25 prose, outside the active milestone window) and wrote neither the phase-table nor the Progress-table row.

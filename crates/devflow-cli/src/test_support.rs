@@ -14,6 +14,7 @@
 //! rather than inside any one cluster.
 
 use devflow_core::agents;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::state::State;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -157,7 +158,7 @@ pub(crate) fn init_repo_no_version_file(root: &Path) {
 /// Uses plain `checkout`, never `checkout -B`, when the branch already
 /// exists: `-B` resets an existing branch to `HEAD`, which would silently
 /// discard the commits an earlier call in the same test already made.
-pub(crate) fn commit_on_feature_branch(root: &Path, phase: u32, label: &str) {
+pub(crate) fn commit_on_feature_branch(root: &Path, phase: PhaseId, label: &str) {
     let git = |args: &[&str]| {
         let ok = devflow_core::test_support::git_command(root)
             .args(args)
@@ -167,7 +168,7 @@ pub(crate) fn commit_on_feature_branch(root: &Path, phase: u32, label: &str) {
             .success();
         assert!(ok, "git {args:?} failed");
     };
-    let branch = format!("feature/phase-{phase:02}");
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     let branch_exists = devflow_core::test_support::git_command(root)
         .args(["rev-parse", "--verify", &branch])
         .output()
@@ -207,7 +208,7 @@ impl agents::AgentAdapter for AlwaysFailAdapter {
     }
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         _prompt: &str,
         _roots: &[PathBuf],
     ) -> (&'static str, Vec<String>) {
@@ -246,7 +247,7 @@ impl agents::AgentAdapter for FailOnceAdapter {
     }
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         _prompt: &str,
         _roots: &[PathBuf],
     ) -> (&'static str, Vec<String>) {
@@ -358,6 +359,70 @@ impl Drop for NeutralPath {
     }
 }
 
+/// RAII guard that REPLACES `PATH` with a deliberately EMPTY directory, so
+/// `git` — and every other binary — cannot be resolved at all for the scope
+/// it is bound in (35-01, criteria 1 and 6).
+///
+/// **Why empty rather than a failing shim (F-1).** The two consumers of
+/// [`devflow_core::agent_result::phase_commit_count`] must distinguish "the
+/// git child could not be executed" from "git ran and reported zero". Only
+/// the first is a measurement failure, and only an UNRESOLVABLE binary
+/// produces it: `Command::output()` returns `Err(NotFound)` when the program
+/// cannot be spawned, whereas a shim that runs and exits non-zero returns
+/// `Ok(status)` — a real observation. A test built on a failing shim would
+/// exercise the already-correct `Some(0)` path while appearing to cover the
+/// `None` one, which is precisely the proxy measurement this phase exists to
+/// remove.
+///
+/// Structurally a sibling of [`NeutralPath`]: same field shape, same
+/// `install()`-not-`new()` naming, same `Drop`-restores-on-every-exit-path
+/// reasoning (WR-05), and the same `TempDir`-outlives-the-`PATH`-that-names-it
+/// ordering. It differs in exactly one respect — the directory it points
+/// `PATH` at is empty, where [`NeutralPath`]'s still holds a real `git`.
+///
+/// **The caller must already hold [`ENV_MUTEX`]** (via [`env_lock`]).
+/// `set_var` is process-wide and `cargo test` runs in parallel; this guard
+/// makes the restore unconditional, it does not make the mutation safe on its
+/// own. Hold it over exactly the one call under test and nothing more: this
+/// is the first guard in the workspace that makes `git` unresolvable
+/// process-wide, so any sibling test shelling out to `git` inside the guarded
+/// window fails spuriously.
+pub(crate) struct NoGitPath {
+    _dir: tempfile::TempDir,
+    original: Option<std::ffi::OsString>,
+}
+
+impl NoGitPath {
+    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
+    /// process-global state at the moment of the call.
+    pub(crate) fn install() -> Self {
+        // Deliberately empty — see the type's doc comment. Nothing is written
+        // into this directory, by design.
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::var_os("PATH");
+        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
+        // no other test thread is reading or writing PATH concurrently.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        Self {
+            _dir: dir,
+            original,
+        }
+    }
+}
+
+impl Drop for NoGitPath {
+    fn drop(&mut self) {
+        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
+        // for at least as long as this guard's own scope.
+        unsafe {
+            match &self.original {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
 /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
 /// (needed by `monitor::spawn_monitor`'s backgrounding script) and a
 /// harmless no-op stub for `program` (needed by `ensure_agent_binary`),
@@ -418,13 +483,13 @@ pub(crate) fn prepend_path(
 /// Count `stage_launched` events recorded for `phase` across the WHOLE
 /// event log — `last_event_for_phase` only sees the most recent line and
 /// cannot distinguish one launch from two.
-pub(crate) fn stage_launched_count(root: &Path, phase: u32) -> usize {
+pub(crate) fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
     std::fs::read_to_string(devflow_core::events::events_path(root))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| {
-            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+            phase.matches_json(event.get("phase"))
                 && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
         })
         .count()
@@ -577,6 +642,69 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::process::Command;
 
+    /// NC-1 (35-VALIDATION.md), and the reason it is load-bearing rather than
+    /// ceremony: criteria 1 and 6 both assert on behaviour that occurs ONLY
+    /// when `git` cannot be executed. If [`NoGitPath`] silently failed to take
+    /// effect — wrong `PATH` ordering, a guard dropped early, an absolute-path
+    /// `git` invocation — every downstream assertion would still run and every
+    /// one of them would pass for the wrong reason. This test is the only
+    /// thing standing between that and a green suite over an unfixed defect,
+    /// which is why it must pass before any criterion-1 or criterion-6 result
+    /// is believed.
+    ///
+    /// The control is inside the test: the pre-guard call must succeed and the
+    /// post-drop call must succeed, so a guard that did nothing at all cannot
+    /// produce a green result here — all three observations would agree, and
+    /// the middle assertion would fail.
+    ///
+    /// `git` is invoked through `devflow_core::test_support::git_command`, the
+    /// same PATH-resolved constructor production code uses (`git.rs`'s
+    /// `git_command` -> `hermetic_command` -> `Command::new("git")`), so this
+    /// measures the harness against the real spawn path rather than an
+    /// approximation of it.
+    #[test]
+    fn no_git_path_makes_git_unresolvable_and_restores_it() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path_before = std::env::var_os("PATH");
+
+        let before = devflow_core::test_support::git_command(dir.path())
+            .arg("--version")
+            .output();
+        assert!(
+            before.is_ok(),
+            "control: `git` must be resolvable BEFORE the guard is installed, \
+             otherwise the middle assertion below proves nothing"
+        );
+
+        let during = {
+            let _no_git = NoGitPath::install();
+            devflow_core::test_support::git_command(dir.path())
+                .arg("--version")
+                .output()
+        };
+        let err = during.expect_err("NoGitPath must make `git` unresolvable");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the spawn must fail because the binary cannot be found — any other \
+             error kind means the guard blocked git for the wrong reason"
+        );
+
+        let after = devflow_core::test_support::git_command(dir.path())
+            .arg("--version")
+            .output();
+        assert!(
+            after.is_ok(),
+            "control: `git` must be resolvable again once the guard has dropped"
+        );
+        assert_eq!(
+            std::env::var_os("PATH"),
+            path_before,
+            "PATH must be byte-identical to its pre-guard value after the guard drops"
+        );
+    }
+
     /// Owns a real, deterministically long-lived child process (`sleep
     /// 300`) so these tests have a subject whose liveness is a deterministic
     /// question. WR-05 established that the stubbed agent wrapper's own
@@ -619,7 +747,7 @@ mod tests {
     /// touches disk.
     fn state_holding(pid: u32) -> State {
         let mut state = State::new(
-            0,
+            PhaseId::new(0),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/nonexistent"),

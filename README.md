@@ -168,7 +168,7 @@ Key flags:
 | `--mode auto\|supervise` | `auto` advances through Ship unattended; `supervise` also gates at Validate for human review |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 
-Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/{phase}-{stage}.json` and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. Respond by writing `.devflow/gates/{phase}-{stage}.response.json` with `{"approved": true|false, "note": "..."}`. The poll timeout defaults to 7 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`.
+Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/{phase}-{stage}.json` and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. Respond by writing `.devflow/gates/{phase}-{stage}.response.json` with `{"approved": true|false, "note": "..."}`. The poll timeout defaults to 3 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`; it bounds how long the monitor holds the phase lock while waiting, not how long you have to answer — the gate file never expires, so a later answer still works, it just needs a `devflow resume` to pick it up.
 
 `DEVFLOW_CAPTURE_RETENTION`, `DEVFLOW_REVIEW_ANGLES`, and
 `DEVFLOW_EXTERNAL_VERIFY_ENABLED` override the corresponding TOML values.

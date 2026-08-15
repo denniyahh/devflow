@@ -1,37 +1,42 @@
 {
   "version": "1.0",
-  "timestamp": "2026-07-16T09:06:52.899Z",
-  "phase": "13-14-transition",
-  "phase_name": "Phase 13 closeout → Phase 14 discussion (not yet started)",
-  "phase_dir": ".planning/phases/14-parallel-safety-observability",
-  "plan": null,
-  "task": null,
-  "total_tasks": null,
+  "timestamp": "2026-08-11T14:18:16.595Z",
+  "phase": "35.1",
+  "phase_name": "unattended-launch-prerequisites",
+  "phase_dir": "35.1-unattended-launch-prerequisites",
+  "plan": 4,
+  "task": 2,
+  "total_tasks": 3,
   "status": "paused",
   "completed_tasks": [
-    {"id": 1, "name": "Ran /gsd-code-review 13 --fix (initial review + fixer agent)", "status": "done", "commit": "306d6db..cbe3478 range start"},
-    {"id": 2, "name": "Independent 8-angle code review of the 15 phase-13 fix commits (9d96c0f..HEAD)", "status": "done", "commit": "n/a — review only"},
-    {"id": 3, "name": "Verified 10 candidate findings (3 new bugs introduced by the fixes, 4 incomplete fixes, 3 quality gaps)", "status": "done", "commit": "n/a — review only"},
-    {"id": 4, "name": "Applied all 10 fixes as 11 atomic commits with regression tests", "status": "done", "commit": "5da8879..cbe3478"},
-    {"id": 5, "name": "Full workspace validation: cargo test (225 passed), clippy -D warnings, cargo fmt --check", "status": "done", "commit": "n/a"},
-    {"id": 6, "name": "Documented deferred CR-03 design flaw for Phase 14", "status": "done", "commit": "10d790a"},
-    {"id": 7, "name": "Marked Phase 13 complete in STATE.md, pushed 31 commits to origin/develop", "status": "done", "commit": "10d790a (pushed)"}
+    {"id": 1, "name": "Build the drill script (scaffold, run both arms, collect evidence, assert, exit non-zero on failure)", "status": "done", "commit": "51178b4"},
+    {"id": 3, "name": "Write the operator guide (docs/guides/unattended-mode.md) + mkdocs nav", "status": "done", "commit": "3fa896d"}
   ],
   "remaining_tasks": [
-    {"id": 8, "name": "Run /gsd-discuss-phase 14 to gather requirements/goals for Phase 14 (Parallel Safety + Observability)", "status": "not_started"}
+    {"id": 2, "name": "Run the drill for real and record 35.1-DRILL.md", "status": "in_progress", "progress": "Script is correct (two real measurement bugs found and fixed, see decisions). Two real execution attempts made after the fixes; both were killed by Claude API rate-limiting before either arm ever reached the Code stage, so neither arm ever reached the checkpoint. The mechanism itself has NOT yet been exercised end-to-end. A third attempt is the next action."}
   ],
-  "blockers": [],
+  "blockers": [
+    {"description": "Both post-fix drill attempts (2843423, 138113) died with rate_limit_resume_scheduled in both arms during the Plan stage, before Code/the checkpoint was ever reached. Root cause is Claude API quota exhaustion, not a defect in the drill or in DevFlow's chain-flag mechanism.", "type": "external", "workaround": "Retry when quota allows. The operator hit their own Claude Code usage limit in this same session shortly after these attempts — plausibly the same underlying account quota. Confirm headroom before retrying."},
+    {"description": "Phase 35.1's own LIVE dogfood run (the real phase, not the drill) has a dead monitor (pid 2563939), an open gate at .devflow/gates/35.1-code.json, and a stale lock at .devflow/lock-35.1 (recorded holder pid is dead). This is separate from plan 35.1-04's work but must be resolved before Ship.", "type": "human_action", "workaround": "Proposed but NOT executed pending explicit operator go-ahead: `devflow gate reject --note \"abort: hand-completing\"` on phase 35.1 — ends the run cleanly without kill(1), but clears state, so do not run without confirming with the operator first."},
+    {"description": "`mkdocs build --strict` fails workspace-wide with a `docs_dir` config error. Confirmed pre-existing by stashing the nav change and reproducing the identical failure on an otherwise-clean tree, so the new guide's mkdocs.yml nav entry could not be build-validated by Task 3's acceptance criteria — this is a real gap in that task's verification, not a false claim of success.", "type": "technical", "workaround": "None applied. Candidate for its own backlog entry; not filed yet."}
+  ],
   "async_jobs": [],
-  "human_actions_pending": [],
+  "human_actions_pending": [
+    {"action": "Decide whether the two post-fix drill attempts count against plan 35.1-04's 'do not retry more than twice' constraint, given neither failed on the mechanism under test — both died to infrastructure (API quota) before either arm ever reached the checkpoint.", "context": "The plan's own wording: 'If the drill fails, that is a result, not a blocker to work around... do not retry more than twice, and report the failure rather than reshaping the fixture until it passes.' That language is aimed at NOT reshaping the fixture to force green, not explicitly at infra failures pre-empting the measurement. Reasonable to treat these two as non-counting and attempt a genuine run, but the resuming agent should not decide this alone without flagging it.", "blocking": false},
+    {"action": "Decide how to close out phase 35.1's stale live-run gate (see blockers).", "context": "Not part of plan 35.1-04 itself, but sits on the same phase and needs resolution before Ship.", "blocking": false}
+  ],
   "decisions": [
-    {"decision": "CR-03 (per-phase lock rescoping) is correct but incomplete — deferred the deeper fix (per-phase state files, phase-threaded monitor advance, coarse lock for main-checkout git ops) to Phase 14 rather than reopening Phase 13", "rationale": "Phase 13 was already verified/shipped; the flaw is a design gap in parallel-safety, not a regression in the MVP core loop itself. Full writeup + acceptance criteria in .planning/phases/13-mvp-core-loop/13-DEFERRED-CR-03.md", "phase": "13"},
-    {"decision": "Used cargo fmt after the fix commits rather than hand-formatting", "rationale": "Kept diffs minimal and consistent with repo style; committed separately as a chore commit for clean history", "phase": "13"},
-    {"decision": "For each of the 10 review findings, verified fail→pass against the OLD code before committing the fix (not just that new tests pass)", "rationale": "User's global feedback/preference for rigor — confirmed at least one fix (sequentagent_fails_when_agent_a_crashes_without_result) actually failed on pre-fix main.rs via git stash", "phase": "13"}
+    {"decision": "Hand-complete plan 35.1-04 instead of continuing to dogfood the real phase 35.1 run.", "rationale": "Operator instruction after three consecutive Code-stage idle-timeout failures on the live phase 35.1 DevFlow run (120s idle timeout, aborted_tools terminal_reason each time); a fourth attempt was judged likely to fail identically.", "phase": "35.1"},
+    {"decision": "Still execute Task 2 (actually run the drill) rather than fabricate 35.1-DRILL.md by hand.", "rationale": "The drill's fixtures are throwaway git repos scaffolded under $TMPDIR via scripts/unattended-drill.sh, guarded by the same refuse-inside-this-checkout guard as scripts/scratch-dogfood-repo.sh (T-23-01) — verified by demonstration, exit 1, nothing created inside the checkout. They never touch this repository, so running the drill is not the 'no more dogfooding' the operator meant. A hand-written DRILL.md would fabricate the run record that must be traceable to real events/captures — the exact failure plan 35.1-04's key_links exist to prevent.", "phase": "35.1"},
+    {"decision": "Adopted a stranded executor's already-committed Task 1 + Task 3 work over a duplicate hand-written version.", "rationale": "A prior subagent had already completed both tasks and even run the drill once, but its commits (329406e, 3fa896d) were stranded in its own dead worktree (branch worktree-agent-aa8b892e8b0eb81a1) and never merged back — the phase branch showed zero new commits, which read as 'no work done' until the sub-worktree was found and inspected. The stranded script's plan-checkpoint detection was also more correct than the independently hand-written duplicate's (it greps one specific generated plan file; the duplicate grepped the whole .planning/ tree and would have false-matched CONTEXT.md's own locked-decision text). Merged via `git merge --no-ff worktree-agent-aa8b892e8b0eb81a1` (commit 5e15457); the hand-written duplicate was discarded.", "phase": "35.1"},
+    {"decision": "Fixed fixture config `workflow.auto_mode: true` -> `false`.", "rationale": "GSD's checkpoint_handling reads 'chain flag OR user preference — same boolean' (gsd-core/workflows/execute-phase.md). With auto_mode:true, the persistent preference alone satisfied that OR in BOTH arms, so the ephemeral chain flag under test was never the deciding variable and the first executed run (before this fix) measured nothing — its own evidence file self-reported this as a failed measurement.", "phase": "35.1"},
+    {"decision": "Removed `reached_validate` from the compact checkpoint-comparison string the drill uses for its arms-agree negative-control check.", "rationale": "It is a downstream consequence of the checkpoint decision, not the checkpoint decision itself. Including it let the two arms register as 'different' for a reason unrelated to auto-approval (auto_approved=yes/surfaced=yes/reached_validate=no vs =yes/=yes/=yes), so the drill's FAILURE-3/3 self-check (both arms observed the same thing => broken measurement) stayed silent on a run where BOTH arms had, in fact, auto-approved. The comparison is now over checkpoint behaviour alone; reached_validate is still reported in the evidence table, just not part of the discrimination test.", "phase": "35.1"}
   ],
   "uncommitted_files": [
-    ".gitignore (pre-existing modification from before this session — not touched)",
-    ".bg-shell/, .codex/, .gsd/, .mcp.json (pre-existing untracked — not touched)"
+    ".planning/phases/35.1-unattended-launch-prerequisites/35.1-DRILL.md (untracked — stale, from the second quota-killed attempt; both arms show auto_approved=no because neither reached Code; do NOT commit as final evidence, it must be overwritten by a real run)",
+    ".planning/STATE.md (pre-existing modified diff, predates this session — left by an earlier killed dogfood executor, not touched this session)",
+    ".gsd/dispatch-isolation-sentinel.json (untracked, unexamined, presumed GSD runtime artifact)"
   ],
-  "next_action": "Run /gsd-discuss-phase 14 to begin requirements/goals discussion for Phase 14 (Parallel Safety + Observability — rescoped 2026-07-16, Hermes work moved to Phase 16). Phase 14 CONTEXT.md exists at .planning/phases/14-parallel-safety-observability/CONTEXT.md with scoping (14a CR-03 parallel safety, 14b capture_agent_output sync-path decision, 14c observability) — read it first, then also read 13-DEFERRED-CR-03.md since that work leads the phase.",
-  "context_notes": "This session did TWO things in sequence: (1) executed /gsd-code-review 13 --fix, which ran the standard reviewer+fixer agents and produced 13-REVIEW.md / 13-REVIEW-FIX.md (15 findings fixed); (2) the user then asked for an independent, deeper /code-review (skill, not gsd-code-review) of those 15 fix commits specifically, run at high effort with 8 parallel finder angles + verification — this caught real regressions the first pass introduced (a startup race in WR-11's reorder, a TOCTOU in CR-03's lock, a rate-limit misclassification in CR-02, plus several incomplete fixes). All 10 survived-verification findings were fixed with tests, verified fail-vs-old-code where practical, and pushed. Phase 13 is now genuinely done — verified, reviewed, re-reviewed, fixed, and closed out in STATE.md/ROADMAP.md. Next step is purely forward motion into Phase 14 discussion; there is no unfinished Phase 13 work."
+  "next_action": "cd .worktrees/phase-35.1 && bash scripts/unattended-drill.sh (after confirming Claude API quota headroom). On success: verify 35.1-DRILL.md's Arm A vs Arm B checkpoint row genuinely differ (auto_approved=yes for auto, =no for supervise) before trusting it, then write .planning/phases/35.1-unattended-launch-prerequisites/35.1-04-SUMMARY.md matching the format of 35.1-01/02/03-SUMMARY.md, and close out phase 35.1. On a third failure: per the plan's own instruction ('a fixture edited until it goes green is the proxy measurement this whole phase is about'), do not retry again without operator input — write the SUMMARY documenting the mechanism as unverified by this drill, flag the human_actions_pending item above, and let the operator decide.",
+  "context_notes": "The plan-checkpoint auto-approval MECHANISM has never actually been observed to succeed or fail in this session — every real attempt died to Claude API rate-limiting before reaching the Code stage where the checkpoint lives. Do not read the 'DRILL FAILED' messages in the retained logs as evidence the auto-approval feature is broken; they are evidence of quota exhaustion. The two measurement bugs that were found and fixed (auto_mode:true, reached_validate polluting the comparison) are real and correctly fixed — verified by scaffolding a fixture and reading the emitted config.json, plus shellcheck/bash -n both exit 0 on the merged+patched script. What remains is purely 'run it again when there is quota.'"
 }

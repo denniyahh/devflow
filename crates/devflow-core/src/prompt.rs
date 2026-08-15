@@ -5,6 +5,7 @@
 //! There is no long instruction template — the GSD command carries the process,
 //! and DevFlow only needs the structured completion marker back.
 
+use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use std::path::Path;
 
@@ -15,6 +16,28 @@ const SHIP_REVIEW_ANGLES: &[&str] = &[
     "external-state claims (does the diff claim merges, tags, or deletions that are not actually true?)",
     "one generalist deep pass",
 ];
+
+/// The token that stops GSD from wiping `workflow._auto_chain_active` before
+/// it is read (35.1-01, RESEARCH Pitfall 1).
+///
+/// `execute-phase.md:161-165` clears that flag at the top of every invocation
+/// whose `$ARGUMENTS` does not carry this token. DevFlow sets the flag in the
+/// monitor immediately before launching the child, so without this the flag is
+/// wiped by the very command it was set for and `checkpoint_handling` never
+/// auto-approves anything.
+///
+/// **The token alone enables nothing.** GSD's `check auto-mode` reads
+/// `.planning/config.json` and nothing else — a full grep of
+/// `execute-phase.md` for `--auto` / `--chain` / `AUTO_CHAIN` / `auto_advance`
+/// returns exactly three hits, all inside that sync-clear block. So within
+/// `execute-phase.md` this token's only effect is to skip the clear. The
+/// mode gate that decides whether checkpoints may actually be auto-approved
+/// lives on the config write, in `pipeline_launch::auto_chain_flag_eligible`.
+///
+/// Named rather than inlined so the three command strings that must carry it
+/// (Code, and `fix_prompt`'s two `execute-phase` arms) cannot drift apart, and
+/// so a reader of any one of them can find this explanation.
+const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
 
 /// The completion contract every agent must honor as its final message.
 const COMPLETION_PROTOCOL: &str = "\
@@ -61,7 +84,7 @@ pub enum FixType {
 }
 
 /// Substitute the `{N}` phase placeholder in a GSD command string.
-fn gsd_command_for(stage: Stage, phase: u32) -> String {
+fn gsd_command_for(stage: Stage, phase: PhaseId) -> String {
     stage.gsd_command().replace("{N}", &phase.to_string())
 }
 
@@ -78,7 +101,7 @@ fn gsd_command_for(stage: Stage, phase: u32) -> String {
 /// proceeds to `/gsd-ship {N}`. The `review:` reason prefix is the
 /// ReviewFailed contract that `handle_ship_failure` matches (trimmed,
 /// case-folded) to loop back to Code with `AuditFix`.
-fn ship_stage_prompt(phase: u32, review_angles: &[String]) -> String {
+fn ship_stage_prompt(phase: PhaseId, review_angles: &[String]) -> String {
     let code_review = format!("/gsd-code-review {phase}");
     let ship = format!("/gsd-ship {phase}");
     let review_angles = review_angles
@@ -120,7 +143,7 @@ fn ship_stage_prompt(phase: u32, review_angles: &[String]) -> String {
 /// so `advance()`'s Validate arm can tell "the agent ran validation" apart
 /// from "validation passed," and never advances to Ship on a bare `status:
 /// success` for this stage.
-fn validate_stage_prompt(phase: u32) -> String {
+fn validate_stage_prompt(phase: PhaseId) -> String {
     let command = gsd_command_for(Stage::Validate, phase);
     format!(
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
@@ -165,10 +188,10 @@ fn validate_stage_prompt(phase: u32) -> String {
 /// command that cannot be answered headlessly. That branch was deleted
 /// rather than made conditional — see [`define_stage_prompt`] for Define's
 /// actual (always-no-op) contract. This function now serves only Plan.
-fn idempotent_stage_prompt(phase: u32) -> String {
+fn idempotent_stage_prompt(phase: PhaseId) -> String {
     let artifact = "PLAN.md";
     let command = gsd_command_for(Stage::Plan, phase);
-    let padded = format!("{phase:02}");
+    let padded = phase.padded();
     format!(
         "First check whether this stage's deliverable already exists:\n\
         \n\
@@ -198,7 +221,7 @@ fn idempotent_stage_prompt(phase: u32) -> String {
 /// CONTEXT.md already exists. The operator decides whether to run the
 /// interview before invoking `devflow start`; DevFlow makes no runtime
 /// accommodation for that choice.
-fn define_stage_prompt(phase: u32) -> String {
+fn define_stage_prompt(phase: PhaseId) -> String {
     format!(
         "This is the Define stage of a headless DevFlow run for phase {phase}.\n\
         \n\
@@ -214,7 +237,7 @@ fn define_stage_prompt(phase: u32) -> String {
 }
 
 /// Build the prompt for a stage of a phase.
-pub fn stage_prompt(stage: Stage, phase: u32) -> String {
+pub fn stage_prompt(stage: Stage, phase: PhaseId) -> String {
     stage_prompt_with_project(stage, phase, None)
 }
 
@@ -223,11 +246,11 @@ pub fn stage_prompt(stage: Stage, phase: u32) -> String {
 /// The CLI uses this entry point after resolving the canonical project root;
 /// library callers that have no project context keep using [`stage_prompt`]
 /// and receive built-in defaults.
-pub fn stage_prompt_for_project(stage: Stage, phase: u32, project_root: &Path) -> String {
+pub fn stage_prompt_for_project(stage: Stage, phase: PhaseId, project_root: &Path) -> String {
     stage_prompt_with_project(stage, phase, Some(project_root))
 }
 
-fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Path>) -> String {
+fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
     if stage == Stage::Ship {
         let review_angles = project_root
             .and_then(crate::config::review_angles)
@@ -250,6 +273,21 @@ fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Pat
     }
     let command = gsd_command_for(stage, phase);
     if stage == Stage::Code {
+        // The Code arm ONLY (D-04/D-05, 35.1-01 Pitfall 1). `execute-phase.md`
+        // wipes `workflow._auto_chain_active` at the top of every invocation
+        // whose `$ARGUMENTS` lacks this token, which would clear the flag
+        // DevFlow just set before `checkpoint_handling` ever reads it. Within
+        // `execute-phase.md` the token's only effect is to skip that clear — it
+        // does not chain and it sets nothing, so it is safe to send
+        // unconditionally here even though the config write that gives it
+        // meaning is gated on `Mode::Auto` (F-2).
+        //
+        // Deliberately NOT applied to `gsd_command_for` or
+        // `Stage::gsd_command`: both are shared with Plan via
+        // `idempotent_stage_prompt`, and the same flag makes `plan-phase.md`
+        // chain into `execute-phase.md`. Leaking the token into the Plan prompt
+        // is precisely the D-04 defect.
+        let command = format!("{command} {AUTO_CHAIN_PRESERVING_FLAG}");
         return format!(
             "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
             ## Advisory incremental self-review\n\
@@ -280,7 +318,7 @@ fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Pat
 /// this exact instruction without churning on every resume. `phase` is
 /// included only for operator legibility in the captured stdout — the
 /// instruction's meaning does not depend on it.
-pub fn checkpoint_auto_decide_prompt(phase: u32) -> String {
+pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
     format!(
         "This is phase {phase} of a headless DevFlow run. You previously \
         stopped at a human-blocking checkpoint, but no human operator is \
@@ -295,11 +333,30 @@ pub fn checkpoint_auto_decide_prompt(phase: u32) -> String {
 }
 
 /// Build a fix prompt used on Code → Validate loop-backs.
-pub fn fix_prompt(fix_type: FixType, phase: u32) -> String {
+///
+/// Both arms that dispatch to `execute-phase` carry
+/// [`AUTO_CHAIN_PRESERVING_FLAG`], for the same reason the Code prompt does:
+/// they reach `execute-phase.md`'s sync-clear step, and without the token that
+/// step wipes the chain flag DevFlow just set. The `--gaps-only` loop is
+/// named explicitly by ROADMAP criterion 1 — a fix pass gets exactly the same
+/// treatment as the first Code pass, or the phase's unattended behaviour
+/// changes the moment validation reports a gap.
+///
+/// `AuditFix` is deliberately left alone: it routes to `/gsd-audit-fix`, never
+/// reaches `execute-phase.md`, and so never meets the sync-clear step.
+///
+/// Flag ORDER within the command string does not matter — GSD extracts
+/// `--`-prefixed tokens position-independently
+/// (`references/phase-argument-parsing.md`).
+pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
     let command = match fix_type {
         FixType::AuditFix => format!("/gsd-audit-fix {phase}"),
-        FixType::GapsOnly => format!("/gsd-execute-phase {phase} --gaps-only"),
-        FixType::FullExecute => format!("/gsd-execute-phase {phase}"),
+        FixType::GapsOnly => {
+            format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
+        }
+        FixType::FullExecute => {
+            format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
+        }
     };
     format!(
         "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
@@ -321,7 +378,7 @@ mod tests {
             (Stage::Ship, "/gsd-ship 11"),
         ];
         for (stage, command) in cases {
-            let prompt = stage_prompt(stage, 11);
+            let prompt = stage_prompt(stage, PhaseId::new(11));
             assert!(prompt.contains(command), "{stage} prompt missing {command}");
             assert!(prompt.contains("DEVFLOW_RESULT"));
         }
@@ -329,13 +386,13 @@ mod tests {
 
     #[test]
     fn phase_placeholder_is_substituted() {
-        assert!(stage_prompt(Stage::Code, 7).contains("/gsd-execute-phase 7"));
-        assert!(!stage_prompt(Stage::Code, 7).contains("{N}"));
+        assert!(stage_prompt(Stage::Code, PhaseId::new(7)).contains("/gsd-execute-phase 7"));
+        assert!(!stage_prompt(Stage::Code, PhaseId::new(7)).contains("{N}"));
     }
 
     #[test]
     fn ship_prompt_sequences_code_review_before_ship() {
-        let prompt = stage_prompt(Stage::Ship, 13);
+        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
         let review_pos = prompt
             .find("/gsd-code-review 13")
             .expect("Ship prompt must run /gsd-code-review {N}");
@@ -350,7 +407,7 @@ mod tests {
 
     #[test]
     fn ship_prompt_defines_critical_gate_and_review_failed_contract() {
-        let prompt = stage_prompt(Stage::Ship, 13);
+        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
         assert!(
             prompt.contains("REVIEW.md"),
             "Ship prompt must reference the REVIEW.md artifact"
@@ -374,7 +431,7 @@ mod tests {
 
     #[test]
     fn ship_prompt_includes_multi_angle_conditional_review() {
-        let prompt = stage_prompt(Stage::Ship, 13);
+        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
         for angle in [
             "doc-accuracy cross-reference",
             "security / leaked-data",
@@ -399,7 +456,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = stage_prompt_for_project(Stage::Ship, 13, dir.path());
+        let prompt = stage_prompt_for_project(Stage::Ship, PhaseId::new(13), dir.path());
 
         assert!(prompt.contains("custom release evidence"));
         assert!(prompt.contains("custom threat boundary"));
@@ -415,7 +472,7 @@ mod tests {
         // `plan_prompt_is_idempotent` below); Define carries its own D-14
         // always-no-op contract (see `define_prompt_never_invokes_discuss_phase`
         // below).
-        let prompt = stage_prompt(Stage::Code, 9);
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(9));
         assert!(prompt.contains("/gsd-execute-phase 9"));
         assert!(prompt.contains("DEVFLOW_RESULT"));
         assert!(
@@ -445,7 +502,7 @@ mod tests {
     /// no-op with success when its deliverable pre-exists. See T-28-09.
     #[test]
     fn plan_prompt_is_idempotent() {
-        let prompt = stage_prompt(Stage::Plan, 9);
+        let prompt = stage_prompt(Stage::Plan, PhaseId::new(9));
         assert!(
             prompt.contains("/gsd-plan-phase 9"),
             "Plan prompt missing /gsd-plan-phase 9"
@@ -471,7 +528,7 @@ mod tests {
     /// T-28-08 (a headless run has no operator to answer it).
     #[test]
     fn define_prompt_never_invokes_discuss_phase() {
-        let prompt = stage_prompt(Stage::Define, 9);
+        let prompt = stage_prompt(Stage::Define, PhaseId::new(9));
         assert!(
             !prompt.contains("/gsd-discuss-phase"),
             "Define prompt must never invoke the interactive discuss-phase command (D-14)"
@@ -493,7 +550,7 @@ mod tests {
 
     #[test]
     fn validate_stage_prompt_requires_verdict() {
-        let prompt = stage_prompt(Stage::Validate, 13);
+        let prompt = stage_prompt(Stage::Validate, PhaseId::new(13));
         assert!(
             prompt.contains("/gsd-validate-phase 13"),
             "Validate prompt missing its GSD command"
@@ -512,12 +569,12 @@ mod tests {
 
     #[test]
     fn fix_prompts_select_the_right_command() {
-        assert!(fix_prompt(FixType::AuditFix, 11).contains("/gsd-audit-fix 11"));
-        assert!(fix_prompt(FixType::GapsOnly, 11).contains("--gaps-only"));
-        assert!(fix_prompt(FixType::AuditFix, 11).contains("DEVFLOW_RESULT"));
+        assert!(fix_prompt(FixType::AuditFix, PhaseId::new(11)).contains("/gsd-audit-fix 11"));
+        assert!(fix_prompt(FixType::GapsOnly, PhaseId::new(11)).contains("--gaps-only"));
+        assert!(fix_prompt(FixType::AuditFix, PhaseId::new(11)).contains("DEVFLOW_RESULT"));
 
         // D-01: FullExecute renders the plain, unflagged execute command.
-        let full_execute_prompt = fix_prompt(FixType::FullExecute, 11);
+        let full_execute_prompt = fix_prompt(FixType::FullExecute, PhaseId::new(11));
         assert!(full_execute_prompt.contains("/gsd-execute-phase 11"));
         // Negative control: without this, FullExecute's command string would
         // just be a substring of GapsOnly's — this proves the two are
@@ -526,20 +583,77 @@ mod tests {
         assert!(!full_execute_prompt.contains("--gaps-only"));
     }
 
+    /// The flag-preserving token belongs on exactly the command strings that
+    /// reach `execute-phase.md`'s sync-clear step, and nowhere else.
+    ///
+    /// All three `FixType` arms are asserted, present AND absent, so this test
+    /// distinguishes "added where it belongs" from "added everywhere" — the
+    /// same habit `fix_prompts_select_the_right_command` above already uses for
+    /// `--gaps-only`.
+    #[test]
+    fn fix_prompts_carry_the_chain_flag_token_only_where_it_reaches_execute_phase() {
+        let phase = PhaseId::new(11);
+
+        assert!(
+            fix_prompt(FixType::GapsOnly, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the --gaps-only fix loop reaches execute-phase.md, so it meets the \
+             sync-clear step and needs the token exactly as the first Code pass does"
+        );
+        assert!(
+            fix_prompt(FixType::FullExecute, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the full-execute loop-back reaches execute-phase.md too"
+        );
+        assert!(
+            !fix_prompt(FixType::AuditFix, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "audit-fix routes to /gsd-audit-fix and never reaches execute-phase.md, \
+             so it never meets the sync-clear step the token exists to skip"
+        );
+    }
+
+    /// The first Code pass and the fix loop must be treated identically —
+    /// ROADMAP criterion 1 names the fix loop explicitly.
+    #[test]
+    fn the_code_prompt_carries_the_chain_flag_token() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(11));
+        assert!(prompt.contains(&format!(
+            "/gsd-execute-phase 11 {AUTO_CHAIN_PRESERVING_FLAG}"
+        )));
+    }
+
+    /// Criterion 3a / D-04: the Plan prompt must NEVER carry the token.
+    ///
+    /// The flag that would enable checkpoint auto-approval at Plan is the same
+    /// flag that makes `plan-phase.md` chain into `execute-phase.md`
+    /// (`plan-phase.md:1564`) — which double-executes the Code stage and
+    /// misattributes its commits. This is ROADMAP criterion 3, and it is why
+    /// the token is appended inside the `Stage::Code` arm rather than in
+    /// `gsd_command_for`, which Plan shares.
+    #[test]
+    fn the_plan_prompt_never_carries_the_chain_flag_token() {
+        let plan = stage_prompt(Stage::Plan, PhaseId::new(11));
+        assert!(
+            !plan.contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the Plan prompt must not chain into execute-phase (D-04)"
+        );
+        // Negative control: the Plan prompt DOES carry its own command, so the
+        // assertion above is about the token and not about an empty string.
+        assert!(plan.contains("/gsd-plan-phase 11"));
+    }
+
     /// D-03/D-07 (28-03): the audit event quotes this instruction verbatim,
     /// so it must be byte-identical across calls for the same phase — no
     /// timestamp, no random content that would churn the recorded string.
     #[test]
     fn checkpoint_auto_decide_prompt_is_deterministic() {
         assert_eq!(
-            checkpoint_auto_decide_prompt(28),
-            checkpoint_auto_decide_prompt(28)
+            checkpoint_auto_decide_prompt(PhaseId::new(28)),
+            checkpoint_auto_decide_prompt(PhaseId::new(28))
         );
     }
 
     #[test]
     fn checkpoint_auto_decide_prompt_terminates_with_completion_protocol() {
-        let prompt = checkpoint_auto_decide_prompt(28);
+        let prompt = checkpoint_auto_decide_prompt(PhaseId::new(28));
         assert!(
             prompt.ends_with(COMPLETION_PROTOCOL),
             "the resumed session's exit must still be parseable by the same \
@@ -550,7 +664,7 @@ mod tests {
 
     #[test]
     fn checkpoint_auto_decide_prompt_states_no_operator_judgment_and_record_reasoning() {
-        let prompt = checkpoint_auto_decide_prompt(28).to_lowercase();
+        let prompt = checkpoint_auto_decide_prompt(PhaseId::new(28)).to_lowercase();
         assert!(
             prompt.contains("no human operator") || prompt.contains("nobody"),
             "must state plainly that no operator is available"
@@ -568,6 +682,6 @@ mod tests {
 
     #[test]
     fn checkpoint_auto_decide_prompt_substitutes_phase_for_legibility() {
-        assert!(checkpoint_auto_decide_prompt(42).contains("phase 42"));
+        assert!(checkpoint_auto_decide_prompt(PhaseId::new(42)).contains("phase 42"));
     }
 }

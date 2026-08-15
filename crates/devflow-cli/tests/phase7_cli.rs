@@ -1,3 +1,4 @@
+use devflow_core::phase_id::PhaseId;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -56,6 +57,17 @@ fn init_repo(root: &Path) {
         fs::write(dir.join(format!("{phase}-CONTEXT.md")), "ctx\n").unwrap();
         fs::write(dir.join(format!("{phase}-01-PLAN.md")), "plan\n").unwrap();
     }
+    // A GSD project config, because a real GSD-driven project has one and
+    // 35.1-03's `preflight_unattended_launch_check` refuses an unattended
+    // launch whose chain flag has nowhere to live. Written here rather than in
+    // the individual tests so the fixture keeps modelling a real project
+    // rather than a project that happens to satisfy one preflight condition.
+    fs::create_dir_all(root.join(".planning")).unwrap();
+    fs::write(
+        root.join(".planning/config.json"),
+        "{\n  \"workflow\": {\n    \"auto_advance\": false\n  }\n}\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-q", "-m", "base"]);
     git(root, &["branch", "main"]);
@@ -167,7 +179,7 @@ fn wait_for_pid(path: &Path) -> u32 {
 /// is still actively driving stages (`BetweenStages`/`Healthy`) — fixtures
 /// that call `cleanup` must first wait for the phase to actually finish,
 /// the same way a real operator would.
-fn wait_for_state_cleared(root: &Path, phase: u32) {
+fn wait_for_state_cleared(root: &Path, phase: PhaseId) {
     for _ in 0..400 {
         if devflow_core::workflow::load_state(root, phase).is_err() {
             return;
@@ -180,7 +192,7 @@ fn wait_for_state_cleared(root: &Path, phase: u32) {
 /// Wait until a phase's persisted state has `stopped == true` (20c: a
 /// `--until`-halted phase). Polls rather than reading once, since the fake
 /// agent + monitor chain advances asynchronously.
-fn wait_for_stopped(root: &Path, phase: u32) -> devflow_core::state::State {
+fn wait_for_stopped(root: &Path, phase: PhaseId) -> devflow_core::state::State {
     for _ in 0..400 {
         if let Ok(state) = devflow_core::workflow::load_state(root, phase)
             && state.stopped
@@ -192,8 +204,8 @@ fn wait_for_stopped(root: &Path, phase: u32) -> devflow_core::state::State {
     panic!("timed out waiting for phase {phase} state to report stopped == true");
 }
 
-fn seed_feature_branch(root: &Path, phase: u32) {
-    let branch = format!("feature/phase-{phase:02}");
+fn seed_feature_branch(root: &Path, phase: PhaseId) {
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     git(root, &["checkout", "-q", "-b", &branch]);
     fs::write(root.join("initial.txt"), "initial phase work\n").unwrap();
     git(root, &["add", "."]);
@@ -254,10 +266,24 @@ esac
         ),
     ]);
 
+    // `--mode supervise` (35.1-03): phase 8 runs on `codex`, and
+    // `preflight_unattended_launch_check`'s C2 refuses a `Mode::Auto` launch on
+    // any agent that cannot host the chain-flag guard — the guard binds inside
+    // the pipe-owning monitor, which is the Claude stream path only. This
+    // test's subject is two worktrees and two monitors, which is
+    // mode-independent; the agent diversity is the point and is preserved.
     let output = run_devflow(
         root,
         &fake_bin.path,
-        &["parallel", "--phases", "7,8", "--agents", "claude,codex"],
+        &[
+            "parallel",
+            "--phases",
+            "7,8",
+            "--agents",
+            "claude,codex",
+            "--mode",
+            "supervise",
+        ],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("phase 7"));
@@ -289,10 +315,10 @@ esac
 
     // 13-DEFERRED-CR-03: each parallel phase persists its own state file —
     // the second start no longer clobbers the first phase's state.
-    let state7 = devflow_core::workflow::load_state(root, 7).expect("phase 7 state");
-    let state8 = devflow_core::workflow::load_state(root, 8).expect("phase 8 state");
-    assert_eq!(state7.phase, 7);
-    assert_eq!(state8.phase, 8);
+    let state7 = devflow_core::workflow::load_state(root, PhaseId::new(7)).expect("phase 7 state");
+    let state8 = devflow_core::workflow::load_state(root, PhaseId::new(8)).expect("phase 8 state");
+    assert_eq!(state7.phase, PhaseId::new(7));
+    assert_eq!(state8.phase, PhaseId::new(8));
     assert!(
         !root.join(".devflow/state.json").exists(),
         "legacy single-slot state.json must not be written anymore"
@@ -319,7 +345,16 @@ fn start_defaults_to_worktree() {
         root,
         &fake_bin.path,
         &[
-            "start", "--phase", "11", "--agent", "claude", "--mode", "auto",
+            // `supervise` (35.1-03): the legacy opt-out pinned above is
+            // exactly what C2 refuses in `Mode::Auto`, and where `start` puts
+            // the phase is mode-independent.
+            "start",
+            "--phase",
+            "11",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
         ],
     );
 
@@ -328,7 +363,7 @@ fn start_defaults_to_worktree() {
     wait_for(&root.join(".worktrees/phase-11"));
     assert!(root.join(".worktrees/phase-11").is_dir());
 
-    let state = devflow_core::workflow::load_state(root, 11).expect("load state");
+    let state = devflow_core::workflow::load_state(root, PhaseId::new(11)).expect("load state");
     assert!(
         state.worktree_path.is_some(),
         "expected worktree_path to be Some(_) by default, got {:?}",
@@ -381,7 +416,16 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
         root,
         &fake_bin.path,
         &[
-            "start", "--phase", "13", "--agent", "claude", "--mode", "auto",
+            // `supervise` (35.1-03): same reason as phase 11 above — the
+            // legacy opt-out is refused in `Mode::Auto`, and this test's
+            // subject (main-checkout divergence) is mode-independent.
+            "start",
+            "--phase",
+            "13",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
         ],
     );
 
@@ -411,8 +455,11 @@ fn start_no_worktree_uses_feature_branch() {
             "12",
             "--agent",
             "claude",
+            // `supervise` (35.1-03): same reason as phase 11 — the legacy
+            // opt-out pinned above is refused in `Mode::Auto`, and
+            // `--no-worktree`'s branch placement is mode-independent.
             "--mode",
-            "auto",
+            "supervise",
             "--no-worktree",
         ],
     );
@@ -422,7 +469,7 @@ fn start_no_worktree_uses_feature_branch() {
     wait_for(&root.join(".devflow/phase-12-agent-pid"));
     assert!(!root.join(".worktrees/phase-12").exists());
 
-    let state = devflow_core::workflow::load_state(root, 12).expect("load state");
+    let state = devflow_core::workflow::load_state(root, PhaseId::new(12)).expect("load state");
     assert!(
         state.worktree_path.is_none(),
         "expected worktree_path to be None with --no-worktree, got {:?}",
@@ -456,11 +503,22 @@ fn start_until_plan_halts_cleanly() {
         root,
         &fake_bin.path,
         &[
-            "start", "--phase", "44", "--agent", "claude", "--mode", "auto", "--until", "plan",
+            // `supervise` (35.1-03): same reason as phase 11 above — the
+            // legacy opt-out is refused in `Mode::Auto`, and the `--until` cap
+            // halts at Plan, well before supervise's Validate gate.
+            "start",
+            "--phase",
+            "44",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
+            "--until",
+            "plan",
         ],
     );
 
-    let state = wait_for_stopped(root, 44);
+    let state = wait_for_stopped(root, PhaseId::new(44));
     assert_eq!(
         state.stage,
         devflow_core::stage::Stage::Plan,
@@ -642,8 +700,11 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let instructions =
-        devflow_core::ship::build_single_agent_cron_instructions(root, 7, "2026-06-18T15:45:30Z");
+    let instructions = devflow_core::ship::build_single_agent_cron_instructions(
+        root,
+        PhaseId::new(7),
+        "2026-06-18T15:45:30Z",
+    );
     devflow_core::ship::write_cron_instructions(root, &instructions).unwrap();
     let fake_bin = fake_bin_dir(&[]);
 
@@ -761,7 +822,7 @@ esac
             "abort test teardown",
         ],
     );
-    wait_for_state_cleared(root, 8);
+    wait_for_state_cleared(root, PhaseId::new(8));
 
     // cleanup — removes worktrees
     let out = run_devflow(root, &fake_bin.path, &["cleanup", "--force"]);
@@ -828,11 +889,13 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let phase = 8;
-    let branch = format!("feature/phase-{phase:02}");
+    let phase = PhaseId::new(8);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     seed_feature_branch(root, phase);
 
-    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     // The agent pid file holds a genuinely alive pid — the test process
@@ -892,11 +955,13 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let phase = 9;
-    let branch = format!("feature/phase-{phase:02}");
+    let phase = PhaseId::new(9);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     seed_feature_branch(root, phase);
 
-    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     // Agent pid file holds a genuinely alive pid (the test process itself).
@@ -958,11 +1023,13 @@ fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let phase = 11;
-    let branch = format!("feature/phase-{phase:02}");
+    let phase = PhaseId::new(11);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     seed_feature_branch(root, phase);
 
-    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     // No agent pid file (the stage's agent has already exited normally) and
@@ -1017,11 +1084,13 @@ fn cleanup_force_removes_worktree_for_until_stopped_phase() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let phase = 13;
-    let branch = format!("feature/phase-{phase:02}");
+    let phase = PhaseId::new(13);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     seed_feature_branch(root, phase);
 
-    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     let mut state = devflow_core::state::State::new(
@@ -1062,11 +1131,13 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let phase = 10;
-    let branch = format!("feature/phase-{phase:02}");
+    let phase = PhaseId::new(10);
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     seed_feature_branch(root, phase);
 
-    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     // Dead agent, dead monitor (Stuck liveness) — a genuinely dead phase,

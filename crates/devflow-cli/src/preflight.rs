@@ -20,15 +20,18 @@
 use crate::CliError;
 use crate::commands::phase_artifact_on_develop;
 use crate::pipeline_gate::{abort, run_gate};
+use crate::pipeline_launch::claude_stream_launch_enabled;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_outcomes::truncate_reason;
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::git::git_command;
+use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
+use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agents, events, version, workflow};
+use devflow_core::{agents, events, verify, version, workflow};
 use std::path::{Path, PathBuf};
 
 /// The sandbox writable roots a worktree-hosted agent needs to commit: the
@@ -79,7 +82,9 @@ fn agent_binary_available(program: &str) -> bool {
 /// scaffolding. The prompt/roots passed here are throwaways — adapters
 /// return a static program name regardless.
 pub(crate) fn agent_program(agent: AgentKind) -> &'static str {
-    agents::adapter_for(agent).exec_command(0, "", &[]).0
+    agents::adapter_for(agent)
+        .exec_command(PhaseId::new(0), "", &[])
+        .0
 }
 
 pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
@@ -140,7 +145,7 @@ pub(crate) enum PhaseReachability {
 /// must be re-pointed at that configuration alongside it.
 pub(crate) fn phase_reachability_on_base(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     base: &str,
 ) -> PhaseReachability {
     // Step 1: does the base branch even exist here?
@@ -191,7 +196,7 @@ pub(crate) fn phase_reachability_on_base(
         .output();
     let phase_dir_found = match ls_tree {
         Ok(out) if out.status.success() => {
-            let prefix = format!(".planning/phases/{phase:02}-");
+            let prefix = format!(".planning/phases/{padded}-", padded = phase.padded());
             String::from_utf8_lossy(&out.stdout).lines().any(|path| {
                 path.strip_prefix(&prefix)
                     .is_some_and(|rest| rest.contains('/'))
@@ -218,7 +223,7 @@ pub(crate) fn phase_reachability_on_base(
 /// operator-facing strings three times (999.10, and again in 18-07's
 /// `self_dogfood_stale_blocked` reason); this must not be a fourth.
 pub(crate) fn unreachable_message(
-    phase: u32,
+    phase: PhaseId,
     base: &str,
     roadmap_entry_found: bool,
     phase_dir_found: bool,
@@ -234,7 +239,8 @@ pub(crate) fn unreachable_message(
     }
     if !phase_dir_found {
         msg.push_str(&format!(
-            "  missing: a `.planning/phases/{phase:02}-*/` directory on `{base}`\n"
+            "  missing: a `.planning/phases/{padded}-*/` directory on `{base}`\n",
+            padded = phase.padded()
         ));
     }
     msg.push_str(&format!(
@@ -279,7 +285,7 @@ pub(crate) fn unreachable_message(
 /// the directory half.
 pub(crate) fn ensure_phase_reachable_on_base(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     base: &str,
 ) -> Result<(), CliError> {
     match phase_reachability_on_base(project_root, phase, base) {
@@ -351,8 +357,8 @@ pub(crate) enum BaseRefCurrency {
 /// `git fetch` so the comparison is made against a freshly-updated
 /// remote-tracking ref rather than merely "nobody has fetched recently."
 ///
-/// The fetch updates ONLY the remote-tracking ref (`git fetch <remote>
-/// <base>`) — it never touches the local branch or the working tree, so it
+/// The fetch updates ONLY the remote-tracking ref (`git fetch <remote> <base>`)
+/// — it never touches the local branch or the working tree, so it
 /// cannot fail with a "branch is checked out" error the way a refspec fetch
 /// into the local branch would. On spawn error or non-zero exit the fetch
 /// fails SOFT: a warning is printed and the comparison proceeds against
@@ -834,6 +840,323 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
     subjects
 }
 
+// ---------------------------------------------------------------------------
+// D-07 (35.1-03): refuse an unattended launch, before any agent time is spent,
+// when the conditions that let it FINISH do not hold.
+//
+// Phase 35.1 makes checkpoint auto-approval possible; it does not make it
+// universal. Three things each independently defeat it, silently, and each one
+// turns an overnight run into a stall discovered the next morning.
+// ---------------------------------------------------------------------------
+
+/// The four states one unattended-launch prerequisite can be in.
+///
+/// The fourth variant is not a nicety (F-12, C3): at Define a phase genuinely
+/// has no plans yet, and folding that into [`Self::Undetermined`] would refuse
+/// every unattended launch ever started.
+///
+/// Reasons are kept SHORT on purpose. [`run_preflight`] passes the joined
+/// refusal string through [`truncate_reason`] — a hard 300-character cap that
+/// includes a 39-character truncation marker — and three verbose reasons would
+/// not survive it. The unbounded detail lives in the printed report instead,
+/// which is exactly the split [`truncate_reason`]'s own doc comment describes.
+#[derive(Debug)]
+enum ConditionState {
+    /// Observed to hold.
+    Holds,
+    /// Observed NOT to hold.
+    DoesNotHold(String),
+    /// Could not be observed either way. Refuses, per D-07's fail-closed rule:
+    /// "unreadable" is a different fact from "absent", and neither is a pass.
+    Undetermined(String),
+    /// Not yet determinable at this stage, and legitimately so.
+    NotYetApplicable(String),
+}
+
+impl ConditionState {
+    /// The report label. Refusing states are shouted so a skim of a monitor log
+    /// finds them.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Holds => "holds",
+            Self::DoesNotHold(_) => "DOES NOT HOLD",
+            Self::Undetermined(_) => "COULD NOT BE DETERMINED",
+            Self::NotYetApplicable(_) => "not yet applicable",
+        }
+    }
+
+    /// Whether this state refuses an unattended launch — exactly
+    /// [`Self::DoesNotHold`] and [`Self::Undetermined`].
+    fn refuses(&self) -> bool {
+        matches!(self, Self::DoesNotHold(_) | Self::Undetermined(_))
+    }
+
+    /// The explanation carried by every state but [`Self::Holds`].
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Holds => None,
+            Self::DoesNotHold(reason)
+            | Self::Undetermined(reason)
+            | Self::NotYetApplicable(reason) => Some(reason),
+        }
+    }
+}
+
+/// D-07: whether the unattended-launch check applies to `stage` — `Define` and
+/// `Code`, split out as its own pure predicate exactly the way
+/// [`gh_auth_check_applies`] and [`major_bump_check_applies`] are, so "does not
+/// run for a non-applicable stage" is unit-testable with no fixture at all.
+///
+/// `Define` is the earliest stage `devflow start` launches, so a refusal there
+/// costs zero agent time. `Code` is where C3 first becomes determinable and
+/// where the mechanism is actually used.
+fn unattended_launch_check_applies(stage: Stage) -> bool {
+    matches!(stage, Stage::Define | Stage::Code)
+}
+
+/// C1: the GSD config at the launch root exists, parses, and can hold the flag.
+///
+/// DevFlow cannot set the chain flag in a file it cannot read or write, and
+/// GSD's `check auto-mode` reads nothing else.
+///
+/// Absent and unreadable are reported as DIFFERENT states on purpose. A file
+/// that is not there is a different fact from a file that cannot be read, and
+/// collapsing them is the "unreachable is not absent" error this project
+/// already has a rule about (see [`preflight_major_bump_check`]'s D-10 branch).
+///
+/// T-35.1-16: no reason below embeds the absolute config path.
+/// [`gsd_config::GsdConfigError::Missing`] carries a `PathBuf` and renders it,
+/// so its `Display` is deliberately NOT used; the `Io` arm reports
+/// [`std::io::ErrorKind`] rather than the error's own message for the same
+/// reason.
+fn unattended_config_condition(launch_root: &Path) -> ConditionState {
+    match gsd_config::auto_chain_active(launch_root) {
+        Ok(_) => ConditionState::Holds,
+        Err(GsdConfigError::Missing(_)) => ConditionState::DoesNotHold(
+            "no `.planning/config.json` under the launch root — nowhere for the chain flag \
+             to live"
+                .to_string(),
+        ),
+        Err(GsdConfigError::Json(err)) => ConditionState::Undetermined(format!(
+            "`.planning/config.json` does not parse ({err}) — unreadable is not absent"
+        )),
+        Err(GsdConfigError::Io(err)) => ConditionState::Undetermined(format!(
+            "`.planning/config.json` could not be read ({}) — unreadable is not absent",
+            err.kind()
+        )),
+    }
+}
+
+/// C2: the Code stage would launch on the pipe-owning arm — Claude, no legacy
+/// opt-out.
+///
+/// The chain-flag guard lives in a Rust process's stack frame; the legacy arm
+/// is a detached shell script with no frame to hang a `Drop` on
+/// (`35.1-RESEARCH.md` Pitfall 4). This turns that accepted gap from a silent
+/// stall hours into an unattended run into a refusal before the first agent is
+/// spawned.
+///
+/// Asks [`claude_stream_launch_enabled`] — the launch path's OWN predicate —
+/// rather than re-deriving the answer, so the preflight and the launch cannot
+/// disagree about whether a guard will exist. `Stage::Code` is passed
+/// explicitly rather than `state.stage`: the question is about the stage where
+/// the mechanism is USED, not about the stage being launched right now.
+fn unattended_launch_shape_condition(state: &State) -> ConditionState {
+    if claude_stream_launch_enabled(state.agent, Stage::Code, state.legacy_claude_launch) {
+        return ConditionState::Holds;
+    }
+    let mut causes = Vec::new();
+    if state.legacy_claude_launch {
+        causes.push("the legacy launch opt-out is active".to_string());
+    }
+    if state.agent != AgentKind::Claude {
+        causes.push(format!("the agent is `{}`, not claude", state.agent));
+    }
+    if causes.is_empty() {
+        // Defensive: reachable only if `STREAM_JSON_STAGES` ever narrows to
+        // exclude Code. Reporting "no cause" would be worse than saying so.
+        causes.push("Code is not on the stream-json launch path".to_string());
+    }
+    // The reason names the CAUSE that applied, and then the consequence in
+    // terms true of every cause. An earlier wording said "the legacy arm has
+    // no process to bound the chain flag's lifetime" unconditionally, which
+    // misattributed a non-Claude refusal to a legacy opt-out the operator had
+    // not set.
+    ConditionState::DoesNotHold(format!(
+        "{} — the chain-flag guard binds only inside the pipe-owning monitor, which this \
+         launch shape never starts",
+        causes.join(" and ")
+    ))
+}
+
+/// C3: no plan for this phase declares a checkpoint GSD never auto-approves.
+///
+/// Those two markers block in EVERY mode (`checkpoints.md` rule 6), so their
+/// presence makes an unattended stall certain regardless of everything this
+/// phase builds.
+///
+/// "No plans yet" is deliberately read differently at the two applicable
+/// stages: pending at Define (the phase is not planned yet — normal), and
+/// undetermined at Code (plans should exist by then, and their absence is an
+/// anomaly, not a pass).
+fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) -> ConditionState {
+    if verify::phase_plan_files(launch_root, state.phase).is_empty() {
+        let reason = "the phase has no plan files yet".to_string();
+        return if state.stage == Stage::Define {
+            ConditionState::NotYetApplicable(format!("{reason} — re-evaluated at Code"))
+        } else {
+            ConditionState::Undetermined(format!("{reason}, but Code expects them"))
+        };
+    }
+    if verify::phase_has_human_only_checkpoint(launch_root, state.phase) {
+        return ConditionState::DoesNotHold(
+            "a plan declares a `blocking-human` gate or a `human-action` checkpoint, which \
+             no mode auto-approves (checkpoints.md rule 6)"
+                .to_string(),
+        );
+    }
+    ConditionState::Holds
+}
+
+/// D-07: refuse an unattended launch whose prerequisites do not definitely
+/// hold, and report them either way.
+///
+/// **D-07 is fail-CLOSED, and warn-and-proceed was rejected rather than
+/// overlooked.** Anything that is not a definite pass — including "could not be
+/// determined" — refuses. A warning is read by nobody in an unattended run,
+/// which is the only kind of run this check exists for.
+///
+/// **D-08, one path with two consequences.** The identical evaluation runs in
+/// both modes and prints the identical per-condition report; only the
+/// disposition differs. `Mode::Supervise` always returns `Ok(())`, so an
+/// operator can rehearse an unattended run's viability without being blocked
+/// out of a supervised one. Printing in both modes is the whole point of the
+/// supervise arm — do not "optimize" the report behind the auto branch.
+///
+/// **D-09: there is no override, and its absence is a decision, not an
+/// oversight.** No flag, no environment variable, no config key, and no
+/// parameter beyond `(&Path, &State)` turns this refusal into a warning.
+/// `state.yes_ship` authorizes the Ship gate and nothing else; that
+/// non-interaction is pinned by `unattended_check_is_not_bypassed_by_yes_ship`.
+/// **Both external review lanes objected to this on record** — a false-positive
+/// refusal has no in-product recovery — and the operator heard the objection
+/// and let the decision stand (registered as T-35.1-15, disposition `accept`).
+/// If it bites in practice, reopen D-09 as a decision; do not quietly add the
+/// escape hatch a later reader might assume was simply forgotten.
+///
+/// **What "refuses" actually does (F-15), stated rather than implied.** This
+/// plugs into [`generic_preflight_checks`], so a refusal takes that framework's
+/// existing disposition: the agent is never spawned ([`run_preflight`] returns
+/// `Ok(false)` and `launch_stage` returns without reaching
+/// `launch_stage_inner`), and the run PARKS at a named preflight gate + notify,
+/// bounded by `state.preflight_retries` / [`mode::MAX_PREFLIGHT_RETRIES`],
+/// after which it aborts with a logged `preflight_retry_ceiling_reached`. It is
+/// NOT a process exit — Phase 17's decision 15 forbids a hard exit from this
+/// framework and this check gets no exception. So the unattended run stops and
+/// waits for a human rather than pushing on.
+///
+/// **Where the report is actually seen (F-16).** [`run_preflight`] runs from
+/// `launch_stage`, which runs in the operator's own `devflow start` process for
+/// the FIRST stage and in the detached `__monitor` process for every later one.
+/// The Define-stage report therefore prints to the operator's TERMINAL — which
+/// is what makes D-08's rehearsal useful — and the Code-stage report prints to
+/// the MONITOR LOG. Nobody should later "fix" a report they could not find.
+///
+/// The signature is exactly `(&Path, &State) -> Result<(), String>` and must
+/// stay that way (D-09, T-35.1-14): a parameter surface is where a future
+/// bypass gets wired in.
+fn preflight_unattended_launch_check(project_root: &Path, state: &State) -> Result<(), String> {
+    unattended_launch_check_reporting_to(project_root, state, &mut std::io::stdout())
+}
+
+/// [`preflight_unattended_launch_check`]'s body, with the report's destination
+/// made injectable so a test can assert on the bytes actually emitted rather
+/// than on a re-derivation of what they ought to be.
+///
+/// **This does not weaken D-09.** The one extra parameter is a byte sink; it
+/// cannot reach the disposition, which is decided entirely by
+/// [`ConditionState::refuses`] and `state.mode` below. The function callers
+/// actually reach, and the only one wired into
+/// [`generic_preflight_checks`], keeps the fixed `(&Path, &State)` signature.
+///
+/// A write failure on the sink is deliberately IGNORED rather than propagated:
+/// a closed stdout must not convert a viable launch into a refusal, nor a
+/// refusal into a pass. The disposition is computed from the conditions, never
+/// from whether the report reached anyone.
+fn unattended_launch_check_reporting_to(
+    project_root: &Path,
+    state: &State,
+    report: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    if !unattended_launch_check_applies(state.stage) {
+        return Ok(());
+    }
+    // The same spelling the chain-flag guard and the force-clear use: in
+    // worktree mode the tracked `.planning/` the agent actually reads is the
+    // WORKTREE's copy, not the main checkout's (999.76).
+    let launch_root = state.worktree_path.as_deref().unwrap_or(project_root);
+
+    let conditions = [
+        (
+            "GSD config can hold the chain flag",
+            unattended_config_condition(launch_root),
+        ),
+        (
+            "Code would launch on the pipe-owning arm",
+            unattended_launch_shape_condition(state),
+        ),
+        (
+            "no plan declares a human-only checkpoint",
+            unattended_planned_checkpoint_condition(launch_root, state),
+        ),
+    ];
+
+    // UNCONDITIONAL, and above the mode branch below on purpose (D-08).
+    let _ = writeln!(
+        report,
+        "unattended-launch prerequisites — phase {phase}, stage {stage}, mode {mode}:",
+        phase = state.phase,
+        stage = state.stage,
+        mode = state.mode
+    );
+    for (name, condition) in &conditions {
+        let _ = match condition.detail() {
+            Some(detail) => writeln!(report, "  [{}] {name} — {detail}", condition.label()),
+            None => writeln!(report, "  [{}] {name}", condition.label()),
+        };
+    }
+
+    // D-08: supervise reports and proceeds. The evaluation above already ran,
+    // so the rehearsal is of the real check and not of a cheaper stand-in.
+    if state.mode != Mode::Auto {
+        return Ok(());
+    }
+
+    // The LABEL is carried into the refusal string, not left in the report
+    // alone. "does not hold" and "could not be determined" call for different
+    // operator actions — fix the condition versus go and look at why it could
+    // not be observed — and the gate context is the only place some operators
+    // will ever read. Keeping the distinction internal would make the
+    // three-state design unobservable from outside, which is indistinguishable
+    // from not having it.
+    let refusals: Vec<String> = conditions
+        .iter()
+        .filter(|(_, condition)| condition.refuses())
+        .filter_map(|(name, condition)| {
+            condition
+                .detail()
+                .map(|detail| format!("{} [{}] — {detail}", name, condition.label()))
+        })
+        .collect();
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unattended launch refused (D-07) — {}",
+        refusals.join("; ")
+    ))
+}
+
 /// The generic (universal) preflight checks (D-14) — the adapter-specific
 /// hook is composed separately in [`run_preflight`].
 ///
@@ -866,6 +1189,26 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
 fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
     let mut reasons = Vec::new();
     if let Err(reason) = preflight_major_bump_check(project_root, state) {
+        reasons.push(reason);
+    }
+    // D-07 (35.1-03) sits SECOND, and the position was chosen rather than
+    // defaulted to. It can never co-occur with the major-bump or gh-auth
+    // reasons — those apply only at `Stage::Ship`, and
+    // `unattended_launch_check_applies` covers only Define and Code — so
+    // second is effectively FIRST on every launch where this reason exists at
+    // all, and `truncate_reason`'s 300-character cap cannot elide it.
+    //
+    // The one check it CAN co-occur with is interactivity (Codex, Auto,
+    // Define), and it outranks that deliberately: interactivity reports a
+    // symptom this check's C2 also reports, with more actionable detail and a
+    // per-condition breakdown. Losing the shorter, more-redundant reason to
+    // truncation costs less than losing this one.
+    //
+    // Aggregated with `if let Err`, never `?` — see this function's CR-01 doc
+    // comment above. A `?` here would mean a human approving the major-bump
+    // gate at some future Ship-and-Code-composing stage never sees why the
+    // unattended launch was refused.
+    if let Err(reason) = preflight_unattended_launch_check(project_root, state) {
         reasons.push(reason);
     }
     if let Err(reason) = preflight_interactivity_check(project_root, state) {
@@ -1026,7 +1369,12 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let mut state = State::new(60, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(60),
+            AgentKind::Codex,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Define;
         assert!(preflight_interactivity_check(root, &state).is_err());
 
@@ -1122,7 +1470,12 @@ mod tests {
     fn major_bump_short_circuits_for_non_ship_stage() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(70),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             state.stage = stage;
             assert!(
@@ -1139,7 +1492,12 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "fix(x): correct off-by-one");
 
-        let mut state = State::new(71, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(71),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         assert!(preflight_major_bump_check(root, &state).is_ok());
 
@@ -1155,7 +1513,12 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
 
-        let mut state = State::new(72, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(72),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         let err = preflight_major_bump_check(root, &state).unwrap_err();
         assert!(err.contains("MAJOR"), "{err}");
@@ -1188,7 +1551,12 @@ mod tests {
         tag(root, "v9.9.9");
         run_git(root, &["checkout", &main_branch]);
 
-        let mut state = State::new(73, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(73),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         let err = preflight_major_bump_check(root, &state).unwrap_err();
         assert!(err.contains("v9.9.9"), "{err}");
@@ -1273,7 +1641,12 @@ mod tests {
         let (outer, worktree_path) = major_bump_worktree_fixture();
         let project_root = outer.path().join("project");
 
-        let mut state = State::new(76, AgentKind::Claude, Mode::Auto, project_root.clone());
+        let mut state = State::new(
+            PhaseId::new(76),
+            AgentKind::Claude,
+            Mode::Auto,
+            project_root.clone(),
+        );
         state.stage = Stage::Ship;
         state.worktree_path = Some(worktree_path.clone());
 
@@ -1320,7 +1693,7 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
 
-        let phase = 74;
+        let phase = PhaseId::new(74);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         state.yes_ship = true;
@@ -1386,7 +1759,7 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
 
-        let phase = 75;
+        let phase = PhaseId::new(75);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         state.yes_ship = true;
@@ -1450,7 +1823,12 @@ mod tests {
 
         let (outer, worktree_path) = major_bump_worktree_fixture();
         let project_root = outer.path().join("project");
-        let mut state = State::new(77, AgentKind::Claude, Mode::Auto, project_root.clone());
+        let mut state = State::new(
+            PhaseId::new(77),
+            AgentKind::Claude,
+            Mode::Auto,
+            project_root.clone(),
+        );
         state.stage = Stage::Ship;
         state.worktree_path = Some(worktree_path);
 
@@ -1488,7 +1866,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 61;
+        let phase = PhaseId::new(61);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Define;
         workflow::save_state(&state).unwrap();
@@ -1525,7 +1903,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 62;
+        let phase = PhaseId::new(62);
         // Plan is unaffected by the interactivity/gh-auth generic checks, so
         // only the adapter hook can be the source of this failure.
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -1572,7 +1950,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 63;
+        let phase = PhaseId::new(63);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // Plan is unaffected by the interactivity/gh-auth generic checks
         // (D-14) — only the injected adapter's `preflight` fails; the real
@@ -1669,7 +2047,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 64;
+        let phase = PhaseId::new(64);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         // Premise moved off `STREAM_JSON_STAGES` membership deliberately
@@ -1797,7 +2175,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 620;
+        let phase = PhaseId::new(620);
         // Codex + Auto + Define + no `.planning/phases/620-*/620-CONTEXT.md`
         // on `develop` deterministically fails `preflight_interactivity_check`
         // — see the section doc comment above for why this (not the adapter
@@ -1891,7 +2269,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 621;
+        let phase = PhaseId::new(621);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Define;
         state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
@@ -1953,7 +2331,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 622;
+        let phase = PhaseId::new(622);
         // Plan + Claude bypasses the generic checks and the real Claude
         // adapter's default preflight passes — the same "unaffected" shape
         // used by `run_preflight_adapter_hook_override_fires` above.
@@ -1990,7 +2368,10 @@ mod tests {
     /// Builds a git repo with a `develop` branch whose `.planning/ROADMAP.md`
     /// content is controlled per-test, optionally committing a
     /// `.planning/phases/{phase:02}-{slug}/.gitkeep` alongside it.
-    fn reachability_fixture(roadmap: &str, phase_dir: Option<(u32, &str)>) -> tempfile::TempDir {
+    fn reachability_fixture(
+        roadmap: &str,
+        phase_dir: Option<(PhaseId, &str)>,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -2014,7 +2395,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".planning")).unwrap();
         std::fs::write(root.join(".planning/ROADMAP.md"), roadmap).unwrap();
         if let Some((phase, slug)) = phase_dir {
-            let d = root.join(format!(".planning/phases/{phase:02}-{slug}"));
+            let d = root.join(format!(
+                ".planning/phases/{padded}-{slug}",
+                padded = phase.padded()
+            ));
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join(".gitkeep"), "").unwrap();
         }
@@ -2025,13 +2409,16 @@ mod tests {
 
     #[test]
     fn reachability_is_reachable_when_roadmap_entry_and_phase_dir_are_both_on_base() {
-        let dir = reachability_fixture("### Phase 24: Something\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 24: Something\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Reachable
         );
-        assert!(ensure_phase_reachable_on_base(root, 24, "develop").is_ok());
+        assert!(ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok());
     }
 
     #[test]
@@ -2039,7 +2426,7 @@ mod tests {
         let dir = reachability_fixture("### Phase 24: Something\n", None);
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: true,
                 phase_dir_found: false,
@@ -2064,7 +2451,7 @@ mod tests {
         // Precondition: this is genuinely the dir-only-missing shape, not a
         // fixture that accidentally satisfies the guard some other way.
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: true,
                 phase_dir_found: false,
@@ -2072,7 +2459,7 @@ mod tests {
         );
 
         assert!(
-            ensure_phase_reachable_on_base(root, 24, "develop").is_ok(),
+            ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok(),
             "a present ROADMAP heading with no phase directory is the legitimate \
              bootstrap state — Define has not run yet, and running it is what \
              creates that directory. The guard must not refuse it (999.63)."
@@ -2084,9 +2471,12 @@ mod tests {
     /// invisible to its own run) would regress open.
     #[test]
     fn enforcement_still_refuses_when_the_roadmap_heading_is_absent() {
-        let dir = reachability_fixture("### Phase 1: Something else\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 1: Something else\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
-        let err = ensure_phase_reachable_on_base(root, 24, "develop")
+        let err = ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop")
             .expect_err("a missing ROADMAP heading must still refuse (23-12's failure class)");
         assert!(
             err.to_string().contains("### Phase 24:"),
@@ -2096,10 +2486,13 @@ mod tests {
 
     #[test]
     fn reachability_is_unreachable_when_the_roadmap_entry_is_absent_from_base() {
-        let dir = reachability_fixture("### Phase 1: Something else\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 1: Something else\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: false,
                 phase_dir_found: true,
@@ -2113,11 +2506,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Undeterminable
         );
         assert!(
-            ensure_phase_reachable_on_base(root, 24, "develop").is_ok(),
+            ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok(),
             "a probe that cannot see must never refuse (fail-open contract)"
         );
     }
@@ -2151,10 +2544,10 @@ mod tests {
         run(&["commit", "-q", "-m", "no roadmap"]);
 
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Undeterminable
         );
-        assert!(ensure_phase_reachable_on_base(root, 24, "develop").is_ok());
+        assert!(ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok());
     }
 
     /// Pins the trailing colon's job: it stops a probe for phase 24 from
@@ -2162,10 +2555,13 @@ mod tests {
     /// with the same digits.
     #[test]
     fn phase_heading_probe_does_not_confuse_a_phase_number_prefix() {
-        let dir = reachability_fixture("### Phase 240: Later\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 240: Later\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: false,
                 phase_dir_found: true,
@@ -2175,19 +2571,19 @@ mod tests {
 
     #[test]
     fn unreachable_message_names_the_base_branch_and_each_missing_half() {
-        let roadmap_missing = unreachable_message(24, "develop", false, true);
+        let roadmap_missing = unreachable_message(PhaseId::new(24), "develop", false, true);
         assert!(roadmap_missing.contains("is not reachable from"));
         assert!(roadmap_missing.contains("develop"));
         assert!(roadmap_missing.contains("### Phase 24:"));
         assert!(!roadmap_missing.contains(".planning/phases/24-"));
 
-        let dir_missing = unreachable_message(24, "develop", true, false);
+        let dir_missing = unreachable_message(PhaseId::new(24), "develop", true, false);
         assert!(dir_missing.contains("is not reachable from"));
         assert!(dir_missing.contains("develop"));
         assert!(!dir_missing.contains("### Phase 24:"));
         assert!(dir_missing.contains(".planning/phases/24-"));
 
-        let both_missing = unreachable_message(24, "develop", false, false);
+        let both_missing = unreachable_message(PhaseId::new(24), "develop", false, false);
         assert!(both_missing.contains("is not reachable from"));
         assert!(both_missing.contains("develop"));
         assert!(both_missing.contains("### Phase 24:"));
@@ -2200,7 +2596,7 @@ mod tests {
     fn unreachable_message_contains_no_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let fixture_root = dir.path().to_string_lossy().into_owned();
-        let msg = unreachable_message(24, "develop", false, false);
+        let msg = unreachable_message(PhaseId::new(24), "develop", false, false);
         assert!(!msg.contains(&fixture_root));
         assert!(!msg.contains("/home/"));
         assert!(!msg.contains("/Users/"));
@@ -2266,8 +2662,10 @@ mod tests {
         let real_dir = reachability_fixture("### Phase 500: Something\n", None);
         let real_root = real_dir.path();
 
-        let foreign_dir =
-            reachability_fixture("### Phase 500: Something\n", Some((500, "something")));
+        let foreign_dir = reachability_fixture(
+            "### Phase 500: Something\n",
+            Some((PhaseId::new(500), "something")),
+        );
         let foreign_root = foreign_dir.path();
 
         // (a) the vulnerability class, reproduced directly: an unscrubbed
@@ -2308,7 +2706,7 @@ mod tests {
         // doc comment above for how this becomes RED-before/GREEN-after when
         // run under this plan's hostile-GIT_DIR-wrapped `<verify>` command.
         assert_eq!(
-            phase_reachability_on_base(real_root, 500, "develop"),
+            phase_reachability_on_base(real_root, PhaseId::new(500), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: true,
                 phase_dir_found: false,
@@ -2847,5 +3245,391 @@ mod tests {
         assert!(msg.contains("develop"));
         assert!(msg.contains("origin/develop"));
         assert!(msg.contains('3'));
+    }
+
+    // -----------------------------------------------------------------
+    // D-07 (35.1-03): the unattended-launch check.
+    //
+    // Every refusing test below carries its PASSING counterpart inside the
+    // same function, reached by changing exactly one thing. A test that only
+    // ever asserts `Err` cannot tell a working condition from a fixture that
+    // was broken for an unrelated reason.
+    // -----------------------------------------------------------------
+
+    /// The GSD config shape a real project has, reduced to the keys that
+    /// matter here. `set_auto_chain_active` must find somewhere to put the
+    /// flag, so a parsing object is the whole requirement.
+    const VIABLE_GSD_CONFIG: &str = "{\n  \"workflow\": {\n    \"auto_advance\": false\n  }\n}\n";
+
+    fn write_gsd_config(root: &Path, contents: &str) {
+        let dir = root.join(".planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), contents).unwrap();
+    }
+
+    /// A plan file for `phase`, written where `verify::phase_plan_files` looks.
+    fn write_plan_for_phase(root: &Path, phase: PhaseId, body: &str) {
+        let padded = phase.padded();
+        let dir = root
+            .join(".planning/phases")
+            .join(format!("{padded}-probe"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{padded}-01-PLAN.md")), body).unwrap();
+    }
+
+    /// A wholly VIABLE fixture: a parsing GSD config, Claude with no legacy
+    /// opt-out, and a plan declaring only an ordinary blocking checkpoint.
+    /// Every test below starts from this and breaks exactly one thing, so a
+    /// refusal is attributable to the condition under test.
+    fn viable_unattended_fixture(phase: PhaseId) -> (tempfile::TempDir, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_gsd_config(&root, VIABLE_GSD_CONFIG);
+        write_plan_for_phase(
+            &root,
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"blocking\">\n</task>\n",
+        );
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root);
+        state.stage = Stage::Code;
+        (dir, state)
+    }
+
+    /// D-07 scope: Define and Code only, mirroring `gh_auth_check_applies` and
+    /// `major_bump_check_applies`. Stages named explicitly rather than
+    /// iterated, so adding a `Stage` variant surfaces here as a compile-time
+    /// prompt to decide rather than as a silently-widened set.
+    #[test]
+    fn unattended_check_does_not_apply_outside_define_and_code() {
+        assert!(unattended_launch_check_applies(Stage::Define));
+        assert!(unattended_launch_check_applies(Stage::Code));
+        assert!(!unattended_launch_check_applies(Stage::Plan));
+        assert!(!unattended_launch_check_applies(Stage::Validate));
+        assert!(!unattended_launch_check_applies(Stage::Ship));
+
+        // A wholly NOT-viable fixture parked at a non-applicable stage still
+        // passes — the early return is what is being measured, so the fixture
+        // is deliberately one that would otherwise refuse three times over.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(80),
+            AgentKind::Codex,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.legacy_claude_launch = true;
+        for stage in [Stage::Plan, Stage::Validate, Stage::Ship] {
+            state.stage = stage;
+            assert!(
+                preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+                "stage {stage} must return before evaluating any condition"
+            );
+        }
+        state.stage = Stage::Code;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_err(),
+            "opposite-result case: the SAME fixture at an applicable stage must refuse — \
+             without this, the assertions above would also pass for a check that never \
+             refuses anything"
+        );
+    }
+
+    /// D-08: the report prints in BOTH modes, and is asserted on the bytes the
+    /// check actually emitted rather than on a re-derivation of them.
+    #[test]
+    fn unattended_check_reports_every_condition_in_both_modes() {
+        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(81));
+        state.legacy_claude_launch = true; // one condition failing, two holding
+
+        let mut auto_report = Vec::new();
+        let auto = unattended_launch_check_reporting_to(dir.path(), &state, &mut auto_report);
+        let auto_report = String::from_utf8(auto_report).unwrap();
+
+        state.mode = Mode::Supervise;
+        let mut supervise_report = Vec::new();
+        let supervise =
+            unattended_launch_check_reporting_to(dir.path(), &state, &mut supervise_report);
+        let supervise_report = String::from_utf8(supervise_report).unwrap();
+
+        assert!(auto.is_err(), "auto must refuse the failing condition");
+        assert!(supervise.is_ok(), "D-08: supervise reports and proceeds");
+
+        for report in [&auto_report, &supervise_report] {
+            assert!(
+                report.contains("unattended-launch prerequisites"),
+                "header missing from {report}"
+            );
+            assert!(
+                report.contains("GSD config can hold the chain flag"),
+                "{report}"
+            );
+            assert!(
+                report.contains("Code would launch on the pipe-owning arm"),
+                "{report}"
+            );
+            assert!(
+                report.contains("no plan declares a human-only checkpoint"),
+                "{report}"
+            );
+            assert_eq!(
+                report.lines().count(),
+                4,
+                "one header plus exactly three condition lines: {report}"
+            );
+        }
+        assert!(
+            auto_report.contains("mode auto") && supervise_report.contains("mode supervise"),
+            "the reports must differ in the one field that differs, or they are not \
+             evidence that both modes were exercised"
+        );
+    }
+
+    /// C1, NOT-viable fixture 1 of 3. An absent GSD config refuses; creating a
+    /// valid one — the single change between the two halves — passes. Without
+    /// the second half, an `Err` here could equally mean the fixture was broken
+    /// in some way that has nothing to do with the config.
+    #[test]
+    fn unattended_check_refuses_when_the_gsd_config_is_absent() {
+        let (dir, state) = viable_unattended_fixture(PhaseId::new(83));
+        let config = dir.path().join(".planning/config.json");
+        std::fs::remove_file(&config).unwrap();
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(err.contains("GSD config can hold the chain flag"), "{err}");
+        assert!(err.contains("DOES NOT HOLD"), "{err}");
+
+        std::fs::write(&config, VIABLE_GSD_CONFIG).unwrap();
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "restoring the config — the ONLY change — must make the same fixture pass"
+        );
+    }
+
+    /// C1, and the observability of the three-state design. A malformed config
+    /// is COULD NOT BE DETERMINED, not DOES NOT HOLD: unreadable and absent are
+    /// different facts and the operator's next action differs. If the two
+    /// collapsed to one label, the fourth `ConditionState` variant and the
+    /// distinction it encodes would be unobservable from outside the module.
+    #[test]
+    fn unattended_check_refuses_when_the_gsd_config_is_malformed() {
+        let (dir, state) = viable_unattended_fixture(PhaseId::new(84));
+        let config = dir.path().join(".planning/config.json");
+        std::fs::write(&config, "{ this is not json").unwrap();
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(
+            err.contains("COULD NOT BE DETERMINED"),
+            "a malformed config is undetermined, not does-not-hold: {err}"
+        );
+        assert!(
+            !err.contains("DOES NOT HOLD"),
+            "the absent-file label must not be reused for an unreadable file: {err}"
+        );
+
+        std::fs::write(&config, VIABLE_GSD_CONFIG).unwrap();
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "valid JSON — the ONLY change — must make the same fixture pass"
+        );
+    }
+
+    /// C2, NOT-viable fixture 2 of 3, and `35.1-RESEARCH.md` Pitfall 4's
+    /// accepted gap becoming a refusal. Every arm that cannot host the
+    /// chain-flag guard is walked, then the viable arm is restored.
+    #[test]
+    fn unattended_check_refuses_a_legacy_or_non_claude_launch_shape() {
+        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(85));
+
+        state.legacy_claude_launch = true;
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(err.contains("legacy launch opt-out"), "{err}");
+        assert!(
+            err.contains("Code would launch on the pipe-owning arm"),
+            "{err}"
+        );
+
+        state.legacy_claude_launch = false;
+        for agent in [AgentKind::Codex, AgentKind::OpenCode] {
+            state.agent = agent;
+            let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+            assert!(
+                err.contains(&format!("the agent is `{agent}`")),
+                "agent {agent} must be named in its own refusal: {err}"
+            );
+        }
+
+        state.agent = AgentKind::Claude;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "claude with the opt-out clear is the one viable shape and must pass"
+        );
+    }
+
+    /// C3, NOT-viable fixture 3 of 3. The two halves differ only in the plan's
+    /// gate value, which is what proves the check DISCRIMINATES between the
+    /// checkpoint class phase 35.1 makes auto-approvable and the class no mode
+    /// can approve — rather than refusing any phase that plans a checkpoint.
+    #[test]
+    fn unattended_check_refuses_a_phase_whose_plan_declares_a_human_only_checkpoint() {
+        let phase = PhaseId::new(86);
+        let (dir, state) = viable_unattended_fixture(phase);
+        write_plan_for_phase(
+            dir.path(),
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"blocking-human\">\n</task>\n",
+        );
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(
+            err.contains("no plan declares a human-only checkpoint"),
+            "{err}"
+        );
+        assert!(err.contains("rule 6"), "{err}");
+
+        write_plan_for_phase(
+            dir.path(),
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"blocking\">\n</task>\n",
+        );
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "the ordinary blocking gate — the ONLY change — is exactly what this \
+             phase makes auto-approvable and must pass"
+        );
+    }
+
+    /// Without this, "refuse on anything that is not a definite pass" would
+    /// refuse every launch made before the phase was planned, and the check
+    /// would be unusable at the stage where refusing is cheapest.
+    #[test]
+    fn unattended_check_treats_an_unplanned_phase_as_pending_at_define_and_undetermined_at_code() {
+        let phase = PhaseId::new(87);
+        let (dir, mut state) = viable_unattended_fixture(phase);
+        std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
+
+        state.stage = Stage::Define;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "an unplanned phase at Define is pending, not failing"
+        );
+
+        state.stage = Stage::Code;
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(
+            err.contains("COULD NOT BE DETERMINED"),
+            "by Code the plans should exist; their absence is an anomaly, not a pass: {err}"
+        );
+    }
+
+    /// D-08. The two halves differ by EXACTLY one field assignment, which is
+    /// what makes this a control rather than two unrelated cases. The fixture
+    /// is the most comprehensively NOT-viable one available: all three
+    /// conditions refuse.
+    #[test]
+    fn unattended_check_reports_but_does_not_refuse_in_supervise_mode() {
+        let phase = PhaseId::new(88);
+        let (dir, mut state) = viable_unattended_fixture(phase);
+        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
+        std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
+        state.legacy_claude_launch = true;
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(err.contains("GSD config can hold the chain flag"), "{err}");
+        assert!(
+            err.contains("Code would launch on the pipe-owning arm"),
+            "{err}"
+        );
+        assert!(
+            err.contains("no plan declares a human-only checkpoint"),
+            "{err}"
+        );
+
+        state.mode = Mode::Supervise; // the one and only change
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "D-08: an operator rehearsing viability must not be blocked out of a \
+             supervised run by the rehearsal"
+        );
+    }
+
+    /// F-13 / D-09. `state.yes_ship` authorizes the Ship gate and NOTHING else.
+    /// A launch-prerequisite bypass arriving through it would be D-09's
+    /// prohibition through a side door, so the non-interaction is pinned here
+    /// rather than left to the reader of `run_gate`'s signature. Mirrors
+    /// `run_preflight_major_bump_gate_not_auto_approved_by_yes_ship`.
+    #[test]
+    fn unattended_check_is_not_bypassed_by_yes_ship() {
+        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(89));
+        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
+
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_err(),
+            "precondition: the fixture must refuse before yes_ship is involved"
+        );
+        state.yes_ship = true;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_err(),
+            "yes_ship must not convert a refusal into a pass — it authorizes the \
+             Ship gate and nothing else (F-13)"
+        );
+    }
+
+    /// CR-01's property, extended to this check: an earlier failing check must
+    /// not hide this one. That is what makes `run_preflight`'s `Advance` arm
+    /// safe to skip the re-check — the human approving the gate has already
+    /// been shown every applicable reason.
+    ///
+    /// The fixture fails BOTH: Codex at Define with no CONTEXT.md on develop
+    /// trips `preflight_interactivity_check`, and Codex also trips this check's
+    /// C2 (no non-Claude agent can host the chain-flag guard).
+    #[test]
+    fn generic_preflight_checks_surfaces_the_unattended_reason_alongside_an_earlier_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        write_gsd_config(root, VIABLE_GSD_CONFIG);
+
+        let phase = PhaseId::new(90);
+        write_plan_for_phase(
+            root,
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"auto\">\n</task>\n",
+        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+
+        let err = generic_preflight_checks(root, &state).unwrap_err();
+        assert!(
+            err.contains("codex cannot run Define's"),
+            "the interactivity reason must survive aggregation: {err}"
+        );
+        assert!(
+            err.contains("Code would launch on the pipe-owning arm"),
+            "the unattended reason must survive aggregation: {err}"
+        );
+
+        // The unattended reason is ordered ahead of interactivity precisely so
+        // the 300-character cap cannot elide it (see the placement comment in
+        // `generic_preflight_checks`).
+        assert!(
+            truncate_reason(&err).contains("Code would launch on the pipe-owning arm"),
+            "{}",
+            truncate_reason(&err)
+        );
+    }
+
+    /// T-35.1-16: no reason may embed the absolute config path. The refusal
+    /// string reaches a persisted gate file and the operator's notification.
+    #[test]
+    fn unattended_refusal_reason_contains_no_absolute_path() {
+        let (dir, state) = viable_unattended_fixture(PhaseId::new(82));
+        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
+        let fixture_root = dir.path().to_string_lossy().into_owned();
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(!err.contains(&fixture_root), "{err}");
+        assert!(!err.contains("/home/"), "{err}");
+        assert!(!err.contains("/Users/"), "{err}");
+        assert!(!err.contains("/tmp/"), "{err}");
     }
 }

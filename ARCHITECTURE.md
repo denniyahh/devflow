@@ -216,7 +216,9 @@ notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD` via
 into the command string; a silent no-op when the variable is unset), then
 blocks in `Gates::poll_response()` with exponential backoff (1s → 2s → …
 capped at 60s) until a response appears or `DEVFLOW_GATE_TIMEOUT_SECS`
-(default 604800 = 7 days) elapses. `GateAction::from_response()` turns an
+(default 259200 = 3 days, held equal to
+`DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` so `devflow gate sweep` cannot reap a
+gate this poll is still watching) elapses. `GateAction::from_response()` turns an
 approval into `Advance`, a rejection into `LoopBack(Code)`, or — when the
 rejection note contains "abort" — `Abort(reason)`. `devflow gate list`
 (`Gates::list_open()`) enumerates requests with no response file yet,

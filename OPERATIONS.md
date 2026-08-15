@@ -106,10 +106,10 @@ only because a stage failed unexpectedly).
 | Variable | Default | Purpose |
 |---|---|---|
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written |
-| `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7d) | How long a monitor waits at a gate before giving up |
+| `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3d) | How long a monitor stays alive holding the phase lock while parked at a gate. Not a deadline for answering: the gate request and phase state are files that never expire, and timing out is a clean resumable stop — past it you answer the gate and run `devflow resume` instead of the answer being picked up automatically |
 | `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate (terminal-hook failure) before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
-| `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 21600 (6h) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned; independent of and much shorter than `DEVFLOW_GATE_TIMEOUT_SECS` — an unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
+| `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3d) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned. Held **equal to** `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter: `gate sweep` writes an `abort:` response, so a threshold below the poll timeout lets a sweep reap gates a live monitor is still polling — turning a clean resumable timeout into an `abort()` that clears state, machine-wide across every registered root. An unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
 | `DEVFLOW_CACHE_DIR` | unset (falls back to `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`) | Test/override hook for the machine-global registry directory (`devflow gate list --all-roots`) |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |
 | `DEVFLOW_REVIEW_ANGLES` | built-in five-angle list | Comma-separated Ship review angles; overrides `devflow.toml` |

@@ -39,3 +39,8 @@ reason = "git diff option in the README pre-push example; not a DevFlow CLI flag
 kind = "docs_to_source"
 token = "--workspace-folder"
 reason = "Dev Containers CLI option in contributor setup; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--force-unattended"
+reason = "Named in the unattended-mode guide as a flag that does NOT exist (D-09 no-override is stated as the absence of this flag); the guide's sentence is a negation, not a documentation of a real flag."

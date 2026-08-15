@@ -12,6 +12,7 @@
 
 use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::path::Path;
@@ -40,7 +41,7 @@ fn git(root: &Path, args: &[&str]) {
 /// commit, hooks disabled — the same shape `gate_sweep_e2e.rs`'s `init_repo`
 /// uses to reach a Code-stage phase whose gate a real `devflow advance`
 /// child parks on.
-fn init_repo(root: &Path, phase: u32) {
+fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
     git(root, &["config", "user.name", "DevFlow Tests"]);
@@ -51,7 +52,7 @@ fn init_repo(root: &Path, phase: u32) {
     git(root, &["add", "README.md"]);
     git(root, &["commit", "-q", "-m", "base"]);
 
-    let branch = format!("feature/phase-{phase:02}");
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     git(root, &["checkout", "-q", "-b", &branch]);
     std::fs::write(root.join("work.txt"), "agent work\n").unwrap();
     git(root, &["add", "work.txt"]);
@@ -98,7 +99,7 @@ fn e2e_child_timeout() -> Duration {
 fn wait_for_child_exit(
     child: &mut std::process::Child,
     root: &Path,
-    phase: u32,
+    phase: PhaseId,
     deadline: Duration,
 ) -> std::process::ExitStatus {
     let start = Instant::now();
@@ -133,7 +134,7 @@ fn wait_for_child_exit(
 fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 95;
+    let phase = PhaseId::new(95);
 
     init_repo(root, phase);
 
@@ -223,7 +224,7 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
 fn stop_marks_state_stopped_and_records_reason() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 96;
+    let phase = PhaseId::new(96);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
     let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -258,7 +259,7 @@ fn stop_marks_state_stopped_and_records_reason() {
 fn stop_preserves_pre_existing_stop_reason() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 97;
+    let phase = PhaseId::new(97);
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stopped = true;
@@ -291,7 +292,7 @@ fn stop_preserves_pre_existing_stop_reason() {
 fn stop_leaves_stop_until_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 98;
+    let phase = PhaseId::new(98);
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stop_until = Some(Stage::Plan);
@@ -331,7 +332,7 @@ fn stop_help_documents_phase_flag() {
 fn stop_is_idempotent_against_an_already_answered_gate() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 99;
+    let phase = PhaseId::new(99);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
     let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -375,7 +376,7 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
 fn stop_against_a_hand_written_response_is_a_success_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 100;
+    let phase = PhaseId::new(100);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
     Gates::respond(
@@ -417,7 +418,7 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
 fn stop_against_a_root_with_no_state_is_a_success() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 101;
+    let phase = PhaseId::new(101);
 
     let output = Command::new(devflow_bin())
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -440,7 +441,7 @@ fn stop_against_a_root_with_no_state_is_a_success() {
 fn stop_then_cleanup_composes_refuse_then_force() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 102;
+    let phase = PhaseId::new(102);
 
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
@@ -452,14 +453,16 @@ fn stop_then_cleanup_composes_refuse_then_force() {
     git(root, &["add", "README.md"]);
     git(root, &["commit", "-q", "-m", "base"]);
 
-    let branch = format!("feature/phase-{phase:02}");
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     git(root, &["checkout", "-q", "-b", &branch]);
     std::fs::write(root.join("work.txt"), "agent work\n").unwrap();
     git(root, &["add", "work.txt"]);
     git(root, &["commit", "-q", "-m", "agent work"]);
     git(root, &["checkout", "-q", "develop"]);
 
-    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    let wt_path = root
+        .join(".worktrees")
+        .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());

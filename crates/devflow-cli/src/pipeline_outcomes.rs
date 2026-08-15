@@ -16,13 +16,15 @@ use crate::CliError;
 use crate::config_parse::{checkout_lock_timeout, gate_timeout_secs};
 use crate::parallel::retry_after_from_reason;
 use crate::pipeline_gate::{
-    abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout, transition,
+    LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
+    transition,
 };
 use crate::pipeline_launch::launch_stage;
 use devflow_core::config::GitFlowConfig;
 use devflow_core::gates::{GateAction, GateResponse, Gates};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
@@ -87,7 +89,7 @@ pub(crate) fn gate_or_abort_infra(
 pub(crate) fn handle_rate_limited_outcome(
     project_root: &Path,
     state: &mut State,
-    phase: u32,
+    phase: PhaseId,
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
@@ -312,11 +314,165 @@ pub(crate) enum ValidateResult {
 /// the project root and are unaffected. Passing the bare `project_root` here in worktree mode
 /// makes the predicate read `false` unconditionally, which is exactly the
 /// defect this parameter's name now guards against.
-fn select_loop_back_fix(evidence_root: &Path, phase: u32) -> FixType {
-    if agent_result::phase_verification_exists(evidence_root, phase) {
+fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State) -> FixType {
+    // 999.79 / HARDEN-03: existence alone is no longer the answer. Nothing
+    // deletes, dates or invalidates `{N}-VERIFICATION.md`, so a
+    // `devflow start --phase N --force` re-run checks out a branch still
+    // carrying the PREVIOUS run's committed copy, and an existence-only probe
+    // reads that inherited file as this run's verdict.
+    //
+    // What the comparison protects against, in BOTH directions — neither
+    // failure is acceptable and only the pair of tests below distinguishes
+    // them:
+    //
+    // * Too permissive (the pre-999.79 behaviour): a forced re-run inherits a
+    //   previous run's verdict and dispatches `--gaps-only` against zero
+    //   matching plans, which gates unresolvably. That is the same unattended
+    //   stall class as DOGFOOD-01, reached from a new direction.
+    // * Too strict (an always-stale rule): `--gaps-only` never fires again.
+    //   That silently reverts what Phase 33 built and trades an unresolvable
+    //   gate for a loop that re-runs every plan in the phase, forever. It
+    //   would pass every test asserting only the stale direction.
+    let current = agent_result::phase_verification_fingerprint(evidence_root, phase);
+    // WR-06: read from the SAME evidence root immediately after the content, so
+    // the pair is one observation of one file.
+    let current_mtime = agent_result::phase_verification_mtime_nanos(evidence_root, phase);
+    // WR-05: an artifact with no captured baseline is dispatched conservatively
+    // (below), but silently doing so would leave an operator who upgraded a
+    // binary mid-phase wondering why a gaps-only pass became a full execute.
+    // Same signalling posture as IN-02's `ValidateFailureNoBaseline`, on the
+    // channel that survives the run.
+    if current.is_some() && !state.verification_baseline_captured {
+        events::emit(
+            &state.project_root.clone(),
+            phase,
+            "verification_baseline_absent",
+            serde_json::json!({
+                "dispatch": "full_execute",
+                "why": "no run-start baseline was captured for this phase's \
+                        {N}-VERIFICATION.md, so its provenance is unknown",
+            }),
+        );
+    }
+    if verification_authored_this_run(
+        (current, current_mtime),
+        (
+            state.last_verification_fingerprint,
+            state.last_verification_mtime_nanos,
+        ),
+        state.verification_baseline_captured,
+        state.verification_run_nonce,
+    ) {
+        // Record the new observation as the baseline, so a SUBSEQUENT
+        // loop-back that finds the artifact unchanged is in turn correctly
+        // treated as stale. Without this, one rewrite would mark the artifact
+        // fresh for the rest of the run.
+        //
+        // F-11: this update does NOT reach disk through the `save_state`
+        // earlier in `handle_validate_outcome` — that one runs before this
+        // point. It is persisted a few statements later, by the `save_state`
+        // inside `prepare_loop_back_to_code`, reached via the
+        // `loop_back_to_code` call on the next line at every call site. A
+        // process killed in that interval loses the update, and the
+        // consequence is NOT fail-safe: a later same-run check would then
+        // compare against the older baseline, read an unchanged artifact as
+        // fresh, and dispatch `--gaps-only` where a full execute was correct —
+        // the exact 999.79 direction this rule exists to close.
+        //
+        // The window is ACCEPTED, not closed. It spans a handful of statements
+        // with no blocking wait in it (the gate wait precedes this mutation),
+        // and the only alternative is a second `save_state` on every single
+        // loop-back — doubling the persistence cost of the common path to
+        // defend an interval a kill can barely land in. Do not add one.
+        // WR-06: both halves of the observation advance together, or the next
+        // cycle would compare a new mtime against a stale one and read every
+        // artifact as rewritten.
+        state.last_verification_fingerprint = current;
+        state.last_verification_mtime_nanos = current_mtime;
         FixType::GapsOnly
     } else {
         FixType::FullExecute
+    }
+}
+
+/// Was the phase's `{N}-VERIFICATION.md` authored during THIS run?
+///
+/// A pure predicate over the pair (`current` fingerprint, `run_start_baseline`),
+/// deliberately separated from the file read and from the [`FixType`] mapping
+/// so its four rows can be pinned by a committed, re-running test
+/// (`verification_freshness_truth_table_is_exhaustive`, H-1/T-35-22b). It must
+/// touch neither the filesystem nor [`State`] — the moment it does, the truth
+/// table stops being able to enumerate it.
+///
+/// The rows, and which over-correction each one catches:
+///
+/// * `current` is `None` — no artifact exists, so nothing was authored. The
+///   phase is mid-arc and D-01's original `FullExecute` answer stands
+///   unchanged. Catches an always-fresh rule.
+/// * `current` is `Some`, baseline is `None`, and the baseline WAS captured —
+///   an artifact exists where the run start saw none, so this run's Validate
+///   agent created it. The ordinary first-verification case. Catches an
+///   always-stale rule.
+/// * `current` is `Some`, baseline is `None`, and the baseline was NOT captured
+///   — this state file predates the field, so nobody looked (WR-05). The
+///   artifact may well be the previous run's, and reading it as this run's is
+///   the 999.79 stall. Answered "inherited", the conservative direction: a full
+///   execute is wasteful, an unresolvable gate is not recoverable.
+/// * fingerprints are EQUAL and the mtimes are equal — the artifact is
+///   byte-identical to what this run last observed AND nothing has written it
+///   since, so it was inherited from a previous run and its verdict must not be
+///   reused (999.79). Catches an always-fresh rule.
+/// * fingerprints DIFFER — Validate rewrote it during this run. Catches an
+///   always-stale rule.
+/// * fingerprints are equal but the MTIME advanced (WR-06) — an IDEMPOTENT
+///   rewrite: the agent re-authored byte-identical content on a later failing
+///   cycle. Hash-only, this read as inherited and dispatched a full execute,
+///   re-running every plan in the phase on every subsequent cycle instead of
+///   the gaps-only pass Phase 33 built. That is the "too strict" over-correction
+///   the paragraph above claims to guard against, and it did not.
+///
+/// **What this cannot establish (HARDEN-03, unclassified).** It keys on content
+/// change and mtime, and has no notion of provenance. An artifact written for
+/// any reason OTHER than this run's Validate agent — a mid-run branch switch, a
+/// worktree merge-back, an operator editing the file — reads as
+/// authored-this-run and dispatches `--gaps-only`, which is the failure
+/// direction HARDEN-03 exists to prevent. **The mtime input marginally WIDENS
+/// that exposure**: a checkout restoring byte-identical content used to read as
+/// inherited and now reads as authored. Accepted deliberately, because the case
+/// it fixes is ordinary (a deterministic verification writer on cycle 2 of an
+/// unresolved gap) while the cases it widens are exotic, and because the
+/// too-strict direction is otherwise unbounded. Establishing real provenance
+/// would need the artifact to carry a run identifier, which is a larger change
+/// than 999.79 asks for.
+fn verification_authored_this_run(
+    current: (Option<u64>, Option<u64>),
+    dispatch_baseline: (Option<u64>, Option<u64>),
+    baseline_captured: bool,
+    validate_dispatch_nonce: Option<u64>,
+) -> bool {
+    // 35.2 D-01: a missing nonce means DevFlow never stamped a Validate
+    // dispatch for this state. Return false so the dispatch is FullExecute.
+    if validate_dispatch_nonce.is_none() {
+        return false;
+    }
+    let (current_hash, current_mtime) = current;
+    let (baseline_hash, baseline_mtime) = dispatch_baseline;
+    // WR-06. Compared ONLY when both readings exist: an mtime is unavailable on
+    // a platform without `modified()`, on unreadable metadata, or past year
+    // 2554, and `Some != None` would then read as "written since" on every
+    // single cycle. Absent either half this degrades to content alone, which is
+    // the pre-WR-06 behaviour rather than a new failure mode.
+    let written_since_baseline = match (current_mtime, baseline_mtime) {
+        (Some(now), Some(baseline)) => now != baseline,
+        _ => false,
+    };
+    match (current_hash, baseline_hash) {
+        (None, _) => false,
+        // WR-05: `baseline_captured` is what separates "the run looked and
+        // found nothing" from "this state predates the field, so nobody
+        // looked". Only the first licenses reading the artifact as this run's.
+        (Some(_), None) => baseline_captured,
+        (Some(now), Some(baseline)) => now != baseline || written_since_baseline,
     }
 }
 
@@ -334,10 +490,23 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32) -> FixType {
 /// what Validate reported. This narrows the ceiling's guarantee to loops that
 /// produce no commits at all; it does not disable the ceiling. That is the
 /// accepted weakness of the commit-count signal recorded in
-/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1. The failure
-/// direction is toward gating: an unrunnable `git` or a missing branch counts
-/// zero every cycle, so once a baseline is recorded the counter accumulates
-/// and the gate stays reachable.
+/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1.
+///
+/// 999.77: this comment used to claim the failure direction was toward gating,
+/// on the grounds that an unrunnable `git` "counts zero every cycle" so the
+/// counter accumulates. **That guarantee held only while `git` stayed broken,
+/// and was false for exactly one transient failure — the likelier event.** One
+/// unmeasurable cycle wrote a `Some(0)` baseline; the next real count then
+/// exceeded it, read as forward progress, and reset the streak to 1, buying a
+/// free extension of the [`mode::MAX_CONSECUTIVE_FAILURES`] ceiling.
+///
+/// The guarantee the code now delivers instead: a cycle whose count could not
+/// be measured — [`agent_result::phase_commit_count`] returning `None` — is
+/// treated as not-progress AND leaves the recorded baseline untouched, so the
+/// next real measurement is compared against the last real observation. A
+/// single transient fault can no longer buy a reset. What is still NOT claimed
+/// is anything about the run boundary: `State::new` zeroes both the counter
+/// and the baseline on every `devflow start`, `--force` included.
 ///
 /// CR-01: the two root-consuming reads in this function are on deliberately
 /// **different** roots, and must stay that way. The `{N}-VERIFICATION.md`
@@ -386,8 +555,11 @@ pub(crate) fn handle_validate_outcome(
                 GateAction::Advance => transition(project_root, state, Stage::Ship),
                 GateAction::LoopBack(_) => {
                     // Evidence root: see the single binding at the top.
-                    let fix = select_loop_back_fix(&evidence_root, state.phase);
-                    loop_back_to_code(project_root, state, fix)
+                    let fix = select_loop_back_fix(&evidence_root, state.phase, state);
+                    // A human adjudicated an ambiguous outcome; no commit
+                    // baseline was consulted, so this arm makes no claim
+                    // about one.
+                    loop_back_to_code(project_root, state, fix, LoopBackReason::GateResponse)
                 }
                 GateAction::Abort(reason) => abort(project_root, state, &reason),
             };
@@ -396,51 +568,179 @@ pub(crate) fn handle_validate_outcome(
         ValidateOutcome::Failed => ValidateResult::Failed,
     };
 
+    // IN-02: read BEFORE the recording below, which sets the baseline to
+    // `Some(current)` on its measured arm and would erase the distinction
+    // within the same call. `None` here means no commit baseline existed when
+    // this failure was recorded — a genuine first failure of the phase, or
+    // state resumed from a binary predating the baseline field. Either way the
+    // failure budget is at its full width, which is the fact the event stream
+    // did not carry.
+    let baseline_absent = state.last_validate_failure_commit_count.is_none();
+
     if result == ValidateResult::Failed {
-        let current =
-            agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase);
-        if mode::consecutive_failures_made_progress(
-            state.last_validate_failure_commit_count,
-            current,
-        ) {
-            // New commits landed since the last recorded failure — this
-            // failure is the first of a new streak, not a continuation. Set
-            // to 1, not 0: the gate context rendered below interpolates the
-            // counter into a message naming how many times validation has
-            // failed, and zeroing it would make that message read zero on a
-            // real failure.
-            state.consecutive_failures = 1;
-        } else {
-            // Now that the counter genuinely accumulates (18d), an unbounded
-            // loop could otherwise overflow it and wrap to 0, silently
-            // restoring the unreachable-ceiling bug in a slower form.
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        // 999.78/WR-01 (D-07): the per-phase total accumulates on EVERY
+        // recorded failure — including the arm below where the commit count
+        // could not be measured, because a failure is a failure whether or
+        // not it could be counted. Placed here, once, ahead of the
+        // measured/unmeasured split, so neither arm can record a failure
+        // without it and neither can record one twice.
+        //
+        // Saturating, like every other counter on `State`: an unbounded loop
+        // that wrapped this to zero would silently restore an exhausted
+        // budget, which is the same unreachable-ceiling class of bug 18d
+        // fixed for `consecutive_failures`, just slower to show up.
+        //
+        // Unlike `consecutive_failures` below, nothing in this function ever
+        // resets it — a commit count cannot clear it, which is the whole
+        // point: the Code stage's fix command is a GSD command that commits
+        // `.planning/` artifacts on cycles that changed no source.
+        state.phase_validate_failures = state.phase_validate_failures.saturating_add(1);
+        match agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase)
+        {
+            Some(current) => {
+                if mode::consecutive_failures_made_progress(
+                    state.last_validate_failure_commit_count,
+                    current,
+                ) {
+                    // New commits landed since the last recorded failure —
+                    // this failure is the first of a new streak, not a
+                    // continuation. Set to 1, not 0: the gate context rendered
+                    // below interpolates the counter into a message naming how
+                    // many times validation has failed, and zeroing it would
+                    // make that message read zero on a real failure.
+                    state.consecutive_failures = 1;
+                } else {
+                    // Now that the counter genuinely accumulates (18d), an
+                    // unbounded loop could otherwise overflow it and wrap to
+                    // 0, silently restoring the unreachable-ceiling bug in a
+                    // slower form.
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                }
+                // The baseline advances on every recorded failure whose count
+                // was actually MEASURED, regardless of which branch ran above
+                // — updating it only on the progress branch would let a stale
+                // low baseline report progress forever.
+                state.last_validate_failure_commit_count = Some(current);
+            }
+            // 999.77 / A-04: the count could not be measured. Treat the cycle
+            // as not-progress — an absent measurement is not evidence that
+            // work landed — and, crucially, do NOT touch the baseline. Writing
+            // a forged zero here is the defect: the next successful
+            // measurement would then compare a real count against that zero,
+            // read it as forward progress, and hand back one free reset of the
+            // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
+            // means the next real measurement compares against the last real
+            // observation.
+            //
+            // `mode::consecutive_failures_made_progress` is deliberately not
+            // called on this arm and its signature is deliberately not widened
+            // — there is no count to compare.
+            None => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
         }
-        // The baseline advances on every recorded failure regardless of
-        // which branch ran above — updating it only on the progress branch
-        // would let a stale low baseline report progress forever.
-        state.last_validate_failure_commit_count = Some(current);
+        workflow::save_state(state)?;
+        // 35.2: stamp the nonce on every Validate failure so the
+        // loop-back cycle below sees it. launch_stage_inner stamps on
+        // the launch path; this stamps on the already-running path
+        // where launch_stage_inner already ran for THIS dispatch.
+        state.verification_run_nonce =
+            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
         workflow::save_state(state)?;
     }
 
-    if state
-        .mode
-        .should_gate(Stage::Validate, state.consecutive_failures)
-    {
+    // F-6: read ONCE, and used for both the message's ceiling clause and the
+    // reset below, so the two can never disagree about whether this gate was a
+    // ceiling gate. Read AFTER the increment above, so it reflects the failure
+    // being handled right now.
+    //
+    // Deliberately NOT "did a gate fire": `Stage::Validate` + `Mode::Supervise`
+    // gates unconditionally, so in Supervise the two conditions overlap
+    // completely. A reset keyed on gating would clear the total at every
+    // Supervise failure, the accumulation would never be observable, and the
+    // bound would be defeated in exactly the mode where an operator watches
+    // every occurrence.
+    let ceiling_gate = mode::phase_failure_ceiling_reached(state.phase_validate_failures);
+
+    if state.mode.should_gate(
+        Stage::Validate,
+        state.consecutive_failures,
+        state.phase_validate_failures,
+    ) {
         let context = match result {
-            ValidateResult::Passed => "Validation passed — approve to ship?".to_string(),
-            ValidateResult::Failed => format!(
-                "Validation failed {} time(s) — human review needed.",
-                state.consecutive_failures
-            ),
+            // WR-04 (35-REVIEW): the ceiling clause belongs in BOTH arms.
+            // `ceiling_gate` and `should_gate` are evaluated regardless of
+            // `result`, and `Mode::should_gate` puts the ceiling predicate
+            // ahead of its per-mode match — so once the budget is exhausted a
+            // *passing* Validate gates too, including in Auto. Without the
+            // clause the whole context read "Validation passed — approve to
+            // ship?", and an operator running unattended-Auto saw a gate this
+            // mode is not supposed to fire on a pass, with nothing explaining
+            // why; answering it then spent the accumulated budget.
+            //
+            // Explaining the gate rather than suppressing it (D-07's "gate,
+            // do not abort" posture): a phase that burned the whole budget
+            // before passing is exactly the one worth a human look before it
+            // ships, and removing an operator checkpoint is the riskier of the
+            // two directions the review offered.
+            ValidateResult::Passed => {
+                let mut message = "Validation passed — approve to ship?".to_string();
+                if ceiling_gate {
+                    message.push_str(&format!(
+                        " (This phase recorded {} Validate failure(s), at the per-phase ceiling of {} — that is why this gate fired. Answering it restarts the count.)",
+                        state.phase_validate_failures,
+                        mode::MAX_PHASE_VALIDATE_FAILURES
+                    ));
+                }
+                message
+            }
+            // WR-04: the CUMULATIVE per-phase total leads, and is named as a
+            // per-phase quantity. The streak follows as a clearly subordinate
+            // parenthetical. The complaint being fixed is that the old text
+            // interpolated only the streak, so in Supervise mode — where every
+            // Validate gates — it read "Validation failed 1 time(s)" at the
+            // 2nd, 5th and 9th gate alike, in the one mode where a human sees
+            // every occurrence. A reader must not be able to mistake the
+            // secondary number for the headline.
+            ValidateResult::Failed => {
+                let mut message = format!(
+                    "Validation has failed {} time(s) for this phase ({} in the current consecutive streak) — human review needed.",
+                    state.phase_validate_failures, state.consecutive_failures
+                );
+                // F-6: conditioned on the ceiling PREDICATE read directly
+                // against the total — never on "a gate fired". In Supervise
+                // every Validate gates, so a gate-keyed clause would appear on
+                // every message and carry no information at all. The
+                // comparison is not re-derived here; there is exactly one
+                // implementation of it, in `mode`, read once into
+                // `ceiling_gate` above.
+                if ceiling_gate {
+                    message.push_str(&format!(
+                        " The per-phase ceiling of {} is reached: this run is paused for a human, not aborted — approve to ship, reject to loop back for another pass, or abort.",
+                        mode::MAX_PHASE_VALIDATE_FAILURES
+                    ));
+                }
+                message
+            }
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
-            GateAction::Advance => transition(project_root, state, Stage::Ship),
+            // D-07: the ceiling fires a gate and the run stays alive. Every
+            // arm below is the same set of choices an ordinary Validate gate
+            // offers — reaching the ceiling adds no abort path, because
+            // aborting is destructive and irreversible relative to gating and
+            // would kill a phase that may be one cycle from converging.
+            GateAction::Advance => {
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
+                transition(project_root, state, Stage::Ship)
+            }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
-                let fix = select_loop_back_fix(&evidence_root, state.phase);
-                loop_back_to_code(project_root, state, fix)
+                let fix = select_loop_back_fix(&evidence_root, state.phase, state);
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
+                loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
+            // No reset on abort: the phase is ending and `abort` clears its
+            // state outright, so there is no budget left to restore.
             GateAction::Abort(reason) => abort(project_root, state, &reason),
         };
     }
@@ -451,9 +751,74 @@ pub(crate) fn handle_validate_outcome(
             // The plain-Failed tail arm — the common auto-loop path, and the
             // one the Phase 29 dogfood actually hit. Evidence root: see the
             // single binding at the top.
-            let fix = select_loop_back_fix(&evidence_root, state.phase);
-            loop_back_to_code(project_root, state, fix)
+            let fix = select_loop_back_fix(&evidence_root, state.phase, state);
+            loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
         }
+    }
+}
+
+/// A-11 reset event two: a human answered the CEILING gate by advancing or
+/// looping back, so the per-phase budget starts again (999.78, D-07).
+///
+/// `ceiling_gate` is the caller's single read of
+/// `mode::phase_failure_ceiling_reached`, passed in rather than recomputed so
+/// this reset and the message's ceiling clause cannot disagree about whether
+/// the gate just answered was a ceiling gate.
+///
+/// The caller must never pass "a gate fired" here. Supervise gates on every
+/// Validate, so that would clear the total at every failure and the bound
+/// would never accumulate at all — an unbounded loop wearing a gate on every
+/// cycle. The persisting write is the caller's: both arms that call this go on
+/// to `transition` or `loop_back_to_code`, each of which saves state.
+///
+/// # Why the reset announces itself (WR-03, WR-04, 35-REVIEW)
+///
+/// This runs BEFORE `loop_back_to_code`, and `prepare_loop_back_to_code` reads
+/// `state.phase_validate_failures` for both its `loop_back` event and its
+/// console line. Those therefore report `0` — correctly, since the budget by
+/// then really is zero, but it left the one moment in the run that should mark
+/// the ceiling being reached with no record of the number that was reached.
+/// The `Advance` arm was worse: nothing at all marked the reset.
+///
+/// So the pre-reset total is reported here, at the moment it is spent, on both
+/// channels. The alternative the review proposed — moving the reset after
+/// `loop_back_to_code` and adding a `save_state` — is NOT taken, and the reason
+/// is specific: `loop_back_to_code` reaches `run_preflight`, which can `abort()`
+/// (clearing the phase's state file) and return `Ok(false)`, so a following
+/// `save_state` would resurrect the state file of an aborted phase as a phantom
+/// active run. Reporting rather than reordering keeps the existing single
+/// persisting write.
+fn reset_phase_failures_at_ceiling(project_root: &Path, state: &mut State, ceiling_gate: bool) {
+    if !ceiling_gate {
+        return;
+    }
+    let spent = state.phase_validate_failures;
+    state.phase_validate_failures = 0;
+    events::emit(
+        project_root,
+        state.phase,
+        "phase_failure_budget_reset",
+        serde_json::json!({
+            "phase_validate_failures_before": spent,
+            "ceiling": mode::MAX_PHASE_VALIDATE_FAILURES,
+        }),
+    );
+    println!(
+        "per-phase Validate-failure budget reset: {spent} failure(s) recorded, \
+         ceiling {} reached and answered by a human — the count restarts at zero",
+        mode::MAX_PHASE_VALIDATE_FAILURES
+    );
+}
+
+/// IN-02: map "was there a commit baseline when this Validate failure was
+/// recorded" onto the loop-back reason, in one place, so the gated arm and the
+/// ungated tail arm cannot disagree about a fact they both observed from the
+/// same binding.
+fn loop_back_reason(baseline_absent: bool) -> LoopBackReason {
+    if baseline_absent {
+        LoopBackReason::ValidateFailureNoBaseline
+    } else {
+        LoopBackReason::ValidateFailure
     }
 }
 
@@ -482,7 +847,12 @@ pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Res
         auto_response.as_ref(),
     )? {
         GateAction::Advance => finish_workflow(project_root, state),
-        GateAction::LoopBack(_) => loop_back_to_code(project_root, state, FixType::GapsOnly),
+        GateAction::LoopBack(_) => loop_back_to_code(
+            project_root,
+            state,
+            FixType::GapsOnly,
+            LoopBackReason::GateResponse,
+        ),
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
 }
@@ -570,7 +940,14 @@ pub(crate) fn handle_ship_failure(
     reason: Option<String>,
 ) -> Result<(), CliError> {
     if is_ship_review_failure(&reason) {
-        return loop_back_to_code(project_root, state, FixType::AuditFix);
+        // A Ship review rejection, not a Validate failure — the commit-count
+        // baseline plays no part in this decision, so it makes no claim.
+        return loop_back_to_code(
+            project_root,
+            state,
+            FixType::AuditFix,
+            LoopBackReason::GateResponse,
+        );
     }
     handle_stage_failure(project_root, state, Stage::Ship, reason)
 }
@@ -750,7 +1127,12 @@ mod tests {
             std::env::set_var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS", "0");
         }
 
-        let state = State::new(33, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let state = State::new(
+            PhaseId::new(33),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
@@ -762,7 +1144,7 @@ mod tests {
             !root.join("CHANGELOG.md").exists(),
             "hooks must not run while the checkout lock is held elsewhere"
         );
-        let last = devflow_core::events::last_event_for_phase(root, 33)
+        let last = devflow_core::events::last_event_for_phase(root, PhaseId::new(33))
             .expect("skip must be recorded in events.jsonl");
         assert_eq!(last["event"], "hook_run");
         assert_eq!(last["ok"], false);
@@ -774,7 +1156,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let phase = 34;
+        let phase = PhaseId::new(34);
         let branch = "feature/phase-34";
         let git = |args: &[&str]| {
             let output = devflow_core::test_support::git_command(root)
@@ -815,8 +1197,8 @@ mod tests {
         let root = dir.path();
         init_repo_no_version_file(root);
 
-        let phase = 47;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(47);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let git = |args: &[&str]| {
             let output = devflow_core::test_support::git_command(root)
                 .args(args)
@@ -880,7 +1262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 22;
+        let phase = PhaseId::new(22);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
@@ -931,7 +1313,7 @@ mod tests {
     /// must never fire from a unit test (see `ship_review_failed_loops_to_code`).
     fn drive_validate_advance_and_read_gate_context(
         root: &Path,
-        phase: u32,
+        phase: PhaseId,
         consecutive_failures: u32,
         verdict_json: Option<&str>,
     ) -> String {
@@ -998,12 +1380,12 @@ mod tests {
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
             root,
-            60,
+            PhaseId::new(60),
             mode::MAX_CONSECUTIVE_FAILURES - 1,
             Some("gaps"),
         );
         assert!(
-            context.contains("Validation failed"),
+            context.contains("Validation has failed"),
             "a gaps verdict must be treated as a failed validation, not a pass: {context}"
         );
     }
@@ -1018,12 +1400,12 @@ mod tests {
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
             root,
-            61,
+            PhaseId::new(61),
             mode::MAX_CONSECUTIVE_FAILURES - 1,
             None,
         );
         assert!(
-            context.contains("Validation failed"),
+            context.contains("Validation has failed"),
             "a missing verdict must be treated as a failed validation, not a pass: {context}"
         );
     }
@@ -1040,7 +1422,7 @@ mod tests {
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
             root,
-            62,
+            PhaseId::new(62),
             mode::MAX_CONSECUTIVE_FAILURES,
             Some("pass"),
         );
@@ -1066,7 +1448,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 90;
+        let phase = PhaseId::new(90);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1118,7 +1500,7 @@ mod tests {
     fn external_verify_disagreement_gates_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 91;
+        let phase = PhaseId::new(91);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1162,7 +1544,7 @@ mod tests {
     fn external_verify_no_verdict_gates_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 92;
+        let phase = PhaseId::new(92);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1480,7 +1862,7 @@ mod tests {
         // `external_verify_disagreement_gates_immediately`).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1517,7 +1899,7 @@ mod tests {
     fn resource_killed_on_code_bumps_infra_failures_not_consecutive_failures() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 73;
+        let phase = PhaseId::new(73);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
 
@@ -1556,7 +1938,7 @@ mod tests {
     fn resource_killed_on_validate_bumps_infra_not_consecutive_failures() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 74;
+        let phase = PhaseId::new(74);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = 2;
@@ -1591,7 +1973,7 @@ mod tests {
     fn infra_ceiling_aborts_instead_of_gating() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 75;
+        let phase = PhaseId::new(75);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
@@ -1641,7 +2023,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 81;
+        let phase = PhaseId::new(81);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -1677,9 +2059,11 @@ mod tests {
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "reaching the ceiling must force the Auto-mode Validate gate"
         );
         assert_eq!(
@@ -1714,7 +2098,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 87;
+        let phase = PhaseId::new(87);
         init_repo(root);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -1759,9 +2143,11 @@ mod tests {
             "a new commit before every failure must restart the streak at 1, not accumulate it"
         );
         assert!(
-            !state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            !state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "genuine forward progress must never force the Auto-mode Validate gate"
         );
     }
@@ -1790,7 +2176,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 88;
+        let phase = PhaseId::new(88);
         init_repo(root);
         // Establish the branch with a stable, non-zero commit count. No
         // further commits land during the loop below.
@@ -1831,11 +2217,1173 @@ mod tests {
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
         );
+    }
+
+    /// 999.77 / HARDEN-01, ROADMAP criterion 1 — **the two-cycle
+    /// discriminating sequence, and nothing less.**
+    ///
+    /// A single transient `git` fault used to buy one free reset of the
+    /// [`mode::MAX_CONSECUTIVE_FAILURES`] ceiling. The mechanism needs two
+    /// cycles to become visible, which is why a one-cycle test is a proxy
+    /// (NC-3) rather than weak coverage:
+    ///
+    ///   - **Cycle 1** — `git` cannot run. Pre-fix, `phase_commit_count`
+    ///     collapsed that to `0` and the unconditional baseline write recorded
+    ///     `Some(0)`. The streak still incremented, so a test that stopped
+    ///     here would look green against the buggy code.
+    ///   - **Cycle 2** — `git` runs and reports the SAME real count as before
+    ///     (nothing was committed between the cycles). Compared against the
+    ///     forged `Some(0)` baseline, `1 > 0` reads as forward progress, and
+    ///     the streak resets to 1. That reset is the defect, and it is only
+    ///     observable from the second cycle.
+    ///
+    /// Exactly two things vary across the cycles: whether `git` can be
+    /// executed, and nothing else. The commit count itself is held constant at
+    /// a real, non-zero value throughout, so a green result here cannot be
+    /// explained by the branch changing underneath the test.
+    ///
+    /// **`NoGitPath` for cycle 1, `NeutralPath` for cycle 2.** Cycle 1 needs
+    /// `git` to be UNRESOLVABLE — only a spawn that fails makes `.output()`
+    /// return `Err`, which is the sole could-not-measure condition (F-1); a
+    /// shim that ran and exited non-zero would be a real observation and would
+    /// exercise the already-correct `Some(0)` path (NC-4). Cycle 2 needs a
+    /// real `git` but still no resolvable agent CLI, which is exactly what
+    /// `NeutralPath`'s git-only `PATH` provides.
+    ///
+    /// **What this does NOT establish.** The run boundary. `State::new` zeroes
+    /// both `consecutive_failures` and the baseline on every `devflow start
+    /// --force`, and nothing here shows the streak surviving a restart.
+    #[test]
+    fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(89);
+        init_repo(root);
+        // One real commit on the feature branch, and no further commits for
+        // the rest of this test: the REAL count is a stable, non-zero 1.
+        commit_on_feature_branch(root, phase, "seed");
+        // C4 (review): `handle_validate_outcome` persists via
+        // `workflow::save_state`, which routes through `write_state_atomic` ->
+        // `ensure_devflow_dir` (a `create_dir_all`), so this directory is not
+        // strictly required. Created anyway, matching the sibling fixtures
+        // that already do so — it costs one line and stops this test's
+        // correctness depending on a detail two crates away.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        // A real baseline from a real prior observation — one commit seen at
+        // the last recorded failure, one failure already on the streak.
+        state.last_validate_failure_commit_count = Some(1);
+        state.consecutive_failures = 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        let seed_gate_response = || {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        };
+        seed_gate_response();
+
+        // CYCLE 1 — the measurement fails. The guard wraps exactly this call
+        // and nothing else.
+        {
+            let _no_git = NoGitPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        assert_eq!(
+            state.last_validate_failure_commit_count,
+            Some(1),
+            "a cycle whose commit count could NOT be measured must leave the baseline \
+             byte-identical to the last real observation — overwriting it with a forged \
+             zero is 999.77 itself"
+        );
+        assert_eq!(
+            state.consecutive_failures, 2,
+            "an unmeasurable count is not evidence of forward progress, so the streak \
+             must continue rather than restart"
+        );
+
+        // The loop-back moved the stage to Code and cleaned up the Validate
+        // gate; restore both so cycle 2 is the same shape as cycle 1.
+        state.stage = Stage::Validate;
+        seed_gate_response();
+
+        // CYCLE 2 — `git` runs again and reports the same real count as
+        // before. Nothing was committed in between, so this is not progress.
+        {
+            let _neutral = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        assert_ne!(
+            state.consecutive_failures, 1,
+            "the streak must never be reset to 1 by this sequence — that reset is the \
+             one free ceiling reset a single transient git fault used to buy"
+        );
+        assert_eq!(
+            state.consecutive_failures, 3,
+            "failure-with-an-unmeasurable-count followed by \
+             failure-with-an-unchanged-real-count must accumulate"
+        );
+        assert!(
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
+            "the human gate must stay reachable across a transient git fault"
+        );
+    }
+
+    /// The loop-back gate response used by the 999.78 tests below. Deliberately
+    /// NOT the `"abort: test cleanup"` note the older fixtures use:
+    /// `GateAction::from_response` routes any note containing `abort` to
+    /// `GateAction::Abort`, which clears the phase's state — and "the run
+    /// stays alive" (D-07) is exactly what these tests have to observe.
+    const LOOP_BACK_RESPONSE: &str =
+        r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#;
+
+    /// Read the context string of the most recent `gate_fired` event. Read from
+    /// `events.jsonl` rather than from the gate file, because
+    /// `prepare_loop_back_to_code` deletes the gate file on its way back to
+    /// Code — a fixture reading the file would be racing its own cleanup.
+    fn last_gate_context(root: &Path, phase: PhaseId) -> Option<String> {
+        devflow_core::events::last_event_of_kind_for_phase(root, phase, "gate_fired")
+            .and_then(|event| event["context"].as_str().map(str::to_string))
+    }
+
+    /// 999.78/WR-01, ROADMAP criterion 2 — **the bound the commit-count
+    /// progress check cannot defeat.**
+    ///
+    /// Every cycle lands a real new commit before the failure is recorded, so
+    /// `consecutive_failures_made_progress` reports progress and the streak
+    /// resets to 1 on every single cycle. `MAX_CONSECUTIVE_FAILURES` is
+    /// therefore unreachable by construction here — which is not an
+    /// adversarial hypothetical: the Code stage's fix command is a GSD command
+    /// that commits `.planning/` artifacts on cycles that changed no source.
+    /// The per-phase total is the only thing that can bound this loop.
+    ///
+    /// Three things are asserted, and the third is the one that distinguishes
+    /// D-07's gate from the abort D-07 rejected:
+    ///
+    ///   1. no gate fires on any cycle below the ceiling — asserted every
+    ///      cycle, not merely at the end, so a gate firing early for some
+    ///      unrelated reason cannot pass unnoticed;
+    ///   2. a gate DOES fire on the cycle that reaches the ceiling, and its
+    ///      context names the ceiling — a bare "a gate fired" would also be
+    ///      satisfied by a gate fired for any other cause;
+    ///   3. the phase's persisted state still exists afterwards. The run is
+    ///      paused for a human, not aborted, and its work is not discarded.
+    #[test]
+    fn phase_validate_failure_ceiling_gates_despite_trivial_commit_progress() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(90);
+        init_repo(root);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for cycle in 1..=mode::MAX_PHASE_VALIDATE_FAILURES {
+            // One trivial commit per cycle — the whole premise of 999.78.
+            commit_on_feature_branch(root, phase, &format!("trivial-{cycle}"));
+            // Re-seeded every iteration: `prepare_loop_back_to_code` cleans up
+            // the Validate gate on every ordinary loop-back, which deletes a
+            // response written only once up front.
+            std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+            state.stage = Stage::Validate;
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+            assert_eq!(
+                state.consecutive_failures, 1,
+                "cycle {cycle}: a new commit before every failure resets the streak, so the \
+                 streak ceiling is unreachable here — if this is not 1 the test is no longer \
+                 exercising the case 999.78 exists for"
+            );
+
+            if cycle < mode::MAX_PHASE_VALIDATE_FAILURES {
+                assert_eq!(
+                    state.phase_validate_failures, cycle,
+                    "cycle {cycle}: the per-phase total must accumulate once per recorded failure"
+                );
+                assert!(
+                    last_gate_context(root, phase).is_none(),
+                    "cycle {cycle}: no gate may fire below the per-phase ceiling"
+                );
+            }
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let context = last_gate_context(root, phase)
+            .expect("reaching the per-phase ceiling must fire a Validate gate");
+        assert!(
+            context.contains(&format!(
+                "The per-phase ceiling of {} is reached",
+                mode::MAX_PHASE_VALIDATE_FAILURES
+            )),
+            "the gate that fires at the ceiling must say so: {context}"
+        );
+        assert!(
+            devflow_core::workflow::state_path(root, phase).exists(),
+            "D-07: the ceiling fires a gate and the run STAYS ALIVE — persisted state for the \
+             phase must survive. A test asserting only that a gate fired cannot tell gating \
+             from aborting"
+        );
+    }
+
+    /// WR-04: the gate message leads with the cumulative per-phase total, names
+    /// it as a per-phase quantity, and relegates the streak to a subordinate
+    /// clause.
+    ///
+    /// Supervise mode, because that is where the complaint lives: every
+    /// Validate gates, so a human sees every occurrence, and the old text —
+    /// interpolating only the streak — read "Validation failed 1 time(s)" at
+    /// the 2nd, 5th and 9th gate alike. A new commit lands before every
+    /// failure, so the streak is pinned at 1 while the total climbs; the two
+    /// numbers therefore genuinely differ at the later gate rather than
+    /// coinciding by accident.
+    ///
+    /// The `assert_ne!` on the two contexts is the load-bearing one: under the
+    /// old message both gates produced byte-identical text, which is the defect
+    /// itself and not a proxy for it.
+    #[test]
+    fn validate_gate_message_leads_with_the_per_phase_total() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(91);
+        init_repo(root);
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let mut first_gate_context = String::new();
+        for cycle in 1..=5 {
+            commit_on_feature_branch(root, phase, &format!("trivial-{cycle}"));
+            std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+            state.stage = Stage::Validate;
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            if cycle == 1 {
+                first_gate_context = last_gate_context(root, phase)
+                    .expect("Supervise gates on every Validate failure");
+            }
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let fifth_gate_context =
+            last_gate_context(root, phase).expect("the fifth failure must also gate in Supervise");
+
+        assert_ne!(
+            first_gate_context, fifth_gate_context,
+            "WR-04: the 1st and 5th Supervise gate must not read identically — that identity \
+             IS the defect"
+        );
+
+        let total_clause = "5 time(s) for this phase";
+        let streak_clause = "(1 in the current consecutive streak)";
+        let total_at = fifth_gate_context.find(total_clause).unwrap_or_else(|| {
+            panic!(
+                "the total must be reported and named as a per-phase quantity: {fifth_gate_context}"
+            )
+        });
+        let streak_at = fifth_gate_context.find(streak_clause).unwrap_or_else(|| {
+            panic!("the streak must still appear, as a subordinate clause: {fifth_gate_context}")
+        });
+        assert!(
+            total_at < streak_at,
+            "the cumulative total must LEAD the message, ahead of the streak: {fifth_gate_context}"
+        );
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "the streak must genuinely differ from the total here, or the ordering assertion \
+             above is comparing a number against itself"
+        );
+    }
+
+    /// F-6's control: the ceiling clause is keyed on the ceiling PREDICATE, not
+    /// on the fact that a gate fired.
+    ///
+    /// **Supervise is the mode this must be written in.** `should_gate` returns
+    /// true for every `Stage::Validate` in Supervise, so a gate fires at both
+    /// points below and "a gate fired" carries no information about why. An
+    /// implementation that conditioned the ceiling clause on gating would
+    /// stamp it on every message here — and the same version of this test
+    /// written in Auto mode would pass against exactly that bug, because in
+    /// Auto the below-ceiling case does not gate at all and its message is
+    /// never produced.
+    #[test]
+    fn ceiling_clause_appears_only_at_the_ceiling_even_in_supervise_mode() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(92);
+        init_repo(root);
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        let ceiling_clause = format!(
+            "The per-phase ceiling of {} is reached",
+            mode::MAX_PHASE_VALIDATE_FAILURES
+        );
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // BELOW the ceiling. This gates — Supervise always does — so the
+        // message exists to be inspected.
+        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        let below = last_gate_context(root, phase).expect("Supervise gates on every Validate");
+
+        // AT the ceiling: one more recorded failure takes the total to the
+        // ceiling exactly.
+        state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        state.stage = Stage::Validate;
+        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        let at = last_gate_context(root, phase).expect("the ceiling failure must also gate");
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            !below.contains(&ceiling_clause),
+            "a below-ceiling Supervise gate must NOT carry the ceiling clause — if it does, the \
+             clause is keyed on gating rather than on the predicate: {below}"
+        );
+        assert!(
+            at.contains(&ceiling_clause),
+            "the gate at the ceiling must carry the ceiling clause: {at}"
+        );
+    }
+
+    /// IN-02: a Validate failure recorded while no commit baseline exists emits
+    /// a different `loop_back` reason from one recorded against an existing
+    /// baseline.
+    ///
+    /// Both halves run in the same test and against the same phase, so the
+    /// only thing that varies between them is the baseline —
+    /// `last_validate_failure_commit_count` is `None` on the first failure and
+    /// `Some(_)` on the second, written by the first. A test asserting only
+    /// that the first reason is the no-baseline string would pass against an
+    /// implementation that emitted that string unconditionally.
+    #[test]
+    fn loop_back_reason_is_distinct_when_no_commit_baseline_exists() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(93);
+        init_repo(root);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        assert_eq!(
+            state.last_validate_failure_commit_count, None,
+            "the first half's premise: no baseline recorded for this phase"
+        );
+        workflow::save_state(&state).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        let without_baseline =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+                .expect("an ungated Auto failure loops back")["reason"]
+                .as_str()
+                .expect("the loop_back event must carry a reason")
+                .to_string();
+
+        assert!(
+            state.last_validate_failure_commit_count.is_some(),
+            "the second half's premise: the first failure recorded a baseline"
+        );
+        state.stage = Stage::Validate;
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        let with_baseline =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+                .expect("the second failure also loops back")["reason"]
+                .as_str()
+                .expect("the loop_back event must carry a reason")
+                .to_string();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_ne!(
+            without_baseline, with_baseline,
+            "IN-02: the absent-baseline case must be distinguishable in events.jsonl"
+        );
+        assert_eq!(without_baseline, "validate_failure_no_commit_baseline");
+        assert_eq!(with_baseline, "validate_failure");
+    }
+
+    /// A-11 reset event TWO: operator approval at the CEILING gate clears the
+    /// per-phase budget — and an ordinary below-ceiling gate does not.
+    ///
+    /// **Both halves run in Supervise, and that is load-bearing.** In Auto a
+    /// below-ceiling Validate failure does not gate at all, so the second half
+    /// would pass without ever exercising the discrimination — it would prove
+    /// only that a gate that never fired did not reset anything. Supervise
+    /// gates on EVERY Validate, so both halves reach a real gate answered by a
+    /// real response, and the only thing that differs between them is whether
+    /// the ceiling predicate is true.
+    ///
+    /// Without the second half, an implementation that reset on every gate
+    /// would pass — and that implementation is the T-35-20b defect: the total
+    /// would never accumulate in the one mode where an operator sees every
+    /// occurrence.
+    #[test]
+    fn phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // HALF ONE — at the ceiling. One more recorded failure takes the total
+        // to exactly MAX, the gate fires, and the operator loops back.
+        let at_ceiling_phase = PhaseId::new(95);
+        let mut at_ceiling = State::new(
+            at_ceiling_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        at_ceiling.stage = Stage::Validate;
+        at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        workflow::save_state(&at_ceiling).unwrap();
+        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
+        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
+        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
+
+        // HALF TWO — below the ceiling, everything else identical. Supervise
+        // gates here too, and the operator answers with the same loop-back.
+        let below_phase = PhaseId::new(96);
+        let mut below = State::new(
+            below_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        below.stage = Stage::Validate;
+        below.phase_validate_failures = 2;
+        workflow::save_state(&below).unwrap();
+        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
+        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
+        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            last_gate_context(root, below_phase).is_some(),
+            "premise for the second half: Supervise gates on a below-ceiling failure too. If \
+             no gate fired, the half proves nothing about the discrimination"
+        );
+        assert_eq!(
+            at_ceiling.phase_validate_failures, 0,
+            "a human answered the CEILING gate, so the per-phase budget starts again"
+        );
+        assert_eq!(
+            below.phase_validate_failures, 3,
+            "an ordinary below-ceiling Supervise gate must leave the total untouched — a reset \
+             on every gate would clear it at every failure and the bound would never accumulate"
+        );
+        assert_eq!(
+            workflow::load_state(root, at_ceiling_phase)
+                .expect("the ceiling gate must leave the run alive, not abort it")
+                .phase_validate_failures,
+            0,
+            "the reset must be persisted, not merely in memory — the next process reads the file"
+        );
+    }
+
+    /// WR-04 (35-REVIEW): a *passing* Validate at the ceiling gates too, and
+    /// the gate must say why.
+    ///
+    /// `ceiling_gate` and `should_gate` are both evaluated regardless of the
+    /// result, and `Mode::should_gate` puts the ceiling predicate ahead of its
+    /// per-mode match — so an exhausted budget gates a pass as well as a
+    /// failure. The ceiling clause was appended only inside the `Failed` arm,
+    /// so an operator running unattended-Auto got a gate whose entire context
+    /// was "Validation passed — approve to ship?" from a mode that is not
+    /// supposed to gate on a pass, and answering it spent the budget.
+    ///
+    /// **The control is the Supervise half, not a below-ceiling Auto pass.**
+    /// Auto below the ceiling does not gate on a pass at all, so that half
+    /// would assert only that a gate which never fired printed no clause — it
+    /// could not tell "clause at the ceiling" from "clause always". Supervise
+    /// gates on EVERY Validate, so the below-ceiling half there produces a real
+    /// gate with a real message that must NOT carry the clause.
+    #[test]
+    fn a_passing_validate_at_the_ceiling_explains_why_it_gated() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // AUTO, at the ceiling, and the Validate PASSED. Nothing here is a
+        // failure: the budget is spent from earlier cycles and no increment
+        // happens on this call.
+        let auto_phase = PhaseId::new(88);
+        let mut auto = State::new(
+            auto_phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        auto.stage = Stage::Validate;
+        auto.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES;
+        workflow::save_state(&auto).unwrap();
+        let auto_response = Gates::response_path(root, auto_phase, Stage::Validate);
+        std::fs::create_dir_all(auto_response.parent().unwrap()).unwrap();
+        std::fs::write(&auto_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut auto, ValidateOutcome::Passed);
+
+        // CONTROL — SUPERVISE, below the ceiling, also a pass. Gates (Supervise
+        // always does), so there IS a message, and it must not blame a ceiling
+        // that was never reached.
+        let supervise_phase = PhaseId::new(89);
+        let mut supervise = State::new(
+            supervise_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        supervise.stage = Stage::Validate;
+        supervise.phase_validate_failures = 2;
+        workflow::save_state(&supervise).unwrap();
+        let supervise_response = Gates::response_path(root, supervise_phase, Stage::Validate);
+        std::fs::create_dir_all(supervise_response.parent().unwrap()).unwrap();
+        std::fs::write(&supervise_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut supervise, ValidateOutcome::Passed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let auto_context = last_gate_context(root, auto_phase)
+            .expect("premise: an exhausted budget gates even in Auto, even on a pass");
+        assert!(
+            auto_context.contains("per-phase ceiling"),
+            "an Auto-mode gate on a PASS is unexplained without the ceiling clause — the \
+             operator has no way to know why the run stopped: {auto_context:?}"
+        );
+
+        let supervise_context = last_gate_context(root, supervise_phase)
+            .expect("premise for the control: Supervise gates on every Validate");
+        assert!(
+            !supervise_context.contains("per-phase ceiling"),
+            "NEGATIVE CONTROL: a clause appended to every passing gate would carry no \
+             information at all: {supervise_context:?}"
+        );
+    }
+
+    /// WR-03 (35-REVIEW): the run's record of the ceiling being reached must
+    /// carry the number that was reached.
+    ///
+    /// The reset runs before `loop_back_to_code`, and `prepare_loop_back_to_code`
+    /// reads the already-zeroed total for both its `loop_back` event and its
+    /// console line — so `events.jsonl` recorded `"phase_validate_failures": 0`
+    /// for the one loop-back in the phase that spent the whole budget, and the
+    /// operator read `looping back to Code (0 validate failure(s) this phase)`
+    /// immediately after being told the ceiling was hit. In the `Advance` arm
+    /// nothing marked the reset at all.
+    ///
+    /// Asserted on `events.jsonl` rather than the console, since that is the
+    /// durable record and the one a later reconciliation reads.
+    ///
+    /// **The below-ceiling half is the negative control**, and it is what
+    /// distinguishes this from an event emitted on every gate: an ordinary
+    /// Supervise Validate gate spends no budget, so it must emit nothing. Both
+    /// halves run in Supervise for the reason the sibling reset test documents
+    /// — in Auto the below-ceiling failure would not gate at all and the
+    /// control would prove only that a gate which never fired stayed silent.
+    #[test]
+    fn the_ceiling_reset_records_the_total_it_spent() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // AT the ceiling: this failure takes the total to exactly MAX.
+        let at_ceiling_phase = PhaseId::new(91);
+        let mut at_ceiling = State::new(
+            at_ceiling_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        at_ceiling.stage = Stage::Validate;
+        at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        workflow::save_state(&at_ceiling).unwrap();
+        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
+        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
+        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
+
+        // NEGATIVE CONTROL — below the ceiling, everything else identical.
+        let below_phase = PhaseId::new(92);
+        let mut below = State::new(
+            below_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        below.stage = Stage::Validate;
+        below.phase_validate_failures = 2;
+        workflow::save_state(&below).unwrap();
+        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
+        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
+        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            last_gate_context(root, below_phase).is_some(),
+            "premise for the control: Supervise gates on a below-ceiling failure too"
+        );
+
+        let reset = devflow_core::events::last_event_of_kind_for_phase(
+            root,
+            at_ceiling_phase,
+            "phase_failure_budget_reset",
+        )
+        .expect("spending the whole per-phase budget must leave a record of it");
+        assert_eq!(
+            reset["phase_validate_failures_before"].as_u64(),
+            Some(u64::from(mode::MAX_PHASE_VALIDATE_FAILURES)),
+            "the record must carry the total that was SPENT, not the zero it was reset to"
+        );
+
+        assert!(
+            devflow_core::events::last_event_of_kind_for_phase(
+                root,
+                below_phase,
+                "phase_failure_budget_reset",
+            )
+            .is_none(),
+            "NEGATIVE CONTROL: an ordinary below-ceiling gate spends no budget and must \
+             emit nothing — an event on every gate would carry no information"
+        );
+    }
+
+    /// `HARDEN-02 precision`: the per-phase total accumulates with a saturating
+    /// add, so an exhausted budget can never wrap back to zero and silently
+    /// restore itself.
+    ///
+    /// Asserted through the OPERATOR-FACING message rather than through
+    /// `state.phase_validate_failures` after the call. At `u32::MAX` the
+    /// ceiling is already reached, so this failure gates, and a ceiling gate
+    /// answered with a loop-back resets the total to zero by design (Task 3) —
+    /// a post-call read of the field would be reading that reset, not the
+    /// increment. The message is rendered from the incremented value before the
+    /// gate opens, so it reports what the add produced: `u32::MAX` if it
+    /// saturated, `0` if it wrapped.
+    #[test]
+    fn phase_validate_failures_increment_saturates() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(94);
+        init_repo(root);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.phase_validate_failures = u32::MAX;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let context = last_gate_context(root, phase)
+            .expect("a total at u32::MAX is past the ceiling, so this must gate");
+        assert!(
+            context.contains(&format!("failed {} time(s) for this phase", u32::MAX)),
+            "the total must saturate at u32::MAX, not wrap: {context}"
+        );
+        assert!(
+            !context.contains("failed 0 time(s) for this phase"),
+            "a wrapped total would silently restore an exhausted budget: {context}"
+        );
+    }
+
+    /// HARDEN-07 / criterion 6 at the LAYER level (D-09): `exit_code = 0` +
+    /// `Stage::Code` (a commit-gated stage) + an unrunnable `git` must fall
+    /// through to Layer 3, not classify as `Failed — no work done`. An
+    /// unmeasurable count is not evidence that no work happened, and this is
+    /// the exact input that made a successful agent read as a failure.
+    ///
+    /// `agent_result::tests::evaluate_layer2_exit_zero_no_commits_is_failed`
+    /// is the required NC-11 opposite-result control and stays byte-unchanged:
+    /// real `git`, a genuinely empty branch, still `Failed`. Extending THAT
+    /// test instead of adding this sibling would have been the proxy NC-11
+    /// names — it covers the ordinary `commits == 0` case, which is a
+    /// different and already-correct path.
+    ///
+    /// # Why this test lives in `devflow-cli` rather than beside its subject
+    ///
+    /// **`NoGitPath` is unavoidable here**, unlike the Layer 3 tests which use
+    /// an unspawnable working directory: `evaluate_layer2` reads its exit file
+    /// from `project_root`, so a non-existent root would make the exit read
+    /// fail and return `Ok(None)` for the WRONG reason — an unreadable exit
+    /// file rather than an unmeasurable count — and the test would pass
+    /// against the unfixed code. The root must EXIST and `git` must still be
+    /// unresolvable, and only a `PATH` guard delivers that combination.
+    ///
+    /// A process-global `PATH` guard is not viable in `devflow-core`'s test
+    /// binary. That crate shells out to `git` from eight modules running in
+    /// parallel, and its tests call production code that spawns `git`
+    /// directly, so no fixture-helper lock can cover them — measured at 1-5
+    /// unrelated failures per run, and still 1 in 8 runs after that module's
+    /// own `git()` helper took a lock. `devflow-cli`'s binary routes every
+    /// `PATH` mutation through the single [`env_lock`] its `git`-touching
+    /// tests already hold, which is why the guard is safe here.
+    ///
+    /// `evaluate_layer2` is `pub`, so this drives exactly the same function
+    /// with exactly the same inputs; only the binary it runs in differs.
+    #[test]
+    fn evaluate_layer2_unrunnable_git_falls_through_to_layer3() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The root EXISTS and carries a readable exit file recording a clean
+        // exit — so an `Ok(None)` return can only come from the commit count.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "0").unwrap();
+        assert!(
+            agent_result::exit_code_path(root, PhaseId::new(4)).exists(),
+            "the exit file must be readable, or Layer 2 returns Ok(None) for the wrong reason"
+        );
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_layer2(
+                root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap()
+        };
+
+        assert!(
+            result.is_none(),
+            "an unmeasurable commit count must fall through to Layer 3, got: {result:?}"
+        );
+        // Asserted separately and explicitly, so a future change that returns
+        // some other non-`Failed` classification from this layer still has to
+        // confront this test rather than slipping past an `is_none()` check.
+        assert_ne!(
+            result.as_ref().map(|r| r.status),
+            Some(devflow_core::agent_result::AgentStatus::Failed),
+            "Layer 2 must never classify an unmeasurable count as absent work"
+        );
+    }
+
+    /// **CR-01 (35-REVIEW), the direction whose absence let the defect ship.**
+    ///
+    /// The fall-through above was placed ABOVE the exit-code classification,
+    /// so an unmeasurable count discarded the `ResourceKilled` verdict too.
+    /// That is not a cosmetic loss: Layer 2 is the SOLE classifier for exit
+    /// 137 and 127 (a SIGKILLed agent writes no `DEVFLOW_RESULT` marker, so
+    /// Layer 1 declines, and Layer 3 has no `ResourceKilled` arm), and the
+    /// host fault that OOM-kills an agent is the same one that makes the
+    /// `fork` for `git` fail — the two arrive TOGETHER, which is why no test
+    /// pairing them existed and why the case is not exotic.
+    ///
+    /// # This test and its predecessor are one measurement, not two
+    ///
+    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3` directly above
+    /// is this test's NC-4 negative control and vice versa. They install the
+    /// **same** `NoGitPath` guard against the **same** fixture shape and
+    /// differ in exactly one byte of input — the exit code written to
+    /// `phase-NN-exit`. One must return `None`; the other must return
+    /// `ResourceKilled`. A suite asserting only the fall-through cannot tell
+    /// those apart, which is precisely how six executors, 942 passing tests
+    /// and four clean gates all missed this.
+    ///
+    /// `Action::GateInfra` is asserted rather than left implicit because the
+    /// routing is the harm: `GateReview` sends an infra fault into
+    /// `handle_validate_outcome`, which `pipeline_launch.rs` documents as
+    /// forbidden (review consensus #4 / D-08) — it bumps `consecutive_failures`
+    /// and the per-phase Validate budget for a fault the agent did not cause,
+    /// while `infra_failures` never accumulates and the infra abort ceiling
+    /// becomes unreachable.
+    #[test]
+    fn evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Identical to the fall-through test's fixture except for the exit
+        // code: the root EXISTS and the exit file is readable, so `git` being
+        // unrunnable is the only difference from a healthy run.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "137").unwrap();
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_layer2(
+                root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap()
+        };
+
+        let result = result.expect(
+            "exit 137 is classified from the exit code alone — an unmeasurable commit \
+             count must not discard the verdict and fall to a layer that cannot produce it",
+        );
+        assert_eq!(
+            result.status,
+            AgentStatus::ResourceKilled,
+            "Layer 2 is the only classifier for 137; losing it here loses it everywhere"
+        );
+        assert_eq!(result.exit_code, Some(137));
+        assert_eq!(
+            result.commits, None,
+            "'could not tell' must not be recorded as a measured zero"
+        );
+        assert_eq!(
+            devflow_core::outcome_policy::decide_action(Stage::Code, result.status),
+            devflow_core::outcome_policy::Action::GateInfra,
+            "an OOM-killed agent must route to the infra gate, NOT into the Validate loop"
+        );
+    }
+
+    /// CR-01's second, independent harm, in the same shape: a NON-commit-gated
+    /// stage that exited 0 never consulted the commit count in the first
+    /// place, so an unmeasurable count must not turn its documented `Success`
+    /// into `Unknown` → `GateReview`. For `Stage::Validate` that mis-routing
+    /// dispatches a cleanly-exited Validate agent as `ValidateOutcome::Failed`.
+    ///
+    /// The negative control is
+    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3`: same guard,
+    /// same exit code 0, and the ONLY difference is the stage — `Code` (commit
+    /// gated, must fall through) versus `Validate` (not gated, must succeed).
+    /// If both stages produced the same answer, the stage scoping would be
+    /// doing nothing and neither test would mean anything.
+    #[test]
+    fn evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "0").unwrap();
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_layer2(
+                root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Validate,
+            )
+            .unwrap()
+        };
+
+        let result = result.expect(
+            "a stage that is not commit-gated never read the count, so an unmeasurable \
+             count cannot change its answer",
+        );
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.commits, None);
+        assert_eq!(
+            devflow_core::outcome_policy::decide_action(Stage::Validate, result.status),
+            devflow_core::outcome_policy::Action::Advance
+        );
+    }
+
+    /// **HARDEN-07 / criterion 6 as an OUTCOME rather than a property of one
+    /// function (F-4).** This is the test the operator ruled must exist, and
+    /// the one whose absence let the Layer 3 defect survive planning.
+    ///
+    /// A unit test on `evaluate_layer2` alone passes while the end-to-end
+    /// answer is unchanged: `evaluate_layer1` returns `None` when there is no
+    /// capture, so everything reaching Layer 2 also reaches Layer 3, and
+    /// Layer 3 used to carry its own copy of the same lossy count. Driving the
+    /// whole cascade is what distinguishes "the defect was removed" from "the
+    /// defect was moved one layer down". NC-12 is this test's control.
+    ///
+    /// Both cascade shortcuts are left unarmed deliberately, so the run really
+    /// does traverse Layer 2's fall-through: no operator-approved external
+    /// post-condition declarations (Layer 0 declines) and no stdout capture
+    /// (Layer 1 returns `None`). `decided_by_layer` is asserted for the same
+    /// reason — it is what proves the cascade reached Layer 3 rather than
+    /// short-circuiting somewhere harmless and passing for the wrong reason.
+    ///
+    /// **Nothing here asserts on `Action`, `decide_action`, or any gating
+    /// consequence (F-5).** `AgentStatus::Failed` and `AgentStatus::Unknown`
+    /// map identically to `Action::GateReview` today, deliberately, so such an
+    /// assertion would pass against the buggy code too. What this fix changes
+    /// is the recorded classification, the commit figure and the
+    /// operator-facing reason — not what the run does next.
+    #[test]
+    fn evaluate_agent_result_with_unrunnable_git_does_not_report_failed() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(96);
+        // A real repo with the feature branch present. Built BEFORE the guard
+        // goes on, because building it shells out to git.
+        init_repo(root);
+        commit_on_feature_branch(root, phase, "seed");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0").unwrap();
+        // No stdout capture, so Layer 1 declines and the cascade reaches
+        // Layer 2 at all.
+        assert!(
+            !agent_result::stdout_path(root, phase).exists(),
+            "Layer 1 must decline, or this test never reaches the cascade under study"
+        );
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
+        };
+
+        assert_ne!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Failed,
+            "END TO END: exit 0 + Stage::Code + an unrunnable git must not report Failed. \
+             This is the criterion-6 outcome, and a passing evaluate_layer2 unit test does \
+             not establish it"
+        );
+        assert_eq!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Unknown,
+            "asserted positively too, so a future non-Failed value still confronts this test"
+        );
+        assert_eq!(
+            result.decided_by_layer,
+            Some(3),
+            "the cascade must genuinely traverse Layer 2's fall-through into Layer 3 — \
+             any other layer means this passed for the wrong reason"
+        );
+        assert_eq!(
+            result.commits, None,
+            "'could not tell' must not be recorded as a measured zero"
+        );
+    }
+
+    /// The companion opposite-result case for
+    /// `evaluate_agent_result_with_unrunnable_git_does_not_report_failed`: the
+    /// same fixture shape with real `git` available and the feature branch
+    /// genuinely empty must still report `Failed`. Without it, a cascade that
+    /// returned `Unknown` unconditionally would pass the test above.
+    ///
+    /// Kept as its own `#[test]` rather than appended to that one, following
+    /// this file's own IN-06 precedent: packed into a single function, a
+    /// failure in the first half aborts before the control ever runs, and the
+    /// control is the half whose loss would be least visible.
+    ///
+    /// The decision lands at Layer 2 here, not Layer 3 — with a real
+    /// measurement the commit gate resolves the case before the fall-through
+    /// is reached. That difference is the point: the two tests differ in
+    /// exactly one input, whether `git` could run.
+    #[test]
+    fn evaluate_agent_result_with_real_git_and_empty_branch_still_reports_failed() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(97);
+        init_repo(root);
+        // The feature branch exists but sits at develop's tip: a real,
+        // measured zero rather than an unmeasurable one.
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
+        assert!(
+            devflow_core::test_support::git_command(root)
+                .args(["checkout", "-b", &branch])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "fixture must create the empty feature branch"
+        );
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0").unwrap();
+        assert!(
+            !agent_result::stdout_path(root, phase).exists(),
+            "Layer 1 must decline here too, matching the companion test's shape"
+        );
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        // `NeutralPath`, not the raw environment: real `git` must resolve so
+        // the count is genuinely measured, while no real agent CLI can.
+        let result = {
+            let _neutral = NeutralPath::install();
+            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
+        };
+
+        assert_eq!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Failed,
+            "a MEASURED zero on a commit-gated stage is still absent work — the fix must \
+             not have widened into 'never report Failed'"
+        );
+        assert_eq!(result.commits, Some(0));
+        assert_eq!(result.decided_by_layer, Some(2));
     }
 
     /// D-01 (33-CONTEXT.md), ROADMAP criterion 1: a Validate failure on a
@@ -1850,7 +3398,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 82;
+        let phase = PhaseId::new(82);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -1899,17 +3447,24 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 83;
+        let phase = PhaseId::new(83);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
+        // WR-05 (35-REVIEW): stands in for `start()`'s run-start capture,
+        // which this fixture does not go through. A hand-built `State` leaves
+        // `verification_baseline_captured` false — the shape of state written
+        // by a binary predating the field — and that is a DIFFERENT scenario
+        // (an artifact of unknown provenance) from the one under test here.
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         let phase_dir = root
             .join(".planning/phases")
-            .join(format!("{phase:02}-test"));
+            .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
-            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
             "verified\n",
         )
         .unwrap();
@@ -1965,7 +3520,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // IN-07: `handle_validate_outcome` is only reached from `advance` with
         // `stage == Validate`, so that is the only stage this fixture may
@@ -1975,6 +3530,13 @@ mod tests {
         let worktree = root.join(format!(".worktrees/phase-{phase}"));
         std::fs::create_dir_all(&worktree).unwrap();
         state.worktree_path = Some(worktree.clone());
+        // WR-05 (35-REVIEW): stands in for `start()`'s run-start capture,
+        // which this fixture does not go through. A hand-built `State` leaves
+        // `verification_baseline_captured` false — the shape of state written
+        // by a binary predating the field — and that is a DIFFERENT scenario
+        // (an artifact of unknown provenance) from the one under test here.
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         // The artifact is written under the WORKTREE only. The bare tempdir
@@ -1983,10 +3545,10 @@ mod tests {
         // checkout — that is the entire point of this test.
         let phase_dir = worktree
             .join(".planning/phases")
-            .join(format!("{phase:02}-test"));
+            .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
-            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
             "verified\n",
         )
         .unwrap();
@@ -2035,7 +3597,7 @@ mod tests {
 
         let dir_a = tempfile::tempdir().unwrap();
         let root_a = dir_a.path();
-        let phase_a = 94;
+        let phase_a = PhaseId::new(94);
         let mut state_a = State::new(phase_a, AgentKind::Claude, Mode::Auto, root_a.to_path_buf());
         // IN-07: Validate is the only stage production reaches this call from.
         state_a.stage = Stage::Validate;
@@ -2091,7 +3653,7 @@ mod tests {
 
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
-        let phase_b = 95;
+        let phase_b = PhaseId::new(95);
         let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
         // IN-07: Validate is the only stage production reaches this call from.
         state_b.stage = Stage::Validate;
@@ -2129,6 +3691,541 @@ mod tests {
         );
     }
 
+    /// 999.79 / HARDEN-03, ROADMAP criterion 3 — the STALE direction. A
+    /// `devflow start --phase N --force` checks out a branch that still
+    /// carries the PREVIOUS run's committed `{N}-VERIFICATION.md`. That re-run
+    /// is mid-arc by construction, so inheriting the artifact's verdict
+    /// dispatches a `--gaps-only` pass against zero matching plans and gates
+    /// unresolvably.
+    ///
+    /// The fixture is the forced-re-run shape exactly: the artifact is on disk
+    /// AND `state.last_verification_fingerprint` already holds its fingerprint,
+    /// because `start()` recorded it before this run's Validate agent had any
+    /// opportunity to rewrite it. Unchanged since run start ⇒ inherited ⇒
+    /// FullExecute.
+    ///
+    /// **Not meaningful without `verification_written_this_run_dispatches_gaps_only`
+    /// below.** This test passes against a rule that reports every artifact
+    /// stale forever — which would silently disable the gaps-only path Phase 33
+    /// built, trading an unresolvable gate for a loop that re-runs every plan.
+    /// Only the paired test detects that. One direction alone is not acceptance.
+    #[test]
+    fn stale_verification_artifact_dispatches_full_execute() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(86);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // IN-07: Validate is the only stage production reaches this call from.
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        // The inherited artifact, committed by the PREVIOUS run and still on
+        // the branch this forced re-run checked out.
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+            "verdict: pass -- authored by a PREVIOUS run\n",
+        )
+        .unwrap();
+
+        // What `start()` records once the evidence root is resolved (A-05).
+        let baseline = devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        assert!(
+            baseline.is_some(),
+            "premise: the inherited artifact must be visible from the evidence root, otherwise \
+             this test would assert FullExecute for the mid-arc reason instead of the stale one"
+        );
+        state.last_verification_fingerprint = baseline;
+        workflow::save_state(&state).unwrap();
+
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "an artifact unchanged since this run started was inherited from a previous run; \
+             its verdict must NOT be reused, so the loop-back must dispatch FullExecute"
+        );
+    }
+
+    /// 999.79 / HARDEN-03, ROADMAP criterion 3 — the FRESH direction, and the
+    /// reason this fix is distinguishable from one that disables `--gaps-only`
+    /// forever (A-12, NC-7, T-35-22).
+    ///
+    /// Two sub-cases, both of which mean "the Validate agent authored this
+    /// during THIS run" and must reach the gaps-only path:
+    ///
+    /// 1. the artifact's fingerprint DIFFERS from the run-start baseline — a
+    ///    stale copy was on disk at run start and Validate rewrote it;
+    /// 2. the artifact EXISTS where the baseline recorded none — the ordinary
+    ///    first-verification case, and the one every pre-999.79 test exercised
+    ///    implicitly by leaving the baseline at `State::new`'s `None`.
+    ///
+    /// Sub-case 1 additionally closes **F-11's testable half**: it round-trips
+    /// state through the persisted file rather than reading the in-memory
+    /// `State`, then asserts the baseline the selector recorded is present on
+    /// disk after the loop-back completed. The risk being covered is a selector
+    /// that updates a value nothing ever writes out — `handle_validate_outcome`
+    /// saves state BEFORE the selector runs, so the update reaches disk only
+    /// via `prepare_loop_back_to_code`'s own save. Reading the in-memory
+    /// `State` would not distinguish those.
+    ///
+    /// Sub-case 2 deliberately does NOT round-trip, and therefore establishes
+    /// nothing about multi-process behaviour on its own.
+    #[test]
+    fn verification_written_this_run_dispatches_gaps_only() {
+        let _guard = env_lock();
+
+        // ---- sub-case 1: content differs from the run-start baseline ----
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(87);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact = phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // The previous run's copy, present when this run started.
+        std::fs::write(&artifact, "verdict: pass -- from a PREVIOUS run\n").unwrap();
+        let run_start =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.last_verification_fingerprint = run_start;
+        state.verification_run_nonce = Some(1);
+        workflow::save_state(&state).unwrap();
+
+        // This run's Validate agent rewrites it.
+        std::fs::write(&artifact, "verdict: gaps -- authored by THIS run\n").unwrap();
+        let rewritten =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        assert_ne!(
+            run_start, rewritten,
+            "premise: the rewrite must actually change the fingerprint, otherwise this test \
+             is silently exercising the stale case with a fresh label"
+        );
+
+        // F-11: reload from disk, so the drive below operates on state that
+        // genuinely crossed a process boundary rather than on the in-memory
+        // value this test just mutated.
+        let mut reloaded = workflow::load_state(root, phase).expect("state must persist");
+        reloaded.verification_run_nonce = Some(1);
+        assert_eq!(
+            reloaded.last_verification_fingerprint, run_start,
+            "premise: the run-start baseline must survive the save/load round trip, or the \
+             comparison below is against an in-memory value the real pipeline never sees"
+        );
+
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut reloaded, ValidateOutcome::Failed);
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "an artifact whose content changed since this run started was authored by THIS \
+             run's Validate agent and must still reach the gaps-only path — a rule that marks \
+             everything stale would pass the stale test and fail here, which is the whole point \
+             of the pair"
+        );
+
+        // F-11's testable half: the selector's baseline update must be OBSERVABLE
+        // IN THE PERSISTED FILE, not merely in the in-memory State. The save in
+        // `handle_validate_outcome` runs BEFORE the selector, so this can only
+        // have been written by `prepare_loop_back_to_code`'s own save.
+        let persisted = workflow::load_state(root, phase)
+            .expect("state must still exist after the loop-back completed");
+        assert_eq!(
+            persisted.last_verification_fingerprint, rewritten,
+            "the baseline the selector recorded must reach DISK — a selector that updates a \
+             value nothing ever writes out would leave a later same-run check comparing against \
+             the old baseline and reading an unchanged artifact as fresh (F-11's fail-open \
+             direction)"
+        );
+
+        // ---- sub-case 2: artifact exists where the baseline recorded none ----
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_b = dir_b.path();
+        let phase_b = PhaseId::new(88);
+        let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
+        state_b.stage = Stage::Validate;
+        let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
+        std::fs::create_dir_all(&worktree_b).unwrap();
+        state_b.worktree_path = Some(worktree_b.clone());
+        // No artifact existed when this run started — and the run DID look.
+        // WR-05 (35-REVIEW): both halves are premises. `None` alone is
+        // ambiguous, and the unlooked variant is a different scenario with the
+        // opposite required dispatch (row 2b of the truth table).
+        assert_eq!(
+            state_b.last_verification_fingerprint, None,
+            "premise: sub-case 2 requires an absent run-start baseline"
+        );
+        state_b.verification_baseline_captured = true;
+        workflow::save_state(&state_b).unwrap();
+
+        let phase_dir_b = worktree_b
+            .join(".planning/phases")
+            .join(format!("{phase_b:02}-test"));
+        std::fs::create_dir_all(&phase_dir_b).unwrap();
+        std::fs::write(
+            phase_dir_b.join(format!("{phase_b:02}-VERIFICATION.md")),
+            "verdict: gaps -- first verification of this phase\n",
+        )
+        .unwrap();
+
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
+        }
+
+        let last_b =
+            devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
+                .expect("sub-case 2 loop_back event must be recorded");
+        assert_eq!(
+            last_b["fix"], "GapsOnly",
+            "an artifact that exists where the run-start baseline recorded none was authored \
+             this run and must dispatch GapsOnly — this is the ordinary first-verification case \
+             Phase 33 built, and a too-strict freshness rule breaks it"
+        );
+    }
+
+    /// H-1 / NC-7's AUTOMATED half (T-35-22b): the stale/fresh decision is a
+    /// pure predicate over the pair (current fingerprint, run-start baseline),
+    /// and all four of its rows are pinned here in one place.
+    ///
+    /// Why this exists as well as the two direction tests above: NC-7's
+    /// performed mutation is a one-time act that nothing re-runs, so an
+    /// always-stale regression introduced later would ship with nothing to
+    /// catch it — and an always-stale rule makes the loop re-run every plan
+    /// forever, which is a worse failure than the stall 999.79 fixes.
+    ///
+    /// The row set is chosen so BOTH over-corrections are caught, not one:
+    ///
+    /// | current       | baseline      | captured | fresh? | fails under |
+    /// |---------------|---------------|----------|--------|-------------|
+    /// | `None`        | `None`        | true     | no     | always-fresh|
+    /// | `(h, t)`      | `None`        | true     | yes    | always-stale|
+    /// | `(h, t)`      | `None`        | **false**| **no** | always-fresh|
+    /// | `(h, t)`      | `(h, t)`      | true     | no     | always-fresh|
+    /// | `(h, **t2**)` | `(h, t)`      | true     | **yes**| always-stale|
+    /// | `(h2, t2)`    | `(h, t)`      | true     | yes    | always-stale|
+    ///
+    /// Three rows fail an always-stale stub and the others fail an always-fresh
+    /// stub. A table that only fails one of the two would not be exhaustive and
+    /// the row set would be wrong.
+    ///
+    /// Row 2b is WR-05's (35-REVIEW): it and row 2 differ in exactly one input,
+    /// and a predicate ignoring `baseline_captured` collapses them — which is
+    /// how an upgraded in-flight phase reproduced the 999.79 stall.
+    ///
+    /// Row 3b is WR-06's: it and row 3 differ in exactly one input, and a
+    /// predicate ignoring the mtime collapses them — which is how an idempotent
+    /// rewrite read as inherited and turned every later cycle into a full
+    /// execute.
+    #[test]
+    fn verification_freshness_truth_table_is_exhaustive() {
+        // Row 1 — no artifact at all. Not "authored this run": there is
+        // nothing to have authored. The phase is mid-arc and D-01's original
+        // FullExecute answer stands, unchanged by 999.79.
+        assert!(
+            !verification_authored_this_run((None, None), (None, None), true, Some(1)),
+            "row 1: an absent artifact is never 'authored this run'"
+        );
+
+        // Row 1b — absent now, present at run start. Still nothing to inherit
+        // a verdict from; grouped with row 1 rather than given its own row
+        // because the predicate cannot distinguish them and must not try.
+        assert!(
+            !verification_authored_this_run((None, None), (Some(7), Some(100)), true, Some(1)),
+            "row 1b: an artifact that is absent NOW is never 'authored this run', whatever the \
+             baseline recorded"
+        );
+
+        // Row 2 — exists now, nothing recorded at run start, and the run DID
+        // look. The ordinary first-verification case: Validate authored it
+        // during this run.
+        assert!(
+            verification_authored_this_run((Some(7), Some(100)), (None, None), true, Some(1)),
+            "row 2: an artifact existing where the baseline recorded none was authored this run"
+        );
+
+        // Row 2b (WR-05) — identical to row 2 except that nobody ever looked:
+        // state written by a binary predating the baseline field. The artifact
+        // may be the PREVIOUS run's, so its verdict must not be reused.
+        assert!(
+            !verification_authored_this_run((Some(7), Some(100)), (None, None), false, Some(1)),
+            "row 2b: with no captured baseline the artifact's provenance is unknown, and \
+             reading it as this run's is the 999.79 stall reproduced across an upgrade"
+        );
+
+        // Row 3 — unchanged since run start, in BOTH content and mtime. The
+        // 999.79 case: inherited from a previous run, its verdict must not be
+        // reused.
+        assert!(
+            !verification_authored_this_run(
+                (Some(7), Some(100)),
+                (Some(7), Some(100)),
+                true,
+                Some(1)
+            ),
+            "row 3: an artifact whose fingerprint AND mtime equal the run-start baseline is \
+             INHERITED, not authored this run"
+        );
+
+        // Row 3b (WR-06) — identical to row 3 except that the file was written
+        // since: the Validate agent re-authored byte-identical content on a
+        // later failing cycle. Hash-only this read as inherited, and every
+        // subsequent cycle re-ran every plan in the phase.
+        assert!(
+            verification_authored_this_run(
+                (Some(7), Some(200)),
+                (Some(7), Some(100)),
+                true,
+                Some(1)
+            ),
+            "row 3b: an IDEMPOTENT rewrite is still a rewrite — unchanged bytes with an \
+             advanced mtime were written by this run's agent"
+        );
+
+        // Row 3c — the degrade. With either mtime unavailable the comparison
+        // falls back to content alone, which is the pre-WR-06 behaviour; a
+        // `Some != None` mtime test would instead read EVERY cycle as rewritten.
+        assert!(
+            !verification_authored_this_run((Some(7), None), (Some(7), Some(100)), true, Some(1)),
+            "row 3c: an unavailable mtime must degrade to the content comparison, not \
+             manufacture a difference"
+        );
+
+        // Row 4 — content changed since run start. Validate rewrote it.
+        assert!(
+            verification_authored_this_run(
+                (Some(7), Some(200)),
+                (Some(8), Some(100)),
+                true,
+                Some(1)
+            ),
+            "row 4: an artifact whose fingerprint differs from the run-start baseline was \
+             rewritten during this run"
+        );
+    }
+
+    /// WR-05 (35-REVIEW) end to end: a phase started under a binary predating
+    /// `last_verification_fingerprint` and continued by this one must NOT read
+    /// the inherited `{N}-VERIFICATION.md` as this run's work.
+    ///
+    /// The old state file deserializes the baseline to `None` while the
+    /// previous run's committed artifact is already on disk, so the
+    /// `(Some, None)` row fired and dispatched `--gaps-only` against zero
+    /// matching plans — the DOGFOOD-01-class unresolvable stall 999.79 exists
+    /// to close, reproduced for every in-flight phase across an upgrade.
+    ///
+    /// **Both halves under one artifact**, differing in exactly one field. The
+    /// upgraded state must dispatch `FullExecute`; a state that genuinely
+    /// captured the baseline and found nothing must still dispatch `GapsOnly`.
+    /// Asserting only the first would be satisfied by an always-stale rule,
+    /// which the selector's own comment names as the worse over-correction —
+    /// it silently reverts what Phase 33 built.
+    #[test]
+    fn an_uncaptured_baseline_does_not_claim_an_inherited_artifact() {
+        let _guard = env_lock();
+
+        /// Drive one Validate failure against a phase whose artifact already
+        /// exists, and report the dispatched fix.
+        fn dispatch_with(root: &Path, phase: PhaseId, baseline_captured: bool) -> String {
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.verification_run_nonce = Some(1);
+            state.stage = Stage::Validate;
+            state.verification_baseline_captured = baseline_captured;
+            workflow::save_state(&state).unwrap();
+
+            let phase_dir = root
+                .join(".planning/phases")
+                .join(format!("{padded}-test", padded = phase.padded()));
+            std::fs::create_dir_all(&phase_dir).unwrap();
+            std::fs::write(
+                phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+                "verdict: pass -- committed by a PREVIOUS run\n",
+            )
+            .unwrap();
+
+            {
+                let _path_guard = NeutralPath::install();
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            }
+
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+                .expect("loop_back event must be recorded")["fix"]
+                .as_str()
+                .expect("the fix must be recorded as a string")
+                .to_string()
+        }
+
+        // The upgrade case: nobody ever looked, and the artifact predates this
+        // run.
+        let upgraded_dir = tempfile::tempdir().unwrap();
+        let upgraded_root = upgraded_dir.path();
+        assert_eq!(
+            dispatch_with(upgraded_root, PhaseId::new(78), false),
+            "FullExecute",
+            "with no captured baseline the artifact's provenance is unknown; --gaps-only \
+             would match zero plans and gate unresolvably"
+        );
+        assert!(
+            devflow_core::events::last_event_of_kind_for_phase(
+                upgraded_root,
+                PhaseId::new(78),
+                "verification_baseline_absent",
+            )
+            .is_some(),
+            "the operator must be able to see WHY a gaps-only pass became a full execute"
+        );
+
+        // NEGATIVE CONTROL: identical in every respect except that this run
+        // performed the observation.
+        let captured_dir = tempfile::tempdir().unwrap();
+        let captured_root = captured_dir.path();
+        assert_eq!(
+            dispatch_with(captured_root, PhaseId::new(79), true),
+            "GapsOnly",
+            "the ordinary first-verification case must be untouched — an always-stale rule \
+             re-runs every plan in the phase forever, which the selector's own comment calls \
+             the worse over-correction"
+        );
+        assert!(
+            devflow_core::events::last_event_of_kind_for_phase(
+                captured_root,
+                PhaseId::new(79),
+                "verification_baseline_absent",
+            )
+            .is_none(),
+            "a signal emitted on the ordinary case too would carry no information"
+        );
+    }
+
+    /// WR-06 (35-REVIEW) end to end: a Validate agent that re-authors
+    /// BYTE-IDENTICAL content on a later failing cycle must still reach the
+    /// gaps-only path.
+    ///
+    /// Cycle 1 writes a verification listing gap G and the selector records its
+    /// fingerprint as the baseline. Cycle 2's gaps-only fix does not close G,
+    /// Validate re-runs and writes the identical document — and with a
+    /// content-only rule `current == baseline` read as INHERITED, dispatching a
+    /// full execute. Every subsequent cycle then re-ran every plan in the phase
+    /// instead of the gaps-only pass Phase 33 built. That is the "too strict"
+    /// over-correction the selector's own comment claims to guard against.
+    ///
+    /// **The mtime is forced rather than observed.** `File::set_modified` makes
+    /// the advance exact, so the test measures the freshness rule instead of
+    /// the host filesystem's timestamp granularity — a coarse-granularity FS
+    /// would otherwise make this pass or fail for a reason that has nothing to
+    /// do with the subject.
+    ///
+    /// The control is the untouched artifact: same content, same baseline, and
+    /// the ONLY difference is whether anything wrote the file. Without it a rule
+    /// that simply always answered "authored" would pass the first half — and
+    /// that rule is the 999.79 stall.
+    #[test]
+    fn an_idempotent_rewrite_is_authored_not_inherited() {
+        let _guard = env_lock();
+
+        /// Seed a phase whose artifact already exists and whose baseline
+        /// records it, optionally rewriting it with identical bytes afterwards.
+        fn dispatch_with(root: &Path, phase: PhaseId, rewrite_identically: bool) -> String {
+            let phase_dir = root
+                .join(".planning/phases")
+                .join(format!("{padded}-test", padded = phase.padded()));
+            std::fs::create_dir_all(&phase_dir).unwrap();
+            let artifact =
+                phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+            let contents = "verdict: gaps -- G is still open\n";
+            std::fs::write(&artifact, contents).unwrap();
+
+            // What the selector recorded on the previous cycle of THIS run.
+            let baseline_hash =
+                devflow_core::agent_result::phase_verification_fingerprint(root, phase);
+            let baseline_mtime =
+                devflow_core::agent_result::phase_verification_mtime_nanos(root, phase)
+                    .expect("the fixture needs a readable mtime");
+
+            if rewrite_identically {
+                std::fs::write(&artifact, contents).unwrap();
+                let advanced = std::time::UNIX_EPOCH
+                    + std::time::Duration::from_nanos(baseline_mtime)
+                    + std::time::Duration::from_secs(1);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&artifact)
+                    .unwrap()
+                    .set_modified(advanced)
+                    .unwrap();
+                assert_eq!(
+                    devflow_core::agent_result::phase_verification_fingerprint(root, phase),
+                    baseline_hash,
+                    "premise: the rewrite must be byte-IDENTICAL, or this exercises row 4"
+                );
+                assert_ne!(
+                    devflow_core::agent_result::phase_verification_mtime_nanos(root, phase),
+                    Some(baseline_mtime),
+                    "premise: the rewrite must advance the mtime, or there is nothing to see"
+                );
+            }
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.verification_baseline_captured = true;
+            state.last_verification_fingerprint = baseline_hash;
+            state.last_verification_mtime_nanos = Some(baseline_mtime);
+            state.verification_run_nonce = Some(1);
+            workflow::save_state(&state).unwrap();
+
+            {
+                let _path_guard = NeutralPath::install();
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            }
+
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+                .expect("loop_back event must be recorded")["fix"]
+                .as_str()
+                .expect("the fix must be recorded as a string")
+                .to_string()
+        }
+
+        let rewritten_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            dispatch_with(rewritten_dir.path(), PhaseId::new(76), true),
+            "GapsOnly",
+            "an idempotent rewrite is still a rewrite; reading it as inherited re-runs every \
+             plan in the phase on every later cycle"
+        );
+
+        // NEGATIVE CONTROL: nothing wrote the file after the baseline was taken.
+        let untouched_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            dispatch_with(untouched_dir.path(), PhaseId::new(77), false),
+            "FullExecute",
+            "an artifact nobody touched since the baseline is INHERITED — a rule that always \
+             answered 'authored' would be the 999.79 stall"
+        );
+    }
+
     /// D-01/D-02: the `Ambiguous` gate's loop-back arm must also consult
     /// `select_loop_back_fix`, not only the plain-Failed tail arm Task 1
     /// wired. Seeds a rejecting `GateResponse` (note without "abort", so
@@ -2144,7 +4241,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 84;
+        let phase = PhaseId::new(84);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -2209,7 +4306,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 85;
+        let phase = PhaseId::new(85);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES;
@@ -2275,7 +4372,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 86;
+        let phase = PhaseId::new(86);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         assert!(
@@ -2337,8 +4434,8 @@ mod tests {
         // Arm A: an Ambiguous outcome gates on cycle one, never touching
         // consecutive_failures. Arm B: a genuine failure still reaches
         // MAX_CONSECUTIVE_FAILURES and forces the gate.
-        arm_a_ambiguous_outcome_gates_on_cycle_one(root, 93);
-        arm_b_genuine_failures_reach_the_ceiling(root, 94);
+        arm_a_ambiguous_outcome_gates_on_cycle_one(root, PhaseId::new(93));
+        arm_b_genuine_failures_reach_the_ceiling(root, PhaseId::new(94));
     }
 
     /// Arm A (18e dominates): an ambiguous `external_verify` outcome gates
@@ -2346,7 +4443,7 @@ mod tests {
     /// irrelevant here and must stay untouched. Asserting that prevents a
     /// future refactor from quietly routing ambiguity back through the
     /// counter-based auto-loop.
-    fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: u32) {
+    fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: PhaseId) {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -2385,7 +4482,7 @@ mod tests {
     /// under `ENV_MUTEX` (matching `consecutive_failures_reaches_ceiling_across_cycles`)
     /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
     /// own `launch_stage` risk spawning a real agent CLI.
-    fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: u32) {
+    fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: PhaseId) {
         let _guard = env_lock();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -2423,9 +4520,11 @@ mod tests {
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "a genuine repeated failure must still reach the reachable ceiling (18d)"
         );
     }
@@ -2440,7 +4539,7 @@ mod tests {
     fn consecutive_failures_increment_saturates() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 82;
+        let phase = PhaseId::new(82);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = u32::MAX;
@@ -2470,7 +4569,7 @@ mod tests {
     fn primary_loop_rate_limited_writes_single_agent_cron_instructions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 76;
+        let phase = PhaseId::new(76);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -2513,7 +4612,7 @@ mod tests {
     fn rate_limited_at_infra_ceiling_stops_resuming_and_aborts() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 77;
+        let phase = PhaseId::new(77);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
@@ -2549,7 +4648,7 @@ mod tests {
     fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 81;
+        let phase = PhaseId::new(81);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -2611,7 +4710,12 @@ mod tests {
         let worktree = root.join(".worktrees/phase-70");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(70),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.worktree_path = Some(worktree.clone());
 
         assert_eq!(
@@ -2672,7 +4776,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 40;
+        let phase = PhaseId::new(40);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
@@ -2725,7 +4829,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 41;
+        let phase = PhaseId::new(41);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
@@ -2733,7 +4837,13 @@ mod tests {
         let reason = Some("review: please fix naming".to_string());
         assert!(is_ship_review_failure(&reason));
 
-        prepare_loop_back_to_code(root, &mut state, FixType::AuditFix).unwrap();
+        prepare_loop_back_to_code(
+            root,
+            &mut state,
+            FixType::AuditFix,
+            LoopBackReason::GateResponse,
+        )
+        .unwrap();
 
         assert_eq!(state.stage, Stage::Code);
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
@@ -2753,7 +4863,7 @@ mod tests {
         assert!(!is_ship_review_failure(&Some("agent crashed".into())));
         assert!(!is_ship_review_failure(&None));
 
-        let prompt = prompt::fix_prompt(FixType::AuditFix, 11);
+        let prompt = prompt::fix_prompt(FixType::AuditFix, PhaseId::new(11));
         assert!(prompt.contains("/gsd-audit-fix"));
         assert!(!prompt.contains("--gaps-only"));
     }
@@ -2788,7 +4898,12 @@ mod tests {
         // State::new takes no project_root-derived config input at all, so
         // no devflow.toml key — including yes_ship, now a real config field
         // — can reach it through this constructor.
-        let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         assert!(
             !state.yes_ship,
             "State::new alone must never derive the Ship pre-authorization from \
@@ -2808,8 +4923,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 50;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(50);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
             .status()
@@ -2845,7 +4960,7 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| {
                 event["event"] == "gate_fired"
-                    && event["phase"] == phase
+                    && phase.matches_json(event.get("phase"))
                     && event["stage"] == "ship"
             })
             .count();
@@ -2875,7 +4990,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 51;
+        let phase = PhaseId::new(51);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         assert!(!state.yes_ship, "yes_ship must default to false");
@@ -2949,7 +5064,7 @@ mod tests {
             );
         }
 
-        let phase = 42;
+        let phase = PhaseId::new(42);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -2957,11 +5072,11 @@ mod tests {
         // A Code-stage failure in Auto mode is exactly the "unexpected" case
         // `run_gate` computes (`!should_gate(..)`) and passes to
         // `fire_gate_notify` — asserted here as a pure, race-free check.
-        assert!(
-            !state
-                .mode
-                .should_gate(Stage::Code, state.consecutive_failures)
-        );
+        assert!(!state.mode.should_gate(
+            Stage::Code,
+            state.consecutive_failures,
+            state.phase_validate_failures
+        ));
 
         // Pre-write an Abort response so the call resolves without spawning
         // a monitor (the notify hook already fired by the time `run_gate`
@@ -2999,7 +5114,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 43;
+        let phase = PhaseId::new(43);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -3033,5 +5148,92 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// 35.2 criterion 2, Task 1 — checkout replacement with no nonce → FullExecute.
+    #[test]
+    fn a_checkout_between_dispatches_does_not_read_as_authored_this_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(87);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact_path =
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // Run-start baseline, no nonce (pre-35.2 or never-dispatched).
+        std::fs::write(&artifact_path, "verdict: pass — from a PREVIOUS run\n").unwrap();
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.last_verification_mtime_nanos =
+            devflow_core::agent_result::phase_verification_mtime_nanos(&worktree, phase);
+        state.verification_baseline_captured = true;
+        assert!(state.verification_run_nonce.is_none());
+
+        // Branch checkout replaces with DIFFERENT bytes.
+        std::fs::write(&artifact_path, "verdict: pass — BRANCH CHECKOUT\n").unwrap();
+        assert_ne!(
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            state.last_verification_fingerprint,
+            "premise: replacement must change fingerprint"
+        );
+
+        workflow::save_state(&state).unwrap();
+        let fix = select_loop_back_fix(&worktree, phase, &mut state);
+        assert_eq!(fix, FixType::FullExecute);
+    }
+
+    /// 35.2 criterion 4, D-04 — both dispatch directions in one #[test].
+    #[test]
+    fn both_dispatch_directions_are_demonstrated_in_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(88);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact = phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // Direction A: nonce present, agent rewrote → GapsOnly.
+        std::fs::write(&artifact, "verdict: pass — authored this run\n").unwrap();
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
+        std::fs::write(&artifact, "verdict: gaps — rewritten by agent\n").unwrap();
+        assert_ne!(
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            state.last_verification_fingerprint,
+            "premise: agent rewrite must change fingerprint"
+        );
+        workflow::save_state(&state).unwrap();
+        assert_eq!(
+            select_loop_back_fix(&worktree, phase, &mut state),
+            FixType::GapsOnly,
+            "Direction A: nonce present, agent rewrote → GapsOnly"
+        );
+
+        // Direction B: same fixture, nonce cleared → FullExecute.
+        state.verification_run_nonce = None;
+        assert_eq!(
+            select_loop_back_fix(&worktree, phase, &mut state),
+            FixType::FullExecute,
+            "Direction B: nonce absent → FullExecute"
+        );
     }
 }
