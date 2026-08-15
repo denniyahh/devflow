@@ -12,6 +12,25 @@
 # This is a no-op for anyone without such a hook.
 set -euo pipefail
 
+# Refuse to commit directly on the PR-protected branches. `develop` and `main`
+# both require changes through a pull request (a repository ruleset rejects a
+# direct push), so a commit made here is doomed to be rejected at push time.
+# Refusing at the commit — while the changes are still staged and can be carried
+# onto a branch with `git switch -c` — saves the round-trip. Deliberately no
+# override: there is no legitimate commit on a protected branch, and an override
+# variable is exactly what a mistaken commit would reach for.
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+case "$branch" in
+    develop | main)
+        echo "pre-commit: refusing to commit directly on '$branch'." >&2
+        echo "  '$branch' is PR-protected — changes must be made through a pull request," >&2
+        echo "  so this commit would be rejected at push time." >&2
+        echo "  Create a branch first (your staged changes carry over):" >&2
+        echo "      git switch -c feature/<name>   # or release/, fix/, docs/, ..." >&2
+        exit 1
+        ;;
+esac
+
 global_hooks=$(git config --global --get core.hooksPath || true)
 if [ -n "$global_hooks" ]; then
   # Expand a leading ~ ourselves; git stores the literal string.
