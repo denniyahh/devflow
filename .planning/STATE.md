@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.5.0
-milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.3
-status: completed
-stopped_at: Phase 35.3 complete — drain gate measured, both concurrent-work paths observed
-last_updated: "2026-08-13T00:30:19.151Z"
-last_activity: 2026-08-12
-last_activity_desc: Phase 35.3 complete — 3/3 plans; drain gate observed via both arms; fixture label CLI-version-pinned
+milestone: v2.6.0
+milestone_name: Multi-Agent Adapter Migration (ACTIVE — declared 2026-08-15)
+status: Planned
+stopped_at: v2.5.0 closed; v2.6.0 declared; Phase 36 SPEC drafted — awaiting discuss
+last_updated: "2026-08-15T19:22:27.259Z"
+last_activity: 2026-08-15
+last_activity_desc: Milestone v2.6.0 declared; Phase 36 SPEC drafted
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 15
-  completed_plans: 15
-  percent: 100
-current_phase_name: Drain Gate Concurrency Measurement (999.83)
+  total_phases: 2
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
+current_phase: 36
+current_phase_name: Pi Agent Support + Release-Preflight Hardening
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.3
-Plan: Not started
-Status: All phases complete
-Last activity: 2026-08-12 — Phase 35.3 complete
+Phase: Milestone v2.5.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-08-15 — Milestone v2.5.0 completed and archived
 
 ## Recently Shipped
 
@@ -845,10 +845,6 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ## Operator Next Steps
 
 - Start the next milestone with /gsd-new-milestone
-- **999.86 / DEN-75 (High) must land in the next milestone's phase set** — `release --check`'s
-  tag-signing predictor produced a live false negative during v2.4.0's own release, for the second
-  time across two releases. Fix direction already decided: replace with a real `ssh-keygen -Y sign`
-  probe. Operator confirmed in-scope 2026-08-06.
 
 ## Accumulated Context
 

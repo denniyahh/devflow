@@ -18,27 +18,40 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone: v2.5.0 Loop-Termination and Release Hardening
+## Current Milestone: v2.6.0 Multi-Agent Adapter Migration
 
-**Goal:** Close five confirmed defects/gaps that surfaced from v2.4.0's own release, plus one
-investigation into a concurrency blind spot in the safety net v2.4.0 just widened. All six are
-pre-existing issues found via code review, live release cuts, and Phase 34's own capture campaign —
-none are new regressions from v2.4.0.
+**Goal:** Replace the thin `AgentAdapter` trait with a driver architecture that onboards new
+agents without agent-specific logic leaking into core — and prove it by onboarding **Pi** as the
+first newly-supported agent. The full modular `AgentDriver` refactor (backlog 999.31) is sequenced
+*after* the first concrete new driver.
 
 **Target features:**
-- Phase 35 — 999.77 (a single transient `git` failure grants a free `consecutive_failures` reset,
-  and the doc comment asserts the opposite) + 999.78 (the Code↔Validate loop has no
-  progress-independent bound) + 999.79 (`{N}-VERIFICATION.md` never goes stale, so a `--force`
-  re-run gates unresolvably) + 999.84 (nothing guards the `GateReview` checkpoint call site's root
-  argument) + 999.86 (`release --check`'s tag-signing predictor false-negatived live, twice across
-  two releases — replace with a real `ssh-keygen -Y sign` probe)
-- Phase 35.3 — 999.83 (the drain gate has never observed real sub-agent concurrency; its fixture's
-  shape doesn't match production). Standalone: investigation-shaped, not a quick patch, so it does
-  not bundle with the confirmed fixes above.
+- Phase 36 — **Pi** support (first new agent driver, alongside Claude/Codex/OpenCode) + three
+  small items in the same code this phase touches: 999.67 (agent result parsing lets an agent plant
+  its own Layer-0 provenance; XS), 999.96 (`release --check` can't catch a forgotten version bump;
+  S), and 999.104 (release-signing key workflow; the SPEC settles the one-line-probe vs. two-key
+  question).
+- Phase 37 — 999.31 (Modular Agent Driver Architecture: capability discovery, driver-owned prompt
+  rendering, command building, completion parsing, health probes, shared conformance suite), with
+  Pi from Phase 36 as the second native implementation (999.31 D-02). 999.94 (unattended `decision`
+  checkpoints take the first option blindly; HIGH) pencilled here.
 
-**v2.5.0 is a planning label**, next minor after the last shipped v2.4.0 — the actual crate version
+**v2.6.0 is a planning label**, next minor after the last shipped v2.5.0 — the actual crate version
 is still derived automatically from conventional-commit classification at release time
 (`version.rs`), per this project's established versioning policy; it may not land exactly here.
+
+<details>
+<summary>Previous milestone: v2.5.0 Loop-Termination and Release Hardening — CLOSED 2026-08-15</summary>
+
+**Shipped and released** (v2.5.0 tag exists). Closed five confirmed loop-termination / release
+defects and one concurrency-blind-spot investigation (999.77, 999.78, 999.79, 999.83, 999.84,
+999.86, 999.87). Full phase detail archived to `.planning/milestones/v2.5.0-ROADMAP.md`.
+
+**Delivered.** The Code↔Validate loop's failure-gating mechanics and the release-signing preflight
+now behave as documented and are regression-tested; the drain gate's concurrency blind spot was
+measured against real production captures (999.83 / Phase 35.3).
+
+</details>
 
 <details>
 <summary>Previous milestone: v2.4.0 Resume Unattended Dogfooding — CLOSED 2026-08-06</summary>

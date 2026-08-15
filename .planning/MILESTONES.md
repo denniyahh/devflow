@@ -1,5 +1,32 @@
 # Milestones
 
+## v2.5.0 Loop-Termination and Release Hardening (Shipped: 2026-08-15)
+
+**Phases completed:** 4 phases, 15 plans, 22 tasks
+**Closeout type:** override_closeout — work shipped and released, but Phases 35.1 and 35.2 were
+marked complete without formal `-VERIFICATION.md` artifacts (their verification lives in
+`-DRILL.md` / `-VALIDATION.md`). Recorded here rather than silently treated as `verified_closeout`.
+
+**Key accomplishments:**
+
+- 999.77 (criterion 1).
+- `advance_with_worktree_declared_checkpoint_reads_the_execution_root`
+- `release --check`'s tag-signing preflight now signs throwaway bytes with `ssh-keygen -Y sign` and reports the exit code, replacing the `ssh-add -l` predictor that false-negatived live on two release cuts with the correct key present.
+- 999.78/WR-01 — the bound.
+- 999.79 / criterion 3 — the rule.
+- The deliverable here is an enumeration, and the failure mode is enumerating from memory.
+- A real `devflow __monitor` process now holds GSD's `workflow._auto_chain_active` true for exactly the lifetime of a `Mode::Auto` Code-stage child, proven by the child's own reading of the config file while it ran, with a supervise-mode arm that reports the opposite.
+- A real `SIGKILL` is shown to leave GSD's `workflow._auto_chain_active` set — and the next real `devflow resume` is shown to clear it in the working tree, clear it at the branch tip with a scoped commit, refuse that commit when the file carries an operator's edit, and announce every repair on stdout and in `events.jsonl`.
+- An unattended launch is now refused, before any agent is spawned, when the GSD config cannot hold the chain flag, the Code stage would not launch on the pipe-owning arm, or a plan declares a checkpoint no mode auto-approves — with each of the three watched refusing a fixture built to make it refuse, and each paired with a passing counterpart one change away.
+- The chain-flag mechanism works. The drill was run end-to-end against a real Claude agent. Auto-approval is blocked by a GSD orchestrator behavior (upstream #3370) that conflates `gate="blocking"` with `gate="blocking-human"` — a narrow edge case in practice because GSD's default `end-of-phase` mode suppresses the checkpoint tasks that trigger it.
+- `verification_authored_this_run` now refuses to read provenance from a content fingerprint alone: a `verification_run_nonce` DevFlow stamps per Validate dispatch gates the decision, and its absence forces a full execute — closing 999.89's residual without changing the artifact format or asking GSD to write anything.
+- The cross-repo branch-naming coincidence that keeps `{N}-VERIFICATION.md` from being routinely replaced is now pinned by two tests in `phase_id.rs` — and the pin revealed the assumption behind it was already safe: production code was using `padded()` all along.
+- complete — 2/2 tasks, 4 captures committed.
+- complete — 1/1 task.
+- complete — 2/2 tasks.
+
+---
+
 ## v2.4.0 Resume Unattended Dogfooding (Shipped: 2026-08-06)
 
 **Phases completed:** 2 phases (33, 34), 12 plans, 25 tasks
@@ -18,21 +45,25 @@ inert in worktree mode.
   `handle_validate_outcome`'s consecutive-failures counter resets on a real new commit and only
   accumulates when a Validate→Code loop produces nothing, so a healthy 3+ wave phase reaches the
   end while a genuinely stuck loop still hits `MAX_CONSECUTIVE_FAILURES`.
+
 - **999.65 / DOGFOOD-01 — loop-back fix selection reads the right root.** `select_loop_back_fix`
   reads `{N}-VERIFICATION.md` from the phase's worktree rather than the main checkout, making
   `FixType::GapsOnly` reachable on the Validate path in worktree mode for the first time. Proven by
   a test that failed with the inverted value against unchanged code.
+
 - **999.74 / DOGFOOD-04 — the Validate trust boundary.** `reconcile_layer0_verdict` now consults
   Layer 1's own status before transplanting its verdict, and `classify_validate_outcome` was
   rewritten as an exhaustive match naming all seven `AgentStatus` variants with no wildcard in the
   status position. An agent-written `verdict: pass` attached to its own `status: failed` no longer
   advances to Ship unattended — the exploit was reproduced against the real cascade before the fix,
   and pinned by a regression test with a matched positive control.
+
 - **999.73 / DOGFOOD-03 — every stream-json stage joined on real evidence.** All five `Stage`
   variants widened onto the stream-json launch path against committed, PII-scrubbed production
   captures with per-stage drain analysis, rather than on assumption. **The campaign refuted its own
   premise** — zero `background_tasks_changed` events across 1063 events despite 8 concurrent
   sub-agent dispatches — and that was filed as backlog 999.83 rather than quietly absorbed.
+
 - **999.76 — Layer 0 works in DevFlow's default operating shape.** External-verification discovery
   reads the execution root, so a correctly-declared probe set no longer silently never executes in
   worktree mode.
@@ -47,12 +78,15 @@ Recorded rather than waved through — this is an `override_closeout`.
   `Action::GateReview` — which is correct by construction but has **no regression guard**:
   reverting its root argument leaves the full 279-test binary suite green. Phase 34's UAT closed
   this by operator attestation rather than demonstration. Tracked as **999.84 / DEN-106**.
+
 - **999.85 / DEN-107** — two in-source comments (`idle_timeout_result`'s doc comment and a residual
   instance inside `stream_success_cannot_stand_against_nonzero_exit_code`) still justify themselves
   by mechanisms this milestone's own fixes deleted. Conclusions correct, reasons stale. Surfaced by
   the Phase 34 security audit.
+
 - **999.83** — the drain gate, the safety mechanism the widened stages' unattended behaviour
   depends on, is currently proven *not* to see sub-agent concurrency on Claude CLI 2.1.222.
+
 - **No `/gsd-audit-milestone` was run** before this close. Requirements coverage was checked against
   REQUIREMENTS.md's traceability table and all phases were independently verified, but the
   cross-phase integration and E2E-flow audit that `/gsd-audit-milestone` performs did not happen.
