@@ -2578,6 +2578,154 @@ fn check_signing(project_root: &Path) -> Check {
 }
 
 // ---------------------------------------------------------------------------
+// release --verify (post-cut)
+// ---------------------------------------------------------------------------
+
+/// Read-only post-cut verifier. `release --check` guards the PRE-release
+/// invariants; this guards the POST-release ones that `--check` cannot see
+/// and that have been the easy-to-miss manual steps in practice: the release
+/// tag must point at a commit on `main` (not the `develop` release commit),
+/// and the `main`→`develop` sync must have been run. Same
+/// `Check`-list-then-report shape as `release --check`.
+pub(crate) fn release_verify(project_root: &Path) -> Result<(), CliError> {
+    let checks: Vec<Check> = vec![
+        check_tag_on_main(project_root),
+        check_sync_done(project_root),
+    ];
+
+    let mut failed = false;
+    for c in &checks {
+        let icon = match c.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            "fail" => "✗",
+            _ => "?",
+        };
+        let detail = c.version.as_deref().unwrap_or("-");
+        println!("  {:<32} {icon}  {detail}", c.name);
+        if matches!(c.status.as_str(), "warn" | "fail")
+            && let Some(hint) = &c.install_hint
+        {
+            println!("      — {hint}");
+        }
+        if c.status == "fail" {
+            failed = true;
+        }
+    }
+
+    if failed {
+        Err(CliError::Message(
+            "release verification failed — see checks above".into(),
+        ))
+    } else {
+        println!("\nrelease verification passed");
+        Ok(())
+    }
+}
+
+/// The release tag (`v{workspace version}`) must point at a commit on
+/// `origin/main`. A tag placed on the `develop` release commit (the mistake
+/// made cutting v2.5.0) is NOT an ancestor of `main`'s squash-merge lineage,
+/// so an ancestry test cleanly separates correct from incorrect placement.
+fn check_tag_on_main(project_root: &Path) -> Check {
+    const NAME: &str = "release tag on main";
+
+    let cargo_toml = project_root.join("Cargo.toml");
+    let contents = match std::fs::read_to_string(&cargo_toml) {
+        Ok(c) => c,
+        Err(err) => {
+            return Check {
+                name: NAME.into(),
+                status: "warn".into(),
+                version: Some(format!("could not read Cargo.toml: {err}")),
+                install_hint: None,
+            };
+        }
+    };
+    let (Some(workspace_version), _) = version::read_workspace_self_pins(&contents) else {
+        return Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("no [workspace.package] version to derive the tag from".into()),
+            install_hint: None,
+        };
+    };
+    let tag = format!("v{workspace_version}");
+
+    let tag_exists = devflow_core::git::git_command(project_root)
+        .args(["rev-parse", "--verify", "--quiet", &tag])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !tag_exists {
+        return Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(format!("tag {tag} does not exist")),
+            install_hint: Some("tag the release commit on main before verifying".into()),
+        };
+    }
+
+    match devflow_core::git::ref_is_ancestor(project_root, &tag, "origin/main") {
+        devflow_core::git::AncestorStatus::Ancestor => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some(format!("{tag} is on origin/main")),
+            install_hint: None,
+        },
+        devflow_core::git::AncestorStatus::Diverged => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(format!(
+                "{tag} is NOT an ancestor of origin/main — tagged the wrong branch"
+            )),
+            install_hint: Some(
+                "re-tag on main:  git -c user.signingkey=\"$(git config --get \
+                 devflow.releaseSigningKey)\" tag -s -f vX.Y.Z origin/main"
+                    .into(),
+            ),
+        },
+        devflow_core::git::AncestorStatus::RefAbsent => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("origin/main not fetched — cannot compare tag placement".into()),
+            install_hint: Some("run `git fetch` first, then re-run".into()),
+        },
+    }
+}
+
+/// After a release, `origin/main` must be an ancestor of `origin/develop`
+/// (the `scripts/sync-main-to-develop.sh` step). Skipping it means the next
+/// release PR conflicts against a stale merge-base.
+fn check_sync_done(project_root: &Path) -> Check {
+    const NAME: &str = "main→develop sync";
+    match devflow_core::git::ref_is_ancestor(project_root, "origin/main", "origin/develop") {
+        devflow_core::git::AncestorStatus::Ancestor => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some("origin/main is an ancestor of origin/develop".into()),
+            install_hint: None,
+        },
+        devflow_core::git::AncestorStatus::Diverged => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(
+                "origin/main is NOT an ancestor of origin/develop — sync was skipped".into(),
+            ),
+            install_hint: Some(
+                "run scripts/sync-main-to-develop.sh, then PR the merge commit (not squash)".into(),
+            ),
+        },
+        devflow_core::git::AncestorStatus::RefAbsent => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("origin/main or origin/develop not fetched — cannot check sync".into()),
+            install_hint: Some("run `git fetch` first, then re-run".into()),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // doctor reconciliation (18a)
 // ---------------------------------------------------------------------------
 

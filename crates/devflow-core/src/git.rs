@@ -572,6 +572,37 @@ pub fn origin_main_ancestor_status(project_root: &Path) -> AncestorStatus {
     }
 }
 
+/// Whether the `ancestor` ref is an ancestor of the `descendant` ref, against
+/// ALREADY-FETCHED local refs — issues NO `git fetch`. Generalises
+/// [`origin_main_ancestor_status`] to an arbitrary ref pair (used by
+/// `release --verify`'s post-cut checks: is the release tag on `main`, and
+/// has the `main`→`develop` sync run). Distinguishes "not an ancestor"
+/// (exit 1) from "a ref is absent" (exit 128) so the caller can degrade to
+/// an actionable `git fetch` message instead of reporting a false
+/// divergence.
+pub fn ref_is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> AncestorStatus {
+    let both_exist = [ancestor, descendant].iter().all(|r| {
+        git_command(project_root)
+            .args(["rev-parse", "--verify", "--quiet", r])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    });
+    if !both_exist {
+        return AncestorStatus::RefAbsent;
+    }
+    let is_ancestor = git_command(project_root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if is_ancestor {
+        AncestorStatus::Ancestor
+    } else {
+        AncestorStatus::Diverged
+    }
+}
+
 /// Derive the crates.io publish order for a workspace's local-path members
 /// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
 /// `[workspace] members` list and each member's own `[dependencies]`
@@ -1888,6 +1919,80 @@ mod tests {
         let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
         git(root, &["update-ref", "refs/remotes/origin/main", &head_sha]);
         assert_eq!(origin_main_ancestor_status(root), AncestorStatus::Ancestor);
+    }
+
+    // -----------------------------------------------------------------
+    // release --verify: ref_is_ancestor (arbitrary ref pair)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ref_is_ancestor_is_ref_absent_without_remote_refs() {
+        let repo = init_repo();
+        let root = repo.path();
+        assert_eq!(
+            ref_is_ancestor(root, "origin/main", "origin/develop"),
+            AncestorStatus::RefAbsent
+        );
+    }
+
+    #[test]
+    fn ref_is_ancestor_is_ancestor_when_the_refs_are_in_order() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head = crate::test_support::git_command(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        git(root, &["update-ref", "refs/remotes/origin/main", &head_sha]);
+        git(
+            root,
+            &["update-ref", "refs/remotes/origin/develop", &head_sha],
+        );
+        assert_eq!(
+            ref_is_ancestor(root, "origin/main", "origin/develop"),
+            AncestorStatus::Ancestor
+        );
+    }
+
+    /// The case `release --verify` exists for: `main` and `develop` point at
+    /// unrelated commits (main is a squash-merge lineage), so neither is an
+    /// ancestor of the other — the "sync skipped" state that makes the next
+    /// release PR conflict against a stale merge-base.
+    #[test]
+    fn ref_is_ancestor_is_diverged_for_unrelated_commits() {
+        let repo = init_repo();
+        let root = repo.path();
+
+        // develop is checked out at commit A. Build an unrelated orphan commit
+        // for "main" (a squash-merge-shaped lineage that never descends from A).
+        git(root, &["checkout", "--orphan", "orphan-main"]);
+        commit_file(root, "orphan.txt");
+        let orphan = crate::test_support::git_command(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let orphan_sha = String::from_utf8_lossy(&orphan.stdout).trim().to_string();
+
+        git(root, &["checkout", "-q", "develop"]);
+        let develop = crate::test_support::git_command(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let develop_sha = String::from_utf8_lossy(&develop.stdout).trim().to_string();
+
+        git(
+            root,
+            &["update-ref", "refs/remotes/origin/main", &orphan_sha],
+        );
+        git(
+            root,
+            &["update-ref", "refs/remotes/origin/develop", &develop_sha],
+        );
+        assert_eq!(
+            ref_is_ancestor(root, "origin/main", "origin/develop"),
+            AncestorStatus::Diverged
+        );
     }
 
     // -----------------------------------------------------------------
