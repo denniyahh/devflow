@@ -115,9 +115,26 @@ step_tag() {
     require_clean
     local v; v="$(workspace_version)"
     git fetch origin main --quiet
+
+    # The release tag MUST be signed with the maintainer's key. If
+    # devflow.releaseSigningKey is unset, `git config --get` returns empty and
+    # the tag silently signs with whatever `user.signingkey` defaults to — the
+    # wrong-identity trap 999.104 catalogues. Fail loudly instead.
+    local release_key; release_key="$(git config --get devflow.releaseSigningKey || true)"
+    if [ -z "$release_key" ]; then
+        echo "cut-release: devflow.releaseSigningKey is not set." >&2
+        echo "  Set it: git config --local devflow.releaseSigningKey <path-to-maintainer-key>" >&2
+        exit 1
+    fi
+    local release_key_expanded="${release_key/#\~/$HOME}"
+    if [ ! -r "$release_key_expanded" ]; then
+        echo "cut-release: devflow.releaseSigningKey points at an unreadable file: $release_key" >&2
+        exit 1
+    fi
+
     # The tag MUST land on main's squash commit, not the develop release
     # commit — enforced here, and re-checked by `release --verify`.
-    git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" \
+    git -c user.signingkey="$release_key" \
         tag -s "v$v" origin/main -m "release: v$v"
     git verify-tag "v$v"
     git push origin "v$v"
