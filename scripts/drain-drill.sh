@@ -33,6 +33,11 @@
 #   --runs <n>              Repetitions per path (default: 2).
 #   --out <path>            Evidence directory (default: the phase's 35.3-evidence/).
 #
+# OUTPUT: per run, writes <out>/<V>-run-<i>-raw_output.jsonl, a `-stderr.log`,
+# and a `-run.log` provenance file (argv, claude version, build commit, exit
+# status, parse-based counts). Appends one row per run to <out>/counts.tsv. The
+# analysis prose (COUNTS.md) is a separate synthesis step, not emitted here.
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,6 +77,16 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Validate the two tunables so a typo cannot silently measure the wrong workload
+# or run zero captures (code-review findings, 2026-08-15).
+case "$PROMPT_VARIANT" in
+    A | B) ;;
+    *) die "--prompt must be A or B (got '$PROMPT_VARIANT')" ;;
+esac
+if ! printf '%s' "$RUNS" | grep -qE '^[1-9][0-9]*$'; then
+    die "--runs must be a positive integer (got '$RUNS')"
+fi
 
 # ---------------------------------------------------------------------------
 # Destination guard (T-23-01, inherited from unattended-drill.sh).
@@ -137,18 +152,36 @@ PROMPT
 CLAUDE_ARGV=(claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions)
 
 launch_and_capture() {
-    local variant="$1" run_i="$2" dest="$3" prompt capture err
+    local variant="$1" run_i="$2" dest="$3" prompt capture err turn_file turn pid rc
     prompt="$([ "$variant" = "A" ] && prompt_A || prompt_B)"
     mkdir -p "$OUT_FILE"
     capture="$OUT_FILE/$variant-run-$run_i-raw_output.jsonl"
     err="$OUT_FILE/$variant-run-$run_i-stderr.log"
     # Build the user-turn JSON with jq so the prompt is escaped, not interpolated
     # (the same reason monitor.rs uses serde_json, not format!).
-    local turn
     turn="$(jq -cn --arg content "$prompt" '{type:"user",message:{role:"user",content:$content}}')"
+    # Temp file, not a pipe: a backgrounded pipeline would make the child PID
+    # ambiguous and trip `pipefail` on a non-zero exit.
+    turn_file="$(mktemp)"
+    printf '%s\n' "$turn" > "$turn_file"
+
     note "variant $variant run $run_i: launching claude (capture -> $capture)"
-    printf '%s\n' "$turn" | "${CLAUDE_ARGV[@]}" > "$capture" 2> "$err"
-    note "variant $variant run $run_i: claude exited ($?)"
+    # Backgrounded so the child PID is tracked and reaped (T-35.1-18), and a
+    # non-zero exit is recorded in the run.log instead of aborting the script
+    # before any provenance exists.
+    "${CLAUDE_ARGV[@]}" < "$turn_file" > "$capture" 2> "$err" &
+    pid=$!
+    CHILD_PIDS="$CHILD_PIDS $pid"
+    rc=0
+    wait "$pid" || rc=$?
+    # Runs are sequential, so this child is the only one tracked; clear the list.
+    # (A `grep -vx` here would return 1 on the reap — pipefail + set -e abort.)
+    CHILD_PIDS=""
+    rm -f "$turn_file"
+    note "variant $variant run $run_i: claude exited ($rc)"
+
+    write_run_log "$variant" "$run_i" "$capture" "$rc"
+    append_counts_row "$variant" "$run_i" "$capture"
 }
 
 count_events() {
@@ -158,6 +191,47 @@ count_events() {
     local bg
     bg="$(jq -s '[.[] | .. | objects | select(.run_in_background? == true)] | length' "$capture" 2>/dev/null || echo 0)"
     echo "    run_in_background:true observed: $bg"
+}
+
+# Write a self-contained provenance file per capture, so a re-run of the drill
+# reproduces the evidence without any hand assembly (code-review HIGH, 2026-08-15).
+write_run_log() {
+    local variant="$1" run_i="$2" capture="$3" rc="$4"
+    local log="$OUT_FILE/$variant-run-$run_i-run.log"
+    local counts bg
+    counts="$(jq -r 'select(.type=="system") | .subtype' "$capture" 2>/dev/null | sort | uniq -c | sed 's/^/  /')"
+    bg="$(jq -s '[.[] | .. | objects | select(.run_in_background? == true)] | length' "$capture" 2>/dev/null || echo 0)"
+    {
+        echo "# Phase 35.3 — drain-gate capture provenance: Variant $variant run $run_i"
+        echo
+        echo "command invoked : scripts/drain-drill.sh --prompt $variant --runs $RUNS"
+        echo "child argv      : ${CLAUDE_ARGV[*]}"
+        echo "claude_cli_version : $(claude --version 2>&1 | head -1)"
+        echo "devflow build commit : $(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+        echo "outcome         : claude exited $rc"
+        echo
+        echo "counts (parse-based, jq):"
+        echo "$counts"
+        echo
+        echo "run_in_background:true observed : $bg"
+    } > "$log"
+}
+
+# Append one machine-readable row per run; counts.tsv is the raw mapping the
+# analysis prose (COUNTS.md) is synthesized from.
+append_counts_row() {
+    local variant="$1" run_i="$2" capture="$3"
+    local tsv="$OUT_FILE/counts.tsv" ts tp tn tu bgc bg
+    ts="$(jq -s '[.[] | select(.type=="system" and .subtype=="task_started")] | length' "$capture" 2>/dev/null || echo 0)"
+    tp="$(jq -s '[.[] | select(.type=="system" and .subtype=="task_progress")] | length' "$capture" 2>/dev/null || echo 0)"
+    tn="$(jq -s '[.[] | select(.type=="system" and .subtype=="task_notification")] | length' "$capture" 2>/dev/null || echo 0)"
+    tu="$(jq -s '[.[] | select(.type=="system" and .subtype=="task_updated")] | length' "$capture" 2>/dev/null || echo 0)"
+    bgc="$(jq -s '[.[] | select(.type=="system" and .subtype=="background_tasks_changed")] | length' "$capture" 2>/dev/null || echo 0)"
+    bg="$(jq -s '[.[] | .. | objects | select(.run_in_background? == true)] | length' "$capture" 2>/dev/null || echo 0)"
+    if [ ! -f "$tsv" ]; then
+        printf 'variant\trun\ttask_started\ttask_progress\ttask_notification\ttask_updated\tbackground_tasks_changed\trun_in_background\n' > "$tsv"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$variant" "$run_i" "$ts" "$tp" "$tn" "$tu" "$bgc" "$bg" >> "$tsv"
 }
 
 # ---------------------------------------------------------------------------
@@ -193,4 +267,4 @@ while [ "$i" -le "$RUNS" ]; do
     i=$((i + 1))
 done
 
-note "evidence written under $OUT_FILE"
+note "evidence written under $OUT_FILE (raw captures + run.log per capture + counts.tsv)"
