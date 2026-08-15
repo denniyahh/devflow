@@ -26,11 +26,15 @@ release signing key, replacing the fragile key checks).
 The adapter wires the interface established from Pi docs v0.84.1:
 
 - `name()` — a stable human-readable name (e.g. `"Pi"`).
-- `exec_command()` — `("pi", vec!["-p", "--model", <model>, "--provider", <provider>,
-  "--approve", <prompt>])` (print mode; see below for transport).
-- `preflight()` — health check: `pi` binary present **and** a provider credential resolves (Pi
-  defaults to `google` via `GEMINI_API_KEY`; "can execute headless" for Pi means "has a working
-  provider credential", which the existing three adapters' checks have no analogue for).
+- `exec_command()` — `("pi", vec!["-p", "--no-approve", "--", <prompt>])` (print mode,
+  positional prompt, `--` delimiter). No `--model`/`--provider` wiring — model/provider selection
+  is Phase 37 (the `AgentDriver` contract has the config access `AgentAdapter` lacks), and an
+  env-sourced value would not survive detached-monitor stage launches. `--no-approve` because
+  `--approve` trusts project-local extensions that execute unsandboxed.
+- `preflight()` — health check backed by `pi auth check` (Pi's authoritative verb), **not**
+  env-var sniffing (`DEVFLOW_PI_PROVIDER` is a provider *name*, not a credential): `ready` →
+  headless-capable, otherwise a distinct credentialless `Err`. The "binary absent" case is
+  `ensure_agent_binary`'s job (runs before preflight).
 
 ### B. 999.96 — `release --check` version-bump row (S)
 
@@ -72,9 +76,10 @@ The two-key model is resolved by making the release path deterministic, not by m
    "installed but not headless-capable".
 2. 999.96: the `release --check` row reports NOT viable on a synthetic mismatched fixture and
    viable when they agree, with direction stated.
-3. 999.104: the release path signs tags with `devflow.releaseSigningKey` deterministically; the
-   signing-viability probe and the pre-push fingerprint hook are gone; a missing
-   `devflow.releaseSigningKey` fails the release loudly.
+3. 999.104: `scripts/cut-release.sh` fails loudly when `devflow.releaseSigningKey` is unset or its
+   file is unreadable; the capability-only signing-viability probe is deleted (clippy-clean, the
+   whole private cluster); the pre-push fingerprint hook is **retained** — it is the only check that
+   distinguishes the agent key from the maintainer key on a hand-cut release tag.
 
 ## Deferred (explicitly not here)
 
