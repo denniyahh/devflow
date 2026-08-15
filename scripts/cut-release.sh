@@ -133,8 +133,9 @@ step_tag() {
     fi
 
     # The tag MUST land on main's squash commit, not the develop release
-    # commit — enforced here, and re-checked by `release --verify`.
-    git -c user.signingkey="$release_key" \
+    # commit — enforced here, and re-checked by `release --verify`. Pass the
+    # tilde-expanded path so git does not rely on its own `~` handling.
+    git -c user.signingkey="$release_key_expanded" \
         tag -s "v$v" origin/main -m "release: v$v"
     git verify-tag "v$v"
     git push origin "v$v"

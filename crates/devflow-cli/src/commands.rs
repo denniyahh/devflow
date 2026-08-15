@@ -2593,15 +2593,27 @@ fn check_changelog_version(project_root: &Path) -> Check {
             };
         }
     };
-    let changelog_version = changelog_contents
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("## ")
-                .and_then(|rest| rest.split_whitespace().next())
-                .filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                .map(str::to_string)
+    let changelog_version = changelog_contents.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("## ")?;
+        let version = rest.split_whitespace().next().map(|w| {
+            w.trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_start_matches('v')
         });
+        // A version looks like `X.Y` — a leading digit, a dot, then another
+        // digit — so a `## [2.5.0]` link and a `## v2.5.0` prefix both parse,
+        // while a numbered section like `## 1. Overview` does not.
+        version
+            .filter(|v| {
+                let Some(dot) = v.find('.') else {
+                    return false;
+                };
+                let bytes = v.as_bytes();
+                bytes.first().is_some_and(|b| b.is_ascii_digit())
+                    && bytes.get(dot + 1).is_some_and(|b| b.is_ascii_digit())
+            })
+            .map(str::to_string)
+    });
     let Some(changelog_version) = changelog_version else {
         return Check {
             name: NAME.into(),
@@ -2619,10 +2631,14 @@ fn check_changelog_version(project_root: &Path) -> Check {
             install_hint: None,
         }
     } else {
-        let direction = match version_components_gt(&changelog_version, &workspace_version) {
-            Some(true) => "changelog ahead of Cargo.toml (version bump not yet applied)",
-            Some(false) => "Cargo.toml ahead of changelog (release notes missing)",
-            None => "direction undetermined (unparseable version)",
+        let direction = match compare_versions(&changelog_version, &workspace_version) {
+            Some(std::cmp::Ordering::Greater) => {
+                "changelog ahead of Cargo.toml (version bump not yet applied)"
+            }
+            Some(std::cmp::Ordering::Less) => {
+                "Cargo.toml ahead of changelog (release notes missing)"
+            }
+            _ => "direction undetermined (equal-numeric or unparseable version)",
         };
         Check {
             name: NAME.into(),
@@ -2635,21 +2651,34 @@ fn check_changelog_version(project_root: &Path) -> Check {
     }
 }
 
-/// Best-effort numeric comparison of two `X.Y.Z` version strings, component-wise.
-/// `Some(true)` if `a > b`, `Some(false)` if `a < b`, `None` if either is
-/// unparseable.
-fn version_components_gt(a: &str, b: &str) -> Option<bool> {
-    let parse = |v: &str| -> Option<Vec<u32>> {
+/// Best-effort comparison of two `X.Y.Z` version strings, component-wise, with
+/// standard semver prerelease ordering (`2.5.0` > `2.5.0-rc.1`). `None` if
+/// either is unparseable.
+fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let components = |v: &str| -> Option<(Vec<u32>, bool)> {
         let parts = v
             .split(|c: char| !c.is_ascii_digit())
             .filter(|s| !s.is_empty())
             .take(3)
             .map(|s| s.parse().ok())
             .collect::<Option<Vec<_>>>()?;
-        (!parts.is_empty()).then_some(parts)
+        if parts.is_empty() {
+            return None;
+        }
+        let has_prerelease = v.contains('-');
+        Some((parts, has_prerelease))
     };
-    let (a, b) = (parse(a)?, parse(b)?);
-    Some(a > b)
+    let (a, a_pre) = components(a)?;
+    let (b, b_pre) = components(b)?;
+    let mut cmp = a.cmp(&b);
+    if cmp == std::cmp::Ordering::Equal {
+        cmp = match (a_pre, b_pre) {
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, false) => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Equal,
+        };
+    }
+    Some(cmp)
 }
 
 // Tag-signing viability check removed (999.104): the probe was capability-only
@@ -6663,9 +6692,23 @@ mod tests {
             "workspace 2.5.0 is newer than changelog 2.4.0"
         );
 
+        // Reverse: changelog 2.6.0 vs workspace 2.5.0 → fail, "changelog ahead".
+        write_workspace("2.5.0");
+        std::fs::write(root.join("CHANGELOG.md"), "## 2.6.0 — 2026-01-01\n").unwrap();
+        let reverse = check_changelog_version(root);
+        assert_eq!(reverse.status, "fail");
+        assert!(
+            reverse.version.unwrap().contains("changelog ahead"),
+            "changelog 2.6.0 is newer than workspace 2.5.0"
+        );
+
         // Agreement: both 2.5.0 → ok.
         write_workspace("2.5.0");
         std::fs::write(root.join("CHANGELOG.md"), "## 2.5.0 — 2026-08-15\n").unwrap();
+        assert_eq!(check_changelog_version(root).status, "ok");
+
+        // Bracketed Keep-a-Changelog heading `## [2.5.0]` → parses, ok.
+        std::fs::write(root.join("CHANGELOG.md"), "## [2.5.0] - 2026-08-15\n").unwrap();
         assert_eq!(check_changelog_version(root).status, "ok");
 
         // Missing heading → warn, not a hard fail.

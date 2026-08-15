@@ -286,7 +286,7 @@ enum Command {
         project: PathBuf,
     },
     /// Read-only release-cut preflight: self-pin, develop/main divergence,
-    /// crates.io publish order, and tag-signing viability.
+    /// crates.io publish order, and changelog-version agreement.
     ///
     /// Ceiling is `--check` only (20d) — this command never runs the actual
     /// merge/tag/sync/publish sequence, which is a deferred, not-yet-built
