@@ -2608,6 +2608,39 @@ can miss it entirely.
 
 ---
 
+### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
+
+**Found:** 2026-08-15, dogfooding Phase 36. A hand-run adversarial review (claude/opus,
+codex/gpt-5.6-sol, antigravity/Gemini 3.1 Pro) against the phase's SPEC/CONTEXT and then its PLAN
+caught, in one phase, three CRITICAL findings — 999.104 targeting dead code (`release_finish` has
+no production caller), a false-green credential check (`DEVFLOW_PI_PROVIDER` is a provider name,
+not a credential), and `--approve` as unsandboxed-code-execution risk — plus two HIGH (an unowned
+doctor integration, and a hook deletion that would break existing tests). Every one of those would
+have shipped or wasted a wave without it.
+
+**The item:** make that review a default part of the phase lifecycle, not an ad-hoc operator step:
+- a cross-model adversarial pass over the CONTEXT (post-discuss) and the PLAN (post-plan), before execute;
+- the pass is the `adversarial-review` skill (selectable `cli:model:effort` reviewers) or a
+  GSD-native equivalent, defaulting to a diverse 2-3 reviewer set;
+- findings feed back into planning the way `gsd-plan-phase --reviews` consumes REVIEWS.md, with the
+  orchestrator gating execute until blocking findings are dispositioned.
+
+**Why this is more than the existing `gsd-review`:** `gsd-review` is plan-only, CLI-level (flags
+select CLIs, not models/effort), and carries no CWD/context discipline — the Phase 36 run's own
+failure mode (reviewers launched from the wrong checkout, reading a stale SPEC) is exactly what this
+feature's procedure must pin. The `adversarial-review` skill already encodes the review-root/CWD and
+citation-verification discipline; this item promotes it into the default flow.
+
+**Priority:** High — it paid for itself in a single phase by catching findings that would otherwise
+have shipped. **Size:** M — the skill exists; the work is wiring it into the phase gates
+(discuss:post / plan:post hooks, or a devflow stage), the feedback loop, and the "blocking
+findings" gate.
+
+**Depends on:** nothing structurally. The `adversarial-review` skill (`~/.agents/skills/`) is the
+reusable core.
+
+---
+
 ### Phase 999.104: The Release-Signing Key Workflow Is Fragile and Has Caused Repeated Mistakes (BACKLOG — discuss in Phase 36)
 
 **Found:** repeatedly, across at least the last ten phases. The v2.5.0 cut (2026-08-15) hit it
