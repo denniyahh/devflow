@@ -25,8 +25,8 @@ use parallel::parallel;
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
-    logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
-    test_cmd,
+    logs, recover_cmd, reference, release_check, release_verify, resolve_gate_target, start,
+    status, stop, test_cmd,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -297,6 +297,11 @@ enum Command {
         /// treated as a valid run.
         #[arg(long)]
         check: bool,
+        /// Run the read-only POST-cut verification: the release tag points
+        /// at `origin/main`, and the `main`→`develop` sync has been run.
+        /// Mutually exclusive with `--check` (pre-cut vs post-cut).
+        #[arg(long)]
+        verify: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -653,20 +658,29 @@ fn run() -> Result<(), CliError> {
         } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
-        Command::Release { check, project } => {
-            // D-03 / Codex MEDIUM: an omitted --check is never silently
-            // treated as a valid check run. This phase ships only the
-            // read-only preflight, not the release-cut executor (merge/tag/
-            // sync/publish) — that command is a deferred backlog item.
-            if !check {
-                return Err(CliError::Message(
-                    "devflow release requires --check: only the read-only preflight ships in \
-                     this phase. The release-cut executor (merge PR → tag → sync develop → \
-                     publish) is deferred (DEN-50) and not yet built."
+        Command::Release {
+            check,
+            verify,
+            project,
+        } => {
+            // D-03 / Codex MEDIUM: a bare `devflow release` is never silently
+            // treated as a valid run. This phase ships only the read-only
+            // preflight (--check) and post-cut verification (--verify), never
+            // the release-cut executor (merge/tag/sync/publish) — that command
+            // is a deferred backlog item (DEN-50).
+            match (check, verify) {
+                (true, false) => release_check(&project_root(project)?),
+                (false, true) => release_verify(&project_root(project)?),
+                (true, true) => Err(CliError::Message(
+                    "devflow release accepts exactly one of --check or --verify".to_string(),
+                )),
+                (false, false) => Err(CliError::Message(
+                    "devflow release requires --check (pre-cut preflight) or --verify \
+                     (post-cut verification) — the release-cut executor \
+                     (merge/tag/sync/publish) is deferred (DEN-50) and not yet built."
                         .to_string(),
-                ));
+                )),
             }
-            release_check(&project_root(project)?)
         }
         Command::Ship {
             phase,
