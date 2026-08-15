@@ -1,6 +1,6 @@
 # Agent Model
 
-DevFlow supports three agents today (Claude Code, Codex, OpenCode) through
+DevFlow supports four agents today (Claude Code, Codex, OpenCode, Pi) through
 one shared adapter interface. This is not a fully agent-neutral platform yet
 — see the driver-architecture backlog (999.31) for that direction.
 

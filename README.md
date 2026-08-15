@@ -164,7 +164,7 @@ Key flags:
 | Flag | Description |
 |---|---|
 | `--phase N` | Phase number to execute |
-| `--agent claude\|codex\|opencode` | Agent to launch |
+| `--agent claude\|codex\|opencode\|pi` | Agent to launch |
 | `--mode auto\|supervise` | `auto` advances through Ship unattended; `supervise` also gates at Validate for human review |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 

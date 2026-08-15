@@ -2313,6 +2313,12 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             "--version",
             "cargo install opencode",
         ),
+        cmd_check(
+            "pi",
+            "pi",
+            "--version",
+            "Install Pi (see https://github.com/earendil-works/pi-mono)",
+        ),
         Check {
             name: format!("devflow v{devflow_version}"),
             status: "ok".into(),

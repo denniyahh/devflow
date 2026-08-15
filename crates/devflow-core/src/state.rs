@@ -391,6 +391,8 @@ pub enum AgentKind {
     Codex,
     /// OpenCode CLI.
     OpenCode,
+    /// Pi coding-agent harness.
+    Pi,
 }
 
 impl fmt::Display for AgentKind {
@@ -399,6 +401,7 @@ impl fmt::Display for AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::OpenCode => "opencode",
+            AgentKind::Pi => "pi",
         };
         f.write_str(name)
     }
@@ -412,6 +415,7 @@ impl FromStr for AgentKind {
             "claude" => Ok(AgentKind::Claude),
             "codex" => Ok(AgentKind::Codex),
             "opencode" | "open-code" => Ok(AgentKind::OpenCode),
+            "pi" => Ok(AgentKind::Pi),
             other => Err(AgentParseError(other.to_string())),
         }
     }
@@ -419,7 +423,7 @@ impl FromStr for AgentKind {
 
 /// Error returned when parsing an unsupported agent name.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unsupported agent `{0}`; expected claude, codex, or opencode")]
+#[error("unsupported agent `{0}`; expected claude, codex, opencode, or pi")]
 pub struct AgentParseError(String);
 
 impl State {
