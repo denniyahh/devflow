@@ -2827,6 +2827,42 @@ can miss it entirely.
 
 ---
 
+### Phase 999.104: The Release-Signing Key Workflow Is Fragile and Has Caused Repeated Mistakes (BACKLOG — discuss in Phase 36)
+
+**Found:** repeatedly, across at least the last ten phases. The v2.5.0 cut (2026-08-15) hit it
+again: `release --check`'s "tag-signing viability" probes `user.signingkey` (the **agent's** key,
+`9BPy…`), not `devflow.releaseSigningKey` (the **maintainer's** key, `u84t…`), so the preflight
+reports "signing viable" for the wrong key and the real enforcement only fires later, in the
+pre-push fingerprint comparison.
+
+**The recurring shape.** Two signing keys coexist on the same machine, both configured with the
+same `user.email`, so a tag signed with the wrong one renders identically everywhere a human looks
+(`git log`, `git tag -v`, GitHub's "Verified" badge). Only the fingerprint differs. The intended
+workflow:
+
+- ordinary commits → agent key (`user.signingkey`)
+- release tags + `main` → maintainer key (`devflow.releaseSigningKey`), via an explicit
+  `git -c user.signingkey=…` override
+
+Every recent release has tripped on some facet: the override forgotten, the preflight probing the
+wrong key, or the "it looks correct but isn't" trap (both keys share the email).
+
+**What to decide in Phase 36 — not fix here.** This is a workflow-design question, not a single
+bug. Open decisions to settle in discuss-phase:
+
+1. Should `release --check`'s signing probe target `devflow.releaseSigningKey` rather than the
+   agent's `user.signingkey`? (The obvious one-line fix — but see 2.)
+2. Is the two-key model itself the right shape? Alternatives: a single release-only signing
+   identity, or making the maintainer key the only key on the release path so there is no "wrong
+   key" to select — and no `-c` override to forget.
+3. Should the fingerprint check surface earlier (in `release --check` / `--verify`) so a wrong-key
+   tag fails at preflight instead of at push?
+
+**Priority:** High-for-annoyance (recurring; the wrong-key trap is silent until push).
+**Size:** TBD — depends on which of (1)–(3) Phase 36 chooses; (1) alone is S.
+
+---
+
 ### Phase 999.103: The Gate Notify Hook Has No Home, No Default, and No Way to Tell You It Is Broken (BACKLOG)
 
 **Found:** 2026-08-09, dogfooding Phase 35.1. Three consecutive Code-stage failures fired
