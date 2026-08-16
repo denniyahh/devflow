@@ -64,7 +64,9 @@ fn unset_signing_key_fails_loudly_before_tagging() {
     let unset_guard = source
         .find("if [ -z \"$release_key\" ]")
         .expect("cut-release.sh must guard the unset-key case");
-    let tag = source.find("tag -s").expect("cut-release.sh must invoke tag -s");
+    let tag = source
+        .find("tag -s")
+        .expect("cut-release.sh must invoke tag -s");
     assert!(
         unset_guard < tag,
         "the unset-key guard must fire before `tag -s` so a missing key fails \
