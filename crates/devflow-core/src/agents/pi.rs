@@ -84,6 +84,13 @@ fn classify_auth_check(stdout: &str, success: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::Mode;
+    use crate::state::{AgentKind, State};
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `PATH` (`set_var` is
+    /// process-wide; `cargo test` runs tests in parallel).
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn exec_command_shape() {
@@ -122,5 +129,118 @@ mod tests {
     fn classify_auth_check_rejects_ready_text_with_failed_exit() {
         // A failed exit must not be read as ready even if the body says "ready".
         assert!(classify_auth_check(r#"{"status":"ready"}"#, false).is_err());
+    }
+
+    /// A `State` value for `preflight`, which ignores it (`_state`) —
+    /// constructed only to satisfy the trait signature.
+    fn test_state() -> State {
+        State::new(
+            PhaseId::new(36),
+            AgentKind::Pi,
+            Mode::Auto,
+            std::path::PathBuf::from("/tmp"),
+        )
+    }
+
+    /// Writes an executable `pi` stub into a fresh tempdir. The stub records its
+    /// arguments (`"$@"`, one per line) to `args.txt` in the same dir, prints
+    /// `body` to stdout, and exits with `exit_code`. The returned tempdir is the
+    /// only entry the test puts on `PATH`, so the operator's live `pi` is never
+    /// consulted.
+    fn stub_pi_on_path(body: &str, exit_code: i32) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create stub dir");
+        let stub = dir.path().join("pi");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\necho '{body}'\nexit {exit_code}\n",
+            args = dir.path().join("args.txt").display(),
+            body = body,
+            exit_code = exit_code,
+        );
+        std::fs::write(&stub, script).expect("write pi stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        }
+        dir
+    }
+
+    /// RAII guard that replaces `PATH` with `path` and restores the previous
+    /// value on `Drop` — including the panic path, so a failing test never
+    /// hands the next test a mutated `PATH`.
+    struct PathGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl PathGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let original = std::env::var_os("PATH");
+            // SAFETY: held under ENV_MUTEX; no other thread reads/writes PATH.
+            unsafe { std::env::set_var("PATH", path) };
+            Self { original }
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(prev) => unsafe { std::env::set_var("PATH", prev) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// The shell-out must actually spawn `pi auth check --json --provider
+    /// google` — not just classify a pre-parsed string. The stub records its
+    /// argv, so this proves the wiring end to end.
+    #[test]
+    fn preflight_invokes_pi_auth_check_and_accepts_ready() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 0);
+        let _path = PathGuard::set(stub_dir.path());
+
+        PiAgent
+            .preflight(&test_state())
+            .expect("a `ready` stub should pass preflight");
+
+        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
+        assert_eq!(argv, "auth\ncheck\n--json\n--provider\ngoogle\n");
+    }
+
+    /// The negative control AC #1 requires: a `pi` binary that reports
+    /// `not_ready` must yield the credentialless `Err`, proving the predicate
+    /// tests credential readiness, not env-var presence.
+    #[test]
+    fn preflight_reports_credentialless_when_auth_check_says_not_ready() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path(
+            r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
+            0,
+        );
+        let _path = PathGuard::set(stub_dir.path());
+
+        let err = PiAgent
+            .preflight(&test_state())
+            .expect_err("a `not_ready` stub should fail preflight");
+        assert!(
+            err.contains("no provider credential resolves"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The exit code must be honored through the shell-out path, not just the
+    /// pure classifier: a `ready` body with a failed exit is still a failure.
+    #[test]
+    fn preflight_rejects_ready_body_with_failed_exit() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 1);
+        let _path = PathGuard::set(stub_dir.path());
+
+        assert!(
+            PiAgent.preflight(&test_state()).is_err(),
+            "a failed exit must not be read as ready even when the body says ready"
+        );
     }
 }
