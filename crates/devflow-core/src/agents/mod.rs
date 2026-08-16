@@ -69,12 +69,119 @@ pub trait AgentAdapter {
     fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String;
 }
 
+/// Capabilities a driver declares, enumerated as-needed (999.31 D-01).
+/// `#[non_exhaustive]` + `Default` so adding a field never breaks an existing
+/// driver (CONTEXT D-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct DriverCapabilities {}
+
+/// What a driver's sandbox needs from the launch environment. Reserved for
+/// 37-03 (Codex's writable-roots requirement).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SandboxRequirements {}
+
+/// One case from a driver's conformance contract (37-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractResult {
+    pub name: &'static str,
+    pub passed: bool,
+}
+
+/// The modular driver contract (999.31): each agent owns its prompt rendering,
+/// command building, completion parsing, and health/capability discovery —
+/// instead of that logic being scattered across `prompt.rs`, `agents/*.rs`,
+/// `agent_result.rs`, and `preflight.rs`.
+pub trait AgentDriver {
+    /// Human-readable driver name.
+    fn name(&self) -> &'static str;
+
+    /// Capabilities this driver declares (as-needed; default empty).
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities::default()
+    }
+
+    /// Render the stage prompt for this agent from a [`crate::prompt::StageIntent`].
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String;
+
+    /// Build the command and arguments to launch this agent headless.
+    fn build_command(
+        &self,
+        phase: PhaseId,
+        prompt: &str,
+        extra_writable_roots: &[PathBuf],
+    ) -> (&'static str, Vec<String>);
+
+    /// Parse this agent's completion signal out of captured output; `None` when
+    /// the transport is process-exit (no event stream to scan).
+    fn parse_completion(&self, _output: &str) -> Option<crate::agent_result::AgentResult> {
+        None
+    }
+
+    /// Driver-specific pre-launch health check.
+    fn health(&self, _state: &crate::state::State) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Extra environment variables for the agent process tree.
+    fn environment(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Sandbox requirements for this agent's launch.
+    fn sandbox_requirements(&self) -> SandboxRequirements {
+        SandboxRequirements::default()
+    }
+
+    /// Discover capabilities from the installed CLI (e.g. `codex features list`).
+    fn discover(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The conformance suite every driver must pass (37-04).
+    fn test_contract(&self) -> Vec<ContractResult> {
+        Vec::new()
+    }
+}
+
+/// Compatibility shim (D-11 removal point): exposes an [`AgentDriver`] through
+/// the legacy [`AgentAdapter`] surface so every caller keeps compiling until
+/// 37-04 migrates them and removes `AgentAdapter`.
+struct DriverShim<D: AgentDriver>(D);
+
+impl<D: AgentDriver> AgentAdapter for DriverShim<D> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn exec_command(
+        &self,
+        phase: PhaseId,
+        prompt: &str,
+        extra_writable_roots: &[PathBuf],
+    ) -> (&'static str, Vec<String>) {
+        self.0.build_command(phase, prompt, extra_writable_roots)
+    }
+    fn extra_env(&self) -> Vec<(String, String)> {
+        self.0.environment()
+    }
+    fn completion_signal_detected(&self, output: &str) -> bool {
+        self.0.parse_completion(output).is_some()
+    }
+    fn preflight(&self, state: &crate::state::State) -> Result<(), String> {
+        self.0.health(state)
+    }
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        self.0.render_prompt(intent)
+    }
+}
+
 /// Return an adapter for a configured agent kind.
 pub fn adapter_for(kind: AgentKind) -> Box<dyn AgentAdapter> {
     match kind {
-        AgentKind::Claude => Box::new(ClaudeAgent),
+        AgentKind::Claude => Box::new(DriverShim(ClaudeDriver)),
         AgentKind::Codex => Box::new(CodexAgent),
-        AgentKind::OpenCode => Box::new(OpenCodeAgent),
+        AgentKind::OpenCode => Box::new(DriverShim(OpenCodeDriver)),
         AgentKind::Pi => Box::new(PiAgent),
     }
 }
@@ -84,9 +191,9 @@ pub mod codex;
 pub mod opencode;
 pub mod pi;
 
-pub use claude::ClaudeAgent;
+pub use claude::{ClaudeAgent, ClaudeDriver};
 pub use codex::CodexAgent;
-pub use opencode::OpenCodeAgent;
+pub use opencode::{OpenCodeAgent, OpenCodeDriver};
 pub use pi::PiAgent;
 
 #[cfg(test)]
@@ -101,6 +208,34 @@ mod tests {
         assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
         assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
         assert_eq!(adapter_for(AgentKind::Pi).name(), "Pi");
+    }
+
+    /// 37-02: the drivers reproduce the legacy adapter byte-for-byte (the shim
+    /// delegates to them, so this guards against future drift when the
+    /// `AgentAdapter` face is removed in 37-04).
+    #[test]
+    fn drivers_reproduce_legacy_adapter_behavior() {
+        let intent = crate::prompt::StageIntent::for_stage(Stage::Code, PhaseId::new(7));
+
+        // Claude: stream-json argv + byte-identical legacy prompt.
+        let (program, args) = ClaudeDriver.build_command(PhaseId::new(7), "x", &[]);
+        assert_eq!(program, "claude");
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--input-format" && w[1] == "stream-json"));
+        assert_eq!(
+            ClaudeDriver.render_prompt(&intent),
+            crate::prompt::render_claude_style(&intent)
+        );
+
+        // OpenCode: positional `run <prompt>` + byte-identical legacy prompt.
+        let (program, args) = OpenCodeDriver.build_command(PhaseId::new(7), "x", &[]);
+        assert_eq!(program, "opencode");
+        assert_eq!(args, ["run", "x"]);
+        assert_eq!(
+            OpenCodeDriver.render_prompt(&intent),
+            crate::prompt::render_claude_style(&intent)
+        );
     }
 
     /// The shared-prompt invariant is retired (999.31 / 37-01): Claude and
