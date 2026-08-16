@@ -49,7 +49,11 @@ The phase does **not** land: Pi running a full `devflow start --agent pi` to ter
 - **D-10 — Conformance suite (31c) in 37 if scope allows**, else defer to 38/37.1. More important
   given D-02's extensibility priority.
 - **D-11 — `AgentAdapter` removal conditional.** Remove only if the migration requires it for Pi;
-  otherwise defer — whatever's easiest for the phase.
+  otherwise defer — whatever's easiest for the phase. **Explicitly supersedes 999.31 D-04**
+  ("put a deprecation date on `AgentAdapter`; do not let both paths persist") — the operator chose
+  conditional removal over a hard deprecation deadline, and that reversal is recorded here rather
+  than left implicit. — **Reversibility:** one-way — keeping both traits across phases is the exact
+  drift 999.31 D-04 warned about; undoing this means re-introducing a removal deadline later.
 
 ### Carried forward from 999.31 (still valid)
 - **D-12 — Capabilities enumerated as-needed** (999.31 D-01): do not guess the full
@@ -69,7 +73,7 @@ The phase does **not** land: Pi running a full `devflow start --agent pi` to ter
 ### Scattered logic to consolidate
 - `crates/devflow-core/src/prompt.rs` — shared prompt rendering (bakes `/gsd-*` slash commands).
 - `crates/devflow-core/src/stage.rs` — `Stage::gsd_command()` to replace with `StageIntent`.
-- `crates/devflow-core/src/agent_result.rs:361-453` — Codex JSONL completion parsing.
+- `crates/devflow-core/src/agent_result.rs` — Codex JSONL completion parsing (locate by symbol: `parse_codex_event_result`, `is_codex_event_stream`, `detect_codex_rate_limit`; line numbers shift — do NOT trust a range).
 - `crates/devflow-core/src/agents/{mod,claude,codex,opencode,pi}.rs` — the `AgentAdapter` trait +
   four adapters.
 - `crates/devflow-cli/src/preflight.rs` — health checks to move under per-driver `health`.
@@ -86,7 +90,7 @@ The phase does **not** land: Pi running a full `devflow start --agent pi` to ter
 ### Reusable Assets
 - `AgentAdapter` trait + four adapters (`claude.rs` 288L, `pi.rs` 246L, `codex.rs` 69L,
   `opencode.rs` 27L) — argv shapes, `extra_env`, `preflight` to relocate under per-driver ownership.
-- Codex JSONL completion parsing at `agent_result.rs:361-453` — the seed of `CodexDriver::parse_completion`.
+- Codex JSONL completion parsing (`parse_codex_event_result` / `is_codex_event_stream`) — the seed of `CodexDriver::parse_completion`.
 - Claude stream-json launch + `MonitorLaunch`/`CloseRule` in `pipeline_launch.rs` — the seed of
   `ClaudeDriver`; the most complex, regression-sensitive piece.
 - `preflight.rs` health checks — the seed of per-driver `health`.
@@ -116,6 +120,8 @@ No specific requirements — open to standard approaches within the driver-contr
 - **Antigravity-cli** (no existing adapter) → future (999.32).
 - **Hermes** → future (999.1).
 - **Conformance suite (31c)** — only if deferred from 37 → 38 / 37.1.
+- **999.101 (upstream Claude Code)** — carried from 36-SPEC as "observation for Phase 37's driver
+  contract"; not acted on this phase, recorded here so it is not silently dropped.
 
 ---
 

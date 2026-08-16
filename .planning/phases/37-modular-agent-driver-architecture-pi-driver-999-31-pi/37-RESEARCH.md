@@ -47,9 +47,13 @@ semantic-equivalence test.
   currently keeps it pinned.
 - **Codex (fixed by the migration).** `--json` JSONL completion parsing already exists
   (`parse_codex_event_result` + `is_codex_event_stream` in `agent_result.rs`) and relocates to
-  `CodexDriver::parse_completion`. 31b hardening: parse `codex features list` for `multi_agent_v2`,
-  explicit `--ask-for-approval never`, prefer `--add-dir` over the hand-escaped `writable_roots` TOML
-  (verify equivalence for linked-worktree metadata first — 13-06 finding).
+  `CodexDriver::parse_completion`. 31b hardening — **verified during adversarial review (codex-cli
+  0.147.0): `multi_agent_v2` is already `stable true`**, so the item is NOT "enable it" but "pin the
+  typed-subagent tool schema in tests" (the audit's real risk). The non-interactive approval flag
+  must be **verified against the installed CLI** — `--ask-for-approval` on `codex exec` is rejected;
+  the effective non-interactive policy is the `-c` config override (or the global flag placed before
+  `exec`). Prefer `--add-dir` over the hand-escaped `writable_roots` TOML (verify equivalence for
+  linked-worktree metadata first — 13-06 finding), with a falsifiable equivalence test.
 - **OpenCode.** Thin positional `opencode run <prompt>`; migrate with the same behavior.
 - **Pi.** Phase 36 registered `PiAgent` on `-p` print mode (`--no-approve`, positional prompt,
   `pi auth check` preflight). Phase 37 migrates Pi onto `AgentDriver` but keeps `-p`; the JSON-mode

@@ -43,11 +43,11 @@ created: 2026-08-15
 | 37-01-01 | 01 | 1 | StageIntent de-Claude-ification (31a) | T-37-01/02 | Codex renders no `/gsd-*`; Claude/OpenCode byte-identical | unit | `cargo test -p devflow-core --lib` (byte snapshots + negative control) | ✅ | ⬜ pending |
 | 37-01-02 | 01 | 1 | retire shared-prompt invariant | T-37-03 | invariant deleted, not skipped | unit | `grep -rn every_adapter_receives_identical_prompt_text crates/` (zero) | ✅ | ⬜ pending |
 | 37-02-01 | 02 | 2 | AgentDriver trait (31c) | T-37-06 | capabilities `#[non_exhaustive]` + Default | unit | `cargo check -p devflow-core` + capabilities test | ✅ | ⬜ pending |
-| 37-02-02 | 02 | 2 | Claude/OpenCode zero-regression | T-37-04/05 | Claude → PipeOwning (never Legacy); argv/prompt byte-equal | unit | `cargo test -p devflow-core --lib` (byte-equality + routing) | ✅ | ⬜ pending |
-| 37-03-01 | 03 | 2 | CodexDriver + 31b hardening | T-37-07/08 | `--ask-for-approval never`; parsing relocated fail-closed | unit | `cargo test -p devflow-core --lib` (golden fixtures + argv) | ✅ | ⬜ pending |
-| 37-03-02 | 03 | 2 | PiDriver on print mode | T-37-09 | `pi auth check` (not env sniffing) | unit | `cargo test -p devflow-core --lib agents::pi` | ✅ | ⬜ pending |
-| 37-04-01 | 04 | 3 | conformance suite + DriverHealth + InteractivityMode | T-37-10 | test_contract passes all four drivers | unit | `cargo test -p devflow-core --lib` (test_contract) | ❌ W0 | ⬜ pending |
-| 37-04-02 | 04 | 3 | docs de-Claude-ification + AgentAdapter removal | T-37-11/12 | removal grep-gated; docs grep-clean | source | `cargo test --workspace` + `scripts/check.sh` + grep | ✅ | ⬜ pending |
+| 37-02-02 | 02 | 2 | Claude/OpenCode zero-regression | T-37-04/05 | Claude → PipeOwning by default, Legacy under `--legacy-claude-launch`; argv/prompt byte-equal | unit | `cargo test -p devflow-core --lib` (byte-equality) + `cargo test -p devflow --bin devflow` (routing) | ✅ | ⬜ pending |
+| 37-03-01 | 03 | 3 | CodexDriver + 31b hardening | T-37-07/08 | verified non-interactive approval flag (spawn-tested); parsing relocated fail-closed | unit | `cargo test -p devflow-core --lib` (golden fixtures + spawn negative control) | ✅ | ⬜ pending |
+| 37-03-02 | 03 | 3 | PiDriver on print mode | T-37-09 | `pi auth check` (not env sniffing) | unit | `cargo test -p devflow-core --lib agents::pi` | ✅ | ⬜ pending |
+| 37-04-01 | 04 | 4 | conformance suite + DriverHealth + InteractivityMode | T-37-10 | test_contract passes all four drivers; InteractivityMode consumed in BOTH preflight.rs + commands.rs:289 | unit | `cargo test -p devflow-core --lib` (test_contract) | ❌ W0 | ⬜ pending |
+| 37-04-02 | 04 | 4 | docs de-Claude-ification + AgentAdapter removal | T-37-11/12 | removal enumerated (canary.rs, test_support.rs, preflight.rs:1266, pipeline_launch.rs:190); docs grep-clean | source | `cargo test --workspace` + `scripts/check.sh` + grep | ✅ | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 

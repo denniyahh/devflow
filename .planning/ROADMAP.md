@@ -15,7 +15,7 @@ Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 36 | Pi Adapter Registration + Release Signing | Complete    | — |
-| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94) | Backlog | — |
+| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi) | Backlog | — |
 
 ### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
 
@@ -29,16 +29,16 @@ the pre-push fingerprint hook). 999.67 was dropped — already shipped.
 **Requirements**: `36-SPEC.md` (locked post adversarial review).
 **Plans**: TBD
 
-### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
+### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi)
 
 **Goal**: Promote the full `AgentDriver` contract — capability discovery, driver-owned prompt
 rendering, command building, completion parsing, health probes, and a shared conformance suite —
 so agent-specific semantics stop being scattered across `prompt.rs`, `agents/*.rs`,
-`agent_result.rs`, and `preflight.rs`. This is what makes **Pi** actually run end-to-end: the
-`StageIntent` de-Claude-ification of the Code-stage prompt (dropping the literal
-`/gsd-execute-phase` string), Pi's JSON-mode event unwrapper, and the monitor/`CloseRule`
-integration for non-Claude agents. **999.94** (an unattended `decision` checkpoint takes the
-first option without reading it; HIGH) is pencilled here.
+`agent_result.rs`, and `preflight.rs`. Migrates Claude, Codex, OpenCode, and Pi onto the contract
+with zero regression on Claude, and fixes the Codex slash-command defect via the `StageIntent`
+de-Claude-ification (dropping the literal `/gsd-execute-phase` string from every stage). Pi's
+*end-to-end* run (JSON-mode event unwrapper + monitor/`CloseRule` integration) is deferred to a
+`37.1` sub-phase / Phase 38; **999.94** is deferred to Phase 38.
 **Depends on**: Phase 36.
 **Plans**: TBD
 
