@@ -1,7 +1,7 @@
 # Adversarial Review — Phase 37 planning docs (replan gate)
 
 **Targets:** `37-CONTEXT.md`, `37-RESEARCH.md`, `37-VALIDATION.md`, `37-01`…`37-04-PLAN.md`
-**Reviewers:** claude (opus, high) · codex (gpt-5.6-sol, high) · antigravity (Gemini 3.1 Pro — **skipped: timeout**)
+**Reviewers:** claude (opus, high) · codex (gpt-5.6-sol, high) · antigravity (Gemini 3.1 Pro — re-run after MCP fix)
 **Date:** 2026-08-15
 **Review root:** `.worktrees/phase-37` @ `feature/phase-37` (code-verified against live tree + installed CLIs)
 
@@ -89,10 +89,23 @@ and several acceptance criteria are unfalsifiable.
     paths persist") without stating the supersession — the same silent-supersession the operator flagged
     for D-02.
 
-## antigravity — skipped
+## antigravity — re-run (was skipped: timeout)
 
-Timed out (`Error: timeout waiting for response`, exit 1). Recorded, not dropped. Recommend a re-run
-with the prompt shortened (the 68KB inline is near the print timeout) or `--print-timeout` raised.
+First run timed out — root cause was NOT the prompt size but the "linear" + "vercel" MCP servers in
+`~/.gemini/config/mcp_config.json` hanging on connect (log: "MCP: 2 server(s) still connecting" for
+the full 5m, then "timed out after 1496 polls"). Re-run with MCP disabled, `--model gemini-3.1-pro-high`,
+`--print-timeout 15m` — completed. NOTE for the review skill: antigravity HAS `--model`/`--effort`/
+`--print-timeout` flags (the skill's "config-bound, no flag" reference is outdated).
+
+Antigravity-only findings (claude/codex overlaps omitted):
+- **HIGH — `FixType` location hallucinated.** 37-01 lists `FixType` under `stage.rs`; it is defined in
+  `prompt.rs:73`. Embedding it in `StageIntent` requires a move or an upward re-export, un-architected.
+- **HIGH — `fix_prompt` callers ignored.** `fix_prompt` is called by `pipeline_gate.rs:198` AND
+  `pipeline_outcomes.rs:4866` — neither in 37-01's `files_modified`, so the signature change breaks
+  compilation.
+- **MEDIUM — `codex features list` shell-out unvalidated.** `capabilities`/`environment` doing a
+  synchronous `codex features list` shell-out per check is a blocking hazard, and the VALIDATION table
+  had no negative control for it.
 
 ## Verdict
 
