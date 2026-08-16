@@ -89,6 +89,34 @@ pub struct ContractResult {
     pub passed: bool,
 }
 
+/// Per-stage interactivity requirement a driver declares (999.31 / 31c),
+/// replacing the hardcoded Codex-Define check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractivityMode {
+    /// The stage can run headless with no pre-existing artifact or operator.
+    HeadlessSafe,
+    /// The stage needs a pre-existing artifact (e.g. Codex's Define needs a
+    /// CONTEXT.md written ahead of time — it cannot run the interactive
+    /// discuss-phase interview headless).
+    RequiresExistingArtifact,
+    /// The stage needs typed-subagent dispatch (e.g. `multi_agent_v2`).
+    RequiresTypedSubagents,
+    /// The stage cannot run headless at all.
+    InteractiveOnly,
+}
+
+/// A driver's health classification, distinguishing "installed" from
+/// "headless-usable" (999.31 / 31c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverHealth {
+    /// The binary is absent — `ensure_agent_binary` fails before health runs.
+    BinaryAbsent,
+    /// Installed but not headless-usable (e.g. no provider credential).
+    NotHeadlessCapable(String),
+    /// Ready to run headless.
+    HeadlessCapable,
+}
+
 /// The modular driver contract (999.31): each agent owns its prompt rendering,
 /// command building, completion parsing, and health/capability discovery —
 /// instead of that logic being scattered across `prompt.rs`, `agents/*.rs`,
@@ -141,8 +169,52 @@ pub trait AgentDriver {
 
     /// The conformance suite every driver must pass (37-04).
     fn test_contract(&self) -> Vec<ContractResult> {
-        Vec::new()
+        contract_checks(self)
     }
+
+    /// The interactivity requirement for running `stage` headless.
+    fn interactivity_mode(&self, _stage: crate::stage::Stage) -> InteractivityMode {
+        InteractivityMode::HeadlessSafe
+    }
+
+    /// Classify this driver's health (the pass/fail [`AgentDriver::health`]
+    /// mapped onto the richer [`DriverHealth`]).
+    fn health_classification(&self, state: &crate::state::State) -> DriverHealth {
+        match self.health(state) {
+            Ok(()) => DriverHealth::HeadlessCapable,
+            Err(reason) => DriverHealth::NotHeadlessCapable(reason),
+        }
+    }
+}
+
+/// Shared conformance checks every driver's `test_contract` runs (37-04).
+/// A future driver (Antigravity, Hermes) plugs in by passing these — the
+/// extensibility proof CONTEXT D-02 asks for.
+fn contract_checks<D: AgentDriver + ?Sized>(driver: &D) -> Vec<ContractResult> {
+    let mut checks = vec![ContractResult {
+        name: "name is non-empty",
+        passed: !driver.name().is_empty(),
+    }];
+    for stage in [
+        crate::stage::Stage::Define,
+        crate::stage::Stage::Plan,
+        crate::stage::Stage::Code,
+        crate::stage::Stage::Validate,
+        crate::stage::Stage::Ship,
+    ] {
+        let intent = crate::prompt::StageIntent::for_stage(stage, PhaseId::new(1));
+        let prompt = driver.render_prompt(&intent);
+        checks.push(ContractResult {
+            name: "render_prompt states the completion contract",
+            passed: prompt.contains("DEVFLOW_RESULT"),
+        });
+    }
+    let (program, _args) = driver.build_command(PhaseId::new(1), "contract", &[]);
+    checks.push(ContractResult {
+        name: "build_command names a program",
+        passed: !program.is_empty(),
+    });
+    checks
 }
 
 /// Compatibility shim (D-11 removal point): exposes an [`AgentDriver`] through
@@ -276,6 +348,55 @@ mod tests {
             !PiDriver
                 .render_prompt(&intent)
                 .contains("/gsd-execute-phase")
+        );
+    }
+
+    /// 37-04: every driver passes the shared conformance suite, and Codex
+    /// declares the Define/Plan interactivity requirement that replaces the
+    /// hardcoded Codex-Define check.
+    #[test]
+    fn every_driver_passes_the_conformance_suite() {
+        let drivers: [Box<dyn AgentDriver>; 4] = [
+            Box::new(ClaudeDriver),
+            Box::new(CodexDriver),
+            Box::new(OpenCodeDriver),
+            Box::new(PiDriver),
+        ];
+        for driver in &drivers {
+            let results = driver.test_contract();
+            assert!(
+                !results.is_empty(),
+                "{} has no conformance cases",
+                driver.name()
+            );
+            for result in &results {
+                assert!(
+                    result.passed,
+                    "{} failed conformance case {:?}",
+                    driver.name(),
+                    result.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_define_and_plan_require_an_existing_artifact() {
+        assert_eq!(
+            CodexDriver.interactivity_mode(crate::stage::Stage::Define),
+            InteractivityMode::RequiresExistingArtifact
+        );
+        assert_eq!(
+            CodexDriver.interactivity_mode(crate::stage::Stage::Plan),
+            InteractivityMode::RequiresExistingArtifact
+        );
+        assert_eq!(
+            CodexDriver.interactivity_mode(crate::stage::Stage::Code),
+            InteractivityMode::HeadlessSafe
+        );
+        assert_eq!(
+            ClaudeDriver.interactivity_mode(crate::stage::Stage::Define),
+            InteractivityMode::HeadlessSafe
         );
     }
 

@@ -5,7 +5,7 @@
 //! verified against the installed CLI (a `codex exec -a never` placement is
 //! rejected as an unknown argument).
 
-use super::{AgentAdapter, AgentDriver};
+use super::{AgentAdapter, AgentDriver, InteractivityMode};
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
@@ -82,6 +82,17 @@ impl AgentDriver for CodexDriver {
             ("GIT_CONFIG_KEY_1".into(), "tag.gpgsign".into()),
             ("GIT_CONFIG_VALUE_1".into(), "false".into()),
         ]
+    }
+
+    fn interactivity_mode(&self, stage: crate::stage::Stage) -> InteractivityMode {
+        use crate::stage::Stage;
+        match stage {
+            // Codex cannot run the interactive discuss-phase interview or the
+            // interactive plan-phase decision headless — its Define/Plan stages
+            // need the artifact to pre-exist (13-06 dogfood finding).
+            Stage::Define | Stage::Plan => InteractivityMode::RequiresExistingArtifact,
+            _ => InteractivityMode::HeadlessSafe,
+        }
     }
 }
 

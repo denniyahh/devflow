@@ -1,22 +1,21 @@
 # Agent Model
 
 DevFlow supports four agents today (Claude Code, Codex, OpenCode, Pi) through
-one shared adapter interface. This is not a fully agent-neutral platform yet
-— see the driver-architecture backlog (999.31) for that direction.
+the modular `AgentDriver` contract (999.31).
 
-## Adapter Contract
+## Driver Contract
 
 ```rust
-pub trait AgentAdapter {
-    fn name(&self) -> &str;
-    fn exec_command(
-        &self,
-        phase: u32,
-        prompt: &str,
-        extra_writable_roots: &[PathBuf],
-    ) -> (&'static str, Vec<String>);
-    fn extra_env(&self) -> Vec<(String, String)>;
-    fn completion_signal_detected(&self, output: &str) -> bool;
+pub trait AgentDriver {
+    fn name(&self) -> &'static str;
+    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+    fn render_prompt(&self, intent: &StageIntent) -> String;
+    fn build_command(&self, phase: PhaseId, prompt: &str, extra_writable_roots: &[PathBuf]) -> (&'static str, Vec<String>);
+    fn parse_completion(&self, output: &str) -> Option<AgentResult> { None }
+    fn health(&self, state: &State) -> Result<(), String> { Ok(()) }
+    fn environment(&self) -> Vec<(String, String)> { Vec::new() }
+    fn test_contract(&self) -> Vec<ContractResult> { contract_checks(self) }
+    fn interactivity_mode(&self, stage: Stage) -> InteractivityMode { InteractivityMode::HeadlessSafe }
 }
 ```
 
@@ -28,24 +27,25 @@ pub trait AgentAdapter {
 | OpenAI Codex | `codex` | `AgentKind::Codex` | `codex` |
 | OpenCode | `opencode` | `AgentKind::OpenCode` | `opencode`, `open-code` |
 
-## Agent Adapters
+## Drivers
 
-Each agent has a dedicated adapter file under `crates/devflow-core/src/agents/`:
+Each agent has a dedicated driver file under `crates/devflow-core/src/agents/`:
 
-- `claude.rs` — Claude Code adapter
-- `codex.rs` — Codex adapter
-- `opencode.rs` — OpenCode adapter
-- `mod.rs` — `AgentAdapter` trait definition + `adapter_for()` factory
+- `claude.rs` — Claude Code driver
+- `codex.rs` — Codex driver
+- `opencode.rs` — OpenCode driver
+- `pi.rs` — Pi driver
+- `mod.rs` — `AgentDriver` trait definition + `adapter_for()` factory + conformance suite
 
-## Shared Prompts
+## Driver-owned prompts
 
-All agents receive the same stage-specific prompt via `stage_prompt()`. The
-adapter supplies only command-line details and narrowly scoped environment
-requirements.
+There is no shared prompt. A `StageIntent` carries the stage's data (phase, fix kind, review
+angles) with no agent-specific syntax; each driver's `render_prompt` turns it into its own
+instruction. Claude/OpenCode render the legacy slash-command text byte-for-byte; Codex/Pi render a
+workflow-file reference.
 
-The prompt asks agents to use the relevant GSD command and finish with a
-`DEVFLOW_RESULT` JSON marker. Validate additionally requires a `pass` or
-`gaps` verdict; Ship requires a review-before-ship decision.
+Every prompt asks the agent to finish with a `DEVFLOW_RESULT` JSON marker. Validate additionally
+requires a `pass` or `gaps` verdict; Ship requires a review-before-ship decision.
 
 ## Completion Evaluation
 

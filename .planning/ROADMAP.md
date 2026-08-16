@@ -2608,6 +2608,33 @@ can miss it entirely.
 
 ---
 
+### Phase 999.106: Remove `AgentAdapter` and the Legacy DriverShim (DEFERRED from Phase 37)
+
+**Found:** 2026-08-16, closing Phase 37. All four agents now implement the modular `AgentDriver`
+contract, but the legacy `AgentAdapter` trait, the `DriverShim` compatibility shim, and the four
+legacy adapter structs (`ClaudeAgent`/`CodexAgent`/`OpenCodeAgent`/`PiAgent`) were **left in place**
+per CONTEXT D-11 ("remove only if required for Pi; otherwise defer — whatever's easiest"). Pi runs
+fine through the shim, so the removal was deferred rather than risked in the same phase.
+
+**Known call sites to migrate before the trait can be deleted** (verified 2026-08-16):
+- `crates/devflow-core/src/canary.rs:40` — the Phase-31 nonce-canary imports `AgentAdapter` +
+  `ClaudeAgent`.
+- `crates/devflow-cli/src/test_support.rs:205/244` — `AlwaysFailAdapter`/`FailOnceAdapter` test
+  doubles implement `AgentAdapter`.
+- `crates/devflow-cli/src/preflight.rs:1266` — `run_preflight(…, adapter: &dyn AgentAdapter)`.
+- `crates/devflow-cli/src/pipeline_launch.rs:190` — `resolve_launch_shape(…, adapter: &dyn AgentAdapter)`;
+  `:204` calls `ClaudeAgent::exec_command_single_document` (the pre-31 legacy builder).
+
+**Also folds in** the deferred `InteractivityMode` *consumption*: `AgentDriver::interactivity_mode`
+exists (Codex declares Define/Plan → `RequiresExistingArtifact`), but the hardcoded
+`agent == AgentKind::Codex` checks in `commands.rs:289` and `preflight.rs`
+(`preflight_interactivity_check`) still gate the Define/Plan path — wiring them through the driver's
+mode requires the `&dyn AgentAdapter` → `&dyn AgentDriver` signature migration above.
+
+**Size:** M — mechanical, but touches the launch path (`pipeline_launch.rs`), which is the most
+regression-sensitive code in the repo; the four legacy structs and the `DriverShim` are deleted once
+every call site resolves through `AgentDriver`.
+
 ### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
 
 **Found:** 2026-08-15, dogfooding Phase 36. A hand-run adversarial review (claude/opus,
