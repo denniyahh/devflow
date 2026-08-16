@@ -1,6 +1,6 @@
 # Adding an Agent
 
-DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
+DevFlow supports four agents today (Claude Code, Codex, OpenCode, Pi) through a
 shared adapter interface — not a fully agent-neutral platform yet (see
 backlog 999.31). Adding a new supported agent is a checklist, not a mystery.
 

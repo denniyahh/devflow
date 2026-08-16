@@ -1,93 +1,89 @@
 ---
 phase: 36
-title: Pi Agent Support + Release-Preflight Hardening
-status: draft (spec-phase, pre-discuss)
-items: [Pi driver, 999.67, 999.96, 999.104]
+title: Pi Adapter Registration + Release Signing
+status: locked (post adversarial review, 2026-08-15)
+items: [Pi adapter registration, 999.96, 999.104]
 ---
 
-# 36-SPEC — Pi Agent Support + Release-Preflight Hardening
+# 36-SPEC — Pi Adapter Registration + Release Signing
 
-## What this phase delivers (one sentence)
+## What this phase delivers
 
-DevFlow can drive **Pi** (the Pi coding-agent harness) end-to-end as a fourth first-class agent
-adapter, and three small release/trust gaps that sit in the same code close in the same phase.
-
-## Why Pi first, 999.31 second
-
-Backlog **999.31** (Modular Agent Driver Architecture) is the L-sized refactor that replaces the
-thin `AgentAdapter` trait with a full `AgentDriver` contract. Its own locked decision **D-02** says
-the contract must be proven against a second native implementation before it is called stable.
-Landing Pi as a concrete new adapter now gives Phase 37 a live second consumer — and delivers
-operator value (Pi support) without waiting on the L refactor. Phase 36 therefore uses the existing
-`AgentAdapter` surface; Phase 37 lifts the whole thing onto `AgentDriver`.
+DevFlow registers **Pi** as a fourth, *selectable* agent adapter — `AgentKind::Pi` + a `PiAgent`
+implementing the existing `AgentAdapter` trait with the correct headless invocation, and a
+preflight health check that distinguishes "Pi binary installed" from "Pi can actually execute
+headless". It does **not** claim an end-to-end `devflow start --agent pi` run: the Code-stage
+prompt is still Claude-specific (`/gsd-execute-phase`) and non-Claude agents still route through
+the legacy launch path, so making Pi *work* end-to-end is Phase 37's job. This phase also closes
+two release-path items: 999.96 (a `release --check` version-bump row) and 999.104 (deterministic
+release signing key, replacing the fragile key checks).
 
 ## Scope
 
-### A. Pi agent adapter (the main deliverable)
+### A. Pi adapter registration + health check
 
-A new adapter for the Pi harness, registered in `AgentKind` / `adapter_for` alongside Claude,
-Codex, and OpenCode.
+`AgentKind::Pi` + `PiAgent` (`crates/devflow-core/src/agents/pi.rs`) registered in `adapter_for`.
+The adapter wires the interface established from Pi docs v0.84.1:
 
-Falsifiable requirements:
+- `name()` — a stable human-readable name (e.g. `"Pi"`).
+- `exec_command()` — `("pi", vec!["-p", "--no-approve", "--", <prompt>])` (print mode,
+  positional prompt, `--` delimiter). No `--model`/`--provider` wiring — model/provider selection
+  is Phase 37 (the `AgentDriver` contract has the config access `AgentAdapter` lacks), and an
+  env-sourced value would not survive detached-monitor stage launches. `--no-approve` because
+  `--approve` trusts project-local extensions that execute unsandboxed.
+- `preflight()` — health check backed by `pi auth check` (Pi's authoritative verb), **not**
+  env-var sniffing (`DEVFLOW_PI_PROVIDER` is a provider *name*, not a credential): `ready` →
+  headless-capable, otherwise a distinct credentialless `Err`. The "binary absent" case is
+  `ensure_agent_binary`'s job (runs before preflight).
 
-1. `devflow` can launch Pi for a Code-stage run and parse its completion, mirroring what it does
-   for the existing three agents.
-2. Pi's invocation (headless flags, stream format, completion signal, exit-code semantics) is
-   established **from Pi's own docs/CLI — not assumed** — and recorded in the phase CONTEXT.
-3. A discovery/health check distinguishes "Pi binary installed" from "Pi can execute headless",
-   in the same shape as the existing three adapters' checks.
-4. `devflow doctor` (or the equivalent preflight) reports Pi's presence/absence like the other
-   adapters.
-
-### B. 999.67 — Layer-0 provenance trust fix (XS)
-
-`parse_devflow_result` overwrites an agent-planted `decided_by_layer` exactly as
-`parse_claude_event_result` already does on the stream path, with a mirror test.
-
-### C. 999.96 — `release --check` version-bump row (S)
+### B. 999.96 — `release --check` version-bump row (S)
 
 A `release --check` row compares `CHANGELOG.md`'s top `## <version>` heading against the workspace
-version, reporting NOT viable (with the disagreement direction stated) when they differ. Must carry
-a negative control — the current tree is itself a ready-made positive fixture (changelog `2.5.0`
-vs. workspace).
+version, reporting NOT viable (with direction) when they disagree. Fixture is **synthetic** — an
+explicit mismatched fixture plus missing/malformed/duplicate-heading cases — *not* "the current
+tree" (the v2.5.0 cut already consumed that skew; `Cargo.toml` and `CHANGELOG.md` are both `2.5.0`).
 
-### D. 999.104 — release-signing key (default: one-line probe)
+### C. 999.104 — deterministic release signing key (S–M)
 
-Default decision: repoint `release --check`'s tag-signing probe at
-`devflow.releaseSigningKey` (the maintainer's key) rather than the agent's `user.signingkey`.
-**Open decision — see "Open decisions" below; the two-key-model alternative is an explicit,
-non-silent branch.**
+The two-key model is resolved by making the release path deterministic, not by more checks:
+
+1. The release/tag signing path signs with **`devflow.releaseSigningKey`** (the maintainer key)
+   via the `git -c user.signingkey=` override **applied in code**, so there is no
+   operator-remembered override to forget.
+2. **Remove** the `release --check` tag-signing-viability probe (`check_signing_viability`,
+   `git.rs:1099`) — it answers "can this key sign", not "is this the maintainer's key", and it
+   probes `user.signingkey` (the agent's key), which is the wrong target.
+3. **Remove** the pre-push fingerprint comparison (`scripts/hooks/pre-push`) — it sources the
+   expected fingerprint from the same config it validates, so it is tautological.
+4. A missing `devflow.releaseSigningKey` fails loudly at release time (a config validation, not a
+   key check) rather than silently signing with the wrong identity.
 
 ## Boundaries / non-goals
 
-- The full `AgentDriver` contract (capability discovery, driver-owned prompt rendering, shared
-  conformance suite) is **Phase 37**, not here. Phase 36 uses the existing `AgentAdapter` surface.
-- Pi's prompt text may initially render the same stage prompt as the other agents
-  (behavior-preserving), unless Pi's interface requires otherwise.
-- No change to the `{N}-VERIFICATION.md` artifact format; no upstream GSD dependency.
+- **No end-to-end Pi run.** Pi reaches terminal completion only after Phase 37 de-Claude-ifies the
+  prompt and integrates Pi's JSON-mode transport into the monitor. AC #1 from the prior draft
+  (end-to-end) is struck.
+- **999.67 dropped** — already shipped: `parse_devflow_result` normalizes both arms
+  (`agent_result.rs:166-180`) with the mirror test at `:4343`. Marked resolved; not re-done here.
+- No `AgentDriver` / `StageIntent` work (Phase 37). No prompt de-Claude-ification (Phase 37).
+- No Pi JSON-mode event unwrapper (Phase 37 — the `-p` transport used here terminates on process
+  exit and needs no unwrapper).
 
-## Acceptance criteria (what must be TRUE)
+## Acceptance criteria
 
-1. A `devflow` run driven by Pi reaches a terminal completion, with its completion parsed and its
-   result classified, on a real (not mocked) Pi session.
-2. 999.67: the planted-`decided_by_layer` fixture on the single-document path now returns the
-   overwritten (non-planted) value, pinned by a regression test with a passing counterpart.
-3. 999.96: `release --check` reports NOT viable on the current skew and viable when they agree.
-4. 999.104: `release --check`'s signing probe reports viable only for the maintainer key, with a
-   negative control (the wrong key reported NOT viable).
-
-## Open decisions (to settle in discuss)
-
-1. **999.104 approach** — one-line probe (operator's lean, this SPEC's default) vs. rethinking the
-   two-key model into a single release-only identity. See operator's pros/cons discussion.
-2. **Pi stage coverage** — all five stages at once, or Code-stage first as a vertical slice?
-3. **Pi interface specifics** — exact invocation/stream format to be established from Pi's docs
-   during discuss (I can pull them).
-4. **999.67 / 999.96 bundling** — both are XS/S and in-code-touched-by-this-phase, but confirm they
-   don't add wave overhead (operator leaning include).
+1. `devflow doctor` (or the equivalent preflight) reports Pi's presence and headless-capability,
+   with a negative control: a machine with the `pi` binary but no provider credential reports
+   "installed but not headless-capable".
+2. 999.96: the `release --check` row reports NOT viable on a synthetic mismatched fixture and
+   viable when they agree, with direction stated.
+3. 999.104: `scripts/cut-release.sh` fails loudly when `devflow.releaseSigningKey` is unset or its
+   file is unreadable; the capability-only signing-viability probe is deleted (clippy-clean, the
+   whole private cluster); the pre-push fingerprint hook is **retained** — it is the only check that
+   distinguishes the agent key from the maintainer key on a hand-cut release tag.
 
 ## Deferred (explicitly not here)
 
-- 999.31 — Phase 37.
-- 999.94 — Phase 37 (pencilled).
-- 999.101 — upstream Claude Code; carry as an observation into Phase 37's driver contract.
+- 999.31 (AgentDriver + StageIntent) — Phase 37.
+- Pi as a full working driver (JSON-mode unwrapper, monitor/`CloseRule` integration) — Phase 37.
+- 999.94 (unattended `decision` checkpoint first-option) — Phase 37.
+- 999.101 (upstream Claude Code) — observation for Phase 37's driver contract.

@@ -65,16 +65,19 @@ pub fn adapter_for(kind: AgentKind) -> Box<dyn AgentAdapter> {
         AgentKind::Claude => Box::new(ClaudeAgent),
         AgentKind::Codex => Box::new(CodexAgent),
         AgentKind::OpenCode => Box::new(OpenCodeAgent),
+        AgentKind::Pi => Box::new(PiAgent),
     }
 }
 
 pub mod claude;
 pub mod codex;
 pub mod opencode;
+pub mod pi;
 
 pub use claude::ClaudeAgent;
 pub use codex::CodexAgent;
 pub use opencode::OpenCodeAgent;
+pub use pi::PiAgent;
 
 #[cfg(test)]
 mod tests {
@@ -87,6 +90,7 @@ mod tests {
         assert_eq!(adapter_for(AgentKind::Claude).name(), "Claude Code");
         assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
         assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
+        assert_eq!(adapter_for(AgentKind::Pi).name(), "Pi");
     }
 
     /// Extract the prompt text as this adapter actually DELIVERS it.

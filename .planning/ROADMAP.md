@@ -7,36 +7,38 @@
 **Declared 2026-08-15, the day v2.5.0 closed.** Replace the thin `AgentAdapter` trait with a
 driver architecture that onboards new agents without agent-specific logic leaking into core — and
 prove it by onboarding **Pi** as the first newly-supported agent. The full modular `AgentDriver`
-refactor (backlog **999.31**, size L) is sequenced *after* the first concrete new driver: Phase 36
-lands Pi on the existing adapter path, Phase 37 lifts the whole surface onto the `AgentDriver`
-contract with Pi as a live second consumer (999.31's D-02 — prove the contract against a second
-native implementation before calling it stable).
+refactor (backlog **999.31**, size L) is the real vehicle: Phase 36 registers Pi as a selectable
+adapter plus release hardening; Phase 37 does the `AgentDriver`/`StageIntent` work that makes Pi
+run end-to-end — the adversarial review showed Pi cannot reach terminal completion until the
+Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 36 | Pi Agent Support + Release-Preflight Hardening | Planned | — |
-| 37 | Modular Agent Driver Architecture (999.31) + Unattended Decision Policy (999.94) | Backlog | — |
+| 36 | Pi Adapter Registration + Release Signing | Complete    | — |
+| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94) | Backlog | — |
 
-### Phase 36: Pi Agent Support + Release-Preflight Hardening (Pi + 999.67 + 999.96 + 999.104)
+### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
 
-**Goal**: DevFlow drives **Pi** (the Pi coding-agent harness) end-to-end as a fourth supported
-agent alongside Claude, Codex, and OpenCode — and three small items land in the same phase because
-they sit in code this phase already touches: **999.67** (agent result parsing lets an agent plant
-its own Layer-0 provenance; XS), **999.96** (`release --check` can't catch a forgotten version
-bump; S), and **999.104** (release-signing key workflow; the SPEC settles the one-line-probe vs.
-two-key-model question).
+**Goal**: DevFlow registers **Pi** as a fourth, selectable agent adapter (`AgentKind::Pi` +
+`PiAgent` + a preflight health check distinguishing "installed" from "can execute headless") —
+**not** an end-to-end run, which is Phase 37 — plus two release items: **999.96** (`release --check`
+can't catch a forgotten version bump; S, synthetic fixture) and **999.104** (deterministic release
+signing key: sign with `devflow.releaseSigningKey` in code, remove the signing-viability probe and
+the pre-push fingerprint hook). 999.67 was dropped — already shipped.
 **Depends on**: Nothing (first phase of this milestone).
-**Requirements**: `36-SPEC.md` (drafted before discuss-phase).
+**Requirements**: `36-SPEC.md` (locked post adversarial review).
 **Plans**: TBD
 
-### Phase 37: Modular Agent Driver Architecture (999.31) + Unattended Decision Policy (999.94)
+### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
 
 **Goal**: Promote the full `AgentDriver` contract — capability discovery, driver-owned prompt
 rendering, command building, completion parsing, health probes, and a shared conformance suite —
 so agent-specific semantics stop being scattered across `prompt.rs`, `agents/*.rs`,
-`agent_result.rs`, and `preflight.rs`. Pi (onboarded in Phase 36) is the second native
-implementation that 999.31's D-02 requires. **999.94** (an unattended `decision` checkpoint takes
-the first option without reading it; HIGH) is pencilled here.
+`agent_result.rs`, and `preflight.rs`. This is what makes **Pi** actually run end-to-end: the
+`StageIntent` de-Claude-ification of the Code-stage prompt (dropping the literal
+`/gsd-execute-phase` string), Pi's JSON-mode event unwrapper, and the monitor/`CloseRule`
+integration for non-Claude agents. **999.94** (an unattended `decision` checkpoint takes the
+first option without reading it; HIGH) is pencilled here.
 **Depends on**: Phase 36.
 **Plans**: TBD
 
@@ -106,7 +108,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.1 | 4/4 | Complete    | 2026-08-12 |
 | 35.2 | 2/2 | Complete    | 2026-08-12 |
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
-| 36 | — | Planned | — |
+| 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | — | Backlog | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -2606,6 +2608,41 @@ can miss it entirely.
 
 ---
 
+### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
+
+**Found:** 2026-08-15, dogfooding Phase 36. A hand-run adversarial review (claude/opus,
+codex/gpt-5.6-sol, antigravity/Gemini 3.1 Pro) against the phase's SPEC/CONTEXT and then its PLAN
+caught, in one phase, three CRITICAL findings — 999.104 targeting dead code (`release_finish` has
+no production caller), a false-green credential check (`DEVFLOW_PI_PROVIDER` is a provider name,
+not a credential), and `--approve` as unsandboxed-code-execution risk — plus two HIGH (an unowned
+doctor integration, and a hook deletion that would break existing tests). Every one of those would
+have shipped or wasted a wave without it.
+
+**The item:** make that review a default part of the phase lifecycle, not an ad-hoc operator step:
+
+- a cross-model adversarial pass over the CONTEXT (post-discuss) and the PLAN (post-plan), before execute;
+- the pass is the `adversarial-review` skill (selectable `cli:model:effort` reviewers) or a
+  GSD-native equivalent, defaulting to a diverse 2-3 reviewer set;
+
+- findings feed back into planning the way `gsd-plan-phase --reviews` consumes REVIEWS.md, with the
+  orchestrator gating execute until blocking findings are dispositioned.
+
+**Why this is more than the existing `gsd-review`:** `gsd-review` is plan-only, CLI-level (flags
+select CLIs, not models/effort), and carries no CWD/context discipline — the Phase 36 run's own
+failure mode (reviewers launched from the wrong checkout, reading a stale SPEC) is exactly what this
+feature's procedure must pin. The `adversarial-review` skill already encodes the review-root/CWD and
+citation-verification discipline; this item promotes it into the default flow.
+
+**Priority:** High — it paid for itself in a single phase by catching findings that would otherwise
+have shipped. **Size:** M — the skill exists; the work is wiring it into the phase gates
+(discuss:post / plan:post hooks, or a devflow stage), the feedback loop, and the "blocking
+findings" gate.
+
+**Depends on:** nothing structurally. The `adversarial-review` skill (`~/.agents/skills/`) is the
+reusable core.
+
+---
+
 ### Phase 999.104: The Release-Signing Key Workflow Is Fragile and Has Caused Repeated Mistakes (BACKLOG — discuss in Phase 36)
 
 **Found:** repeatedly, across at least the last ten phases. The v2.5.0 cut (2026-08-15) hit it
@@ -2631,9 +2668,11 @@ bug. Open decisions to settle in discuss-phase:
 
 1. Should `release --check`'s signing probe target `devflow.releaseSigningKey` rather than the
    agent's `user.signingkey`? (The obvious one-line fix — but see 2.)
+
 2. Is the two-key model itself the right shape? Alternatives: a single release-only signing
    identity, or making the maintainer key the only key on the release path so there is no "wrong
    key" to select — and no `-c` override to forget.
+
 3. Should the fingerprint check surface earlier (in `release --check` / `--verify`) so a wrong-key
    tag fails at preflight instead of at push?
 
@@ -3282,7 +3321,13 @@ generated anyway.
 
 ---
 
-### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (BACKLOG — shortlisted for Phase 31)
+### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (RESOLVED — shipped; verified 2026-08-15)
+
+**Resolution note (2026-08-15):** the fix landed in an ancestor commit — `parse_devflow_result`
+now normalizes both parser arms via `normalise_stream_marker_provenance` (`agent_result.rs:166-180`),
+and the mirror regression `generic_marker_cannot_forge_layer0_provenance` exists at
+`agent_result.rs:4343` with the passing counterpart. Verified by two independent code reviewers
+(adversarial review, Phase 36). This entry was stale; the fix is shipped.
 
 **Linear:** [DEN-88](https://linear.app/denniskim/issue/DEN-88/99967-parse-devflow-result-lets-an-agent-plant-its-own-layer-0)
 **Found:** 2026-08-02, Phase 30 plan 30-01 execution (finding F-1). Surfaced *by* the fix for the
