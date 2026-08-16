@@ -4,17 +4,17 @@ milestone: v2.6.0
 milestone_name: milestone (Multi-Agent Adapter Migration, ACTIVE — declared 2026-08-15)
 current_phase: 37
 current_phase_name: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
-status: planning
+status: "Phase 36 shipped — PR #113"
 stopped_at: Phase 35.1 context gathered
-last_updated: "2026-08-16T00:50:30.679Z"
+last_updated: "2026-08-16T01:15:08.839Z"
 last_activity: 2026-08-15
-last_activity_desc: Phase 36 executed (2 plans)
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 2
   completed_plans: 2
   percent: 50
+last_activity_desc: Phase 36 executed (2 plans)
 ---
 
 # DevFlow — Project State
@@ -156,8 +156,8 @@ change earns 2.0.
 
 Phase: 37 — Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
 Plan: Not started
-Status: Ready to plan
-Last activity: 2026-08-15 — Phase 36 complete, transitioned to Phase 37
+Status: Phase 36 shipped — PR #113
+Last activity: 2026-08-15
 
 ## Recently Shipped
 
