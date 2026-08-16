@@ -372,6 +372,37 @@ pub fn render_claude_style(intent: &StageIntent) -> String {
     }
 }
 
+/// Render a [`StageIntent`] as a workflow-reference instruction for agents that
+/// cannot receive the legacy `/gsd-*` slash command (Codex, Pi). The instruction
+/// points at the GSD workflow file to follow, carries the `--auto` token where
+/// the workflow requires it, and states the completion contract. Contains NO
+/// GSD slash command.
+pub fn render_workflow_style(intent: &StageIntent, agent_label: &str) -> String {
+    let (workflow, args) = match intent {
+        StageIntent::Define { phase } => ("discuss-phase.md", format!("phase {phase}")),
+        StageIntent::Plan { phase } => ("plan-phase.md", format!("phase {phase}")),
+        StageIntent::Code { phase, fix } => match fix {
+            Some(FixType::AuditFix) => ("audit-fix.md", format!("phase {phase}")),
+            Some(FixType::GapsOnly) => (
+                "execute-phase.md",
+                format!("phase {phase} --auto --gaps-only"),
+            ),
+            Some(FixType::FullExecute) | None => {
+                ("execute-phase.md", format!("phase {phase} --auto"))
+            }
+        },
+        StageIntent::Validate { phase } => ("validate-phase.md", format!("phase {phase}")),
+        StageIntent::Ship { phase, .. } => ("ship.md", format!("phase {phase}")),
+    };
+    format!(
+        "You are executing one stage of a headless DevFlow run as {agent_label}.\n\n\
+        Read the GSD workflow file at $HOME/.codex/gsd-core/workflows/{workflow} and follow it for {args}. \
+        Do not run GSD slash-command instructions; execute the workflow file's instructions directly. \
+        The `--auto` flag, where present, is part of the workflow invocation and must be preserved verbatim.\n\n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
 fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
     render_claude_style(&StageIntent::for_stage_in_project(
         stage,

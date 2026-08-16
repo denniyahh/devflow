@@ -165,8 +165,11 @@ impl<D: AgentDriver> AgentAdapter for DriverShim<D> {
     fn extra_env(&self) -> Vec<(String, String)> {
         self.0.environment()
     }
-    fn completion_signal_detected(&self, output: &str) -> bool {
-        self.0.parse_completion(output).is_some()
+    fn completion_signal_detected(&self, _output: &str) -> bool {
+        // Every current driver is process-exit transport (the monitor detects
+        // exit via kill -0); none emits an in-stream completion signal. This
+        // matches the legacy adapters' behavior byte-for-byte.
+        false
     }
     fn preflight(&self, state: &crate::state::State) -> Result<(), String> {
         self.0.health(state)
@@ -180,9 +183,9 @@ impl<D: AgentDriver> AgentAdapter for DriverShim<D> {
 pub fn adapter_for(kind: AgentKind) -> Box<dyn AgentAdapter> {
     match kind {
         AgentKind::Claude => Box::new(DriverShim(ClaudeDriver)),
-        AgentKind::Codex => Box::new(CodexAgent),
+        AgentKind::Codex => Box::new(DriverShim(CodexDriver)),
         AgentKind::OpenCode => Box::new(DriverShim(OpenCodeDriver)),
-        AgentKind::Pi => Box::new(PiAgent),
+        AgentKind::Pi => Box::new(DriverShim(PiDriver)),
     }
 }
 
@@ -192,9 +195,9 @@ pub mod opencode;
 pub mod pi;
 
 pub use claude::{ClaudeAgent, ClaudeDriver};
-pub use codex::CodexAgent;
+pub use codex::{CodexAgent, CodexDriver};
 pub use opencode::{OpenCodeAgent, OpenCodeDriver};
-pub use pi::PiAgent;
+pub use pi::{PiAgent, PiDriver};
 
 #[cfg(test)]
 mod tests {
@@ -220,9 +223,10 @@ mod tests {
         // Claude: stream-json argv + byte-identical legacy prompt.
         let (program, args) = ClaudeDriver.build_command(PhaseId::new(7), "x", &[]);
         assert_eq!(program, "claude");
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "--input-format" && w[1] == "stream-json"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--input-format" && w[1] == "stream-json")
+        );
         assert_eq!(
             ClaudeDriver.render_prompt(&intent),
             crate::prompt::render_claude_style(&intent)
@@ -235,6 +239,43 @@ mod tests {
         assert_eq!(
             OpenCodeDriver.render_prompt(&intent),
             crate::prompt::render_claude_style(&intent)
+        );
+    }
+
+    /// 37-03: Codex/Pi drivers. Codex carries the verified non-interactive
+    /// approval flag BEFORE `exec`; Pi keeps the Phase-36 `-p --no-approve`
+    /// argv and renders the de-Claude-ified workflow prompt.
+    #[test]
+    fn codex_and_pi_drivers_reproduce_legacy_behavior() {
+        let intent = crate::prompt::StageIntent::for_stage(Stage::Code, PhaseId::new(7));
+
+        let (program, args) = CodexDriver.build_command(PhaseId::new(7), "x", &[]);
+        assert_eq!(program, "codex");
+        assert_eq!(
+            &args[0..2],
+            ["-a", "never"],
+            "the global approval flag must precede `exec` (verified form): {args:?}"
+        );
+        assert!(args.contains(&"exec".to_string()));
+        assert!(
+            CodexDriver
+                .render_prompt(&intent)
+                .contains("execute-phase.md")
+        );
+        assert!(
+            !CodexDriver
+                .render_prompt(&intent)
+                .contains("/gsd-execute-phase")
+        );
+
+        let (program, args) = PiDriver.build_command(PhaseId::new(7), "x", &[]);
+        assert_eq!(program, "pi");
+        assert_eq!(args, ["-p", "--no-approve", "x"]);
+        assert!(PiDriver.render_prompt(&intent).contains("execute-phase.md"));
+        assert!(
+            !PiDriver
+                .render_prompt(&intent)
+                .contains("/gsd-execute-phase")
         );
     }
 

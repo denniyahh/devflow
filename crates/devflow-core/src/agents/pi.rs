@@ -16,18 +16,25 @@
 //! never begin with `-`, so the leading-dash hazard (a markdown `- [ ]` list) is
 //! a Phase 37 concern, not something a `--` can guard here.
 
-use super::AgentAdapter;
+use super::{AgentAdapter, AgentDriver};
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
-pub struct PiAgent;
+/// The modular driver for Pi (37-03): print-mode `-p` launch, `pi auth check`
+/// health, and the de-Claude-ified workflow-reference prompt. NO JSON unwrapper
+/// or monitor/`CloseRule` integration here — that is 37.1/38 (CONTEXT D-04).
+pub struct PiDriver;
 
-impl AgentAdapter for PiAgent {
+impl AgentDriver for PiDriver {
     fn name(&self) -> &'static str {
         "Pi"
     }
 
-    fn exec_command(
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_workflow_style(intent, "the Pi coding agent")
+    }
+
+    fn build_command(
         &self,
         _phase: PhaseId,
         prompt: &str,
@@ -39,19 +46,9 @@ impl AgentAdapter for PiAgent {
         )
     }
 
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        // `pi -p` exits cleanly when done; the monitor detects exit via kill -0.
-        // (Mirrors ClaudeAgent — print-mode transport has no event stream to scan.)
-        false
-    }
-
-    /// Credential readiness via `pi auth check` — Pi's own verb — rather than
-    /// env-var sniffing. `DEVFLOW_PI_PROVIDER` is a provider *name*, not a
-    /// credential; treating it as one is a false-green. `pi auth check` requires
-    /// a `--provider` selector, so it is pinned to `google` (Pi's default) until
-    /// Phase 37 wires provider selection. The "binary absent" case is out of
-    /// scope here: `ensure_agent_binary` runs first on the start path.
-    fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
+    fn health(&self, _state: &crate::state::State) -> Result<(), String> {
+        // Credential readiness via `pi auth check` — Pi's own verb — rather
+        // than env-var sniffing (see `classify_auth_check`).
         let output = std::process::Command::new("pi")
             .args(["auth", "check", "--json", "--provider", "google"])
             .output()
@@ -61,11 +58,37 @@ impl AgentAdapter for PiAgent {
             output.status.success(),
         )
     }
+}
 
-    // Temporary: Pi still renders the legacy shared prompt. 37-03 migrates Pi
-    // to the de-Claude-ified intent; this keeps Pi byte-identical until then.
+/// Legacy `AgentAdapter` face for Pi (D-11 removal point). Delegates to
+/// [`PiDriver`].
+pub struct PiAgent;
+
+impl AgentAdapter for PiAgent {
+    fn name(&self) -> &'static str {
+        PiDriver.name()
+    }
+
+    fn exec_command(
+        &self,
+        phase: PhaseId,
+        prompt: &str,
+        extra_writable_roots: &[PathBuf],
+    ) -> (&'static str, Vec<String>) {
+        PiDriver.build_command(phase, prompt, extra_writable_roots)
+    }
+
+    fn completion_signal_detected(&self, _output: &str) -> bool {
+        // `pi -p` exits cleanly when done; the monitor detects exit via kill -0.
+        false
+    }
+
+    fn preflight(&self, state: &crate::state::State) -> Result<(), String> {
+        PiDriver.health(state)
+    }
+
     fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        crate::prompt::render_claude_style(intent)
+        PiDriver.render_prompt(intent)
     }
 }
 
