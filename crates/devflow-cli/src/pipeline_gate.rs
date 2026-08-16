@@ -27,7 +27,7 @@ use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::prompt::{self, FixType};
+use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
 use devflow_core::{events, lock, registry, workflow};
@@ -195,7 +195,14 @@ pub(crate) fn prepare_loop_back_to_code(
         "looping back to Code ({} validate failure(s) this phase, {} in the current streak)",
         state.phase_validate_failures, state.consecutive_failures
     );
-    Ok(prompt::fix_prompt(fix, state.phase))
+    Ok(
+        devflow_core::agents::adapter_for(state.agent).render_prompt(
+            &devflow_core::prompt::StageIntent::Code {
+                phase: state.phase,
+                fix: Some(fix),
+            },
+        ),
+    )
 }
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.

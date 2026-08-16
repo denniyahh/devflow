@@ -1,8 +1,9 @@
 //! Agent adapter trait and implementations.
 //!
-//! Each adapter knows how to wrap a stage prompt into its CLI's non-interactive
-//! launch command. The prompt text itself comes from [`crate::prompt`] — the
-//! adapter only formats it into the right flags for its agent.
+//! Each adapter knows how to render a stage prompt for its agent and wrap it
+//! into the CLI's non-interactive launch command. Prompt RENDERING is
+//! driver-owned ([`AgentAdapter::render_prompt`]): Claude/OpenCode render the
+//! legacy slash-command text, Codex renders a Codex-native instruction.
 
 use crate::phase_id::PhaseId;
 use crate::state::AgentKind;
@@ -57,6 +58,15 @@ pub trait AgentAdapter {
     fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
         Ok(())
     }
+
+    /// Render the stage prompt for this agent from a [`crate::prompt::StageIntent`].
+    ///
+    /// This is the de-Claude-ification seam (999.31 / 37-01): the intent carries
+    /// no agent syntax; each adapter turns it into its own instruction.
+    /// Claude and OpenCode render the legacy slash-command text byte-for-byte
+    /// (`crate::prompt::render_claude_style`); Codex renders a Codex-native
+    /// instruction with no `/gsd-*` string.
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String;
 }
 
 /// Return an adapter for a configured agent kind.
@@ -93,58 +103,55 @@ mod tests {
         assert_eq!(adapter_for(AgentKind::Pi).name(), "Pi");
     }
 
-    /// Extract the prompt text as this adapter actually DELIVERS it.
-    ///
-    /// Codex and OpenCode pass it positionally, so it is read back out of
-    /// argv. Claude does not: under `--input-format stream-json` the initial
-    /// user turn travels on the child's stdin, so it is read back out of the
-    /// wire document [`crate::monitor::user_turn_line`] builds. Two lookups,
-    /// one question — "what text did the agent receive?".
-    fn delivered_prompt(kind: AgentKind, prompt: &str) -> String {
-        if kind == AgentKind::Claude {
-            let turn: serde_json::Value =
-                serde_json::from_str(&crate::monitor::user_turn_line(prompt))
-                    .expect("the stdin user turn must be one valid JSON document");
-            return turn
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(serde_json::Value::as_str)
-                .expect("the user turn must carry the prompt as message.content")
-                .to_string();
-        }
-        let (_program, args) = adapter_for(kind).exec_command(PhaseId::new(7), prompt, &[]);
-        args.into_iter()
-            .find(|arg| arg.contains("DEVFLOW_RESULT"))
-            .expect("agent command should carry the prompt with the DEVFLOW_RESULT contract")
-    }
-
-    /// The invariant survived a transport change; it was not deleted with the
-    /// mechanism that used to carry it. Every adapter still receives the
-    /// canonical stage prompt byte-for-byte — Codex and OpenCode in argv,
-    /// Claude in the stdin user turn.
-    ///
-    /// The Claude leg additionally asserts the prompt is ABSENT from argv,
-    /// because "identical text" would otherwise be satisfiable by an adapter
-    /// that sent the prompt through both routes — which would double the
-    /// initial turn.
+    /// The shared-prompt invariant is retired (999.31 / 37-01): Claude and
+    /// OpenCode still render byte-identical legacy text, but Codex now renders
+    /// a Codex-native instruction instead of the shared `/gsd-*` slash command.
     #[test]
-    fn every_adapter_receives_identical_prompt_text() {
-        let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
-        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode] {
-            assert_eq!(
-                delivered_prompt(kind, &prompt),
-                prompt,
-                "{kind} must receive the canonical stage prompt unchanged"
+    fn claude_and_opencode_stay_identical_but_codex_renders_native() {
+        let intent = crate::prompt::StageIntent::for_stage(Stage::Code, PhaseId::new(7));
+        let claude = adapter_for(AgentKind::Claude).render_prompt(&intent);
+        let opencode = adapter_for(AgentKind::OpenCode).render_prompt(&intent);
+        let codex = adapter_for(AgentKind::Codex).render_prompt(&intent);
+
+        // Claude/OpenCode: byte-identical legacy text (zero regression).
+        assert_eq!(
+            claude, opencode,
+            "Claude and OpenCode must stay byte-identical after the migration"
+        );
+        assert_eq!(
+            claude,
+            stage_prompt(Stage::Code, PhaseId::new(7)),
+            "Claude must render the legacy stage_prompt text byte-for-byte (CONTEXT D-01)"
+        );
+
+        // Codex: native, NOT the shared slash-command text (the dogfood fix).
+        assert_ne!(
+            codex, claude,
+            "Codex must no longer render the shared slash-command text"
+        );
+        // Negative control, precise: no GSD slash COMMAND may appear (the
+        // `gsd-core` workflow-directory path is legitimate and must not trip
+        // a naive `/gsd-` substring check).
+        for command in [
+            "/gsd-discuss-phase",
+            "/gsd-plan-phase",
+            "/gsd-execute-phase",
+            "/gsd-validate-phase",
+            "/gsd-ship",
+            "/gsd-code-review",
+            "/gsd-audit-fix",
+        ] {
+            assert!(
+                !codex.contains(command),
+                "Codex render must not carry {command}: {codex}"
             );
         }
-
-        let (_program, args) =
-            adapter_for(AgentKind::Claude).exec_command(PhaseId::new(7), &prompt, &[]);
-        assert!(
-            !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
-            "Claude's prompt must travel on stdin ONLY; a copy left in argv \
-             would deliver the initial turn twice: {args:?}"
-        );
+        // Positive oracle: the native instruction references the workflow path,
+        // carries the --auto token, and states the completion contract (so an
+        // empty or \"do nothing\" string cannot pass).
+        assert!(codex.contains("execute-phase.md"));
+        assert!(codex.contains("--auto"));
+        assert!(codex.contains("DEVFLOW_RESULT"));
     }
 
     /// The Phase 31 launch contract, asserted as one thing because getting

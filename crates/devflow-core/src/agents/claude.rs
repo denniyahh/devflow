@@ -68,6 +68,10 @@ impl AgentAdapter for ClaudeAgent {
         // Claude exits cleanly when done; monitor detects exit via kill -0.
         false
     }
+
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_claude_style(intent)
+    }
 }
 
 impl ClaudeAgent {

@@ -40,7 +40,7 @@ const SHIP_REVIEW_ANGLES: &[&str] = &[
 const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
 
 /// The completion contract every agent must honor as its final message.
-const COMPLETION_PROTOCOL: &str = "\
+pub const COMPLETION_PROTOCOL: &str = "\
 ## Completion Protocol (REQUIRED)\n\
 \n\
 When all work is done, your FINAL message must be exactly:\n\
@@ -53,6 +53,80 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 \n\
 DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
+
+/// The data a stage wants rendered, with NO agent-specific syntax.
+///
+/// This is the de-Claude-ification artifact (999.31 / 37-01): the old
+/// `Stage::gsd_command()` returned a `/gsd-*` slash-command string that
+/// `prompt.rs` interpolated identically for every agent. `StageIntent` instead
+/// carries the stage's *data* (phase, fix kind, review angles), and each
+/// adapter's `render_prompt` turns that data into its own instruction — Claude
+/// and OpenCode render the legacy slash-command text byte-for-byte, Codex
+/// renders a Codex-native instruction with no `/gsd-*` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageIntent {
+    Define {
+        phase: PhaseId,
+    },
+    Plan {
+        phase: PhaseId,
+    },
+    Code {
+        phase: PhaseId,
+        fix: Option<FixType>,
+    },
+    Validate {
+        phase: PhaseId,
+    },
+    Ship {
+        phase: PhaseId,
+        review_angles: Vec<String>,
+    },
+}
+
+impl StageIntent {
+    /// The stage this intent drives.
+    pub fn stage(&self) -> Stage {
+        match self {
+            StageIntent::Define { .. } => Stage::Define,
+            StageIntent::Plan { .. } => Stage::Plan,
+            StageIntent::Code { .. } => Stage::Code,
+            StageIntent::Validate { .. } => Stage::Validate,
+            StageIntent::Ship { .. } => Stage::Ship,
+        }
+    }
+
+    /// Build the intent for a stage with no fix and default review angles
+    /// (callers that need a project-local review-angle override use
+    /// [`StageIntent::for_stage_in_project`]).
+    pub fn for_stage(stage: Stage, phase: PhaseId) -> Self {
+        Self::for_stage_in_project(stage, phase, None)
+    }
+
+    /// Build the intent for a stage, resolving project-local review angles.
+    pub fn for_stage_in_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> Self {
+        match stage {
+            Stage::Define => StageIntent::Define { phase },
+            Stage::Plan => StageIntent::Plan { phase },
+            Stage::Code => StageIntent::Code { phase, fix: None },
+            Stage::Validate => StageIntent::Validate { phase },
+            Stage::Ship => {
+                let review_angles = project_root
+                    .and_then(crate::config::review_angles)
+                    .unwrap_or_else(|| {
+                        SHIP_REVIEW_ANGLES
+                            .iter()
+                            .map(|angle| (*angle).to_owned())
+                            .collect()
+                    });
+                StageIntent::Ship {
+                    phase,
+                    review_angles,
+                }
+            }
+        }
+    }
+}
 
 /// A fix variant used when looping Code ↔ Validate.
 ///
@@ -250,60 +324,60 @@ pub fn stage_prompt_for_project(stage: Stage, phase: PhaseId, project_root: &Pat
     stage_prompt_with_project(stage, phase, Some(project_root))
 }
 
-fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
-    if stage == Stage::Ship {
-        let review_angles = project_root
-            .and_then(crate::config::review_angles)
-            .unwrap_or_else(|| {
-                SHIP_REVIEW_ANGLES
-                    .iter()
-                    .map(|angle| (*angle).to_owned())
-                    .collect()
-            });
-        return ship_stage_prompt(phase, &review_angles);
-    }
-    if stage == Stage::Validate {
-        return validate_stage_prompt(phase);
-    }
-    if stage == Stage::Define {
-        return define_stage_prompt(phase);
-    }
-    if stage == Stage::Plan {
-        return idempotent_stage_prompt(phase);
-    }
-    let command = gsd_command_for(stage, phase);
-    if stage == Stage::Code {
-        // The Code arm ONLY (D-04/D-05, 35.1-01 Pitfall 1). `execute-phase.md`
-        // wipes `workflow._auto_chain_active` at the top of every invocation
-        // whose `$ARGUMENTS` lacks this token, which would clear the flag
-        // DevFlow just set before `checkpoint_handling` ever reads it. Within
-        // `execute-phase.md` the token's only effect is to skip that clear — it
-        // does not chain and it sets nothing, so it is safe to send
-        // unconditionally here even though the config write that gives it
-        // meaning is gated on `Mode::Auto` (F-2).
-        //
-        // Deliberately NOT applied to `gsd_command_for` or
-        // `Stage::gsd_command`: both are shared with Plan via
-        // `idempotent_stage_prompt`, and the same flag makes `plan-phase.md`
-        // chain into `execute-phase.md`. Leaking the token into the Plan prompt
-        // is precisely the D-04 defect.
-        let command = format!("{command} {AUTO_CHAIN_PRESERVING_FLAG}");
-        return format!(
-            "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
-            ## Advisory incremental self-review\n\
-            \n\
-            After each plan or wave lands, perform a quick, shallow self-check \
-            for doc accuracy, leaked data, CI/build correctness, and \
-            external-state claims. Record any drift in the working output and \
-            continue execution; the authoritative review happens during Ship. \
-            This check must not pause execution or request human input.\n\
-            \n\
-            {COMPLETION_PROTOCOL}"
-        );
-    }
+/// The Code stage's dedicated prompt.
+///
+/// The Code arm ONLY carries [`AUTO_CHAIN_PRESERVING_FLAG`] (D-04/D-05, 35.1-01
+/// Pitfall 1): `execute-phase.md` wipes `workflow._auto_chain_active` at the top
+/// of every invocation whose `$ARGUMENTS` lacks this token, which would clear
+/// the flag DevFlow just set before `checkpoint_handling` ever reads it.
+fn code_stage_prompt(phase: PhaseId) -> String {
+    let command = format!(
+        "{} {AUTO_CHAIN_PRESERVING_FLAG}",
+        gsd_command_for(Stage::Code, phase)
+    );
     format!(
-        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+        ## Advisory incremental self-review\n\
+        \n\
+        After each plan or wave lands, perform a quick, shallow self-check \
+        for doc accuracy, leaked data, CI/build correctness, and \
+        external-state claims. Record any drift in the working output and \
+        continue execution; the authoritative review happens during Ship. \
+        This check must not pause execution or request human input.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
     )
+}
+
+/// Render a [`StageIntent`] as the legacy Claude/OpenCode slash-command text.
+///
+/// This is the byte-identical renderer: Claude and OpenCode produce exactly
+/// what `stage_prompt` produced before the migration (CONTEXT D-01 zero
+/// regression). It lives here — not in the adapters — so the two agents cannot
+/// drift apart, and the per-stage snapshot tests pin it.
+pub fn render_claude_style(intent: &StageIntent) -> String {
+    match intent {
+        StageIntent::Define { phase } => define_stage_prompt(*phase),
+        StageIntent::Plan { phase } => idempotent_stage_prompt(*phase),
+        StageIntent::Code { phase, fix: None } => code_stage_prompt(*phase),
+        StageIntent::Code {
+            phase,
+            fix: Some(fix),
+        } => fix_prompt(*fix, *phase),
+        StageIntent::Validate { phase } => validate_stage_prompt(*phase),
+        StageIntent::Ship {
+            phase,
+            review_angles,
+        } => ship_stage_prompt(*phase, review_angles),
+    }
+}
+
+fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
+    render_claude_style(&StageIntent::for_stage_in_project(
+        stage,
+        phase,
+        project_root,
+    ))
 }
 
 /// The synthesized instruction sent into a resumed Claude session when a

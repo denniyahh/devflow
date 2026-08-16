@@ -24,4 +24,8 @@ impl AgentAdapter for OpenCodeAgent {
     fn completion_signal_detected(&self, _output: &str) -> bool {
         false
     }
+
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_claude_style(intent)
+    }
 }

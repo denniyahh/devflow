@@ -61,6 +61,12 @@ impl AgentAdapter for PiAgent {
             output.status.success(),
         )
     }
+
+    // Temporary: Pi still renders the legacy shared prompt. 37-03 migrates Pi
+    // to the de-Claude-ified intent; this keeps Pi byte-identical until then.
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_claude_style(intent)
+    }
 }
 
 /// Map `pi auth check --json` output to a readiness verdict. Split out so the
