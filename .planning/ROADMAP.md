@@ -15,7 +15,7 @@ Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 36 | Pi Adapter Registration + Release Signing | Complete    | — |
-| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi) | Backlog | — |
+| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi) | Complete    | — |
 
 ### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
 
@@ -109,7 +109,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.2 | 2/2 | Complete    | 2026-08-12 |
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
 | 36 | 2/2 | Complete    | 2026-08-15 |
-| 37 | — | Backlog | — |
+| 37 | 4/4 | Complete    | 2026-08-16 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -2617,10 +2617,13 @@ per CONTEXT D-11 ("remove only if required for Pi; otherwise defer — whatever'
 fine through the shim, so the removal was deferred rather than risked in the same phase.
 
 **Known call sites to migrate before the trait can be deleted** (verified 2026-08-16):
+
 - `crates/devflow-core/src/canary.rs:40` — the Phase-31 nonce-canary imports `AgentAdapter` +
   `ClaudeAgent`.
+
 - `crates/devflow-cli/src/test_support.rs:205/244` — `AlwaysFailAdapter`/`FailOnceAdapter` test
   doubles implement `AgentAdapter`.
+
 - `crates/devflow-cli/src/preflight.rs:1266` — `run_preflight(…, adapter: &dyn AgentAdapter)`.
 - `crates/devflow-cli/src/pipeline_launch.rs:190` — `resolve_launch_shape(…, adapter: &dyn AgentAdapter)`;
   `:204` calls `ClaudeAgent::exec_command_single_document` (the pre-31 legacy builder).
@@ -2646,6 +2649,7 @@ functions predate the diff), but real:
    `item.completed(agent_message: DEVFLOW_RESULT success)` → `turn.failed(error: …)` is read as
    Success, so the stage can advance despite the terminal failure. The existing test covers
    success + `turn.completed` (`:4490-4498`), not success + `turn.failed`.
+
 2. **Codex writable-root serialization mishandles hostile paths.**
    `crates/devflow-core/src/agents/codex.rs:47-60` uses `root.display().to_string()` and escapes only
    `\` and `"`; a non-UTF-8 path becomes `�`, a newline-containing path produces invalid TOML, yielding
