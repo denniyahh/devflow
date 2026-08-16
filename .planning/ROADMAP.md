@@ -14,7 +14,7 @@ Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 36 | Pi Adapter Registration + Release Signing | Planned | — |
+| 36 | Pi Adapter Registration + Release Signing | Complete    | — |
 | 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94) | Backlog | — |
 
 ### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
@@ -108,7 +108,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.1 | 4/4 | Complete    | 2026-08-12 |
 | 35.2 | 2/2 | Complete    | 2026-08-12 |
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
-| 36 | — | Planned | — |
+| 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | — | Backlog | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -2619,9 +2619,11 @@ doctor integration, and a hook deletion that would break existing tests). Every 
 have shipped or wasted a wave without it.
 
 **The item:** make that review a default part of the phase lifecycle, not an ad-hoc operator step:
+
 - a cross-model adversarial pass over the CONTEXT (post-discuss) and the PLAN (post-plan), before execute;
 - the pass is the `adversarial-review` skill (selectable `cli:model:effort` reviewers) or a
   GSD-native equivalent, defaulting to a diverse 2-3 reviewer set;
+
 - findings feed back into planning the way `gsd-plan-phase --reviews` consumes REVIEWS.md, with the
   orchestrator gating execute until blocking findings are dispositioned.
 
@@ -2666,9 +2668,11 @@ bug. Open decisions to settle in discuss-phase:
 
 1. Should `release --check`'s signing probe target `devflow.releaseSigningKey` rather than the
    agent's `user.signingkey`? (The obvious one-line fix — but see 2.)
+
 2. Is the two-key model itself the right shape? Alternatives: a single release-only signing
    identity, or making the maintainer key the only key on the release path so there is no "wrong
    key" to select — and no `-c` override to forget.
+
 3. Should the fingerprint check surface earlier (in `release --check` / `--verify`) so a wrong-key
    tag fails at preflight instead of at push?
 
