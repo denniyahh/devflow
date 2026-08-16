@@ -3,11 +3,10 @@ gsd_state_version: 1.0
 milestone: v2.6.0
 milestone_name: milestone (Multi-Agent Adapter Migration, ACTIVE — declared 2026-08-15)
 current_phase: 37
-status: completed
+status: "Phase 37 shipped — PR #115"
 stopped_at: Phase 35.1 context gathered
-last_updated: "2026-08-16T23:33:57.699Z"
+last_updated: "2026-08-16T23:36:45.779Z"
 last_activity: 2026-08-16
-last_activity_desc: Phase 37 complete
 progress:
   total_phases: 2
   completed_phases: 2
@@ -15,6 +14,7 @@ progress:
   completed_plans: 6
   percent: 100
 current_phase_name: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
+last_activity_desc: Phase 37 complete
 ---
 
 # DevFlow — Project State
@@ -156,8 +156,8 @@ change earns 2.0.
 
 Phase: 37
 Plan: Not started
-Status: All phases complete
-Last activity: 2026-08-16 — Phase 37 complete
+Status: Phase 37 shipped — PR #115
+Last activity: 2026-08-16
 
 ## Recently Shipped
 
