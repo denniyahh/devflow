@@ -177,6 +177,13 @@ pub trait AgentDriver {
         InteractivityMode::HeadlessSafe
     }
 
+    /// The directory holding this agent's GSD workflow files, used by the
+    /// workflow-reference renderer. Defaults to the Codex install; a driver
+    /// with a different install (e.g. Pi) overrides it.
+    fn workflow_root(&self) -> String {
+        "$HOME/.codex/gsd-core/workflows".to_string()
+    }
+
     /// Classify this driver's health (the pass/fail [`AgentDriver::health`]
     /// mapped onto the richer [`DriverHealth`]).
     fn health_classification(&self, state: &crate::state::State) -> DriverHealth {
@@ -378,6 +385,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A deliberately-broken driver: empty render + empty program. The suite
+    /// must FAIL it — the negative control proving `test_contract` isn't
+    /// vacuous (code-review finding #7).
+    struct BrokenDriver;
+
+    impl AgentDriver for BrokenDriver {
+        fn name(&self) -> &'static str {
+            "broken"
+        }
+        fn render_prompt(&self, _intent: &crate::prompt::StageIntent) -> String {
+            String::new()
+        }
+        fn build_command(
+            &self,
+            _phase: PhaseId,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("", Vec::new())
+        }
+    }
+
+    #[test]
+    fn conformance_suite_fails_a_broken_driver() {
+        let results = BrokenDriver.test_contract();
+        assert!(
+            results.iter().any(|r| !r.passed),
+            "the conformance suite must fail a broken driver (empty render, empty program)"
+        );
+    }
+
+    /// The workflow renderer must preserve the per-stage contracts (code-review
+    /// findings #1-5): Validate verdict, Ship review gate, Define no-op, Plan
+    /// idempotency, and a per-driver workflow root.
+    #[test]
+    fn workflow_render_preserves_stage_contracts() {
+        use crate::prompt::StageIntent;
+        use crate::stage::Stage;
+
+        let codex = CodexDriver;
+
+        // Validate demands the verdict (finding #1).
+        let validate =
+            codex.render_prompt(&StageIntent::for_stage(Stage::Validate, PhaseId::new(7)));
+        assert!(validate.contains("\"verdict\": \"pass\""));
+        assert!(validate.contains("\"verdict\": \"gaps\""));
+
+        // Ship keeps the review gate (finding #2).
+        let ship = codex.render_prompt(&StageIntent::for_stage(Stage::Ship, PhaseId::new(7)));
+        assert!(ship.contains("Critical"));
+        assert!(ship.contains("review:"));
+
+        // Define is the D-14 no-op (finding #3).
+        let define = codex.render_prompt(&StageIntent::for_stage(Stage::Define, PhaseId::new(7)));
+        assert!(define.contains("must NOT run") || define.contains("do NOT run"));
+        assert!(!define.contains("discuss-phase.md"));
+
+        // Plan keeps the idempotency guard (finding #3).
+        let plan = codex.render_prompt(&StageIntent::for_stage(Stage::Plan, PhaseId::new(7)));
+        assert!(plan.contains("already exists"));
+
+        // Pi points at its own workflow root (finding #5).
+        let pi_code = PiDriver.render_prompt(&StageIntent::for_stage(Stage::Code, PhaseId::new(7)));
+        assert!(pi_code.contains("$HOME/.pi/agent/gsd-core/workflows"));
+        assert!(!pi_code.contains("$HOME/.codex/gsd-core"));
     }
 
     #[test]

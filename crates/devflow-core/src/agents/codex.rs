@@ -20,7 +20,7 @@ impl AgentDriver for CodexDriver {
     }
 
     fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        crate::prompt::render_workflow_style(intent, "the OpenAI Codex coding agent")
+        crate::prompt::render_workflow_style(intent, &self.workflow_root())
     }
 
     fn build_command(

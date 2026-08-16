@@ -31,7 +31,13 @@ impl AgentDriver for PiDriver {
     }
 
     fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        crate::prompt::render_workflow_style(intent, "the Pi coding agent")
+        crate::prompt::render_workflow_style(intent, &self.workflow_root())
+    }
+
+    /// Pi installs its GSD workflows under `~/.pi/agent/gsd-core/workflows/`,
+    /// NOT the Codex install the default points at (code-review finding #5).
+    fn workflow_root(&self) -> String {
+        "$HOME/.pi/agent/gsd-core/workflows".to_string()
     }
 
     fn build_command(
@@ -49,8 +55,18 @@ impl AgentDriver for PiDriver {
     fn health(&self, _state: &crate::state::State) -> Result<(), String> {
         // Credential readiness via `pi auth check` — Pi's own verb — rather
         // than env-var sniffing (see `classify_auth_check`).
+        // `--no-refresh` prevents a stalled OAuth token refresh from hanging
+        // preflight (code-review finding #8: `pi auth check` refreshes expired
+        // credentials by default, and `.output()` has no timeout).
         let output = std::process::Command::new("pi")
-            .args(["auth", "check", "--json", "--provider", "google"])
+            .args([
+                "auth",
+                "check",
+                "--json",
+                "--provider",
+                "google",
+                "--no-refresh",
+            ])
             .output()
             .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
         classify_auth_check(
@@ -235,7 +251,10 @@ mod tests {
             .expect("a `ready` stub should pass preflight");
 
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(argv, "auth\ncheck\n--json\n--provider\ngoogle\n");
+        assert_eq!(
+            argv,
+            "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n"
+        );
     }
 
     /// The negative control AC #1 requires: a `pi` binary that reports

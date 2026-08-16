@@ -2635,6 +2635,25 @@ mode requires the `&dyn AgentAdapter` → `&dyn AgentDriver` signature migration
 regression-sensitive code in the repo; the four legacy structs and the `DriverShim` are deleted once
 every call site resolves through `AgentDriver`.
 
+### Phase 999.107: Two Pre-Existing Codex-Parser Defects Surfaced by the Phase 37 Code Review (BACKLOG)
+
+**Found:** 2026-08-16, the Phase 37 code review. Pre-existing (not introduced by Phase 37 — both
+functions predate the diff), but real:
+
+1. **The Codex parser lets an earlier success marker beat a later terminal failure.**
+   `crates/devflow-core/src/agent_result.rs:764-781` returns the last `agent_message` marker before
+   examining `turn.failed` (`:784-812`). A stream of `thread.started` →
+   `item.completed(agent_message: DEVFLOW_RESULT success)` → `turn.failed(error: …)` is read as
+   Success, so the stage can advance despite the terminal failure. The existing test covers
+   success + `turn.completed` (`:4490-4498`), not success + `turn.failed`.
+2. **Codex writable-root serialization mishandles hostile paths.**
+   `crates/devflow-core/src/agents/codex.rs:47-60` uses `root.display().to_string()` and escapes only
+   `\` and `"`; a non-UTF-8 path becomes `�`, a newline-containing path produces invalid TOML, yielding
+   a malformed `sandbox_workspace_write.writable_roots` override.
+
+**Size:** S–M — #1 is a parser-ordering fix with a new `turn.failed` negative test; #2 is a
+serialization hardening with a hostile-path fixture.
+
 ### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
 
 **Found:** 2026-08-15, dogfooding Phase 36. A hand-run adversarial review (claude/opus,
