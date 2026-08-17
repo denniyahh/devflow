@@ -1,11 +1,11 @@
-//! OpenAI Codex agent driver + legacy adapter.
+//! OpenAI Codex agent driver.
 //!
 //! Launches `codex -a never exec "<prompt>"` in non-interactive mode with JSON
 //! output. `-a never` is the GLOBAL approval flag and must precede `exec` —
 //! verified against the installed CLI (a `codex exec -a never` placement is
 //! rejected as an unknown argument).
 
-use super::{AgentAdapter, AgentDriver, InteractivityMode};
+use super::{AgentDriver, InteractivityMode};
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
@@ -42,17 +42,14 @@ impl AgentDriver for CodexDriver {
         // Linked-worktree commits write git metadata outside the
         // workspace-write sandbox (13-06 dogfood finding: Code stage
         // implemented and tested, then could not commit). Grant every extra
-        // root in one TOML list value; escape backslashes and quotes in paths.
+        // root in one TOML list value; escape backslashes, quotes, and control
+        // characters so a hostile path cannot corrupt the array (999.107 #2).
         if !extra_writable_roots.is_empty() {
             let list = extra_writable_roots
                 .iter()
                 .map(|root| {
-                    let escaped = root
-                        .display()
-                        .to_string()
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"");
-                    format!("\"{escaped}\"")
+                    let path = root.to_string_lossy();
+                    format!("\"{}\"", escape_toml_basic_string(&path))
                 })
                 .collect::<Vec<_>>()
                 .join(",");
@@ -96,33 +93,79 @@ impl AgentDriver for CodexDriver {
     }
 }
 
-/// Legacy `AgentAdapter` face for Codex (D-11 removal point). Delegates to
-/// [`CodexDriver`].
-pub struct CodexAgent;
+/// Escape a string for embedding inside a TOML basic (double-quoted) string.
+///
+/// 999.107 #2: the previous serializer escaped only `\` and `"`, so a path
+/// containing a newline or other control character produced malformed TOML and
+/// a corrupt `sandbox_workspace_write.writable_roots` override. Control
+/// characters are escaped as `\n`/`\t`/`\r` (or `\uXXXX` for the rest) so the
+/// array value stays a valid TOML string no matter what a path contains.
+fn escape_toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
-impl AgentAdapter for CodexAgent {
-    fn name(&self) -> &'static str {
-        CodexDriver.name()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::phase_id::PhaseId;
+
+    fn writable_roots_flag(args: &[String]) -> &str {
+        let idx = args
+            .iter()
+            .position(|a| a == "-c")
+            .expect("-c flag present");
+        &args[idx + 1]
     }
 
-    fn exec_command(
-        &self,
-        phase: PhaseId,
-        prompt: &str,
-        extra_writable_roots: &[PathBuf],
-    ) -> (&'static str, Vec<String>) {
-        CodexDriver.build_command(phase, prompt, extra_writable_roots)
+    /// 999.107 #2: a path containing a quote, backslash, and newline must
+    /// serialize to valid TOML — the newline becomes `\n`, the quote `\"`,
+    /// the backslash `\\` — never a raw control character that would corrupt
+    /// the `writable_roots` array value.
+    #[test]
+    fn codex_writable_roots_escape_hostile_paths() {
+        let roots = vec![PathBuf::from("/repo/a\"b\\c\nd")];
+        let (_, args) = CodexDriver.build_command(PhaseId::new(7), "prompt", &roots);
+        let flag = writable_roots_flag(&args);
+        assert!(
+            !flag.contains('\n'),
+            "raw newline must be escaped: {flag:?}"
+        );
+        assert!(flag.contains(r#"\n"#), "newline must be `\\n`: {flag:?}");
+        assert!(flag.contains(r#"\""#), "quote must be escaped: {flag:?}");
+        assert!(
+            flag.contains(r#"\\"#),
+            "backslash must be escaped: {flag:?}"
+        );
     }
 
-    fn extra_env(&self) -> Vec<(String, String)> {
-        CodexDriver.environment()
-    }
-
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        false
-    }
-
-    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        CodexDriver.render_prompt(intent)
+    /// 999.107 #2: a non-UTF-8 path is lossily converted to U+FFFD and still
+    /// serializes as a valid TOML string (no raw invalid byte, no raw control
+    /// character).
+    #[cfg(unix)]
+    #[test]
+    fn codex_writable_roots_lossy_for_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        // 0xFF is not valid UTF-8; `to_string_lossy` maps it to U+FFFD.
+        let raw = std::ffi::OsString::from_vec(vec![b'/', b'r', b'e', b'p', b'o', 0xFF, b'x']);
+        let roots = vec![PathBuf::from(raw)];
+        let (_, args) = CodexDriver.build_command(PhaseId::new(7), "prompt", &roots);
+        let flag = writable_roots_flag(&args);
+        assert!(
+            flag.contains('\u{FFFD}'),
+            "lossy replacement expected: {flag:?}"
+        );
+        assert!(!flag.contains('\n'), "no raw control chars: {flag:?}");
     }
 }

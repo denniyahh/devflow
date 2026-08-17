@@ -8,15 +8,15 @@
 //! no trust decision — that is a security boundary, not a convenience.
 //!
 //! No `--model`/`--provider` wiring here: model/provider selection is the
-//! `AgentDriver` contract's job (Phase 37), and `AgentAdapter` has no config
-//! surface to source it from. Pi uses its own defaults (provider `google`).
+//! `AgentDriver` contract's job (Phase 37), and the launch surface has no
+//! config to source it from. Pi uses its own defaults (provider `google`).
 //!
 //! Note: Pi has NO `--` end-of-options convention — passing `--` is rejected as
 //! an unknown option, so the prompt is passed raw. DevFlow's own stage prompts
 //! never begin with `-`, so the leading-dash hazard (a markdown `- [ ]` list) is
 //! a Phase 37 concern, not something a `--` can guard here.
 
-use super::{AgentAdapter, AgentDriver};
+use super::AgentDriver;
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
@@ -76,38 +76,6 @@ impl AgentDriver for PiDriver {
     }
 }
 
-/// Legacy `AgentAdapter` face for Pi (D-11 removal point). Delegates to
-/// [`PiDriver`].
-pub struct PiAgent;
-
-impl AgentAdapter for PiAgent {
-    fn name(&self) -> &'static str {
-        PiDriver.name()
-    }
-
-    fn exec_command(
-        &self,
-        phase: PhaseId,
-        prompt: &str,
-        extra_writable_roots: &[PathBuf],
-    ) -> (&'static str, Vec<String>) {
-        PiDriver.build_command(phase, prompt, extra_writable_roots)
-    }
-
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        // `pi -p` exits cleanly when done; the monitor detects exit via kill -0.
-        false
-    }
-
-    fn preflight(&self, state: &crate::state::State) -> Result<(), String> {
-        PiDriver.health(state)
-    }
-
-    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        PiDriver.render_prompt(intent)
-    }
-}
-
 /// Map `pi auth check --json` output to a readiness verdict. Split out so the
 /// classification is unit-testable without spawning a process. Parses the JSON
 /// rather than substring-matching, so whitespace formatting can't defeat it.
@@ -139,7 +107,7 @@ mod tests {
 
     #[test]
     fn exec_command_shape() {
-        let (program, args) = PiAgent.exec_command(PhaseId::new(1), "do the thing", &[]);
+        let (program, args) = PiDriver.build_command(PhaseId::new(1), "do the thing", &[]);
         assert_eq!(program, "pi");
         assert_eq!(args, vec!["-p", "--no-approve", "do the thing"]);
     }
@@ -246,8 +214,8 @@ mod tests {
         let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 0);
         let _path = PathGuard::set(stub_dir.path());
 
-        PiAgent
-            .preflight(&test_state())
+        PiDriver
+            .health(&test_state())
             .expect("a `ready` stub should pass preflight");
 
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
@@ -269,8 +237,8 @@ mod tests {
         );
         let _path = PathGuard::set(stub_dir.path());
 
-        let err = PiAgent
-            .preflight(&test_state())
+        let err = PiDriver
+            .health(&test_state())
             .expect_err("a `not_ready` stub should fail preflight");
         assert!(
             err.contains("no provider credential resolves"),
@@ -287,7 +255,7 @@ mod tests {
         let _path = PathGuard::set(stub_dir.path());
 
         assert!(
-            PiAgent.preflight(&test_state()).is_err(),
+            PiDriver.health(&test_state()).is_err(),
             "a failed exit must not be read as ready even when the body says ready"
         );
     }

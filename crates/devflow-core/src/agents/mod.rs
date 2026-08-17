@@ -1,73 +1,13 @@
-//! Agent adapter trait and implementations.
+//! Agent driver contract and implementations.
 //!
-//! Each adapter knows how to render a stage prompt for its agent and wrap it
+//! Each driver knows how to render a stage prompt for its agent and wrap it
 //! into the CLI's non-interactive launch command. Prompt RENDERING is
-//! driver-owned ([`AgentAdapter::render_prompt`]): Claude/OpenCode render the
+//! driver-owned ([`AgentDriver::render_prompt`]): Claude/OpenCode render the
 //! legacy slash-command text, Codex renders a Codex-native instruction.
 
 use crate::phase_id::PhaseId;
 use crate::state::AgentKind;
 use std::path::PathBuf;
-
-/// Common behavior implemented by every supported coding-agent backend.
-pub trait AgentAdapter {
-    /// Human-readable adapter name.
-    fn name(&self) -> &'static str;
-
-    /// Build the command and arguments to launch this agent headless with the
-    /// given `prompt` for `phase`. Returns `(program, args)`.
-    ///
-    /// `extra_writable_roots` are directories OUTSIDE the agent's working
-    /// directory that its sandbox must still be allowed to write. Linked git
-    /// worktrees keep their git metadata under the main repo's `.git/` — and
-    /// Codex additionally read-only-mounts the cwd's resolved git dir, so
-    /// BOTH the common `.git` and the worktree admin dir
-    /// (`.git/worktrees/<name>`) must be granted explicitly (13-06 dogfood
-    /// finding, verified with `codex sandbox` probes). Adapters without a
-    /// sandbox ignore it.
-    fn exec_command(
-        &self,
-        phase: PhaseId,
-        prompt: &str,
-        extra_writable_roots: &[PathBuf],
-    ) -> (&'static str, Vec<String>);
-
-    /// Extra environment variables for the agent process tree. Codex uses
-    /// this to disable commit/tag signing inside its sandbox: the operator's
-    /// signing agent (ssh-agent/gpg-agent) is unreachable there, so signed
-    /// commits fail headless with a passphrase error (13-06 dogfood finding
-    /// — same rationale as the unsigned VersionBump tags). `GIT_CONFIG_*`
-    /// env scoping keeps the override out of every repo/global config.
-    fn extra_env(&self) -> Vec<(String, String)> {
-        Vec::new()
-    }
-
-    /// Detect an agent-specific completion signal in captured output.
-    fn completion_signal_detected(&self, output: &str) -> bool;
-
-    /// Adapter-specific pre-launch readiness check (D-13/D-14 adapter hook,
-    /// Phase 17c). The default is a no-op — most adapters have nothing extra
-    /// to check, mirroring [`Self::extra_env`]'s empty-default shape. The
-    /// `Err` variant is a human-readable failure reason that flows into the
-    /// preflight gate's context (`run_preflight` in `devflow-cli/src/main.rs`).
-    /// This is the trait surface Phase 18's Hermes adapter implements to
-    /// enforce a non-empty reviewer/receiver set — no built-in adapter
-    /// (Claude/Codex/OpenCode) overrides it in Phase 17 because no
-    /// reviewer-set storage exists yet in `state.rs`/`config.rs` (review
-    /// consensus #6).
-    fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Render the stage prompt for this agent from a [`crate::prompt::StageIntent`].
-    ///
-    /// This is the de-Claude-ification seam (999.31 / 37-01): the intent carries
-    /// no agent syntax; each adapter turns it into its own instruction.
-    /// Claude and OpenCode render the legacy slash-command text byte-for-byte
-    /// (`crate::prompt::render_claude_style`); Codex renders a Codex-native
-    /// instruction with no `/gsd-*` string.
-    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String;
-}
 
 /// Capabilities a driver declares, enumerated as-needed (999.31 D-01).
 /// `#[non_exhaustive]` + `Default` so adding a field never breaks an existing
@@ -224,47 +164,13 @@ fn contract_checks<D: AgentDriver + ?Sized>(driver: &D) -> Vec<ContractResult> {
     checks
 }
 
-/// Compatibility shim (D-11 removal point): exposes an [`AgentDriver`] through
-/// the legacy [`AgentAdapter`] surface so every caller keeps compiling until
-/// 37-04 migrates them and removes `AgentAdapter`.
-struct DriverShim<D: AgentDriver>(D);
-
-impl<D: AgentDriver> AgentAdapter for DriverShim<D> {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-    fn exec_command(
-        &self,
-        phase: PhaseId,
-        prompt: &str,
-        extra_writable_roots: &[PathBuf],
-    ) -> (&'static str, Vec<String>) {
-        self.0.build_command(phase, prompt, extra_writable_roots)
-    }
-    fn extra_env(&self) -> Vec<(String, String)> {
-        self.0.environment()
-    }
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        // Every current driver is process-exit transport (the monitor detects
-        // exit via kill -0); none emits an in-stream completion signal. This
-        // matches the legacy adapters' behavior byte-for-byte.
-        false
-    }
-    fn preflight(&self, state: &crate::state::State) -> Result<(), String> {
-        self.0.health(state)
-    }
-    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        self.0.render_prompt(intent)
-    }
-}
-
-/// Return an adapter for a configured agent kind.
-pub fn adapter_for(kind: AgentKind) -> Box<dyn AgentAdapter> {
+/// Return the driver for a configured agent kind.
+pub fn driver_for(kind: AgentKind) -> Box<dyn AgentDriver> {
     match kind {
-        AgentKind::Claude => Box::new(DriverShim(ClaudeDriver)),
-        AgentKind::Codex => Box::new(DriverShim(CodexDriver)),
-        AgentKind::OpenCode => Box::new(DriverShim(OpenCodeDriver)),
-        AgentKind::Pi => Box::new(DriverShim(PiDriver)),
+        AgentKind::Claude => Box::new(ClaudeDriver),
+        AgentKind::Codex => Box::new(CodexDriver),
+        AgentKind::OpenCode => Box::new(OpenCodeDriver),
+        AgentKind::Pi => Box::new(PiDriver),
     }
 }
 
@@ -273,10 +179,10 @@ pub mod codex;
 pub mod opencode;
 pub mod pi;
 
-pub use claude::{ClaudeAgent, ClaudeDriver};
-pub use codex::{CodexAgent, CodexDriver};
-pub use opencode::{OpenCodeAgent, OpenCodeDriver};
-pub use pi::{PiAgent, PiDriver};
+pub use claude::ClaudeDriver;
+pub use codex::CodexDriver;
+pub use opencode::OpenCodeDriver;
+pub use pi::PiDriver;
 
 #[cfg(test)]
 mod tests {
@@ -285,16 +191,16 @@ mod tests {
     use crate::stage::Stage;
 
     #[test]
-    fn adapter_for_returns_correct_names() {
-        assert_eq!(adapter_for(AgentKind::Claude).name(), "Claude Code");
-        assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
-        assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
-        assert_eq!(adapter_for(AgentKind::Pi).name(), "Pi");
+    fn driver_for_returns_correct_names() {
+        assert_eq!(driver_for(AgentKind::Claude).name(), "Claude Code");
+        assert_eq!(driver_for(AgentKind::Codex).name(), "OpenAI Codex");
+        assert_eq!(driver_for(AgentKind::OpenCode).name(), "OpenCode");
+        assert_eq!(driver_for(AgentKind::Pi).name(), "Pi");
     }
 
     /// 37-02: the drivers reproduce the legacy adapter byte-for-byte (the shim
-    /// delegates to them, so this guards against future drift when the
-    /// `AgentAdapter` face is removed in 37-04).
+    /// delegated to them, so this guards against future drift now that the
+    /// legacy surface is removed).
     #[test]
     fn drivers_reproduce_legacy_adapter_behavior() {
         let intent = crate::prompt::StageIntent::for_stage(Stage::Code, PhaseId::new(7));
@@ -480,9 +386,9 @@ mod tests {
     #[test]
     fn claude_and_opencode_stay_identical_but_codex_renders_native() {
         let intent = crate::prompt::StageIntent::for_stage(Stage::Code, PhaseId::new(7));
-        let claude = adapter_for(AgentKind::Claude).render_prompt(&intent);
-        let opencode = adapter_for(AgentKind::OpenCode).render_prompt(&intent);
-        let codex = adapter_for(AgentKind::Codex).render_prompt(&intent);
+        let claude = driver_for(AgentKind::Claude).render_prompt(&intent);
+        let opencode = driver_for(AgentKind::OpenCode).render_prompt(&intent);
+        let codex = driver_for(AgentKind::Codex).render_prompt(&intent);
 
         // Claude/OpenCode: byte-identical legacy text (zero regression).
         assert_eq!(
@@ -533,7 +439,7 @@ mod tests {
     fn claude_launches_headless_stream_json_without_positional_prompt() {
         let prompt = stage_prompt(Stage::Code, PhaseId::new(3));
         let (program, args) =
-            adapter_for(AgentKind::Claude).exec_command(PhaseId::new(3), &prompt, &[]);
+            driver_for(AgentKind::Claude).build_command(PhaseId::new(3), &prompt, &[]);
         assert_eq!(program, "claude");
         assert!(args.iter().any(|a| a == "-p"));
         assert!(
@@ -561,7 +467,7 @@ mod tests {
     fn codex_wraps_prompt_in_exec_and_json() {
         let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
         let (program, args) =
-            adapter_for(AgentKind::Codex).exec_command(PhaseId::new(7), &prompt, &[]);
+            driver_for(AgentKind::Codex).build_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "codex");
         let joined = args.join(" ");
         assert!(joined.contains("exec"));
@@ -573,7 +479,7 @@ mod tests {
     fn opencode_wraps_prompt_in_run() {
         let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
         let (program, args) =
-            adapter_for(AgentKind::OpenCode).exec_command(PhaseId::new(7), &prompt, &[]);
+            driver_for(AgentKind::OpenCode).build_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "opencode");
         assert_eq!(args, ["run", prompt.as_str()]);
     }
@@ -591,7 +497,7 @@ mod tests {
             PathBuf::from("/repo/.git/worktrees/phase-07"),
         ];
         let (_, args) =
-            adapter_for(AgentKind::Codex).exec_command(PhaseId::new(7), &prompt, &roots);
+            driver_for(AgentKind::Codex).build_command(PhaseId::new(7), &prompt, &roots);
         let joined = args.join(" ");
         assert!(
             joined.contains(
@@ -600,7 +506,7 @@ mod tests {
             "codex must whitelist the common .git AND the worktree admin dir: {joined}"
         );
 
-        let (_, args) = adapter_for(AgentKind::Codex).exec_command(PhaseId::new(7), &prompt, &[]);
+        let (_, args) = driver_for(AgentKind::Codex).build_command(PhaseId::new(7), &prompt, &[]);
         assert!(
             !args.join(" ").contains("writable_roots"),
             "no override without an extra root"
@@ -613,11 +519,11 @@ mod tests {
     /// env; agents without a sandbox get no extra env.
     #[test]
     fn codex_disables_signing_via_env_others_do_not() {
-        let env = adapter_for(AgentKind::Codex).extra_env();
+        let env = driver_for(AgentKind::Codex).environment();
         assert!(env.contains(&("GIT_CONFIG_KEY_0".into(), "commit.gpgsign".into())));
         assert!(env.contains(&("GIT_CONFIG_KEY_1".into(), "tag.gpgsign".into())));
-        assert!(adapter_for(AgentKind::Claude).extra_env().is_empty());
-        assert!(adapter_for(AgentKind::OpenCode).extra_env().is_empty());
+        assert!(driver_for(AgentKind::Claude).environment().is_empty());
+        assert!(driver_for(AgentKind::OpenCode).environment().is_empty());
     }
 
     /// D-13: `preflight`'s default body is `Ok(())` for every built-in
@@ -632,8 +538,8 @@ mod tests {
             crate::mode::Mode::Auto,
             PathBuf::from("/repo"),
         );
-        assert!(adapter_for(AgentKind::Claude).preflight(&state).is_ok());
-        assert!(adapter_for(AgentKind::Codex).preflight(&state).is_ok());
-        assert!(adapter_for(AgentKind::OpenCode).preflight(&state).is_ok());
+        assert!(driver_for(AgentKind::Claude).health(&state).is_ok());
+        assert!(driver_for(AgentKind::Codex).health(&state).is_ok());
+        assert!(driver_for(AgentKind::OpenCode).health(&state).is_ok());
     }
 }

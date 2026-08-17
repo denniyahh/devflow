@@ -37,7 +37,7 @@
 //! free to drift away from the first, and the drift would be invisible.
 
 use crate::agent_result;
-use crate::agents::{AgentAdapter, ClaudeAgent};
+use crate::agents::{AgentDriver, ClaudeDriver};
 use crate::git::hermetic_command;
 use crate::monitor::{self, CloseRule};
 use crate::phase_id::PhaseId;
@@ -282,7 +282,7 @@ impl CanaryLauncher for ClaudeCanaryLauncher {
         // (see `advance`'s `events::emit(project_root, 0, …)`). `exec_command`
         // ignores both the phase and the prompt: under `--input-format
         // stream-json` the prompt travels on stdin, not argv.
-        let (program, args) = ClaudeAgent.exec_command(PhaseId::new(0), prompt, &[]);
+        let (program, args) = ClaudeDriver.build_command(PhaseId::new(0), prompt, &[]);
 
         let mut capture_file = std::fs::File::create(capture).map_err(|err| {
             format!(

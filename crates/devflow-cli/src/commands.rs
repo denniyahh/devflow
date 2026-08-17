@@ -279,27 +279,34 @@ pub(crate) fn start(
     // is a narrower and misleading diagnosis of the same root fact.
     ensure_phase_reachable_on_base(project_root, phase, DEVELOP)?;
 
-    // 13-06 dogfood pre-flight (Codex leg): a fresh headless Codex run can
-    // never pass Define — GSD's discuss-phase is an interview, and Codex's
-    // exec mode cannot answer it (`request_user_input is unavailable in
-    // Default mode`). Fail in one second with instructions instead of after
+    // 999.106 driver-driven pre-flight: whether a fresh headless run can pass
+    // a stage is declared by the driver's `interactivity_mode`, not a
+    // hardcoded `agent == Codex`. A `RequiresExistingArtifact` Define must
+    // have CONTEXT.md on develop; a `RequiresExistingArtifact` Plan warns
+    // without a PLAN.md. Fail in one second with instructions instead of after
     // a burned agent run and a dead-end gate. Checked on `develop` (the
     // branch worktrees fork from), so the result does not depend on what the
     // primary checkout happens to have checked out.
-    if agent == AgentKind::Codex {
-        if !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md") {
-            return Err(CliError::Message(format!(
-                "phase {phase} has no CONTEXT.md on develop, and codex cannot run an \
-                 interactive discussion headless. Run /gsd-discuss-phase {phase} \
-                 interactively first (any agent), or use --agent claude."
-            )));
-        }
-        if !phase_artifact_on_develop(project_root, phase, "-PLAN.md") {
-            println!(
-                "warning: phase {phase} has no PLAN.md on develop — headless codex \
-                 planning is untested and may need input; pre-writing plans is safer"
-            );
-        }
+    let driver = agents::driver_for(agent);
+    if driver.interactivity_mode(Stage::Define)
+        == agents::InteractivityMode::RequiresExistingArtifact
+        && !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md")
+    {
+        return Err(CliError::Message(format!(
+            "phase {phase} has no CONTEXT.md on develop, and {} cannot run an \
+             interactive discussion headless. Run /gsd-discuss-phase {phase} \
+             interactively first (any agent), or use --agent claude.",
+            driver.name()
+        )));
+    }
+    if driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
+        && !phase_artifact_on_develop(project_root, phase, "-PLAN.md")
+    {
+        println!(
+            "warning: phase {phase} has no PLAN.md on develop — headless {} \
+             planning is untested and may need input; pre-writing plans is safer",
+            driver.name()
+        );
     }
 
     // Pre-start divergence check: runs on current HEAD before any git
@@ -874,7 +881,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 "  stage: {} | mode: {} | gate: {}",
                 state.stage, state.mode, gate
             );
-            println!("  agent: {}", agents::adapter_for(state.agent).name());
+            println!("  agent: {}", agents::driver_for(state.agent).name());
             if state.consecutive_failures > 0 {
                 println!("  validate failures: {}", state.consecutive_failures);
             }
@@ -2108,10 +2115,7 @@ pub(crate) fn recover_cmd(
         println!("phase: {}", status.state.phase);
         println!("  stage: {}", status.state.stage);
         println!("  mode: {}", status.state.mode);
-        println!(
-            "  agent: {}",
-            agents::adapter_for(status.state.agent).name()
-        );
+        println!("  agent: {}", agents::driver_for(status.state.agent).name());
         println!("  started: {} ({})", status.state.started_at, status.age);
         match agent_pid_from_file(project_root, status.state.phase) {
             Some(pid) => {

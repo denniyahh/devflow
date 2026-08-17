@@ -755,6 +755,39 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(indeterminate_capture_failure());
     }
 
+    // 999.107 #1: a terminal `turn.failed` must not be overridden by an
+    // earlier `agent_message` success marker. Read the terminal event FIRST —
+    // `turn.failed` is decisive failure regardless of any success marker that
+    // preceded it (the old order returned the marker before ever reading the
+    // terminal, so a stream ending `success marker → turn.failed` was misread
+    // as Success).
+    let terminal = events.iter().rev().find(|v| {
+        matches!(
+            v.get("type").and_then(serde_json::Value::as_str),
+            Some("turn.completed") | Some("turn.failed")
+        )
+    });
+    if let Some(terminal) = terminal
+        && terminal.get("type").and_then(serde_json::Value::as_str) == Some("turn.failed")
+    {
+        let reason = terminal
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "codex turn failed".to_string());
+
+        return Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(reason),
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(1),
+        });
+    }
+
     // Codex delivers the agent's DEVFLOW_RESULT self-report inside an
     // `agent_message` item's `text` — never as a raw stdout line — so the
     // top-level marker scan cannot see it (13-06 dogfood finding: a Codex
@@ -781,35 +814,9 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(normalise_stream_marker_provenance(result));
     }
 
-    let terminal = events.iter().rev().find(|v| {
-        matches!(
-            v.get("type").and_then(serde_json::Value::as_str),
-            Some("turn.completed") | Some("turn.failed")
-        )
-    })?;
-
-    if terminal.get("type").and_then(serde_json::Value::as_str) != Some("turn.failed") {
-        // turn.completed (or any other terminal we don't recognize) defers
-        // to Layer 2 rather than an unconditional Success.
-        return None;
-    }
-
-    let reason = terminal
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "codex turn failed".to_string());
-
-    Some(AgentResult {
-        status: AgentStatus::Failed,
-        exit_code: None,
-        reason: Some(reason),
-        commits: None,
-        summary: None,
-        verdict: None,
-        decided_by_layer: Some(1),
-    })
+    // turn.completed (or no terminal event at all) with no marker defers to
+    // Layer 2 rather than an unconditional Success.
+    None
 }
 
 /// Parse a captured stdout as JSONL: one `serde_json::Value` per non-blank,
@@ -4495,6 +4502,23 @@ mod tests {
         );
         let result = parse_codex_event_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// 999.107 #1: the pre-fix parser returned the `agent_message` success
+    /// marker before examining the terminal event, so a stream that ended
+    /// `success marker → turn.failed` was misread as Success and the stage
+    /// could advance despite the terminal failure. A terminal `turn.failed`
+    /// must win over any earlier success marker.
+    #[test]
+    fn codex_turn_failed_beats_an_earlier_success_marker() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\": \\\"success\\\"}\"}}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"sandbox denied write\"}}\n",
+        );
+        let result = parse_codex_event_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("sandbox denied write"));
     }
 
     /// 13-06 dogfood regression: document content echoed into a JSONL event

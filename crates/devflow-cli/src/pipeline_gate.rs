@@ -195,14 +195,12 @@ pub(crate) fn prepare_loop_back_to_code(
         "looping back to Code ({} validate failure(s) this phase, {} in the current streak)",
         state.phase_validate_failures, state.consecutive_failures
     );
-    Ok(
-        devflow_core::agents::adapter_for(state.agent).render_prompt(
-            &devflow_core::prompt::StageIntent::Code {
-                phase: state.phase,
-                fix: Some(fix),
-            },
-        ),
-    )
+    Ok(devflow_core::agents::driver_for(state.agent).render_prompt(
+        &devflow_core::prompt::StageIntent::Code {
+            phase: state.phase,
+            fix: Some(fix),
+        },
+    ))
 }
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.

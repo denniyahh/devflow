@@ -474,10 +474,10 @@ mod tests {
 
     #[test]
     fn agent_name_and_display() {
-        use crate::agents::adapter_for;
-        assert_eq!(adapter_for(AgentKind::Claude).name(), "Claude Code");
-        assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
-        assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
+        use crate::agents::driver_for;
+        assert_eq!(driver_for(AgentKind::Claude).name(), "Claude Code");
+        assert_eq!(driver_for(AgentKind::Codex).name(), "OpenAI Codex");
+        assert_eq!(driver_for(AgentKind::OpenCode).name(), "OpenCode");
 
         assert_eq!(AgentKind::Claude.to_string(), "claude");
         assert_eq!(AgentKind::Codex.to_string(), "codex");
