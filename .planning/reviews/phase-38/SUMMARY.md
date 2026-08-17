@@ -1,7 +1,7 @@
 # Adversarial Review — Phase 38 CONTEXT (D-01..D-04)
 
 **Targets:** `38-CONTEXT.md` + `38-DISCUSSION-LOG.md` (committed `76d08a9` on `feature/phase-38`)
-**Reviewers:** claude (opus, high) · antigravity (Gemini 3.7 Flash High) · codex (terra — **failed**, see below)
+**Reviewers:** claude (opus, high) · codex (gpt-5.6-terra, high) · antigravity (Gemini 3.7 Flash High)
 **Date:** 2026-08-17
 **Review root:** `.worktrees/phase-38` (both reviewers read the live source + ran the installed `pi` 0.84.1 with negative controls)
 
@@ -63,6 +63,21 @@ phase must be re-scoped before planning.
 - **MEDIUM — prompt echo.** Pi echoes the prompt as `message_start`/`message_end`; this reintroduces
   the 30-05 false-positive surface with none of Claude's `parent_tool_use_id` provenance.
 
+## codex-only (code-verified against Pi 0.84.1 source, not just the CLI)
+
+- **HIGH — `--mode json` is single-shot print mode, not an event stream.** codex read Pi's own
+  `print-mode.js`: `pi --mode json "prompt"` processes positional messages and exits; it does not
+  consume the stdin protocol DevFlow injects. This is the root cause of the deadlock (finding 1) —
+  the "JSON-mode event unwrapper" premise in the roadmap is wrong as stated.
+- **HIGH — D-01 has no completion-parser plan.** Pi's final text lives inside JSON `message_*`
+  events; Layer 1 recognizes only Claude envelopes/streams, raw marker lines, and Codex events
+  (`agent_result.rs:1806-1841`). A `DEVFLOW_RESULT` marker embedded in Pi JSON is recognized by
+  neither, so Pi's own result is invisible to the verifier.
+- **MEDIUM — the acceptance bar is non-falsifiable.** "Completing Plan→Code→Validate→Ship" names no
+  Pi version, fixture, expected JSONL records, completion/error mapping, or negative controls
+  (e.g. `message_end` with `stopReason:error` + exit 0; marker-in-tool-message not becoming
+  completion; absent task events not read as "drained"; Pi-without-Claude not invoking the canary).
+
 ## Document bugs (minor)
 
 - `D-03` appears only under "Deferred", not in the numbered `D-01..D-04` list (antigravity 5).
@@ -74,9 +89,7 @@ phase must be re-scoped before planning.
 - **claude** — success (opus, high).
 - **antigravity** — success after re-run with `--dangerously-skip-permissions` (Gemini 3.7 Flash High;
   the first attempt auto-denied a `command`-permission tool).
-- **codex** — **FAILED**: `-m terra` → HTTP 400 *"The 'terra' model is not supported when using Codex
-  with a ChatGPT account."* No findings. (Note: the user's correction named Terra as the model for
-  codex "going forward"; it is not available on this ChatGPT account.)
+- **codex** — success (gpt-5.6-terra, high; re-run after the `-m terra` → `-m gpt-5.6-terra` slug correction).
 
 ## Recommended path
 
