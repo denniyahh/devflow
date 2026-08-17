@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.6.0 — 2026-08-16
+
+The multi-agent adapter migration (milestone v2.6.0). DevFlow stops rendering one shared
+`/gsd-*` prompt for every agent and moves to a modular `AgentDriver` contract, where each agent
+owns its prompt rendering, command building, completion parsing, and health. This fixes Codex
+(which received GSD slash commands as literal shell strings) and registers Pi as a fourth,
+selectable agent.
+
+### What's new
+
+- **Pi is a fourth, selectable agent (Phase 36).** `AgentKind::Pi` + `PiAgent` with a
+  `pi auth check`-backed health check that distinguishes "installed" from "headless-capable"
+  (never env-var sniffing). Pi launches with `--no-approve` — `--approve` would trust
+  project-local extensions that execute unsandboxed.
+- **The release path signs deterministically (999.104 / Phase 36).** `scripts/cut-release.sh`
+  fails loudly before `tag -s` when `devflow.releaseSigningKey` is unset or unreadable, instead of
+  silently signing with whatever `user.signingkey` defaults to. The capability-only
+  signing-viability probe is removed; the pre-push fingerprint hook — the only check that
+  distinguishes the maintainer key from the agent key — is retained.
+- **`release --check` catches a forgotten version bump (999.96 / Phase 36).** A new row compares
+  `CHANGELOG.md`'s top heading to the workspace version and reports NOT viable with direction.
+- **A modular `AgentDriver` contract replaces `AgentAdapter` (Phase 37).** Each driver owns its
+  prompt rendering, command building, completion parsing, health, and interactivity declaration,
+  instead of that logic being scattered across `prompt.rs`, `agents/*.rs`, `agent_result.rs`, and
+  `preflight.rs`.
+- **Codex is fixed (999.31 / Phase 37).** The `StageIntent` de-Claude-ification removes the
+  literal `/gsd-*` slash commands from every stage prompt; Codex now receives a workflow-file
+  reference and the verified non-interactive approval flag (`-a never`, the global form).
+- **Pi is the second native driver (Phase 37).** Pi runs on `-p` print mode with the same
+  de-Claude-ified prompt; its end-to-end run (JSON unwrapper + monitor `CloseRule`) is a
+  follow-on (37.1/38).
+- **A shared conformance suite (`test_contract()`) (Phase 37).** Every driver must pass it; a
+  deliberately-broken driver must fail it. `InteractivityMode` and `DriverHealth` are declared at
+  the driver layer.
+
+### Deferred (recorded, not shipped here)
+
+- `AgentAdapter` removal + `InteractivityMode` consumption (999.106).
+- Codex parser success-before-failure + writable-root serialization (999.107, pre-existing).
+- Pi end-to-end (JSON unwrapper + `CloseRule`) — 37.1/38.
+
 ## 2.5.0 — 2026-08-15
 
 Phase 35 (loop termination and baseline correctness). Four defects that let an unattended
