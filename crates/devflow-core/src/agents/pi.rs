@@ -41,6 +41,14 @@ impl AgentDriver for PiDriver {
         "$HOME/.pi/agent/gsd-core/workflows".to_string()
     }
 
+    /// Pi declares subagent-dispatch capability when a subagent extension is
+    /// installed in the user profile (see [`pi_subagent_dispatch_available`]).
+    fn capabilities(&self) -> super::DriverCapabilities {
+        super::DriverCapabilities {
+            subagent_dispatch: pi_subagent_dispatch_available(),
+        }
+    }
+
     fn build_command(
         &self,
         _phase: PhaseId,
@@ -137,6 +145,29 @@ fn configured_pi_providers() -> Vec<String> {
         .and_then(serde_json::Value::as_object)
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Whether Pi's profile has a subagent/dispatch extension installed (e.g.
+/// `@bacnh85/pi-subagent`). Probed via `pi list --no-approve` — Pi exposes no
+/// `pi tools` command, so the installed-package name is the only cheap,
+/// non-interactive signal. A package name containing "subagent" is treated as
+/// dispatch capability.
+///
+/// **Honest limit:** name-based, not a tool-registry proof — it does not
+/// confirm the extension registers a working dispatch tool. Any probe failure
+/// returns `false`, so an undetectable profile fails closed to the baseline
+/// single-agent path rather than refusing a working run.
+fn pi_subagent_dispatch_available() -> bool {
+    let Ok(output) = std::process::Command::new("pi")
+        .args(["list", "--no-approve"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .to_lowercase()
+            .contains("subagent")
 }
 
 #[cfg(test)]
@@ -364,5 +395,41 @@ mod tests {
             err.contains("no provider configured"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The capability probe shells out to `pi list --no-approve` and matches on
+    /// the installed-package name (there is no `pi tools` command). A stub
+    /// reporting an installed subagent package flips the capability on, and the
+    /// argv proves the probe is exactly `pi list --no-approve`.
+    #[test]
+    fn pi_capabilities_detect_subagent_dispatch() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path("npm:@bacnh85/pi-subagent@0.15.1 (user)", 0);
+        let _path = PathGuard::set(stub_dir.path());
+
+        assert!(PiDriver.capabilities().subagent_dispatch);
+
+        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
+        assert_eq!(argv, "list\n--no-approve\n");
+    }
+
+    /// No subagent package in `pi list` → capability stays off (baseline path).
+    #[test]
+    fn pi_capabilities_fail_closed_when_no_subagent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path("No packages installed.", 0);
+        let _path = PathGuard::set(stub_dir.path());
+
+        assert!(!PiDriver.capabilities().subagent_dispatch);
+    }
+
+    /// A failing probe (non-zero exit) fails closed to baseline, never refuses.
+    #[test]
+    fn pi_capabilities_fail_closed_when_probe_fails() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path("", 1);
+        let _path = PathGuard::set(stub_dir.path());
+
+        assert!(!PiDriver.capabilities().subagent_dispatch);
     }
 }

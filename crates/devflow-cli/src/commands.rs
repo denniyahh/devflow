@@ -2323,6 +2323,31 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             "--version",
             "Install Pi (see https://github.com/earendil-works/pi-mono)",
         ),
+        {
+            // Pi subagent dispatch is a user-installed, optional enhancement
+            // (@bacnh85/pi-subagent). Report it as a warning when absent — the
+            // baseline single-agent path still works without it.
+            let dispatch = agents::driver_for(AgentKind::Pi)
+                .capabilities()
+                .subagent_dispatch;
+            Check {
+                name: "pi subagent dispatch".into(),
+                status: if dispatch { "ok".into() } else { "warn".into() },
+                version: Some(if dispatch {
+                    "available".into()
+                } else {
+                    "not installed".into()
+                }),
+                install_hint: if dispatch {
+                    None
+                } else {
+                    Some(
+                        "optional — `pi install npm:@bacnh85/pi-subagent` (user scope) enables subagent dispatch"
+                            .into(),
+                    )
+                },
+            }
+        },
         Check {
             name: format!("devflow v{devflow_version}"),
             status: "ok".into(),

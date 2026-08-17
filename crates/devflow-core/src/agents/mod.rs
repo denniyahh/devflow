@@ -14,7 +14,13 @@ use std::path::PathBuf;
 /// driver (CONTEXT D-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
-pub struct DriverCapabilities {}
+pub struct DriverCapabilities {
+    /// Whether the agent has subagent/dispatch capability available in its
+    /// profile (e.g. Pi's `@bacnh85/pi-subagent` extension). Detected by probing
+    /// the installed CLI; `false` when absent or undetectable (fail-closed to
+    /// the baseline single-agent path).
+    pub subagent_dispatch: bool,
+}
 
 /// What a driver's sandbox needs from the launch environment. Reserved for
 /// 37-03 (Codex's writable-roots requirement).
