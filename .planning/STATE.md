@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.5.0
-milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.3
-status: completed
-stopped_at: Phase 35.3 complete — drain gate measured, both concurrent-work paths observed
-last_updated: "2026-08-13T00:30:19.151Z"
-last_activity: 2026-08-12
-last_activity_desc: Phase 35.3 complete — 3/3 plans; drain gate observed via both arms; fixture label CLI-version-pinned
+milestone: v2.6.0
+milestone_name: milestone (Multi-Agent Adapter Migration, ACTIVE — declared 2026-08-15)
+current_phase: 37
+status: "Phase 37 shipped — PR #115"
+stopped_at: Phase 35.1 context gathered
+last_updated: "2026-08-16T23:36:45.779Z"
+last_activity: 2026-08-16
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 15
-  completed_plans: 15
+  total_phases: 2
+  completed_phases: 2
+  total_plans: 6
+  completed_plans: 6
   percent: 100
-current_phase_name: Drain Gate Concurrency Measurement (999.83)
+current_phase_name: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
+last_activity_desc: Phase 37 complete
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.3
+Phase: 37
 Plan: Not started
-Status: All phases complete
-Last activity: 2026-08-12 — Phase 35.3 complete
+Status: Phase 37 shipped — PR #115
+Last activity: 2026-08-16
 
 ## Recently Shipped
 
@@ -845,10 +845,6 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ## Operator Next Steps
 
 - Start the next milestone with /gsd-new-milestone
-- **999.86 / DEN-75 (High) must land in the next milestone's phase set** — `release --check`'s
-  tag-signing predictor produced a live false negative during v2.4.0's own release, for the second
-  time across two releases. Fix direction already decided: replace with a real `ssh-keygen -Y sign`
-  probe. Operator confirmed in-scope 2026-08-06.
 
 ## Accumulated Context
 

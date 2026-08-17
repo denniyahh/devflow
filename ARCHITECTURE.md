@@ -89,11 +89,10 @@ dispatch table.
 Agent backends are isolated behind a trait
 (`crates/devflow-core/src/agents/mod.rs`):
 
-- `AgentAdapter` trait: `name()`, `exec_command(phase, prompt,
-  extra_writable_roots) -> (program, args)`, `extra_env()` (defaults to
-  none — Codex uses it to disable commit/tag signing inside its sandbox),
-  `completion_signal_detected(output)`. Each adapter only knows how to wrap
-  a prompt into its CLI's non-interactive launch flags.
+- `AgentDriver` trait: `name()`, `render_prompt(intent)`, `build_command(phase, prompt,
+  extra_writable_roots) -> (program, args)`, `parse_completion(output)`, `health(state)`,
+  `environment()`, `capabilities()`, `interactivity_mode(stage)`, `test_contract()`. Each
+  driver owns its prompt rendering, command building, completion parsing, and health.
 - Supported `AgentKind`s (`state.rs`): `Claude`, `Codex`, `OpenCode`.
   Accepted names: `claude`, `codex`, `opencode` / `open-code`.
 - `adapter_for(kind)` returns the boxed adapter for a kind
@@ -392,19 +391,17 @@ variable is set to a parseable value and warns when it is missing or invalid.
 
 ## Extension points — adding an agent
 
-DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
-shared `AgentAdapter` trait; agent-specific code lives only in `agents/*.rs`
-and the targeted result parsing. This is not a fully agent-neutral platform
-yet — see the driver-architecture backlog (999.31) for that direction. Adding
-a backend today is a checklist, not a fixed "3 changes" — keep these in sync
-or tests/builds fail:
+DevFlow supports four agents today (Claude Code, Codex, OpenCode, Pi) through
+the modular `AgentDriver` contract; agent-specific code lives only in
+`agents/*.rs` and the targeted result parsing. Adding a backend today is a
+checklist — keep these in sync or tests/builds fail:
 
-1. Add an adapter file under `crates/devflow-core/src/agents/` implementing the
-   `AgentAdapter` trait.
+1. Add a driver file under `crates/devflow-core/src/agents/` implementing the
+   `AgentDriver` trait.
 2. Add a variant to the `AgentKind` enum in `state.rs`.
 3. Update the `FromStr` parser, `Display`, and `AgentParseError` text in
    `state.rs` to accept/emit the new name.
 4. Add a match arm in `agents::adapter_for()`.
 5. Add the `pub mod` and `pub use` exports in `agents/mod.rs`.
-6. Add/extend tests (adapter name, parser aliases, prompt-sharing).
+6. Add/extend tests (driver name, parser aliases, and a conformance-suite run).
 7. Update docs (`README.md`, `DEPENDENCIES.md`, `CONTRIBUTING.md`, this file).

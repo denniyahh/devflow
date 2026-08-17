@@ -82,11 +82,11 @@ crates/
 
 **Key design decisions:**
 
-- **Opinionated, not universal** — Claude Code, Codex, and OpenCode are supported today through a shared `AgentAdapter` trait, but DevFlow is built around specific workflow decisions, not a lowest-common-denominator abstraction over every agent. Full agent-neutral modularity is a deliberate future direction, not a current guarantee (adding a supported agent today follows a small checklist — see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
+- **Opinionated, not universal** — Claude Code, Codex, OpenCode, and Pi are supported today through the modular `AgentDriver` contract, but DevFlow is built around specific workflow decisions, not a lowest-common-denominator abstraction over every agent. Adding a supported agent follows a small checklist — see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent).
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
 - **Four-layer evaluation** — operator-declared external post-conditions can fail a stage before agent-controlled signals; ordinary work then uses `DEVFLOW_RESULT`, exit code + commit count, and the final commit heuristic.
-- **Per-stage prompts** — `stage_prompt(stage, phase)` builds a dedicated prompt per pipeline stage (not one shared instruction template); the same prompt text is used across agents for a given stage, with adapter-specific logic limited to CLI launch flags, not prompt content.
+- **Per-stage prompts** — a `StageIntent` carries each stage's data (phase, fix kind, review angles) with no agent-specific syntax; each driver's `render_prompt` turns it into its own instruction (Claude/OpenCode render the legacy slash-command text; Codex/Pi render a workflow-file reference).
 
 ## Agent Protocol
 
@@ -164,7 +164,7 @@ Key flags:
 | Flag | Description |
 |---|---|
 | `--phase N` | Phase number to execute |
-| `--agent claude\|codex\|opencode` | Agent to launch |
+| `--agent claude\|codex\|opencode\|pi` | Agent to launch |
 | `--mode auto\|supervise` | `auto` advances through Ship unattended; `supervise` also gates at Validate for human review |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 

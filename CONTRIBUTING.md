@@ -252,6 +252,13 @@ rejected ("Changes must be made through a pull request", plus required status
 checks) even for the maintainer. Every step below that changes a branch goes
 through a PR.
 
+> **Commit guard (enforced, not just documented):** `scripts/hooks/pre-commit`
+> refuses to commit directly on `develop` or `main` — both are PR-protected, so
+> such a commit would be rejected at push time anyway. There is no override;
+> the fix is `git switch -c <branch>` first. This makes step 2's "put the work
+> on a branch" mandatory at the commit level rather than a convention an
+> inattentive release cut can skip.
+
 1. Bump the version in **two** places in the root `Cargo.toml`: `version`
    under `[workspace.package]`, **and** `devflow-core`'s `version` under
    `[workspace.dependencies]`. Bumping only the first is the easy miss;

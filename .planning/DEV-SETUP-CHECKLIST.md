@@ -73,7 +73,9 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PATTERN]** `scripts/hooks/pre-commit` and `post-commit` **chain to whatever hook the
   global `core.hooksPath` already pointed at**, rather than silently replacing it — critical
   because setting a repo-local `core.hooksPath` otherwise disables any global hook wholesale
-  (secret scanners, etc.).
+  (secret scanners, etc.). `pre-commit` additionally **refuses to commit directly on
+  `develop`/`main`** (both PR-protected, so the commit would be rejected at push time), with no
+  override — the fix is `git switch -c <branch>` first.
 - [ ] **[PROJECT]** `scripts/hooks/pre-push`:
   - Scrubs `GIT_DIR`/`GIT_WORK_TREE`/etc. before doing anything (prevents a worktree push from
     retargeting the wrong repo — a real incident here, `999.37`).

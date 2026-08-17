@@ -2313,6 +2313,12 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             "--version",
             "cargo install opencode",
         ),
+        cmd_check(
+            "pi",
+            "pi",
+            "--version",
+            "Install Pi (see https://github.com/earendil-works/pi-mono)",
+        ),
         Check {
             name: format!("devflow v{devflow_version}"),
             status: "ok".into(),
@@ -2395,7 +2401,7 @@ pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
         check_self_pin(project_root),
         check_divergence(project_root),
         check_publish_order(project_root),
-        check_signing(project_root),
+        check_changelog_version(project_root),
     ];
 
     let mut failed = false;
@@ -2546,33 +2552,284 @@ fn check_publish_order(project_root: &Path) -> Check {
     }
 }
 
-/// Tag-signing viability check (20d, Pattern 4): `gpg.format`-aware,
-/// fail-soft, and reports only boolean viability + an optional PUBLIC key
-/// fingerprint — never private key material or a full filesystem path
-/// (T-20-04, ASVS V6 / WR-02).
-fn check_signing(project_root: &Path) -> Check {
-    const NAME: &str = "tag-signing viability";
-    match devflow_core::git::check_signing_viability(project_root) {
-        devflow_core::git::SigningViability::Viable { fingerprint } => Check {
-            name: NAME.into(),
-            status: "ok".into(),
-            version: Some(match fingerprint {
-                Some(fp) => format!("signing viable ({fp})"),
-                None => "signing viable".into(),
-            }),
-            install_hint: None,
-        },
-        devflow_core::git::SigningViability::NotViable { reason } => Check {
-            name: NAME.into(),
-            status: "fail".into(),
-            version: Some(reason),
-            install_hint: Some("resolve before attempting the signed release tag".into()),
-        },
-        devflow_core::git::SigningViability::Unknown { reason } => Check {
+/// Changelog-version check (999.96): `CHANGELOG.md`'s topmost `## <version>`
+/// heading must agree with the workspace version, so a forgotten bump can't
+/// ship a changelog under the old version. The negative control is a SYNTHETIC
+/// mismatched fixture — not "the current tree", which the v2.5.0 cut already
+/// brought into agreement.
+fn check_changelog_version(project_root: &Path) -> Check {
+    const NAME: &str = "changelog version (matches workspace)";
+
+    let cargo_toml = project_root.join("Cargo.toml");
+    let contents = match std::fs::read_to_string(&cargo_toml) {
+        Ok(contents) => contents,
+        Err(err) => {
+            return Check {
+                name: NAME.into(),
+                status: "warn".into(),
+                version: Some(format!("could not read Cargo.toml: {err}")),
+                install_hint: None,
+            };
+        }
+    };
+    let (workspace_version, _) = version::read_workspace_self_pins(&contents);
+    let Some(workspace_version) = workspace_version else {
+        return Check {
             name: NAME.into(),
             status: "warn".into(),
-            version: Some(reason),
+            version: Some("not a workspace Cargo.toml (no [workspace.package] version)".into()),
             install_hint: None,
+        };
+    };
+
+    let changelog_contents = match std::fs::read_to_string(project_root.join("CHANGELOG.md")) {
+        Ok(contents) => contents,
+        Err(err) => {
+            return Check {
+                name: NAME.into(),
+                status: "warn".into(),
+                version: Some(format!("could not read CHANGELOG.md: {err}")),
+                install_hint: None,
+            };
+        }
+    };
+    let changelog_version = changelog_contents.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("## ")?;
+        let version = rest.split_whitespace().next().map(|w| {
+            w.trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_start_matches('v')
+        });
+        // A version looks like `X.Y` — a leading digit, a dot, then another
+        // digit — so a `## [2.5.0]` link and a `## v2.5.0` prefix both parse,
+        // while a numbered section like `## 1. Overview` does not.
+        version
+            .filter(|v| {
+                let Some(dot) = v.find('.') else {
+                    return false;
+                };
+                let bytes = v.as_bytes();
+                bytes.first().is_some_and(|b| b.is_ascii_digit())
+                    && bytes.get(dot + 1).is_some_and(|b| b.is_ascii_digit())
+            })
+            .map(str::to_string)
+    });
+    let Some(changelog_version) = changelog_version else {
+        return Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("no `## <version>` heading found in CHANGELOG.md".into()),
+            install_hint: None,
+        };
+    };
+
+    if changelog_version == workspace_version {
+        Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some(format!("changelog {changelog_version} matches workspace")),
+            install_hint: None,
+        }
+    } else {
+        let direction = match compare_versions(&changelog_version, &workspace_version) {
+            Some(std::cmp::Ordering::Greater) => {
+                "changelog ahead of Cargo.toml (version bump not yet applied)"
+            }
+            Some(std::cmp::Ordering::Less) => {
+                "Cargo.toml ahead of changelog (release notes missing)"
+            }
+            _ => "direction undetermined (equal-numeric or unparseable version)",
+        };
+        Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(format!(
+                "changelog {changelog_version} != workspace {workspace_version} — {direction}"
+            )),
+            install_hint: Some(direction.into()),
+        }
+    }
+}
+
+/// Best-effort comparison of two `X.Y.Z` version strings, component-wise, with
+/// standard semver prerelease ordering (`2.5.0` > `2.5.0-rc.1`). `None` if
+/// either is unparseable.
+fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let components = |v: &str| -> Option<(Vec<u32>, bool)> {
+        let parts = v
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .take(3)
+            .map(|s| s.parse().ok())
+            .collect::<Option<Vec<_>>>()?;
+        if parts.is_empty() {
+            return None;
+        }
+        let has_prerelease = v.contains('-');
+        Some((parts, has_prerelease))
+    };
+    let (a, a_pre) = components(a)?;
+    let (b, b_pre) = components(b)?;
+    let mut cmp = a.cmp(&b);
+    if cmp == std::cmp::Ordering::Equal {
+        cmp = match (a_pre, b_pre) {
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, false) => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Equal,
+        };
+    }
+    Some(cmp)
+}
+
+// Tag-signing viability check removed (999.104): the probe was capability-only
+// ("can this key sign"), never identity ("is this the maintainer's key"), and
+// `scripts/cut-release.sh` now fails loudly when `devflow.releaseSigningKey` is
+// unset. The identity check that matters lives in `scripts/hooks/pre-push`.
+
+// ---------------------------------------------------------------------------
+// release --verify (post-cut)
+// ---------------------------------------------------------------------------
+
+/// Read-only post-cut verifier. `release --check` guards the PRE-release
+/// invariants; this guards the POST-release ones that `--check` cannot see
+/// and that have been the easy-to-miss manual steps in practice: the release
+/// tag must point at a commit on `main` (not the `develop` release commit),
+/// and the `main`→`develop` sync must have been run. Same
+/// `Check`-list-then-report shape as `release --check`.
+pub(crate) fn release_verify(project_root: &Path) -> Result<(), CliError> {
+    let checks: Vec<Check> = vec![
+        check_tag_on_main(project_root),
+        check_sync_done(project_root),
+    ];
+
+    let mut failed = false;
+    for c in &checks {
+        let icon = match c.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            "fail" => "✗",
+            _ => "?",
+        };
+        let detail = c.version.as_deref().unwrap_or("-");
+        println!("  {:<32} {icon}  {detail}", c.name);
+        if matches!(c.status.as_str(), "warn" | "fail")
+            && let Some(hint) = &c.install_hint
+        {
+            println!("      — {hint}");
+        }
+        if c.status == "fail" {
+            failed = true;
+        }
+    }
+
+    if failed {
+        Err(CliError::Message(
+            "release verification failed — see checks above".into(),
+        ))
+    } else {
+        println!("\nrelease verification passed");
+        Ok(())
+    }
+}
+
+/// The release tag (`v{workspace version}`) must point at a commit on
+/// `origin/main`. A tag placed on the `develop` release commit (the mistake
+/// made cutting v2.5.0) is NOT an ancestor of `main`'s squash-merge lineage,
+/// so an ancestry test cleanly separates correct from incorrect placement.
+fn check_tag_on_main(project_root: &Path) -> Check {
+    const NAME: &str = "release tag on main";
+
+    let cargo_toml = project_root.join("Cargo.toml");
+    let contents = match std::fs::read_to_string(&cargo_toml) {
+        Ok(c) => c,
+        Err(err) => {
+            return Check {
+                name: NAME.into(),
+                status: "warn".into(),
+                version: Some(format!("could not read Cargo.toml: {err}")),
+                install_hint: None,
+            };
+        }
+    };
+    let (Some(workspace_version), _) = version::read_workspace_self_pins(&contents) else {
+        return Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("no [workspace.package] version to derive the tag from".into()),
+            install_hint: None,
+        };
+    };
+    let tag = format!("v{workspace_version}");
+
+    let tag_exists = devflow_core::git::git_command(project_root)
+        .args(["rev-parse", "--verify", "--quiet", &tag])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !tag_exists {
+        return Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(format!("tag {tag} does not exist")),
+            install_hint: Some("tag the release commit on main before verifying".into()),
+        };
+    }
+
+    match devflow_core::git::ref_is_ancestor(project_root, &tag, "origin/main") {
+        devflow_core::git::AncestorStatus::Ancestor => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some(format!("{tag} is on origin/main")),
+            install_hint: None,
+        },
+        devflow_core::git::AncestorStatus::Diverged => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(format!(
+                "{tag} is NOT an ancestor of origin/main — tagged the wrong branch"
+            )),
+            install_hint: Some(
+                "re-tag on main:  git -c user.signingkey=\"$(git config --get \
+                 devflow.releaseSigningKey)\" tag -s -f vX.Y.Z origin/main"
+                    .into(),
+            ),
+        },
+        devflow_core::git::AncestorStatus::RefAbsent => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("origin/main not fetched — cannot compare tag placement".into()),
+            install_hint: Some("run `git fetch` first, then re-run".into()),
+        },
+    }
+}
+
+/// After a release, `origin/main` must be an ancestor of `origin/develop`
+/// (the `scripts/sync-main-to-develop.sh` step). Skipping it means the next
+/// release PR conflicts against a stale merge-base.
+fn check_sync_done(project_root: &Path) -> Check {
+    const NAME: &str = "main→develop sync";
+    match devflow_core::git::ref_is_ancestor(project_root, "origin/main", "origin/develop") {
+        devflow_core::git::AncestorStatus::Ancestor => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some("origin/main is an ancestor of origin/develop".into()),
+            install_hint: None,
+        },
+        devflow_core::git::AncestorStatus::Diverged => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(
+                "origin/main is NOT an ancestor of origin/develop — sync was skipped".into(),
+            ),
+            install_hint: Some(
+                "run scripts/sync-main-to-develop.sh, then PR the merge commit (not squash)".into(),
+            ),
+        },
+        devflow_core::git::AncestorStatus::RefAbsent => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("origin/main or origin/develop not fetched — cannot check sync".into()),
+            install_hint: Some("run `git fetch` first, then re-run".into()),
         },
     }
 }
@@ -6410,5 +6667,52 @@ mod tests {
             message.contains("33"),
             "message must name the phase: {message}"
         );
+    }
+
+    #[test]
+    fn changelog_version_check_flags_mismatch_and_passes_on_agreement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let write_workspace = |version: &str| {
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!("[workspace.package]\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        };
+
+        // Mismatch: changelog 2.4.0 vs workspace 2.5.0 → fail, "Cargo.toml ahead".
+        write_workspace("2.5.0");
+        std::fs::write(root.join("CHANGELOG.md"), "## 2.4.0 — 2026-01-01\n").unwrap();
+        let mismatch = check_changelog_version(root);
+        assert_eq!(mismatch.status, "fail");
+        assert!(
+            mismatch.version.unwrap().contains("Cargo.toml ahead"),
+            "workspace 2.5.0 is newer than changelog 2.4.0"
+        );
+
+        // Reverse: changelog 2.6.0 vs workspace 2.5.0 → fail, "changelog ahead".
+        write_workspace("2.5.0");
+        std::fs::write(root.join("CHANGELOG.md"), "## 2.6.0 — 2026-01-01\n").unwrap();
+        let reverse = check_changelog_version(root);
+        assert_eq!(reverse.status, "fail");
+        assert!(
+            reverse.version.unwrap().contains("changelog ahead"),
+            "changelog 2.6.0 is newer than workspace 2.5.0"
+        );
+
+        // Agreement: both 2.5.0 → ok.
+        write_workspace("2.5.0");
+        std::fs::write(root.join("CHANGELOG.md"), "## 2.5.0 — 2026-08-15\n").unwrap();
+        assert_eq!(check_changelog_version(root).status, "ok");
+
+        // Bracketed Keep-a-Changelog heading `## [2.5.0]` → parses, ok.
+        std::fs::write(root.join("CHANGELOG.md"), "## [2.5.0] - 2026-08-15\n").unwrap();
+        assert_eq!(check_changelog_version(root).status, "ok");
+
+        // Missing heading → warn, not a hard fail.
+        std::fs::write(root.join("CHANGELOG.md"), "no heading here\n").unwrap();
+        assert_eq!(check_changelog_version(root).status, "warn");
     }
 }

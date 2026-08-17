@@ -15,7 +15,7 @@ external_verify_enabled = true
 | Flag | Description |
 |---|---|
 | `--phase N` | Phase number to execute |
-| `--agent claude\|codex\|opencode` | Agent to launch |
+| `--agent claude\|codex\|opencode\|pi` | Agent to launch |
 | `--mode auto\|supervise` | `auto` advances through Ship unattended (gating only at Ship, plus never-silent failure gates); `supervise` also gates every Validate for human review |
 | `--force` | Overwrite the feature branch if it already exists |
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |

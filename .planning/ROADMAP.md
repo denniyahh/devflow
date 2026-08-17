@@ -2,282 +2,61 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## 🚧 v2.5.0 milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
+## 🚧 v2.6.0 milestone (Multi-Agent Adapter Migration, ACTIVE — declared 2026-08-15)
 
-**Declared 2026-08-06, the same day v2.4.0 released.** Closes five confirmed defects/gaps that
-surfaced from v2.4.0's own release, plus one investigation into a concurrency blind spot the
-safety net v2.4.0 just widened. All six are pre-existing issues found via code review, live
-release cuts, and Phase 34's own capture campaign — none are new regressions from v2.4.0. See
-`.planning/REQUIREMENTS.md` (HARDEN-01..06) and `.planning/PROJECT.md` § "Current Milestone."
+**Declared 2026-08-15, the day v2.5.0 closed.** Replace the thin `AgentAdapter` trait with a
+driver architecture that onboards new agents without agent-specific logic leaking into core — and
+prove it by onboarding **Pi** as the first newly-supported agent. The full modular `AgentDriver`
+refactor (backlog **999.31**, size L) is the real vehicle: Phase 36 registers Pi as a selectable
+adapter plus release hardening; Phase 37 does the `AgentDriver`/`StageIntent` work that makes Pi
+run end-to-end — the adversarial review showed Pi cannot reach terminal completion until the
+Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 
-**Why two phases, not one or six.** Phase 35 bundles five items that are confirmed live defects
-or already-decided fixes, small-to-medium in size, safe to land together in one phase: **999.77**
-(a transient `git` failure grants a free `consecutive_failures` reset, contradicting the doc
-comment), **999.78** (the Code↔Validate loop has no progress-independent bound, and the
-Supervise-mode gate message reports a resettable streak instead of a cumulative total),
-**999.79** (`{N}-VERIFICATION.md` never goes stale, so `--force` inherits a prior run's verdict
-and gates unresolvably), **999.84** (the `GateReview` checkpoint call site's root argument is
-correct by construction but has no regression test), and **999.86** (`release --check`'s
-tag-signing predictor has now false-negatived live twice with the correct key present; replace it
-with a real `ssh-keygen -Y sign` probe). Phase 35.3 carries **999.83** alone — the drain gate has
-never observed real sub-agent concurrency, and its fixture's shape doesn't match what production
-actually emits. That item is investigation-shaped (design the right experiment first, same family
-as backlog 999.71's precedent) rather than a quick patch, and bundling it with Phase 35 would slow
-those five confirmed fixes down waiting on a harness.
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 36 | Pi Adapter Registration + Release Signing | Complete    | — |
+| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi) | Complete    | — |
+
+### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
+
+**Goal**: DevFlow registers **Pi** as a fourth, selectable agent adapter (`AgentKind::Pi` +
+`PiAgent` + a preflight health check distinguishing "installed" from "can execute headless") —
+**not** an end-to-end run, which is Phase 37 — plus two release items: **999.96** (`release --check`
+can't catch a forgotten version bump; S, synthetic fixture) and **999.104** (deterministic release
+signing key: sign with `devflow.releaseSigningKey` in code, remove the signing-viability probe and
+the pre-push fingerprint hook). 999.67 was dropped — already shipped.
+**Depends on**: Nothing (first phase of this milestone).
+**Requirements**: `36-SPEC.md` (locked post adversarial review).
+**Plans**: TBD
+
+### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi)
+
+**Goal**: Promote the full `AgentDriver` contract — capability discovery, driver-owned prompt
+rendering, command building, completion parsing, health probes, and a shared conformance suite —
+so agent-specific semantics stop being scattered across `prompt.rs`, `agents/*.rs`,
+`agent_result.rs`, and `preflight.rs`. Migrates Claude, Codex, OpenCode, and Pi onto the contract
+with zero regression on Claude, and fixes the Codex slash-command defect via the `StageIntent`
+de-Claude-ification (dropping the literal `/gsd-execute-phase` string from every stage). Pi's
+*end-to-end* run (JSON-mode event unwrapper + monitor/`CloseRule` integration) is deferred to a
+`37.1` sub-phase / Phase 38; **999.94** is deferred to Phase 38.
+**Depends on**: Phase 36.
+**Plans**: TBD
+
+---
+
+## v2.5.0 milestone (CLOSED 2026-08-15 — Loop-Termination and Release Hardening)
+
+**Declared 2026-08-06, closed 2026-08-15.** Closed five confirmed loop-termination / release
+defects and one concurrency-blind-spot investigation (999.77, 999.78, 999.79, 999.83, 999.84,
+999.86, 999.87). Full phase detail archived to `.planning/milestones/v2.5.0-ROADMAP.md`;
+requirements to `.planning/milestones/v2.5.0-REQUIREMENTS.md`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
 | 35.1 | Unattended-Launch Prerequisites | Complete | — |
 | 35.2 | Verification Provenance | Complete | — |
-| 35.3 | Drain Gate Concurrency Measurement | Planned | — |
-
-### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
-
-**Goal**: Operator can trust the Code↔Validate loop's failure-gating mechanics and the release
-signing preflight behave as documented and are enforced by regression tests, not by
-correctness-by-construction alone — a transient `git` failure can no longer forge a fresh
-baseline, the loop has a bound independent of trivial per-cycle commits, a `--force` re-run
-doesn't inherit a stale verdict, the worktree-mode checkpoint call site is regression-tested, and
-`release --check`'s signing result reflects a real probe rather than a predictor that has already
-false-negatived live twice. **Scope widened 2026-08-06 (operator):** 999.87 folded in — the same
-`Option<u32>` change forces `evaluate_layer2`'s call site open, so both consumers of the lossy count
-are fixed together rather than one being repaired while the other keeps collapsing the distinction.
-**Depends on**: Nothing (first phase of this milestone).
-**Requirements**: HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05, HARDEN-07
-**Success Criteria** (what must be TRUE):
-
-  1. A transient `git` failure while measuring `phase_commit_count` no longer overwrites the
-     persisted `consecutive_failures` baseline with a false zero — the next successful
-     measurement compares against the last real observed count, "could not count" is
-     distinguished from "counted zero," and `pipeline_outcomes.rs`'s doc comment no longer
-     promises a guarantee the code doesn't have (999.77).
-
-  2. An unattended Code↔Validate loop that commits trivial `.planning/` artifacts every cycle
-     without making real progress still reaches a bound distinguishable from ordinary streak
-     resets — a never-reset per-phase Validate-failure total exists — and in Supervise mode the
-     gate message reports that cumulative total rather than a streak length that can read
-     misleadingly low at the 2nd, 5th, and 9th gate alike (999.78).
-
-  3. Running `devflow start --phase N --force` against a phase with a stale `{N}-VERIFICATION.md`
-     from a previous run no longer inherits that verdict — staleness is detected (via a recorded
-     plan-count comparison or equivalent) so the loop-back treats the phase as mid-arc rather than
-     dispatching `--gaps-only` against zero matching plans and gating unresolvably (999.79).
-
-  4. The worktree-mode `GateReview` checkpoint auto-decide call site
-     (`pipeline_launch.rs:1070`, passing `execution_root` into
-     `phase_has_blocking_human_checkpoint`) is covered by an integration test that fails when the
-     argument is reverted to `project_root` — demonstrated by actually performing that revert and
-     watching the new test fail, with its negative control recorded alongside it, not asserted
-     from reading the fix (999.84).
-
-  5. `release --check`'s tag-signing preflight reports `Viable`/`NotViable` from a real
-     `ssh-keygen -Y sign` probe against a throwaway payload, not from an `ssh-add -l`
-     fingerprint comparison — closing the predictor that has produced a live false negative with
-     the correct key present on two separate release cuts (999.86).
-
-  6. A transient `git` failure no longer causes `evaluate_layer2` to classify a successful agent as
-     `Failed` — an unmeasurable commit count is distinguished from a measured zero at **both**
-     consumers, not only at the `consecutive_failures` baseline, and Layer 2 returns `Ok(None)` to
-     fall through to Layer 3 (the idiom it already uses for an unreadable exit file) rather than
-     treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
-     harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
-     `Stage::Code` + unrunnable `git` (999.87).
-**Plans**: 6/6 plans executed
-
-Plans:
-**Wave 1**
-
-- [x] 35-01-PLAN.md — tracer: the unmeasurable-`git` spine end to end — `NoGitPath` harness in both crates, `phase_commit_count` becomes `Option<u32>`, **all three** consumers honour it, two-cycle regression test, corrected doc comments (criteria 1 + 6). **Scope grew 2026-08-07 (cross-AI review, A-H1):** `evaluate_layer3` carried its own inline copy of the same lossy count, so criterion 6's `Ok(None)` fall-through only relocated the misclassification into Layer 3. Layer 3 is now fixed in the same plan and verified at the **cascade** level (`evaluate_agent_result`), since a per-layer test on `evaluate_layer2` alone is the proxy that hid it. Note `Failed` and `Unknown` both route to `Action::GateReview` (`outcome_policy.rs:53-54`), so this corrects the recorded classification and reason string, not the dispatch — no dispatch-level assertion is admissible as evidence here.
-- [x] 35-02-PLAN.md — worktree-mode `GateReview` checkpoint regression test with D-05's decoy PLAN, D-06's re-running control, and the performed revert demonstration (criterion 4)
-- [x] 35-03-PLAN.md — replace `release --check`'s signing predictor with a bounded, non-interactive `ssh-keygen -Y sign` probe; delete the predictor, its enum and the orphaned helper (criterion 5)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 35-04-PLAN.md — never-reset per-phase Validate-failure total that survives `--force`, a ceiling that gates without aborting, and a gate message led by the cumulative number (criterion 2)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 35-05-PLAN.md — run-scoped content fingerprint makes `{N}-VERIFICATION.md` go stale, so a `--force` re-run stops inheriting the previous run's verdict; both directions tested (criterion 3)
-
-**Wave 4** *(blocked on Wave 3 completion)*
-
-- [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
-
-### Phase 35.1: Unattended-Launch Prerequisites (999.93 + 999.98 + 999.99 + 999.100)
-
-**Goal**: `devflow start --mode auto` can actually complete a phase with no human present — ordinary
-GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
-loudly, when the conditions that make that true do not hold.
-**Depends on**: Phase 35 (whose `phase_validate_failures` accounting is what a stalled unattended run
-currently burns through). Sequenced **before** Phase 35.3, which needs a working unattended run to
-gather the live concurrency evidence its criterion 1 demands.
-**Requirements**: HARDEN-07
-**Success Criteria** (what must be TRUE):
-
-  1. During the Code stage and the `--gaps-only` fix loop, `check auto-mode` reports active, so GSD
-     auto-approves ordinary `gate="blocking"` checkpoints instead of the run stalling into a gate.
-     Established by driving a real checkpoint, not by asserting the flag's value.
-
-  2. The chain flag DevFlow sets is cleared again on **every** exit path from those stages, including
-     error and kill paths. `.planning/config.json` is tracked and `commit_docs` is on, so a leaked
-     `_auto_chain_active: true` is committed and then fires GSD's plan-phase chaining on the *next*
-     phase (upstream G-03: the clear at `plan-phase.md:1547` does not affect the decision at `:1563`,
-     which reads the pre-clear value). A test must demonstrate the leak is closed on a failure path,
-     not only on the happy path.
-
-  3. DevFlow's Plan stage does not chain into execute-phase. `workflow.auto_advance` is NOT set
-     persistently — that flag conflates checkpoint-bypass with stage-chaining (upstream G-01), and
-     setting it makes plan-phase launch execute-phase itself, double-executing the Code stage and
-     misattributing its commits to the Plan stage.
-
-  4. A preflight reports, per condition, whether an unattended run's prerequisites hold, and
-     **refuses** the launch when they do not — a warning is read by nobody in an unattended run. It
-     carries a negative control: a fixture where the check reports NOT viable. A preflight that
-     cannot fail is the defect it exists to prevent (the 999.86 lesson, one phase earlier).
-
-  5. The work is demonstrated by a simulated unattended run that crosses the seams under test —
-     Plan → Code with a real checkpoint — rather than by unit tests alone. Phase 35 shipped with no
-     end-to-end run anywhere in it; this criterion exists so the same gap is not repeated on the
-     change whose entire purpose is making unattended runs work.
-
-  6. **Observation to collect while running, not a criterion to satisfy:** record the per-phase
-     Validate-failure count this run actually reaches. `MAX_PHASE_VALIDATE_FAILURES = 10` (35-04) is
-     an unmeasured judgement — the const assertion pins only its relation to
-     `MAX_CONSECUTIVE_FAILURES`, never the absolute value — and no history exists to mine because the
-     counter did not exist before Phase 35. This run is the first opportunity to observe the real
-     number. Record it even if the run never approaches the ceiling; "converged in 2" is data.
-
-**Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
-correctness question about *how* an unattended agent decides, separable from *whether* it can
-proceed at all.
-
-**Promoted into this phase mid-flight (2026-08-08):** 999.99 and 999.98, both found by dogfooding
-this phase's own Plan stage and both fixed before the plans were executed. Their code landed ahead
-of 35.1's success criteria rather than in service of them, so a reader comparing the criteria
-against the diff will find more than the criteria ask for — that is why, not drift. Both are
-prerequisites in the literal sense: an unattended run cannot be made to work while the monitor
-kills any stage that backgrounds work.
-**Plans**: 3/4 plans executed across 3 waves
-
-Plans:
-
-**Wave 1**
-
-- [x] 35.1-01-PLAN.md — TRACER: the chain-flag lifecycle end to end on one path — `gsd_config` (the
-  sole writer of `workflow._auto_chain_active`), `serde_json`'s `preserve_order`,
-  `AUTO_CHAIN_ELIGIBLE_STAGES` + its eligibility predicate, the RAII guard inside `run_monitor`, and
-  the flag-preserving token on the Code and fix prompts — proven by a real `devflow __monitor` run
-  whose supervised child reports the flag it saw, with a supervise-mode negative control. Closes
-  criterion 3 in full (D-04/D-05/D-06)
-
-**Wave 2** *(both blocked on Wave 1; disjoint file sets, so they run in parallel)*
-
-- [x] 35.1-02-PLAN.md — leak repair: `force_clear_auto_chain` at `start` and `resume`, reaching the
-  committed tree and refusing to sweep an operator's edit, the loud stdout notice plus
-  `auto_chain_flag_repaired` event, and the SIGKILL regression test built on a demonstrated leak
-  (criterion 2, D-01/D-02/D-03)
-
-- [x] 35.1-03-PLAN.md — the fail-closed preflight: three conditions to a four-state report, refusing
-  in `--mode auto` and reporting in `--mode supervise`, with three NOT-viable fixtures each
-  demonstrated failing and no override of any kind (criterion 4, D-07/D-08/D-09)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 35.1-04-PLAN.md — the live drill against a real Claude agent with a real GSD blocking
-  checkpoint and a real `--gaps-only` loop, its supervise-mode negative control, the criterion 6
-  observation recorded in `35.1-DRILL.md`, and the operator guide stating all three known limitations
-  (criteria 5 and 6, D-10/D-11). Completed 2026-08-12 — chain-flag mechanism confirmed working;
-  auto-approval blocked by upstream GSD #3370 (orchestrator conflates `gate="blocking"` with
-  `gate="blocking-human"`); GSD #3370 filed; stale live-run gate rejected.
-
-### Phase 35.2: Verification Provenance (999.89 / HARDEN-03)
-
-**Goal**: A loop-back decision knows whether *this run's* Validate agent authored
-`{N}-VERIFICATION.md`, rather than inferring it from whether the bytes changed — and the cross-repo
-branch-naming coincidence that currently keeps the byte-inference safe is pinned by a test instead of
-being relied on silently.
-**Depends on**: Phase 35.1 — reuses its simulated unattended run as the harness for criterion 4
-rather than standing up a second one.
-**Requirements**: HARDEN-03
-**Success Criteria** (what must be TRUE):
-
-  1. `verification_authored_this_run` decides on a **run-owned marker DevFlow itself writes**, not on
-     a content fingerprint. DevFlow does not author `{N}-VERIFICATION.md` — the only `fs::write` of
-     it in this codebase is two test fixtures (`agent_result.rs:7532`, `:7602`); GSD's verifier agent
-     is the writer. So the marker must be something DevFlow owns and stamps around the Validate
-     stage, **not** a field the agent is asked to embed: an instruction to an agent is a request, not
-     a guarantee, and provenance that can be silently skipped is not provenance.
-
-  2. A byte change the Validate agent did not cause no longer reads as authored-this-run. The
-     scenario to drive is 999.89's: the artifact is replaced under the evidence root (as a branch
-     checkout would replace it) with no Validate agent having run, and the dispatch must be a full
-     execute — not `--gaps-only` against zero matching plans.
-
-  3. **The cheap half, which defends the route that would make the defect common.** A test pins that
-     DevFlow's phase-branch name matches the string GSD's `execute-phase` independently computes,
-     **including the single-digit padding case** (DevFlow zero-pads to `feature/phase-07`; GSD takes
-     a bare number and — verified 2026-08-07 — emits the same). Today GSD's branching step finds the
-     branch already present and degenerates to a no-op `git switch`; that is the only reason a
-     checkout does not routinely replace the artifact. Two conventions maintained in two
-     repositories, nothing enforcing agreement. This test is what makes a drift loud instead of
-     turning a rare failure routine, silently, from a change in a repo that has no reason to know the
-     invariant exists.
-
-  4. Both directions are demonstrated in the same run: an artifact the Validate agent genuinely wrote
-     still dispatches `--gaps-only`, and an artifact changed by anything else dispatches a full
-     execute. 35-05's own lesson applies directly — its two-stub demonstration showed an
-     always-stale rule silently reverts Phase 33, and a rule tested in only one direction cannot
-     catch that.
-
-  5. `mtime` is stated as rejected, with its reason, so a later reader does not retry it:
-     `phase_verification_mtime_nanos` already exists, but a checkout or merge-back updates mtime
-     exactly as it updates content, so it fails on the identical scenario.
-
-**Not in scope**: changing the artifact's format or asking GSD to write anything. Both would make
-this depend on an upstream change (see `.planning/UPSTREAM-GSD-ISSUES.md`); the whole point of the
-run-owned marker is that DevFlow can close this alone.
-**Plans**: TBD
-
-### Phase 35.3: Drain Gate Concurrency Measurement (999.83)
-
-**Goal**: Operator has a real, evidence-based answer to whether the drain gate — the safety net
-the v2.4.0 stream-json widening depends on — actually observes real sub-agent concurrency, in
-place of the untested assumption its synthetic fixture currently encodes. This is
-investigation-shaped work: design and run the right experiment, in the same family as backlog
-999.71's precedent, rather than apply a predetermined fix.
-**Depends on**: Nothing structurally — sequenced after Phase 35.2 by phase numbering.
-Deliberately isolated so this investigation does not block Phase 35's five confirmed fixes; it may
-be planned and executed independently of Phase 35's completion.
-**Requirements**: HARDEN-06
-**Success Criteria** (what must be TRUE):
-
-  1. The event family (or families) Claude CLI actually emits for each kind of concurrent child
-     work — sub-agent dispatch, backgrounded shell, or other — is established from live
-     production evidence beyond the single n=1 capture already on record (`34-evidence/`), not
-     inferred a second time from source reading alone.
-
-  2. The question "does the drain gate see real sub-agent concurrency" is answered honestly per
-     observed condition (CLI version, workload shape) — including recording a negative or
-     inconclusive result exactly as measured, rather than assuming the answer resolves in the
-     direction of "the gate already works."
-
-  3. One of two outcomes is delivered, not deferred: either `CloseRule::observe` is widened to
-     the event families production actually emits, or an in-source explanation records why
-     `background_tasks_changed` remains the right and sufficient key — and the SYNTHETIC fixture
-     label is corrected to match whatever the measurement found.
-
-  4. The measurement's own scope and strength are stated explicitly in its record — sample size,
-     CLI version(s), workload shape(s) covered, and what conclusion that evidence can and cannot
-     support — so a future reader cannot mistake a narrow result for a general guarantee about the
-     drain gate.
-
-  5. **Observation to collect while running, not a criterion to satisfy:** record the per-phase
-     Validate-failure count this run reaches (same ask as Phase 35.1's criterion 6, repeated here so
-     whichever run happens first captures it). `MAX_PHASE_VALIDATE_FAILURES = 10` is an unmeasured
-     judgement carried provisionally from 35-04; these are the first runs able to say what the real
-     number looks like.
-**Plans**: TBD
+| 35.3 | Drain Gate Concurrency Measurement | Complete | — |
 
 ## Progress
 
@@ -329,6 +108,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.1 | 4/4 | Complete    | 2026-08-12 |
 | 35.2 | 2/2 | Complete    | 2026-08-12 |
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
+| 36 | 2/2 | Complete    | 2026-08-15 |
+| 37 | 4/4 | Complete    | 2026-08-16 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -2827,6 +2608,129 @@ can miss it entirely.
 
 ---
 
+### Phase 999.106: Remove `AgentAdapter` and the Legacy DriverShim (DEFERRED from Phase 37)
+
+**Found:** 2026-08-16, closing Phase 37. All four agents now implement the modular `AgentDriver`
+contract, but the legacy `AgentAdapter` trait, the `DriverShim` compatibility shim, and the four
+legacy adapter structs (`ClaudeAgent`/`CodexAgent`/`OpenCodeAgent`/`PiAgent`) were **left in place**
+per CONTEXT D-11 ("remove only if required for Pi; otherwise defer — whatever's easiest"). Pi runs
+fine through the shim, so the removal was deferred rather than risked in the same phase.
+
+**Known call sites to migrate before the trait can be deleted** (verified 2026-08-16):
+
+- `crates/devflow-core/src/canary.rs:40` — the Phase-31 nonce-canary imports `AgentAdapter` +
+  `ClaudeAgent`.
+
+- `crates/devflow-cli/src/test_support.rs:205/244` — `AlwaysFailAdapter`/`FailOnceAdapter` test
+  doubles implement `AgentAdapter`.
+
+- `crates/devflow-cli/src/preflight.rs:1266` — `run_preflight(…, adapter: &dyn AgentAdapter)`.
+- `crates/devflow-cli/src/pipeline_launch.rs:190` — `resolve_launch_shape(…, adapter: &dyn AgentAdapter)`;
+  `:204` calls `ClaudeAgent::exec_command_single_document` (the pre-31 legacy builder).
+
+**Also folds in** the deferred `InteractivityMode` *consumption*: `AgentDriver::interactivity_mode`
+exists (Codex declares Define/Plan → `RequiresExistingArtifact`), but the hardcoded
+`agent == AgentKind::Codex` checks in `commands.rs:289` and `preflight.rs`
+(`preflight_interactivity_check`) still gate the Define/Plan path — wiring them through the driver's
+mode requires the `&dyn AgentAdapter` → `&dyn AgentDriver` signature migration above.
+
+**Size:** M — mechanical, but touches the launch path (`pipeline_launch.rs`), which is the most
+regression-sensitive code in the repo; the four legacy structs and the `DriverShim` are deleted once
+every call site resolves through `AgentDriver`.
+
+### Phase 999.107: Two Pre-Existing Codex-Parser Defects Surfaced by the Phase 37 Code Review (BACKLOG)
+
+**Found:** 2026-08-16, the Phase 37 code review. Pre-existing (not introduced by Phase 37 — both
+functions predate the diff), but real:
+
+1. **The Codex parser lets an earlier success marker beat a later terminal failure.**
+   `crates/devflow-core/src/agent_result.rs:764-781` returns the last `agent_message` marker before
+   examining `turn.failed` (`:784-812`). A stream of `thread.started` →
+   `item.completed(agent_message: DEVFLOW_RESULT success)` → `turn.failed(error: …)` is read as
+   Success, so the stage can advance despite the terminal failure. The existing test covers
+   success + `turn.completed` (`:4490-4498`), not success + `turn.failed`.
+
+2. **Codex writable-root serialization mishandles hostile paths.**
+   `crates/devflow-core/src/agents/codex.rs:47-60` uses `root.display().to_string()` and escapes only
+   `\` and `"`; a non-UTF-8 path becomes `�`, a newline-containing path produces invalid TOML, yielding
+   a malformed `sandbox_workspace_write.writable_roots` override.
+
+**Size:** S–M — #1 is a parser-ordering fix with a new `turn.failed` negative test; #2 is a
+serialization hardening with a hostile-path fixture.
+
+### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
+
+**Found:** 2026-08-15, dogfooding Phase 36. A hand-run adversarial review (claude/opus,
+codex/gpt-5.6-sol, antigravity/Gemini 3.1 Pro) against the phase's SPEC/CONTEXT and then its PLAN
+caught, in one phase, three CRITICAL findings — 999.104 targeting dead code (`release_finish` has
+no production caller), a false-green credential check (`DEVFLOW_PI_PROVIDER` is a provider name,
+not a credential), and `--approve` as unsandboxed-code-execution risk — plus two HIGH (an unowned
+doctor integration, and a hook deletion that would break existing tests). Every one of those would
+have shipped or wasted a wave without it.
+
+**The item:** make that review a default part of the phase lifecycle, not an ad-hoc operator step:
+
+- a cross-model adversarial pass over the CONTEXT (post-discuss) and the PLAN (post-plan), before execute;
+- the pass is the `adversarial-review` skill (selectable `cli:model:effort` reviewers) or a
+  GSD-native equivalent, defaulting to a diverse 2-3 reviewer set;
+
+- findings feed back into planning the way `gsd-plan-phase --reviews` consumes REVIEWS.md, with the
+  orchestrator gating execute until blocking findings are dispositioned.
+
+**Why this is more than the existing `gsd-review`:** `gsd-review` is plan-only, CLI-level (flags
+select CLIs, not models/effort), and carries no CWD/context discipline — the Phase 36 run's own
+failure mode (reviewers launched from the wrong checkout, reading a stale SPEC) is exactly what this
+feature's procedure must pin. The `adversarial-review` skill already encodes the review-root/CWD and
+citation-verification discipline; this item promotes it into the default flow.
+
+**Priority:** High — it paid for itself in a single phase by catching findings that would otherwise
+have shipped. **Size:** M — the skill exists; the work is wiring it into the phase gates
+(discuss:post / plan:post hooks, or a devflow stage), the feedback loop, and the "blocking
+findings" gate.
+
+**Depends on:** nothing structurally. The `adversarial-review` skill (`~/.agents/skills/`) is the
+reusable core.
+
+---
+
+### Phase 999.104: The Release-Signing Key Workflow Is Fragile and Has Caused Repeated Mistakes (BACKLOG — discuss in Phase 36)
+
+**Found:** repeatedly, across at least the last ten phases. The v2.5.0 cut (2026-08-15) hit it
+again: `release --check`'s "tag-signing viability" probes `user.signingkey` (the **agent's** key,
+`9BPy…`), not `devflow.releaseSigningKey` (the **maintainer's** key, `u84t…`), so the preflight
+reports "signing viable" for the wrong key and the real enforcement only fires later, in the
+pre-push fingerprint comparison.
+
+**The recurring shape.** Two signing keys coexist on the same machine, both configured with the
+same `user.email`, so a tag signed with the wrong one renders identically everywhere a human looks
+(`git log`, `git tag -v`, GitHub's "Verified" badge). Only the fingerprint differs. The intended
+workflow:
+
+- ordinary commits → agent key (`user.signingkey`)
+- release tags + `main` → maintainer key (`devflow.releaseSigningKey`), via an explicit
+  `git -c user.signingkey=…` override
+
+Every recent release has tripped on some facet: the override forgotten, the preflight probing the
+wrong key, or the "it looks correct but isn't" trap (both keys share the email).
+
+**What to decide in Phase 36 — not fix here.** This is a workflow-design question, not a single
+bug. Open decisions to settle in discuss-phase:
+
+1. Should `release --check`'s signing probe target `devflow.releaseSigningKey` rather than the
+   agent's `user.signingkey`? (The obvious one-line fix — but see 2.)
+
+2. Is the two-key model itself the right shape? Alternatives: a single release-only signing
+   identity, or making the maintainer key the only key on the release path so there is no "wrong
+   key" to select — and no `-c` override to forget.
+
+3. Should the fingerprint check surface earlier (in `release --check` / `--verify`) so a wrong-key
+   tag fails at preflight instead of at push?
+
+**Priority:** High-for-annoyance (recurring; the wrong-key trap is silent until push).
+**Size:** TBD — depends on which of (1)–(3) Phase 36 chooses; (1) alone is S.
+
+---
+
 ### Phase 999.103: The Gate Notify Hook Has No Home, No Default, and No Way to Tell You It Is Broken (BACKLOG)
 
 **Found:** 2026-08-09, dogfooding Phase 35.1. Three consecutive Code-stage failures fired
@@ -3467,7 +3371,13 @@ generated anyway.
 
 ---
 
-### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (BACKLOG — shortlisted for Phase 31)
+### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (RESOLVED — shipped; verified 2026-08-15)
+
+**Resolution note (2026-08-15):** the fix landed in an ancestor commit — `parse_devflow_result`
+now normalizes both parser arms via `normalise_stream_marker_provenance` (`agent_result.rs:166-180`),
+and the mirror regression `generic_marker_cannot_forge_layer0_provenance` exists at
+`agent_result.rs:4343` with the passing counterpart. Verified by two independent code reviewers
+(adversarial review, Phase 36). This entry was stale; the fix is shipped.
 
 **Linear:** [DEN-88](https://linear.app/denniskim/issue/DEN-88/99967-parse-devflow-result-lets-an-agent-plant-its-own-layer-0)
 **Found:** 2026-08-02, Phase 30 plan 30-01 execution (finding F-1). Surfaced *by* the fix for the

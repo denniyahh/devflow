@@ -709,7 +709,7 @@ pub fn checkpoint_reported_in_capture(project_root: &Path, phase: PhaseId) -> bo
 /// Determine whether a set of parsed JSONL lines look like a Codex `--json`
 /// event stream (as opposed to a single-document Claude envelope or plain
 /// text) — i.e. at least one line is a `thread.started` or `turn.*` event.
-fn is_codex_event_stream(events: &[serde_json::Value]) -> bool {
+pub(crate) fn is_codex_event_stream(events: &[serde_json::Value]) -> bool {
     events.iter().any(|v| {
         v.get("type")
             .and_then(serde_json::Value::as_str)
@@ -737,7 +737,7 @@ fn is_codex_event_stream(events: &[serde_json::Value]) -> bool {
 /// error.message) but not yet verified against the installed Codex CLI
 /// version — the 13-06 dogfood run captures real output and reconciles any
 /// delta, the same empirical practice 12-12-SUMMARY.md used for Claude.
-fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
+pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
     let capture = ParsedCapture::parse(stdout);
     let events = &capture.events;
 

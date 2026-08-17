@@ -87,10 +87,14 @@ pub(crate) fn launch_stage_inner(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
-    let prompt = prompt_override.unwrap_or_else(|| {
-        prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
-    });
     let adapter = agents::adapter_for(state.agent);
+    let prompt = prompt_override.unwrap_or_else(|| {
+        adapter.render_prompt(&prompt::StageIntent::for_stage_in_project(
+            state.stage,
+            state.phase,
+            Some(&state.project_root),
+        ))
+    });
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
     // agents need it (and the worktree admin dir, which Codex read-only-
@@ -1078,7 +1082,11 @@ pub(crate) fn launch_stage(
 ) -> Result<(), CliError> {
     let adapter = agents::adapter_for(state.agent);
     let prompt = prompt_override.clone().unwrap_or_else(|| {
-        prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
+        adapter.render_prompt(&prompt::StageIntent::for_stage_in_project(
+            state.stage,
+            state.phase,
+            Some(&state.project_root),
+        ))
     });
     let roots = state
         .worktree_path

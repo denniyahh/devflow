@@ -40,7 +40,7 @@ const SHIP_REVIEW_ANGLES: &[&str] = &[
 const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
 
 /// The completion contract every agent must honor as its final message.
-const COMPLETION_PROTOCOL: &str = "\
+pub const COMPLETION_PROTOCOL: &str = "\
 ## Completion Protocol (REQUIRED)\n\
 \n\
 When all work is done, your FINAL message must be exactly:\n\
@@ -53,6 +53,80 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 \n\
 DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
+
+/// The data a stage wants rendered, with NO agent-specific syntax.
+///
+/// This is the de-Claude-ification artifact (999.31 / 37-01): the old
+/// `Stage::gsd_command()` returned a `/gsd-*` slash-command string that
+/// `prompt.rs` interpolated identically for every agent. `StageIntent` instead
+/// carries the stage's *data* (phase, fix kind, review angles), and each
+/// adapter's `render_prompt` turns that data into its own instruction — Claude
+/// and OpenCode render the legacy slash-command text byte-for-byte, Codex
+/// renders a Codex-native instruction with no `/gsd-*` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageIntent {
+    Define {
+        phase: PhaseId,
+    },
+    Plan {
+        phase: PhaseId,
+    },
+    Code {
+        phase: PhaseId,
+        fix: Option<FixType>,
+    },
+    Validate {
+        phase: PhaseId,
+    },
+    Ship {
+        phase: PhaseId,
+        review_angles: Vec<String>,
+    },
+}
+
+impl StageIntent {
+    /// The stage this intent drives.
+    pub fn stage(&self) -> Stage {
+        match self {
+            StageIntent::Define { .. } => Stage::Define,
+            StageIntent::Plan { .. } => Stage::Plan,
+            StageIntent::Code { .. } => Stage::Code,
+            StageIntent::Validate { .. } => Stage::Validate,
+            StageIntent::Ship { .. } => Stage::Ship,
+        }
+    }
+
+    /// Build the intent for a stage with no fix and default review angles
+    /// (callers that need a project-local review-angle override use
+    /// [`StageIntent::for_stage_in_project`]).
+    pub fn for_stage(stage: Stage, phase: PhaseId) -> Self {
+        Self::for_stage_in_project(stage, phase, None)
+    }
+
+    /// Build the intent for a stage, resolving project-local review angles.
+    pub fn for_stage_in_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> Self {
+        match stage {
+            Stage::Define => StageIntent::Define { phase },
+            Stage::Plan => StageIntent::Plan { phase },
+            Stage::Code => StageIntent::Code { phase, fix: None },
+            Stage::Validate => StageIntent::Validate { phase },
+            Stage::Ship => {
+                let review_angles = project_root
+                    .and_then(crate::config::review_angles)
+                    .unwrap_or_else(|| {
+                        SHIP_REVIEW_ANGLES
+                            .iter()
+                            .map(|angle| (*angle).to_owned())
+                            .collect()
+                    });
+                StageIntent::Ship {
+                    phase,
+                    review_angles,
+                }
+            }
+        }
+    }
+}
 
 /// A fix variant used when looping Code ↔ Validate.
 ///
@@ -143,31 +217,36 @@ fn ship_stage_prompt(phase: PhaseId, review_angles: &[String]) -> String {
 /// so `advance()`'s Validate arm can tell "the agent ran validation" apart
 /// from "validation passed," and never advances to Ship on a bare `status:
 /// success` for this stage.
+/// The Validate verdict contract (13b verdict-vs-ran): a Validate stage must
+/// report `verdict: pass|gaps`, not a bare `status`. Shared by the legacy and
+/// workflow renderers so they cannot drift.
+const VALIDATE_VERDICT_CONTRACT: &str = "\
+## Completion Protocol (REQUIRED)\n\
+\n\
+When all work is done, your FINAL message must be exactly one of:\n\
+\n\
+DEVFLOW_RESULT: {\"status\": \"success\", \"verdict\": \"pass\"}\n\
+\n\
+if validation found NO gaps, or:\n\
+\n\
+DEVFLOW_RESULT: {\"status\": \"success\", \"verdict\": \"gaps\"}\n\
+\n\
+if validation found gaps that still need fixing. The `verdict` field is \
+REQUIRED for this stage — it is distinct from `status` (which only reports \
+whether the validation task itself completed) and MUST be exactly the \
+lowercase string `pass` or `gaps`.\n\
+\n\
+If something prevents completion:\n\
+\n\
+DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n\
+\n\
+DevFlow reads this line to decide whether the stage succeeded. \
+Output nothing after it.";
+
 fn validate_stage_prompt(phase: PhaseId) -> String {
     let command = gsd_command_for(Stage::Validate, phase);
     format!(
-        "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
-        ## Completion Protocol (REQUIRED)\n\
-        \n\
-        When all work is done, your FINAL message must be exactly one of:\n\
-        \n\
-        DEVFLOW_RESULT: {{\"status\": \"success\", \"verdict\": \"pass\"}}\n\
-        \n\
-        if validation found NO gaps, or:\n\
-        \n\
-        DEVFLOW_RESULT: {{\"status\": \"success\", \"verdict\": \"gaps\"}}\n\
-        \n\
-        if validation found gaps that still need fixing. The `verdict` field \
-        is REQUIRED for this stage — it is distinct from `status` (which only \
-        reports whether the validation task itself completed) and MUST be \
-        exactly the lowercase string `pass` or `gaps`.\n\
-        \n\
-        If something prevents completion:\n\
-        \n\
-        DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"specific explanation\"}}\n\
-        \n\
-        DevFlow reads this line to decide whether the stage succeeded. \
-        Output nothing after it."
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{VALIDATE_VERDICT_CONTRACT}"
     )
 }
 
@@ -250,46 +329,115 @@ pub fn stage_prompt_for_project(stage: Stage, phase: PhaseId, project_root: &Pat
     stage_prompt_with_project(stage, phase, Some(project_root))
 }
 
-fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
-    if stage == Stage::Ship {
-        let review_angles = project_root
-            .and_then(crate::config::review_angles)
-            .unwrap_or_else(|| {
-                SHIP_REVIEW_ANGLES
-                    .iter()
-                    .map(|angle| (*angle).to_owned())
-                    .collect()
-            });
-        return ship_stage_prompt(phase, &review_angles);
+/// The Code stage's dedicated prompt.
+///
+/// The Code arm ONLY carries [`AUTO_CHAIN_PRESERVING_FLAG`] (D-04/D-05, 35.1-01
+/// Pitfall 1): `execute-phase.md` wipes `workflow._auto_chain_active` at the top
+/// of every invocation whose `$ARGUMENTS` lacks this token, which would clear
+/// the flag DevFlow just set before `checkpoint_handling` ever reads it.
+fn code_stage_prompt(phase: PhaseId) -> String {
+    let command = format!(
+        "{} {AUTO_CHAIN_PRESERVING_FLAG}",
+        gsd_command_for(Stage::Code, phase)
+    );
+    format!(
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+        ## Advisory incremental self-review\n\
+        \n\
+        After each plan or wave lands, perform a quick, shallow self-check \
+        for doc accuracy, leaked data, CI/build correctness, and \
+        external-state claims. Record any drift in the working output and \
+        continue execution; the authoritative review happens during Ship. \
+        This check must not pause execution or request human input.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
+/// Render a [`StageIntent`] as the legacy Claude/OpenCode slash-command text.
+///
+/// This is the byte-identical renderer: Claude and OpenCode produce exactly
+/// what `stage_prompt` produced before the migration (CONTEXT D-01 zero
+/// regression). It lives here — not in the adapters — so the two agents cannot
+/// drift apart, and the per-stage snapshot tests pin it.
+pub fn render_claude_style(intent: &StageIntent) -> String {
+    match intent {
+        StageIntent::Define { phase } => define_stage_prompt(*phase),
+        StageIntent::Plan { phase } => idempotent_stage_prompt(*phase),
+        StageIntent::Code { phase, fix: None } => code_stage_prompt(*phase),
+        StageIntent::Code {
+            phase,
+            fix: Some(fix),
+        } => fix_prompt(*fix, *phase),
+        StageIntent::Validate { phase } => validate_stage_prompt(*phase),
+        StageIntent::Ship {
+            phase,
+            review_angles,
+        } => ship_stage_prompt(*phase, review_angles),
     }
-    if stage == Stage::Validate {
-        return validate_stage_prompt(phase);
+}
+
+/// Render a [`StageIntent`] as a workflow-reference instruction for agents that
+/// cannot receive the legacy `/gsd-*` slash command (Codex, Pi). The instruction
+/// points at the GSD workflow file to follow, carries the `--auto` token where
+/// the workflow requires it, and states the completion contract. Contains NO
+/// GSD slash command.
+/// Render a [`StageIntent`] for an agent that cannot receive the legacy
+/// `/gsd-*` slash command (Codex, Pi). Each stage's *contract* is preserved —
+/// Validate verdict, Ship review gate, Define no-op, Plan idempotency — but the
+/// instruction references the workflow file under `workflow_root` (a per-driver
+/// path) instead of naming a slash command.
+pub fn render_workflow_style(intent: &StageIntent, workflow_root: &str) -> String {
+    match intent {
+        // D-14: Define is a no-op for every agent — `define_stage_prompt`
+        // already carries no slash command, so it is shared verbatim.
+        StageIntent::Define { phase } => define_stage_prompt(*phase),
+        StageIntent::Plan { phase } => workflow_plan_prompt(*phase, workflow_root),
+        StageIntent::Code { phase, fix } => workflow_code_prompt(*phase, *fix, workflow_root),
+        StageIntent::Validate { phase } => workflow_validate_prompt(*phase, workflow_root),
+        StageIntent::Ship {
+            phase,
+            review_angles,
+        } => workflow_ship_prompt(*phase, review_angles, workflow_root),
     }
-    if stage == Stage::Define {
-        return define_stage_prompt(phase);
-    }
-    if stage == Stage::Plan {
-        return idempotent_stage_prompt(phase);
-    }
-    let command = gsd_command_for(stage, phase);
-    if stage == Stage::Code {
-        // The Code arm ONLY (D-04/D-05, 35.1-01 Pitfall 1). `execute-phase.md`
-        // wipes `workflow._auto_chain_active` at the top of every invocation
-        // whose `$ARGUMENTS` lacks this token, which would clear the flag
-        // DevFlow just set before `checkpoint_handling` ever reads it. Within
-        // `execute-phase.md` the token's only effect is to skip that clear — it
-        // does not chain and it sets nothing, so it is safe to send
-        // unconditionally here even though the config write that gives it
-        // meaning is gated on `Mode::Auto` (F-2).
-        //
-        // Deliberately NOT applied to `gsd_command_for` or
-        // `Stage::gsd_command`: both are shared with Plan via
-        // `idempotent_stage_prompt`, and the same flag makes `plan-phase.md`
-        // chain into `execute-phase.md`. Leaking the token into the Plan prompt
-        // is precisely the D-04 defect.
-        let command = format!("{command} {AUTO_CHAIN_PRESERVING_FLAG}");
-        return format!(
-            "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+}
+
+fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str) -> String {
+    let artifact = "PLAN.md";
+    let padded = phase.padded();
+    format!(
+        "First check whether this stage's deliverable already exists:\n\
+        \n\
+        ls .planning/phases/{padded}-*/{padded}-*{artifact} 2>/dev/null\n\
+        \n\
+        - If it EXISTS: the stage's work is already done. Do NOT run the \
+        workflow, do NOT ask for input, and do NOT modify the existing \
+        artifacts. Your FINAL message must be exactly:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
+        \n\
+        - If it does NOT exist: read and follow the GSD workflow file at \
+        {workflow_root}/plan-phase.md for phase {phase}.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
+fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
+    match fix {
+        Some(FixType::AuditFix) => format!(
+            "Read and follow the GSD workflow file at {workflow_root}/audit-fix.md for \
+            phase {phase}.\n\n{COMPLETION_PROTOCOL}"
+        ),
+        Some(FixType::GapsOnly) => format!(
+            "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
+            phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
+            of the workflow invocation and must be preserved verbatim.\n\n{COMPLETION_PROTOCOL}"
+        ),
+        Some(FixType::FullExecute) | None => format!(
+            "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
+            phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
+            must be preserved verbatim.\n\n\
             ## Advisory incremental self-review\n\
             \n\
             After each plan or wave lands, perform a quick, shallow self-check \
@@ -299,11 +447,57 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
             This check must not pause execution or request human input.\n\
             \n\
             {COMPLETION_PROTOCOL}"
-        );
+        ),
     }
+}
+
+fn workflow_validate_prompt(phase: PhaseId, workflow_root: &str) -> String {
     format!(
-        "Run the GSD workflow command for this stage:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
+        "Read and follow the GSD workflow file at {workflow_root}/validate-phase.md for \
+        phase {phase}.\n\n{VALIDATE_VERDICT_CONTRACT}"
     )
+}
+
+fn workflow_ship_prompt(phase: PhaseId, review_angles: &[String], workflow_root: &str) -> String {
+    let review_angles = review_angles
+        .iter()
+        .map(|angle| format!("- {angle}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Run the Ship stage in two steps:\n\
+        \n\
+        1. Read and follow the GSD workflow file at {workflow_root}/code-review.md for \
+        phase {phase}. This writes a REVIEW.md artifact with severity-classified findings. \
+        Review at high depth from every angle below:\n\
+        \n\
+        {review_angles}\n\
+        \n\
+        If your harness supports parallel finder subagents, dispatch one per angle; otherwise \
+        run each angle as a focused sequential pass. Merge and deduplicate every angle's \
+        findings into one REVIEW.md.\n\
+        2. Check REVIEW.md for the Critical-severity gate:\n\
+        \n\
+        - If REVIEW.md contains ANY finding at Critical severity: do NOT run the ship workflow \
+        at all. Your FINAL message must be exactly:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"review: <short summary of the \
+        Critical findings>\"}}\n\
+        \n\
+        - If REVIEW.md has NO Critical-severity findings: read and follow the GSD workflow file \
+        at {workflow_root}/ship.md for phase {phase} and report the outcome via the normal \
+        completion protocol below.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
+fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<&Path>) -> String {
+    render_claude_style(&StageIntent::for_stage_in_project(
+        stage,
+        phase,
+        project_root,
+    ))
 }
 
 /// The synthesized instruction sent into a resumed Claude session when a
