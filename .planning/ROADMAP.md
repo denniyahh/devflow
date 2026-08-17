@@ -11,7 +11,7 @@
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 37.1 | Pi Subagent-Extension Spike (research) | Not started | — |
+| 37.1 | Pi Subagent-Extension Spike (research) | Complete | — |
 | 38 | Driver Contract Completion (999.106 + 999.107) | Not started | — |
 | 39 | Pi End-to-End | Not started | — |
 
@@ -21,6 +21,14 @@
 existing multi-agent functionality (Claude/Codex). Deliverable: a comparison doc + a recommendation
 + a decision gate (dispatch viable → full-dispatch arm; not viable → reduced-capacity is shipped).
 **Depends on**: Phase 37.
+
+- [x] Phase 37.1 complete (2026-08-17): verdict **NOT VIABLE** — full Pi dispatch moves to
+the backlog; Phase 39 ships the reduced-capacity baseline (`Legacy`/`-p` + `parse_pi_result`).
+
+**Status (2026-08-17):** Complete — verdict **NOT VIABLE**. Phase 39 ships the reduced-capacity
+baseline (D-02: `Legacy`/`-p` + `parse_pi_result`); full Pi dispatch moves to the backlog as an
+independently-scoped phase (vendored extension + Pi parser + Pi drain predicate). See
+`37.1-DECISION-GATE.md`.
 
 ### Phase 38: Driver Contract Completion (999.106 + 999.107)
 
@@ -123,7 +131,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
 | 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | 4/4 | Complete    | 2026-08-16 |
-| 37.1 | — | Not started | — |
+| 37.1 | — | Complete    | 2026-08-17 |
 | 38 | — | Not started | — |
 | 39 | — | Not started | — |
 
