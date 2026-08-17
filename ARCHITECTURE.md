@@ -93,8 +93,8 @@ Agent backends are isolated behind a trait
   extra_writable_roots) -> (program, args)`, `parse_completion(output)`, `health(state)`,
   `environment()`, `capabilities()`, `interactivity_mode(stage)`, `test_contract()`. Each
   driver owns its prompt rendering, command building, completion parsing, and health.
-- Supported `AgentKind`s (`state.rs`): `Claude`, `Codex`, `OpenCode`.
-  Accepted names: `claude`, `codex`, `opencode` / `open-code`.
+- Supported `AgentKind`s (`state.rs`): `Claude`, `Codex`, `OpenCode`, `Pi`.
+  Accepted names: `claude`, `codex`, `opencode` / `open-code`, `pi`.
 - `driver_for(kind)` returns the boxed driver for a kind
   (`ClaudeDriver`/`CodexDriver`/`OpenCodeDriver`/`PiDriver`).
 - Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`

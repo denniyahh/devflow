@@ -596,36 +596,31 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 // readiness failure is caught before any agent time is spent.
 // ---------------------------------------------------------------------------
 
-/// D-14 (universal, generic layer): a headless/auto Codex run cannot pass
 /// The driver-driven interactivity gate (999.106): whether `stage` can run
-/// headless is now declared by the driver's `interactivity_mode`, not a
-/// hardcoded `agent == Codex` check. `RequiresExistingArtifact` stages need
-/// their artifact (Define → CONTEXT.md, Plan → PLAN.md) already on develop in
-/// auto mode; `HeadlessSafe` is never refused; `RequiresTypedSubagents` /
-/// `InteractiveOnly` have no headless path at all. Routes the failure through
-/// the preflight gate (D-15) rather than a hard error, closing the gap the
-/// pre-start check leaves open for non-`start()` launch paths (`resume`, gate
-/// retries, loop-backs).
+/// headless is declared by the driver's `interactivity_mode`, not a hardcoded
+/// `agent == Codex` check. `RequiresExistingArtifact` gates **Define only**
+/// (CONTEXT.md must already be on develop in auto mode — a pre-existing input);
+/// Plan is deliberately un-gated because PLAN.md is an *output* the phase
+/// itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
+/// / `InteractiveOnly` have no headless path at all. Routes the failure
+/// through the preflight gate (D-15) rather than a hard error.
 fn preflight_interactivity_check(project_root: &Path, state: &State) -> Result<(), String> {
     use devflow_core::agents::InteractivityMode;
     let driver = agents::driver_for(state.agent);
     match driver.interactivity_mode(state.stage) {
         InteractivityMode::HeadlessSafe => Ok(()),
         InteractivityMode::RequiresExistingArtifact => {
-            if state.mode == Mode::Auto {
-                let artifact = match state.stage {
-                    Stage::Define => "-CONTEXT.md",
-                    _ => "-PLAN.md",
-                };
-                if !phase_artifact_on_develop(project_root, state.phase, artifact) {
-                    return Err(format!(
-                        "phase {} has no {artifact} on develop — {} cannot run the {} \
-                         stage headlessly in auto mode",
-                        state.phase,
-                        driver.name(),
-                        state.stage,
-                    ));
-                }
+            if state.mode == Mode::Auto
+                && state.stage == Stage::Define
+                && !phase_artifact_on_develop(project_root, state.phase, "-CONTEXT.md")
+            {
+                return Err(format!(
+                    "phase {} has no -CONTEXT.md on develop — {} cannot run the {} \
+                     stage headlessly in auto mode",
+                    state.phase,
+                    driver.name(),
+                    state.stage,
+                ));
             }
             Ok(())
         }
@@ -1372,11 +1367,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// D-14/999.106 interactivity check: the gate is driver-driven — Codex
-    /// declares Define AND Plan `RequiresExistingArtifact`, so a headless
-    /// Auto-mode Codex run without CONTEXT.md (Define) or PLAN.md (Plan) on
-    /// develop is flagged; Supervise mode and a non-Codex agent (Claude
-    /// declares HeadlessSafe, verified live 13-06) are unaffected, and the
-    /// artifacts existing on develop clear the gate.
+    /// declares Define `RequiresExistingArtifact`, so a headless Auto-mode
+    /// Codex Define run without CONTEXT.md on develop is flagged. Supervise
+    /// mode, a non-Define stage (Plan is un-gated — PLAN.md is an output), a
+    /// non-Codex agent (Claude declares HeadlessSafe), and a CONTEXT.md that
+    /// does exist are all unaffected.
     #[test]
     fn preflight_interactivity_check_flags_auto_define_without_context_md() {
         let dir = tempfile::tempdir().unwrap();
@@ -1397,7 +1392,7 @@ mod tests {
 
         state.mode = Mode::Auto;
         state.stage = Stage::Plan;
-        assert!(preflight_interactivity_check(root, &state).is_err());
+        assert!(preflight_interactivity_check(root, &state).is_ok());
 
         state.stage = Stage::Define;
         state.agent = AgentKind::Claude;
@@ -1420,13 +1415,10 @@ mod tests {
         };
         std::fs::create_dir_all(root.join(".planning/phases/60-widget")).unwrap();
         std::fs::write(root.join(".planning/phases/60-widget/60-CONTEXT.md"), "ctx").unwrap();
-        std::fs::write(root.join(".planning/phases/60-widget/60-PLAN.md"), "plan").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-q", "-m", "context"]);
 
         state.stage = Stage::Define;
-        assert!(preflight_interactivity_check(root, &state).is_ok());
-        state.stage = Stage::Plan;
         assert!(preflight_interactivity_check(root, &state).is_ok());
     }
 

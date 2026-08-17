@@ -22,6 +22,22 @@ impl AgentDriver for ClaudeDriver {
         crate::prompt::render_claude_style(intent)
     }
 
+    /// Build the headless `stream-json` launch (Phase 31, constraint 1).
+    ///
+    /// **The prompt is deliberately absent from the returned argv.** Under
+    /// `--input-format stream-json` the CLI takes its initial user turn from
+    /// stdin as a JSON document, not from a positional argument; the monitor
+    /// writes that turn via `crate::monitor::user_turn_line`. The `prompt`
+    /// parameter is kept in the signature for the shared `AgentDriver` shape —
+    /// it is unused here on purpose, not by oversight.
+    ///
+    /// `--verbose` is load-bearing, not decoration: every archived Phase-30
+    /// trial that produced a usable capture carried it, and dropping it is
+    /// untested territory. Do not "clean it up".
+    ///
+    /// The switch is unconditional and stage-blind — which stages route here is
+    /// a rollout-order choice made at the call site
+    /// (`claude_stream_launch_enabled`), not a prediction this builder makes.
     fn build_command(
         &self,
         _phase: PhaseId,

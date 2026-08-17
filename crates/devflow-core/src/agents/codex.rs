@@ -48,8 +48,15 @@ impl AgentDriver for CodexDriver {
             let list = extra_writable_roots
                 .iter()
                 .map(|root| {
-                    let path = root.to_string_lossy();
-                    format!("\"{}\"", escape_toml_basic_string(&path))
+                    // Refuse (panic) on a non-UTF-8 path: TOML basic strings are
+                    // UTF-8-only, so a non-UTF-8 root cannot be serialized
+                    // losslessly. A lossy U+FFFD would name a different,
+                    // nonexistent path and silently drop the sandbox write grant
+                    // (999.107 #2 review).
+                    let path = root
+                        .to_str()
+                        .expect("non-UTF-8 writable root path — refusing Codex launch");
+                    format!("\"{}\"", escape_toml_basic_string(path))
                 })
                 .collect::<Vec<_>>()
                 .join(",");
@@ -109,7 +116,9 @@ fn escape_toml_basic_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if (c as u32) < 0x20 || c == '\u{7F}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -150,22 +159,34 @@ mod tests {
         );
     }
 
-    /// 999.107 #2: a non-UTF-8 path is lossily converted to U+FFFD and still
-    /// serializes as a valid TOML string (no raw invalid byte, no raw control
-    /// character).
-    #[cfg(unix)]
+    /// 999.107 #2 / review: DEL (U+007F) must be escaped as `\u007F`, not
+    /// emitted literally — TOML forbids a raw DEL in a basic string.
     #[test]
-    fn codex_writable_roots_lossy_for_non_utf8_paths() {
-        use std::os::unix::ffi::OsStringExt;
-        // 0xFF is not valid UTF-8; `to_string_lossy` maps it to U+FFFD.
-        let raw = std::ffi::OsString::from_vec(vec![b'/', b'r', b'e', b'p', b'o', 0xFF, b'x']);
-        let roots = vec![PathBuf::from(raw)];
+    fn codex_writable_roots_escape_del() {
+        let roots = vec![PathBuf::from("/repo/a\u{7F}b")];
         let (_, args) = CodexDriver.build_command(PhaseId::new(7), "prompt", &roots);
         let flag = writable_roots_flag(&args);
         assert!(
-            flag.contains('\u{FFFD}'),
-            "lossy replacement expected: {flag:?}"
+            !flag.contains('\u{7F}'),
+            "raw DEL must be escaped: {flag:?}"
         );
-        assert!(!flag.contains('\n'), "no raw control chars: {flag:?}");
+        assert!(
+            flag.contains(r#"\u007F"#),
+            "DEL must be `\\u007F`: {flag:?}"
+        );
+    }
+
+    /// 999.107 #2: a non-UTF-8 path cannot be serialized losslessly, so the
+    /// launch must refuse (panic) rather than emit a writable root that names
+    /// a different path.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "non-UTF-8 writable root")]
+    fn codex_writable_roots_refuses_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        // 0xFF is not valid UTF-8.
+        let raw = std::ffi::OsString::from_vec(vec![b'/', b'r', b'e', b'p', b'o', 0xFF, b'x']);
+        let roots = vec![PathBuf::from(raw)];
+        let _ = CodexDriver.build_command(PhaseId::new(7), "prompt", &roots);
     }
 }
