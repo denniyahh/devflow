@@ -1,5 +1,20 @@
 # Milestones
 
+## v2.6.0 Multi-Agent Adapter Migration (Shipped: 2026-08-16)
+
+**Phases completed:** 2 phases, 6 plans, 0 tasks
+
+**Key accomplishments:**
+
+- 36-01 (tracer, wave 1) — `AgentKind::Pi` + `PiAgent` + preflight + doctor integration.
+- 36-02 (wave 2) — 999.104 (deterministic release signing + probe removal) + 999.96
+- 37-01 (tracer, wave 1) — `StageIntent` enum + per-driver `render_prompt` for all five stages + `fix_prompt`.
+- 37-02 (wave 2) — `AgentDriver` contract + `ClaudeDriver`/`OpenCodeDriver` with zero regression.
+- 37-03 (wave 3) — migrate Codex and Pi onto `AgentDriver`; all four agents now resolve through it.
+- 37-04 (wave 4) — `test_contract()`, `DriverHealth`/`InteractivityMode`, docs, and the
+
+---
+
 ## v2.5.0 Loop-Termination and Release Hardening (Shipped: 2026-08-15)
 
 **Phases completed:** 4 phases, 15 plans, 22 tasks

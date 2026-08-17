@@ -151,6 +151,50 @@ blocker on a requirement's traceability row.
 - Notable: Phase 34's live capture campaign declared ~8.2 USD across five stage captures (the CLI's
   own `total_cost_usd`, recorded as reported), dominated by Code at 6.10 USD / 49 turns / 695s.
 
+## Milestone: v2.6.0 — Multi-Agent Adapter Migration
+
+**Shipped:** 2026-08-16
+**Phases:** 2 | **Plans:** 6 | **Tasks:** 8
+
+### What Was Built
+- Pi as a fourth, selectable agent (`AgentKind::Pi` + `pi auth check` health, `--no-approve`).
+- Deterministic release signing (999.104) + `release --check` version-bump row (999.96).
+- The modular `AgentDriver` contract (9-method) replacing `AgentAdapter`, with `StageIntent`
+  de-Claude-ification that fixed Codex's `/gsd-*` defect; Pi as the second native driver; a
+  `test_contract()` conformance suite.
+
+### What Worked
+- The adversarial-review gate (plans + code) caught four renderer regressions and a hardcoded path
+  the automated suite missed — remediating before ship was cheaper than a post-release fix.
+- The DriverShim kept Claude/OpenCode byte-identical through a full contract swap — the
+  zero-regression bar held.
+- Spawn-verifying CLI flags against the installed binaries (`-a never` for codex,
+  `--no-approve`/`--no-refresh` for pi) caught a flag form the 999.31 audit had assumed.
+
+### What Was Inefficient
+- The first `render_workflow_style` draft was too generic — it dropped the per-stage contracts
+  (Validate verdict, Ship gate, Define no-op, Plan idempotency). The code review caught it; a
+  negative-control conformance test up front would have caught it at write time.
+- The worktree-vs-container gitdir limitation forced `DEVFLOW_SKIP_CONTAINER_CHECK=1` on every
+  push — CI re-verified, but local fast-feedback stayed host-only.
+
+### Patterns Established
+- Driver-owned prompt rendering: `StageIntent` (data) + per-driver `render_prompt` (syntax); no
+  shared prompt.
+- Conformance suite (`test_contract()`) with a deliberately-broken negative control.
+- Per-driver `workflow_root` (Codex vs Pi install dirs).
+
+### Key Lessons
+- A "generic" renderer that drops stage contracts is worse than a per-stage renderer that shares
+  boilerplate — preserve the contracts, parameterize the rest.
+- Enumerate call sites before deciding a trait removal is "conditional" — the deferral (999.106)
+  was honest but the blast radius was only visible after the code review.
+
+### Cost Observations
+- Adversarial reviews: 2 (plan + code), each claude(opus) + codex + antigravity.
+- Notable: antigravity's timeout root cause was MCP servers hanging, not prompt size — recorded in
+  the review skill.
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
