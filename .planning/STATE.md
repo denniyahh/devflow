@@ -1,12 +1,15 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.7.0
-milestone_name: Pi End-to-End + Driver Contract Completion
+milestone_name: milestone (Pi End-to-End + Driver Contract Completion, ACTIVE — declared 2026-08-16)
+current_phase_name: defining requirements
 status: planning
-last_updated: "2026-08-17T09:52:45.504Z"
+stopped_at: Phase 38 context gathered
+last_updated: "2026-08-17T14:45:51.464Z"
 last_activity: 2026-08-17
+last_activity_desc: Milestone v2.7.0 started
 progress:
-  total_phases: 0
+  total_phases: 3
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -834,9 +837,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-08T01:44:50.269Z
-**Stopped at:** Phase 35.1 context gathered
-**Resume file:** .planning/phases/35.1-unattended-launch-prerequisites/35.1-CONTEXT.md
+**Last session:** 2026-08-17T14:45:51.417Z
+**Stopped at:** Phase 38 context gathered
+**Resume file:** .planning/phases/38-driver-contract-completion-999-106-999-107/38-CONTEXT.md
 
 ## Operator Next Steps
 
