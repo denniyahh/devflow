@@ -1,71 +1,60 @@
-# Phase 39: Pi End-to-End — Plan
+# Phase 39: Pi End-to-End — Plan (dual-stage, revised)
 
-**Planned:** 2026-08-17
-**Source:** `39-CONTEXT.md` (D-01..D-04) + Phase 37.1 verdict (NOT VIABLE → baseline arm only)
+**Planned:** 2026-08-17 (revised — 37.1 verdict VIABLE via `@bacnh85/pi-subagent`)
+**Source:** `39-CONTEXT.md` (D-01..D-04) + `.planning/reviews/phase-37.1/research/RESEARCH-SUMMARY.md`
 **Package under test:** `devflow` (binary-only) + `devflow-core` (lib)
 
 ## Objective
 
-Make `devflow start --agent pi` complete the pipeline (Plan → Code → Validate → Ship) on the
-**baseline arm only** — `Legacy`/`-p` transport + a Pi-specific structured-completion parser. No
-drain-gate claim, no full-dispatch arm (37.1 verdict: NOT VIABLE). Anything Pi cannot natively
-support is recorded as a limitation, not worked around.
+`devflow start --agent pi` completes Plan → Code → Validate → Ship in two stages: **Stage 1**
+baseline (`Legacy`/`-p` + `litellm` provider fix + completion detection), **Stage 2** dispatch
+(`@bacnh85/pi-subagent` user-scope, no drain gate).
 
-## Open questions to resolve at the top of execution (research, not guesses)
+## Open question to settle at execution (research, not guess)
 
-These are load-bearing and must be answered against the live `pi` 0.84.1 binary before/while
-implementing, per the repo's verify-don't-assume rule:
-
-1. **What does `pi -p --no-approve "<prompt>"` actually emit on stdout?** The baseline transport
-   is `-p` (print mode). The CONTEXT names `agent_end`/`stopReason`/`willRetry` — which are
-   `--mode json` vocabulary, not `-p` vocabulary. A `DEVFLOW_RESULT` marker emitted by `-p` is
-   plain text and *may already be caught* by `parse_devflow_result`'s tail scan. The executor
-   must capture a real `pi -p` run's stdout and decide whether `parse_pi_result` adds anything
-   over the generic marker path, or whether it is needed only for a future `--mode json` arm.
-2. **Provider/credential health:** `pi.rs` hardcodes `pi auth check --provider google`, which
-   returns `not_ready` on this machine while `pi` runs fine (operator `litellm`/`deepseek`
-   config). Decide: drop `--provider google` (let `pi` probe its configured default), or read the
-   provider from Pi's own config. Verify against the live binary.
+The 37.1 research confirmed the `litellm` provider lives in `~/.pi/agent/models.json`
+(`providers.litellm`, models `deepseek-v4-pro`/`deepseek-v4-flash`); `auth.json` is empty `{}`.
+`PiDriver::health` hardcodes `--provider google` → `not_ready`. **Fix:** probe the configured
+provider rather than `google` (read `models.json` or drop `--provider` and let Pi use its default).
+Verify against the live binary before implementing.
 
 ## Waves
 
-### Wave 1 — Pi completion parser (the core)
-- **T-39-01** Add `parse_pi_result(stdout) -> Option<AgentResult>` in `agent_result.rs`, modeled
-  on `parse_codex_event_result`: recognize Pi's completion/error signals (the `DEVFLOW_RESULT`
-  marker, and — for the structured arm — `agent_end`/`stopReason`/`willRetry`) into an
-  `AgentResult`. Resolve open question 1 first; if `-p` output is plain marker text, the parser
-  is a thin, Pi-specific wrapper that also handles Pi's error/retry vocabulary. Must be gated by
-  an `is_pi_output`/`is_pi_event_stream` predicate so it never misclassifies Claude/Codex captures.
-- **T-39-02** Register `parse_pi_result` in `evaluate_layer1`'s `.or_else` chain (after the
-  Claude/Codex parsers, before the final rate-limit heuristic), so Layer 1 owns Pi captures.
+### Wave 1 — Stage 1 baseline
+- **T-39-01** Fix `PiDriver::health`: stop hardcoding `--provider google`. Use the provider from
+  Pi's own config (`models.json`) — or drop `--provider` so `pi auth check` probes its configured
+  default. Keep the `--no-refresh` flag and the `classify_auth_check` readiness gate.
+- **T-39-02** Add a regression test pinning Pi to `MonitorLaunch::Legacy` in `resolve_launch_shape`
+  (Pi is never Claude, so `stream_launch` is false → Legacy). No production change expected.
+- **T-39-03** Completion: confirm the generic `DEVFLOW_RESULT` marker path (`parse_devflow_result` /
+  `evaluate_layer1`) already covers `-p` plain-text completion — a `parse_pi_result` is **not**
+  needed for `@bacnh85` (in-process, plain-text marker). If any Pi-specific failure signal
+  (rate-limit/`agent_end` error) needs handling, add it here, but do not build a JSON-event parser
+  unless a live probe shows `-p` emits non-marker failure text.
 
-### Wave 2 — wire the driver
-- **T-39-03** `PiDriver::parse_completion` → `parse_pi_result` (the `AgentDriver` hook that
-  replaces the deleted `AgentAdapter::completion_signal_detected`).
-
-### Wave 3 — provider/credential health fix
-- **T-39-04** Fix `PiDriver::health`'s hardcoded `--provider google` (open question 2). The check
-  must reflect the operator's actually-configured provider rather than assuming `google`, so a
-  working Pi install is not blocked at preflight.
-
-### Wave 4 — transport lock-in + tests
-- **T-39-05** Verify (and lock with a test) that `resolve_launch_shape` keeps Pi on
-  `MonitorLaunch::Legacy` — Pi is never Claude, so `stream_launch` is false and the `else` branch
-  applies. No production change expected; a regression test pins it.
-- **T-39-06** Tests for `parse_pi_result`: success marker, failure marker, error/`willRetry`
-  signal, and a negative control (a Claude/Codex capture must NOT be classified by the Pi parser).
+### Wave 2 — Stage 2 dispatch arm
+- **T-39-04** `@bacnh85/pi-subagent` integration: user-scope install (or vendor-and-pin) — no
+  source change to DevFlow required (synchronous + process-exit + generic marker already cover it).
+- **T-39-05** Trust-boundary confirmation (no code, an acceptance step): verify the installed
+  extension fails closed headless (rejects project agents without UI) and that no child re-trusts
+  project extensions. Record the evidence.
+- **T-39-06** End-to-end smoke: one `pi -p --no-approve` run with the extension loaded, model
+  delegates to a subagent, parent emits `DEVFLOW_RESULT` after it finishes. **Gated on the
+  credential question** — must run against a profile with `models.json` (live, or throwaway with
+  `models.json` copied), and NOT with `PI_OFFLINE=1`.
 
 ## Out of scope (recorded, not built)
 
-- Full-dispatch arm + `CloseRule` drain-gate coverage → 37.1 verdict NOT VIABLE; backlog.
-- 999.94 (unattended `decision` checkpoint first-option guard).
-- `PipeOwning` transport for Pi — proven to deadlock (review); never routed.
+- `CloseRule`/drain-gate / `PipeOwning` integration for Pi — unnecessary; synchronous in-process
+  dispatch + `Legacy` covers it.
+- Isolated-context (process-spawning) dispatch — follow-on (needs `--no-approve` child patch + a Pi
+  drain predicate).
+- 999.94; provider-agnostic auth beyond the `litellm` fix.
 
 ## Acceptance
 
-- `cargo test -p devflow-core --lib` and `cargo test -p devflow --bin devflow` — green, real
-  `N passed`.
-- `devflow start --agent pi --dry-run` shows the Define→Plan→Code→Validate→Ship pipeline for Pi.
-- A live `pi -p` smoke probe confirms the baseline completion signal is detectable (open question
-  1 answered with evidence, not assumption).
-- No `CloseRule`/`PipeOwning`/drain-gate claim added anywhere.
+- `cargo test -p devflow-core --lib` + `cargo test -p devflow --bin devflow` green; `clippy -D warnings` clean.
+- `devflow start --agent pi --dry-run` shows the full pipeline for Pi.
+- Stage 2 smoke: one live run proves subagent delegation completes under `Legacy` + `DEVFLOW_RESULT`
+  (or is recorded as blocked on credentials with the precise reason).
+- No `CloseRule`/`PipeOwning`/drain-gate claim added.

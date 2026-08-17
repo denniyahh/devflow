@@ -38,10 +38,11 @@ removed; call sites migrated to `AgentDriver`; driver-driven Define/Plan interac
 
 ### Phase 39: Pi End-to-End
 
-**Goal**: Make `devflow start --agent pi` complete the pipeline. Baseline transport on
-`Legacy`/`-p` with structured completion detection (parse Pi's output → completion/error status)
-and the provider/credential fix; the full-dispatch arm (`CloseRule`/drain-gate coverage) is gated
-on Phase 37.1's verdict and lands as a follow-on.
+**Goal**: Make `devflow start --agent pi` complete the pipeline, in two stages. **Stage 1**
+(baseline): `Legacy`/`-p` + completion detection (the generic `DEVFLOW_RESULT` marker) + the
+`litellm` provider fix (`--provider google` → the configured provider). **Stage 2** (dispatch):
+integrate `@bacnh85/pi-subagent` at user scope — synchronous, in-process, so `MonitorLaunch::Legacy`
+observes completion with **no `CloseRule`/drain-gate and no `PipeOwning`** (37.1 verdict VIABLE).
 **Depends on**: Phase 37.1, Phase 38.
 
 ---
