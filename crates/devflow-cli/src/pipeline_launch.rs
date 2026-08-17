@@ -3266,6 +3266,33 @@ mod tests {
         );
     }
 
+    /// Phase 39 Stage 1 regression: Pi always resolves to `MonitorLaunch::Legacy`.
+    /// Pi is never Claude, so `stream_launch` is false and the `else` branch
+    /// applies; `PipeOwning` deadlocks Pi (Pi consumes stdin until EOF while
+    /// `PipeOwning` holds it open — phase-38 review).
+    #[test]
+    fn pi_resolves_to_legacy_launch() {
+        let mut state = State::new(
+            PhaseId::new(39),
+            AgentKind::Pi,
+            Mode::Auto,
+            std::path::PathBuf::from("/tmp"),
+        );
+        state.stage = Stage::Code;
+        let driver = agents::driver_for(state.agent);
+        let (program, args, launch) = resolve_launch_shape(
+            state.agent,
+            driver.as_ref(),
+            state.phase,
+            "the stage prompt".to_string(),
+            &[],
+            false,
+        );
+        assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
+        assert_eq!(program, "pi");
+        assert_eq!(args, vec!["-p", "--no-approve", "the stage prompt"]);
+    }
+
     /// Off by default: nothing set anywhere leaves the run on the Phase 31
     /// transport. An escape hatch that engaged on its own would be the silent
     /// downgrade D-11 rejects.

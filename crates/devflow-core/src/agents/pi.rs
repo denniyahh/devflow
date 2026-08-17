@@ -7,9 +7,10 @@
 //! UNSANDBOXED (Pi ships no sandbox), and a fresh per-phase worktree establishes
 //! no trust decision — that is a security boundary, not a convenience.
 //!
-//! No `--model`/`--provider` wiring here: model/provider selection is the
-//! `AgentDriver` contract's job (Phase 37), and the launch surface has no
-//! config to source it from. Pi uses its own defaults (provider `google`).
+//! No `--model`/`--provider` wiring in the launch argv: model/provider
+//! selection is Pi's own. The `health` check probes the provider(s) actually
+//! configured in Pi's `models.json` (this machine: `litellm`) — not a hardcoded
+//! `google`.
 //!
 //! Note: Pi has NO `--` end-of-options convention — passing `--` is rejected as
 //! an unknown option, so the prompt is passed raw. DevFlow's own stage prompts
@@ -54,25 +55,42 @@ impl AgentDriver for PiDriver {
 
     fn health(&self, _state: &crate::state::State) -> Result<(), String> {
         // Credential readiness via `pi auth check` — Pi's own verb — rather
-        // than env-var sniffing (see `classify_auth_check`).
-        // `--no-refresh` prevents a stalled OAuth token refresh from hanging
-        // preflight (code-review finding #8: `pi auth check` refreshes expired
-        // credentials by default, and `.output()` has no timeout).
-        let output = std::process::Command::new("pi")
-            .args([
-                "auth",
-                "check",
-                "--json",
-                "--provider",
-                "google",
-                "--no-refresh",
-            ])
-            .output()
-            .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
-        classify_auth_check(
-            &String::from_utf8_lossy(&output.stdout),
-            output.status.success(),
-        )
+        // than env-var sniffing (see `classify_auth_check`). `--no-refresh`
+        // prevents a stalled OAuth token refresh from hanging preflight
+        // (code-review finding #8). Probe the actually-configured provider(s)
+        // from `models.json`, NOT a hardcoded `google` — `pi auth check`
+        // requires an explicit `--provider`, and a hardcoded `google` returns
+        // `not_ready` on a LiteLLM-configured machine even though Pi runs fine
+        // (phase-39 review, claude A).
+        let providers = configured_pi_providers();
+        if providers.is_empty() {
+            return Err(
+                "no provider configured in Pi's models.json — run `pi auth check` for details"
+                    .to_string(),
+            );
+        }
+        let mut last_err: Option<String> = None;
+        for provider in providers {
+            let output = std::process::Command::new("pi")
+                .args([
+                    "auth",
+                    "check",
+                    "--json",
+                    "--provider",
+                    &provider,
+                    "--no-refresh",
+                ])
+                .output()
+                .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
+            match classify_auth_check(
+                &String::from_utf8_lossy(&output.stdout),
+                output.status.success(),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "no provider credential resolves".to_string()))
     }
 }
 
@@ -92,6 +110,33 @@ fn classify_auth_check(stdout: &str, success: bool) -> Result<(), String> {
     } else {
         Err("no provider credential resolves — run `pi auth check` for details".to_string())
     }
+}
+
+/// The provider names configured in Pi's `models.json` (the `providers` keys).
+/// Resolves the Pi config dir from `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+/// Empty when the file is missing or unparseable — callers refuse rather than
+/// guess a provider.
+fn configured_pi_providers() -> Vec<String> {
+    let base = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".pi").join("agent"))
+        });
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    let path = base.join("models.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    json.get("providers")
+        .and_then(serde_json::Value::as_object)
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -180,6 +225,19 @@ mod tests {
         dir
     }
 
+    /// Like [`stub_pi_on_path`], plus a `models.json` naming a single `litellm`
+    /// provider — so the health check probes the configured provider instead of
+    /// a hardcoded `google`.
+    fn stub_pi_with_models(body: &str, exit_code: i32) -> tempfile::TempDir {
+        let dir = stub_pi_on_path(body, exit_code);
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"{"providers":{"litellm":{"baseUrl":"http://127.0.0.1:4000/v1","models":[]}}}"#,
+        )
+        .expect("write models.json");
+        dir
+    }
+
     /// RAII guard that replaces `PATH` with `path` and restores the previous
     /// value on `Drop` — including the panic path, so a failing test never
     /// hands the next test a mutated `PATH`.
@@ -205,14 +263,41 @@ mod tests {
         }
     }
 
+    /// RAII guard that sets an environment variable to `value` and restores it
+    /// on `Drop` — the same panic-safe pattern as [`PathGuard`].
+    struct EnvGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &std::path::Path) -> Self {
+            let original = std::env::var_os(name);
+            // SAFETY: held under ENV_MUTEX; no other thread reads/writes this var.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(prev) => unsafe { std::env::set_var(self.name, prev) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
     /// The shell-out must actually spawn `pi auth check --json --provider
-    /// google` — not just classify a pre-parsed string. The stub records its
-    /// argv, so this proves the wiring end to end.
+    /// <configured>` — not just classify a pre-parsed string. The stub records
+    /// its argv, proving the wiring end to end, and that the provider is read
+    /// from `models.json` (`litellm`), not hardcoded.
     #[test]
     fn preflight_invokes_pi_auth_check_and_accepts_ready() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 0);
+        let stub_dir = stub_pi_with_models(r#"{"status":"ready"}"#, 0);
         let _path = PathGuard::set(stub_dir.path());
+        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
 
         PiDriver
             .health(&test_state())
@@ -221,7 +306,7 @@ mod tests {
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
         assert_eq!(
             argv,
-            "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n"
+            "auth\ncheck\n--json\n--provider\nlitellm\n--no-refresh\n"
         );
     }
 
@@ -231,11 +316,12 @@ mod tests {
     #[test]
     fn preflight_reports_credentialless_when_auth_check_says_not_ready() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let stub_dir = stub_pi_on_path(
+        let stub_dir = stub_pi_with_models(
             r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
             0,
         );
         let _path = PathGuard::set(stub_dir.path());
+        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
 
         let err = PiDriver
             .health(&test_state())
@@ -251,12 +337,32 @@ mod tests {
     #[test]
     fn preflight_rejects_ready_body_with_failed_exit() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 1);
+        let stub_dir = stub_pi_with_models(r#"{"status":"ready"}"#, 1);
         let _path = PathGuard::set(stub_dir.path());
+        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
 
         assert!(
             PiDriver.health(&test_state()).is_err(),
             "a failed exit must not be read as ready even when the body says ready"
+        );
+    }
+
+    /// No `models.json` (or an empty one) must refuse with a clear reason, not
+    /// guess a provider.
+    #[test]
+    fn health_refuses_when_no_provider_configured() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // `stub_pi_on_path` writes no models.json, so no provider is configured.
+        let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 0);
+        let _path = PathGuard::set(stub_dir.path());
+        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
+
+        let err = PiDriver
+            .health(&test_state())
+            .expect_err("no configured provider must refuse");
+        assert!(
+            err.contains("no provider configured"),
+            "unexpected error: {err}"
         );
     }
 }
