@@ -18,9 +18,21 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone
+## Current Milestone: v2.7.0 Pi End-to-End + Driver Contract Completion
 
-*(None declared — v2.6.0 closed 2026-08-16; run `$gsd-new-milestone` to declare the next.)*
+**Goal:** Finish the `AgentDriver` migration and make **Pi** run end-to-end —
+`devflow start --agent pi` through all five stages — closing everything Phase 37 deferred.
+
+**Target features:**
+- Phase 38 — **Pi end-to-end**: the Pi JSON-mode event unwrapper + monitor/`CloseRule`
+  integration (route Pi through the pipe-owning arm + the drain gate), so Pi completes
+  Define→Plan→Code→Validate→Ship. **Co-dependent:** the `InteractivityMode` *consumption*
+  (a driver-driven Define/Plan gate replacing the hardcoded `AgentKind::Codex` check) — Pi's
+  Define cannot run headlessly without it.
+- Phase 39 — **driver contract completion**: `999.106`'s remaining half (remove `AgentAdapter`
+  + `DriverShim`, migrate the five call sites) + `999.107` (Codex parser
+  success-before-`turn.failed` ordering + writable-root serialization).
+- `999.94` (tentative) — unattended `decision` checkpoint takes the first option blindly.
 
 <details>
 <summary>Previous milestone: v2.6.0 Multi-Agent Adapter Migration — CLOSED 2026-08-16</summary>

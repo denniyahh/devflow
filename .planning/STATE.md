@@ -1,20 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.6.0
-milestone_name: milestone (Multi-Agent Adapter Migration, CLOSED 2026-08-16)
-status: Awaiting next milestone
-stopped_at: Phase 35.1 context gathered
-last_updated: "2026-08-17T02:07:28.684Z"
-last_activity: 2026-08-16
-last_activity_desc: Phase 37 complete
+milestone: v2.7.0
+milestone_name: Pi End-to-End + Driver Contract Completion
+status: planning
+last_updated: "2026-08-17T09:52:45.504Z"
+last_activity: 2026-08-17
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 6
-  completed_plans: 6
-  percent: 100
-current_phase: 37
-current_phase_name: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -154,10 +150,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v2.6.0 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-16 — Milestone v2.6.0 completed and archived
+Status: Defining requirements
+Last activity: 2026-08-17 — Milestone v2.7.0 started
 
 ## Recently Shipped
 
