@@ -12,7 +12,7 @@
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 37.1 | Pi Subagent-Extension Spike (research) | Not started | — |
-| 38 | Driver Contract Completion (999.106 + 999.107) | Not started | — |
+| 38 | Driver Contract Completion (999.106 + 999.107) | Complete | — |
 | 39 | Pi End-to-End | Not started | — |
 
 ### Phase 37.1: Pi Subagent-Extension Spike (research)
@@ -31,6 +31,10 @@ the `InteractivityMode` consumption (a driver-driven Define/Plan gate replacing 
 success-before-`turn.failed` ordering at `agent_result.rs:764-781`, and the writable-root
 serialization of hostile paths at `codex.rs:47-60`).
 **Depends on**: Phase 37.
+
+- [x] Phase 38 complete (2026-08-17): `AgentAdapter`/`DriverShim` + legacy `*Agent` structs
+removed; call sites migrated to `AgentDriver`; driver-driven Define/Plan interactivity gate; both
+999.107 Codex-parser defects fixed with negative/hostile-path fixtures. 633 + 322 tests green.
 
 ### Phase 39: Pi End-to-End
 
@@ -124,7 +128,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | 4/4 | Complete    | 2026-08-16 |
 | 37.1 | — | Not started | — |
-| 38 | — | Not started | — |
+| 38 | — | Complete    | 2026-08-17 |
 | 39 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
