@@ -16,18 +16,31 @@
 //! never begin with `-`, so the leading-dash hazard (a markdown `- [ ]` list) is
 //! a Phase 37 concern, not something a `--` can guard here.
 
-use super::AgentAdapter;
+use super::{AgentAdapter, AgentDriver};
 use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
-pub struct PiAgent;
+/// The modular driver for Pi (37-03): print-mode `-p` launch, `pi auth check`
+/// health, and the de-Claude-ified workflow-reference prompt. NO JSON unwrapper
+/// or monitor/`CloseRule` integration here — that is 37.1/38 (CONTEXT D-04).
+pub struct PiDriver;
 
-impl AgentAdapter for PiAgent {
+impl AgentDriver for PiDriver {
     fn name(&self) -> &'static str {
         "Pi"
     }
 
-    fn exec_command(
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_workflow_style(intent, &self.workflow_root())
+    }
+
+    /// Pi installs its GSD workflows under `~/.pi/agent/gsd-core/workflows/`,
+    /// NOT the Codex install the default points at (code-review finding #5).
+    fn workflow_root(&self) -> String {
+        "$HOME/.pi/agent/gsd-core/workflows".to_string()
+    }
+
+    fn build_command(
         &self,
         _phase: PhaseId,
         prompt: &str,
@@ -39,27 +52,59 @@ impl AgentAdapter for PiAgent {
         )
     }
 
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        // `pi -p` exits cleanly when done; the monitor detects exit via kill -0.
-        // (Mirrors ClaudeAgent — print-mode transport has no event stream to scan.)
-        false
-    }
-
-    /// Credential readiness via `pi auth check` — Pi's own verb — rather than
-    /// env-var sniffing. `DEVFLOW_PI_PROVIDER` is a provider *name*, not a
-    /// credential; treating it as one is a false-green. `pi auth check` requires
-    /// a `--provider` selector, so it is pinned to `google` (Pi's default) until
-    /// Phase 37 wires provider selection. The "binary absent" case is out of
-    /// scope here: `ensure_agent_binary` runs first on the start path.
-    fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
+    fn health(&self, _state: &crate::state::State) -> Result<(), String> {
+        // Credential readiness via `pi auth check` — Pi's own verb — rather
+        // than env-var sniffing (see `classify_auth_check`).
+        // `--no-refresh` prevents a stalled OAuth token refresh from hanging
+        // preflight (code-review finding #8: `pi auth check` refreshes expired
+        // credentials by default, and `.output()` has no timeout).
         let output = std::process::Command::new("pi")
-            .args(["auth", "check", "--json", "--provider", "google"])
+            .args([
+                "auth",
+                "check",
+                "--json",
+                "--provider",
+                "google",
+                "--no-refresh",
+            ])
             .output()
             .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
         classify_auth_check(
             &String::from_utf8_lossy(&output.stdout),
             output.status.success(),
         )
+    }
+}
+
+/// Legacy `AgentAdapter` face for Pi (D-11 removal point). Delegates to
+/// [`PiDriver`].
+pub struct PiAgent;
+
+impl AgentAdapter for PiAgent {
+    fn name(&self) -> &'static str {
+        PiDriver.name()
+    }
+
+    fn exec_command(
+        &self,
+        phase: PhaseId,
+        prompt: &str,
+        extra_writable_roots: &[PathBuf],
+    ) -> (&'static str, Vec<String>) {
+        PiDriver.build_command(phase, prompt, extra_writable_roots)
+    }
+
+    fn completion_signal_detected(&self, _output: &str) -> bool {
+        // `pi -p` exits cleanly when done; the monitor detects exit via kill -0.
+        false
+    }
+
+    fn preflight(&self, state: &crate::state::State) -> Result<(), String> {
+        PiDriver.health(state)
+    }
+
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        PiDriver.render_prompt(intent)
     }
 }
 
@@ -206,7 +251,10 @@ mod tests {
             .expect("a `ready` stub should pass preflight");
 
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(argv, "auth\ncheck\n--json\n--provider\ngoogle\n");
+        assert_eq!(
+            argv,
+            "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n"
+        );
     }
 
     /// The negative control AC #1 requires: a `pi` binary that reports

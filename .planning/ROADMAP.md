@@ -15,7 +15,7 @@ Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 36 | Pi Adapter Registration + Release Signing | Complete    | — |
-| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94) | Backlog | — |
+| 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi) | Complete    | — |
 
 ### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
 
@@ -29,16 +29,16 @@ the pre-push fingerprint hook). 999.67 was dropped — already shipped.
 **Requirements**: `36-SPEC.md` (locked post adversarial review).
 **Plans**: TBD
 
-### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi + 999.94)
+### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi)
 
 **Goal**: Promote the full `AgentDriver` contract — capability discovery, driver-owned prompt
 rendering, command building, completion parsing, health probes, and a shared conformance suite —
 so agent-specific semantics stop being scattered across `prompt.rs`, `agents/*.rs`,
-`agent_result.rs`, and `preflight.rs`. This is what makes **Pi** actually run end-to-end: the
-`StageIntent` de-Claude-ification of the Code-stage prompt (dropping the literal
-`/gsd-execute-phase` string), Pi's JSON-mode event unwrapper, and the monitor/`CloseRule`
-integration for non-Claude agents. **999.94** (an unattended `decision` checkpoint takes the
-first option without reading it; HIGH) is pencilled here.
+`agent_result.rs`, and `preflight.rs`. Migrates Claude, Codex, OpenCode, and Pi onto the contract
+with zero regression on Claude, and fixes the Codex slash-command defect via the `StageIntent`
+de-Claude-ification (dropping the literal `/gsd-execute-phase` string from every stage). Pi's
+*end-to-end* run (JSON-mode event unwrapper + monitor/`CloseRule` integration) is deferred to a
+`37.1` sub-phase / Phase 38; **999.94** is deferred to Phase 38.
 **Depends on**: Phase 36.
 **Plans**: TBD
 
@@ -109,7 +109,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.2 | 2/2 | Complete    | 2026-08-12 |
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
 | 36 | 2/2 | Complete    | 2026-08-15 |
-| 37 | — | Backlog | — |
+| 37 | 4/4 | Complete    | 2026-08-16 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -2607,6 +2607,56 @@ can miss it entirely.
 **Priority:** Medium. **Size:** M.
 
 ---
+
+### Phase 999.106: Remove `AgentAdapter` and the Legacy DriverShim (DEFERRED from Phase 37)
+
+**Found:** 2026-08-16, closing Phase 37. All four agents now implement the modular `AgentDriver`
+contract, but the legacy `AgentAdapter` trait, the `DriverShim` compatibility shim, and the four
+legacy adapter structs (`ClaudeAgent`/`CodexAgent`/`OpenCodeAgent`/`PiAgent`) were **left in place**
+per CONTEXT D-11 ("remove only if required for Pi; otherwise defer — whatever's easiest"). Pi runs
+fine through the shim, so the removal was deferred rather than risked in the same phase.
+
+**Known call sites to migrate before the trait can be deleted** (verified 2026-08-16):
+
+- `crates/devflow-core/src/canary.rs:40` — the Phase-31 nonce-canary imports `AgentAdapter` +
+  `ClaudeAgent`.
+
+- `crates/devflow-cli/src/test_support.rs:205/244` — `AlwaysFailAdapter`/`FailOnceAdapter` test
+  doubles implement `AgentAdapter`.
+
+- `crates/devflow-cli/src/preflight.rs:1266` — `run_preflight(…, adapter: &dyn AgentAdapter)`.
+- `crates/devflow-cli/src/pipeline_launch.rs:190` — `resolve_launch_shape(…, adapter: &dyn AgentAdapter)`;
+  `:204` calls `ClaudeAgent::exec_command_single_document` (the pre-31 legacy builder).
+
+**Also folds in** the deferred `InteractivityMode` *consumption*: `AgentDriver::interactivity_mode`
+exists (Codex declares Define/Plan → `RequiresExistingArtifact`), but the hardcoded
+`agent == AgentKind::Codex` checks in `commands.rs:289` and `preflight.rs`
+(`preflight_interactivity_check`) still gate the Define/Plan path — wiring them through the driver's
+mode requires the `&dyn AgentAdapter` → `&dyn AgentDriver` signature migration above.
+
+**Size:** M — mechanical, but touches the launch path (`pipeline_launch.rs`), which is the most
+regression-sensitive code in the repo; the four legacy structs and the `DriverShim` are deleted once
+every call site resolves through `AgentDriver`.
+
+### Phase 999.107: Two Pre-Existing Codex-Parser Defects Surfaced by the Phase 37 Code Review (BACKLOG)
+
+**Found:** 2026-08-16, the Phase 37 code review. Pre-existing (not introduced by Phase 37 — both
+functions predate the diff), but real:
+
+1. **The Codex parser lets an earlier success marker beat a later terminal failure.**
+   `crates/devflow-core/src/agent_result.rs:764-781` returns the last `agent_message` marker before
+   examining `turn.failed` (`:784-812`). A stream of `thread.started` →
+   `item.completed(agent_message: DEVFLOW_RESULT success)` → `turn.failed(error: …)` is read as
+   Success, so the stage can advance despite the terminal failure. The existing test covers
+   success + `turn.completed` (`:4490-4498`), not success + `turn.failed`.
+
+2. **Codex writable-root serialization mishandles hostile paths.**
+   `crates/devflow-core/src/agents/codex.rs:47-60` uses `root.display().to_string()` and escapes only
+   `\` and `"`; a non-UTF-8 path becomes `�`, a newline-containing path produces invalid TOML, yielding
+   a malformed `sandbox_workspace_write.writable_roots` override.
+
+**Size:** S–M — #1 is a parser-ordering fix with a new `turn.failed` negative test; #2 is a
+serialization hardening with a hostile-path fixture.
 
 ### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
 

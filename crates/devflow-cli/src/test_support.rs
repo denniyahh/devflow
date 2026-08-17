@@ -220,6 +220,9 @@ impl agents::AgentAdapter for AlwaysFailAdapter {
     fn preflight(&self, _state: &State) -> Result<(), String> {
         Err("test adapter always rejects".to_string())
     }
+    fn render_prompt(&self, intent: &devflow_core::prompt::StageIntent) -> String {
+        devflow_core::prompt::render_claude_style(intent)
+    }
 }
 
 /// TEST-ONLY adapter whose `preflight` fails on the first call only —
@@ -263,6 +266,9 @@ impl agents::AgentAdapter for FailOnceAdapter {
             self.failed_once.set(true);
             Err("test adapter fails on the first preflight call only".to_string())
         }
+    }
+    fn render_prompt(&self, intent: &devflow_core::prompt::StageIntent) -> String {
+        devflow_core::prompt::render_claude_style(intent)
     }
 }
 

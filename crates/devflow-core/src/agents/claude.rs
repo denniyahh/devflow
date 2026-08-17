@@ -5,8 +5,43 @@
 //! back on stdout one JSON object per line. Claude runs headless — no trust
 //! dialogs, no user prompts.
 
-use super::AgentAdapter;
+use super::{AgentAdapter, AgentDriver};
 use crate::phase_id::PhaseId;
+
+/// The modular driver for Claude (37-02): owns the `stream-json` launch and
+/// legacy prompt rendering. `ClaudeAgent` below remains the legacy
+/// `AgentAdapter` face (the D-11 removal point) and delegates to this driver.
+pub struct ClaudeDriver;
+
+impl super::AgentDriver for ClaudeDriver {
+    fn name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_claude_style(intent)
+    }
+
+    fn build_command(
+        &self,
+        _phase: PhaseId,
+        _prompt: &str,
+        _extra_writable_roots: &[std::path::PathBuf],
+    ) -> (&'static str, Vec<String>) {
+        (
+            "claude",
+            vec![
+                "-p".into(),
+                "--input-format".into(),
+                "stream-json".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+        )
+    }
+}
 
 pub struct ClaudeAgent;
 
@@ -46,27 +81,20 @@ impl AgentAdapter for ClaudeAgent {
     /// rather than a deprecated one.
     fn exec_command(
         &self,
-        _phase: PhaseId,
-        _prompt: &str,
-        _extra_writable_roots: &[std::path::PathBuf],
+        phase: PhaseId,
+        prompt: &str,
+        extra_writable_roots: &[std::path::PathBuf],
     ) -> (&'static str, Vec<String>) {
-        (
-            "claude",
-            vec![
-                "-p".into(),
-                "--input-format".into(),
-                "stream-json".into(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--verbose".into(),
-                "--dangerously-skip-permissions".into(),
-            ],
-        )
+        ClaudeDriver.build_command(phase, prompt, extra_writable_roots)
     }
 
     fn completion_signal_detected(&self, _output: &str) -> bool {
         // Claude exits cleanly when done; monitor detects exit via kill -0.
         false
+    }
+
+    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
+        crate::prompt::render_claude_style(intent)
     }
 }
 
