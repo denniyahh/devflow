@@ -22,13 +22,13 @@ existing multi-agent functionality (Claude/Codex). Deliverable: a comparison doc
 + a decision gate (dispatch viable → full-dispatch arm; not viable → reduced-capacity is shipped).
 **Depends on**: Phase 37.
 
-- [x] Phase 37.1 complete (2026-08-17): verdict **NOT VIABLE** — full Pi dispatch moves to
-the backlog; Phase 39 ships the reduced-capacity baseline (`Legacy`/`-p` + `parse_pi_result`).
+- [x] Phase 37.1 complete (2026-08-17): verdict **VIABLE** (revised) — `@bacnh85/pi-subagent`
+works as-is (synchronous, in-process, fails closed headless); Phase 39 ships the full-dispatch arm
+re-scoped to drop `CloseRule`/drain-gate.
 
-**Status (2026-08-17):** Complete — verdict **NOT VIABLE**. Phase 39 ships the reduced-capacity
-baseline (D-02: `Legacy`/`-p` + `parse_pi_result`); full Pi dispatch moves to the backlog as an
-independently-scoped phase (vendored extension + Pi parser + Pi drain predicate). See
-`37.1-DECISION-GATE.md`.
+**Status (2026-08-17):** Complete — verdict **VIABLE** (revised). Phase 39 ships both arms: Stage 1
+baseline (`Legacy`/`-p` + `litellm` provider fix) and Stage 2 dispatch (`@bacnh85` user-scope, no
+drain gate). See `37.1-DECISION-GATE.md` and `.planning/reviews/phase-37.1/research/`.
 
 ### Phase 38: Driver Contract Completion (999.106 + 999.107)
 
