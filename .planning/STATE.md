@@ -1,7 +1,7 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.6.0
-milestone_name: milestone (Multi-Agent Adapter Migration, ACTIVE — declared 2026-08-15)
+milestone_name: milestone (Multi-Agent Adapter Migration, CLOSED 2026-08-16)
 status: Awaiting next milestone
 stopped_at: Phase 35.1 context gathered
 last_updated: "2026-08-17T02:07:28.684Z"
