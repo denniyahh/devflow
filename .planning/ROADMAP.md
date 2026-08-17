@@ -2,6 +2,37 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
+## 🚧 v2.7.0 milestone (Pi End-to-End + Driver Contract Completion, ACTIVE — declared 2026-08-16)
+
+**Declared 2026-08-16, the day v2.6.0 closed.** Finish the `AgentDriver` migration and make
+**Pi** run end-to-end — `devflow start --agent pi` through all five stages — closing everything
+Phase 37 deferred. Phase 38 is the Pi transport/monitor work; Phase 39 removes the legacy
+`AgentAdapter`/`DriverShim` and fixes the two pre-existing Codex-parser defects.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 38 | Pi End-to-End | Not started | — |
+| 39 | Driver Contract Completion (999.106 + 999.107) | Not started | — |
+
+### Phase 38: Pi End-to-End
+
+**Goal**: Make `devflow start --agent pi` complete all five stages. Add the Pi JSON-mode
+(`--mode json`) event unwrapper and integrate Pi with the monitor/`CloseRule` drain gate (route Pi
+through the pipe-owning arm instead of `MonitorLaunch::Legacy`). **Co-dependent:** the
+`InteractivityMode` consumption — a driver-driven Define/Plan gate replacing the hardcoded
+`AgentKind::Codex` check — since Pi's Define cannot run the interactive interview headlessly.
+**Depends on**: Phase 37.
+
+### Phase 39: Driver Contract Completion (999.106 + 999.107)
+
+**Goal**: Remove the legacy `AgentAdapter` trait + `DriverShim` and migrate the five call sites
+(`canary.rs:40`, `test_support.rs:205/244`, `preflight.rs:1266`, `pipeline_launch.rs:190/204`), and
+fix the two pre-existing Codex-parser defects — the success-before-`turn.failed` ordering
+(`agent_result.rs:764-781`) and the writable-root serialization of hostile paths (`codex.rs:47-60`).
+**Depends on**: Phase 37 (parallel with 38; shares `preflight.rs`/`pipeline_launch.rs` touch points).
+
+---
+
 ## ✅ v2.6.0 milestone (CLOSED 2026-08-16 — Multi-Agent Adapter Migration)
 
 **Declared 2026-08-15, closed 2026-08-16.** Replaced the thin `AgentAdapter` trait with the modular
@@ -83,6 +114,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
 | 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | 4/4 | Complete    | 2026-08-16 |
+| 38 | — | Not started | — |
+| 39 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
