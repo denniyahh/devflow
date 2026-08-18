@@ -13,23 +13,26 @@ change.
 
 | Phase | Name | Requirements | Status |
 |---|---|---|---|
-| 40 | Pi Dogfood | PIDG-01 | Not started |
+| 40 | Pi Dogfood | PIDG-01, MAINT-01 | Not started |
 | 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03 | Not started |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |
-| 45 | Opportunistic Cleanup (999.94 + 999.85) | DECN-01, MAINT-01 | Not started |
+| 45 | Opportunistic Cleanup (999.94) | DECN-01 | Not started |
 
 ### Phase 40: Pi Dogfood
-**Goal**: `devflow start --agent pi` drives a real Define→Ship phase end-to-end, proving the Pi
-driver (shipped in v2.7.0) is reliable under real use.
+**Goal**: `devflow start --agent pi` drives a real supervised run through Define→Validate (at least
+one live gate), proving the Pi driver (shipped in v2.7.0) is reliable under real use. Code-stage
+subject: 999.85 (two stale comments, MAINT-01).
 **Depends on**: Nothing (Pi driver already shipped)
-**Requirements**: PIDG-01
+**Requirements**: PIDG-01, MAINT-01
 **Success Criteria** (what must be TRUE):
-  1. A real phase completes Define→Plan→Code→Validate→Ship through `--agent pi` without operator babysitting.
-  2. Every operator gate decision is honored — no lost gate, no marker-less silent advance.
-  3. The deferred isolated-context Pi dispatch item is closed, or re-filed with fresh evidence.
-**Plans**: TBD
+  1. A real supervised run completes Define→Plan→Code→Validate through `--agent pi`; the 999.85 comments are correctly rewritten.
+  2. At least one live gate fires and the operator's decision is honored — no lost gate, no marker-less silent advance.
+  3. Pi-transport regression tests (stubbed `pi`) prove a marker-less run, a non-zero exit, and a hung Pi are each handled without advancing.
+**Plans**: 2 plans
+- [ ] 40-01-PLAN.md — Pi-transport regression tests (stubbed `pi` failure modes)
+- [ ] 40-02-PLAN.md — Real supervised Pi dogfood run (999.85 rewrite + live gate + subagent dispatch)
 
 ### Phase 41: Antigravity Driver
 **Goal**: `devflow start --agent antigravity` launches the Antigravity CLI headless and drives a
@@ -77,14 +80,12 @@ completion/verdict is parsed from the JSON events.
   3. No regression to the existing Codex driver behavior (workspace tests green).
 **Plans**: TBD
 
-### Phase 45: Opportunistic Cleanup (999.94 + 999.85)
-**Goal**: Close 999.94 (unattended `decision` checkpoint blind-first-option, HIGH) and 999.85 (two
-stale comments, low) if capacity permits.
+### Phase 45: Opportunistic Cleanup (999.94)
+**Goal**: Close 999.94 (unattended `decision` checkpoint blind-first-option, HIGH) if capacity permits.
 **Depends on**: Nothing (independent of the driver phases)
-**Requirements**: DECN-01, MAINT-01
+**Requirements**: DECN-01
 **Success Criteria** (what must be TRUE):
   1. An unattended `decision` checkpoint no longer blindly takes the first option — acceptance-tested, since it alters unattended-run policy.
-  2. The two stale comments are removed or corrected.
 **Plans**: TBD
 
 ---
