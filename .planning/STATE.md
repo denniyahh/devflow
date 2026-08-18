@@ -5,14 +5,14 @@ milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 40
 current_phase_name: Pi Dogfood
 status: planning
-stopped_at: Phase 40 context gathered
-last_updated: "2026-08-18T20:52:03.146Z"
+stopped_at: Phase 40 planned (2 plans)
+last_updated: "2026-08-18T23:14:20.614Z"
 last_activity: 2026-08-18
 last_activity_desc: "Milestone v2.8.0 roadmap created (6 phases: 40–45)"
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 0
+  total_plans: 2
   completed_plans: 0
   percent: 0
 ---
@@ -838,8 +838,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-18T20:52:03.089Z
-**Stopped at:** Phase 40 context gathered
+**Last session:** 2026-08-18T23:14:20.567Z
+**Stopped at:** Phase 40 planned (2 plans)
 **Resume file:** .planning/phases/40-pi-dogfood/40-CONTEXT.md
 
 ## Operator Next Steps
