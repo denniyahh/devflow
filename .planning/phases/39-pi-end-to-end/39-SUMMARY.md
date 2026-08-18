@@ -124,7 +124,7 @@ Tasks were bundled into two feature commits plus a review-fix commit (not one co
 - `crates/devflow-cli/src/commands.rs` — extracted `pi_subagent_dispatch_check` + unit test
 - `docs/guides/pi-subagent-dispatch.md` — "reported only, no consumer yet"
 - `ARCHITECTURE.md` — same correction
-- `.planning/phases/39-pi-end-to-end/39-{CONTEXT,PLAN,E2E-SMOKE}.md` — re-scope + evidence correction
+- `.planning/phases/39-pi-end-to-end/39-*.md` — phase artifacts (CONTEXT, PLAN, E2E-SMOKE, SUMMARY, VALIDATION, VERIFICATION, UAT)
 
 ## Decisions Made
 

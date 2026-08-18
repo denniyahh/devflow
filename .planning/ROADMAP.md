@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 37.1 | Pi Subagent-Extension Spike (research) | Not started | — |
 | 38 | Driver Contract Completion (999.106 + 999.107) | Complete | — |
-| 39 | Pi End-to-End | In Progress | — |
+| 39 | Pi End-to-End | Complete    | — |
 
 ### Phase 37.1: Pi Subagent-Extension Spike (research)
 
