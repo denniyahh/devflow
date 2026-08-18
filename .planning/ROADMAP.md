@@ -11,7 +11,7 @@
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 37.1 | Pi Subagent-Extension Spike (research) | Not started | — |
+| 37.1 | Pi Subagent-Extension Spike (research) | Complete | — |
 | 38 | Driver Contract Completion (999.106 + 999.107) | Complete | — |
 | 39 | Pi End-to-End | Complete    | — |
 
@@ -21,6 +21,14 @@
 existing multi-agent functionality (Claude/Codex). Deliverable: a comparison doc + a recommendation
 + a decision gate (dispatch viable → full-dispatch arm; not viable → reduced-capacity is shipped).
 **Depends on**: Phase 37.
+
+- [x] Phase 37.1 complete (2026-08-17): verdict **VIABLE** (revised) — `@bacnh85/pi-subagent`
+works as-is (synchronous, in-process, fails closed headless); Phase 39 ships the full-dispatch arm
+re-scoped to drop `CloseRule`/drain-gate.
+
+**Status (2026-08-17):** Complete — verdict **VIABLE** (revised). Phase 39 ships both arms: Stage 1
+baseline (`Legacy`/`-p` + `litellm` provider fix) and Stage 2 dispatch (`@bacnh85` user-scope, no
+drain gate). See `37.1-DECISION-GATE.md` and `.planning/reviews/phase-37.1/research/`.
 
 ### Phase 38: Driver Contract Completion (999.106 + 999.107)
 
@@ -128,9 +136,9 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
 | 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | 4/4 | Complete    | 2026-08-16 |
-| 37.1 | — | Not started | — |
+| 37.1 | — | Complete    | 2026-08-17 |
 | 38 | — | Complete    | 2026-08-17 |
-| 39 | 1/1 | In Progress|  |
+| 39 | 1/1 | Complete    | 2026-08-18 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
