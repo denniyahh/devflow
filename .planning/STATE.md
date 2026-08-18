@@ -1,20 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.7.0
-milestone_name: milestone (Pi End-to-End + Driver Contract Completion, ACTIVE — declared 2026-08-16)
-status: Awaiting next milestone
-stopped_at: Phase 38 context gathered
-last_updated: "2026-08-18T17:09:45.033Z"
+milestone: v2.8.0
+milestone_name: Remaining Harness Support + Pi Dogfood
+status: planning
+last_updated: "2026-08-18T19:49:00.283Z"
 last_activity: 2026-08-18
-last_activity_desc: Phase 39 complete
 progress:
-  total_phases: 3
-  completed_phases: 2
-  total_plans: 2
-  completed_plans: 2
-  percent: 67
-current_phase: 39
-current_phase_name: Pi End-to-End
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -154,10 +150,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v2.7.0 complete
+Phase: Phase 40 (Pi Dogfood) — ready to plan
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-18 — Milestone v2.7.0 completed and archived
+Status: Ready to plan
+Last activity: 2026-08-18 — Milestone v2.8.0 roadmap created (6 phases: 40–45)
 
 ## Recently Shipped
 
