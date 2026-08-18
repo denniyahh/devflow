@@ -202,11 +202,11 @@ pub(crate) fn commit_on_feature_branch(root: &Path, phase: PhaseId, label: &str)
 /// `poll_response`.
 pub(crate) struct AlwaysFailAdapter;
 
-impl agents::AgentAdapter for AlwaysFailAdapter {
+impl agents::AgentDriver for AlwaysFailAdapter {
     fn name(&self) -> &'static str {
         "test-always-fail"
     }
-    fn exec_command(
+    fn build_command(
         &self,
         _phase: PhaseId,
         _prompt: &str,
@@ -214,10 +214,7 @@ impl agents::AgentAdapter for AlwaysFailAdapter {
     ) -> (&'static str, Vec<String>) {
         ("true", Vec::new())
     }
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        false
-    }
-    fn preflight(&self, _state: &State) -> Result<(), String> {
+    fn health(&self, _state: &State) -> Result<(), String> {
         Err("test adapter always rejects".to_string())
     }
     fn render_prompt(&self, intent: &devflow_core::prompt::StageIntent) -> String {
@@ -244,11 +241,11 @@ impl FailOnceAdapter {
     }
 }
 
-impl agents::AgentAdapter for FailOnceAdapter {
+impl agents::AgentDriver for FailOnceAdapter {
     fn name(&self) -> &'static str {
         "test-fail-once"
     }
-    fn exec_command(
+    fn build_command(
         &self,
         _phase: PhaseId,
         _prompt: &str,
@@ -256,10 +253,7 @@ impl agents::AgentAdapter for FailOnceAdapter {
     ) -> (&'static str, Vec<String>) {
         ("true", Vec::new())
     }
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        false
-    }
-    fn preflight(&self, _state: &State) -> Result<(), String> {
+    fn health(&self, _state: &State) -> Result<(), String> {
         if self.failed_once.get() {
             Ok(())
         } else {

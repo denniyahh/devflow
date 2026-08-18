@@ -755,12 +755,24 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(indeterminate_capture_failure());
     }
 
+    // 999.107 #1: a terminal `turn.failed` must not be overridden by an
+    // earlier `agent_message` success marker. Resolve BOTH the terminal event
+    // and the marker once, then apply precedence: `turn.failed` is decisive
+    // regardless of any success marker that preceded it (the pre-fix order
+    // returned the marker before ever reading the terminal, so a stream ending
+    // `success marker → turn.failed` was misread as Success).
+    let terminal = events.iter().rev().find(|v| {
+        matches!(
+            v.get("type").and_then(serde_json::Value::as_str),
+            Some("turn.completed") | Some("turn.failed")
+        )
+    });
+
     // Codex delivers the agent's DEVFLOW_RESULT self-report inside an
     // `agent_message` item's `text` — never as a raw stdout line — so the
-    // top-level marker scan cannot see it (13-06 dogfood finding: a Codex
-    // `DEVFLOW_RESULT: failed` was invisible and the run fell through to
-    // heuristics). The decoded `text` is a plain marker line; reuse the
-    // marker parser on it. Last marker wins, matching parse_marker_lines.
+    // top-level marker scan cannot see it (13-06 dogfood finding). The decoded
+    // `text` is a plain marker line; reuse the marker parser on it. Last
+    // marker wins, matching parse_marker_lines.
     let marker = events.iter().rev().find_map(|v| {
         if v.get("type").and_then(serde_json::Value::as_str) != Some("item.completed") {
             return None;
@@ -772,6 +784,40 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         let text = item.get("text").and_then(serde_json::Value::as_str)?;
         parse_marker_lines(text)
     });
+
+    if let Some(terminal) = terminal
+        && terminal.get("type").and_then(serde_json::Value::as_str) == Some("turn.failed")
+    {
+        let reason = terminal
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "codex turn failed".to_string());
+
+        // The failure direction is safe, but keep whatever the agent did
+        // self-report (commits/summary/verdict/exit_code) so the gate context
+        // isn't silently discarded (999.107 #1 review). `decided_by_layer` is
+        // deliberately NOT copied — it is the forgeable provenance field, and
+        // Layer 1 owns this verdict.
+        let mut result = AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(reason),
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(1),
+        };
+        if let Some(m) = marker.as_ref() {
+            result.exit_code = m.exit_code;
+            result.commits = m.commits;
+            result.summary = m.summary.clone();
+            result.verdict = m.verdict;
+        }
+        return Some(result);
+    }
+
     if let Some(result) = marker {
         // Same provenance overwrite as parse_devflow_result and the Claude
         // stream path (T-30-26): this AgentResult was deserialized from the
@@ -781,35 +827,9 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(normalise_stream_marker_provenance(result));
     }
 
-    let terminal = events.iter().rev().find(|v| {
-        matches!(
-            v.get("type").and_then(serde_json::Value::as_str),
-            Some("turn.completed") | Some("turn.failed")
-        )
-    })?;
-
-    if terminal.get("type").and_then(serde_json::Value::as_str) != Some("turn.failed") {
-        // turn.completed (or any other terminal we don't recognize) defers
-        // to Layer 2 rather than an unconditional Success.
-        return None;
-    }
-
-    let reason = terminal
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "codex turn failed".to_string());
-
-    Some(AgentResult {
-        status: AgentStatus::Failed,
-        exit_code: None,
-        reason: Some(reason),
-        commits: None,
-        summary: None,
-        verdict: None,
-        decided_by_layer: Some(1),
-    })
+    // turn.completed (or no terminal event at all) with no marker defers to
+    // Layer 2 rather than an unconditional Success.
+    None
 }
 
 /// Parse a captured stdout as JSONL: one `serde_json::Value` per non-blank,
@@ -4141,10 +4161,10 @@ mod tests {
     /// The Codex arm of the trailing-torn rule — same R1 root cause, and the
     /// Codex adapter is live in production.
     ///
-    /// The resurrection shape here is a torn SUPERSEDING marker: codex verdict
-    /// precedence is marker-over-`turn.failed` by design (13-06 dogfood
-    /// finding), and last-marker-wins — so the tear that matters is one that
-    /// conceals a LATER marker contradicting an earlier success.
+    /// A torn tail must not resurrect an earlier success marker: the torn-tail
+    /// check runs before both the terminal and marker scans. (The
+    /// terminal-vs-marker precedence is now `turn.failed`-over-marker —
+    /// 999.107 #1 — superseding the pre-fix marker-first order.)
     #[test]
     fn codex_torn_tail_does_not_resurrect_earlier_success_marker() {
         let intact = concat!(
@@ -4495,6 +4515,23 @@ mod tests {
         );
         let result = parse_codex_event_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// 999.107 #1: the pre-fix parser returned the `agent_message` success
+    /// marker before examining the terminal event, so a stream that ended
+    /// `success marker → turn.failed` was misread as Success and the stage
+    /// could advance despite the terminal failure. A terminal `turn.failed`
+    /// must win over any earlier success marker.
+    #[test]
+    fn codex_turn_failed_beats_an_earlier_success_marker() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\": \\\"success\\\"}\"}}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"sandbox denied write\"}}\n",
+        );
+        let result = parse_codex_event_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("sandbox denied write"));
     }
 
     /// 13-06 dogfood regression: document content echoed into a JSONL event

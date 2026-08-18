@@ -6,8 +6,8 @@ DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
 coding agent needs to drive a development phase end-to-end: branch creation,
 agent launch, completion detection, gated human checkpoints, versioning,
 docs/changelog updates, and cleanup. It runs a 5-stage pipeline
-(Define → Plan → Code → Validate → Ship), today against three supported
-agent adapters (Claude Code, OpenAI Codex, OpenCode) — opinionated by design,
+(Define → Plan → Code → Validate → Ship), today against four supported
+agents (Claude Code, OpenAI Codex, OpenCode, Pi) through the modular `AgentDriver` contract — opinionated by design,
 not a universal agent platform — in either `auto` (unattended) or
 `supervise` (gated) mode.
 
@@ -18,7 +18,32 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone: v2.6.0 Multi-Agent Adapter Migration
+## Current Milestone
+
+*(None declared — v2.7.0 closed 2026-08-18; run `$gsd-new-milestone` to declare the next.)*
+
+<details>
+<summary>Previous milestone: v2.7.0 Pi End-to-End + Driver Contract Completion — CLOSED 2026-08-18</summary>
+
+**Delivered.** The `AgentDriver` migration is finished and **Pi** runs end-to-end. Phase 37.1
+(research spike) returned a **VIABLE** verdict for `@bacnh85/pi-subagent`; Phase 38 removed
+`AgentAdapter` + `DriverShim`, wired `InteractivityMode`, and fixed 999.107; Phase 39 landed the Pi
+pipeline (provider-aware health, `Legacy` launch, subagent dispatch with no drain gate).
+
+**Target features:**
+- Phase 37.1 — Pi subagent-extension spike (research): verdict **VIABLE** (`@bacnh85/pi-subagent`).
+- Phase 38 — driver contract completion (999.106 + 999.107).
+- Phase 39 — Pi end-to-end: `devflow start --agent pi` completes the pipeline.
+- `999.94` (tentative) — unattended `decision` checkpoint takes the first option blindly (carried).
+
+**Closed 2026-08-18, not yet released** — `Cargo.toml` is still `2.6.0` and no `v2.7.0` tag exists;
+release/tag is a separate step. Full phase detail archived to `.planning/milestones/v2.7.0-ROADMAP.md`;
+phase dirs to `.planning/milestones/v2.7.0-phases/`.
+
+</details>
+
+<details>
+<summary>Previous milestone: v2.6.0 Multi-Agent Adapter Migration — CLOSED 2026-08-16</summary>
 
 **Goal:** Replace the thin `AgentAdapter` trait with a driver architecture that onboards new
 agents without agent-specific logic leaking into core — and prove it by onboarding **Pi** as the
@@ -39,6 +64,8 @@ first newly-supported agent. The full modular `AgentDriver` refactor (backlog 99
 **v2.6.0 is a planning label**, next minor after the last shipped v2.5.0 — the actual crate version
 is still derived automatically from conventional-commit classification at release time
 (`version.rs`), per this project's established versioning policy; it may not land exactly here.
+
+</details>
 
 <details>
 <summary>Previous milestone: v2.5.0 Loop-Termination and Release Hardening — CLOSED 2026-08-15</summary>
@@ -263,7 +290,7 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
   through Phase 16. Current operator commands include `start`, `gate`, `logs`,
   `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
   `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `2.3.0` (shipped 2026-08-04, tag `v2.3.0`, signed).
+- Workspace version is `2.6.0` (shipped 2026-08-16, tag `v2.6.0`, signed).
   Code/docs historically over-claimed "v2.0.0" as current; Phase 12 corrected
   this. The `v2.0.0` label named an **open-ended** milestone rather than a
   bounded arc — decided 2026-07-23 (ROADMAP.md "Milestone stays open") — and
@@ -317,6 +344,14 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | gsd-hygiene closes unversioned — no `vX.Y.Z` tag, archived under the plain label `gsd-hygiene` instead of `v[X.Y]` (Phase 32 close, 2026-08-04) | The milestone was declared intentionally unversioned (pure `.planning/` docs, no crates code, nothing published); a semver tag would misrepresent it and pollute the tag namespace shared with real crates.io releases | ✓ Good |
 | Backfilled `32-01-PLAN.md`/`32-01-SUMMARY.md` after the fact, explicitly labeled as backfilled, to work around `init.manager`'s `planCount > 0` assumption (Phase 32 close, 2026-08-04) | `buildPhaseCompletionProjection` never reads a phase's real VERIFICATION.md when `plan_count` is 0, so a genuinely complete zero-plan phase reports `phase_complete: false` forever; filed upstream as issue 18. Operator chose this over silently overriding the milestone-close readiness gate | ✓ Good |
 | `milestone.complete` ran cleanly (no `--dry-run` bypass needed) for gsd-hygiene's close, unlike v2.3.0's | 999.72's fix (this same milestone) is what made the CLI's phase-scoping correct — direct confirmation the fix holds, not just the earlier `--dry-run` checks | ✓ Good |
+| Pi is the second native `AgentDriver` (Phase 37, operator decision — supersedes 999.31 D-02's Claude/OpenCode answer) | Priority is preserving Claude (zero regression) and onboarding Pi; Claude/OpenCode stay legacy via the shim until 999.106 removes it | ✓ Good |
+| `-a never` (Codex global flag, before `exec`) and `--no-approve` (Pi) are spawn-verified against the installed CLIs (Phase 37) | The review showed `--ask-for-approval never` on `codex exec` is rejected; flag placement/form must be proven by a real spawn, never assumed | ✓ Good |
+| `AgentAdapter` removal deferred (D-11 conditional) → 999.106 | Pi runs through the shim, so removal is not required; deferring avoids a risky launch-path refactor in the same phase | ✓ Good (Phase 38 removed it) |
+| Pi end-to-end (JSON unwrapper + monitor `CloseRule`) deferred to 37.1/38 | The migration core is the shared prerequisite; the Pi-specific tail is deferred rather than rushed | ✓ Good (Phase 39, re-scoped to Legacy + no CloseRule) |
+| Pi health probes `settings.json`'s `defaultProvider`, not "any ready `models.json` provider" (Phase 39) | `build_command` passes no `--provider`, so the run uses the default; probing a catalog false-greens, and refusing on absent `models.json` false-rejects standard installs | ✓ Good |
+| Pi pinned to `MonitorLaunch::Legacy`, never `PipeOwning` (Phase 39) | `PipeOwning`'s stdin wire protocol deadlocks Pi (phase-38 review); the regression test asserts the `claude_stream_launch_enabled` precondition | ✓ Good |
+| Subagent dispatch via `@bacnh85/pi-subagent` (in-process, synchronous) under `Legacy` (Phase 39) | The 37.1 verdict: a synchronous extension awaits its children, so process-exit supervision suffices — no `CloseRule`/drain gate | ✓ Good |
+| Capability detection matches the vetted `@bacnh85/pi-subagent` name, not `*subagent*` (Phase 39) | Unsafe/deferred packages (`@mystilleef` etc.) must not report "available" | ✓ Good |
 
 ## Key Files
 
@@ -344,7 +379,11 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)
+*Last updated: 2026-08-18 after the v2.7.0 milestone (Pi End-to-End + Driver Contract Completion) — 3/3 phases (37.1 research, 38, 39), 2/2 plans, verified + validated. NOT yet released: `Cargo.toml` still `2.6.0`, no `v2.7.0` tag — release/tag is a separate step. Milestone archived to `.planning/milestones/v2.7.0-*`; phase dirs to `v2.7.0-phases/`.*
+
+*Previous: 2026-08-16 after the v2.6.0 milestone (Multi-Agent Adapter Migration) — 2/2 phases (36, 37), 6/6 plans, verified + validated + secured (threats_open: 0). Released as `v2.6.0`: signed tag on `main`, both crates published (devflow-core → devflow), main→develop synced (merge commit), GitHub Release published, milestone archived to `.planning/milestones/v2.6.0-*`; phase dirs archived to `v2.6.0-phases/`.*
+
+*Previous: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)
 shipped as v2.1.0 — 18/19 plans (25-10 superseded by 25-13), verified 10/10
 across five gap-closure rounds, 129/129 threats closed, broken-windows ledger at
 0 open / 1 waived / 4 fixed. PR #47 → develop, #50 squash-merged to main,

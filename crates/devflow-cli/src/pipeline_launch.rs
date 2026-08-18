@@ -87,9 +87,9 @@ pub(crate) fn launch_stage_inner(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
-    let adapter = agents::adapter_for(state.agent);
+    let driver = agents::driver_for(state.agent);
     let prompt = prompt_override.unwrap_or_else(|| {
-        adapter.render_prompt(&prompt::StageIntent::for_stage_in_project(
+        driver.render_prompt(&prompt::StageIntent::for_stage_in_project(
             state.stage,
             state.phase,
             Some(&state.project_root),
@@ -104,7 +104,7 @@ pub(crate) fn launch_stage_inner(
         .as_deref()
         .map(|wt| worktree_writable_roots(&state.project_root, wt))
         .unwrap_or_default();
-    // D-09/D-10 sequencing gate. `ClaudeAgent::exec_command` is itself
+    // D-09/D-10 sequencing gate. `ClaudeDriver::build_command` is itself
     // unconditional and stage-blind (constraint 1 forbids predicting at launch
     // time which stages background work); the choice of which stages have been
     // widened to it *yet* is a rollout-order choice, made here at the call
@@ -151,7 +151,7 @@ pub(crate) fn launch_stage_inner(
 
     let (program, args, launch) = resolve_launch_shape(
         state.agent,
-        adapter.as_ref(),
+        driver.as_ref(),
         state.phase,
         prompt,
         &roots,
@@ -175,7 +175,7 @@ pub(crate) fn launch_stage_inner(
         state,
         program,
         &args,
-        &adapter.extra_env(),
+        &driver.environment(),
         archived_stage,
         launch,
     )
@@ -191,24 +191,24 @@ pub(crate) fn launch_stage_inner(
 /// canary gate, and the D-11 notice.
 fn resolve_launch_shape(
     agent: AgentKind,
-    adapter: &dyn agents::AgentAdapter,
+    driver: &dyn agents::AgentDriver,
     phase: PhaseId,
     prompt: String,
     roots: &[std::path::PathBuf],
     stream_launch: bool,
 ) -> (&'static str, Vec<String>, monitor::MonitorLaunch) {
     if stream_launch {
-        let (program, args) = adapter.exec_command(phase, &prompt, roots);
+        let (program, args) = driver.build_command(phase, &prompt, roots);
         (program, args, monitor::MonitorLaunch::PipeOwning { prompt })
     } else if agent == AgentKind::Claude {
         // Claude on a stage the rollout has not reached, or a run that took
         // D-11's opt-out: the explicitly named pre-31 builder, NOT
         // `exec_command` — which now returns the stream-json shape for every
         // stage.
-        let (program, args) = agents::ClaudeAgent::exec_command_single_document(&prompt);
+        let (program, args) = agents::ClaudeDriver::exec_command_single_document(&prompt);
         (program, args, monitor::MonitorLaunch::Legacy)
     } else {
-        let (program, args) = adapter.exec_command(phase, &prompt, roots);
+        let (program, args) = driver.build_command(phase, &prompt, roots);
         (program, args, monitor::MonitorLaunch::Legacy)
     }
 }
@@ -575,8 +575,8 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 ///
 /// **The launch argv is stage-blind, so a per-stage capture is evidence about
 /// the AGENT and never about the transport** (ROADMAP criterion 1; 34-REVIEW.md
-/// R-02). [`devflow_core::agents::AgentAdapter::exec_command`]
-/// (`crates/devflow-core/src/agents/claude.rs:46`) ignores all three of its
+/// R-02). [`devflow_core::agents::ClaudeDriver::build_command`]
+/// (`crates/devflow-core/src/agents/claude.rs`) ignores all three of its
 /// `_phase`, `_prompt` and `_extra_writable_roots` arguments — verified by
 /// reading the body, which returns a fixed `vec![...]`, not by the underscore
 /// prefixes — and so returns a **byte-identical** argv for every stage.
@@ -998,7 +998,7 @@ fn spawn_agent_and_record(
     println!(
         "stage {} → launched {} (monitor pid {pid})",
         state.stage,
-        agents::adapter_for(state.agent).name()
+        agents::driver_for(state.agent).name()
     );
     Ok(())
 }
@@ -1045,7 +1045,7 @@ pub(crate) fn relaunch_checkpoint_session(
         }),
     );
 
-    let (program, args) = agents::ClaudeAgent::exec_resume_command(session_id, &instruction);
+    let (program, args) = agents::ClaudeDriver::exec_resume_command(session_id, &instruction);
 
     // `Legacy`, deliberately: `exec_resume_command` builds the pre-31
     // single-document shape (positional instruction, `--output-format json`),
@@ -1080,9 +1080,9 @@ pub(crate) fn launch_stage(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
-    let adapter = agents::adapter_for(state.agent);
+    let driver = agents::driver_for(state.agent);
     let prompt = prompt_override.clone().unwrap_or_else(|| {
-        adapter.render_prompt(&prompt::StageIntent::for_stage_in_project(
+        driver.render_prompt(&prompt::StageIntent::for_stage_in_project(
             state.stage,
             state.phase,
             Some(&state.project_root),
@@ -1093,7 +1093,7 @@ pub(crate) fn launch_stage(
         .as_deref()
         .map(|wt| worktree_writable_roots(&state.project_root, wt))
         .unwrap_or_default();
-    let (program, _args) = adapter.exec_command(state.phase, &prompt, &roots);
+    let (program, _args) = driver.build_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
 
     // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
@@ -1105,7 +1105,7 @@ pub(crate) fn launch_stage(
     // abort) — this frame must not run any more launch steps in that case,
     // or the agent gets spawned a second time for the same stage.
     let project_root = state.project_root.clone();
-    if !run_preflight(&project_root, state, adapter.as_ref())? {
+    if !run_preflight(&project_root, state, driver.as_ref())? {
         return Ok(());
     }
 
@@ -3246,10 +3246,10 @@ mod tests {
             state.legacy_claude_launch
         ));
 
-        let adapter = agents::adapter_for(state.agent);
+        let driver = agents::driver_for(state.agent);
         let (program, args, launch) = resolve_launch_shape(
             state.agent,
-            adapter.as_ref(),
+            driver.as_ref(),
             state.phase,
             "the stage prompt".to_string(),
             &[],
@@ -3260,10 +3260,47 @@ mod tests {
         assert_eq!(program, "claude");
         assert_eq!(
             (program, args),
-            agents::ClaudeAgent::exec_command_single_document("the stage prompt"),
+            agents::ClaudeDriver::exec_command_single_document("the stage prompt"),
             "the forced path must be exec_command_single_document byte-for-byte, \
              not an approximation of it"
         );
+    }
+
+    /// Phase 39 Stage 1 regression: Pi always resolves to `MonitorLaunch::Legacy`.
+    /// Pi is never Claude, so `stream_launch` is false and the `else` branch
+    /// applies; `PipeOwning` deadlocks Pi (Pi consumes stdin until EOF while
+    /// `PipeOwning` holds it open — phase-38 review).
+    #[test]
+    fn pi_resolves_to_legacy_launch() {
+        let mut state = State::new(
+            PhaseId::new(39),
+            AgentKind::Pi,
+            Mode::Auto,
+            std::path::PathBuf::from("/tmp"),
+        );
+        state.stage = Stage::Code;
+
+        // Precondition: Pi must NOT be in the stream-json rollout, so the
+        // assertion below discriminates a broken `claude_stream_launch_enabled`
+        // predicate instead of a stage that was going to be Legacy anyway
+        // (phase-39 code review, finding 3).
+        assert!(
+            !claude_stream_launch_enabled(state.agent, state.stage, false),
+            "Pi must never be stream-launch-enabled for this test to mean anything"
+        );
+
+        let driver = agents::driver_for(state.agent);
+        let (program, args, launch) = resolve_launch_shape(
+            state.agent,
+            driver.as_ref(),
+            state.phase,
+            "the stage prompt".to_string(),
+            &[],
+            false,
+        );
+        assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
+        assert_eq!(program, "pi");
+        assert_eq!(args, vec!["-p", "--no-approve", "the stage prompt"]);
     }
 
     /// Off by default: nothing set anywhere leaves the run on the Phase 31
@@ -3288,10 +3325,10 @@ mod tests {
             claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(stream_launch);
 
-        let adapter = agents::adapter_for(state.agent);
+        let driver = agents::driver_for(state.agent);
         let (_program, _args, launch) = resolve_launch_shape(
             state.agent,
-            adapter.as_ref(),
+            driver.as_ref(),
             state.phase,
             "the stage prompt".to_string(),
             &[],
@@ -3461,10 +3498,10 @@ mod tests {
             stream_launch,
             "a parse failure must not select the legacy path — D-11 rejects automatic fallback"
         );
-        let adapter = agents::adapter_for(state.agent);
+        let driver = agents::driver_for(state.agent);
         let (_program, _args, launch) = resolve_launch_shape(
             state.agent,
-            adapter.as_ref(),
+            driver.as_ref(),
             state.phase,
             "the stage prompt".to_string(),
             &[],

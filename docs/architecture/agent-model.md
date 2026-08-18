@@ -26,6 +26,7 @@ pub trait AgentDriver {
 | Claude Code | `claude` | `AgentKind::Claude` | `claude` |
 | OpenAI Codex | `codex` | `AgentKind::Codex` | `codex` |
 | OpenCode | `opencode` | `AgentKind::OpenCode` | `opencode`, `open-code` |
+| Pi | `pi` | `AgentKind::Pi` | `pi` |
 
 ## Drivers
 
@@ -35,7 +36,7 @@ Each agent has a dedicated driver file under `crates/devflow-core/src/agents/`:
 - `codex.rs` — Codex driver
 - `opencode.rs` — OpenCode driver
 - `pi.rs` — Pi driver
-- `mod.rs` — `AgentDriver` trait definition + `adapter_for()` factory + conformance suite
+- `mod.rs` — `AgentDriver` trait definition + `driver_for()` factory + conformance suite
 
 ## Driver-owned prompts
 

@@ -2,45 +2,35 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## 🚧 v2.6.0 milestone (Multi-Agent Adapter Migration, ACTIVE — declared 2026-08-15)
+## ✅ v2.7.0 milestone (CLOSED 2026-08-18 — Pi End-to-End + Driver Contract Completion)
 
-**Declared 2026-08-15, the day v2.5.0 closed.** Replace the thin `AgentAdapter` trait with a
-driver architecture that onboards new agents without agent-specific logic leaking into core — and
-prove it by onboarding **Pi** as the first newly-supported agent. The full modular `AgentDriver`
-refactor (backlog **999.31**, size L) is the real vehicle: Phase 36 registers Pi as a selectable
-adapter plus release hardening; Phase 37 does the `AgentDriver`/`StageIntent` work that makes Pi
-run end-to-end — the adversarial review showed Pi cannot reach terminal completion until the
-Code-stage prompt stops hardcoding Claude's `/gsd-execute-phase`.
+**Declared 2026-08-16, closed 2026-08-18.** Finished the `AgentDriver` migration and made **Pi**
+run end-to-end. Phase 37.1 (research spike) returned a **VIABLE** verdict for `@bacnh85/pi-subagent`;
+Phase 38 removed `AgentAdapter` and wired `InteractivityMode` plus the two 999.107 fixes; Phase 39
+landed the Pi pipeline (provider-aware health, `Legacy` launch, subagent dispatch). Full phase detail
+archived to `.planning/milestones/v2.7.0-ROADMAP.md`; phase directories to
+`.planning/milestones/v2.7.0-phases/`.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 37.1 | Pi Subagent-Extension Spike (research) | Complete | — |
+| 38 | Driver Contract Completion (999.106 + 999.107) | Complete | — |
+| 39 | Pi End-to-End | Complete    | — |
+
+---
+
+## ✅ v2.6.0 milestone (CLOSED 2026-08-16 — Multi-Agent Adapter Migration)
+
+**Declared 2026-08-15, closed 2026-08-16.** Replaced the thin `AgentAdapter` trait with the modular
+`AgentDriver` contract and onboarded **Pi** as the first newly-supported agent — Phase 36 (Pi
+adapter + release hardening) and Phase 37 (`AgentDriver`/`StageIntent` migration: Codex fixed, Pi
+as the second native driver, conformance suite). Full phase detail archived to
+`.planning/milestones/v2.6.0-ROADMAP.md`; phase directories to `.planning/milestones/v2.6.0-phases/`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 36 | Pi Adapter Registration + Release Signing | Complete    | — |
 | 37 | Modular Agent Driver Architecture + Pi Driver (999.31 + Pi) | Complete    | — |
-
-### Phase 36: Pi Adapter Registration + Release Signing (Pi + 999.96 + 999.104)
-
-**Goal**: DevFlow registers **Pi** as a fourth, selectable agent adapter (`AgentKind::Pi` +
-`PiAgent` + a preflight health check distinguishing "installed" from "can execute headless") —
-**not** an end-to-end run, which is Phase 37 — plus two release items: **999.96** (`release --check`
-can't catch a forgotten version bump; S, synthetic fixture) and **999.104** (deterministic release
-signing key: sign with `devflow.releaseSigningKey` in code, remove the signing-viability probe and
-the pre-push fingerprint hook). 999.67 was dropped — already shipped.
-**Depends on**: Nothing (first phase of this milestone).
-**Requirements**: `36-SPEC.md` (locked post adversarial review).
-**Plans**: TBD
-
-### Phase 37: Modular Agent Driver Architecture + Pi Driver (999.31 + Pi)
-
-**Goal**: Promote the full `AgentDriver` contract — capability discovery, driver-owned prompt
-rendering, command building, completion parsing, health probes, and a shared conformance suite —
-so agent-specific semantics stop being scattered across `prompt.rs`, `agents/*.rs`,
-`agent_result.rs`, and `preflight.rs`. Migrates Claude, Codex, OpenCode, and Pi onto the contract
-with zero regression on Claude, and fixes the Codex slash-command defect via the `StageIntent`
-de-Claude-ification (dropping the literal `/gsd-execute-phase` string from every stage). Pi's
-*end-to-end* run (JSON-mode event unwrapper + monitor/`CloseRule` integration) is deferred to a
-`37.1` sub-phase / Phase 38; **999.94** is deferred to Phase 38.
-**Depends on**: Phase 36.
-**Plans**: TBD
 
 ---
 
@@ -110,6 +100,9 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 35.3 | 3/3 | Complete    | 2026-08-12 |
 | 36 | 2/2 | Complete    | 2026-08-15 |
 | 37 | 4/4 | Complete    | 2026-08-16 |
+| 37.1 | — | Complete    | 2026-08-17 |
+| 38 | — | Complete    | 2026-08-17 |
+| 39 | 1/1 | Complete    | 2026-08-18 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

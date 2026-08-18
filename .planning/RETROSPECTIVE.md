@@ -151,6 +151,84 @@ blocker on a requirement's traceability row.
 - Notable: Phase 34's live capture campaign declared ~8.2 USD across five stage captures (the CLI's
   own `total_cost_usd`, recorded as reported), dominated by Code at 6.10 USD / 49 turns / 695s.
 
+## Milestone: v2.6.0 — Multi-Agent Adapter Migration
+
+**Shipped:** 2026-08-16
+**Phases:** 2 | **Plans:** 6 | **Tasks:** 8
+
+### What Was Built
+- Pi as a fourth, selectable agent (`AgentKind::Pi` + `pi auth check` health, `--no-approve`).
+- Deterministic release signing (999.104) + `release --check` version-bump row (999.96).
+- The modular `AgentDriver` contract (9-method) replacing `AgentAdapter`, with `StageIntent`
+  de-Claude-ification that fixed Codex's `/gsd-*` defect; Pi as the second native driver; a
+  `test_contract()` conformance suite.
+
+### What Worked
+- The adversarial-review gate (plans + code) caught four renderer regressions and a hardcoded path
+  the automated suite missed — remediating before ship was cheaper than a post-release fix.
+- The DriverShim kept Claude/OpenCode byte-identical through a full contract swap — the
+  zero-regression bar held.
+- Spawn-verifying CLI flags against the installed binaries (`-a never` for codex,
+  `--no-approve`/`--no-refresh` for pi) caught a flag form the 999.31 audit had assumed.
+
+### What Was Inefficient
+- The first `render_workflow_style` draft was too generic — it dropped the per-stage contracts
+  (Validate verdict, Ship gate, Define no-op, Plan idempotency). The code review caught it; a
+  negative-control conformance test up front would have caught it at write time.
+- The worktree-vs-container gitdir limitation forced `DEVFLOW_SKIP_CONTAINER_CHECK=1` on every
+  push — CI re-verified, but local fast-feedback stayed host-only.
+
+### Patterns Established
+- Driver-owned prompt rendering: `StageIntent` (data) + per-driver `render_prompt` (syntax); no
+  shared prompt.
+- Conformance suite (`test_contract()`) with a deliberately-broken negative control.
+- Per-driver `workflow_root` (Codex vs Pi install dirs).
+
+### Key Lessons
+- A "generic" renderer that drops stage contracts is worse than a per-stage renderer that shares
+  boilerplate — preserve the contracts, parameterize the rest.
+- Enumerate call sites before deciding a trait removal is "conditional" — the deferral (999.106)
+  was honest but the blast radius was only visible after the code review.
+
+### Cost Observations
+- Adversarial reviews: 2 (plan + code), each claude(opus) + codex + antigravity.
+- Notable: antigravity's timeout root cause was MCP servers hanging, not prompt size — recorded in
+  the review skill.
+
+## Milestone: v2.7.0 — Pi End-to-End + Driver Contract Completion
+
+**Shipped:** 2026-08-18 (milestone closed; NOT released — `Cargo.toml` still `2.6.0`, no tag yet)
+**Phases:** 3 | **Plans:** 2 | **Tasks:** 15
+
+### What Was Built
+- 37.1 (research spike): a **VIABLE** verdict for `@bacnh85/pi-subagent` — primary-source research overturned the original NOT VIABLE verdict (which read zero lines of source).
+- 38: `AgentAdapter`/`DriverShim` deleted, all call sites migrated to `AgentDriver`, `InteractivityMode` wired (Define/Plan), 999.107 fixed (`turn.failed` precedence + non-UTF-8 writable-root refusal).
+- 39: Pi end-to-end — provider-aware health, `Legacy` launch, vetted capability detection, and a live subagent-dispatch run captured as a transcript.
+
+### What Worked
+- The adversarial code review (FIX-FIRST) caught the provider-fix BLOCKER — `models.json`-based probing false-rejects standard installs and false-greens any-ready providers — before ship.
+- Re-running the e2e with the session transcript captured (the `toolCall: subagent` → nested `bash` → `DEVFLOW_RESULT` chain) replaced a proxy-only first smoke that recorded a bash side-effect file.
+- Backfilling formal SUMMARY/VERIFICATION artifacts for already-complete phases (37.1, 38) let the milestone close against real artifacts rather than an override.
+
+### What Was Inefficient
+- The first e2e smoke's "dispatch proof" was a bash side-effect file the parent's own `bash` tool could produce, and it ran on the wrong provider (the throwaway profile lacked `settings.json`). Needed a full re-run.
+- The first provider fix read `models.json` instead of `settings.json` — caught by review post-hoc rather than at planning time.
+- `phase.complete` / `roadmap update-plan-progress` re-injected stray blank lines into ROADMAP prose (hand-fixed twice), and `phase.complete` misplaced a STATE.md frontmatter field.
+- A zero-plan research phase (37.1) can't project `phase_complete: true` in `init.manager`, so a genuinely-complete phase still needed a backfill to satisfy the close.
+
+### Patterns Established
+- Provider-aware health: probe what `build_command` actually uses (`settings.json` `defaultProvider`), not a catalog of "anything that could work".
+- Live e2e evidence = the captured session transcript (tool-call nesting), never a side-effect file.
+- Research-phase summaries point at the decision gate rather than restating it.
+
+### Key Lessons
+- "Any ready provider" is a false-green and "no models.json" is a false-reject — probe the active provider, fall back to the built-in default, never refuse on a missing catalog.
+- A file written by bash does not prove a tool was dispatched; capture the transcript.
+
+### Cost Observations
+- Adversarial reviews: 1 code review (claude/codex/antigravity), plus the earlier planning review.
+- The live dispatch run: parent on `litellm` (deepseek-v4-pro), subagent on `openrouter` (free nemotron) — the subagent's model is the extension's own chain, not the parent's provider.
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -158,12 +236,14 @@ blocker on a requirement's traceability row.
 | Milestone | Sessions | Phases | Key Change |
 |-----------|----------|--------|------------|
 | gsd-hygiene | 1 | 1 | First milestone closed by an interactive session end-to-end same-day; first use of a backfilled PLAN/SUMMARY pair to satisfy a completion-projection tooling gap; first unversioned/plain-label milestone archive |
+| v2.7.0 | 1 (multi-session) | 3 | First milestone driven end-to-end by pi — the agent DevFlow itself now supports; first live subagent-dispatch transcript as e2e evidence |
 
 ### Cumulative Quality
 
 | Milestone | Tests | Coverage | Zero-Dep Additions |
 |-----------|-------|----------|-------------------|
 | gsd-hygiene | N/A — no crates code | N/A | 0 |
+| v2.7.0 | 13 `agents::pi` tests + full workspace + `clippy -D warnings` | N/A | 0 |
 
 ### Top Lessons (Verified Across Milestones)
 

@@ -8,7 +8,7 @@ DevFlow supports four agents today (Claude Code, Codex, OpenCode, Pi) through th
 1. **Add a driver file** under `crates/devflow-core/src/agents/` implementing the `AgentDriver` trait
 2. **Add a variant** to the `AgentKind` enum in `state.rs`
 3. **Update the `FromStr` parser**, `Display`, and `AgentParseError` text in `state.rs`
-4. **Add a match arm** in `agents::adapter_for()`
+4. **Add a match arm** in `agents::driver_for()`
 5. **Add `pub mod` and `pub use`** exports in `agents/mod.rs`
 6. **Add/extend tests** — driver name, parser aliases, and a conformance-suite run
 7. **Update docs** — `README.md`, `CONTRIBUTING.md`, `ARCHITECTURE.md`, dependency matrix
