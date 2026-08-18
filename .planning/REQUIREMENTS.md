@@ -41,8 +41,9 @@ phase.
 
 ### Pi Dogfood
 
-- [ ] **PIDG-01**: Phase 40 completes a real Define→Ship run through `--agent pi`, proving Pi driver
-  reliability; the deferred isolated-context Pi dispatch item closed if it surfaces.
+- [ ] **PIDG-01**: Phase 40 completes a real supervised Define→Validate run through `--agent pi`
+  (at least one live gate), proving Pi driver reliability; the deferred isolated-context Pi dispatch
+  item is re-filed (not built this phase).
 
 ### Opportunistic (capacity-permitting)
 
@@ -90,7 +91,7 @@ Which phases cover which requirements. Filled during roadmap creation.
 | CODE-01 | Phase 44 | Pending |
 | PIDG-01 | Phase 40 | Pending |
 | DECN-01 | Phase 45 | Pending |
-| MAINT-01 | Phase 45 | Pending |
+| MAINT-01 | Phase 40 | Pending |
 
 **Coverage:**
 - v2.8.0 requirements: 13 total
