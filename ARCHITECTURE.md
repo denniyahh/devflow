@@ -100,11 +100,12 @@ Agent backends are isolated behind a trait
 - **Pi subagent dispatch is user-installed and capability-detected.** A user
   installs `@bacnh85/pi-subagent` at **user scope** (`pi install
   npm:@bacnh85/pi-subagent`); DevFlow never ships or manages it. `PiDriver::
-  capabilities()` probes `pi list --no-approve` for a package name containing
-  `subagent` and sets `DriverCapabilities::subagent_dispatch`. Present → the
-  dispatch arm (the run may delegate to subagents); absent/undetectable → the
-  baseline single-agent arm (fail-closed, never refused). The signal is
-  name-based (Pi has no `pi tools` command), not a tool-registry proof.
+  capabilities()` probes `pi list --no-approve` for the vetted
+  `@bacnh85/pi-subagent` package (not a bare `*subagent*` name-match) and sets
+  `DriverCapabilities::subagent_dispatch`. The capability is **reported only**
+  (surfaced by `devflow doctor`) — no stage-routing or launch logic consumes it
+  yet. The signal is name-based (Pi has no `pi tools` command), not a
+  tool-registry proof.
 - Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`
   (or `stage_prompt_for_project` when the CLI applies project config),
   not a single shared instruction template. Every prompt hands the agent its

@@ -55,6 +55,10 @@ Verify against the live binary before implementing.
 
 - `cargo test -p devflow-core --lib` + `cargo test -p devflow --bin devflow` green; `clippy -D warnings` clean.
 - `devflow start --agent pi --dry-run` shows the full pipeline for Pi.
-- Stage 2 smoke: one live run proves subagent delegation completes under `Legacy` + `DEVFLOW_RESULT`
-  (or is recorded as blocked on credentials with the precise reason).
+- Stage 2 smoke: one live run with `@bacnh85/pi-subagent` installed at user scope, whose
+  captured session transcript shows the parent invoking the `subagent` tool and emitting
+  `DEVFLOW_RESULT: {"status":"success"}` only after the subagent's tool result returns (exit 0).
+  The discriminator is the transcript's `toolCall`-nesting — a bash side-effect file is NOT
+  sufficient evidence. A credential block is recorded separately and does NOT satisfy this
+  criterion.
 - No `CloseRule`/`PipeOwning`/drain-gate claim added.
