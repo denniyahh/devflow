@@ -150,10 +150,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: Phase 40 (Pi Dogfood) — ready to plan
 Plan: —
-Status: Defining requirements
-Last activity: 2026-08-18 — Milestone v2.8.0 started
+Status: Ready to plan
+Last activity: 2026-08-18 — Milestone v2.8.0 roadmap created (6 phases: 40–45)
 
 ## Recently Shipped
 

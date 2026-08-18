@@ -78,24 +78,24 @@ Which phases cover which requirements. Filled during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ANTG-01 | — | Pending |
-| ANTG-02 | — | Pending |
-| ANTG-03 | — | Pending |
-| HRMS-01 | — | Pending |
-| HRMS-02 | — | Pending |
-| HRMS-03 | — | Pending |
-| OPCD-01 | — | Pending |
-| OPCD-02 | — | Pending |
-| OPCD-03 | — | Pending |
-| CODE-01 | — | Pending |
-| PIDG-01 | — | Pending |
-| DECN-01 | — | Pending |
-| MAINT-01 | — | Pending |
+| ANTG-01 | Phase 41 | Pending |
+| ANTG-02 | Phase 41 | Pending |
+| ANTG-03 | Phase 41 | Pending |
+| HRMS-01 | Phase 42 | Pending |
+| HRMS-02 | Phase 42 | Pending |
+| HRMS-03 | Phase 42 | Pending |
+| OPCD-01 | Phase 43 | Pending |
+| OPCD-02 | Phase 43 | Pending |
+| OPCD-03 | Phase 43 | Pending |
+| CODE-01 | Phase 44 | Pending |
+| PIDG-01 | Phase 40 | Pending |
+| DECN-01 | Phase 45 | Pending |
+| MAINT-01 | Phase 45 | Pending |
 
 **Coverage:**
 - v2.8.0 requirements: 13 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 13 ⚠️
+- Mapped to phases: 13
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-08-18 after the v2.8.0 milestone (Remaining Harness Support + Pi
