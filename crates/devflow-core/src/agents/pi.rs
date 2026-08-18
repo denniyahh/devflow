@@ -79,7 +79,14 @@ impl AgentDriver for PiDriver {
         // default (`google`) when `settings.json` carries no `defaultProvider`.
         let provider = configured_pi_provider().unwrap_or_else(|| "google".to_string());
         let output = std::process::Command::new("pi")
-            .args(["auth", "check", "--json", "--provider", &provider, "--no-refresh"])
+            .args([
+                "auth",
+                "check",
+                "--json",
+                "--provider",
+                &provider,
+                "--no-refresh",
+            ])
             .output()
             .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
         classify_auth_check(&String::from_utf8_lossy(&output.stdout), output.status.success())
@@ -400,7 +407,10 @@ mod tests {
             .expect("a default-provider stub must pass preflight via the google fallback");
 
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(argv, "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n");
+        assert_eq!(
+            argv,
+            "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n"
+        );
     }
 
     /// The capability probe shells out to `pi list --no-approve` and matches on
