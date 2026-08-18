@@ -4,11 +4,11 @@ milestone: v2.7.0
 milestone_name: milestone (Pi End-to-End + Driver Contract Completion, ACTIVE — declared 2026-08-16)
 current_phase: 39
 current_phase_name: Pi End-to-End
-status: executing
-stopped_at: Phase 38 context gathered
+status: verify
+stopped_at: Phase 39 execution recorded
 last_updated: "2026-08-18T15:14:22.243Z"
 last_activity: 2026-08-18
-last_activity_desc: Phase 39 execution started
+last_activity_desc: Phase 39 execution recorded (summary written; awaiting validate/verify)
 progress:
   total_phases: 3
   completed_phases: 0
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 39 (Pi End-to-End) — EXECUTING
+Phase: 39 (Pi End-to-End) — EXECUTED (summary written)
 Plan: 1 of 1
-Status: Executing Phase 39
-Last activity: 2026-08-18 — Phase 39 execution started
+Status: Awaiting validate/verify
+Last activity: 2026-08-18 — Phase 39 execution recorded
 
 ## Recently Shipped
 
