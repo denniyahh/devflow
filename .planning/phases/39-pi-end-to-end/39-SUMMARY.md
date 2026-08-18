@@ -78,9 +78,12 @@ coverage:
     human_judgment: false
   - id: D4
     description: "Stage-2 subagent dispatch completes under Legacy + DEVFLOW_RESULT (live e2e run with @bacnh85/pi-subagent)"
-    verification: []
+    verification:
+      - kind: e2e
+        ref: ".planning/phases/39-pi-end-to-end/39-E2E-SESSION.jsonl#toolCall subagent -> nested bash -> DEVFLOW_RESULT"
+        status: pass
     human_judgment: true
-    rationale: "The in-repo e2e evidence is a bash side-effect proxy (not a captured session transcript showing toolCall: subagent), and the smoke ran on deepseek/openrouter rather than litellm. A re-run that captures the session transcript is required before this deliverable can pass."
+    rationale: "Recorded live run captured in-repo (parent on litellm delegating via toolCall: subagent, subagent's bash nested inside its result, DEVFLOW_RESULT emitted after). Human confirmation still required because it is a recorded e2e, not a re-runnable automated test."
 
 # Metrics
 duration: ~2h (incl. adversarial review + FIX-FIRST close)
@@ -132,17 +135,16 @@ Tasks were bundled into two feature commits plus a review-fix commit (not one co
 ## Deviations from Plan
 
 - **The provider fix's first implementation was wrong.** The plan's open question ("read `models.json` or drop `--provider`") was resolved to `models.json`, which the adversarial review proved both false-rejects standard installs (no `models.json`) and false-greens (any ready provider). Rewritten to read `settings.json`'s `defaultProvider`. This is the finding-1 BLOCKER, now closed in `66e5c4a`.
-- **The e2e smoke's evidence is a proxy, not proof.** The recorded dispatch evidence is a bash side-effect file, which the parent's own `bash` tool could produce without invoking `subagent`. The discriminating session transcript (`toolCall: subagent`) was observed at review time but not captured into the repo, and the smoke ran on `deepseek`/`openrouter` rather than `litellm`.
+- **The first e2e smoke's evidence was a proxy, not proof.** The 2026-08-17 run recorded only a bash side-effect file and (because its profile lacked `settings.json`) ran the parent on env-var providers. Re-run on 2026-08-18 with both `models.json` and `settings.json` copied; the discriminating transcript is captured in-repo.
 
 ## Issues Encountered
 
-- **Stage-2 e2e acceptance is NOT met.** See coverage D4: the transcript is not captured in-repo and the smoke exercised the wrong provider. A re-run against a `litellm` profile (or a corrected provider claim) with the transcript committed is required before verify/close.
-- The FIX-FIRST review (claude/codex/antigravity) surfaced five convergent findings; all five are closed, with the e2e-evidence one reduced to a documented follow-up rather than a code fix.
+- The FIX-FIRST review (claude/codex/antigravity) surfaced five convergent findings; all five are closed. The e2e-evidence finding was reduced to a re-run (not a code fix) and is now resolved — see `39-E2E-SESSION.jsonl` and coverage D4.
 
 ## Next Phase Readiness
 
-- Ready for verify-work: deliverables D1–D3 auto-pass (unit tests green, 13 `agents::pi` tests + full workspace + clippy `-D warnings` clean); D4 routes to a human for the e2e re-run.
-- Blocker for phase close: the Stage-2 e2e re-run with a captured `toolCall: subagent` transcript (see D4).
+- Ready for verify-work: deliverables D1–D3 auto-pass (unit tests green, 13 `agents::pi` tests + full workspace + clippy `-D warnings` clean); D4 routes to a human to confirm the captured transcript (a live e2e, not an automated test).
+- No remaining blockers for phase close beyond the D4 human confirmation.
 
 ---
 *Phase: 39-pi-end-to-end*

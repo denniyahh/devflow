@@ -1,43 +1,45 @@
 # Phase 39 — Stage 2 end-to-end smoke (recorded evidence)
 
-**Date:** 2026-08-17
-**Profile:** throwaway `PI_CODING_AGENT_DIR=/tmp/p39-e2e-profile` (live profile untouched)
-**Setup:** `models.json` copied from the live profile (provider `litellm`); `pi install npm:@bacnh85/pi-subagent@0.15.1` into the throwaway profile.
+**Date:** 2026-08-18 (re-run after the 2026-08-17 smoke was found to be proxy-only)
+**Profile:** throwaway `PI_CODING_AGENT_DIR=/tmp/p39-e2e-v2` (live profile untouched)
+**Setup:** `models.json` **and** `settings.json` copied from the live profile (so `defaultProvider: litellm` is set — the first run copied only `models.json`, which is why it fell through to env-var providers); `pi install npm:@bacnh85/pi-subagent` into the throwaway profile.
 
-## Result: proxy-only evidence; provider claim corrected post-review
+## Result: PASS — discriminating evidence captured
 
-**Provider correction (phase-39 code review, finding 4):** the throwaway profile's `settings.json`
-carried no `defaultProvider`, so Pi did **not** run on `litellm` — the recorded session `provider`
-was `deepseek`/`openrouter` (env-var providers). The `litellm` path this phase's provider fix
-targets was therefore **not exercised** by this smoke.
+Run: `PI_CODING_AGENT_DIR=/tmp/p39-e2e-v2 pi -p --no-approve "<prompt>"` (cwd `/tmp`) →
+stdout `DEVFLOW_RESULT: {"status":"success"}`, exit 0.
 
-Run 1 (completion): `PI_CODING_AGENT_DIR=/tmp/p39-e2e-profile pi -p --no-approve "<subagent prompt>"`
-→ stdout `DEVFLOW_RESULT: {"status":"success"}`, exit 0.
+The full session transcript is captured in-repo at
+[`39-E2E-SESSION.jsonl`](./39-E2E-SESSION.jsonl). The discriminating chain, read
+directly from that transcript:
 
-Run 2 (dispatch): same, with the subagent task `echo subagent-ran > /tmp/p39-subagent-proof.txt` →
-stdout `DEVFLOW_RESULT: {"status":"success"}`, exit 0, and `/tmp/p39-subagent-proof.txt` contains
-`subagent-ran`.
+| Event | Detail |
+|---|---|
+| `session` / `model_change` | parent provider **`litellm`**, model `deepseek-v4-pro` |
+| parent `assistant` turn | exactly one `toolCall` with `name: "subagent"`, `arguments.agent: "worker"` |
+| `toolResult` (subagent) | nested subagent session (`provider: openrouter`, `nvidia/nemotron-3-super-120b-a12b:free`) whose own `toolCall` `name: "bash"` ran `echo subagent-ran > /tmp/p39-v2-proof.txt && cat …`; bash result `subagent-ran` |
+| parent final `assistant` | `DEVFLOW_RESULT: {"status":"success"}` — emitted only **after** the tool result returned |
 
-## What this establishes — and what it does not
+`/tmp/p39-v2-proof.txt` contains `subagent-ran` (the bash side-effect), but it is
+now corroborated by the transcript's `toolCall` nesting rather than standing
+alone as proxy evidence.
 
-Established:
+## What this proves
 
-1. `@bacnh85/pi-subagent` loads at user scope under `pi -p --no-approve`. (stdout + exit 0)
-2. The parent emits `DEVFLOW_RESULT` and exits 0.
+1. `@bacnh85/pi-subagent` loads at user scope under `pi -p --no-approve`.
+2. The **parent** runs on the configured `defaultProvider` (`litellm`) — the
+   path `PiDriver::health` probes.
+3. The parent delegates to the subagent (`toolCall: subagent`); the subagent's
+   `bash` executes nested inside the subagent result, not as a parent tool call.
+4. The parent emits `DEVFLOW_RESULT` *after* the subagent finishes, and exits 0
+   — so `MonitorLaunch::Legacy` process-exit + the generic marker path observe
+   completion, with **no drain gate, no `PipeOwning`, no DevFlow source change**.
 
-**Not established by the in-repo evidence:** that the *subagent tool* (rather than Pi's own `bash`
-tool) wrote `/tmp/p39-subagent-proof.txt`. A bash side-effect file is a proxy — the parent's own
-`bash` tool could produce the identical file without ever invoking `subagent`. The discriminating
-evidence (the session transcript showing exactly one `toolCall` named `subagent`, with the bash
-calls nested inside the subagent's result) was observed at review time (2026-08-17) in
-`/tmp/p39-e2e-profile/sessions/`, but it was **not captured into the repo** and the throwaway
-profile has since been removed.
+## Honest limits
 
-**Verdict:** the acceptance criterion in `39-PLAN.md` ("captured transcript shows `toolCall:
-subagent` nesting") is **not met** — a re-run that captures the transcript is required.
-
-## Capability-detection sanity check
-
-`PI_CODING_AGENT_DIR=/tmp/p39-e2e-profile pi list --no-approve` → `npm:@bacnh85/pi-subagent@0.15.1`
-→ the vetted `@bacnh85/pi-subagent` name-match predicate returns `true` (matches the unit test's
-stubbed shape).
+- The subagent resolved to `openrouter` (the extension's own role-model chain),
+  not `litellm` — expected: the subagent's model is the extension's concern; the
+  *parent's* provider is the `litellm` fix's target and is what the transcript
+  shows on `litellm`.
+- This is a recorded live run, not a re-runnable automated test — see the
+  summary's coverage D4 (`human_judgment: true`).
