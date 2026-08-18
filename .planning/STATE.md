@@ -1,14 +1,18 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.8.0
-milestone_name: Remaining Harness Support + Pi Dogfood
+milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
+current_phase: 40
+current_phase_name: Pi Dogfood
 status: planning
-last_updated: "2026-08-18T19:49:00.283Z"
+stopped_at: Phase 40 planned (2 plans)
+last_updated: "2026-08-18T23:14:20.614Z"
 last_activity: 2026-08-18
+last_activity_desc: "Milestone v2.8.0 roadmap created (6 phases: 40–45)"
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
-  total_plans: 0
+  total_plans: 2
   completed_plans: 0
   percent: 0
 ---
@@ -834,9 +838,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-17T14:45:51.417Z
-**Stopped at:** Phase 38 context gathered
-**Resume file:** .planning/phases/38-driver-contract-completion-999-106-999-107/38-CONTEXT.md
+**Last session:** 2026-08-18T23:14:20.567Z
+**Stopped at:** Phase 40 planned (2 plans)
+**Resume file:** .planning/phases/40-pi-dogfood/40-CONTEXT.md
 
 ## Operator Next Steps
 
