@@ -30,7 +30,9 @@ subject: 999.85 (two stale comments, MAINT-01).
   1. A real supervised run completes Define→Plan→Code→Validate through `--agent pi`; the 999.85 comments are correctly rewritten.
   2. At least one live gate fires and the operator's decision is honored — no lost gate, no marker-less silent advance.
   3. Pi-transport regression tests (stubbed `pi`) prove a marker-less run, a non-zero exit, and a hung Pi are each handled without advancing.
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 40-01-PLAN.md — Pi-transport regression tests (stubbed `pi` failure modes)
+- [ ] 40-02-PLAN.md — Real supervised Pi dogfood run (999.85 rewrite + live gate + subagent dispatch)
 
 ### Phase 41: Antigravity Driver
 **Goal**: `devflow start --agent antigravity` launches the Antigravity CLI headless and drives a
