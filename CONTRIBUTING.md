@@ -408,18 +408,17 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation.
 
 ### Adding a New Agent
 
-DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
-shared `AgentAdapter` trait; agent-specific code lives only under
-`crates/devflow-core/src/agents/`. This is not a fully agent-neutral platform
-yet — see the driver-architecture backlog (999.31). Adding a backend today is
+DevFlow supports four agents today (Claude Code, Codex, OpenCode, Pi) through the
+modular `AgentDriver` contract; agent-specific code lives only under
+`crates/devflow-core/src/agents/`. Adding a backend today is
 a short checklist — keep these in sync or tests/builds fail:
 
-1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `AgentAdapter` trait
+1. Add a driver file in `crates/devflow-core/src/agents/` implementing the `AgentDriver` trait
 2. Add a variant to the `AgentKind` enum in `state.rs`
 3. Update the `FromStr` parser, `Display`, and `AgentParseError` text in `state.rs`
-4. Add a match arm in `agents::adapter_for()`
+4. Add a match arm in `agents::driver_for()`
 5. Add the `pub mod` / `pub use` exports in `agents/mod.rs`
-6. Extend tests (adapter name, parser aliases, prompt-sharing)
+6. Extend tests (driver name, parser aliases, prompt-sharing)
 7. Update docs (README, this file, ARCHITECTURE.md, DEPENDENCIES.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent) for the

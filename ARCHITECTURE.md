@@ -93,10 +93,19 @@ Agent backends are isolated behind a trait
   extra_writable_roots) -> (program, args)`, `parse_completion(output)`, `health(state)`,
   `environment()`, `capabilities()`, `interactivity_mode(stage)`, `test_contract()`. Each
   driver owns its prompt rendering, command building, completion parsing, and health.
-- Supported `AgentKind`s (`state.rs`): `Claude`, `Codex`, `OpenCode`.
-  Accepted names: `claude`, `codex`, `opencode` / `open-code`.
-- `adapter_for(kind)` returns the boxed adapter for a kind
-  (`ClaudeAgent`/`CodexAgent`/`OpenCodeAgent`).
+- Supported `AgentKind`s (`state.rs`): `Claude`, `Codex`, `OpenCode`, `Pi`.
+  Accepted names: `claude`, `codex`, `opencode` / `open-code`, `pi`.
+- `driver_for(kind)` returns the boxed driver for a kind
+  (`ClaudeDriver`/`CodexDriver`/`OpenCodeDriver`/`PiDriver`).
+- **Pi subagent dispatch is user-installed and capability-detected.** A user
+  installs `@bacnh85/pi-subagent` at **user scope** (`pi install
+  npm:@bacnh85/pi-subagent`); DevFlow never ships or manages it. `PiDriver::
+  capabilities()` probes `pi list --no-approve` for the vetted
+  `@bacnh85/pi-subagent` package (not a bare `*subagent*` name-match) and sets
+  `DriverCapabilities::subagent_dispatch`. The capability is **reported only**
+  (surfaced by `devflow doctor`) — no stage-routing or launch logic consumes it
+  yet. The signal is name-based (Pi has no `pi tools` command), not a
+  tool-registry proof.
 - Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`
   (or `stage_prompt_for_project` when the CLI applies project config),
   not a single shared instruction template. Every prompt hands the agent its
@@ -401,7 +410,7 @@ checklist — keep these in sync or tests/builds fail:
 2. Add a variant to the `AgentKind` enum in `state.rs`.
 3. Update the `FromStr` parser, `Display`, and `AgentParseError` text in
    `state.rs` to accept/emit the new name.
-4. Add a match arm in `agents::adapter_for()`.
+4. Add a match arm in `agents::driver_for()`.
 5. Add the `pub mod` and `pub use` exports in `agents/mod.rs`.
 6. Add/extend tests (driver name, parser aliases, and a conformance-suite run).
 7. Update docs (`README.md`, `DEPENDENCIES.md`, `CONTRIBUTING.md`, this file).

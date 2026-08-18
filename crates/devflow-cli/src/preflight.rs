@@ -82,8 +82,8 @@ fn agent_binary_available(program: &str) -> bool {
 /// scaffolding. The prompt/roots passed here are throwaways — adapters
 /// return a static program name regardless.
 pub(crate) fn agent_program(agent: AgentKind) -> &'static str {
-    agents::adapter_for(agent)
-        .exec_command(PhaseId::new(0), "", &[])
+    agents::driver_for(agent)
+        .build_command(PhaseId::new(0), "", &[])
         .0
 }
 
@@ -596,32 +596,41 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 // readiness failure is caught before any agent time is spent.
 // ---------------------------------------------------------------------------
 
-/// D-14 (universal, generic layer): a headless/auto Codex run cannot pass
-/// Define's discuss-phase interview — Codex's `exec` mode has no route to
-/// answer an interactive interview (`request_user_input is unavailable in
-/// Default mode`), unlike Claude/OpenCode's headless Define, which can and
-/// does complete it non-interactively (verified live, 13-06; the existing
-/// integration tests exercise exactly this: `--agent claude --mode auto`
-/// with no pre-existing CONTEXT.md succeeds). This check reuses the same
-/// `phase_artifact_on_develop` predicate as the existing pre-state Codex
-/// check in `start()`, but routes the failure through the preflight gate
-/// (D-15) instead of a hard error — closing the gap that check leaves open
-/// for non-`start()` launch paths (`resume`, gate retries, loop-backs). The
-/// pre-state Codex check itself is intentionally left unmigrated (Review
-/// dispositions, out of scope for this plan).
+/// The driver-driven interactivity gate (999.106): whether `stage` can run
+/// headless is declared by the driver's `interactivity_mode`, not a hardcoded
+/// `agent == Codex` check. `RequiresExistingArtifact` gates **Define only**
+/// (CONTEXT.md must already be on develop in auto mode — a pre-existing input);
+/// Plan is deliberately un-gated because PLAN.md is an *output* the phase
+/// itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
+/// / `InteractiveOnly` have no headless path at all. Routes the failure
+/// through the preflight gate (D-15) rather than a hard error.
 fn preflight_interactivity_check(project_root: &Path, state: &State) -> Result<(), String> {
-    if state.agent == AgentKind::Codex
-        && state.mode == Mode::Auto
-        && state.stage == Stage::Define
-        && !phase_artifact_on_develop(project_root, state.phase, "-CONTEXT.md")
-    {
-        return Err(format!(
-            "phase {} has no CONTEXT.md on develop — codex cannot run Define's \
-             discuss-phase interview headlessly in auto mode",
-            state.phase
-        ));
+    use devflow_core::agents::InteractivityMode;
+    let driver = agents::driver_for(state.agent);
+    match driver.interactivity_mode(state.stage) {
+        InteractivityMode::HeadlessSafe => Ok(()),
+        InteractivityMode::RequiresExistingArtifact => {
+            if state.mode == Mode::Auto
+                && state.stage == Stage::Define
+                && !phase_artifact_on_develop(project_root, state.phase, "-CONTEXT.md")
+            {
+                return Err(format!(
+                    "phase {} has no -CONTEXT.md on develop — {} cannot run the {} \
+                     stage headlessly in auto mode",
+                    state.phase,
+                    driver.name(),
+                    state.stage,
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "{} declares {} as {:?} — that stage cannot run headless",
+            driver.name(),
+            state.stage,
+            other,
+        )),
     }
-    Ok(())
 }
 
 /// D-14 (universal, generic layer): whether the gh-auth credential probe
@@ -1263,11 +1272,11 @@ fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), St
 pub(crate) fn run_preflight(
     project_root: &Path,
     state: &mut State,
-    adapter: &dyn agents::AgentAdapter,
+    driver: &dyn agents::AgentDriver,
 ) -> Result<bool, CliError> {
     let stage = state.stage;
     if let Err(reason) =
-        generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
+        generic_preflight_checks(project_root, state).and_then(|()| driver.health(state))
     {
         // Check the ceiling BEFORE writing another gate — writing the gate
         // first would let the ceiling case open yet another gate nobody
@@ -1357,12 +1366,12 @@ mod tests {
     // 17c: preflight readiness gate (D-13-D-16, Task 1)
     // -----------------------------------------------------------------
 
-    /// D-14 interactivity check: a headless Auto-mode Codex Define run with
-    /// no CONTEXT.md on develop is flagged; Supervise mode, a non-Define
-    /// stage, a non-Codex agent (Claude/OpenCode can complete Define
-    /// headlessly, verified live 13-06 — the existing `start_defaults_to_
-    /// worktree` integration test exercises exactly this), and a CONTEXT.md
-    /// that does exist are all unaffected.
+    /// D-14/999.106 interactivity check: the gate is driver-driven — Codex
+    /// declares Define `RequiresExistingArtifact`, so a headless Auto-mode
+    /// Codex Define run without CONTEXT.md on develop is flagged. Supervise
+    /// mode, a non-Define stage (Plan is un-gated — PLAN.md is an output), a
+    /// non-Codex agent (Claude declares HeadlessSafe), and a CONTEXT.md that
+    /// does exist are all unaffected.
     #[test]
     fn preflight_interactivity_check_flags_auto_define_without_context_md() {
         let dir = tempfile::tempdir().unwrap();
@@ -1389,7 +1398,7 @@ mod tests {
         state.agent = AgentKind::Claude;
         assert!(
             preflight_interactivity_check(root, &state).is_ok(),
-            "Claude/OpenCode can complete Define headlessly — only Codex is flagged"
+            "Claude declares Define HeadlessSafe — not flagged"
         );
         state.agent = AgentKind::Codex;
 
@@ -1707,7 +1716,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = agents::adapter_for(AgentKind::Claude);
+        let adapter = agents::driver_for(AgentKind::Claude);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
 
         // SAFETY: still serialized under ENV_MUTEX from above.
@@ -1765,7 +1774,7 @@ mod tests {
         state.yes_ship = true;
         workflow::save_state(&state).unwrap();
 
-        let adapter = agents::adapter_for(AgentKind::Claude);
+        let adapter = agents::driver_for(AgentKind::Claude);
         let result = run_preflight(root, &mut state, adapter.as_ref());
 
         // SAFETY: still serialized under ENV_MUTEX from above.
@@ -1879,7 +1888,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapter = agents::adapter_for(AgentKind::Codex);
+        let adapter = agents::driver_for(AgentKind::Codex);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
 
         assert!(
@@ -2141,7 +2150,7 @@ mod tests {
     // fail were it ever reached), but it structurally CANNOT be what
     // reproduces the wedge across a relaunch: `launch_stage`'s internal
     // recursion always re-resolves the REAL production adapter via
-    // `agents::adapter_for(state.agent)`, discarding whatever adapter
+    // `agents::driver_for(state.agent)`, discarding whatever adapter
     // reference was passed into the OUTER `run_preflight` call (confirmed
     // by `run_preflight_advance_gate_launches_agent_exactly_once`'s own
     // comment above: "the real Claude adapter's default (Ok) preflight
@@ -2340,7 +2349,7 @@ mod tests {
         state.preflight_retries = 2;
         workflow::save_state(&state).unwrap();
 
-        let adapter = agents::adapter_for(AgentKind::Claude);
+        let adapter = agents::driver_for(AgentKind::Claude);
         let result = run_preflight(root, &mut state, adapter.as_ref());
 
         assert!(
@@ -3600,7 +3609,7 @@ mod tests {
 
         let err = generic_preflight_checks(root, &state).unwrap_err();
         assert!(
-            err.contains("codex cannot run Define's"),
+            err.contains("cannot run the define stage headlessly"),
             "the interactivity reason must survive aggregation: {err}"
         );
         assert!(

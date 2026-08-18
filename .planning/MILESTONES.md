@@ -1,5 +1,17 @@
 # Milestones
 
+## v2.7.0 Pi End-to-End + Driver Contract Completion (Shipped: 2026-08-18)
+
+**Phases completed:** 3 phases, 2 plans, 15 tasks
+
+**Key accomplishments:**
+
+- Pi subagent dispatch is VIABLE: `@bacnh85/pi-subagent` works as-shipped (synchronous, in-process, fails closed headless), so the full-dispatch arm is re-scoped to `MonitorLaunch::Legacy` with no `CloseRule`/drain gate.
+- Deleted the legacy `AgentAdapter` surface, migrated all call sites to `AgentDriver`, wired the driver-driven `InteractivityMode` gate, and fixed both 999.107 Codex-parser defects — Claude launch argv byte-identical, 633 + 322 tests green.
+- Pi driver health reads the active provider from settings.json (google fallback), Pi pinned to Legacy launch with a discriminating regression test, and capability detection matching only the vetted @bacnh85/pi-subagent — with a FIX-FIRST adversarial review closed.
+
+---
+
 ## v2.6.0 Multi-Agent Adapter Migration (Shipped: 2026-08-16)
 
 **Phases completed:** 2 phases, 6 plans, 0 tasks

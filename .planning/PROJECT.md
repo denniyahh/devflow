@@ -6,7 +6,7 @@ DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
 coding agent needs to drive a development phase end-to-end: branch creation,
 agent launch, completion detection, gated human checkpoints, versioning,
 docs/changelog updates, and cleanup. It runs a 5-stage pipeline
-(Define → Plan → Code → Validate → Ship), today against three supported
+(Define → Plan → Code → Validate → Ship), today against four supported
 agents (Claude Code, OpenAI Codex, OpenCode, Pi) through the modular `AgentDriver` contract — opinionated by design,
 not a universal agent platform — in either `auto` (unattended) or
 `supervise` (gated) mode.
@@ -18,21 +18,29 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone: v2.7.0 Pi End-to-End + Driver Contract Completion
+## Current Milestone
 
-**Goal:** Finish the `AgentDriver` migration and make **Pi** run end-to-end —
-`devflow start --agent pi` through all five stages — closing everything Phase 37 deferred.
+*(None declared — v2.7.0 closed 2026-08-18; run `$gsd-new-milestone` to declare the next.)*
 
-**Target features** (renumbered 2026-08-17 — see the discussion log):
-- Phase 37.1 — **Pi subagent-extension spike (research)**: survey Pi's dispatch/subagent
-  extensions, recommend the best fit for DevFlow, and gate the transport decision via a verdict.
-- Phase 38 — **driver contract completion**: remove `AgentAdapter` + `DriverShim` and migrate the
-  five call sites, wire the `InteractivityMode` consumption (driver-driven Define/Plan gate), and
-  `999.107` (Codex parser success-before-`turn.failed` + writable-root serialization).
-- Phase 39 — **Pi end-to-end**: `devflow start --agent pi` completes the pipeline — baseline
-  transport on `Legacy`/`-p` with structured completion detection + the provider/credential fix;
-  the full-dispatch arm (`CloseRule` coverage) is gated on 37.1's verdict.
-- `999.94` (tentative) — unattended `decision` checkpoint takes the first option blindly.
+<details>
+<summary>Previous milestone: v2.7.0 Pi End-to-End + Driver Contract Completion — CLOSED 2026-08-18</summary>
+
+**Delivered.** The `AgentDriver` migration is finished and **Pi** runs end-to-end. Phase 37.1
+(research spike) returned a **VIABLE** verdict for `@bacnh85/pi-subagent`; Phase 38 removed
+`AgentAdapter` + `DriverShim`, wired `InteractivityMode`, and fixed 999.107; Phase 39 landed the Pi
+pipeline (provider-aware health, `Legacy` launch, subagent dispatch with no drain gate).
+
+**Target features:**
+- Phase 37.1 — Pi subagent-extension spike (research): verdict **VIABLE** (`@bacnh85/pi-subagent`).
+- Phase 38 — driver contract completion (999.106 + 999.107).
+- Phase 39 — Pi end-to-end: `devflow start --agent pi` completes the pipeline.
+- `999.94` (tentative) — unattended `decision` checkpoint takes the first option blindly (carried).
+
+**Closed 2026-08-18, not yet released** — `Cargo.toml` is still `2.6.0` and no `v2.7.0` tag exists;
+release/tag is a separate step. Full phase detail archived to `.planning/milestones/v2.7.0-ROADMAP.md`;
+phase dirs to `.planning/milestones/v2.7.0-phases/`.
+
+</details>
 
 <details>
 <summary>Previous milestone: v2.6.0 Multi-Agent Adapter Migration — CLOSED 2026-08-16</summary>
@@ -338,8 +346,12 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | `milestone.complete` ran cleanly (no `--dry-run` bypass needed) for gsd-hygiene's close, unlike v2.3.0's | 999.72's fix (this same milestone) is what made the CLI's phase-scoping correct — direct confirmation the fix holds, not just the earlier `--dry-run` checks | ✓ Good |
 | Pi is the second native `AgentDriver` (Phase 37, operator decision — supersedes 999.31 D-02's Claude/OpenCode answer) | Priority is preserving Claude (zero regression) and onboarding Pi; Claude/OpenCode stay legacy via the shim until 999.106 removes it | ✓ Good |
 | `-a never` (Codex global flag, before `exec`) and `--no-approve` (Pi) are spawn-verified against the installed CLIs (Phase 37) | The review showed `--ask-for-approval never` on `codex exec` is rejected; flag placement/form must be proven by a real spawn, never assumed | ✓ Good |
-| `AgentAdapter` removal deferred (D-11 conditional) → 999.106 | Pi runs through the shim, so removal is not required; deferring avoids a risky launch-path refactor in the same phase | — Pending |
-| Pi end-to-end (JSON unwrapper + monitor `CloseRule`) deferred to 37.1/38 | The migration core is the shared prerequisite; the Pi-specific tail is deferred rather than rushed | — Pending |
+| `AgentAdapter` removal deferred (D-11 conditional) → 999.106 | Pi runs through the shim, so removal is not required; deferring avoids a risky launch-path refactor in the same phase | ✓ Good (Phase 38 removed it) |
+| Pi end-to-end (JSON unwrapper + monitor `CloseRule`) deferred to 37.1/38 | The migration core is the shared prerequisite; the Pi-specific tail is deferred rather than rushed | ✓ Good (Phase 39, re-scoped to Legacy + no CloseRule) |
+| Pi health probes `settings.json`'s `defaultProvider`, not "any ready `models.json` provider" (Phase 39) | `build_command` passes no `--provider`, so the run uses the default; probing a catalog false-greens, and refusing on absent `models.json` false-rejects standard installs | ✓ Good |
+| Pi pinned to `MonitorLaunch::Legacy`, never `PipeOwning` (Phase 39) | `PipeOwning`'s stdin wire protocol deadlocks Pi (phase-38 review); the regression test asserts the `claude_stream_launch_enabled` precondition | ✓ Good |
+| Subagent dispatch via `@bacnh85/pi-subagent` (in-process, synchronous) under `Legacy` (Phase 39) | The 37.1 verdict: a synchronous extension awaits its children, so process-exit supervision suffices — no `CloseRule`/drain gate | ✓ Good |
+| Capability detection matches the vetted `@bacnh85/pi-subagent` name, not `*subagent*` (Phase 39) | Unsafe/deferred packages (`@mystilleef` etc.) must not report "available" | ✓ Good |
 
 ## Key Files
 
@@ -367,7 +379,9 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-16 after the v2.6.0 milestone (Multi-Agent Adapter Migration) — 2/2 phases (36, 37), 6/6 plans, verified + validated + secured (threats_open: 0). Released as `v2.6.0`: signed tag on `main`, both crates published (devflow-core → devflow), main→develop synced (merge commit), GitHub Release published, milestone archived to `.planning/milestones/v2.6.0-*`; phase dirs archived to `v2.6.0-phases/`.*
+*Last updated: 2026-08-18 after the v2.7.0 milestone (Pi End-to-End + Driver Contract Completion) — 3/3 phases (37.1 research, 38, 39), 2/2 plans, verified + validated. NOT yet released: `Cargo.toml` still `2.6.0`, no `v2.7.0` tag — release/tag is a separate step. Milestone archived to `.planning/milestones/v2.7.0-*`; phase dirs to `v2.7.0-phases/`.*
+
+*Previous: 2026-08-16 after the v2.6.0 milestone (Multi-Agent Adapter Migration) — 2/2 phases (36, 37), 6/6 plans, verified + validated + secured (threats_open: 0). Released as `v2.6.0`: signed tag on `main`, both crates published (devflow-core → devflow), main→develop synced (merge commit), GitHub Release published, milestone archived to `.planning/milestones/v2.6.0-*`; phase dirs archived to `v2.6.0-phases/`.*
 
 *Previous: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)
 shipped as v2.1.0 — 18/19 plans (25-10 superseded by 25-13), verified 10/10

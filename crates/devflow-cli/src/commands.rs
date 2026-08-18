@@ -279,27 +279,34 @@ pub(crate) fn start(
     // is a narrower and misleading diagnosis of the same root fact.
     ensure_phase_reachable_on_base(project_root, phase, DEVELOP)?;
 
-    // 13-06 dogfood pre-flight (Codex leg): a fresh headless Codex run can
-    // never pass Define — GSD's discuss-phase is an interview, and Codex's
-    // exec mode cannot answer it (`request_user_input is unavailable in
-    // Default mode`). Fail in one second with instructions instead of after
+    // 999.106 driver-driven pre-flight: whether a fresh headless run can pass
+    // a stage is declared by the driver's `interactivity_mode`, not a
+    // hardcoded `agent == Codex`. A `RequiresExistingArtifact` Define must
+    // have CONTEXT.md on develop; a `RequiresExistingArtifact` Plan warns
+    // without a PLAN.md. Fail in one second with instructions instead of after
     // a burned agent run and a dead-end gate. Checked on `develop` (the
     // branch worktrees fork from), so the result does not depend on what the
     // primary checkout happens to have checked out.
-    if agent == AgentKind::Codex {
-        if !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md") {
-            return Err(CliError::Message(format!(
-                "phase {phase} has no CONTEXT.md on develop, and codex cannot run an \
-                 interactive discussion headless. Run /gsd-discuss-phase {phase} \
-                 interactively first (any agent), or use --agent claude."
-            )));
-        }
-        if !phase_artifact_on_develop(project_root, phase, "-PLAN.md") {
-            println!(
-                "warning: phase {phase} has no PLAN.md on develop — headless codex \
-                 planning is untested and may need input; pre-writing plans is safer"
-            );
-        }
+    let driver = agents::driver_for(agent);
+    if driver.interactivity_mode(Stage::Define)
+        == agents::InteractivityMode::RequiresExistingArtifact
+        && !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md")
+    {
+        return Err(CliError::Message(format!(
+            "phase {phase} has no CONTEXT.md on develop, and {} cannot run an \
+             interactive discussion headless. Run /gsd-discuss-phase {phase} \
+             interactively first (any agent), or use --agent claude.",
+            driver.name()
+        )));
+    }
+    if driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
+        && !phase_artifact_on_develop(project_root, phase, "-PLAN.md")
+    {
+        println!(
+            "warning: phase {phase} has no PLAN.md on develop — headless {} \
+             planning is untested and may need input; pre-writing plans is safer",
+            driver.name()
+        );
     }
 
     // Pre-start divergence check: runs on current HEAD before any git
@@ -874,7 +881,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 "  stage: {} | mode: {} | gate: {}",
                 state.stage, state.mode, gate
             );
-            println!("  agent: {}", agents::adapter_for(state.agent).name());
+            println!("  agent: {}", agents::driver_for(state.agent).name());
             if state.consecutive_failures > 0 {
                 println!("  validate failures: {}", state.consecutive_failures);
             }
@@ -2108,10 +2115,7 @@ pub(crate) fn recover_cmd(
         println!("phase: {}", status.state.phase);
         println!("  stage: {}", status.state.stage);
         println!("  mode: {}", status.state.mode);
-        println!(
-            "  agent: {}",
-            agents::adapter_for(status.state.agent).name()
-        );
+        println!("  agent: {}", agents::driver_for(status.state.agent).name());
         println!("  started: {} ({})", status.state.started_at, status.age);
         match agent_pid_from_file(project_root, status.state.phase) {
             Some(pid) => {
@@ -2319,6 +2323,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             "--version",
             "Install Pi (see https://github.com/earendil-works/pi-mono)",
         ),
+        pi_subagent_dispatch_check(),
         Check {
             name: format!("devflow v{devflow_version}"),
             status: "ok".into(),
@@ -2431,6 +2436,40 @@ pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
     } else {
         println!("\nrelease preflight passed");
         Ok(())
+    }
+}
+
+/// The `pi subagent dispatch` doctor check: reports whether the vetted
+/// `@bacnh85/pi-subagent` extension is installed at user scope. Warns when
+/// absent — the baseline single-agent path still works without it. Split out
+/// (phase-39 code review) so the check's mapping is unit-testable.
+fn pi_subagent_dispatch_check() -> Check {
+    let dispatch = agents::driver_for(AgentKind::Pi)
+        .capabilities()
+        .subagent_dispatch;
+    pi_subagent_dispatch_check_for(dispatch)
+}
+
+/// The pure boolean→`Check` mapping behind [`pi_subagent_dispatch_check`],
+/// separated from the `pi list` probe so the doctor rendering is testable
+/// without spawning a process.
+fn pi_subagent_dispatch_check_for(dispatch: bool) -> Check {
+    Check {
+        name: "pi subagent dispatch".into(),
+        status: if dispatch { "ok".into() } else { "warn".into() },
+        version: Some(if dispatch {
+            "available".into()
+        } else {
+            "not installed".into()
+        }),
+        install_hint: if dispatch {
+            None
+        } else {
+            Some(
+                "optional — `pi install npm:@bacnh85/pi-subagent` (user scope) enables subagent dispatch"
+                    .into(),
+            )
+        },
     }
 }
 
@@ -3683,6 +3722,32 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
+
+    /// The doctor check's rendering maps the `pi list` capability probe onto a
+    /// `Check` without spawning `pi` — the pure mapping is what needs a test,
+    /// the probe itself is covered by `PiDriver::capabilities()` tests
+    /// (phase-39 code review, finding 5 / claude LOW #8).
+    #[test]
+    fn pi_subagent_dispatch_check_renders_both_arms() {
+        let available = pi_subagent_dispatch_check_for(true);
+        assert_eq!(available.name, "pi subagent dispatch");
+        assert_eq!(available.status, "ok");
+        assert_eq!(available.version.as_deref(), Some("available"));
+        assert_eq!(available.install_hint, None);
+
+        let missing = pi_subagent_dispatch_check_for(false);
+        assert_eq!(missing.name, "pi subagent dispatch");
+        assert_eq!(missing.status, "warn");
+        assert_eq!(missing.version.as_deref(), Some("not installed"));
+        assert!(missing.install_hint.is_some());
+        assert!(
+            missing
+                .install_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("@bacnh85/pi-subagent")),
+            "the absent hint must name the vetted install command"
+        );
+    }
 
     /// 999.78/A-11, reset event ZERO — the one that must NOT happen. The
     /// per-phase Validate-failure total survives a `devflow start --force`

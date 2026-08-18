@@ -1,19 +1,19 @@
-//! Claude Code agent adapter.
+//! Claude Code agent driver.
 //!
 //! Launches `claude -p` headless with a bidirectional `stream-json` transport:
 //! the initial user turn travels on the child's **stdin**, and its events come
 //! back on stdout one JSON object per line. Claude runs headless — no trust
 //! dialogs, no user prompts.
 
-use super::{AgentAdapter, AgentDriver};
+use super::AgentDriver;
 use crate::phase_id::PhaseId;
 
-/// The modular driver for Claude (37-02): owns the `stream-json` launch and
-/// legacy prompt rendering. `ClaudeAgent` below remains the legacy
-/// `AgentAdapter` face (the D-11 removal point) and delegates to this driver.
+/// The modular driver for Claude (37-02): owns the `stream-json` launch,
+/// legacy prompt rendering, the pre-31 single-document builder, and the
+/// checkpoint-resume relaunch command.
 pub struct ClaudeDriver;
 
-impl super::AgentDriver for ClaudeDriver {
+impl AgentDriver for ClaudeDriver {
     fn name(&self) -> &'static str {
         "Claude Code"
     }
@@ -22,6 +22,22 @@ impl super::AgentDriver for ClaudeDriver {
         crate::prompt::render_claude_style(intent)
     }
 
+    /// Build the headless `stream-json` launch (Phase 31, constraint 1).
+    ///
+    /// **The prompt is deliberately absent from the returned argv.** Under
+    /// `--input-format stream-json` the CLI takes its initial user turn from
+    /// stdin as a JSON document, not from a positional argument; the monitor
+    /// writes that turn via `crate::monitor::user_turn_line`. The `prompt`
+    /// parameter is kept in the signature for the shared `AgentDriver` shape —
+    /// it is unused here on purpose, not by oversight.
+    ///
+    /// `--verbose` is load-bearing, not decoration: every archived Phase-30
+    /// trial that produced a usable capture carried it, and dropping it is
+    /// untested territory. Do not "clean it up".
+    ///
+    /// The switch is unconditional and stage-blind — which stages route here is
+    /// a rollout-order choice made at the call site
+    /// (`claude_stream_launch_enabled`), not a prediction this builder makes.
     fn build_command(
         &self,
         _phase: PhaseId,
@@ -43,62 +59,7 @@ impl super::AgentDriver for ClaudeDriver {
     }
 }
 
-pub struct ClaudeAgent;
-
-impl AgentAdapter for ClaudeAgent {
-    fn name(&self) -> &'static str {
-        "Claude Code"
-    }
-
-    /// Build the headless `stream-json` launch (Phase 31, constraint 1).
-    ///
-    /// **The prompt is deliberately absent from the returned argv.** Under
-    /// `--input-format stream-json` the CLI takes its initial user turn from
-    /// stdin as a JSON document, not from a positional argument; the monitor
-    /// writes that turn via [`crate::monitor::user_turn_line`]. The `prompt`
-    /// parameter is kept in the signature because [`AgentAdapter`] is shared
-    /// with adapters that DO pass it positionally (Codex, OpenCode) — it is
-    /// unused here on purpose, not by oversight.
-    ///
-    /// Evidence: all three archived Phase 30 harnesses
-    /// (`.planning/phases/30-keep-the-session-alive-past-turn-end/`,
-    /// `30b`/`30c`/`30d`) launch with exactly this flag set and no positional
-    /// prompt, then write
-    /// `{"type":"user","message":{"role":"user","content":<prompt>}}` to the
-    /// child's stdin. `30c-monitor-env-harness.py`'s `DEFAULT_CLI_ARGV` is the
-    /// literal argv reproduced here.
-    ///
-    /// `--verbose` is load-bearing, not decoration: every archived trial that
-    /// produced a usable capture carried it, and dropping it is untested
-    /// territory. Do not "clean it up".
-    ///
-    /// The switch is unconditional and stage-blind — constraint 1 forbids
-    /// predicting at launch time which stages will background work. The
-    /// *sequencing* choice about which stages route here lives at the call
-    /// site (`claude_stream_launch_enabled` in `pipeline_launch.rs`); the
-    /// shape a not-yet-widened stage gets instead is
-    /// [`ClaudeAgent::exec_command_single_document`], which is a live path
-    /// rather than a deprecated one.
-    fn exec_command(
-        &self,
-        phase: PhaseId,
-        prompt: &str,
-        extra_writable_roots: &[std::path::PathBuf],
-    ) -> (&'static str, Vec<String>) {
-        ClaudeDriver.build_command(phase, prompt, extra_writable_roots)
-    }
-
-    fn completion_signal_detected(&self, _output: &str) -> bool {
-        // Claude exits cleanly when done; monitor detects exit via kill -0.
-        false
-    }
-
-    fn render_prompt(&self, intent: &crate::prompt::StageIntent) -> String {
-        crate::prompt::render_claude_style(intent)
-    }
-}
-
-impl ClaudeAgent {
+impl ClaudeDriver {
     /// The pre-31 single-document launch: `-p <prompt>` positionally with
     /// `--output-format json`.
     ///
@@ -116,7 +77,7 @@ impl ClaudeAgent {
     ///   fallback on parse failure is rejected: a silent downgrade is the same
     ///   invisible-degradation class as the bug Phase 31 exists to fix.
     ///
-    /// The argv is the pre-31 [`AgentAdapter::exec_command`] body verbatim, so
+    /// The argv is the pre-31 single-document launch body verbatim, so
     /// the shipped capture shape (`CaptureKind::SingleDocEnvelope`) and the
     /// 30b isolation tests that guard it (D-12) keep holding bit-for-bit.
     pub fn exec_command_single_document(prompt: &str) -> (&'static str, Vec<String>) {
@@ -133,10 +94,9 @@ impl ClaudeAgent {
     }
 
     /// Build the resume relaunch command for a confirmed checkpoint
-    /// auto-decide (D-03/D-04, 28-03). NOT a trait method — `--resume` is a
-    /// Claude-CLI-specific, documented feature with no equivalent on
-    /// `AgentAdapter` (D-05: Claude-only, no Codex/OpenCode accommodation,
-    /// `AgentAdapter` itself is untouched).
+    /// auto-decide (D-03/D-04, 28-03). Not a trait method — `--resume` is a
+    /// Claude-CLI-specific, documented feature (D-05: Claude-only, no Codex/OpenCode
+    /// accommodation).
     ///
     /// Argv order (RESEARCH.md § "Architecture Patterns / Pattern 4",
     /// confirmed): the print flag, the instruction, the resume flag
@@ -191,7 +151,7 @@ mod tests {
     /// agent asking what to do.
     #[test]
     fn exec_command_uses_stream_json_on_both_input_and_output() {
-        let (program, args) = ClaudeAgent.exec_command(PhaseId::new(7), PROMPT, &[]);
+        let (program, args) = ClaudeDriver.build_command(PhaseId::new(7), PROMPT, &[]);
         assert_eq!(program, "claude");
         assert!(
             args.windows(2)
@@ -222,7 +182,7 @@ mod tests {
     /// tested in Phase 30.
     #[test]
     fn exec_command_carries_no_positional_prompt() {
-        let (_program, args) = ClaudeAgent.exec_command(PhaseId::new(7), PROMPT, &[]);
+        let (_program, args) = ClaudeDriver.build_command(PhaseId::new(7), PROMPT, &[]);
         assert!(
             !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
             "the prompt must not appear in argv at all — it travels as a JSON \
@@ -239,7 +199,7 @@ mod tests {
     /// with it.
     #[test]
     fn single_document_command_preserves_pre31_shape() {
-        let (program, args) = ClaudeAgent::exec_command_single_document(PROMPT);
+        let (program, args) = ClaudeDriver::exec_command_single_document(PROMPT);
         assert_eq!(program, "claude");
         assert!(
             args.windows(2).any(|w| w[0] == "-p" && w[1] == PROMPT),
@@ -264,20 +224,20 @@ mod tests {
 
     #[test]
     fn resume_command_names_claude_program() {
-        let (program, _args) = ClaudeAgent::exec_resume_command("sess", "instr");
+        let (program, _args) = ClaudeDriver::exec_resume_command("sess", "instr");
         assert_eq!(program, "claude");
     }
 
     #[test]
     fn resume_command_carries_print_flag_and_instruction() {
-        let (_program, args) = ClaudeAgent::exec_resume_command("sess", "do the thing");
+        let (_program, args) = ClaudeDriver::exec_resume_command("sess", "do the thing");
         assert!(args.iter().any(|a| a == "-p"));
         assert!(args.iter().any(|a| a == "do the thing"));
     }
 
     #[test]
     fn resume_command_resume_flag_immediately_precedes_session_id() {
-        let (_program, args) = ClaudeAgent::exec_resume_command("sess-abc", "instr");
+        let (_program, args) = ClaudeDriver::exec_resume_command("sess-abc", "instr");
         let resume_idx = args
             .iter()
             .position(|a| a == "--resume")
@@ -297,7 +257,7 @@ mod tests {
     /// silent headless hang on a permission prompt nobody can answer.
     #[test]
     fn resume_command_includes_permission_bypass() {
-        let (program, args) = ClaudeAgent::exec_resume_command("sess-123", "do the thing");
+        let (program, args) = ClaudeDriver::exec_resume_command("sess-123", "do the thing");
         assert_eq!(program, "claude");
         assert!(
             args.iter().any(|a| a == "--dangerously-skip-permissions"),
