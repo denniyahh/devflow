@@ -57,9 +57,17 @@ workspace_version() {
 require_merged_to_develop() {
     # A step that opens a PR depends on the previous one having merged; check
     # that the named string is reachable on origin/develop.
+    #
+    # Uses `git log --grep` + command substitution rather than piping into
+    # `grep -q`: under `set -o pipefail`, `grep -q` exits at the first match
+    # and SIGPIPEs the still-streaming `git log`, turning a successful match
+    # into a non-zero pipeline exit (and a spurious "merge the previous PR
+    # first" refusal).
     local needle="$1"
     git fetch origin develop main --quiet
-    git log --oneline origin/develop | grep -qF "$needle" || \
+    local found
+    found="$(git log --oneline origin/develop --grep="$needle" -1 2>/dev/null || true)"
+    [ -n "$found" ] || \
         die "origin/develop does not yet contain '$needle' — merge the previous PR first"
 }
 
@@ -76,7 +84,14 @@ step_branch() {
     require_develop
     local v; v="$(workspace_version)"
     [ -n "$v" ] || die "could not read workspace version from Cargo.toml"
-    local branch="release/v${v#v}"
+    # Name the branch after the version being RELEASED, not the current one.
+    # Releases in this repo are minor bumps (feat commits since the last tag),
+    # so the target is minor+1 with the patch reset to 0. A patch/major cut
+    # must rename the branch by hand — the script cannot know the target
+    # ahead of the bump that produces it.
+    local major="${v%%.*}"; local rest="${v#*.}"; local minor="${rest%%.*}"
+    local target="${major}.$((minor + 1)).0"
+    local branch="release/v$target"
     if git show-ref --verify --quiet "refs/heads/$branch"; then
         note "branch $branch already exists — reusing"
         git checkout -q "$branch"
@@ -85,7 +100,7 @@ step_branch() {
         note "created $branch off develop"
     fi
     note "now bump Cargo.toml (two places) and add the CHANGELOG section, then commit"
-    note "commit message convention: release: v$v — <description>"
+    note "commit message convention: release: v$target — <description>"
 }
 
 step_pr_develop() {
