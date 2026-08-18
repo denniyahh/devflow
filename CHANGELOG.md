@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.7.0 — 2026-08-18
+
+Pi end-to-end (milestone v2.7.0). DevFlow finishes the `AgentDriver` migration and drives **Pi**
+through the full pipeline. Phase 37.1 (research) returned a **VIABLE** verdict for the
+`@bacnh85/pi-subagent` extension; Phase 38 removed the legacy `AgentAdapter` surface and wired
+`InteractivityMode`; Phase 39 landed the Pi pipeline (provider-aware health, `Legacy` launch,
+subagent dispatch).
+
+### What's new
+
+- **The legacy `AgentAdapter` surface is gone (999.106 / Phase 38).** `AgentAdapter`, `DriverShim`,
+  `adapter_for`, and the four legacy `*Agent` structs are removed; every call site resolves through
+  `driver_for(kind) -> Box<dyn AgentDriver>`. Claude's launch argv stays byte-identical (zero
+  regression).
+- **`InteractivityMode` is consumed (Phase 38).** A driver-driven Define/Plan gate replaces the
+  hardcoded `AgentKind::Codex` Define check.
+- **Two Codex-parser defects fixed (999.107 / Phase 38).** Terminal `turn.failed` now takes
+  precedence over an earlier success marker; non-UTF-8 / hostile writable-root paths are refused
+  rather than lossily converted to U+FFFD.
+- **Pi health probes the active provider (Phase 39).** `PiDriver::health` reads `settings.json`'s
+  `defaultProvider` (falling back to Pi's `--provider` default) instead of a hardcoded `google` or
+  "any ready `models.json` provider" — fixing both a false-reject of standard installs and a
+  false-green of a provider the launch never uses.
+- **Pi is pinned to `MonitorLaunch::Legacy` (Phase 39).** A regression test asserts the
+  `claude_stream_launch_enabled(Pi)` precondition, so Pi can never land on the `PipeOwning` path
+  whose stdin wire protocol deadlocks it.
+- **Pi subagent dispatch is detected, not faked (Phase 39).** Capability detection matches the
+  vetted `@bacnh85/pi-subagent` package specifically (not `*subagent*`), and a captured session
+  transcript proves the live dispatch (parent `toolCall: subagent` → nested subagent `bash` →
+  `DEVFLOW_RESULT`) completes under `Legacy` with no drain gate.
+
+### Deferred (recorded, not shipped here)
+
+- `999.94` — unattended `decision` checkpoint takes the first option blindly.
+- Isolated-context (process-spawning) Pi dispatch — needs a `--no-approve` child-argv patch.
+
 ## 2.6.0 — 2026-08-16
 
 The multi-agent adapter migration (milestone v2.6.0). DevFlow stops rendering one shared
