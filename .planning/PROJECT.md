@@ -20,7 +20,22 @@ mid-run crash or kill.
 
 ## Current Milestone
 
-*(None declared — v2.7.0 closed 2026-08-18; run `$gsd-new-milestone` to declare the next.)*
+**v2.8.0 — Remaining Harness Support + Pi Dogfood** (declared 2026-08-18)
+
+**Goal:** Onboard the remaining coding harnesses onto the `AgentDriver` contract — new drivers for
+**Antigravity CLI** and **Hermes** (backlog 999.1), complete the under-built **OpenCode** stub
+driver, verify/harden **Codex** end-to-end — and prove **Pi** holds up under real use by dogfooding
+Phase 40 through it. Closes 999.94 + 999.85 if capacity permits.
+
+**Target features:**
+- **Antigravity CLI** — new `AgentKind` variant + driver + conformance suite (currently unsupported).
+- **Hermes** — new `AgentKind` variant + driver + conformance suite (backlog 999.1).
+- **OpenCode** — complete the stub driver: completion parsing, health/discover, capabilities, workflow root.
+- **Codex** — end-to-end verification/hardening (already a native driver; dogfood + gap-closure).
+- **Phase 40** — Pi dogfood: run a real phase through DevFlow using Pi (incl. the deferred
+  isolated-context Pi dispatch item if it surfaces).
+- **999.94** (unattended `decision` checkpoint takes the first option blindly, HIGH) + **999.85**
+  (two stale comments, low) — *if capacity permits*.
 
 <details>
 <summary>Previous milestone: v2.7.0 Pi End-to-End + Driver Contract Completion — CLOSED 2026-08-18</summary>
@@ -36,9 +51,9 @@ pipeline (provider-aware health, `Legacy` launch, subagent dispatch with no drai
 - Phase 39 — Pi end-to-end: `devflow start --agent pi` completes the pipeline.
 - `999.94` (tentative) — unattended `decision` checkpoint takes the first option blindly (carried).
 
-**Closed 2026-08-18, not yet released** — `Cargo.toml` is still `2.6.0` and no `v2.7.0` tag exists;
-release/tag is a separate step. Full phase detail archived to `.planning/milestones/v2.7.0-ROADMAP.md`;
-phase dirs to `.planning/milestones/v2.7.0-phases/`.
+**Closed 2026-08-18, released as `v2.7.0`** (signed tag; `Cargo.toml`/`Cargo.lock` at 2.7.0).
+Full phase detail archived to `.planning/milestones/v2.7.0-ROADMAP.md`; phase dirs to
+`.planning/milestones/v2.7.0-phases/`.
 
 </details>
 
