@@ -2323,31 +2323,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             "--version",
             "Install Pi (see https://github.com/earendil-works/pi-mono)",
         ),
-        {
-            // Pi subagent dispatch is a user-installed, optional enhancement
-            // (@bacnh85/pi-subagent). Report it as a warning when absent — the
-            // baseline single-agent path still works without it.
-            let dispatch = agents::driver_for(AgentKind::Pi)
-                .capabilities()
-                .subagent_dispatch;
-            Check {
-                name: "pi subagent dispatch".into(),
-                status: if dispatch { "ok".into() } else { "warn".into() },
-                version: Some(if dispatch {
-                    "available".into()
-                } else {
-                    "not installed".into()
-                }),
-                install_hint: if dispatch {
-                    None
-                } else {
-                    Some(
-                        "optional — `pi install npm:@bacnh85/pi-subagent` (user scope) enables subagent dispatch"
-                            .into(),
-                    )
-                },
-            }
-        },
+        pi_subagent_dispatch_check(),
         Check {
             name: format!("devflow v{devflow_version}"),
             status: "ok".into(),
@@ -2460,6 +2436,40 @@ pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
     } else {
         println!("\nrelease preflight passed");
         Ok(())
+    }
+}
+
+/// The `pi subagent dispatch` doctor check: reports whether the vetted
+/// `@bacnh85/pi-subagent` extension is installed at user scope. Warns when
+/// absent — the baseline single-agent path still works without it. Split out
+/// (phase-39 code review) so the check's mapping is unit-testable.
+fn pi_subagent_dispatch_check() -> Check {
+    let dispatch = agents::driver_for(AgentKind::Pi)
+        .capabilities()
+        .subagent_dispatch;
+    pi_subagent_dispatch_check_for(dispatch)
+}
+
+/// The pure boolean→`Check` mapping behind [`pi_subagent_dispatch_check`],
+/// separated from the `pi list` probe so the doctor rendering is testable
+/// without spawning a process.
+fn pi_subagent_dispatch_check_for(dispatch: bool) -> Check {
+    Check {
+        name: "pi subagent dispatch".into(),
+        status: if dispatch { "ok".into() } else { "warn".into() },
+        version: Some(if dispatch {
+            "available".into()
+        } else {
+            "not installed".into()
+        }),
+        install_hint: if dispatch {
+            None
+        } else {
+            Some(
+                "optional — `pi install npm:@bacnh85/pi-subagent` (user scope) enables subagent dispatch"
+                    .into(),
+            )
+        },
     }
 }
 
@@ -3712,6 +3722,32 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
+
+    /// The doctor check's rendering maps the `pi list` capability probe onto a
+    /// `Check` without spawning `pi` — the pure mapping is what needs a test,
+    /// the probe itself is covered by `PiDriver::capabilities()` tests
+    /// (phase-39 code review, finding 5 / claude LOW #8).
+    #[test]
+    fn pi_subagent_dispatch_check_renders_both_arms() {
+        let available = pi_subagent_dispatch_check_for(true);
+        assert_eq!(available.name, "pi subagent dispatch");
+        assert_eq!(available.status, "ok");
+        assert_eq!(available.version.as_deref(), Some("available"));
+        assert_eq!(available.install_hint, None);
+
+        let missing = pi_subagent_dispatch_check_for(false);
+        assert_eq!(missing.name, "pi subagent dispatch");
+        assert_eq!(missing.status, "warn");
+        assert_eq!(missing.version.as_deref(), Some("not installed"));
+        assert!(missing.install_hint.is_some());
+        assert!(
+            missing
+                .install_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("@bacnh85/pi-subagent")),
+            "the absent hint must name the vetted install command"
+        );
+    }
 
     /// 999.78/A-11, reset event ZERO — the one that must NOT happen. The
     /// per-phase Validate-failure total survives a `devflow start --force`

@@ -8,9 +8,11 @@
 //! no trust decision — that is a security boundary, not a convenience.
 //!
 //! No `--model`/`--provider` wiring in the launch argv: model/provider
-//! selection is Pi's own. The `health` check probes the provider(s) actually
-//! configured in Pi's `models.json` (this machine: `litellm`) — not a hardcoded
-//! `google`.
+//! selection is Pi's own. The `health` check probes the provider a launch will
+//! actually use — `settings.json`'s `defaultProvider` (this machine:
+//! `litellm`), falling back to Pi's built-in `--provider` default (`google`)
+//! when unset — never a hardcoded provider and never "any ready provider in
+//! `models.json`".
 //!
 //! Note: Pi has NO `--` end-of-options convention — passing `--` is rejected as
 //! an unknown option, so the prompt is passed raw. DevFlow's own stage prompts
@@ -65,40 +67,27 @@ impl AgentDriver for PiDriver {
         // Credential readiness via `pi auth check` — Pi's own verb — rather
         // than env-var sniffing (see `classify_auth_check`). `--no-refresh`
         // prevents a stalled OAuth token refresh from hanging preflight
-        // (code-review finding #8). Probe the actually-configured provider(s)
-        // from `models.json`, NOT a hardcoded `google` — `pi auth check`
-        // requires an explicit `--provider`, and a hardcoded `google` returns
-        // `not_ready` on a LiteLLM-configured machine even though Pi runs fine
-        // (phase-39 review, claude A).
-        let providers = configured_pi_providers();
-        if providers.is_empty() {
-            return Err(
-                "no provider configured in Pi's models.json — run `pi auth check` for details"
-                    .to_string(),
-            );
-        }
-        let mut last_err: Option<String> = None;
-        for provider in providers {
-            let output = std::process::Command::new("pi")
-                .args([
-                    "auth",
-                    "check",
-                    "--json",
-                    "--provider",
-                    &provider,
-                    "--no-refresh",
-                ])
-                .output()
-                .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
-            match classify_auth_check(
-                &String::from_utf8_lossy(&output.stdout),
-                output.status.success(),
-            ) {
-                Ok(()) => return Ok(()),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| "no provider credential resolves".to_string()))
+        // (code-review finding #8).
+        //
+        // Probe the provider a launch will ACTUALLY use: `settings.json`'s
+        // `defaultProvider`. `build_command` passes no `--provider`, so the run
+        // selects the default — probing "any ready provider in `models.json`"
+        // false-greens a credential the run never touches, and refusing when
+        // `models.json` is absent false-rejects every standard install
+        // (built-in providers are credentialled from env vars / `auth.json`,
+        // never listed in `models.json`). Fall back to Pi's `--provider`
+        // default (`google`) when `settings.json` carries no `defaultProvider`.
+        let provider = configured_pi_provider().unwrap_or_else(|| "google".to_string());
+        let output = std::process::Command::new("pi")
+            .args(["auth", "check", "--json", "--provider", &provider, "--no-refresh"])
+            .output()
+            .map_err(|e| format!("could not run `pi auth check`: {e}"))?;
+        classify_auth_check(&String::from_utf8_lossy(&output.stdout), output.status.success())
+            .map_err(|reason| {
+                format!(
+                    "{reason} for provider `{provider}` — `pi auth check --json --provider {provider}` reports it not ready"
+                )
+            })
     }
 }
 
@@ -116,42 +105,58 @@ fn classify_auth_check(stdout: &str, success: bool) -> Result<(), String> {
     if ready {
         Ok(())
     } else {
-        Err("no provider credential resolves — run `pi auth check` for details".to_string())
+        Err("no provider credential resolves".to_string())
     }
 }
 
-/// The provider names configured in Pi's `models.json` (the `providers` keys).
-/// Resolves the Pi config dir from `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
-/// Empty when the file is missing or unparseable — callers refuse rather than
-/// guess a provider.
-fn configured_pi_providers() -> Vec<String> {
-    let base = std::env::var_os("PI_CODING_AGENT_DIR")
+/// The provider a `pi -p` launch actually uses: `settings.json`'s
+/// `defaultProvider`. `None` when the file is missing/unparseable or carries no
+/// `defaultProvider` — the caller falls back to Pi's built-in `--provider`
+/// default (`google`, per `pi --help`).
+///
+/// `models.json` is NOT the provider configuration: it is the custom-model
+/// CATALOG (LiteLLM/vLLM endpoints). A standard Pi install (built-in provider
+/// credentialled from `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/OAuth in
+/// `auth.json`) has no `models.json` at all — reading it here both
+/// hard-refuses default installs and false-greens a provider the run never
+/// selects (phase-39 code review, finding 1).
+fn configured_pi_provider() -> Option<String> {
+    let base = pi_config_dir()?;
+    let path = base.join("settings.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    json.get("defaultProvider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Resolve Pi's config dir: `PI_CODING_AGENT_DIR` if set, else `~/.pi/agent`.
+/// A leading `~` is expanded the way Pi's own `getAgentDir` does, so a tilde
+/// value resolves instead of yielding an unreadable literal path (phase-39
+/// code review, claude LOW #7).
+fn pi_config_dir() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("PI_CODING_AGENT_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(|home| std::path::PathBuf::from(home).join(".pi").join("agent"))
-        });
-    let Some(base) = base else {
-        return Vec::new();
-    };
-    let path = base.join("models.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    json.get("providers")
-        .and_then(serde_json::Value::as_object)
-        .map(|obj| obj.keys().cloned().collect())
-        .unwrap_or_default()
+        })?;
+    let raw_str = raw.to_string_lossy();
+    if let Some(rest) = raw_str.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Some(std::path::PathBuf::from(home).join(rest));
+    }
+    Some(raw)
 }
 
-/// Whether Pi's profile has a subagent/dispatch extension installed (e.g.
-/// `@bacnh85/pi-subagent`). Probed via `pi list --no-approve` — Pi exposes no
+/// Whether Pi's profile has the vetted `@bacnh85/pi-subagent` dispatch
+/// extension installed. Probed via `pi list --no-approve` — Pi exposes no
 /// `pi tools` command, so the installed-package name is the only cheap,
-/// non-interactive signal. A package name containing "subagent" is treated as
-/// dispatch capability.
+/// non-interactive signal. The match is the specific vetted package, NOT a
+/// bare `*subagent*` substring: other `subagent`-named packages (`@mystilleef`,
+/// `@dreki-gg`, `@smoose`) are unsafe/deferred and must not be reported
+/// available (phase-39 code review, finding 2).
 ///
 /// **Honest limit:** name-based, not a tool-registry proof — it does not
 /// confirm the extension registers a working dispatch tool. Any probe failure
@@ -167,7 +172,7 @@ fn pi_subagent_dispatch_available() -> bool {
     output.status.success()
         && String::from_utf8_lossy(&output.stdout)
             .to_lowercase()
-            .contains("subagent")
+            .contains("@bacnh85/pi-subagent")
 }
 
 #[cfg(test)]
@@ -256,16 +261,16 @@ mod tests {
         dir
     }
 
-    /// Like [`stub_pi_on_path`], plus a `models.json` naming a single `litellm`
-    /// provider — so the health check probes the configured provider instead of
-    /// a hardcoded `google`.
-    fn stub_pi_with_models(body: &str, exit_code: i32) -> tempfile::TempDir {
+    /// Like [`stub_pi_on_path`], plus a `settings.json` naming the provider a
+    /// launch would use — so the health check probes the configured provider
+    /// instead of a hardcoded `google`.
+    fn stub_pi_with_provider(body: &str, exit_code: i32, provider: &str) -> tempfile::TempDir {
         let dir = stub_pi_on_path(body, exit_code);
         std::fs::write(
-            dir.path().join("models.json"),
-            r#"{"providers":{"litellm":{"baseUrl":"http://127.0.0.1:4000/v1","models":[]}}}"#,
+            dir.path().join("settings.json"),
+            format!(r#"{{"defaultProvider":"{provider}"}}"#),
         )
-        .expect("write models.json");
+        .expect("write settings.json");
         dir
     }
 
@@ -322,11 +327,11 @@ mod tests {
     /// The shell-out must actually spawn `pi auth check --json --provider
     /// <configured>` — not just classify a pre-parsed string. The stub records
     /// its argv, proving the wiring end to end, and that the provider is read
-    /// from `models.json` (`litellm`), not hardcoded.
+    /// from `settings.json` (`litellm`), not hardcoded.
     #[test]
     fn preflight_invokes_pi_auth_check_and_accepts_ready() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let stub_dir = stub_pi_with_models(r#"{"status":"ready"}"#, 0);
+        let stub_dir = stub_pi_with_provider(r#"{"status":"ready"}"#, 0, "litellm");
         let _path = PathGuard::set(stub_dir.path());
         let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
 
@@ -347,9 +352,10 @@ mod tests {
     #[test]
     fn preflight_reports_credentialless_when_auth_check_says_not_ready() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let stub_dir = stub_pi_with_models(
+        let stub_dir = stub_pi_with_provider(
             r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
             0,
+            "litellm",
         );
         let _path = PathGuard::set(stub_dir.path());
         let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
@@ -368,7 +374,7 @@ mod tests {
     #[test]
     fn preflight_rejects_ready_body_with_failed_exit() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let stub_dir = stub_pi_with_models(r#"{"status":"ready"}"#, 1);
+        let stub_dir = stub_pi_with_provider(r#"{"status":"ready"}"#, 1, "litellm");
         let _path = PathGuard::set(stub_dir.path());
         let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
 
@@ -378,23 +384,23 @@ mod tests {
         );
     }
 
-    /// No `models.json` (or an empty one) must refuse with a clear reason, not
-    /// guess a provider.
+    /// No `settings.json` (a standard install: built-in provider from env vars
+    /// / `auth.json`, no custom `models.json`) must NOT be hard-refused — the
+    /// health check falls back to Pi's `--provider` default (`google`) and lets
+    /// `pi auth check` report readiness (phase-39 code review, finding 1a).
     #[test]
-    fn health_refuses_when_no_provider_configured() {
+    fn preflight_falls_back_to_google_when_no_default_provider() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        // `stub_pi_on_path` writes no models.json, so no provider is configured.
         let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 0);
         let _path = PathGuard::set(stub_dir.path());
         let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
 
-        let err = PiDriver
+        PiDriver
             .health(&test_state())
-            .expect_err("no configured provider must refuse");
-        assert!(
-            err.contains("no provider configured"),
-            "unexpected error: {err}"
-        );
+            .expect("a default-provider stub must pass preflight via the google fallback");
+
+        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
+        assert_eq!(argv, "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n");
     }
 
     /// The capability probe shells out to `pi list --no-approve` and matches on
@@ -411,6 +417,19 @@ mod tests {
 
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
         assert_eq!(argv, "list\n--no-approve\n");
+    }
+
+    /// A `subagent`-named package that is NOT the vetted `@bacnh85/pi-subagent`
+    /// (e.g. the unsafe/deferred `@mystilleef`) must NOT flip the capability on
+    /// — the name-match is the specific package, not `*subagent*` (phase-39
+    /// code review, finding 2).
+    #[test]
+    fn pi_capabilities_exclude_unvetted_subagent_packages() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_pi_on_path("npm:@mystilleef/pi-subagent@2.0.0 (user)", 0);
+        let _path = PathGuard::set(stub_dir.path());
+
+        assert!(!PiDriver.capabilities().subagent_dispatch);
     }
 
     /// No subagent package in `pi list` → capability stays off (baseline path).

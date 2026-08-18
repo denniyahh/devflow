@@ -3279,6 +3279,16 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
         );
         state.stage = Stage::Code;
+
+        // Precondition: Pi must NOT be in the stream-json rollout, so the
+        // assertion below discriminates a broken `claude_stream_launch_enabled`
+        // predicate instead of a stage that was going to be Legacy anyway
+        // (phase-39 code review, finding 3).
+        assert!(
+            !claude_stream_launch_enabled(state.agent, state.stage, false),
+            "Pi must never be stream-launch-enabled for this test to mean anything"
+        );
+
         let driver = agents::driver_for(state.agent);
         let (program, args, launch) = resolve_launch_shape(
             state.agent,
