@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 37.1 | Pi Subagent-Extension Spike (research) | Not started | — |
 | 38 | Driver Contract Completion (999.106 + 999.107) | Complete | — |
-| 39 | Pi End-to-End | Not started | — |
+| 39 | Pi End-to-End | In Progress | — |
 
 ### Phase 37.1: Pi Subagent-Extension Spike (research)
 
@@ -130,7 +130,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 37 | 4/4 | Complete    | 2026-08-16 |
 | 37.1 | — | Not started | — |
 | 38 | — | Complete    | 2026-08-17 |
-| 39 | — | Not started | — |
+| 39 | 1/1 | In Progress|  |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
