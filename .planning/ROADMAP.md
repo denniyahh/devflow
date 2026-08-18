@@ -356,6 +356,26 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (BACKLOG)
+
+**Found:** 2026-08-18, attempting `$gsd-plan-phase 40` from a Pi session. The workflow's subagent
+spawns (`gsd-planner`, `gsd-plan-checker`, `gsd-phase-researcher`, …) have no available dispatch
+mechanism in Pi, so the planning lifecycle falls back to inline execution or must move to another
+runtime.
+
+**The item:** GSD's subagent-dispatching workflows (plan, execute, review, and any other that
+spawns `gsd-*` role agents) cannot run natively in a Pi session. GSD does not recognize `pi` as a
+runtime, so those workflows' subagent calls find no matching tool, and there is no translation to
+Pi's available subagent mechanism. The current workaround is to run those workflows from Codex or
+Claude Code.
+
+**Priority:** Medium — blocks native GSD lifecycle work from Pi, but a working fallback (another
+runtime) exists. **Size:** M.
+
+**Depends on:** nothing structural.
+
+---
+
 ### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (BACKLOG)
 
 **Linear:** [DEN-113](https://linear.app/denniskim/issue/DEN-113/99992-the-99947-regression-test-loses-its-own-fixture-shape-before-it)
