@@ -362,7 +362,9 @@ own `phases/999.N-*/CONTEXT.md`.
 **Found:** 2026-08-18, attempting `$gsd-plan-phase 40` from a Pi session. The workflow's subagent
 spawns (`gsd-planner`, `gsd-plan-checker`, `gsd-phase-researcher`, …) have no available dispatch
 mechanism in Pi, so the planning lifecycle falls back to inline execution or must move to another
-runtime.
+runtime. **Reproduced live 2026-08-19** during the Phase 40 Pi dogfood: the `subagent` tool is
+available headlessly, but the Code stage made 0 dispatches because `execute-phase.md` only knows the
+Claude/Codex `Agent()` model (see CONTEXT.md).
 
 **The item:** GSD's subagent-dispatching workflows (plan, execute, review, and any other that
 spawns `gsd-*` role agents) cannot run natively in a Pi session. GSD does not recognize `pi` as a
