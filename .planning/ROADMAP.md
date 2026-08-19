@@ -381,6 +381,8 @@ own `phases/999.N-*/CONTEXT.md`.
 
 ### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (BACKLOG)
 
+**Linear:** [DEN-114](https://linear.app/denniskim/issue/DEN-114)
+
 **Found:** 2026-08-18, attempting `$gsd-plan-phase 40` from a Pi session. The workflow's subagent
 spawns (`gsd-planner`, `gsd-plan-checker`, `gsd-phase-researcher`, …) have no available dispatch
 mechanism in Pi, so the planning lifecycle falls back to inline execution or must move to another
