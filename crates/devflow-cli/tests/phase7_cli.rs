@@ -1,4 +1,6 @@
 use devflow_core::phase_id::PhaseId;
+use devflow_core::stage::Stage;
+use devflow_core::workflow::load_state;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1178,5 +1180,166 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         second.status.success(),
         "second cleanup run must find the worktree already gone and not error\nstderr: {}",
         String::from_utf8_lossy(&second.stderr)
+    );
+}
+/// A `pi` stub that answers the preflight health check (`pi auth check` →
+/// `{"status":"ready"}`) and the capability probe (`pi list` → the vetted
+/// `@bacnh85/pi-subagent` package), then runs `launch` for the real
+/// `pi -p --no-approve` stage launch. The health check probes the provider in
+/// the real `~/.pi/agent/settings.json`, so the stub must classify as `ready`
+/// or preflight gates and the stage never runs.
+fn pi_stub(launch: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+           auth) printf '{{\"status\":\"ready\"}}\\n'; exit 0 ;;\n\
+           list) printf 'npm:@bacnh85/pi-subagent (user)\\n'; exit 0 ;;\n\
+         esac\n\
+         {launch}\n"
+    )
+}
+
+/// Wait until a phase's persisted state reports `gate_pending == true` — the
+/// never-silent failure/review gate (WR-11) that fires when a stage's agent
+/// outcome does not advance. Polls rather than reading once, since the
+/// detached monitor chain advances asynchronously.
+fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
+    for _ in 0..400 {
+        if let Ok(state) = load_state(root, phase)
+            && state.gate_pending
+        {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {phase} to report gate_pending");
+}
+
+/// A Pi run that exits 0 without emitting a DEVFLOW_RESULT marker must not
+/// advance a commit-gated stage. Define (not commit-gated) legitimately
+/// advances on exit 0, but Plan — a commit-gated stage — runs the same
+/// marker-less stub, which produces no commits and no marker, so it is
+/// `Failed` and gates instead of advancing to Code.
+#[test]
+fn pi_marker_less_run_does_not_advance() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 0\n"))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "pi",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let state = wait_for_gate(root, PhaseId::new(7));
+    assert_eq!(
+        state.stage,
+        Stage::Plan,
+        "a marker-less run must not advance past the commit-gated Plan stage"
+    );
+    assert!(state.gate_pending, "the never-silent gate must have fired");
+}
+
+/// A Pi run that exits non-zero must not advance its stage: the failed exit is
+/// not Success, so the pipeline gates instead of advancing.
+#[test]
+fn pi_nonzero_exit_does_not_advance() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 1\n"))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "pi",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let state = wait_for_gate(root, PhaseId::new(7));
+    assert_eq!(
+        state.stage,
+        Stage::Define,
+        "a non-zero-exit run must not advance its stage"
+    );
+    assert!(state.gate_pending, "the never-silent gate must have fired");
+}
+
+/// A hung Pi process (never exits) is surfaced as alive by monitor liveness —
+/// the stage never advances while it runs (no false Success) — and once killed,
+/// the monitor reaps it and gates (never a silent advance).
+#[test]
+fn pi_hung_process_is_detected_not_left_running() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "pi",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let pid_path = root.join(".devflow/phase-07-agent-pid");
+    let pid = wait_for_pid(&pid_path);
+
+    // The hung process must be surfaced as alive, not silently reaped or
+    // declared complete.
+    assert!(
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "the hung pi process must still be alive"
+    );
+    let state = load_state(root, PhaseId::new(7)).expect("load state");
+    assert_eq!(
+        state.stage,
+        Stage::Define,
+        "the stage must not advance while pi is hung"
+    );
+
+    // Kill the hung process; the monitor reaps it and gates — never advances.
+    assert!(
+        Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "should be able to kill the hung pi process"
+    );
+    let gated = wait_for_gate(root, PhaseId::new(7));
+    assert_eq!(
+        gated.stage,
+        Stage::Define,
+        "a hung-then-killed run must not advance its stage"
     );
 }

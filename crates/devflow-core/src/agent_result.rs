@@ -1798,11 +1798,19 @@ fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Optio
 /// Build the `IdleTimeout` verdict Layer 1 reports for a monitor-recorded
 /// timeout.
 ///
-/// `verdict` stays `None` deliberately: at `Stage::Validate`,
-/// `classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST and would
-/// classify the stage as passed on the strength of that field alone, whatever
-/// the status says. A timeout has no verdict to offer, and inventing one here
-/// would advance a run that never reported.
+/// `verdict` stays `None` deliberately: a timeout has no verdict to offer, and
+/// inventing one here would advance a run that never reported. The invariant is
+/// now carried by two structural defences, not by this convention alone
+/// (999.85 / F-34-01):
+///
+/// 1. The classifier's enumerated status position — `classify_validate_outcome`
+///    (`pipeline_outcomes.rs`) matches `(_, AgentStatus::Success,
+///    Some(Verdict::Pass))`, so a non-`Success` status such as `IdleTimeout`
+///    can never reach `Passed` on the strength of the verdict field alone.
+/// 2. The graft's status filter — `reconcile_layer0_verdict` transplants a
+///    Layer 1 verdict only when `layer1.status == AgentStatus::Success`. This
+///    result's `IdleTimeout` status is filtered out, so its (already `None`)
+///    verdict can never be grafted onto a Layer 0 Validate result.
 fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
     AgentResult {
         status: AgentStatus::IdleTimeout,
@@ -6880,10 +6888,14 @@ mod tests {
         // Layer 1 still decided this — the arbitration corrects its verdict, it
         // does not hand the decision to Layer 2.
         assert_eq!(result.decided_by_layer, Some(1));
-        // Load-bearing: a downgraded result has no verdict to offer. Carrying
-        // `Some(Verdict::Pass)` over would leave Validate classified Passed and
-        // make this whole test's premise false at the stage that matters most
-        // (999.74 / DEN-95).
+        // Load-bearing: a downgraded result has no verdict to offer. The
+        // invariant is structural, not conventional (999.85 / F-34-02): the
+        // classifier's enumerated status position (`(_, AgentStatus::Success,
+        // Some(Verdict::Pass))` in `classify_validate_outcome`) and the graft's
+        // status filter (`reconcile_layer0_verdict`) both reject a verdict
+        // riding a non-`Success` status. This assertion pins that the
+        // arbitration drops the verdict outright rather than leaving it to be
+        // re-classified downstream.
         assert_eq!(result.verdict, None);
     }
 
