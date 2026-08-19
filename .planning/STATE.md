@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 40
-current_phase_name: Pi Dogfood
-status: planning
+current_phase_name: pi-dogfood
+status: executing
 stopped_at: Phase 40 planned (2 plans)
-last_updated: "2026-08-18T23:14:20.614Z"
+last_updated: "2026-08-18T23:34:24.254Z"
 last_activity: 2026-08-18
 last_activity_desc: "Milestone v2.8.0 roadmap created (6 phases: 40–45)"
 progress:
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Phase 40 (Pi Dogfood) — ready to plan
-Plan: —
-Status: Ready to plan
-Last activity: 2026-08-18 — Milestone v2.8.0 roadmap created (6 phases: 40–45)
+Phase: 40 (pi-dogfood) — EXECUTING
+Plan: 1 of 2
+Status: Executing Phase 40
+Last activity: 2026-08-18 — Phase 40 execution started
 
 ## Recently Shipped
 

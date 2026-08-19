@@ -1235,7 +1235,11 @@ fn pi_markerless_exit_does_not_advance() {
     // Pi's Define gates (35.1-03: Legacy launch can't bind the chain flag) —
     // expected; approve it so the marker-less agent stages actually run.
     wait_for(&root.join(".devflow/gates/07-define.json"));
-    run_devflow(root, &fake_bin.path, &["gate", "approve", "7", "--stage", "define"]);
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &["gate", "approve", "7", "--stage", "define"],
+    );
 
     let state = settle_then_load(root, PhaseId::new(7));
     assert_ne!(
@@ -1278,7 +1282,11 @@ fn pi_nonzero_exit_does_not_advance() {
     );
 
     wait_for(&root.join(".devflow/gates/07-define.json"));
-    run_devflow(root, &fake_bin.path, &["gate", "approve", "7", "--stage", "define"]);
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &["gate", "approve", "7", "--stage", "define"],
+    );
 
     let state = settle_then_load(root, PhaseId::new(7));
     assert_ne!(
