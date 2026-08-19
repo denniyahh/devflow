@@ -13,7 +13,7 @@ change.
 
 | Phase | Name | Requirements | Status |
 |---|---|---|---|
-| 40 | Pi Dogfood | PIDG-01, MAINT-01 | Not started |
+| 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
 | 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03 | Not started |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
@@ -21,71 +21,90 @@ change.
 | 45 | Opportunistic Cleanup (999.94) | DECN-01 | Not started |
 
 ### Phase 40: Pi Dogfood
+
 **Goal**: `devflow start --agent pi` drives a real supervised run through Define→Validate (at least
 one live gate), proving the Pi driver (shipped in v2.7.0) is reliable under real use. Code-stage
 subject: 999.85 (two stale comments, MAINT-01).
 **Depends on**: Nothing (Pi driver already shipped)
 **Requirements**: PIDG-01, MAINT-01
 **Success Criteria** (what must be TRUE):
+
   1. A real supervised run completes Define→Plan→Code→Validate through `--agent pi`; the 999.85 comments are correctly rewritten.
   2. At least one live gate fires and the operator's decision is honored — no lost gate, no marker-less silent advance.
   3. Pi-transport regression tests (stubbed `pi`) prove a marker-less run, a non-zero exit, and a hung Pi are each handled without advancing.
-**Plans**: 2 plans
-- [ ] 40-01-PLAN.md — Pi-transport regression tests (stubbed `pi` failure modes)
-- [ ] 40-02-PLAN.md — Real supervised Pi dogfood run (999.85 rewrite + live gate + subagent dispatch)
+
+**Plans**: 2/2 plans complete
+
+- [x] 40-01-PLAN.md — Pi-transport regression tests (stubbed `pi` failure modes)
+- [x] 40-02-PLAN.md — Real supervised Pi dogfood run (999.85 rewrite + live gate + subagent dispatch)
 
 ### Phase 41: Antigravity Driver
+
 **Goal**: `devflow start --agent antigravity` launches the Antigravity CLI headless and drives a
 stage to completion with honest completion detection.
 **Depends on**: Nothing (mirrors the existing ClaudeDriver pattern)
 **Requirements**: ANTG-01, ANTG-02, ANTG-03
 **Success Criteria** (what must be TRUE):
+
   1. `--agent antigravity` resolves through `AgentKind`/`driver_for`/`agent_program`, and `devflow doctor` reports it installed.
   2. The driver spawns the vetted `antigravity-cli` (1.1.14) headless with skip-permissions — argv spawn-tested, not assumed.
   3. A marker-less run never advances a stage (regression test).
   4. The driver passes the shared conformance suite.
+
 **Plans**: TBD
 
 ### Phase 42: Hermes Driver
+
 **Goal**: `devflow start --agent hermes` launches Hermes oneshot (`-z --yolo`) headless and drives a
 stage with honest completion.
 **Depends on**: Nothing (mirrors the existing PiDriver pattern)
 **Requirements**: HRMS-01, HRMS-02, HRMS-03
 **Success Criteria** (what must be TRUE):
+
   1. `--agent hermes` resolves end-to-end (enum / `FromStr` / `driver_for` / `agent_program`).
   2. The driver spawns `hermes -z "<prompt>" --yolo` headless — argv spawn-tested.
   3. Completion is process-exit + `DEVFLOW_RESULT` prompt contract; a marker-less run never advances.
   4. The driver passes the shared conformance suite.
+
 **Plans**: TBD
 
 ### Phase 43: OpenCode Driver Completion
+
 **Goal**: `devflow start --agent opencode` runs headless with `--auto` + `--format json`, and
 completion/verdict is parsed from the JSON events.
 **Depends on**: Nothing
 **Requirements**: OPCD-01, OPCD-02, OPCD-03
 **Success Criteria** (what must be TRUE):
+
   1. The driver launches `opencode run "<prompt>" --auto --format json`.
   2. Completion/verdict is parsed from `--format json` events, regression-tested against a real capture (not an assumed schema).
   3. The health check fails closed when OpenCode is not usable.
   4. The driver passes the shared conformance suite.
+
 **Plans**: TBD
 
 ### Phase 44: Codex End-to-End Verification
+
 **Goal**: `--agent codex` proven through a real phase run; any surfaced gaps closed.
 **Depends on**: Nothing (Codex driver already native since 37-03)
 **Requirements**: CODE-01
 **Success Criteria** (what must be TRUE):
+
   1. A real phase completes through `--agent codex`, or the run surfaces concrete, re-filed gaps.
   2. Each surfaced gap is closed or re-filed with evidence.
   3. No regression to the existing Codex driver behavior (workspace tests green).
+
 **Plans**: TBD
 
 ### Phase 45: Opportunistic Cleanup (999.94)
+
 **Goal**: Close 999.94 (unattended `decision` checkpoint blind-first-option, HIGH) if capacity permits.
 **Depends on**: Nothing (independent of the driver phases)
 **Requirements**: DECN-01
 **Success Criteria** (what must be TRUE):
+
   1. An unattended `decision` checkpoint no longer blindly takes the first option — acceptance-tested, since it alters unattended-run policy.
+
 **Plans**: TBD
 
 ---
@@ -191,7 +210,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 37.1 | — | Complete    | 2026-08-17 |
 | 38 | — | Complete    | 2026-08-17 |
 | 39 | 1/1 | Complete    | 2026-08-18 |
-| 40 | — | Not started | — |
+| 40 | 2/2 | Complete   | 2026-08-18 |
 | 41 | — | Not started | — |
 | 42 | — | Not started | — |
 | 43 | — | Not started | — |

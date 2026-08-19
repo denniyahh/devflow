@@ -14,8 +14,10 @@ phase.
 
 - [ ] **ANTG-01**: Operator can select `--agent antigravity` — the `AgentKind` variant resolves
   through FromStr/Display, `driver_for`, and `agent_program`.
+
 - [ ] **ANTG-02**: Antigravity driver launches headless (Claude-style `-p` + stream-json +
   skip-permissions) and passes the shared conformance suite.
+
 - [ ] **ANTG-03**: Antigravity completion/verdict is parsed from the stream (or honest process-exit)
   — a marker-less run never advances a stage.
 
@@ -24,6 +26,7 @@ phase.
 - [ ] **HRMS-01**: Operator can select `--agent hermes` — full `AgentKind` registration.
 - [ ] **HRMS-02**: Hermes driver launches headless (`hermes -z "<prompt>" --yolo`) and passes the
   conformance suite.
+
 - [ ] **HRMS-03**: Hermes completion is honest (process-exit + `DEVFLOW_RESULT` prompt contract); a
   marker-less run never advances a stage.
 
@@ -32,6 +35,7 @@ phase.
 - [ ] **OPCD-01**: OpenCode driver launches headless with `--auto` + `--format json`.
 - [ ] **OPCD-02**: OpenCode completion/verdict is parsed from `--format json` events
   (regression-tested), modeled on Codex's `parse_codex_event_result`.
+
 - [ ] **OPCD-03**: OpenCode has a fail-closed health check + capability discovery.
 
 ### Codex
@@ -41,7 +45,7 @@ phase.
 
 ### Pi Dogfood
 
-- [ ] **PIDG-01**: Phase 40 completes a real supervised Define→Validate run through `--agent pi`
+- [x] **PIDG-01**: Phase 40 completes a real supervised Define→Validate run through `--agent pi`
   (at least one live gate), proving Pi driver reliability; the deferred isolated-context Pi dispatch
   item is re-filed (not built this phase).
 
@@ -49,7 +53,8 @@ phase.
 
 - [ ] **DECN-01**: (999.94, HIGH) — an unattended `decision` checkpoint no longer takes the first
   option blindly.
-- [ ] **MAINT-01**: (999.85, low) — the two stale code comments removed/corrected.
+
+- [x] **MAINT-01**: (999.85, low) — the two stale code comments removed/corrected.
 
 ## Future Requirements
 
@@ -89,11 +94,12 @@ Which phases cover which requirements. Filled during roadmap creation.
 | OPCD-02 | Phase 43 | Pending |
 | OPCD-03 | Phase 43 | Pending |
 | CODE-01 | Phase 44 | Pending |
-| PIDG-01 | Phase 40 | Pending |
+| PIDG-01 | Phase 40 | Complete |
 | DECN-01 | Phase 45 | Pending |
-| MAINT-01 | Phase 40 | Pending |
+| MAINT-01 | Phase 40 | Complete |
 
 **Coverage:**
+
 - v2.8.0 requirements: 13 total
 - Mapped to phases: 13
 - Unmapped: 0 ✓
