@@ -14,7 +14,7 @@ change.
 | Phase | Name | Requirements | Status |
 |---|---|---|---|
 | 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
-| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03 | Not started |
+| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Not started |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |
@@ -41,15 +41,18 @@ subject: 999.85 (two stale comments, MAINT-01).
 ### Phase 41: Antigravity Driver
 
 **Goal**: `devflow start --agent antigravity` launches the Antigravity CLI headless and drives a
-stage to completion with honest completion detection.
+stage to completion with honest completion detection. Also closes two dogfood-hygiene items surfaced
+by the Phase 40 run — the leaked test monitors (HYG-01) and the container git-env failures (HYG-02).
 **Depends on**: Nothing (mirrors the existing ClaudeDriver pattern)
-**Requirements**: ANTG-01, ANTG-02, ANTG-03
+**Requirements**: ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02
 **Success Criteria** (what must be TRUE):
 
   1. `--agent antigravity` resolves through `AgentKind`/`driver_for`/`agent_program`, and `devflow doctor` reports it installed.
   2. The driver spawns the vetted `antigravity-cli` (1.1.14) headless with skip-permissions — argv spawn-tested, not assumed.
   3. A marker-less run never advances a stage (regression test).
   4. The driver passes the shared conformance suite.
+  5. The Phase-7 integration tests reap their own monitors — a full `cargo test` run leaks 0 detached `devflow start` processes (HYG-01).
+  6. `check-in-container.sh` passes under root (uid 0) — the 3 git-env tests that fail in the pinned container are fixed (HYG-02).
 
 **Plans**: TBD
 

@@ -21,6 +21,14 @@ phase.
 - [ ] **ANTG-03**: Antigravity completion/verdict is parsed from the stream (or honest process-exit)
   — a marker-less run never advances a stage.
 
+### Dogfood Hygiene (Phase 41)
+
+- [ ] **HYG-01**: The Phase-7 integration tests reap their own `devflow start` monitors — a full
+  `cargo test` run leaves 0 detached monitor processes (the Phase 40 dogfood leaked 43).
+
+- [ ] **HYG-02**: `check-in-container.sh` passes under root (uid 0) in the pinned container — the 3
+  git-env tests that fail as root are fixed (unrelated to the code under test).
+
 ### Hermes
 
 - [ ] **HRMS-01**: Operator can select `--agent hermes` — full `AgentKind` registration.
@@ -87,6 +95,8 @@ Which phases cover which requirements. Filled during roadmap creation.
 | ANTG-01 | Phase 41 | Pending |
 | ANTG-02 | Phase 41 | Pending |
 | ANTG-03 | Phase 41 | Pending |
+| HYG-01 | Phase 41 | Pending |
+| HYG-02 | Phase 41 | Pending |
 | HRMS-01 | Phase 42 | Pending |
 | HRMS-02 | Phase 42 | Pending |
 | HRMS-03 | Phase 42 | Pending |
@@ -100,8 +110,8 @@ Which phases cover which requirements. Filled during roadmap creation.
 
 **Coverage:**
 
-- v2.8.0 requirements: 13 total
-- Mapped to phases: 13
+- v2.8.0 requirements: 15 total
+- Mapped to phases: 15
 - Unmapped: 0 ✓
 
 ---
