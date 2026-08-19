@@ -1180,3 +1180,118 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         String::from_utf8_lossy(&second.stderr)
     );
 }
+
+/// Spawn `devflow` without blocking. `devflow start` blocks on Pi's Define
+/// gate (35.1-03 unattended-launch check: Legacy launch cannot bind the chain
+/// flag), so the test must answer that gate while `start` is still running —
+/// `.output()` would hang.
+fn spawn_devflow(root: &Path, fake_bin: &Path, args: &[&str]) -> std::process::Child {
+    Command::new(devflow_bin())
+        .args(args)
+        .arg(root)
+        .env("PATH", path_with_fake_bin(fake_bin))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .current_dir(root)
+        .spawn()
+        .expect("spawn devflow")
+}
+
+/// Wait a bounded window for the detached monitor to drive the stages to the
+/// failure (the stub `pi` exits immediately), then return the persisted state.
+/// The marker-less run stalls at an agent stage; the non-zero run stalls at
+/// Define (the first agent launch) — either way it must never reach
+/// Validate/Ship.
+fn settle_then_load(root: &Path, phase: PhaseId) -> devflow_core::state::State {
+    std::thread::sleep(Duration::from_secs(5));
+    devflow_core::workflow::load_state(root, phase).unwrap()
+}
+
+/// 40-01 (Pi-transport regression): a `pi` that exits 0 without emitting a
+/// DEVFLOW_RESULT marker must not advance its stage — a marker-less process
+/// exit must never be read as Success (D-05). The Pi driver's `-p` transport
+/// must feed `parse_devflow_result` the same way Claude/Codex do.
+#[test]
+fn pi_markerless_exit_does_not_advance() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("pi", "#!/bin/sh\nexit 0\n")]);
+
+    let mut child = spawn_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "7",
+            "--agent",
+            "pi",
+            "--mode",
+            "supervise",
+            "--no-worktree",
+        ],
+    );
+
+    // Pi's Define gates (35.1-03: Legacy launch can't bind the chain flag) —
+    // expected; approve it so the marker-less agent stages actually run.
+    wait_for(&root.join(".devflow/gates/07-define.json"));
+    run_devflow(root, &fake_bin.path, &["gate", "approve", "7", "--stage", "define"]);
+
+    let state = settle_then_load(root, PhaseId::new(7));
+    assert_ne!(
+        state.stage,
+        devflow_core::stage::Stage::Validate,
+        "marker-less pi exit must not advance past the agent stages, got {:?}",
+        state.stage
+    );
+    assert_ne!(
+        state.stage,
+        devflow_core::stage::Stage::Ship,
+        "marker-less pi exit must not reach Ship"
+    );
+
+    let _ = child.wait();
+}
+
+/// 40-01 (Pi-transport regression): a `pi` that exits non-zero must not advance
+/// its stage (D-05). A non-zero exit is a typed failure, never Success.
+#[test]
+fn pi_nonzero_exit_does_not_advance() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("pi", "#!/bin/sh\nexit 1\n")]);
+
+    let mut child = spawn_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "7",
+            "--agent",
+            "pi",
+            "--mode",
+            "supervise",
+            "--no-worktree",
+        ],
+    );
+
+    wait_for(&root.join(".devflow/gates/07-define.json"));
+    run_devflow(root, &fake_bin.path, &["gate", "approve", "7", "--stage", "define"]);
+
+    let state = settle_then_load(root, PhaseId::new(7));
+    assert_ne!(
+        state.stage,
+        devflow_core::stage::Stage::Validate,
+        "non-zero pi exit must not advance past the agent stages, got {:?}",
+        state.stage
+    );
+    assert_ne!(
+        state.stage,
+        devflow_core::stage::Stage::Ship,
+        "non-zero pi exit must not reach Ship"
+    );
+
+    let _ = child.wait();
+}
