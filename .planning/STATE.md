@@ -5,10 +5,10 @@ milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 41
 current_phase_name: Antigravity Driver
 status: planning
-stopped_at: Phase 40 planned (2 plans)
-last_updated: "2026-08-19T01:28:28.942Z"
-last_activity: 2026-08-18
-last_activity_desc: "Milestone v2.8.0 roadmap created (6 phases: 40–45)"
+stopped_at: Phase 41 discuss-phase in progress
+last_updated: "2026-08-19T17:05:39.941Z"
+last_activity: 2026-08-19
+last_activity_desc: "Phase 40 closed; resumed to Phase 41 discuss-phase (Antigravity Driver)"
 progress:
   total_phases: 6
   completed_phases: 1
@@ -838,9 +838,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-18T23:14:20.567Z
-**Stopped at:** Phase 40 planned (2 plans)
-**Resume file:** .planning/phases/40-pi-dogfood/40-CONTEXT.md
+**Last session:** 2026-08-19 (resumed from pause)
+**Stopped at:** Session resumed, proceeding to Phase 41 discuss-phase
+**Resume file:** (none — resume complete)
 
 ## Operator Next Steps
 
