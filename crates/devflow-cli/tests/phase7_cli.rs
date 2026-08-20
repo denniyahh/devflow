@@ -94,7 +94,7 @@ fn path_with_fake_bin(fake_bin: &Path) -> String {
 }
 
 fn run_devflow(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    run_devflow_inner(root, fake_bin, args, false)
+    run_devflow_inner(root, fake_bin, args, false, ReapMode::Auto)
 }
 
 /// [`run_devflow`] with D-11's legacy-launch opt-out forced on for the spawned
@@ -124,10 +124,30 @@ fn run_devflow(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
 /// `parallel_creates_two_worktrees_and_spawns_two_monitors`, which deliberately
 /// does not use this helper.
 fn run_devflow_legacy_launch(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    run_devflow_inner(root, fake_bin, args, true)
+    run_devflow_inner(root, fake_bin, args, true, ReapMode::Auto)
 }
 
-fn run_devflow_inner(root: &Path, fake_bin: &Path, args: &[&str], legacy_launch: bool) -> Output {
+/// Whether [`run_devflow_inner`] registers the spawned monitor in the
+/// suite-level [`REGISTRY`] (codex-4, 41-02 Task 1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReapMode {
+    /// Register the monitor pid read from state after launch; the binding
+    /// test's `MonitorReapGuard` reaps it and the suite audit asserts the
+    /// registry drains.
+    Auto,
+    /// Do NOT register (and the caller does NOT bind a guard): the
+    /// intentional-opt-out control, proving an unguarded test leaves a live
+    /// monitor that the audit would detect were it registered.
+    Disabled,
+}
+
+fn run_devflow_inner(
+    root: &Path,
+    fake_bin: &Path,
+    args: &[&str],
+    legacy_launch: bool,
+    reap: ReapMode,
+) -> Output {
     let mut command = Command::new(devflow_bin());
     command
         .args(args)
@@ -138,6 +158,15 @@ fn run_devflow_inner(root: &Path, fake_bin: &Path, args: &[&str], legacy_launch:
     if legacy_launch {
         command.env("DEVFLOW_CLAUDE_LEGACY_LAUNCH", "true");
     }
+    // HYG-01: bound the gate wait on the CHILD's env. Supervise-mode stages
+    // that reach a gate (never-silent Define/Plan failures, Validate in
+    // supervise) block `devflow advance` for the default 3-day gate timeout;
+    // the sh monitor reaps cleanly but its advance child — spawned as the
+    // script's last line — is orphaned and keeps polling. The tests finish
+    // their own assertions far inside this window (the wait_for_* helpers cap
+    // at 10s), and the orphaned advances exit on their own once the gate
+    // times out instead of accumulating across runs.
+    command.env("DEVFLOW_GATE_TIMEOUT_SECS", "60");
     let output = command.output().expect("run devflow");
     assert!(
         output.status.success(),
@@ -145,7 +174,67 @@ fn run_devflow_inner(root: &Path, fake_bin: &Path, args: &[&str], legacy_launch:
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if reap == ReapMode::Auto {
+        register_spawned_monitors(root, args);
+    }
     output
+}
+
+/// Suite-level registry of monitor PIDs `run_devflow*` launches caused
+/// (41-02 Task 1, codex-4).
+///
+/// Why it exists: per-test `MonitorReapGuard` Drop guards verify only the
+/// PIDs each test captured — they cannot detect a test that never binds a
+/// guard at all. The registry makes the leak provable at the SUITE level:
+/// every launch registers the monitor it caused; `suite_reap_audit` asserts
+/// the registry drains (every guard ran, or the monitor exited on its own);
+/// and `unguarded_monitor_is_detected_by_the_registry` proves the gate can
+/// fail. Best-effort registration — a test that fails before the launch
+/// never reaches it.
+static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+    std::sync::OnceLock::new();
+
+fn registry() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Register the monitor(s) `devflow start`/`parallel` in `args` caused, read
+/// from the persisted state right after launch. `status`/`reference`/
+/// `cleanup` invocations carry no `--phase`/`--phases` and register nothing.
+fn register_spawned_monitors(root: &Path, args: &[&str]) {
+    let mut phases: Vec<PhaseId> = Vec::new();
+    for w in args.windows(2) {
+        match (w[0], w[1]) {
+            ("--phase", p) => {
+                if let Ok(phase) = p.parse::<PhaseId>() {
+                    phases.push(phase);
+                }
+            }
+            ("--phases", list) => {
+                phases.extend(list.split(',').filter_map(|p| p.parse::<PhaseId>().ok()));
+            }
+            _ => {}
+        }
+    }
+    for phase in phases {
+        if let Ok(state) = load_state(root, phase)
+            && let Some(pid) = state.monitor_pid
+        {
+            registry().lock().unwrap().insert(pid);
+        }
+    }
+}
+
+/// The suite-audit detection helper (codex-4): which registered PIDs are
+/// still alive? Pure over the registry so it can be unit-tested to FAIL
+/// against a deliberately-alive registered PID — the audit must be able to
+/// redden, or a per-test guard that can never be wrong proves nothing.
+fn registered_monitors_alive(registry: &std::collections::HashSet<u32>) -> Vec<u32> {
+    registry
+        .iter()
+        .copied()
+        .filter(|pid| devflow_core::agent::agent_running(*pid))
+        .collect()
 }
 
 fn wait_for(path: &Path) {
@@ -325,6 +414,10 @@ esac
         !root.join(".devflow/state.json").exists(),
         "legacy single-slot state.json must not be written anymore"
     );
+
+    // HYG-01: both parallel monitors are this test's to reap.
+    let _reap7 = MonitorReapGuard::after_launch(&state7);
+    let _reap8 = MonitorReapGuard::after_launch(&state8);
 }
 
 #[test]
@@ -371,6 +464,11 @@ fn start_defaults_to_worktree() {
         "expected worktree_path to be Some(_) by default, got {:?}",
         state.worktree_path
     );
+    // Bind the guard to the SETTLED state: the chain advances through the
+    // supervise stages and blocks at the Validate gate; that last monitor is
+    // the one this test must reap (HYG-01).
+    let settled = wait_for_settled(root, PhaseId::new(11));
+    let _reap = MonitorReapGuard::after_launch(&settled);
 }
 
 /// WR-10 (13-REVIEW.md): the pre-start divergence check must not inspect the
@@ -433,6 +531,11 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
 
     wait_for(&root.join(".worktrees/phase-13"));
     assert!(root.join(".worktrees/phase-13").is_dir());
+
+    // Bind the guard to the SETTLED state (the chain blocks at the Validate
+    // gate in supervise mode — that last monitor is this test's to reap).
+    let settled = wait_for_settled(root, PhaseId::new(13));
+    let _reap = MonitorReapGuard::after_launch(&settled);
 }
 
 #[test]
@@ -477,6 +580,10 @@ fn start_no_worktree_uses_feature_branch() {
         "expected worktree_path to be None with --no-worktree, got {:?}",
         state.worktree_path
     );
+    // Bind the guard to the SETTLED state (the chain blocks at the Validate
+    // gate in supervise mode — that last monitor is this test's to reap).
+    let settled = wait_for_settled(root, PhaseId::new(12));
+    let _reap = MonitorReapGuard::after_launch(&settled);
 }
 
 /// 20c (D-09 + review: Codex HIGH off-by-one): `devflow start --until plan`
@@ -536,6 +643,10 @@ fn start_until_plan_halts_cleanly() {
         state.stop_reason.is_some(),
         "a human-readable stop_reason must be recorded"
     );
+    // The stop path cleared monitor_pid; the guard still binds (no-op) so
+    // every monitor-spawning test in this file follows the same teardown
+    // shape (41-02 Task 1 systematic pass).
+    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// 20c (D-07): `--until ship` is a semantic no-op — Ship never calls
@@ -1203,6 +1314,24 @@ fn pi_stub(launch: &str) -> String {
 /// never-silent failure/review gate (WR-11) that fires when a stage's agent
 /// outcome does not advance. Polls rather than reading once, since the
 /// detached monitor chain advances asynchronously.
+/// Wait until a phase's chain settles in a state the tests can reap from:
+/// either the never-silent gate fired (`gate_pending`) or the machine
+/// stopped (`--until` / completion). Returns that state — whose
+/// `monitor_pid` is the LAST monitor the chain spawned, the one a
+/// `MonitorReapGuard` must capture (a guard bound to an early state read
+/// reaps an already-exited pid and leaks the gate-waiting monitor, HYG-01).
+fn wait_for_settled(root: &Path, phase: PhaseId) -> devflow_core::state::State {
+    for _ in 0..400 {
+        if let Ok(state) = load_state(root, phase)
+            && (state.gate_pending || state.stopped)
+        {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {phase} to settle (gate or stop)");
+}
+
 fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
     for _ in 0..400 {
         if let Ok(state) = load_state(root, phase)
@@ -1248,6 +1377,7 @@ fn pi_marker_less_run_does_not_advance() {
         "a marker-less run must not advance past the commit-gated Plan stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
+    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// A Pi run that exits non-zero must not advance its stage: the failed exit is
@@ -1280,6 +1410,7 @@ fn pi_nonzero_exit_does_not_advance() {
         "a non-zero-exit run must not advance its stage"
     );
     assert!(state.gate_pending, "the never-silent gate must have fired");
+    let _reap = MonitorReapGuard::after_launch(&state);
 }
 
 /// A hung Pi process (never exits) is surfaced as alive by monitor liveness —
@@ -1342,6 +1473,7 @@ fn pi_hung_process_is_detected_not_left_running() {
         Stage::Define,
         "a hung-then-killed run must not advance its stage"
     );
+    let _reap = MonitorReapGuard::after_launch(&gated);
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,6 +1569,9 @@ impl Drop for MonitorReapGuard {
             devflow_core::agent::TERMINATE_VERIFY_WAIT,
             devflow_core::agent::TERMINATE_VERIFY_POLL,
         );
+        // Deregister after the verified reap: the suite audit's
+        // empty-registry assertion then means "every guard ran".
+        registry().lock().unwrap().remove(&pid);
         if devflow_core::agent::agent_running(pid) {
             if std::thread::panicking() {
                 use std::io::Write as _;
@@ -1563,4 +1698,84 @@ fn antigravity_init_without_marker_gates_at_plan() {
         "a stream with events but no marker must not advance past Plan"
     );
     assert!(state.gate_pending);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 41 41-02 Task 1 (HYG-01, codex-4): the suite-level registered-PID
+// audit. Per-test Drop guards cannot detect an unguarded test; the registry
+// + audit make the leak provable, and the intentional opt-out proves the
+// gate can fail.
+// ---------------------------------------------------------------------------
+
+/// The suite audit: after every monitor-spawning test has run (and reaped,
+/// or seen its monitor exit naturally), the registry must DRAIN. Polls
+/// bounded so a slow legitimate test does not flake; a genuinely leaked
+/// monitor keeps the registry non-empty and the audit panics naming the pid.
+#[test]
+fn suite_reap_audit() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let alive = registered_monitors_alive(&registry().lock().unwrap());
+        if alive.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "registered monitor(s) still alive after the suite: {alive:?} — \
+             an unguarded test leaked them"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// codex-4: an unguarded test is DETECTABLE at the suite level. With
+/// auto-reap/registration disabled, a start leaves its monitor ALIVE; the
+/// test registers that pid by hand (what a registering helper would have
+/// recorded), proves the detection helper FAILS against it (the gate can
+/// redden), then reaps and deregisters through the normal guard.
+#[test]
+fn unguarded_monitor_is_detected_by_the_registry() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    // A HANGING pi keeps the Define monitor alive past the launch — the
+    // "leaked" shape this control must be able to see.
+    let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
+
+    run_devflow_inner(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "pi",
+            "--mode",
+            "supervise",
+        ],
+        false,
+        ReapMode::Disabled,
+    );
+
+    let state = load_state(root, PhaseId::new(7)).expect("load state");
+    let pid = state
+        .monitor_pid
+        .expect("a launched stage must record a monitor pid");
+    assert!(
+        devflow_core::agent::agent_running(pid),
+        "premise: with the opt-out the monitor stays alive — nothing reaps it"
+    );
+
+    // Simulate what a registering helper would have recorded (the leak).
+    registry().lock().unwrap().insert(pid);
+    // The detection helper MUST see it — the audit can fail.
+    let alive = registered_monitors_alive(&registry().lock().unwrap());
+    assert!(
+        alive.contains(&pid),
+        "a live registered monitor must be detected: {alive:?}"
+    );
+
+    // Clean up through the normal guard: verified reap + deregister.
+    let _reap = MonitorReapGuard::after_launch(&state);
 }

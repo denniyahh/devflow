@@ -3741,7 +3741,6 @@ fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env_lock;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
 
