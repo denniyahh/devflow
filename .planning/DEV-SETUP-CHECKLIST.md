@@ -114,6 +114,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PATTERN]** `scripts/check.sh` (runs fmt/clippy/tests) and
   `scripts/check-in-container.sh` (the same, but launched inside the pinned image) — the single
   source of truth CI, the pre-push hook, and a developer's manual check all call into.
+- [ ] **[PATTERN]** `check-in-container.sh` is WORKTREE-AWARE (phase 41, HYG-02): when the
+  invocation runs from a git worktree, its `.git` is a FILE pointing at
+  `<main>/.git/worktrees/<N>` and the COMMON gitdir (`<main>/.git`) is a second path outside
+  the mount — both are bind-mounted at their absolute host paths (detected via
+  `git rev-parse --absolute-git-dir` + `--git-common-dir`). A fresh replication that runs
+  phase work from `.worktrees/`-style worktrees must keep this or git dies with
+  `fatal: not a git repository` inside the container.
 
 ## 6. Claude Code / agent tooling — mostly [GLOBAL], currently unversioned
 

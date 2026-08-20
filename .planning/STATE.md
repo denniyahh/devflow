@@ -4,11 +4,11 @@ milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 41
 current_phase_name: Antigravity Driver
-status: executing
-stopped_at: Phase 41 discuss-phase in progress
-last_updated: "2026-08-19T23:50:59.464Z"
-last_activity: 2026-08-19
-last_activity_desc: Phase 40 closed; resumed to Phase 41 discuss-phase (Antigravity Driver)
+status: awaiting review
+stopped_at: Phase 41 executed — 41-01 (8/8) + 41-02 (2/2) complete; commits 4e71053/122dedc/2793ff6 on feature/phase-41; NOT pushed
+last_updated: "2026-08-20T15:55:00.000Z"
+last_activity: 2026-08-20
+last_activity_desc: Phase 41 executed end-to-end (Antigravity driver + dogfood hygiene); summaries/UAT/validation committed; awaiting review / push
 state_head: 0b7e46688d01a2260b79eafc8cdbf098d58c084f
 progress:
   total_phases: 6
