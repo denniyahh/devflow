@@ -114,15 +114,14 @@ pub(crate) fn launch_stage_inner(
     // governs both the launch shape and the guard that protects it — the guard
     // must fire on exactly the launches whose premise it checks, and two
     // separate evaluations of "is this the stream path?" would be free to drift.
-    let stream_launch =
-        claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+    let stream_launch = stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
 
     // D-11 (31-04): the opt-out is loud, on three channels. Fires only when the
     // opt-out is what made the difference — forcing legacy on a stage the
     // rollout has not reached changes nothing, and a notice there would imply
     // it did. Placed ahead of the canary gate so the operator learns what the
     // legacy path costs before anything else happens.
-    if !stream_launch && claude_stream_launch_enabled(state.agent, state.stage, false) {
+    if !stream_launch && stream_launch_enabled(state.agent, state.stage, false) {
         announce_forced_legacy_launch(state);
     }
 
@@ -140,13 +139,14 @@ pub(crate) fn launch_stage_inner(
         .unwrap_or(&state.project_root)
         .to_path_buf();
     let canary_capture_dir = state.project_root.join(".devflow");
+    // D-07 (round-3 B2): the launcher is selected BY AGENT. The widened
+    // predicate arms the canary gate for Antigravity runs, and a hardcoded
+    // ClaudeCanaryLauncher there would spend a Claude invocation per
+    // Antigravity run — and refuse to launch when `claude` is absent or
+    // unauthenticated.
+    let canary_launcher = canary_launcher_for(state.agent, canary_workdir);
     canary_gate(state, stream_launch, move || {
-        canary::run_delivery_canary(
-            &canary::ClaudeCanaryLauncher {
-                workdir: canary_workdir,
-            },
-            &canary_capture_dir,
-        )
+        canary::run_delivery_canary(canary_launcher.as_ref(), &canary_capture_dir)
     })?;
 
     let (program, args, launch) = resolve_launch_shape(
@@ -186,7 +186,7 @@ pub(crate) fn launch_stage_inner(
 /// Extracted from [`launch_stage_inner`] unchanged (31-04) so the shape a
 /// launch resolves to is assertable without spawning a process. The body is the
 /// pre-extraction `if/else if/else` verbatim; `stream_launch` is the caller's
-/// already-computed [`claude_stream_launch_enabled`] reading, threaded in
+/// already-computed [`stream_launch_enabled`] reading, threaded in
 /// rather than recomputed so one predicate still governs the launch shape, the
 /// canary gate, and the D-11 notice.
 fn resolve_launch_shape(
@@ -459,6 +459,24 @@ fn repaired_word(repaired: bool) -> &'static str {
 ///
 /// A recorded `Absent`/`Unverified` refuses on EVERY later launch in the run,
 /// not just the one that discovered it; only the canary RUN is once-per-run.
+/// Select the delivery-canary launcher for a launch (round-3 D-07/B2).
+///
+/// Claude -> [`canary::ClaudeCanaryLauncher`]; Antigravity ->
+/// [`canary::AntigravityCanaryLauncher`] (agy-based, event-key turn,
+/// agent-aware close rule). Every other agent keeps Claude's launcher because
+/// the canary gate only ever fires for stream launches, and Claude is the
+/// only non-Antigravity stream agent today — the fallback is the pre-widening
+/// behaviour, not a new decision.
+fn canary_launcher_for(
+    agent: AgentKind,
+    workdir: std::path::PathBuf,
+) -> Box<dyn canary::CanaryLauncher> {
+    match agent {
+        AgentKind::Antigravity => Box::new(canary::AntigravityCanaryLauncher { workdir }),
+        _ => Box::new(canary::ClaudeCanaryLauncher { workdir }),
+    }
+}
+
 fn canary_gate<F>(state: &mut State, stream_launch: bool, run_canary: F) -> Result<(), CliError>
 where
     F: FnOnce() -> canary::CanaryOutcome,
@@ -677,6 +695,14 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
 ///
+/// **Agent coverage (round-3 D-10):** Claude and Antigravity. The
+/// `legacy_opt_out` term applies ONLY to Claude — `DEVFLOW_CLAUDE_LEGACY_LAUNCH`
+/// is an escape hatch for Claude's pre-31 single-document launch, and
+/// Antigravity has no single-document format, so the variable must never route
+/// it to `MonitorLaunch::Legacy` (stdin would be `/dev/null` and the child
+/// would silently fail; antigravity reviewer notice (b)). Antigravity
+/// evaluates purely on `STREAM_JSON_STAGES` membership.
+///
 /// **This is a SEQUENCING choice, not a behaviour prediction.** Constraint 1
 /// forbids deciding at launch time which stages will background work; it
 /// permits rolling a change out one stage at a time. The reason for
@@ -704,12 +730,10 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// directly, so it never consults this predicate at all. That is a
 /// pre-existing, deliberate legacy route (see `MonitorLaunch::Legacy`'s own
 /// doc), recorded rather than silently covered.
-pub(crate) fn claude_stream_launch_enabled(
-    agent: AgentKind,
-    stage: Stage,
-    legacy_opt_out: bool,
-) -> bool {
-    !legacy_opt_out && agent == AgentKind::Claude && STREAM_JSON_STAGES.contains(&stage)
+pub(crate) fn stream_launch_enabled(agent: AgentKind, stage: Stage, legacy_opt_out: bool) -> bool {
+    matches!(agent, AgentKind::Claude | AgentKind::Antigravity)
+        && STREAM_JSON_STAGES.contains(&stage)
+        && !(agent == AgentKind::Claude && legacy_opt_out)
 }
 
 /// The stages whose launch may set GSD's `workflow._auto_chain_active` flag
@@ -840,6 +864,7 @@ pub(crate) fn run_monitor(
     workdir: &Path,
     prompt_file: &Path,
     idle_timeout_secs: u64,
+    agent: AgentKind,
     argv: &[String],
 ) -> Result<(), CliError> {
     let prompt = std::fs::read_to_string(prompt_file).map_err(|err| {
@@ -868,11 +893,13 @@ pub(crate) fn run_monitor(
     // F-4 — no agent or launch-shape condition belongs in the predicate.
     // `run_monitor` is the body of the hidden `__monitor` subcommand, which
     // `monitor::spawn_monitor` re-execs ONLY on its `MonitorLaunch::PipeOwning`
-    // arm. Being inside this function already implies a Claude + stream launch,
-    // so re-checking `state.agent` or `state.legacy_claude_launch` here would
-    // be a second, driftable notion of the same fact. The consequence — a
-    // Legacy-arm or non-Claude launch never gets the flag — is accepted and is
-    // turned into a loud preflight refusal by plan `35.1-03`, not left silent.
+    // arm. Being inside this function already implies a stream launch (Claude
+    // and Antigravity today, round-3 D-10) — the old "Claude + stream launch"
+    // claim became false when the predicate widened — so re-checking
+    // `state.agent` or `state.legacy_claude_launch` here would be a second,
+    // driftable notion of the same fact. The consequence — a Legacy-arm or
+    // non-stream-agent launch never gets the flag — is accepted and is turned
+    // into a loud preflight refusal by plan `35.1-03`, not left silent.
     //
     // A state that will not load is NOT fatal here: warn, skip the guard, and
     // let `advance` surface the real state error afterwards with its own
@@ -900,6 +927,7 @@ pub(crate) fn run_monitor(
         program,
         args,
         &[],
+        agent,
     )
     .map_err(|err| CliError::Message(format!("pipe-owning monitor failed: {err}")))?;
 
@@ -2432,7 +2460,7 @@ mod tests {
     /// `false` and the test becomes unconstructible as written — it would have
     /// had to be deleted or rewritten under the time pressure of the widening
     /// commit. `legacy_opt_out` is a separate `&&` term that
-    /// `claude_stream_launch_enabled` respects regardless of the constant's
+    /// `stream_launch_enabled` respects regardless of the constant's
     /// contents, so a premise built on it survives full widening.
     ///
     /// Verified, not assumed: this pair was run against a temporarily
@@ -2456,7 +2484,7 @@ mod tests {
         // Driven by the REAL predicate rather than a hardcoded `false`, so this
         // test tracks the rollout instead of a copy of it.
         let stream_launch =
-            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(
             !stream_launch,
             "the legacy opt-out must force this launch off the stream path for this test \
@@ -2467,7 +2495,7 @@ mod tests {
         // a constant rather than a discrimination — and unlike a stage-
         // membership control, this one cannot be invalidated by widening.
         assert!(
-            claude_stream_launch_enabled(AgentKind::Claude, state.stage, false),
+            stream_launch_enabled(AgentKind::Claude, state.stage, false),
             "clearing the opt-out must flip the predicate back to true, or the check above \
              is vacuous"
         );
@@ -2519,7 +2547,7 @@ mod tests {
         state.legacy_claude_launch = false;
 
         let stream_launch =
-            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(
             stream_launch,
             "without the opt-out this stage must be on the stream path, or this test is \
@@ -3236,11 +3264,11 @@ mod tests {
         // the assertion below is a real discrimination and not a stage that
         // was going to be legacy anyway.
         assert!(
-            claude_stream_launch_enabled(state.agent, state.stage, false),
+            stream_launch_enabled(state.agent, state.stage, false),
             "Stage::Code must be in STREAM_JSON_STAGES for this test to mean anything"
         );
 
-        assert!(!claude_stream_launch_enabled(
+        assert!(!stream_launch_enabled(
             state.agent,
             state.stage,
             state.legacy_claude_launch
@@ -3281,11 +3309,11 @@ mod tests {
         state.stage = Stage::Code;
 
         // Precondition: Pi must NOT be in the stream-json rollout, so the
-        // assertion below discriminates a broken `claude_stream_launch_enabled`
+        // assertion below discriminates a broken `stream_launch_enabled`
         // predicate instead of a stage that was going to be Legacy anyway
         // (phase-39 code review, finding 3).
         assert!(
-            !claude_stream_launch_enabled(state.agent, state.stage, false),
+            !stream_launch_enabled(state.agent, state.stage, false),
             "Pi must never be stream-launch-enabled for this test to mean anything"
         );
 
@@ -3322,7 +3350,7 @@ mod tests {
         assert!(!devflow_core::config::claude_legacy_launch());
 
         let stream_launch =
-            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(stream_launch);
 
         let driver = agents::driver_for(state.agent);
@@ -3412,15 +3440,11 @@ mod tests {
         // Driven by the REAL predicate, so this tracks the wiring rather than
         // a copy of it.
         let stream_launch =
-            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(!stream_launch);
         // Negative control: the SAME stage and agent, opt-out off, does run the
         // stream path — so the reading above is the opt-out's doing.
-        assert!(claude_stream_launch_enabled(
-            state.agent,
-            state.stage,
-            false
-        ));
+        assert!(stream_launch_enabled(state.agent, state.stage, false));
 
         let calls = std::cell::Cell::new(0usize);
         // `Absent` deliberately: if the gate ran this canary at all, the call
@@ -3450,7 +3474,7 @@ mod tests {
     /// false on `develop`. `relaunch_checkpoint_session` hardcodes
     /// `MonitorLaunch::Legacy`, is reached by unconditional checkpoint
     /// auto-decide, and bypasses both `canary_gate` and
-    /// `claude_stream_launch_enabled` by calling `spawn_agent_and_record`
+    /// `stream_launch_enabled` by calling `spawn_agent_and_record`
     /// directly. That is a pre-existing, deliberate exception recorded in
     /// 31-04-SUMMARY.md as a known un-migrated route, not something this test
     /// covers.
@@ -3493,7 +3517,7 @@ mod tests {
         // ...and the launch shape for the very same state is UNCHANGED by that
         // failure. Nothing consulted the capture to pick a transport.
         let stream_launch =
-            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+            stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(
             stream_launch,
             "a parse failure must not select the legacy path — D-11 rejects automatic fallback"
@@ -3576,5 +3600,117 @@ mod tests {
         let mut never_opted_out = legacy_state(root, PhaseId::new(phase.major() + 1), false);
         apply_legacy_launch_opt_out(&mut never_opted_out, false);
         assert!(!never_opted_out.legacy_claude_launch);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 41 Task 3: the widened stream predicate (Antigravity joins
+    // Claude; the legacy opt-out stays Claude-only, D-10), the PipeOwning
+    // launch shape, the by-agent canary dispatch (B2/D-07), and the
+    // AutoChainGuard comment correction.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stream_launch_includes_antigravity_on_stream_stages() {
+        assert!(
+            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, false),
+            "Antigravity is a stream agent on a stream stage (round-3 D-10)"
+        );
+        // Claude unchanged.
+        assert!(stream_launch_enabled(AgentKind::Claude, Stage::Code, false));
+        // The other adapters never stream.
+        for agent in [AgentKind::Codex, AgentKind::OpenCode, AgentKind::Pi] {
+            assert!(
+                !stream_launch_enabled(agent, Stage::Code, false),
+                "{agent:?} must stay off the stream path"
+            );
+        }
+    }
+
+    /// D-10 (antigravity notice (b)): `DEVFLOW_CLAUDE_LEGACY_LAUNCH` is
+    /// Claude's escape hatch. It must force CLAUDE off the stream path but
+    /// never route ANTIGRAVITY to Legacy — Antigravity has no single-document
+    /// format, and Legacy stdin is `/dev/null`.
+    #[test]
+    fn stream_launch_includes_antigravity_ignores_claude_legacy_opt_out() {
+        assert!(
+            !stream_launch_enabled(AgentKind::Claude, Stage::Code, true),
+            "the legacy opt-out keeps its hold on Claude"
+        );
+        assert!(
+            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, true),
+            "the legacy opt-out must NOT move Antigravity (D-10)"
+        );
+        // Same with the opt-out cleared, for the record.
+        assert!(stream_launch_enabled(
+            AgentKind::Antigravity,
+            Stage::Code,
+            false
+        ));
+    }
+
+    #[test]
+    fn stream_launch_includes_antigravity_resolves_to_pipe_owning() {
+        let driver = devflow_core::agents::driver_for(AgentKind::Antigravity);
+        let (_program, _args, launch) = resolve_launch_shape(
+            AgentKind::Antigravity,
+            driver.as_ref(),
+            PhaseId::new(7),
+            "prompt".to_string(),
+            &[],
+            true,
+        );
+        assert!(
+            matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }),
+            "Antigravity on a stream stage must reach the pipe-owning arm"
+        );
+    }
+
+    /// B2/D-07: the canary launcher is selected BY AGENT — Antigravity gets
+    /// the agy-based launcher, never a Claude invocation.
+    #[test]
+    fn canary_launcher_for_selects_antigravity_canary() {
+        let antg = canary_launcher_for(AgentKind::Antigravity, std::path::PathBuf::from("/tmp"));
+        assert_eq!(
+            antg.agent(),
+            AgentKind::Antigravity,
+            "Antigravity must drive the agy-based canary (B2)"
+        );
+        let claude = canary_launcher_for(AgentKind::Claude, std::path::PathBuf::from("/tmp"));
+        assert_eq!(
+            claude.agent(),
+            AgentKind::Claude,
+            "Claude keeps the Claude canary"
+        );
+    }
+
+    /// The AutoChainGuard comment claimed "implies a Claude + stream launch";
+    /// the widened predicate made that false. The guard's engagement for an
+    /// Antigravity auto-mode Code launch is the conjunction run_monitor
+    /// actually applies: stream predicate true -> PipeOwning shape -> the
+    /// chain-flag eligibility predicate holds.
+    #[test]
+    fn auto_chain_guard_antigravity_engages_on_auto_code() {
+        let driver = devflow_core::agents::driver_for(AgentKind::Antigravity);
+        assert!(
+            stream_launch_enabled(AgentKind::Antigravity, Stage::Code, false),
+            "premise: Antigravity is on the stream path at Code"
+        );
+        let (_program, _args, launch) = resolve_launch_shape(
+            AgentKind::Antigravity,
+            driver.as_ref(),
+            PhaseId::new(7),
+            "prompt".to_string(),
+            &[],
+            true,
+        );
+        assert!(
+            matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }),
+            "premise: the launch shape is PipeOwning — the only arm run_monitor guards"
+        );
+        assert!(
+            auto_chain_flag_eligible(Stage::Code, Mode::Auto),
+            "premise: the chain flag is eligible for auto Code — run_monitor engages \
+             the guard for ANY pipe-owning launch (Claude + Antigravity today)"
+        );
     }
 }

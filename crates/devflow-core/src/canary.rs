@@ -37,10 +37,11 @@
 //! free to drift away from the first, and the drift would be invisible.
 
 use crate::agent_result;
-use crate::agents::{AgentDriver, ClaudeDriver};
+use crate::agents::{AgentDriver, AntigravityDriver, ClaudeDriver};
 use crate::git::hermetic_command;
 use crate::monitor::{self, CloseRule};
 use crate::phase_id::PhaseId;
+use crate::state::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -129,6 +130,17 @@ pub trait CanaryLauncher {
     /// Run one throwaway agent turn against `prompt`, teeing its stdout to
     /// `capture`.
     fn run(&self, prompt: &str, capture: &Path) -> Result<(), String>;
+
+    /// Which agent's transport this launcher drives.
+    ///
+    /// Selects the token-trust predicate in [`run_delivery_canary`]
+    /// ([`agent_result::token_reported_in_capture_for`]): Claude matches a
+    /// top-level `type: "result"` event, Antigravity a top-level
+    /// `event: "result"` object's `result.response` (round-3 B2/D-07). The
+    /// default keeps every pre-existing (Claude-shaped) launcher unchanged.
+    fn agent(&self) -> AgentKind {
+        AgentKind::Claude
+    }
 }
 
 /// Where one canary run's throwaway capture lands.
@@ -175,7 +187,10 @@ pub fn canary_prompt(token: &str) -> String {
 /// Every failure mode below is `Unverified`, never `Absent`. `Absent` is a
 /// claim about the CLI's behaviour and may only be made after the CLI actually
 /// ran and produced a capture that could be read.
-pub fn run_delivery_canary<L: CanaryLauncher>(launcher: &L, capture_dir: &Path) -> CanaryOutcome {
+pub fn run_delivery_canary<L: CanaryLauncher + ?Sized>(
+    launcher: &L,
+    capture_dir: &Path,
+) -> CanaryOutcome {
     let token = declare_token();
     let capture = canary_capture_path(capture_dir);
 
@@ -208,7 +223,7 @@ pub fn run_delivery_canary<L: CanaryLauncher>(launcher: &L, capture_dir: &Path) 
         }
     };
 
-    if agent_result::token_reported_in_capture(&text, &token) {
+    if agent_result::token_reported_in_capture_for(launcher.agent(), &text, &token) {
         CanaryOutcome::Confirmed
     } else {
         CanaryOutcome::Absent
@@ -278,127 +293,181 @@ pub struct ClaudeCanaryLauncher {
 
 impl CanaryLauncher for ClaudeCanaryLauncher {
     fn run(&self, prompt: &str, capture: &Path) -> Result<(), String> {
-        // Phase 0 — the codebase's "not attributable to a real phase" sentinel
-        // (see `advance`'s `events::emit(project_root, 0, …)`). `exec_command`
-        // ignores both the phase and the prompt: under `--input-format
-        // stream-json` the prompt travels on stdin, not argv.
         let (program, args) = ClaudeDriver.build_command(PhaseId::new(0), prompt, &[]);
+        run_stream_canary(
+            program,
+            &args,
+            &self.workdir,
+            monitor::user_turn_line(prompt),
+            CloseRule::default(),
+            capture,
+        )
+    }
+}
 
-        let mut capture_file = std::fs::File::create(capture).map_err(|err| {
-            format!(
-                "could not create the canary capture {}: {err}",
-                capture.display()
-            )
-        })?;
+/// The Antigravity delivery canary (round-3 B2/D-07): one throwaway `agy` turn
+/// over the SAME bidirectional `stream-json` transport a production
+/// Antigravity stage uses, with the agent-aware first turn
+/// ([`monitor::user_turn_line_for`]) and close rule
+/// ([`CloseRule::for_agent`]). The trust decision stays in
+/// [`run_delivery_canary`], which now resolves it agent-aware via
+/// [`agent_result::token_reported_in_capture_for`].
+pub struct AntigravityCanaryLauncher {
+    /// Working directory for the throwaway child — same rationale as
+    /// [`ClaudeCanaryLauncher::workdir`].
+    pub workdir: PathBuf,
+}
 
-        // No `.process_group(0)` here, deliberately — the opposite choice from
-        // `run_pipe_owning_monitor`'s detached child. This one runs in the
-        // FOREGROUND of the operator's own CLI, so it should stay in the
-        // terminal's process group and die with a Ctrl-C like any other
-        // foreground child. Group isolation would leave a canary running with
-        // nothing left to reap it.
-        let mut child = hermetic_command(program, &self.workdir)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // stderr is discarded rather than teed: the capture must stay
-            // parseable JSONL, and nothing reads a canary's diagnostics.
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| format!("could not run `{program}`: {err}"))?;
+impl CanaryLauncher for AntigravityCanaryLauncher {
+    fn agent(&self) -> AgentKind {
+        AgentKind::Antigravity
+    }
 
-        let mut child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "the canary child exposed no stdin pipe".to_string())?;
-        let child_stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "the canary child exposed no stdout pipe".to_string())?;
+    fn run(&self, prompt: &str, capture: &Path) -> Result<(), String> {
+        let (program, args) = AntigravityDriver.build_command(PhaseId::new(0), prompt, &[]);
+        run_stream_canary(
+            program,
+            &args,
+            &self.workdir,
+            monitor::user_turn_line_for(AgentKind::Antigravity, prompt),
+            CloseRule::for_agent(AgentKind::Antigravity),
+            capture,
+        )
+    }
+}
 
-        // Same three-participant threading model as the production monitor, and
-        // for the same reason (T-31-04): writing the turn synchronously before
-        // reading stdout is the textbook two-pipe deadlock.
-        let (close_tx, close_rx) = mpsc::channel::<()>();
-        let turn = monitor::user_turn_line(prompt);
-        let writer = std::thread::spawn(move || {
-            let wrote = child_stdin
-                .write_all(turn.as_bytes())
-                .and_then(|()| child_stdin.write_all(b"\n"))
-                .and_then(|()| child_stdin.flush());
-            if let Err(err) = wrote {
-                warn!("could not write the canary's user turn to the child's stdin: {err}");
-                return;
+/// The shared bidirectional `stream-json` canary supervisor.
+///
+/// Spawns `program` with `args`, writes the PREPARED `turn` on stdin (the
+/// caller chose the agent-aware shape), applies the PREPARED close `rule` (the
+/// caller chose the agent-aware predicate), tees stdout to `capture`, and
+/// reaps. Claude and Antigravity (round-3) share one implementation instead of
+/// two that drift; the transport mechanics are agent-neutral, the schema is
+/// not, and the schema decisions are the two values this function receives.
+fn run_stream_canary(
+    program: &str,
+    args: &[String],
+    workdir: &Path,
+    turn: String,
+    mut rule: CloseRule,
+    capture: &Path,
+) -> Result<(), String> {
+    // Phase 0 — the codebase's "not attributable to a real phase" sentinel
+    // (see `advance`'s `events::emit(project_root, 0, …)`). `build_command`
+    // ignores both the phase and the prompt: under `--input-format
+    // stream-json` the prompt travels on stdin, not argv.
+    let mut capture_file = std::fs::File::create(capture).map_err(|err| {
+        format!(
+            "could not create the canary capture {}: {err}",
+            capture.display()
+        )
+    })?;
+
+    // No `.process_group(0)` here, deliberately — the opposite choice from
+    // `run_pipe_owning_monitor`'s detached child. This one runs in the
+    // FOREGROUND of the operator's own CLI, so it should stay in the
+    // terminal's process group and die with a Ctrl-C like any other
+    // foreground child. Group isolation would leave a canary running with
+    // nothing left to reap it.
+    let mut child = hermetic_command(program, workdir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // stderr is discarded rather than teed: the capture must stay
+        // parseable JSONL, and nothing reads a canary's diagnostics.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("could not run `{program}`: {err}"))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "the canary child exposed no stdin pipe".to_string())?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "the canary child exposed no stdout pipe".to_string())?;
+
+    // Same three-participant threading model as the production monitor, and
+    // for the same reason (T-31-04): writing the turn synchronously before
+    // reading stdout is the textbook two-pipe deadlock.
+    let (close_tx, close_rx) = mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        let wrote = child_stdin
+            .write_all(turn.as_bytes())
+            .and_then(|()| child_stdin.write_all(b"\n"))
+            .and_then(|()| child_stdin.flush());
+        if let Err(err) = wrote {
+            warn!("could not write the canary's user turn to the child's stdin: {err}");
+            return;
+        }
+        // Held open past the first turn ON PURPOSE. Releasing it here would
+        // end the session before any task-notification turn could be
+        // delivered — which is the very behaviour being measured, so the
+        // guard would report `Absent` against a perfectly healthy CLI.
+        let _ = close_rx.recv();
+        drop(child_stdin);
+    });
+
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Err(err) = writeln!(capture_file, "{line}") {
+                warn!("could not append to the canary capture: {err}");
             }
-            // Held open past the first turn ON PURPOSE. Releasing it here would
-            // end the session before any task-notification turn could be
-            // delivered — which is the very behaviour being measured, so the
-            // guard would report `Absent` against a perfectly healthy CLI.
-            let _ = close_rx.recv();
-            drop(child_stdin);
-        });
-
-        let (line_tx, line_rx) = mpsc::channel::<String>();
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(child_stdout).lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if let Err(err) = writeln!(capture_file, "{line}") {
-                    warn!("could not append to the canary capture: {err}");
-                }
-                let _ = capture_file.flush();
-                if line_tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // The SAME close rule the production monitor applies (constraint 4's
-        // AND: a top-level marker plus a drained background-task list), reused
-        // rather than reimplemented. This governs only when stdin is released —
-        // it is a lifecycle decision, not the trust decision. The trust
-        // decision is made once, afterwards, by `run_delivery_canary`.
-        let mut rule = CloseRule::default();
-        let mut close_signalled = false;
-        let idle = Duration::from_secs(CANARY_IDLE_SECS);
-        let deadline = Instant::now() + Duration::from_secs(CANARY_DEADLINE_SECS);
-
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let _ = capture_file.flush();
+            if line_tx.send(line).is_err() {
                 break;
             }
-            match line_rx.recv_timeout(idle.min(remaining)) {
-                Ok(line) => {
-                    if close_signalled {
-                        continue;
-                    }
-                    rule.observe(&line);
-                    if rule.should_close() {
-                        let _ = close_tx.send(());
-                        close_signalled = true;
-                    }
+        }
+    });
+
+    // The SAME close rule the production monitor applies (constraint 4's
+    // AND: a top-level marker plus a drained background-task list), reused
+    // rather than reimplemented. This governs only when stdin is released —
+    // it is a lifecycle decision, not the trust decision. The trust
+    // decision is made once, afterwards, by `run_delivery_canary`.
+    let mut close_signalled = false;
+    let idle = Duration::from_secs(CANARY_IDLE_SECS);
+    let deadline = Instant::now() + Duration::from_secs(CANARY_DEADLINE_SECS);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match line_rx.recv_timeout(idle.min(remaining)) {
+            Ok(line) => {
+                if close_signalled {
+                    continue;
                 }
-                // Idle expiry, deadline expiry and stdout EOF all mean the same
-                // thing here: stop waiting and go read what was captured. A
-                // timeout is NOT an error — a child that ran and said nothing
-                // useful is a fact about the CLI, and belongs in the
-                // `Absent` decision rather than in `Unverified`.
-                Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout) => {
-                    break;
+                rule.observe(&line);
+                if rule.should_close() {
+                    let _ = close_tx.send(());
+                    close_signalled = true;
                 }
             }
+            // Idle expiry, deadline expiry and stdout EOF all mean the same
+            // thing here: stop waiting and go read what was captured. A
+            // timeout is NOT an error — a child that ran and said nothing
+            // useful is a fact about the CLI, and belongs in the
+            // `Absent` decision rather than in `Unverified`.
+            Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout) => {
+                break;
+            }
         }
-
-        // Release stdin before waiting: a child still holding an open stdin may
-        // never exit on its own.
-        drop(close_tx);
-        reap(&mut child);
-        let _ = writer.join();
-        let _ = reader.join();
-        Ok(())
     }
+
+    // Release stdin before waiting: a child still holding an open stdin may
+    // never exit on its own.
+    drop(close_tx);
+    reap(&mut child);
+    let _ = writer.join();
+    let _ = reader.join();
+    Ok(())
 }
 
 /// Wait a bounded time for the canary child to exit, then kill it.
@@ -712,6 +781,147 @@ mod tests {
         assert!(
             first.starts_with(TOKEN_PREFIX) && second.starts_with(TOKEN_PREFIX),
             "both tokens must carry the greppable prefix"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Antigravity canary transport (phase 41, Task 3, B2/D-07): the trust
+    // predicate is agent-aware — a token inside an Antigravity-shaped
+    // `event: "result"` `result.response` is trustworthy; inside an echoed
+    // `event: "user"` event it is not.
+    // ------------------------------------------------------------------
+
+    fn antg_init_line() -> String {
+        r#"{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}"#
+            .to_string()
+    }
+
+    fn antg_result_line(text: &str) -> String {
+        serde_json::json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": text },
+        })
+        .to_string()
+    }
+
+    /// The Antigravity CLI's echo of the operator's prompt as a `user` event —
+    /// the event-key analogue of the 30-05 echo hazard.
+    fn antg_echoed_user_line(prompt: &str) -> String {
+        serde_json::json!({
+            "event": "user",
+            "message": { "role": "user", "content": prompt },
+        })
+        .to_string()
+    }
+
+    /// A launcher driving the Antigravity transport: `agent()` reports
+    /// Antigravity (selecting the event-key trust predicate) and it writes
+    /// Antigravity-shaped events.
+    struct AntigravityCannedLauncher<F: Fn(&str) -> Vec<String>> {
+        lines: F,
+    }
+
+    impl<F: Fn(&str) -> Vec<String>> CanaryLauncher for AntigravityCannedLauncher<F> {
+        fn agent(&self) -> AgentKind {
+            AgentKind::Antigravity
+        }
+
+        fn run(&self, prompt: &str, capture: &Path) -> Result<(), String> {
+            let token = token_in(prompt);
+            let body = (self.lines)(&token).join("\n");
+            std::fs::write(capture, format!("{body}\n")).map_err(|err| err.to_string())?;
+            Ok(())
+        }
+    }
+
+    /// B2/D-07: the token comes back inside `event: "result"`'s
+    /// `result.response` — the Antigravity-shaped trustworthy location.
+    #[test]
+    fn canary_antigravity_confirmed_when_token_returns_in_event_result_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = AntigravityCannedLauncher {
+            lines: |token| {
+                vec![
+                    antg_init_line(),
+                    antg_result_line(&format!(
+                        "All done.\n{token}\nDEVFLOW_RESULT: {{\"status\":\"success\"}}"
+                    )),
+                ]
+            },
+        };
+        let outcome = run_delivery_canary(&launcher, dir.path());
+        assert_eq!(
+            outcome,
+            CanaryOutcome::Confirmed,
+            "a token inside an antigravity result.response is the whole point of the guard"
+        );
+    }
+
+    /// The 30-05 discipline preserved for the event-key schema: the CLI echoes
+    /// the prompt back as a `user` event, so a substring scan of the capture
+    /// would certify delivery that never happened.
+    #[test]
+    fn canary_antigravity_absent_when_token_only_in_echoed_user_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = AntigravityCannedLauncher {
+            lines: |token| {
+                vec![
+                    antg_init_line(),
+                    antg_echoed_user_line(&format!("...{token}...")),
+                    antg_result_line("The turn completed without the token."),
+                ]
+            },
+        };
+        let outcome = run_delivery_canary(&launcher, dir.path());
+        assert_eq!(
+            outcome,
+            CanaryOutcome::Absent,
+            "a token only inside an echoed user event must NOT be trusted"
+        );
+    }
+
+    /// Schema isolation both ways: a Claude-shaped `type: "result"` capture
+    /// does not satisfy the Antigravity predicate, and an Antigravity-shaped
+    /// capture does not satisfy the Claude predicate. The dispatch is
+    /// agent-aware, never a raw `contains`.
+    #[test]
+    fn canary_antigravity_trust_predicate_does_not_cross_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Claude-shaped capture (type:result) under the ANTIGRAVITY launcher.
+        let launcher = AntigravityCannedLauncher {
+            lines: |token| {
+                vec![
+                    r#"{"type":"system","subtype":"init","session_id":"s1"}"#.to_string(),
+                    serde_json::json!({
+                        "type": "result",
+                        "result": format!("done\n{token}\nDEVFLOW_RESULT: {{\"status\":\"success\"}}"),
+                    })
+                    .to_string(),
+                ]
+            },
+        };
+        assert_eq!(
+            run_delivery_canary(&launcher, dir.path()),
+            CanaryOutcome::Absent,
+            "a Claude-shaped token report must not be trusted under the antigravity predicate"
+        );
+
+        // Antigravity-shaped capture (event:result) under the CLAUDE launcher.
+        let launcher = CannedLauncher {
+            lines: |token| {
+                vec![
+                    antg_init_line(),
+                    antg_result_line(&format!(
+                        "done\n{token}\nDEVFLOW_RESULT: {{\"status\":\"success\"}}"
+                    )),
+                ]
+            },
+        };
+        assert_eq!(
+            run_delivery_canary(&launcher, dir.path()),
+            CanaryOutcome::Absent,
+            "an antigravity-shaped token report must not be trusted under the Claude predicate"
         );
     }
 }

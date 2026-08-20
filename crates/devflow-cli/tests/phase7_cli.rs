@@ -1343,3 +1343,224 @@ fn pi_hung_process_is_detected_not_left_running() {
         "a hung-then-killed run must not advance its stage"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 41 Task 8 (ANTG-03, F4, codex-3, antigravity notice (a)): the
+// Antigravity transport, end to end through `devflow start --agent
+// antigravity` with a stubbed `agy` on PATH. The canary-aware stub answers
+// the `DEVFLOW_DELIVERY_CANARY_` turn (AntigravityCanaryLauncher at Define),
+// schema-checks every turn (codex-3), and then behaves per mode.
+// ---------------------------------------------------------------------------
+
+/// The canary-aware `agy` stub (F4).
+///
+/// Three behaviours, selected by `mode`. EVERY variant first answers a
+/// `*DEVFLOW_DELIVERY_CANARY_*` turn (the common prefix; the enum is named
+/// without it) by echoing the token inside an antigravity-shaped
+/// `event:result.response`, so `run_delivery_canary` reaches `Confirmed` at
+/// Define; then:
+/// - `MarkerStream`: emits a marker stream for real stage turns — the happy
+///   path.
+/// - `Quiet`: exits 0 with NO events — the marker-less control (ANTG-03).
+/// - `InitOnly`: emits `init` + `step_update` but NO `result` — the
+///   discrimination control (transport alone never advances a commit-gated
+///   stage).
+///
+/// Schema check (codex-3): EVERY turn must parse as an event-key user line
+/// (`"event":"user"`); a Claude `type`-form turn exits 92 with a diagnostic —
+/// an implementation that left the monitor's writer on `user_turn_line`
+/// FAILS here, not just in the unit helper.
+fn antigravity_stub(mode: StubMode) -> String {
+    const SCHEMA_AND_CANARY: &str = r#"#!/bin/sh
+IFS= read -r turn || exit 91
+printf '%s' "$turn" | grep -q '"event":"user"' || { echo 'NON_EVENT_KEY_TURN' >&2; exit 92; }
+case "$turn" in
+  *DEVFLOW_DELIVERY_CANARY_*)
+    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
+    printf '%s\n' '{"event":"init","model":"stub"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"canary: '"$token"'\nDEVFLOW_RESULT: {\"status\":\"success\"}"}}'
+    exit 0 ;;
+esac
+"#;
+    let body = match mode {
+        StubMode::MarkerStream => {
+            r#"printf '%s\n' '{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}'
+printf '%s\n' '{"event":"step_update","index":0,"text_delta":"working"}'
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"success\"}"}}'
+exit 0
+"#
+        }
+        StubMode::Quiet => "exit 0\n",
+        StubMode::InitOnly => {
+            r#"printf '%s\n' '{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}'
+printf '%s\n' '{"event":"step_update","index":0,"text_delta":"working"}'
+exit 0
+"#
+        }
+    };
+    format!("{SCHEMA_AND_CANARY}{body}")
+}
+
+#[derive(Clone, Copy)]
+enum StubMode {
+    MarkerStream,
+    Quiet,
+    InitOnly,
+}
+
+/// Reap the detached `__monitor` wrapper a `devflow start` run left behind
+/// (phase 41 Task 8, antigravity notice (a)): the integration-suite analogue
+/// of the binary crate's `ReapMonitorOnDrop`, built on the PUBLIC
+/// `devflow_core::agent` surface (integration tests cannot reach
+/// `devflow-cli`'s test_support). TERM->KILL escalation with VERIFIED death,
+/// keyed to `state.monitor_pid`, bound strictly after the final
+/// `&mut State` use. 41-02 Task 1 turns this into the systematic pass.
+struct MonitorReapGuard {
+    pid: Option<u32>,
+}
+
+impl MonitorReapGuard {
+    fn after_launch(state: &devflow_core::state::State) -> Self {
+        Self {
+            pid: state.monitor_pid,
+        }
+    }
+}
+
+impl Drop for MonitorReapGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        devflow_core::agent::terminate_and_verify(
+            pid,
+            devflow_core::agent::TERMINATE_VERIFY_WAIT,
+            devflow_core::agent::TERMINATE_VERIFY_POLL,
+        );
+        if devflow_core::agent::agent_running(pid) {
+            if std::thread::panicking() {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "MonitorReapGuard: monitor wrapper pid {pid} still alive after reap \
+                     during an unwind — not re-panicking because a panic is already in flight"
+                );
+            } else {
+                panic!(
+                    "monitor wrapper pid {pid}, spawned by this test's own start run, must be \
+                     verified dead after reaping — not merely assumed dead"
+                );
+            }
+        }
+    }
+}
+
+/// ANTG-03: a stubbed `agy` that exits 0 with no stream events must not
+/// advance a COMMIT-GATED stage. Define (not commit-gated) legitimately
+/// advances on exit 0; Plan — a commit-gated stage — produces no marker and
+/// no commits, so it gates instead of advancing to Code.
+#[test]
+fn marker_less_antigravity_never_advances() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::Quiet))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "antigravity",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let state = wait_for_gate(root, PhaseId::new(7));
+    let _reap = MonitorReapGuard::after_launch(&state);
+    assert_eq!(
+        state.stage,
+        Stage::Plan,
+        "a marker-less antigravity run must not advance past the commit-gated Plan stage"
+    );
+    assert!(state.gate_pending, "the never-silent gate must have fired");
+}
+
+/// The happy path: a stubbed `agy` emitting ANTIGRAVITY-shaped events with
+/// the `DEVFLOW_RESULT` marker inside `event:result.response` advances past
+/// the commit gate. `--until plan` halts right after Plan completes, so the
+/// assertion is: Plan RAN (the commit gate passed) and the machine is
+/// stopped, NOT gated.
+#[test]
+fn antigravity_parses_devflow_result_from_stream() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::MarkerStream))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "antigravity",
+            "--mode",
+            "supervise",
+            "--until",
+            "plan",
+        ],
+    );
+
+    let state = wait_for_stopped(root, PhaseId::new(7));
+    let _reap = MonitorReapGuard::after_launch(&state);
+    assert_eq!(
+        state.stage,
+        Stage::Plan,
+        "the persisted stage must be the COMPLETED target (Plan), proving Plan ran"
+    );
+    assert!(
+        !state.gate_pending,
+        "a marker-bearing antigravity stream must pass the commit gate, not gate"
+    );
+}
+
+/// Discrimination control: a stream that emits `init` + `step_update` but NO
+/// `result`/marker must still gate at Plan — the TRANSPORT alone never
+/// advances a commit-gated stage, only the marker does (ANTG-03).
+#[test]
+fn antigravity_init_without_marker_gates_at_plan() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::InitOnly))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "antigravity",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let state = wait_for_gate(root, PhaseId::new(7));
+    let _reap = MonitorReapGuard::after_launch(&state);
+    assert_eq!(
+        state.stage,
+        Stage::Plan,
+        "a stream with events but no marker must not advance past Plan"
+    );
+    assert!(state.gate_pending);
+}

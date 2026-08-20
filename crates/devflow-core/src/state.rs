@@ -393,6 +393,8 @@ pub enum AgentKind {
     OpenCode,
     /// Pi coding-agent harness.
     Pi,
+    /// Antigravity CLI (`agy`), stream-json transport (phase 41).
+    Antigravity,
 }
 
 impl fmt::Display for AgentKind {
@@ -402,6 +404,7 @@ impl fmt::Display for AgentKind {
             AgentKind::Codex => "codex",
             AgentKind::OpenCode => "opencode",
             AgentKind::Pi => "pi",
+            AgentKind::Antigravity => "antigravity",
         };
         f.write_str(name)
     }
@@ -416,6 +419,7 @@ impl FromStr for AgentKind {
             "codex" => Ok(AgentKind::Codex),
             "opencode" | "open-code" => Ok(AgentKind::OpenCode),
             "pi" => Ok(AgentKind::Pi),
+            "antigravity" => Ok(AgentKind::Antigravity),
             other => Err(AgentParseError(other.to_string())),
         }
     }
@@ -423,7 +427,7 @@ impl FromStr for AgentKind {
 
 /// Error returned when parsing an unsupported agent name.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unsupported agent `{0}`; expected claude, codex, opencode, or pi")]
+#[error("unsupported agent `{0}`; expected claude, codex, opencode, pi, or antigravity")]
 pub struct AgentParseError(String);
 
 impl State {
@@ -1064,5 +1068,56 @@ mod tests {
         assert_eq!(loaded.stop_until, None);
         assert!(!loaded.stopped);
         assert_eq!(loaded.stop_reason, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 41 Task 6: AgentKind::Antigravity (unique test prefix so the
+    // verify filter matches ONLY the new work — F6).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn agent_kind_antigravity_from_str_is_case_insensitive() {
+        assert_eq!(
+            "antigravity".parse::<AgentKind>().unwrap(),
+            AgentKind::Antigravity
+        );
+        assert_eq!(
+            "ANTIGRAVITY".parse::<AgentKind>().unwrap(),
+            AgentKind::Antigravity
+        );
+        assert_eq!(
+            "Antigravity".parse::<AgentKind>().unwrap(),
+            AgentKind::Antigravity
+        );
+    }
+
+    #[test]
+    fn agent_kind_antigravity_display_is_lowercase() {
+        assert_eq!(AgentKind::Antigravity.to_string(), "antigravity");
+    }
+
+    #[test]
+    fn agent_kind_antigravity_serde_round_trips_lowercase() {
+        let wire = serde_json::to_string(&AgentKind::Antigravity).unwrap();
+        assert_eq!(wire, "\"antigravity\"");
+        let back: AgentKind = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, AgentKind::Antigravity);
+    }
+
+    #[test]
+    fn agent_kind_antigravity_error_message_lists_it() {
+        let err = "aider".parse::<AgentKind>().unwrap_err();
+        assert!(
+            err.to_string().contains("antigravity"),
+            "the parse error must advertise the new agent: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_kind_antigravity_driver_for_resolves() {
+        assert_eq!(
+            crate::agents::driver_for(AgentKind::Antigravity).name(),
+            "Antigravity"
+        );
     }
 }
