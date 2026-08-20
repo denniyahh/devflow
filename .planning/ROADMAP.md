@@ -48,8 +48,8 @@ by the Phase 40 run — the leaked test monitors (HYG-01) and the container git-
 **Success Criteria** (what must be TRUE):
 
   1. `--agent antigravity` resolves through `AgentKind`/`driver_for`/`agent_program`, and `devflow doctor` reports it installed.
-  2. The driver spawns the vetted `agy` wrapper (exec `antigravity-cli` 1.1.16, live at review 2026-08-20) headless via `--input-format stream-json --output-format stream-json` — no `-p` (Go-flag string flag that swallows the next token), skip-permissions injected by the wrapper (D-01), not the driver; argv spawn-tested, not assumed.
-  3. A marker-less run never advances a stage (regression test).
+  2. The driver spawns the vetted `agy` wrapper (exec `antigravity-cli` 1.1.16, live at review 2026-08-20) headless via `--input-format stream-json --output-format stream-json --print-timeout 60m` — no `-p` (Go-flag string flag that swallows the next token), `--print-timeout` above the 5m CLI default (F3), skip-permissions injected by the wrapper (D-01), not the driver; argv spawn-tested, not assumed (spawn smoke test).
+  3. A marker-less run never advances a COMMIT-GATED stage without a marker (regression test) — Define legitimately advances on exit 0; the gate fires at the first commit-gated stage (Plan).
   4. The driver passes the shared conformance suite.
   5. The Phase-7 integration tests reap their own monitors — a full `cargo test` run leaks 0 detached `devflow start` processes (HYG-01).
   6. `check-in-container.sh` passes from both a git worktree and the main checkout — the in-container failure is the worktree `.git`-file mount (gitdir outside the mount), not uid 0 and not "3 git-env tests under root"; fixed in `check-in-container.sh`, with no test-file changes (HYG-02).
