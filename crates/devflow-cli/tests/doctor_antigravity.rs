@@ -76,8 +76,16 @@ fn doctor_reports_antigravity_absent_without_agy() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
+    // Scope the assertion to the ANTIGRAVITY entry, not the whole output: an
+    // empty PATH puts `✗` on many lines (git, cargo, gh, ...), so an unscoped
+    // `contains("✗")` passes even if the antigravity entry falsely reported
+    // present. The present-case test carries the positive discrimination.
+    let antg_line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("antigravity"))
+        .unwrap_or_else(|| panic!("antigravity entry missing from doctor output:\n{text}"));
     assert!(
-        text.contains("antigravity") && (text.contains("✗") || text.contains("missing")),
-        "absent agy must read missing/warn, never a false green: {text}"
+        antg_line.contains("✗") || antg_line.contains("missing"),
+        "absent agy must read missing/warn on the antigravity entry, never a false green: {antg_line}"
     );
 }

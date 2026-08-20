@@ -2199,10 +2199,6 @@ pub(crate) struct Check {
 /// module-level seam so a unit test can assert the LIST without invoking the
 /// whole doctor flow. `doctor()` calls this and renders the result. Presence
 /// probes only — never a hard failure when a binary is absent (D-04).
-/// The environment checks `doctor` reports (phase 41 Task 7, F7): a named,
-/// module-level seam so a unit test can assert the LIST without invoking the
-/// whole doctor flow. `doctor()` calls this and renders the result. Presence
-/// probes only — never a hard failure when a binary is absent (D-04).
 fn doctor_checks() -> Vec<Check> {
     use std::process::Command;
 
@@ -2356,6 +2352,7 @@ fn doctor_checks() -> Vec<Check> {
     ]
 }
 
+/// Audit the environment and report what's installed, missing, or broken.
 pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     let checks = doctor_checks();
 
@@ -6801,11 +6798,6 @@ mod tests {
         std::fs::write(root.join("CHANGELOG.md"), "no heading here\n").unwrap();
         assert_eq!(check_changelog_version(root).status, "warn");
     }
-
-    // ------------------------------------------------------------------
-    // Phase 41 Task 7 (D-04/F7): the doctor antigravity entry lives behind an
-    // assertable seam and reports presence, never a hard failure.
-    // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
     // Phase 41 Task 7 (D-04/F7): the doctor antigravity entry lives behind an

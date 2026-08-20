@@ -526,6 +526,22 @@ pub fn claude_cli_version() -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
+/// The `agy --version` string, for the run's provenance — the Antigravity
+/// counterpart of [`claude_cli_version`]. `agy --version` reports the CLI
+/// version WITHOUT invoking the model, so the `-p --help` hazard (a Go-flag
+/// string flag that swallows the next token) does not apply to `--version`.
+pub fn antigravity_cli_version() -> Option<String> {
+    let output = std::process::Command::new("agy")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!version.is_empty()).then_some(version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

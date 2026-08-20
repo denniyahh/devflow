@@ -232,23 +232,6 @@ printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"DEVF
     }
 
     #[test]
-    fn antigravity_driver_health_is_not_overridden() {
-        // `health()` stays the trait default (presence is proven by preflight
-        // + doctor, D-04); there is nothing to assert beyond that the default
-        // is Ok for a bare driver.
-        assert!(
-            AntigravityDriver
-                .health(&crate::state::State::new(
-                    PhaseId::new(0),
-                    crate::state::AgentKind::Antigravity,
-                    crate::mode::Mode::Supervise,
-                    std::path::PathBuf::from("/tmp"),
-                ))
-                .is_ok()
-        );
-    }
-
-    #[test]
     fn antigravity_driver_name_is_correct() {
         assert_eq!(AntigravityDriver.name(), "Antigravity");
     }

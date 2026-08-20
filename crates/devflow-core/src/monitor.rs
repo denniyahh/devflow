@@ -234,28 +234,14 @@ pub fn parse_idle_timeout_secs(raw: Option<String>) -> IdleTimeoutSetting {
     }
 }
 
-/// The thin environment wrapper over [`parse_idle_timeout_secs`].
-///
-/// The variable name is spelled out as a STRING LITERAL here rather than
-/// passed as [`IDLE_TIMEOUT_ENV`], and that is deliberate.
-/// `doc_check::source_read_env_vars` recognises a variable only when it is read
-/// through a literal inside `std::env::var("...")`; reading it through the
-/// const compiles and works identically but makes the variable INVISIBLE to
-/// the operator-doc parity gate, which would then pass green while the
-/// variable went undocumented. Verified by removing this variable's row from
-/// `OPERATIONS.md` and confirming `doc_check` reddens.
-pub fn idle_timeout_setting() -> IdleTimeoutSetting {
-    parse_idle_timeout_secs(std::env::var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS").ok())
-}
-
 /// The AGENT-SPECIFIC idle-timeout resolution (round-3 D-08, B3).
 ///
 /// The 120s floor was measured against Claude's stream cadence; applying it
 /// to an unmeasured agent would be a behaviour prediction. The decision is
 /// therefore per-agent and explicit, never a silent inheritance:
 ///
-/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` — exactly as
-///   [`idle_timeout_setting`] always did (byte-identical behaviour).
+/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` — byte-identical to the
+///   pre-phase-41 behaviour this replaces.
 /// - Antigravity reads `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` with the same
 ///   120s floor as a DECIDED starting point (documented in the variable's
 ///   OPERATIONS.md row), to be revisited after the first real cadence

@@ -562,13 +562,33 @@ fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
 /// was or was not witnessed on — and never the guard itself, which is the
 /// distinction D-13 turns on.
 fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
-    let (event, reason) = match outcome {
-        canary::CanaryOutcome::Confirmed => ("claude_delivery_canary_confirmed", None),
-        canary::CanaryOutcome::Absent => ("claude_delivery_canary_absent", None),
-        canary::CanaryOutcome::Unverified(reason) => (
-            "claude_delivery_canary_unverified",
-            Some(truncate_reason(reason)),
+    // Agent-aware (41-02 review finding F4). The canary LAUNCHER and trust
+    // predicate were made agent-aware, but this emission path still hardcoded
+    // the Claude event names and `claude --version` — so an Antigravity run
+    // recorded Claude provenance and spent a `claude --version` spawn. Branch
+    // on the agent: Antigravity emits `antigravity_delivery_canary_*` and
+    // records `agy --version`; every other agent keeps the Claude names.
+    let (event, version) = match state.agent {
+        AgentKind::Antigravity => (
+            match outcome {
+                canary::CanaryOutcome::Confirmed => "antigravity_delivery_canary_confirmed",
+                canary::CanaryOutcome::Absent => "antigravity_delivery_canary_absent",
+                canary::CanaryOutcome::Unverified(_) => "antigravity_delivery_canary_unverified",
+            },
+            canary::antigravity_cli_version(),
         ),
+        _ => (
+            match outcome {
+                canary::CanaryOutcome::Confirmed => "claude_delivery_canary_confirmed",
+                canary::CanaryOutcome::Absent => "claude_delivery_canary_absent",
+                canary::CanaryOutcome::Unverified(_) => "claude_delivery_canary_unverified",
+            },
+            canary::claude_cli_version(),
+        ),
+    };
+    let reason = match outcome {
+        canary::CanaryOutcome::Unverified(reason) => Some(truncate_reason(reason)),
+        _ => None,
     };
     events::emit(
         &state.project_root,
@@ -577,7 +597,7 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
         serde_json::json!({
             "stage": state.stage.to_string(),
             "token_prefix": canary::TOKEN_PREFIX,
-            "cli_version": canary::claude_cli_version(),
+            "cli_version": version,
             "reason": reason,
         }),
     );
@@ -2723,6 +2743,49 @@ mod tests {
             line.matches(canary::TOKEN_PREFIX).count(),
             1,
             "the prefix must appear exactly once — a second occurrence means a token leaked in"
+        );
+    }
+
+    /// F4 (41-02 review): the canary outcome emission is agent-aware — an
+    /// Antigravity run records `antigravity_delivery_canary_*`, never a
+    /// Claude event, and reads `agy --version` rather than `claude --version`.
+    #[test]
+    fn antigravity_canary_outcome_emits_antigravity_provenance() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(126);
+        let mut state = State::new(
+            phase,
+            AgentKind::Antigravity,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let calls = std::cell::Cell::new(0usize);
+        canary_gate(
+            &mut state,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+        let line = log
+            .lines()
+            .find(|line| line.contains("antigravity_delivery_canary_confirmed"))
+            .expect("an Antigravity run must emit the antigravity canary event");
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(event["event"], "antigravity_delivery_canary_confirmed");
+        // Never a Claude event on an Antigravity run.
+        assert!(
+            !log.contains("claude_delivery_canary_"),
+            "an Antigravity run must not record Claude canary provenance"
         );
     }
 
