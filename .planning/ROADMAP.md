@@ -54,7 +54,7 @@ by the Phase 40 run — the leaked test monitors (HYG-01) and the container git-
   5. The Phase-7 integration tests reap their own monitors — a full `cargo test` run leaks 0 detached `devflow start` processes (HYG-01).
   6. `check-in-container.sh` passes from both a git worktree and the main checkout — the in-container failure is the worktree `.git`-file mount (gitdir outside the mount), not uid 0 and not "3 git-env tests under root"; fixed in `check-in-container.sh`, with no test-file changes (HYG-02).
 
-**Plans**: TBD
+**Plans**: 2/2 plans complete (41-01, 41-02)
 
 ### Phase 42: Hermes Driver
 

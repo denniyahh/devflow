@@ -61,11 +61,36 @@ else
     PIN=(taskset -c "$CPUS")
 fi
 
+# HYG-02 (41-02, re-derived from real container runs 2026-08-20): a git
+# WORKTREE's `.git` is a FILE — `gitdir: <main>/.git/worktrees/<N>` — pointing
+# at the main repo's gitdir, which lives OUTSIDE the worktree and therefore
+# outside the single `-v "$REPO_ROOT":/workspace` mount below. Inside the
+# container git resolves that absolute gitdir path to nothing and every
+# git-dependent check dies with `fatal: not a git repository`. Two paths must
+# come through: the worktree gitdir itself AND the COMMON gitdir it shares
+# (`commondir` — the main repo's `.git`, where refs/objects live). The MAIN
+# checkout is unaffected (its gitdir is inside REPO_ROOT) — verified both
+# ways in the pinned image: worktree FAILS, main checkout as uid 0 PASSES.
+# The fix is the mount, not the tests and not a uid-0 skip: gitignore /
+# ci-parity / pre-commit-branch guards stay active under CI's root-over-
+# normal-checkout runs.
+GITDIR="$(git rev-parse --absolute-git-dir)"
+COMMONDIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+GITDIR_MOUNT=()
+for dir in "$GITDIR" "$COMMONDIR"; do
+    if [ "${dir#"$REPO_ROOT"/}" = "$dir" ]         && ! printf '%s
+' "${GITDIR_MOUNT[@]}" | grep -qx -- "$dir"; then
+        echo "==> worktree detected: gitdir component $dir is outside the mount; binding it through"
+        GITDIR_MOUNT+=(-v "$dir:$dir")
+    fi
+done
+
 echo "==> image:  $IMAGE"
 echo "==> target: $TARGET"
 echo "==> cpus:   $CPUS"
 
 exec docker run --rm -t \
+    "${GITDIR_MOUNT[@]}" \
     -v "$REPO_ROOT":/workspace \
     -v devflow-ci-target:/ctarget \
     -v devflow-ci-registry:/usr/local/cargo/registry \
