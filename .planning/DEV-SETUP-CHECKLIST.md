@@ -121,6 +121,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   `git rev-parse --absolute-git-dir` + `--git-common-dir`). A fresh replication that runs
   phase work from `.worktrees/`-style worktrees must keep this or git dies with
   `fatal: not a git repository` inside the container.
+- [ ] **[PATTERN]** `check-in-container.sh` derives the `devflow-ci-target` / `devflow-ci-registry`
+  volume names PER CHECKOUT (a hash of `REPO_ROOT` suffix). A single shared volume mounted at
+  the same `/workspace` path aliases cargo's path-keyed fingerprints across the main checkout
+  and worktrees — the worktree build reuses a stale `devflow-core` rmeta and dies with
+  `E0599: no variant named Antigravity` (false RED), and the inverse yields a false GREEN.
 
 ## 6. Claude Code / agent tooling — mostly [GLOBAL], currently unversioned
 
