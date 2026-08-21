@@ -150,6 +150,10 @@ enum Command {
         /// Seconds of stream silence before the idle timeout fires.
         #[arg(long)]
         idle_timeout_secs: u64,
+        /// Which agent's transport the monitor supervises (selects the
+        /// first-turn schema and the close-rule marker predicate).
+        #[arg(long)]
+        agent: AgentKind,
         /// The supervised child's program and arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -571,6 +575,7 @@ fn run() -> Result<(), CliError> {
             workdir,
             prompt_file,
             idle_timeout_secs,
+            agent,
             argv,
         } => run_monitor(
             &project_root(project)?,
@@ -578,6 +583,7 @@ fn run() -> Result<(), CliError> {
             &workdir,
             &prompt_file,
             idle_timeout_secs,
+            agent,
             &argv,
         ),
         Command::Resume {

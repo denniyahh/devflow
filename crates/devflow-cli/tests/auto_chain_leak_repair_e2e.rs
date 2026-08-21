@@ -266,6 +266,8 @@ impl Fixture {
             // Comfortably above the sleeper's own 30s ceiling, so the idle
             // timeout can never be what ends this run — the kill below is.
             .arg("120")
+            .arg("--agent")
+            .arg("claude")
             .arg("--")
             .arg("sh")
             .arg(&self.script)

@@ -2,6 +2,116 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
+## 🚧 v2.8.0 milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
+
+**Declared 2026-08-18.** Onboard the remaining coding harnesses onto the `AgentDriver` contract —
+new drivers for **Antigravity CLI** and **Hermes** (backlog 999.1), complete the under-built
+**OpenCode** stub, verify/harden **Codex** end-to-end — and prove **Pi** holds up under real use by
+dogfooding Phase 40 through it. Closes 999.94 + 999.85 if capacity permits. All driver work maps
+onto the two existing launch families (stream-json vs positional single-document); no architectural
+change.
+
+| Phase | Name | Requirements | Status |
+|---|---|---|---|
+| 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
+| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Complete    |
+| 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
+| 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
+| 44 | Codex End-to-End Verification | CODE-01 | Not started |
+| 45 | Opportunistic Cleanup (999.94) | DECN-01 | Not started |
+
+### Phase 40: Pi Dogfood
+
+**Goal**: `devflow start --agent pi` drives a real supervised run through Define→Validate (at least
+one live gate), proving the Pi driver (shipped in v2.7.0) is reliable under real use. Code-stage
+subject: 999.85 (two stale comments, MAINT-01).
+**Depends on**: Nothing (Pi driver already shipped)
+**Requirements**: PIDG-01, MAINT-01
+**Success Criteria** (what must be TRUE):
+
+  1. A real supervised run completes Define→Plan→Code→Validate through `--agent pi`; the 999.85 comments are correctly rewritten.
+  2. At least one live gate fires and the operator's decision is honored — no lost gate, no marker-less silent advance.
+  3. Pi-transport regression tests (stubbed `pi`) prove a marker-less run, a non-zero exit, and a hung Pi are each handled without advancing.
+
+**Plans**: 2/2 plans complete
+
+- [x] 40-01-PLAN.md — Pi-transport regression tests (stubbed `pi` failure modes)
+- [x] 40-02-PLAN.md — Real supervised Pi dogfood run (999.85 rewrite + live gate + subagent dispatch)
+
+### Phase 41: Antigravity Driver
+
+**Goal**: `devflow start --agent antigravity` launches the Antigravity CLI headless and drives a
+stage to completion with honest completion detection. Also closes two dogfood-hygiene items surfaced
+by the Phase 40 run — the leaked test monitors (HYG-01) and the container git-env failures (HYG-02).
+**Depends on**: Nothing (mirrors the existing ClaudeDriver pattern)
+**Requirements**: ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02
+**Success Criteria** (what must be TRUE):
+
+  1. `--agent antigravity` resolves through `AgentKind`/`driver_for`/`agent_program`, and `devflow doctor` reports it installed.
+  2. The driver spawns the vetted `agy` wrapper (exec `antigravity-cli` 1.1.16, live at review 2026-08-20) headless via `--input-format stream-json --output-format stream-json --print-timeout 60m` — no `-p` (Go-flag string flag that swallows the next token), `--print-timeout` above the 5m CLI default (F3), skip-permissions injected by the wrapper (D-01), not the driver; argv spawn-tested, not assumed (spawn smoke test).
+  3. A marker-less run never advances a COMMIT-GATED stage without a marker (regression test) — Define legitimately advances on exit 0; the gate fires at the first commit-gated stage (Plan).
+  4. The driver passes the shared conformance suite.
+  5. The Phase-7 integration tests reap their own monitors — a full `cargo test` run leaks 0 detached `devflow start` processes (HYG-01).
+  6. `check-in-container.sh` passes from both a git worktree and the main checkout — the in-container failure is the worktree `.git`-file mount (gitdir outside the mount), not uid 0 and not "3 git-env tests under root"; fixed in `check-in-container.sh`, with no test-file changes (HYG-02).
+
+**Plans**: 2/2 plans complete (41-01, 41-02)
+
+### Phase 42: Hermes Driver
+
+**Goal**: `devflow start --agent hermes` launches Hermes oneshot (`-z --yolo`) headless and drives a
+stage with honest completion.
+**Depends on**: Nothing (mirrors the existing PiDriver pattern)
+**Requirements**: HRMS-01, HRMS-02, HRMS-03, ANTG-04
+**Success Criteria** (what must be TRUE):
+
+  1. `--agent hermes` resolves end-to-end (enum / `FromStr` / `driver_for` / `agent_program`).
+  2. The driver spawns `hermes -z "<prompt>" --yolo` headless — argv spawn-tested.
+  3. Completion is process-exit + `DEVFLOW_RESULT` prompt contract; a marker-less run never advances.
+  4. The driver passes the shared conformance suite.
+
+**Plans**: TBD
+
+### Phase 43: OpenCode Driver Completion
+
+**Goal**: `devflow start --agent opencode` runs headless with `--auto` + `--format json`, and
+completion/verdict is parsed from the JSON events.
+**Depends on**: Nothing
+**Requirements**: OPCD-01, OPCD-02, OPCD-03
+**Success Criteria** (what must be TRUE):
+
+  1. The driver launches `opencode run "<prompt>" --auto --format json`.
+  2. Completion/verdict is parsed from `--format json` events, regression-tested against a real capture (not an assumed schema).
+  3. The health check fails closed when OpenCode is not usable.
+  4. The driver passes the shared conformance suite.
+
+**Plans**: TBD
+
+### Phase 44: Codex End-to-End Verification
+
+**Goal**: `--agent codex` proven through a real phase run; any surfaced gaps closed.
+**Depends on**: Nothing (Codex driver already native since 37-03)
+**Requirements**: CODE-01
+**Success Criteria** (what must be TRUE):
+
+  1. A real phase completes through `--agent codex`, or the run surfaces concrete, re-filed gaps.
+  2. Each surfaced gap is closed or re-filed with evidence.
+  3. No regression to the existing Codex driver behavior (workspace tests green).
+
+**Plans**: TBD
+
+### Phase 45: Opportunistic Cleanup (999.94)
+
+**Goal**: Close 999.94 (unattended `decision` checkpoint blind-first-option, HIGH) if capacity permits.
+**Depends on**: Nothing (independent of the driver phases)
+**Requirements**: DECN-01
+**Success Criteria** (what must be TRUE):
+
+  1. An unattended `decision` checkpoint no longer blindly takes the first option — acceptance-tested, since it alters unattended-run policy.
+
+**Plans**: TBD
+
+---
+
 ## ✅ v2.7.0 milestone (CLOSED 2026-08-18 — Pi End-to-End + Driver Contract Completion)
 
 **Declared 2026-08-16, closed 2026-08-18.** Finished the `AgentDriver` migration and made **Pi**
@@ -103,6 +213,12 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 37.1 | — | Complete    | 2026-08-17 |
 | 38 | — | Complete    | 2026-08-17 |
 | 39 | 1/1 | Complete    | 2026-08-18 |
+| 40 | 2/2 | Complete   | 2026-08-18 |
+| 41 | — | Not started | — |
+| 42 | — | Not started | — |
+| 43 | — | Not started | — |
+| 44 | — | Not started | — |
+| 45 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -262,6 +378,30 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
+
+### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (BACKLOG)
+
+**Linear:** [DEN-114](https://linear.app/denniskim/issue/DEN-114)
+
+**Found:** 2026-08-18, attempting `$gsd-plan-phase 40` from a Pi session. The workflow's subagent
+spawns (`gsd-planner`, `gsd-plan-checker`, `gsd-phase-researcher`, …) have no available dispatch
+mechanism in Pi, so the planning lifecycle falls back to inline execution or must move to another
+runtime. **Reproduced live 2026-08-19** during the Phase 40 Pi dogfood: the `subagent` tool is
+available headlessly, but the Code stage made 0 dispatches because `execute-phase.md` only knows the
+Claude/Codex `Agent()` model (see CONTEXT.md).
+
+**The item:** GSD's subagent-dispatching workflows (plan, execute, review, and any other that
+spawns `gsd-*` role agents) cannot run natively in a Pi session. GSD does not recognize `pi` as a
+runtime, so those workflows' subagent calls find no matching tool, and there is no translation to
+Pi's available subagent mechanism. The current workaround is to run those workflows from Codex or
+Claude Code.
+
+**Priority:** Medium — blocks native GSD lifecycle work from Pi, but a working fallback (another
+runtime) exists. **Size:** M.
+
+**Depends on:** nothing structural.
+
+---
 
 ### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (BACKLOG)
 

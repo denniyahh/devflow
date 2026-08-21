@@ -2195,8 +2195,11 @@ pub(crate) struct Check {
     pub(crate) install_hint: Option<String>,
 }
 
-/// Audit the environment and report what's installed, missing, or broken.
-pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
+/// The environment checks `doctor` reports (phase 41 Task 7, F7): a named,
+/// module-level seam so a unit test can assert the LIST without invoking the
+/// whole doctor flow. `doctor()` calls this and renders the result. Presence
+/// probes only — never a hard failure when a binary is absent (D-04).
+fn doctor_checks() -> Vec<Check> {
     use std::process::Command;
 
     fn cmd_check(name: &str, cmd: &str, version_arg: &str, install_hint: &str) -> Check {
@@ -2284,7 +2287,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         ),
     };
 
-    let checks: Vec<Check> = vec![
+    vec![
         cmd_check(
             "git",
             "git",
@@ -2323,6 +2326,16 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             "--version",
             "Install Pi (see https://github.com/earendil-works/pi-mono)",
         ),
+        // Phase 41 Task 7 (D-04/F7): presence-only probe of the operator's
+        // `agy` wrapper. `agy --version` reports the CLI version WITHOUT
+        // invoking the model — the `-p --help` hazard (a Go-flag string flag
+        // that swallows the next token) does not apply to `--version`.
+        cmd_check(
+            "antigravity",
+            "agy",
+            "--version",
+            "Install the Antigravity CLI so `agy` is on PATH (wrapper injects --dangerously-skip-permissions)",
+        ),
         pi_subagent_dispatch_check(),
         Check {
             name: format!("devflow v{devflow_version}"),
@@ -2336,7 +2349,12 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             version: rust_log_version,
             install_hint: rust_log_hint,
         },
-    ];
+    ]
+}
+
+/// Audit the environment and report what's installed, missing, or broken.
+pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
+    let checks = doctor_checks();
 
     let facts = collect_phase_facts(project_root);
     let doc_findings = collect_planning_doc_findings(project_root);
@@ -6779,5 +6797,35 @@ mod tests {
         // Missing heading → warn, not a hard fail.
         std::fs::write(root.join("CHANGELOG.md"), "no heading here\n").unwrap();
         assert_eq!(check_changelog_version(root).status, "warn");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 41 Task 7 (D-04/F7): the doctor antigravity entry lives behind an
+    // assertable seam and reports presence, never a hard failure. The
+    // PATH-based presence reporting tests live in tests/doctor_antigravity.rs
+    // (integration — spawning the real binary from a unit-test harness
+    // re-enters the suite).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn doctor_includes_antigravity_check_in_the_seam() {
+        // The seam asserts the LIST, not the machine's PATH state: the entry
+        // exists with the agy probe shape regardless of whether `agy` happens
+        // to be installed here.
+        let checks = doctor_checks();
+        let antg = checks
+            .iter()
+            .find(|c| c.name == "antigravity")
+            .expect("doctor_checks() must contain the antigravity entry");
+        // When the probe reports missing, the hint names the agy binary. When
+        // agy IS installed on this machine the hint is None (status ok), so
+        // the hint assertion is conditional.
+        if antg.status == "missing" {
+            assert!(
+                antg.install_hint.as_deref().unwrap_or("").contains("agy"),
+                "the hint must name the agy binary: {:?}",
+                antg.install_hint
+            );
+        }
     }
 }

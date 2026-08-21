@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.7.0
-milestone_name: milestone (Pi End-to-End + Driver Contract Completion, ACTIVE — declared 2026-08-16)
-status: Awaiting next milestone
-stopped_at: Phase 38 context gathered
-last_updated: "2026-08-18T17:09:45.033Z"
-last_activity: 2026-08-18
-last_activity_desc: Phase 39 complete
+milestone: v2.8.0
+milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
+current_phase: 42
+current_phase_name: Hermes Driver
+status: "Phase 41 shipped — PR #133"
+stopped_at: Phase 41 complete, ready to plan Phase 42
+last_updated: "2026-08-21T15:07:01.326Z"
+last_activity: 2026-08-21
+state_head: 4a510122d405cc0df7e439cffaea5f9e54b5d777
 progress:
-  total_phases: 3
+  total_phases: 6
   completed_phases: 2
-  total_plans: 2
-  completed_plans: 2
-  percent: 67
-current_phase: 39
-current_phase_name: Pi End-to-End
+  total_plans: 4
+  completed_plans: 4
+  percent: 33
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v2.7.0 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-18 — Milestone v2.7.0 completed and archived
+Phase: 42 — Hermes Driver
+Plan: Not started
+Status: Phase 41 shipped — PR #133
+Last activity: 2026-08-21
 
 ## Recently Shipped
 
@@ -838,9 +838,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-17T14:45:51.417Z
-**Stopped at:** Phase 38 context gathered
-**Resume file:** .planning/phases/38-driver-contract-completion-999-106-999-107/38-CONTEXT.md
+**Last session:** 2026-08-19 (resumed from pause)
+**Stopped at:** Phase 41 complete, ready to plan Phase 42
+**Resume file:** (none — resume complete)
 
 ## Operator Next Steps
 

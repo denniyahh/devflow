@@ -208,6 +208,8 @@ impl Fixture {
             .arg(&self.prompt_file)
             .arg("--idle-timeout-secs")
             .arg("30")
+            .arg("--agent")
+            .arg("claude")
             .arg("--")
             .args(argv)
             .output()

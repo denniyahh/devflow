@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.8.0 — 2026-08-21
+
+Antigravity driver + test hygiene and dogfood validation (milestone v2.8.0). DevFlow adds the
+`AntigravityDriver` for headless CLI automation (`agy`), closes the test monitor-leak hygiene
+defect, and fixes container git worktree verification.
+
+### What's new
+
+- **Antigravity CLI Driver (Phase 41).** Operator can select `--agent antigravity`. Spawns `agy`
+  headless via `--input-format stream-json --output-format stream-json --print-timeout 60m`.
+  Includes agent-aware transport handling (event-key first turn, top-level result marker close
+  predicate), agent-aware canary trust, and explicit ERROR-envelope failure parsing.
+- **Unattended Safety Policy (Phase 41).** `--mode auto` is refused for Antigravity in preflight
+  (C2 gate) until dogfooded through a supervised run.
+- **Test Monitor Hygiene (HYG-01 / Phase 41).** Integration tests in `phase7_cli` bind
+  `MonitorReapGuard` to settled state, with a suite registry and audit ensuring zero orphaned
+  monitor processes across test runs.
+- **Container Parity for Git Worktrees (HYG-02 / Phase 41).** `scripts/check-in-container.sh`
+  bind-mounts worktree `.git` files and commondir paths to pass cleanly under container root.
+- **Pi Supervised Dogfood Run (Phase 40).** Full supervised Define→Validate run completed
+  through `--agent pi` (closing 999.85 stale comments).
+
 ## 2.7.0 — 2026-08-18
 
 Pi end-to-end (milestone v2.7.0). DevFlow finishes the `AgentDriver` migration and drives **Pi**

@@ -20,7 +20,22 @@ mid-run crash or kill.
 
 ## Current Milestone
 
-*(None declared — v2.7.0 closed 2026-08-18; run `$gsd-new-milestone` to declare the next.)*
+**v2.8.0 — Remaining Harness Support + Pi Dogfood** (declared 2026-08-18)
+
+**Goal:** Onboard the remaining coding harnesses onto the `AgentDriver` contract — new drivers for
+**Antigravity CLI** and **Hermes** (backlog 999.1), complete the under-built **OpenCode** stub
+driver, verify/harden **Codex** end-to-end — and prove **Pi** holds up under real use by dogfooding
+Phase 40 through it. Closes 999.94 + 999.85 if capacity permits.
+
+**Target features:**
+- **Antigravity CLI** — new `AgentKind` variant + driver + conformance suite (currently unsupported).
+- **Hermes** — new `AgentKind` variant + driver + conformance suite (backlog 999.1).
+- **OpenCode** — complete the stub driver: completion parsing, health/discover, capabilities, workflow root.
+- **Codex** — end-to-end verification/hardening (already a native driver; dogfood + gap-closure).
+- **Phase 40** — Pi dogfood: run a real phase through DevFlow using Pi (incl. the deferred
+  isolated-context Pi dispatch item if it surfaces).
+- **999.94** (unattended `decision` checkpoint takes the first option blindly, HIGH) + **999.85**
+  (two stale comments, low) — *if capacity permits*.
 
 <details>
 <summary>Previous milestone: v2.7.0 Pi End-to-End + Driver Contract Completion — CLOSED 2026-08-18</summary>
@@ -36,9 +51,9 @@ pipeline (provider-aware health, `Legacy` launch, subagent dispatch with no drai
 - Phase 39 — Pi end-to-end: `devflow start --agent pi` completes the pipeline.
 - `999.94` (tentative) — unattended `decision` checkpoint takes the first option blindly (carried).
 
-**Closed 2026-08-18, not yet released** — `Cargo.toml` is still `2.6.0` and no `v2.7.0` tag exists;
-release/tag is a separate step. Full phase detail archived to `.planning/milestones/v2.7.0-ROADMAP.md`;
-phase dirs to `.planning/milestones/v2.7.0-phases/`.
+**Closed 2026-08-18, released as `v2.7.0`** (signed tag; `Cargo.toml`/`Cargo.lock` at 2.7.0).
+Full phase detail archived to `.planning/milestones/v2.7.0-ROADMAP.md`; phase dirs to
+`.planning/milestones/v2.7.0-phases/`.
 
 </details>
 
@@ -238,13 +253,18 @@ version is still derived automatically from conventional-commit classification a
   real `ssh-keygen -Y sign` probe, not a predictor that had already false-negatived live twice
   (999.86) — Phase 35, v2.5.0. HARDEN-03's fingerprint keys on artifact bytes rather than run
   identity; that residual gap is filed as its own follow-up, Phase 35.2 (999.89).
+- ✓ **PIDG-01, MAINT-01** — the shipped Pi driver (`devflow start --agent pi`, v2.7.0) survived a
+  real supervised Define→Code run with a witnessed reviewer-subagent dispatch and a live Validate
+  gate (the operator's file-based answer, 40-UAT.md), the two 999.85 protected comments were
+  rewritten to cite the structural `verdict: None` defences — the classifier's enumerated status
+  position and the graft's status filter — instead of the mechanism Phase 34 deleted (keeping the
+  instruction intact and unweakened), and three Pi-transport regression tests (marker-less,
+  non-zero-exit, hung) closed the failure-mode gap (D-05) — Phase 40, milestone v2.8.0.
 
 ### Active
 
 - **HARDEN-06** (999.83) — the drain gate's concurrency guarantee, held back from Phase 35's bundle
   specifically to avoid slowing HARDEN-01..05/07 on a harness — Phase 35.3, planned (not yet executed).
-- **999.85 / DEN-107** (two comments justifying themselves by mechanisms v2.4.0 deleted) — low
-  severity, not folded into v2.5.0's scope; remains backlog for a future pass.
 - Phase 35.1 (999.93, unattended-launch prerequisites) and Phase 35.2 (999.89/HARDEN-03
   provenance) — inserted 2026-08-07, not yet planned.
 
@@ -379,7 +399,9 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-18 after the v2.7.0 milestone (Pi End-to-End + Driver Contract Completion) — 3/3 phases (37.1 research, 38, 39), 2/2 plans, verified + validated. NOT yet released: `Cargo.toml` still `2.6.0`, no `v2.7.0` tag — release/tag is a separate step. Milestone archived to `.planning/milestones/v2.7.0-*`; phase dirs to `v2.7.0-phases/`.*
+*Last updated: 2026-08-19 after Phase 40 (Pi Dogfood) — the shipped Pi driver proven through a
+real supervised Define→Validate run, the 999.85 comments corrected (MAINT-01), and Pi-transport
+regression tests added. Prior: the v2.7.0 milestone (Pi End-to-End + Driver Contract Completion)*
 
 *Previous: 2026-08-16 after the v2.6.0 milestone (Multi-Agent Adapter Migration) — 2/2 phases (36, 37), 6/6 plans, verified + validated + secured (threats_open: 0). Released as `v2.6.0`: signed tag on `main`, both crates published (devflow-core → devflow), main→develop synced (merge commit), GitHub Release published, milestone archived to `.planning/milestones/v2.6.0-*`; phase dirs archived to `v2.6.0-phases/`.*
 

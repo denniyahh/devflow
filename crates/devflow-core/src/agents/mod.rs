@@ -177,14 +177,17 @@ pub fn driver_for(kind: AgentKind) -> Box<dyn AgentDriver> {
         AgentKind::Codex => Box::new(CodexDriver),
         AgentKind::OpenCode => Box::new(OpenCodeDriver),
         AgentKind::Pi => Box::new(PiDriver),
+        AgentKind::Antigravity => Box::new(AntigravityDriver),
     }
 }
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod opencode;
 pub mod pi;
 
+pub use antigravity::AntigravityDriver;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
 pub use opencode::OpenCodeDriver;
@@ -202,6 +205,7 @@ mod tests {
         assert_eq!(driver_for(AgentKind::Codex).name(), "OpenAI Codex");
         assert_eq!(driver_for(AgentKind::OpenCode).name(), "OpenCode");
         assert_eq!(driver_for(AgentKind::Pi).name(), "Pi");
+        assert_eq!(driver_for(AgentKind::Antigravity).name(), "Antigravity");
     }
 
     /// 37-02: the drivers reproduce the legacy adapter byte-for-byte (the shim
@@ -275,11 +279,12 @@ mod tests {
     /// hardcoded Codex-Define check.
     #[test]
     fn every_driver_passes_the_conformance_suite() {
-        let drivers: [Box<dyn AgentDriver>; 4] = [
+        let drivers: [Box<dyn AgentDriver>; 5] = [
             Box::new(ClaudeDriver),
             Box::new(CodexDriver),
             Box::new(OpenCodeDriver),
             Box::new(PiDriver),
+            Box::new(AntigravityDriver),
         ];
         for driver in &drivers {
             let results = driver.test_contract();
@@ -296,6 +301,47 @@ mod tests {
                     result.name
                 );
             }
+        }
+    }
+
+    /// F6: the Antigravity enrollment is PROVEN by a uniquely-named test —
+    /// the generic `conformance` filter matched two pre-existing tests and
+    /// would pass with zero Antigravity code, so the enrollment needed a name
+    /// that can only match this one. Asserts the hardcoded array is now 5
+    /// drivers AND that the Antigravity driver passes all 7 contract checks.
+    #[test]
+    fn antigravity_conformance_enrollment() {
+        let drivers: [Box<dyn AgentDriver>; 5] = [
+            Box::new(ClaudeDriver),
+            Box::new(CodexDriver),
+            Box::new(OpenCodeDriver),
+            Box::new(PiDriver),
+            Box::new(AntigravityDriver),
+        ];
+        let antigravity = drivers
+            .iter()
+            .find(|d| d.name() == "Antigravity")
+            .expect("the Antigravity driver must be enrolled in the shared suite");
+        let results = antigravity.test_contract();
+        assert_eq!(
+            results.len(),
+            7,
+            "1 name + 5 per-stage DEVFLOW_RESULT prompts + 1 program"
+        );
+        for result in &results {
+            assert!(
+                result.passed,
+                "Antigravity failed conformance case {:?}",
+                result.name
+            );
+        }
+        // The whole suite still passes with the 5th driver present.
+        for driver in &drivers {
+            assert!(
+                driver.test_contract().iter().all(|r| r.passed),
+                "{} must pass the shared conformance suite",
+                driver.name()
+            );
         }
     }
 
