@@ -2336,6 +2336,13 @@ fn doctor_checks() -> Vec<Check> {
             "--version",
             "Install the Antigravity CLI so `agy` is on PATH (wrapper injects --dangerously-skip-permissions)",
         ),
+        // Phase 42 Task 3 (HRMS-01, D-06): presence-only probe of the `hermes` binary.
+        cmd_check(
+            "hermes",
+            "hermes",
+            "--version",
+            "Install the Hermes Agent CLI so `hermes` is on PATH",
+        ),
         pi_subagent_dispatch_check(),
         Check {
             name: format!("devflow v{devflow_version}"),
@@ -6825,6 +6832,22 @@ mod tests {
                 antg.install_hint.as_deref().unwrap_or("").contains("agy"),
                 "the hint must name the agy binary: {:?}",
                 antg.install_hint
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_includes_hermes_check_in_the_seam() {
+        let checks = doctor_checks();
+        let hermes = checks
+            .iter()
+            .find(|c| c.name == "hermes")
+            .expect("doctor_checks() must contain the hermes entry");
+        if hermes.status == "missing" {
+            assert!(
+                hermes.install_hint.as_deref().unwrap_or("").contains("hermes"),
+                "the hint must name the hermes binary: {:?}",
+                hermes.install_hint
             );
         }
     }

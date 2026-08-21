@@ -395,6 +395,8 @@ pub enum AgentKind {
     Pi,
     /// Antigravity CLI (`agy`), stream-json transport (phase 41).
     Antigravity,
+    /// Hermes Agent CLI (`hermes`), headless oneshot (phase 42).
+    Hermes,
 }
 
 impl fmt::Display for AgentKind {
@@ -405,6 +407,7 @@ impl fmt::Display for AgentKind {
             AgentKind::OpenCode => "opencode",
             AgentKind::Pi => "pi",
             AgentKind::Antigravity => "antigravity",
+            AgentKind::Hermes => "hermes",
         };
         f.write_str(name)
     }
@@ -420,6 +423,7 @@ impl FromStr for AgentKind {
             "opencode" | "open-code" => Ok(AgentKind::OpenCode),
             "pi" => Ok(AgentKind::Pi),
             "antigravity" => Ok(AgentKind::Antigravity),
+            "hermes" => Ok(AgentKind::Hermes),
             other => Err(AgentParseError(other.to_string())),
         }
     }
@@ -427,7 +431,7 @@ impl FromStr for AgentKind {
 
 /// Error returned when parsing an unsupported agent name.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unsupported agent `{0}`; expected claude, codex, opencode, pi, or antigravity")]
+#[error("unsupported agent `{0}`; expected claude, codex, opencode, pi, antigravity, or hermes")]
 pub struct AgentParseError(String);
 
 impl State {
@@ -1118,6 +1122,47 @@ mod tests {
         assert_eq!(
             crate::agents::driver_for(AgentKind::Antigravity).name(),
             "Antigravity"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 42 Task 2: AgentKind::Hermes (HRMS-01, D-05, D-06).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn agent_kind_hermes_from_str_is_case_insensitive() {
+        assert_eq!("hermes".parse::<AgentKind>().unwrap(), AgentKind::Hermes);
+        assert_eq!("HERMES".parse::<AgentKind>().unwrap(), AgentKind::Hermes);
+        assert_eq!("Hermes".parse::<AgentKind>().unwrap(), AgentKind::Hermes);
+    }
+
+    #[test]
+    fn agent_kind_hermes_display_is_lowercase() {
+        assert_eq!(AgentKind::Hermes.to_string(), "hermes");
+    }
+
+    #[test]
+    fn agent_kind_hermes_serde_round_trips_lowercase() {
+        let wire = serde_json::to_string(&AgentKind::Hermes).unwrap();
+        assert_eq!(wire, "\"hermes\"");
+        let back: AgentKind = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, AgentKind::Hermes);
+    }
+
+    #[test]
+    fn agent_kind_hermes_error_message_lists_it() {
+        let err = "aider".parse::<AgentKind>().unwrap_err();
+        assert!(
+            err.to_string().contains("hermes"),
+            "the parse error must advertise the new agent: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_kind_hermes_driver_for_resolves() {
+        assert_eq!(
+            crate::agents::driver_for(AgentKind::Hermes).name(),
+            "Hermes"
         );
     }
 }
