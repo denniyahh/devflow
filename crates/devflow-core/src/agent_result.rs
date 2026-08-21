@@ -79,6 +79,21 @@ pub enum AgentStatus {
     /// rename for the same reason.
     #[serde(rename = "idle_timeout")]
     IdleTimeout,
+    /// The agent's own final message self-reported success, but the CLI's
+    /// result envelope reports a transport-level cancellation ("context
+    /// canceled" / "context deadline exceeded"). The outcome is AMBIGUOUS:
+    /// the work completed — the success marker is present in
+    /// `result.response` — but the transport was torn down before the result
+    /// could be finalized (A2, 41-antigravity UAT).
+    ///
+    /// Deliberately NOT `Success` (advance): a torn envelope is not proof the
+    /// stage finished cleanly, and silently advancing would be the exact
+    /// stale-marker class the Antigravity "ERROR envelope first" rule
+    /// (round-3 notice (c)) exists to prevent. Retryable rather than gated:
+    /// the agent's own final word was success, so the stage is re-driven
+    /// instead of asking an operator to review a stage that already reported
+    /// success.
+    Ambiguous,
 }
 
 impl AgentStatus {
@@ -98,6 +113,7 @@ impl AgentStatus {
             AgentStatus::ResourceKilled => "resource_killed",
             AgentStatus::AgentUnavailable => "agent_unavailable",
             AgentStatus::IdleTimeout => "idle_timeout",
+            AgentStatus::Ambiguous => "ambiguous",
         }
     }
 }
@@ -1620,7 +1636,7 @@ fn last_top_level_antigravity_result(events: &[serde_json::Value]) -> Option<&se
 }
 
 /// The Antigravity counterpart of [`claude_stream_envelope_failure`]: the
-/// CLI's explicit failure report is a Layer-1-decisive `Failed` carrying the
+/// CLI's explicit failure report is a Layer-1-decisive verdict carrying the
 /// CLI's own reason.
 ///
 /// The CLI writes `result.status: "ERROR"` (often with a non-empty
@@ -1628,6 +1644,14 @@ fn last_top_level_antigravity_result(events: &[serde_json::Value]) -> Option<&se
 /// field` when the first turn's schema is wrong). Without this arm, Layer 1
 /// returns `None` and the CLI's explicit reason is lost to Layer 2's coarse
 /// exit-code heuristic (antigravity reviewer notice (c)).
+///
+/// A2 (41-antigravity UAT): the ONE exception to the decisive-`Failed` rule
+/// is a transport-level cancellation (`context canceled` / `context deadline
+/// exceeded`) whose SAME envelope still carries a `DEVFLOW_RESULT` SUCCESS
+/// marker in `result.response` — the agent succeeded but the CLI's context was
+/// torn down before the result could be finalized. That resolves to
+/// [`AgentStatus::Ambiguous`] (re-driven, never advanced, never gated), not
+/// `Failed`.
 fn antigravity_stream_envelope_failure(result_event: &serde_json::Value) -> Option<AgentResult> {
     let result = result_event.get("result")?;
     let status = result.get("status").and_then(serde_json::Value::as_str);
@@ -1641,6 +1665,36 @@ fn antigravity_stream_envelope_failure(result_event: &serde_json::Value) -> Opti
         .map(str::to_string)
         .unwrap_or_else(|| "antigravity reported an error envelope".to_string());
 
+    // A2 (41-antigravity UAT): a transport-level cancellation whose SAME
+    // envelope still carries a SUCCESS marker in `result.response` is an
+    // AMBIGUOUS outcome, not a failure. The agent's own final message
+    // self-reported success, but the CLI's context was torn down before the
+    // result could be finalized. `Failed` would gate a stage whose agent
+    // already succeeded; `Success` would silently advance on a torn envelope
+    // — the exact stale-marker class round-3's "ERROR envelope first" rule
+    // exists to prevent. `Ambiguous` routes to a bounded re-drive (never
+    // advance).
+    if is_antigravity_transport_cancel(error) {
+        let marker = result
+            .get("response")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_marker_lines);
+        if matches!(
+            marker.as_ref().map(|m| m.status),
+            Some(AgentStatus::Success)
+        ) {
+            return Some(AgentResult {
+                status: AgentStatus::Ambiguous,
+                exit_code: None,
+                reason: Some(reason),
+                commits: None,
+                summary: None,
+                verdict: None,
+                decided_by_layer: Some(1),
+            });
+        }
+    }
+
     Some(AgentResult {
         status: AgentStatus::Failed,
         exit_code: None,
@@ -1650,6 +1704,16 @@ fn antigravity_stream_envelope_failure(result_event: &serde_json::Value) -> Opti
         verdict: None,
         decided_by_layer: Some(1),
     })
+}
+
+/// Whether an Antigravity CLI error string is a transport-level cancellation
+/// (Go's `context.Canceled` / `context.DeadlineExceeded`) rather than an
+/// agent-reported or model failure (A2, 41-antigravity UAT).
+fn is_antigravity_transport_cancel(error: Option<&str>) -> bool {
+    matches!(
+        error,
+        Some("context canceled") | Some("context deadline exceeded")
+    )
 }
 
 /// Parse an Antigravity `--input-format stream-json --output-format
@@ -7834,7 +7898,7 @@ mod tests {
     }
 
     /// review consensus #1: `as_wire_str()` must never diverge from the serde
-    /// form for ANY variant — pin it for all seven via a single round-trip
+    /// form for ANY variant — pin it for all eight via a single round-trip
     /// assertion (quotes stripped).
     ///
     /// 31-02: `IdleTimeout` is enumerated here explicitly rather than left to
@@ -7852,6 +7916,7 @@ mod tests {
             AgentStatus::ResourceKilled,
             AgentStatus::AgentUnavailable,
             AgentStatus::IdleTimeout,
+            AgentStatus::Ambiguous,
         ] {
             let serde_form = serde_json::to_string(&variant).unwrap();
             let stripped = serde_form.trim_matches('"');
@@ -8145,6 +8210,14 @@ mod tests {
     const ANTG_RESULT_MARKER_LESS: &str =
         r#"{"event":"result","result":{"status":"SUCCESS","response":"all done, no marker here"}}"#;
     const ANTG_RESULT_ERROR: &str = r#"{"event":"result","result":{"status":"ERROR","response":"","error":"stream input message is missing the \"event\" field"}}"#;
+    // A2 (41-antigravity UAT): the live CLI can emit `status:"ERROR"` with a
+    // transport-cancel `error` even when the agent's own final `response`
+    // still carries a success marker (client-side teardown race). These are
+    // the observed shapes.
+    const ANTG_RESULT_CANCEL_WITH_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n","error":"context canceled"}}"#;
+    const ANTG_RESULT_DEADLINE_WITH_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n","error":"context deadline exceeded"}}"#;
+    const ANTG_RESULT_CANCEL_NO_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"","error":"context canceled"}}"#;
+    const ANTG_RESULT_CANCEL_WITH_FAILED_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"agent refused\"}\n","error":"context canceled"}}"#;
 
     #[test]
     fn antigravity_event_stream_detects_init_only() {
@@ -8211,6 +8284,57 @@ mod tests {
             "the CLI's explicit reason must survive, not be replaced by Layer 2's exit-code heuristic"
         );
         assert_eq!(got.decided_by_layer, Some(1));
+    }
+
+    #[test]
+    fn antigravity_transport_cancel_with_success_marker_is_ambiguous() {
+        // A2 (41-antigravity UAT): the CLI tore the envelope with a transport
+        // cancel, but the SAME envelope's response carries a success marker.
+        // Ambiguous (re-driven), never Success and never a plain Failed gate.
+        for shape in [
+            ANTG_RESULT_CANCEL_WITH_MARKER,
+            ANTG_RESULT_DEADLINE_WITH_MARKER,
+        ] {
+            let capture = format!("{ANTG_INIT}\n{shape}\n");
+            let got = parse_antigravity_event_result(&capture)
+                .expect("transport-cancel envelope must resolve at Layer 1");
+            assert_eq!(got.status, AgentStatus::Ambiguous, "shape: {shape}");
+            assert_eq!(got.decided_by_layer, Some(1));
+        }
+    }
+
+    #[test]
+    fn antigravity_transport_cancel_without_marker_is_failed() {
+        // Transport-cancel WITHOUT a success marker -> plain Failed (unchanged).
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_CANCEL_NO_MARKER}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("transport-cancel without a marker must be a plain Failed");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(got.reason.as_deref(), Some("context canceled"));
+    }
+
+    #[test]
+    fn antigravity_transport_cancel_with_failed_marker_is_failed() {
+        // A transport cancel whose response carries a FAILED (not success)
+        // marker is still Failed — only a SUCCESS marker is ambiguous.
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_CANCEL_WITH_FAILED_MARKER}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("transport-cancel + failed marker must be Failed");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(got.reason.as_deref(), Some("context canceled"));
+    }
+
+    #[test]
+    fn antigravity_real_error_envelope_still_failed() {
+        // A NON-transport-cancel error stays Failed, unchanged by A2.
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_ERROR}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("a real ERROR envelope must be decisive Failed");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(
+            got.reason.as_deref(),
+            Some("stream input message is missing the \"event\" field")
+        );
     }
 
     #[test]

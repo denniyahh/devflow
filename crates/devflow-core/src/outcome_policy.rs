@@ -39,6 +39,12 @@ pub fn decide_action(_stage: Stage, outcome: AgentStatus) -> Action {
     match outcome {
         AgentStatus::Success => Action::Advance,
         AgentStatus::RateLimited => Action::AutoResume,
+        // A2 (41-antigravity UAT): an ambiguous transport-cancel — the agent's
+        // own final message self-reported success but the CLI's envelope was
+        // torn down before finalization — is retried, never advanced and never
+        // gated. Bounded by the same shared infra ceiling as RateLimited (see
+        // `handle_ambiguous_outcome` in the CLI).
+        AgentStatus::Ambiguous => Action::AutoResume,
         AgentStatus::ResourceKilled => Action::GateInfra,
         AgentStatus::AgentUnavailable => Action::GateInfra,
         // DEFERRED (Plan 01 MEDIUM, OpenCode): Failed and Unknown map
@@ -83,6 +89,27 @@ mod tests {
         assert_eq!(
             decide_action(Stage::Code, AgentStatus::RateLimited),
             Action::AutoResume
+        );
+    }
+
+    /// A2 (41-antigravity UAT): an ambiguous transport-cancel resolves to
+    /// auto-resume, never Advance and never a gate — the agent self-reported
+    /// success, so the stage is re-driven rather than reviewed.
+    #[test]
+    fn ambiguous_auto_resumes_never_advances() {
+        assert_eq!(
+            decide_action(Stage::Plan, AgentStatus::Ambiguous),
+            Action::AutoResume
+        );
+        assert_ne!(
+            decide_action(Stage::Plan, AgentStatus::Ambiguous),
+            Action::Advance,
+            "Ambiguous must never advance"
+        );
+        assert_ne!(
+            decide_action(Stage::Plan, AgentStatus::Ambiguous),
+            Action::GateReview,
+            "Ambiguous must never gate for review"
         );
     }
 

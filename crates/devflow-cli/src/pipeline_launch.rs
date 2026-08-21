@@ -1160,6 +1160,50 @@ pub(crate) fn launch_stage(
     launch_stage_inner(state, prompt_override, archived_stage)
 }
 
+/// Route an `Ambiguous` outcome from the PRIMARY advance() monitor loop
+/// (A2, 41-antigravity UAT): the agent's own final message self-reported
+/// success, but the CLI's result envelope was torn down by a transport-level
+/// cancellation (`context canceled` / `context deadline exceeded`). The stage
+/// is RE-DRIVEN — the same stage is relaunched with the same prompt — rather
+/// than gated (the agent already succeeded) or advanced (a torn envelope is
+/// not proof of a clean finish).
+///
+/// Bounded by the same shared `infra_failures` ceiling as
+/// [`handle_rate_limited_outcome`] (D-08's intentional shared infra counter):
+/// once bumping would reach the ceiling, the re-drive stops and the outcome
+/// routes through the infra gate/abort path. Never touches
+/// `consecutive_failures`, and never advances.
+pub(crate) fn handle_ambiguous_outcome(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let projected_infra_failures = state.infra_failures.saturating_add(1);
+    if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
+        return handle_infra_outcome(project_root, state, stage, reason);
+    }
+    state.infra_failures = projected_infra_failures;
+    workflow::save_state(state)?;
+
+    events::emit(
+        project_root,
+        state.phase,
+        "ambiguous_transport_retry",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "infra_failures": state.infra_failures,
+            "reason": reason,
+        }),
+    );
+
+    // Re-drive the SAME stage (never advance): `launch_stage` re-renders the
+    // stage prompt, re-archives the prior (torn) capture, and spawns a fresh
+    // monitor for `state.stage` — unchanged, since this outcome did not
+    // advance. `Some(stage)` names the archived capture correctly.
+    launch_stage(state, None, Some(stage))
+}
+
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
 /// consensus #5). Loads the persisted `.devflow/state-{NN}.json` and
 /// relaunches its saved stage via [`launch_stage`] — unlike `start`, this
@@ -1468,11 +1512,17 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
         // handle_validate_outcome/handle_ship_failure, which would bump
         // consecutive_failures (review consensus #4, D-08).
         Action::GateInfra => handle_infra_outcome(project_root, &mut state, stage, result.reason),
-        // RateLimited: auto-resume via the primary loop's single-agent cron
-        // path (D-09), bounded by the shared infra-failure ceiling (D-08).
-        Action::AutoResume => {
-            handle_rate_limited_outcome(project_root, &mut state, phase, stage, result.reason)
-        }
+        // RateLimited / Ambiguous: auto-resume via the primary loop (D-09 /
+        // A2). RateLimited schedules a cron resume; Ambiguous (a transport
+        // cancel whose own envelope still carried a success marker) re-drives
+        // the SAME stage immediately. Both bounded by the shared
+        // infra-failure ceiling (D-08).
+        Action::AutoResume => match result.status {
+            agent_result::AgentStatus::Ambiguous => {
+                handle_ambiguous_outcome(project_root, &mut state, stage, result.reason)
+            }
+            _ => handle_rate_limited_outcome(project_root, &mut state, phase, stage, result.reason),
+        },
     }
 }
 

@@ -181,7 +181,7 @@ pub(crate) enum ValidateOutcome {
 /// directly unit-testable.
 ///
 /// **The match is exhaustive over the `AgentStatus` position with no wildcard
-/// arm** (D-06, ROADMAP criterion 3). Every one of the seven variants appears by
+/// arm** (D-06, ROADMAP criterion 3). Every one of the eight variants appears by
 /// name, so an eighth is a compile error (E0004) rather than a silent join in
 /// either direction. The ban is POSITIONAL: `_` in the `layer0` or `verdict`
 /// position is fine — only the status position must be enumerated. It is a ban
@@ -262,6 +262,7 @@ pub(crate) fn classify_validate_outcome(result: &agent_result::AgentResult) -> V
             AgentStatus::Failed
             | AgentStatus::Unknown
             | AgentStatus::RateLimited
+            | AgentStatus::Ambiguous
             | AgentStatus::ResourceKilled
             | AgentStatus::AgentUnavailable
             | AgentStatus::IdleTimeout,
