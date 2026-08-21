@@ -29,6 +29,17 @@ phase.
 - [x] **HYG-02**: `check-in-container.sh` passes under root (uid 0) in the pinned container — the 3
   git-env tests that fail as root are fixed (unrelated to the code under test).
 
+### Antigravity Dogfood + Cadence (Phase 42)
+
+- [ ] **ANTG-04**: Antigravity is dogfooded through a real supervised phase run
+  (`devflow start --agent antigravity --phase N --mode supervise`), which unlocks `--mode auto`
+  (C2 preflight gate). During the run, event cadence is measured: the real quiet-gap distribution
+  is compared against the 120s idle-timeout default (`idle_timeout_setting_for` /
+  `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS`), and the default is raised if organic thinking gaps
+  approach or exceed it (Phase 35.1 precedent: one 120s gap killed a healthy run). Any >5m quiet
+  gap that survives confirms the `--print-timeout 60m` override holds end-to-end (closing
+  41-UAT.md test 12's deferred negative control).
+
 ### Hermes
 
 - [ ] **HRMS-01**: Operator can select `--agent hermes` — full `AgentKind` registration.

@@ -61,7 +61,7 @@ by the Phase 40 run — the leaked test monitors (HYG-01) and the container git-
 **Goal**: `devflow start --agent hermes` launches Hermes oneshot (`-z --yolo`) headless and drives a
 stage with honest completion.
 **Depends on**: Nothing (mirrors the existing PiDriver pattern)
-**Requirements**: HRMS-01, HRMS-02, HRMS-03
+**Requirements**: HRMS-01, HRMS-02, HRMS-03, ANTG-04
 **Success Criteria** (what must be TRUE):
 
   1. `--agent hermes` resolves end-to-end (enum / `FromStr` / `driver_for` / `agent_program`).
