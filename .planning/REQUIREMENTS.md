@@ -12,14 +12,33 @@ phase.
 
 ### Antigravity
 
-- [ ] **ANTG-01**: Operator can select `--agent antigravity` — the `AgentKind` variant resolves
+- [x] **ANTG-01**: Operator can select `--agent antigravity` — the `AgentKind` variant resolves
   through FromStr/Display, `driver_for`, and `agent_program`.
 
-- [ ] **ANTG-02**: Antigravity driver launches headless (Claude-style `-p` + stream-json +
+- [x] **ANTG-02**: Antigravity driver launches headless (Claude-style `-p` + stream-json +
   skip-permissions) and passes the shared conformance suite.
 
-- [ ] **ANTG-03**: Antigravity completion/verdict is parsed from the stream (or honest process-exit)
+- [x] **ANTG-03**: Antigravity completion/verdict is parsed from the stream (or honest process-exit)
   — a marker-less run never advances a stage.
+
+### Dogfood Hygiene (Phase 41)
+
+- [x] **HYG-01**: The Phase-7 integration tests reap their own `devflow start` monitors — a full
+  `cargo test` run leaves 0 detached monitor processes (the Phase 40 dogfood leaked 43).
+
+- [x] **HYG-02**: `check-in-container.sh` passes under root (uid 0) in the pinned container — the 3
+  git-env tests that fail as root are fixed (unrelated to the code under test).
+
+### Antigravity Dogfood + Cadence (Phase 42)
+
+- [ ] **ANTG-04**: Antigravity is dogfooded through a real supervised phase run
+  (`devflow start --agent antigravity --phase N --mode supervise`), which unlocks `--mode auto`
+  (C2 preflight gate). During the run, event cadence is measured: the real quiet-gap distribution
+  is compared against the 120s idle-timeout default (`idle_timeout_setting_for` /
+  `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS`), and the default is raised if organic thinking gaps
+  approach or exceed it (Phase 35.1 precedent: one 120s gap killed a healthy run). Any >5m quiet
+  gap that survives confirms the `--print-timeout 60m` override holds end-to-end (closing
+  41-UAT.md test 12's deferred negative control).
 
 ### Hermes
 
@@ -84,9 +103,11 @@ Which phases cover which requirements. Filled during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ANTG-01 | Phase 41 | Pending |
-| ANTG-02 | Phase 41 | Pending |
-| ANTG-03 | Phase 41 | Pending |
+| ANTG-01 | Phase 41 | Complete |
+| ANTG-02 | Phase 41 | Complete |
+| ANTG-03 | Phase 41 | Complete |
+| HYG-01 | Phase 41 | Complete |
+| HYG-02 | Phase 41 | Complete |
 | HRMS-01 | Phase 42 | Pending |
 | HRMS-02 | Phase 42 | Pending |
 | HRMS-03 | Phase 42 | Pending |
@@ -100,8 +121,8 @@ Which phases cover which requirements. Filled during roadmap creation.
 
 **Coverage:**
 
-- v2.8.0 requirements: 13 total
-- Mapped to phases: 13
+- v2.8.0 requirements: 15 total
+- Mapped to phases: 15
 - Unmapped: 0 ✓
 
 ---

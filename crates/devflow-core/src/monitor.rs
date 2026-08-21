@@ -14,7 +14,7 @@
 use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
 use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
-use crate::state::State;
+use crate::state::{AgentKind, State};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -163,16 +163,27 @@ impl IdleTimeoutSetting {
     /// operator supplied is NOT the value in force — the case that must never
     /// pass silently.
     pub fn notice(&self) -> Option<String> {
+        self.notice_for(IDLE_TIMEOUT_ENV)
+    }
+
+    /// [`Self::notice`] named for the SPECIFIC environment variable that
+    /// produced this resolution.
+    ///
+    /// The per-agent idle policy (D-08, round 3) resolves different variables
+    /// per agent; the notice must name the knob the operator actually set, or
+    /// a clamped/typo'd `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` would be
+    /// reported as if `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` were the culprit.
+    pub fn notice_for(&self, env: &str) -> Option<String> {
         match &self.resolution {
             IdleTimeoutResolution::Default | IdleTimeoutResolution::Configured => None,
             IdleTimeoutResolution::Clamped { configured } => Some(format!(
-                "{IDLE_TIMEOUT_ENV}={configured} is below the {IDLE_TIMEOUT_FLOOR_SECS}s floor \
+                "{env}={configured} is below the {IDLE_TIMEOUT_FLOOR_SECS}s floor \
                  and was CLAMPED; {}s is in force. A shorter window kills healthy runs: a 12s \
                  bound terminated a live, healthy run in 2 of 7 measured trials.",
                 self.timeout.as_secs()
             )),
             IdleTimeoutResolution::Unparseable { raw } => Some(format!(
-                "{IDLE_TIMEOUT_ENV}={raw:?} could not be parsed as a whole number of seconds; \
+                "{env}={raw:?} could not be parsed as a whole number of seconds; \
                  the {}s default is in force. If you meant to RAISE the timeout, this did not \
                  do it.",
                 self.timeout.as_secs()
@@ -223,18 +234,28 @@ pub fn parse_idle_timeout_secs(raw: Option<String>) -> IdleTimeoutSetting {
     }
 }
 
-/// The thin environment wrapper over [`parse_idle_timeout_secs`].
+/// The AGENT-SPECIFIC idle-timeout resolution (round-3 D-08, B3).
 ///
-/// The variable name is spelled out as a STRING LITERAL here rather than
-/// passed as [`IDLE_TIMEOUT_ENV`], and that is deliberate.
-/// `doc_check::source_read_env_vars` recognises a variable only when it is read
-/// through a literal inside `std::env::var("...")`; reading it through the
-/// const compiles and works identically but makes the variable INVISIBLE to
-/// the operator-doc parity gate, which would then pass green while the
-/// variable went undocumented. Verified by removing this variable's row from
-/// `OPERATIONS.md` and confirming `doc_check` reddens.
-pub fn idle_timeout_setting() -> IdleTimeoutSetting {
-    parse_idle_timeout_secs(std::env::var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS").ok())
+/// The 120s floor was measured against Claude's stream cadence; applying it
+/// to an unmeasured agent would be a behaviour prediction. The decision is
+/// therefore per-agent and explicit, never a silent inheritance:
+///
+/// - Claude reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` — byte-identical to the
+///   pre-phase-41 behaviour this replaces.
+/// - Antigravity reads `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` with the same
+///   120s floor as a DECIDED starting point (documented in the variable's
+///   OPERATIONS.md row), to be revisited after the first real cadence
+///   measurement.
+///
+/// Both literals are spelled out here so `doc_check` keeps every variable
+/// visible to the operator-doc parity gate (same rule as the single-variable
+/// wrapper above).
+pub fn idle_timeout_setting_for(agent: AgentKind) -> IdleTimeoutSetting {
+    let raw = match agent {
+        AgentKind::Antigravity => std::env::var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS").ok(),
+        _ => std::env::var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS").ok(),
+    };
+    parse_idle_timeout_secs(raw)
 }
 
 /// Which supervision shape [`spawn_monitor`] should launch.
@@ -341,8 +362,8 @@ fn spawn_monitor_inner(
 
         // The adapter's extra env rides down by INHERITANCE here (set via
         // `.envs(...)` on the `__monitor` process below), and that is only
-        // sufficient because the sole adapter routed through this arm —
-        // Claude — declares no extra env at all
+        // sufficient because the adapters routed through this arm — Claude
+        // and Antigravity (round-3) — declare no extra env at all
         // (`codex_disables_signing_via_env_others_do_not` asserts this).
         // Widening this arm to an adapter that DOES set env requires
         // threading it explicitly to `run_pipe_owning_monitor`: the inner
@@ -369,8 +390,15 @@ fn spawn_monitor_inner(
         // failure class this project keeps paying for, so the notice goes to
         // BOTH `tracing::warn!` and stdout — the log for the record, stdout
         // for the human who is watching right now.
-        let idle = idle_timeout_setting();
-        if let Some(notice) = idle.notice() {
+        let idle = idle_timeout_setting_for(state.agent);
+        // The notice names the variable the operator actually set (D-08): the
+        // literal is deliberately spelled here so `doc_check` keeps BOTH
+        // variables visible to the operator-doc parity gate.
+        let idle_env = match state.agent {
+            AgentKind::Antigravity => "DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS",
+            _ => IDLE_TIMEOUT_ENV,
+        };
+        if let Some(notice) = idle.notice_for(idle_env) {
             warn!("{notice}");
             println!("{notice}");
         }
@@ -404,6 +432,8 @@ fn spawn_monitor_inner(
             .arg(prompt_file)
             .arg("--idle-timeout-secs")
             .arg(idle.timeout.as_secs().to_string())
+            .arg("--agent")
+            .arg(state.agent.to_string())
             .arg("--")
             .arg(program)
             .args(args)
@@ -578,7 +608,6 @@ const TERMINAL_TASK_STATUSES: &[&str] = &[
     "error",
 ];
 
-#[derive(Default)]
 pub struct CloseRule {
     marker_seen: bool,
     background_tasks: BackgroundTaskState,
@@ -606,15 +635,63 @@ pub struct CloseRule {
     /// The two signals are ANDed, never substituted: whichever one says work
     /// is pending wins.
     open_tasks: std::collections::HashSet<String>,
+    /// Which event shape carries the `DEVFLOW_RESULT` marker this rule closes
+    /// on — the AGENT-AWARE half of the close rule (round-3 B1).
+    ///
+    /// Claude emits `type: "result"` with a STRING `result` field;
+    /// Antigravity emits `event: "result"` with `result.response`. The
+    /// predicate is selected at construction via [`CloseRule::for_agent`];
+    /// [`Default`] keeps the Claude predicate so every pre-existing
+    /// construction site is unchanged.
+    marker_predicate: fn(&serde_json::Value) -> bool,
+}
+
+impl Default for CloseRule {
+    fn default() -> Self {
+        Self::for_agent(AgentKind::Claude)
+    }
 }
 
 impl CloseRule {
+    /// The close rule for a specific agent.
+    ///
+    /// Selects the marker predicate by agent: Claude keeps
+    /// [`crate::agent_result::event_is_top_level_result_marker`]; Antigravity
+    /// uses [`crate::agent_result::event_is_top_level_antigravity_result_marker`]
+    /// (round-3 B1). Without the agent-aware predicate, an Antigravity stream's
+    /// `event: "result"` object never sets `marker_seen`, stdin is never
+    /// released, and every real stage idle-times-out before its capture is read.
+    ///
+    /// **Vacuously-satisfied drain arms (Antigravity, B1).** The
+    /// `background_tasks` / `open_tasks` arms read `type: "system"` subtypes
+    /// (`background_tasks_changed`, `task_started`, `task_notification`, ...)
+    /// that the Antigravity CLI never emits — its event-key schema has no
+    /// `type` field at all. An Antigravity rule therefore stays at
+    /// `NeverAnnounced` / empty forever and [`CloseRule::should_close`] reduces
+    /// to the marker predicate. This is STATED, not silently inherited: it is a
+    /// documented property of the Antigravity transport, asserted by the
+    /// close-rule tests (close_rule_antigravity_*).
+    pub fn for_agent(agent: AgentKind) -> Self {
+        let marker_predicate = match agent {
+            AgentKind::Antigravity => {
+                crate::agent_result::event_is_top_level_antigravity_result_marker
+            }
+            _ => crate::agent_result::event_is_top_level_result_marker,
+        };
+        Self {
+            marker_seen: false,
+            background_tasks: BackgroundTaskState::NeverAnnounced,
+            open_tasks: std::collections::HashSet::new(),
+            marker_predicate,
+        }
+    }
+
     /// Fold one raw stdout line into the rule.
     pub fn observe(&mut self, line: &str) {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
-        if crate::agent_result::event_is_top_level_result_marker(&event) {
+        if (self.marker_predicate)(&event) {
             self.marker_seen = true;
         }
         if event.get("type").and_then(serde_json::Value::as_str) == Some("system")
@@ -731,9 +808,33 @@ pub fn user_turn_line(prompt: &str) -> String {
     .to_string()
 }
 
+/// The AGENT-AWARE first-turn wire shape for a `--input-format stream-json`
+/// child (round-3 D-02, antigravity notice (b)).
+///
+/// Antigravity's CLI rejects Claude's `{"type":"user",...}` turn — the round-2
+/// live capture records `stream input message is missing the "event" field`
+/// for exactly that shape — so the Antigravity turn is
+/// `{"event":"user","message":{...}}` (the `event`-key schema, matching every
+/// other event the CLI emits). Every other agent keeps today's
+/// [`user_turn_line`] shape; the Claude path is byte-identical.
+pub fn user_turn_line_for(agent: AgentKind, prompt: &str) -> String {
+    match agent {
+        AgentKind::Antigravity => serde_json::json!({
+            "event": "user",
+            "message": { "role": "user", "content": prompt },
+        })
+        .to_string(),
+        _ => user_turn_line(prompt),
+    }
+}
+
 /// Supervise a `stream-json` child, owning both of its pipes, until the close
 /// rule is satisfied and the child exits. Returns the child's exit code, which
 /// is also written to the phase exit file.
+///
+/// Agent-aware transport (round-3): the first turn is written via
+/// [`user_turn_line_for`] and the close rule via [`CloseRule::for_agent`], so
+/// the write/read/close triple matches whichever CLI is being supervised.
 ///
 /// This runs INSIDE the detached `__monitor` process, not in the CLI.
 ///
@@ -764,6 +865,7 @@ pub fn run_pipe_owning_monitor(
     program: &str,
     args: &[String],
     envs: &[(String, String)],
+    agent: AgentKind,
 ) -> Result<i32, MonitorError> {
     let stdout_file = crate::agent_result::stdout_path(project_root, phase);
     let stderr_file = crate::agent_result::stderr_path(project_root, phase);
@@ -817,7 +919,7 @@ pub fn run_pipe_owning_monitor(
         .ok_or(MonitorError::NoChildPipe("stdout"))?;
 
     let (close_tx, close_rx) = mpsc::channel::<()>();
-    let turn = user_turn_line(prompt);
+    let turn = user_turn_line_for(agent, prompt);
     let writer = std::thread::spawn(move || {
         let wrote = child_stdin
             .write_all(turn.as_bytes())
@@ -879,7 +981,7 @@ pub fn run_pipe_owning_monitor(
 
     // Constraint 4's close rule lives in `CloseRule` so it can be unit-tested
     // by feeding it lines, with no child process per case.
-    let mut rule = CloseRule::default();
+    let mut rule = CloseRule::for_agent(agent);
     let mut close_signalled = false;
     let mut idle_extensions: u32 = 0;
 
@@ -1021,10 +1123,14 @@ pub fn run_pipe_owning_monitor(
 /// this repo treats irreversible operations as needing review, not tests.
 ///
 /// Scoped to the `PipeOwning` arm alone: `Legacy` keeps today's behaviour, and
-/// Codex/OpenCode keep theirs. The 120-second floor was measured against
-/// Claude's stream cadence (a fixed 30.00s `tool_progress` keepalive), and
-/// applying it to an agent whose output cadence has never been measured would
-/// be a behaviour prediction — the thing constraint 1 forbids.
+/// Codex/OpenCode/Pi keep theirs. The 120-second floor was measured against
+/// Claude's stream cadence (a fixed 30.00s `tool_progress` keepalive). The
+/// per-agent resolution is explicit, not inherited (round-3 D-08):
+/// [`idle_timeout_setting_for`] reads `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` for
+/// Claude unchanged and `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS` for
+/// Antigravity with the same floor as a DECIDED starting point — revisited
+/// after the first real cadence measurement, never a silent application of an
+/// unmeasured policy (the thing constraint 1 forbids).
 ///
 /// Every step is best-effort and none can abort the sequence. A failure to
 /// enumerate, write, or log must still leave the child terminated and the
@@ -1787,6 +1893,7 @@ exit 0
             "sh",
             &["-c".to_string(), script],
             &[],
+            AgentKind::Claude,
         )
         .expect("pipe-owning monitor should supervise the stub to completion");
 
@@ -1894,6 +2001,7 @@ exit 0
             "sh",
             &["-c".to_string(), silent_stub(true)],
             &[],
+            AgentKind::Claude,
         )
         .expect("the monitor must supervise a backgrounding stub to completion");
 
@@ -1947,6 +2055,7 @@ exit 0
             "sh",
             &["-c".to_string(), script],
             &[],
+            AgentKind::Claude,
         );
 
         assert!(
@@ -1976,6 +2085,7 @@ exit 0
             "sh",
             &["-c".to_string(), silent_stub(false)],
             &[],
+            AgentKind::Claude,
         );
 
         assert!(
@@ -2022,6 +2132,7 @@ exit 0
             "sh",
             &["-c".to_string(), script.to_string()],
             &[],
+            AgentKind::Claude,
         )
         .expect("the monitor must survive a non-UTF-8 byte on the child's stdout");
         assert_eq!(code, 0, "stub should exit cleanly");
@@ -2086,6 +2197,7 @@ exit 0
             "sh",
             &["-c".to_string(), script.to_string()],
             &[],
+            AgentKind::Claude,
         )
         .expect("a slow-exiting child that already reported is not a failure");
 
@@ -2141,6 +2253,7 @@ kill -9 $$
             "sh",
             &["-c".to_string(), script.to_string()],
             &[],
+            AgentKind::Claude,
         )
         .expect("the monitor must reap a signal-killed child");
 
@@ -2692,6 +2805,7 @@ exit 0
             "sh",
             &["-c".to_string(), script.to_string()],
             &[],
+            AgentKind::Claude,
         )
         .expect("a chatty child must be supervised to completion");
         let elapsed = started.elapsed();
@@ -2779,6 +2893,7 @@ sleep 120
             "sh",
             &["-c".to_string(), script.to_string()],
             &[],
+            AgentKind::Claude,
         )
         .expect("a silent child must still produce a supervised outcome");
 
@@ -2902,6 +3017,7 @@ sleep 120
             "sh",
             &["-c".to_string(), script.to_string()],
             &[],
+            AgentKind::Claude,
         )
         .expect("a silent child must still produce a supervised outcome");
 
@@ -2937,5 +3053,258 @@ sleep 120
             reason.contains("NONE of them were rolled back"),
             "reason: {reason}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Agent-aware transport (phase 41, Task 2): user_turn_line_for,
+    // agent-aware CloseRule, per-agent idle timeout. Live Antigravity shapes
+    // per the round-2 review evidence (antigravity-cli 1.1.16).
+    // ------------------------------------------------------------------
+
+    const ANTG_INIT_LINE: &str = r#"{"event":"init","model":"gemini-3.7-flash-high","inputFormat":"stream-json","outputFormat":"stream-json","printTimeout":"60m"}"#;
+    const ANTG_STEP_LINE: &str = r#"{"event":"step_update","index":0,"text_delta":"..."}"#;
+    const ANTG_RESULT_MARKER_LINE: &str = r#"{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n"}}"#;
+
+    #[test]
+    fn user_turn_line_for_antigravity_uses_event_key() {
+        let prompt = "stage prompt with \"quotes\" and\nnewlines";
+        let antg = user_turn_line_for(AgentKind::Antigravity, prompt);
+        let v: serde_json::Value =
+            serde_json::from_str(&antg).expect("antigravity turn must be valid JSON");
+        assert_eq!(
+            v.get("event").and_then(serde_json::Value::as_str),
+            Some("user"),
+            "antigravity first turn is the event-key shape (D-02)"
+        );
+        assert!(
+            v.get("type").is_none(),
+            "no Claude type key may leak into the antigravity turn"
+        );
+        assert_eq!(
+            v.pointer("/message/content")
+                .and_then(serde_json::Value::as_str),
+            Some(prompt),
+            "the prompt survives escaping"
+        );
+
+        // Claude stays byte-identical to the long-standing shape.
+        let claude = user_turn_line_for(AgentKind::Claude, prompt);
+        assert_eq!(
+            claude,
+            user_turn_line(prompt),
+            "Claude must be byte-identical"
+        );
+        let v: serde_json::Value = serde_json::from_str(&claude).unwrap();
+        assert_eq!(
+            v.get("type").and_then(serde_json::Value::as_str),
+            Some("user")
+        );
+        assert!(v.get("event").is_none());
+    }
+
+    #[test]
+    fn close_rule_antigravity_closes_on_event_key_marker() {
+        let mut rule = CloseRule::for_agent(AgentKind::Antigravity);
+        rule.observe(ANTG_INIT_LINE);
+        assert!(!rule.should_close(), "init alone must not close");
+        rule.observe(ANTG_STEP_LINE);
+        assert!(!rule.should_close(), "progress alone must not close");
+        rule.observe(ANTG_RESULT_MARKER_LINE);
+        assert!(
+            rule.should_close(),
+            "event:result with a marker in result.response must close the antigravity stream (B1)"
+        );
+
+        // Claude-shaped lines never satisfy the antigravity rule.
+        let mut rule = CloseRule::for_agent(AgentKind::Antigravity);
+        rule.observe(r#"{"type":"system","subtype":"init","session_id":"s1"}"#);
+        rule.observe(
+            r#"{"type":"result","subtype":"success","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#,
+        );
+        assert!(
+            !rule.should_close(),
+            "a Claude stream must not satisfy the antigravity close rule"
+        );
+
+        // The Claude rule's behaviour is unchanged for Claude input (B1: the
+        // Claude predicate is byte-for-byte what it always was).
+        let mut claude_rule = CloseRule::for_agent(AgentKind::Claude);
+        claude_rule.observe(r#"{"type":"system","subtype":"init","session_id":"s1"}"#);
+        claude_rule.observe(
+            r#"{"type":"result","subtype":"success","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#,
+        );
+        assert!(
+            claude_rule.should_close(),
+            "Claude rule closes on Claude input"
+        );
+    }
+
+    /// B1: for Antigravity the `type:"system"` background-task/open-task drain
+    /// arms are VACUOUSLY satisfied — the CLI never emits a `type` key at all
+    /// — stated here, not silently inherited. The rule reduces to the marker
+    /// predicate, and no Antigravity-shaped input can ever open a task.
+    #[test]
+    fn close_rule_antigravity_drain_arms_vacuously_satisfied() {
+        let mut rule = CloseRule::for_agent(AgentKind::Antigravity);
+        rule.observe(ANTG_INIT_LINE);
+        rule.observe(ANTG_STEP_LINE);
+        assert_eq!(
+            rule.background_tasks,
+            BackgroundTaskState::NeverAnnounced,
+            "Antigravity emits no type:system background_tasks_changed events (stated, B1)"
+        );
+        assert!(
+            rule.open_tasks.is_empty(),
+            "Antigravity emits no type:system per-task events (stated, B1)"
+        );
+        assert!(
+            !rule.has_open_background_tasks(),
+            "no open tasks means the drain arms never block closing"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_setting_for_is_agent_specific() {
+        use std::sync::Mutex;
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        // Baseline: nothing set -> both agents get the decided floor.
+        unsafe {
+            std::env::remove_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS");
+            std::env::remove_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS");
+        }
+        let claude_default = idle_timeout_setting_for(AgentKind::Claude);
+        let antg_default = idle_timeout_setting_for(AgentKind::Antigravity);
+        assert_eq!(
+            claude_default.timeout,
+            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS)
+        );
+        assert_eq!(
+            antg_default.timeout,
+            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS),
+            "the antigravity default is the DECIDED 120s floor (D-08), not inherited \
+             silently — the decision is explicit and documented"
+        );
+
+        // Claude's variable moves Claude, NOT Antigravity.
+        unsafe {
+            std::env::set_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS", "300");
+            std::env::remove_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS");
+        }
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Claude).timeout,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Antigravity).timeout,
+            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS),
+            "Claude's variable must not move Antigravity"
+        );
+
+        // Antigravity's variable moves Antigravity, NOT Claude.
+        unsafe {
+            std::env::set_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS", "240");
+            std::env::remove_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS");
+        }
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Antigravity).timeout,
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            idle_timeout_setting_for(AgentKind::Claude).timeout,
+            Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS),
+            "Antigravity's variable must not move Claude"
+        );
+
+        unsafe {
+            std::env::remove_var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS");
+            std::env::remove_var("DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS");
+        }
+    }
+
+    /// codex-3: the REAL PipeOwning writer path, not just the pure helper —
+    /// spawn a child whose stdin is read and validated. A stub `sh` script
+    /// records its first stdin line, emits the Antigravity stream (init +
+    /// result with marker in `response`), then drains stdin to EOF; the
+    /// monitor writes via `user_turn_line_for(Antigravity, ...)` and closes
+    /// via the agent-aware rule. The recorded line must be the event-key
+    /// shape — an implementation that left the writer on Claude's `type`-form
+    /// FAILS here, not just in the unit helper.
+    #[test]
+    fn pipe_owning_writer_delivers_antigravity_event_key_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let turn_file = root.join("stdin-turn.txt");
+        let eof_file = root.join("stdin-eof");
+        let script = format!(
+            r#"
+set -u
+IFS= read -r turn || {{ echo "NO_INITIAL_TURN_ON_STDIN" >&2; exit 91; }}
+printf '%s\n' "$turn" > '{turn}'
+printf '%s\n' '{{"event":"init","model":"stub","inputFormat":"stream-json","outputFormat":"stream-json"}}'
+printf '%s\n' '{{"event":"result","result":{{"status":"SUCCESS","response":"DEVFLOW_RESULT: {{\"status\":\"success\"}}"}}}}'
+exec 3<&0
+( cat <&3 > /dev/null; printf 'EOF\n' > '{eof}' ) > /dev/null 2>&1 &
+exit 0
+"#,
+            turn = turn_file.display(),
+            eof = eof_file.display(),
+        );
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "the-prompt",
+            Duration::from_secs(30),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+            AgentKind::Antigravity,
+        )
+        .expect("pipe-owning monitor should supervise the antigravity stub");
+
+        assert_eq!(code, 0, "stub exited {code}");
+        // The close rule must have released stdin (B1): the stub's background
+        // drain saw EOF. Without the agent-aware close rule this fails. The
+        // drain runs in a backgrounded subshell, so poll with a bounded wait
+        // (same discipline as the Phase-31 tracer test) rather than asserting
+        // synchronously after the child exits.
+        let mut saw_eof = false;
+        for _ in 0..100 {
+            if eof_file.exists() {
+                saw_eof = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            saw_eof,
+            "stdin was never released — the agent-aware close rule (B1) did not fire"
+        );
+
+        let turn = std::fs::read_to_string(&turn_file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&turn).expect("recorded turn must be JSON");
+        assert_eq!(
+            v.get("event").and_then(serde_json::Value::as_str),
+            Some("user"),
+            "the REAL writer must deliver the event-key turn (codex-3): {turn}"
+        );
+        assert!(v.get("type").is_none(), "no type key: {turn}");
+        assert_eq!(
+            v.pointer("/message/content")
+                .and_then(serde_json::Value::as_str),
+            Some("the-prompt")
+        );
+
+        // The capture round-trips through the antigravity parser.
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        let parsed = crate::agent_result::parse_antigravity_event_result(&capture).unwrap();
+        assert_eq!(parsed.status, crate::agent_result::AgentStatus::Success);
     }
 }

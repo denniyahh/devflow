@@ -11,7 +11,7 @@ use crate::config::GitFlowConfig;
 use crate::git::git_command;
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
-use crate::state::State;
+use crate::state::{AgentKind, State};
 use std::path::{Path, PathBuf};
 
 /// Parsed agent completion result.
@@ -79,6 +79,21 @@ pub enum AgentStatus {
     /// rename for the same reason.
     #[serde(rename = "idle_timeout")]
     IdleTimeout,
+    /// The agent's own final message self-reported success, but the CLI's
+    /// result envelope reports a transport-level cancellation ("context
+    /// canceled" / "context deadline exceeded"). The outcome is AMBIGUOUS:
+    /// the work completed — the success marker is present in
+    /// `result.response` — but the transport was torn down before the result
+    /// could be finalized (A2, 41-antigravity UAT).
+    ///
+    /// Deliberately NOT `Success` (advance): a torn envelope is not proof the
+    /// stage finished cleanly, and silently advancing would be the exact
+    /// stale-marker class the Antigravity "ERROR envelope first" rule
+    /// (round-3 notice (c)) exists to prevent. Retryable rather than gated:
+    /// the agent's own final word was success, so the stage is re-driven
+    /// instead of asking an operator to review a stage that already reported
+    /// success.
+    Ambiguous,
 }
 
 impl AgentStatus {
@@ -98,6 +113,7 @@ impl AgentStatus {
             AgentStatus::ResourceKilled => "resource_killed",
             AgentStatus::AgentUnavailable => "agent_unavailable",
             AgentStatus::IdleTimeout => "idle_timeout",
+            AgentStatus::Ambiguous => "ambiguous",
         }
     }
 }
@@ -1176,17 +1192,53 @@ fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Va
 /// token ever come back?" — and a token returned on an earlier
 /// task-notification turn is a complete answer to it.
 pub fn token_reported_in_capture(capture: &str, token: &str) -> bool {
-    ParsedCapture::parse(capture)
-        .events
-        .iter()
-        .filter(|v| {
-            v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
-        })
-        .any(|v| {
-            v.get("result")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| text.contains(token))
-        })
+    token_reported_in_capture_for(AgentKind::Claude, capture, token)
+}
+
+/// The AGENT-AWARE token-trust predicate: did the planted canary token come
+/// back inside an event the AGENT — not the CLI's prompt echo — authored?
+///
+/// The 30-05 discipline, extended to the Antigravity schema (round-3 D-07/B2).
+/// The raw `contains` on the whole capture is exactly the false-positive shape
+/// 30-05 fixed: the CLI echoes the operator's prompt back into the same stdout
+/// as a user event, so the planted token appears there whether or not anything
+/// was delivered. The trustworthy locations are schema-specific:
+///
+/// - Claude: a top-level `type: "result"` event whose STRING `result` field
+///   contains the token ([`token_reported_in_capture`]).
+/// - Antigravity: a top-level `event: "result"` object whose `result.response`
+///   STRING contains the token — the `result` value is an OBJECT under the
+///   event-key schema, so the Claude filter would never match an
+///   Antigravity-shaped capture and the canary would report `Absent` against a
+///   healthy CLI, refusing every Antigravity launch.
+pub fn token_reported_in_capture_for(agent: AgentKind, capture: &str, token: &str) -> bool {
+    match agent {
+        AgentKind::Antigravity => ParsedCapture::parse(capture)
+            .events
+            .iter()
+            .filter(|v| {
+                v.get("event").and_then(serde_json::Value::as_str) == Some("result")
+                    && is_top_level(v)
+            })
+            .any(|v| {
+                v.get("result")
+                    .and_then(|r| r.get("response"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(token))
+            }),
+        _ => ParsedCapture::parse(capture)
+            .events
+            .iter()
+            .filter(|v| {
+                v.get("type").and_then(serde_json::Value::as_str) == Some("result")
+                    && is_top_level(v)
+            })
+            .any(|v| {
+                v.get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(token))
+            }),
+    }
 }
 
 /// Whether ONE parsed stream event is a top-level `result` carrying a
@@ -1547,6 +1599,217 @@ fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
     held_success
 }
 
+/// Whether parsed JSONL lines are an Antigravity `stream-json` event stream.
+///
+/// Gates on `event: "init"` — the Antigravity event-key schema — and nothing
+/// else. The Antigravity CLI emits one JSON object per line under an `event`
+/// key (`init`, `step_update`, `user`, `result`, ...); the live shape is
+/// `{"event":"init",...}` -> `{"event":"step_update",...}` ->
+/// `{"event":"result","result":{"status":"SUCCESS","response":"..."}}`.
+///
+/// **Why this cannot collide with the other adapters' gates:** Claude's gate
+/// ([`is_claude_event_stream`]) is `type: "system"` + `subtype: "init"`,
+/// Codex's ([`is_codex_event_stream`]) is `type: "thread.started"` /
+/// `turn.*`, and the single-document envelope is a bare `type: "result"`
+/// line. Antigravity events carry `event`, not `type`/`subtype` — the two key
+/// namespaces are disjoint, so an Antigravity capture can never satisfy a
+/// Claude or Codex gate and vice versa (41-CONTEXT D-03, round 3).
+fn is_antigravity_event_stream(events: &[serde_json::Value]) -> bool {
+    events
+        .iter()
+        .any(|v| v.get("event").and_then(serde_json::Value::as_str) == Some("init"))
+}
+
+/// The LAST top-level `event: "result"` object in an Antigravity stream
+/// capture.
+///
+/// The Antigravity counterpart of [`last_top_level_result`], keying on the
+/// event-key schema and the OBJECT-shaped `result` field instead of Claude's
+/// `type: "result"` + string `result`. Same provenance discipline: only
+/// top-level objects are eligible — each value here is one whole JSONL line,
+/// so a `result`-shaped structure the agent writes inside its own message
+/// text is structurally unreachable from this scan.
+fn last_top_level_antigravity_result(events: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    events.iter().rev().find(|v| {
+        v.get("event").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+    })
+}
+
+/// The Antigravity counterpart of [`claude_stream_envelope_failure`]: the
+/// CLI's explicit failure report is a Layer-1-decisive verdict carrying the
+/// CLI's own reason.
+///
+/// The CLI writes `result.status: "ERROR"` (often with a non-empty
+/// `result.error` string, e.g. `stream input message is missing the "event"
+/// field` when the first turn's schema is wrong). Without this arm, Layer 1
+/// returns `None` and the CLI's explicit reason is lost to Layer 2's coarse
+/// exit-code heuristic (antigravity reviewer notice (c)).
+///
+/// A2 (41-antigravity UAT): the ONE exception to the decisive-`Failed` rule
+/// is a transport-level cancellation (`context canceled` / `context deadline
+/// exceeded`) whose SAME envelope still carries a `DEVFLOW_RESULT` SUCCESS
+/// marker in `result.response` — the agent succeeded but the CLI's context was
+/// torn down before the result could be finalized. That resolves to
+/// [`AgentStatus::Ambiguous`] (re-driven, never advanced, never gated), not
+/// `Failed`.
+fn antigravity_stream_envelope_failure(result_event: &serde_json::Value) -> Option<AgentResult> {
+    let result = result_event.get("result")?;
+    let status = result.get("status").and_then(serde_json::Value::as_str);
+    let error = result.get("error").and_then(serde_json::Value::as_str);
+    if status != Some("ERROR") && error.is_none_or(str::is_empty) {
+        return None;
+    }
+
+    let reason = error
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "antigravity reported an error envelope".to_string());
+
+    // A2 (41-antigravity UAT): a transport-level cancellation whose SAME
+    // envelope still carries a SUCCESS marker in `result.response` is an
+    // AMBIGUOUS outcome, not a failure. The agent's own final message
+    // self-reported success, but the CLI's context was torn down before the
+    // result could be finalized. `Failed` would gate a stage whose agent
+    // already succeeded; `Success` would silently advance on a torn envelope
+    // — the exact stale-marker class round-3's "ERROR envelope first" rule
+    // exists to prevent. `Ambiguous` routes to a bounded re-drive (never
+    // advance).
+    if is_antigravity_transport_cancel(error) {
+        let marker = result
+            .get("response")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_marker_lines);
+        if matches!(
+            marker.as_ref().map(|m| m.status),
+            Some(AgentStatus::Success)
+        ) {
+            return Some(AgentResult {
+                status: AgentStatus::Ambiguous,
+                exit_code: None,
+                reason: Some(reason),
+                commits: None,
+                summary: None,
+                verdict: None,
+                decided_by_layer: Some(1),
+            });
+        }
+    }
+
+    Some(AgentResult {
+        status: AgentStatus::Failed,
+        exit_code: None,
+        reason: Some(reason),
+        commits: None,
+        summary: None,
+        verdict: None,
+        decided_by_layer: Some(1),
+    })
+}
+
+/// Whether an Antigravity CLI error string is a transport-level cancellation
+/// (Go's `context.Canceled` / `context.DeadlineExceeded`) rather than an
+/// agent-reported or model failure (A2, 41-antigravity UAT).
+fn is_antigravity_transport_cancel(error: Option<&str>) -> bool {
+    matches!(
+        error,
+        Some("context canceled") | Some("context deadline exceeded")
+    )
+}
+
+/// Parse an Antigravity `--input-format stream-json --output-format
+/// stream-json` JSONL capture and read the `DEVFLOW_RESULT` marker out of its
+/// LAST `event: "result"` object.
+///
+/// The Antigravity counterpart of [`parse_claude_event_result`] — same
+/// contract, agent-specific schema (41-CONTEXT D-03, round-3 re-derivation).
+/// The CLI's live terminal shape is
+/// `{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: ..."}}`
+/// — the `result` value is an OBJECT whose `response` STRING holds the
+/// agent's final message, unlike Claude's string `result` field.
+///
+/// Precedence, per the round-3 plan rather than a new invention:
+///
+/// 1. Format gate ([`is_antigravity_event_stream`]); every other shape
+///    declines here.
+/// 2. Torn-tail guard, identical to the Claude path: a torn JSON line after
+///    the last surviving `result` means the session's REAL final verdict may
+///    be among the casualties — nothing that survives before the tear is
+///    allowed to stand in for it (constraint 9 item 1).
+/// 3. **ERROR envelope first** — `result.status == "ERROR"` or a non-empty
+///    `result.error` string is the CLI's explicit failure report and is
+///    decisive immediately ([`antigravity_stream_envelope_failure`], notice
+///    (c)).
+/// 4. The `DEVFLOW_RESULT` marker in `result.response`. A non-success marker
+///    is the agent's own final word and returns immediately; a success marker
+///    is HELD for the same reason the Claude parser holds it — nothing below
+///    can override it here, so the hold is what survives.
+///
+/// A last `result` with no marker and no ERROR envelope returns `None`
+/// (defer to Layer 2) rather than an unconditional Success, matching the
+/// `turn.completed` convention: a marker-less turn must never silently
+/// advance a stage (ANTG-03).
+pub(crate) fn parse_antigravity_event_result(stdout: &str) -> Option<AgentResult> {
+    let capture = ParsedCapture::parse(stdout);
+    if !is_antigravity_event_stream(&capture.events) {
+        return None;
+    }
+
+    if capture.torn_json_after_last_matching(|v| {
+        v.get("event").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+    }) {
+        return Some(indeterminate_capture_failure());
+    }
+
+    let last_result = last_top_level_antigravity_result(&capture.events)?;
+
+    // ERROR envelope first (antigravity notice (c)): the CLI's explicit
+    // failure report is decisive at Layer 1 — without it the reason is lost
+    // to Layer 2.
+    if let Some(failure) = antigravity_stream_envelope_failure(last_result) {
+        return Some(failure);
+    }
+
+    let marker = last_result
+        .get("result")
+        .and_then(|r| r.get("response"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_marker_lines)
+        .map(normalise_stream_marker_provenance);
+
+    // The marker IS the answer here: a non-success marker is the agent's own
+    // final word (decisive), and a success marker is held — but unlike the
+    // Claude parser, there is nothing AFTER this point that could override a
+    // hold, because the ERROR envelope already ran above. So the function's
+    // value is simply `marker`, and the hold/return split the Claude parser
+    // needs does not exist here.
+    marker
+}
+
+/// Whether ONE parsed Antigravity stream event is a top-level
+/// `event: "result"` carrying a `DEVFLOW_RESULT` marker in its
+/// `result.response` STRING.
+///
+/// The agent-aware CLOSE predicate for the pipe-owning monitor's `CloseRule`
+/// (41-CONTEXT round-3 B1). The Claude close predicate
+/// ([`event_is_top_level_result_marker`]) requires `type: "result"` AND the
+/// `result` field to be a STRING that parses as a marker — Antigravity emits
+/// `event: "result"` with `result` as an OBJECT, so `marker_seen` would never
+/// become true, stdin would never be released, and every real stage would
+/// idle-timeout before its capture was ever read. This predicate keys on the
+/// Antigravity schema instead: `event == "result"`, top-level, and
+/// `result.response` a string that [`parse_marker_lines`] accepts. The Claude
+/// predicate is deliberately unchanged.
+pub(crate) fn event_is_top_level_antigravity_result_marker(event: &serde_json::Value) -> bool {
+    event.get("event").and_then(serde_json::Value::as_str) == Some("result")
+        && is_top_level(event)
+        && event
+            .get("result")
+            .and_then(|r| r.get("response"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_marker_lines)
+            .is_some()
+}
+
 /// The Layer-1 verdict for a stream capture whose TAIL is provably unreadable:
 /// a torn JSON line after the last surviving result (constraint 9 item 1).
 ///
@@ -1864,6 +2127,7 @@ pub fn evaluate_layer1(project_root: &Path, phase: PhaseId) -> Option<AgentResul
         .map(rate_limited_result)
         .or_else(|| detect_claude_envelope_failure(&stdout))
         .or_else(|| parse_claude_event_result(&stdout))
+        .or_else(|| parse_antigravity_event_result(&stdout))
         .or_else(|| parse_devflow_result(&stdout))
         .or_else(|| parse_codex_event_result(&stdout))
         .or_else(|| detect_codex_rate_limit(&stdout).map(rate_limited_result))
@@ -7634,7 +7898,7 @@ mod tests {
     }
 
     /// review consensus #1: `as_wire_str()` must never diverge from the serde
-    /// form for ANY variant — pin it for all seven via a single round-trip
+    /// form for ANY variant — pin it for all eight via a single round-trip
     /// assertion (quotes stripped).
     ///
     /// 31-02: `IdleTimeout` is enumerated here explicitly rather than left to
@@ -7652,6 +7916,7 @@ mod tests {
             AgentStatus::ResourceKilled,
             AgentStatus::AgentUnavailable,
             AgentStatus::IdleTimeout,
+            AgentStatus::Ambiguous,
         ] {
             let serde_form = serde_json::to_string(&variant).unwrap();
             let stripped = serde_form.trim_matches('"');
@@ -7924,5 +8189,213 @@ mod tests {
             "an EMPTY artifact still exists and must yield Some — the control against an \
              implementation that conflates 'absent' with 'no bytes'"
         );
+    }
+    // ------------------------------------------------------------------
+    // Antigravity `stream-json` parser (phase 41, Task 1)
+    // ------------------------------------------------------------------
+    //
+    // Fixtures mirror the LIVE stream shapes from the round-2 review evidence
+    // (antigravity-cli 1.1.16, .planning/reviews/phase-41/review-2/): the CLI
+    // emits one JSON object per line under an `event` key — `init` opens the
+    // stream, `step_update` carries progress deltas, and `result` is the
+    // terminal object whose `result.response` STRING holds the agent's final
+    // message (`result` is an OBJECT, unlike Claude's string `result` field).
+    // Marker payloads are synthetic (no archived capture contains a real
+    // DEVFLOW_RESULT marker); the envelope shapes are the observed ones.
+
+    const ANTG_INIT: &str = r#"{"event":"init","model":"gemini-3.7-flash-high","inputFormat":"stream-json","outputFormat":"stream-json","printTimeout":"60m"}"#;
+    const ANTG_STEP: &str = r#"{"event":"step_update","index":0,"text_delta":"..."}"#;
+    const ANTG_RESULT_MARKER: &str = r#"{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n"}}"#;
+    const ANTG_RESULT_FAILED_MARKER: &str = r#"{"event":"result","result":{"status":"SUCCESS","response":"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"agent refused\"}\n"}}"#;
+    const ANTG_RESULT_MARKER_LESS: &str =
+        r#"{"event":"result","result":{"status":"SUCCESS","response":"all done, no marker here"}}"#;
+    const ANTG_RESULT_ERROR: &str = r#"{"event":"result","result":{"status":"ERROR","response":"","error":"stream input message is missing the \"event\" field"}}"#;
+    // A2 (41-antigravity UAT): the live CLI can emit `status:"ERROR"` with a
+    // transport-cancel `error` even when the agent's own final `response`
+    // still carries a success marker (client-side teardown race). These are
+    // the observed shapes.
+    const ANTG_RESULT_CANCEL_WITH_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n","error":"context canceled"}}"#;
+    const ANTG_RESULT_DEADLINE_WITH_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"success\"}\n","error":"context deadline exceeded"}}"#;
+    const ANTG_RESULT_CANCEL_NO_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"","error":"context canceled"}}"#;
+    const ANTG_RESULT_CANCEL_WITH_FAILED_MARKER: &str = r#"{"event":"result","result":{"status":"ERROR","response":"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"agent refused\"}\n","error":"context canceled"}}"#;
+
+    #[test]
+    fn antigravity_event_stream_detects_init_only() {
+        let init = serde_json::from_str(ANTG_INIT).unwrap();
+        assert!(
+            is_antigravity_event_stream(&[init]),
+            "event-key init opens an antigravity stream"
+        );
+        // Claude framing (type/subtype) and Codex framing (type thread.*) must
+        // NOT satisfy the antigravity gate — disjoint key namespaces (D-03).
+        let claude = serde_json::json!({"type": "system", "subtype": "init", "session_id": "s1"});
+        let codex = serde_json::json!({"type": "thread.started", "thread_id": "t1"});
+        assert!(
+            !is_antigravity_event_stream(&[claude, codex]),
+            "claude/codex shapes must not satisfy the antigravity gate"
+        );
+        assert!(
+            !is_antigravity_event_stream(&[]),
+            "no events is not a stream"
+        );
+        // init mid-stream still counts (the gate is existence, not position).
+        let mid = serde_json::json!({"event": "step_update", "index": 0});
+        let late_init = serde_json::from_str(ANTG_INIT).unwrap();
+        assert!(is_antigravity_event_stream(&[mid, late_init]));
+    }
+
+    #[test]
+    fn antigravity_event_result_extracts_marker_from_live_shape() {
+        let capture = format!("{ANTG_INIT}\n{ANTG_STEP}\n{ANTG_RESULT_MARKER}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("a marker inside result.response must resolve at Layer 1");
+        assert_eq!(got.status, AgentStatus::Success);
+        assert_eq!(
+            got.decided_by_layer,
+            Some(1),
+            "marker provenance must be forced to Layer 1, never agent-supplied"
+        );
+
+        // LAST result wins, mirroring the Claude path.
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_MARKER}\n{ANTG_RESULT_FAILED_MARKER}\n");
+        let got = parse_antigravity_event_result(&capture).expect("last result's marker must win");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(got.reason.as_deref(), Some("agent refused"));
+    }
+
+    #[test]
+    fn antigravity_event_result_marker_less_defers() {
+        let capture = format!("{ANTG_INIT}\n{ANTG_STEP}\n{ANTG_RESULT_MARKER_LESS}\n");
+        assert!(
+            parse_antigravity_event_result(&capture).is_none(),
+            "a marker-less final result must defer to Layer 2, never fabricate Success (ANTG-03)"
+        );
+    }
+
+    #[test]
+    fn antigravity_event_result_error_envelope_survives_layer1() {
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_ERROR}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("the CLI's ERROR envelope must be decisive at Layer 1 (notice (c))");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(
+            got.reason.as_deref(),
+            Some("stream input message is missing the \"event\" field"),
+            "the CLI's explicit reason must survive, not be replaced by Layer 2's exit-code heuristic"
+        );
+        assert_eq!(got.decided_by_layer, Some(1));
+    }
+
+    #[test]
+    fn antigravity_transport_cancel_with_success_marker_is_ambiguous() {
+        // A2 (41-antigravity UAT): the CLI tore the envelope with a transport
+        // cancel, but the SAME envelope's response carries a success marker.
+        // Ambiguous (re-driven), never Success and never a plain Failed gate.
+        for shape in [
+            ANTG_RESULT_CANCEL_WITH_MARKER,
+            ANTG_RESULT_DEADLINE_WITH_MARKER,
+        ] {
+            let capture = format!("{ANTG_INIT}\n{shape}\n");
+            let got = parse_antigravity_event_result(&capture)
+                .expect("transport-cancel envelope must resolve at Layer 1");
+            assert_eq!(got.status, AgentStatus::Ambiguous, "shape: {shape}");
+            assert_eq!(got.decided_by_layer, Some(1));
+        }
+    }
+
+    #[test]
+    fn antigravity_transport_cancel_without_marker_is_failed() {
+        // Transport-cancel WITHOUT a success marker -> plain Failed (unchanged).
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_CANCEL_NO_MARKER}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("transport-cancel without a marker must be a plain Failed");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(got.reason.as_deref(), Some("context canceled"));
+    }
+
+    #[test]
+    fn antigravity_transport_cancel_with_failed_marker_is_failed() {
+        // A transport cancel whose response carries a FAILED (not success)
+        // marker is still Failed — only a SUCCESS marker is ambiguous.
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_CANCEL_WITH_FAILED_MARKER}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("transport-cancel + failed marker must be Failed");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(got.reason.as_deref(), Some("context canceled"));
+    }
+
+    #[test]
+    fn antigravity_real_error_envelope_still_failed() {
+        // A NON-transport-cancel error stays Failed, unchanged by A2.
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_ERROR}\n");
+        let got = parse_antigravity_event_result(&capture)
+            .expect("a real ERROR envelope must be decisive Failed");
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(
+            got.reason.as_deref(),
+            Some("stream input message is missing the \"event\" field")
+        );
+    }
+
+    #[test]
+    fn antigravity_event_marker_close_predicate_discriminates() {
+        let marker_event = serde_json::from_str(ANTG_RESULT_MARKER).unwrap();
+        assert!(
+            event_is_top_level_antigravity_result_marker(&marker_event),
+            "event:result with a marker in result.response must close the antigravity stream (B1)"
+        );
+
+        // Marker-less antigravity result — the transport ran but no marker
+        // arrived: NOT a close (the capture must be read and evaluated).
+        let marker_less = serde_json::from_str(ANTG_RESULT_MARKER_LESS).unwrap();
+        assert!(!event_is_top_level_antigravity_result_marker(&marker_less));
+
+        // Claude-shaped result — disjoint schema, never matches the antigravity
+        // predicate; the Claude predicate is unchanged (the inverse holds).
+        let claude_result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "DEVFLOW_RESULT: {\"status\":\"success\"}"
+        });
+        assert!(!event_is_top_level_antigravity_result_marker(
+            &claude_result
+        ));
+        assert!(
+            event_is_top_level_result_marker(&claude_result),
+            "the Claude close predicate must be untouched by the antigravity work"
+        );
+        assert!(
+            !event_is_top_level_result_marker(&marker_event),
+            "an antigravity-shaped event must not satisfy the Claude close predicate"
+        );
+    }
+
+    #[test]
+    fn antigravity_event_parser_rejects_foreign_shapes() {
+        // Claude stream capture fed to the antigravity parser -> None.
+        let claude_capture = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}\n",
+        );
+        assert!(
+            parse_antigravity_event_result(claude_capture).is_none(),
+            "Claude framing must not be consumed by the antigravity parser"
+        );
+        // Antigravity capture fed to the Claude parser -> None (inverse).
+        let antg_capture = format!("{ANTG_INIT}\n{ANTG_RESULT_MARKER}\n");
+        assert!(
+            parse_claude_event_result(&antg_capture).is_none(),
+            "Antigravity framing must not be consumed by the Claude parser"
+        );
+    }
+
+    #[test]
+    fn antigravity_event_torn_tail_fails_closed() {
+        let capture = format!("{ANTG_INIT}\n{ANTG_RESULT_MARKER}\n{{\"event\":\"result\"");
+        let got = parse_antigravity_event_result(&capture).expect(
+            "a torn tail after the last result must fail closed, not trust the intact prefix",
+        );
+        assert_eq!(got.status, AgentStatus::Failed);
+        assert_eq!(got.decided_by_layer, Some(1));
     }
 }

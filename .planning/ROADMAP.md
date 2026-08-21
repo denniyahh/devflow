@@ -14,7 +14,7 @@ change.
 | Phase | Name | Requirements | Status |
 |---|---|---|---|
 | 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
-| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03 | Not started |
+| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Complete    |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |
@@ -41,24 +41,27 @@ subject: 999.85 (two stale comments, MAINT-01).
 ### Phase 41: Antigravity Driver
 
 **Goal**: `devflow start --agent antigravity` launches the Antigravity CLI headless and drives a
-stage to completion with honest completion detection.
+stage to completion with honest completion detection. Also closes two dogfood-hygiene items surfaced
+by the Phase 40 run — the leaked test monitors (HYG-01) and the container git-env failures (HYG-02).
 **Depends on**: Nothing (mirrors the existing ClaudeDriver pattern)
-**Requirements**: ANTG-01, ANTG-02, ANTG-03
+**Requirements**: ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02
 **Success Criteria** (what must be TRUE):
 
   1. `--agent antigravity` resolves through `AgentKind`/`driver_for`/`agent_program`, and `devflow doctor` reports it installed.
-  2. The driver spawns the vetted `antigravity-cli` (1.1.14) headless with skip-permissions — argv spawn-tested, not assumed.
-  3. A marker-less run never advances a stage (regression test).
+  2. The driver spawns the vetted `agy` wrapper (exec `antigravity-cli` 1.1.16, live at review 2026-08-20) headless via `--input-format stream-json --output-format stream-json --print-timeout 60m` — no `-p` (Go-flag string flag that swallows the next token), `--print-timeout` above the 5m CLI default (F3), skip-permissions injected by the wrapper (D-01), not the driver; argv spawn-tested, not assumed (spawn smoke test).
+  3. A marker-less run never advances a COMMIT-GATED stage without a marker (regression test) — Define legitimately advances on exit 0; the gate fires at the first commit-gated stage (Plan).
   4. The driver passes the shared conformance suite.
+  5. The Phase-7 integration tests reap their own monitors — a full `cargo test` run leaks 0 detached `devflow start` processes (HYG-01).
+  6. `check-in-container.sh` passes from both a git worktree and the main checkout — the in-container failure is the worktree `.git`-file mount (gitdir outside the mount), not uid 0 and not "3 git-env tests under root"; fixed in `check-in-container.sh`, with no test-file changes (HYG-02).
 
-**Plans**: TBD
+**Plans**: 2/2 plans complete (41-01, 41-02)
 
 ### Phase 42: Hermes Driver
 
 **Goal**: `devflow start --agent hermes` launches Hermes oneshot (`-z --yolo`) headless and drives a
 stage with honest completion.
 **Depends on**: Nothing (mirrors the existing PiDriver pattern)
-**Requirements**: HRMS-01, HRMS-02, HRMS-03
+**Requirements**: HRMS-01, HRMS-02, HRMS-03, ANTG-04
 **Success Criteria** (what must be TRUE):
 
   1. `--agent hermes` resolves end-to-end (enum / `FromStr` / `driver_for` / `agent_program`).
@@ -377,6 +380,8 @@ Unsequenced items — not part of the active phase sequence. Promote with
 own `phases/999.N-*/CONTEXT.md`.
 
 ### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (BACKLOG)
+
+**Linear:** [DEN-114](https://linear.app/denniskim/issue/DEN-114)
 
 **Found:** 2026-08-18, attempting `$gsd-plan-phase 40` from a Pi session. The workflow's subagent
 spawns (`gsd-planner`, `gsd-plan-checker`, `gsd-phase-researcher`, …) have no available dispatch

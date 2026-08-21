@@ -1,6 +1,7 @@
 ---
 status: backlog
 source: 2026-08-18 — running `$gsd-plan-phase 40` from a Pi session
+linear: https://linear.app/denniskim/issue/DEN-114
 ---
 
 # Backlog: GSD Subagent Dispatch From the Pi Runtime
