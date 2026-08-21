@@ -14,7 +14,7 @@ change.
 | Phase | Name | Requirements | Status |
 |---|---|---|---|
 | 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
-| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Not started |
+| 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Complete    |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |

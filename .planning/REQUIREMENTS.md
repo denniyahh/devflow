@@ -12,21 +12,21 @@ phase.
 
 ### Antigravity
 
-- [ ] **ANTG-01**: Operator can select `--agent antigravity` — the `AgentKind` variant resolves
+- [x] **ANTG-01**: Operator can select `--agent antigravity` — the `AgentKind` variant resolves
   through FromStr/Display, `driver_for`, and `agent_program`.
 
-- [ ] **ANTG-02**: Antigravity driver launches headless (Claude-style `-p` + stream-json +
+- [x] **ANTG-02**: Antigravity driver launches headless (Claude-style `-p` + stream-json +
   skip-permissions) and passes the shared conformance suite.
 
-- [ ] **ANTG-03**: Antigravity completion/verdict is parsed from the stream (or honest process-exit)
+- [x] **ANTG-03**: Antigravity completion/verdict is parsed from the stream (or honest process-exit)
   — a marker-less run never advances a stage.
 
 ### Dogfood Hygiene (Phase 41)
 
-- [ ] **HYG-01**: The Phase-7 integration tests reap their own `devflow start` monitors — a full
+- [x] **HYG-01**: The Phase-7 integration tests reap their own `devflow start` monitors — a full
   `cargo test` run leaves 0 detached monitor processes (the Phase 40 dogfood leaked 43).
 
-- [ ] **HYG-02**: `check-in-container.sh` passes under root (uid 0) in the pinned container — the 3
+- [x] **HYG-02**: `check-in-container.sh` passes under root (uid 0) in the pinned container — the 3
   git-env tests that fail as root are fixed (unrelated to the code under test).
 
 ### Hermes
@@ -92,11 +92,11 @@ Which phases cover which requirements. Filled during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ANTG-01 | Phase 41 | Pending |
-| ANTG-02 | Phase 41 | Pending |
-| ANTG-03 | Phase 41 | Pending |
-| HYG-01 | Phase 41 | Pending |
-| HYG-02 | Phase 41 | Pending |
+| ANTG-01 | Phase 41 | Complete |
+| ANTG-02 | Phase 41 | Complete |
+| ANTG-03 | Phase 41 | Complete |
+| HYG-01 | Phase 41 | Complete |
+| HYG-02 | Phase 41 | Complete |
 | HRMS-01 | Phase 42 | Pending |
 | HRMS-02 | Phase 42 | Pending |
 | HRMS-03 | Phase 42 | Pending |
