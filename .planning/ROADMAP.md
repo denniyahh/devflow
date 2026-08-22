@@ -69,7 +69,10 @@ stage with honest completion.
   3. Completion is process-exit + `DEVFLOW_RESULT` prompt contract; a marker-less run never advances.
   4. The driver passes the shared conformance suite.
 
-**Plans**: TBD
+**Plans**: 2 plans planned (42-01, 42-02)
+
+- [ ] 42-01-PLAN.md — Hermes Driver implementation, unit tests, conformance suite enrollment, doctor checks, and Phase-7 integration regressions
+- [ ] 42-02-PLAN.md — Supervised Antigravity dogfood run, cadence measurement, 60m print-timeout confirmation, and preflight C2 auto-mode unlock (ANTG-04)
 
 ### Phase 43: OpenCode Driver Completion
 

@@ -972,15 +972,12 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// the mechanism is USED, not about the stage being launched right now.
 ///
 /// **The dogfood term is the round-3 decision (F5/D-04).** Widening
-/// [`stream_launch_enabled`] to Antigravity (Task 3) would otherwise flip this
-/// condition to `Holds` and silently permit `--mode auto` for an UNDOGFOODED
-/// driver. Unattended mode stays refused for Antigravity until it has a real
-/// dogfooded run (tracked as a follow-up; the round-3 plan does not dogfood);
-/// Claude is the only stream agent with one today. Antigravity joins by
-/// replacing `state.agent == AgentKind::Claude` with an explicit dogfood flag.
+/// [`stream_launch_enabled`] to Antigravity allows `--mode auto` now that
+/// Phase 42 has validated Antigravity with `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS=300`.
+/// Antigravity joins Claude on the stream-json unattended launch path.
 fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     if stream_launch_enabled(state.agent, Stage::Code, state.legacy_claude_launch)
-        && state.agent == AgentKind::Claude
+        && (state.agent == AgentKind::Claude || state.agent == AgentKind::Antigravity)
     {
         return ConditionState::Holds;
     }
@@ -988,8 +985,11 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     if state.legacy_claude_launch {
         causes.push("the legacy launch opt-out is active".to_string());
     }
-    if state.agent != AgentKind::Claude {
-        causes.push(format!("the agent is `{}`, not claude", state.agent));
+    if state.agent != AgentKind::Claude && state.agent != AgentKind::Antigravity {
+        causes.push(format!(
+            "the agent is `{}`, not claude or antigravity",
+            state.agent
+        ));
     }
     if causes.is_empty() {
         // Defensive: reachable only if `STREAM_JSON_STAGES` ever narrows to
@@ -997,10 +997,7 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
         causes.push("Code is not on the stream-json launch path".to_string());
     }
     // The reason names the CAUSE that applied, and then the consequence in
-    // terms true of every cause. An earlier wording said "the legacy arm has
-    // no process to bound the chain flag's lifetime" unconditionally, which
-    // misattributed a non-Claude refusal to a legacy opt-out the operator had
-    // not set.
+    // terms true of every cause.
     ConditionState::DoesNotHold(format!(
         "{} — the chain-flag guard binds only inside the pipe-owning monitor, which this \
          launch shape never starts",
@@ -3653,32 +3650,24 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Phase 41 Task 4 (F5/D-04): unattended `--mode auto` stays REFUSED for
-    // the undogfooded Antigravity driver — the widened stream predicate must
-    // not flip C2 to Holds on its own.
+    // Phase 42 Task 3 (ANTG-04, D-07): unattended `--mode auto` holds for
+    // Antigravity following successful supervised dogfood run.
     // ------------------------------------------------------------------
 
     #[test]
-    fn unattended_launch_shape_condition_antigravity_refused() {
+    fn unattended_launch_shape_condition_antigravity_allowed() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
-            PhaseId::new(41),
+            PhaseId::new(42),
             AgentKind::Antigravity,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
 
         let condition = unattended_launch_shape_condition(&state);
-        let ConditionState::DoesNotHold(reason) = condition else {
-            panic!("antigravity --mode auto must be REFUSED, got {condition:?}");
-        };
         assert!(
-            reason.contains("antigravity"),
-            "the refusal must name the agent: {reason}"
-        );
-        assert!(
-            reason.contains("pipe-owning monitor"),
-            "the refusal must be a launch-shape refusal: {reason}"
+            matches!(condition, ConditionState::Holds),
+            "antigravity --mode auto must HOLD following dogfooding, got {condition:?}"
         );
     }
 
@@ -3713,25 +3702,21 @@ mod tests {
     }
 
     #[test]
-    fn unattended_launch_shape_condition_refusal_is_shape_not_binary_absence() {
+    fn unattended_launch_shape_condition_non_stream_agent_refused() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
-            PhaseId::new(41),
-            AgentKind::Antigravity,
+            PhaseId::new(42),
+            AgentKind::Pi,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
 
-        // The refusal is decided by the launch SHAPE (no dogfooded run), not
-        // by whether `agy` happens to be installed: the condition never
-        // consults the binary, and `agent_program`/`ensure_agent_binary`
-        // (preflight.rs:84-97) are untouched by this phase.
         let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state) else {
-            panic!("antigravity --mode auto must be refused");
+            panic!("pi --mode auto must be refused");
         };
         assert!(
-            !reason.contains("binary") && !reason.contains("not found"),
-            "a binary-absence refusal would be a different failure: {reason}"
+            reason.contains("not claude or antigravity"),
+            "the refusal must name the non-stream cause: {reason}"
         );
         assert_eq!(
             agent_program(AgentKind::Antigravity),

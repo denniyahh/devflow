@@ -1785,3 +1785,153 @@ fn unguarded_monitor_is_detected_by_the_registry() {
     // Clean up through the normal guard: verified reap + deregister.
     let _reap = MonitorReapGuard::after_launch(&state);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 42 Task 4 (HRMS-03, D-03): Hermes transport integration tests.
+// ---------------------------------------------------------------------------
+
+fn hermes_stub(launch: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf 'hermes 0.5.0\n'
+    exit 0
+fi
+if [ "$1" = "tools" ] && [ "$2" = "list" ]; then
+    printf 'Available Toolsets:\n  ✓ enabled delegation 👥 Task Delegation\n  ✓ enabled terminal 💻 Terminal Execution\n'
+    exit 0
+fi
+{launch}
+"#
+    )
+}
+
+/// HRMS-03: a stubbed `hermes` that exits 0 with no marker must not advance a
+/// commit-gated stage. Define advances on exit 0; Plan gates.
+#[test]
+fn hermes_marker_less_run_does_not_advance() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "hermes",
+        &hermes_stub("printf 'fake hermes, no marker\\n'\nexit 0\n"),
+    )]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "hermes",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let state = wait_for_gate(root, PhaseId::new(7));
+    assert_eq!(
+        state.stage,
+        Stage::Plan,
+        "a marker-less hermes run must not advance past the commit-gated Plan stage"
+    );
+    assert!(state.gate_pending, "the never-silent gate must have fired");
+    let _reap = MonitorReapGuard::after_launch(&state);
+}
+
+/// HRMS-03: a Hermes run that exits non-zero must not advance its stage.
+#[test]
+fn hermes_nonzero_exit_does_not_advance() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "hermes",
+        &hermes_stub("printf 'fake hermes error\\n'\nexit 1\n"),
+    )]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "hermes",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let state = wait_for_gate(root, PhaseId::new(7));
+    assert_eq!(
+        state.stage,
+        Stage::Define,
+        "a non-zero-exit hermes run must not advance its stage"
+    );
+    assert!(state.gate_pending, "the never-silent gate must have fired");
+    let _reap = MonitorReapGuard::after_launch(&state);
+}
+
+/// HRMS-03: a hung Hermes process is detected as alive by monitor liveness,
+/// does not falsely advance, and gates when killed.
+#[test]
+fn hermes_hung_process_is_detected_not_left_running() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub("exec sleep 30\n"))]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "07",
+            "--agent",
+            "hermes",
+            "--mode",
+            "supervise",
+        ],
+    );
+
+    let pid_path = root.join(".devflow/phase-07-agent-pid");
+    let pid = wait_for_pid(&pid_path);
+
+    assert!(
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "the hung hermes process must still be alive"
+    );
+    let state = load_state(root, PhaseId::new(7)).expect("load state");
+    assert_eq!(
+        state.stage,
+        Stage::Define,
+        "the stage must not advance while hermes is hung"
+    );
+
+    assert!(
+        Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "should be able to kill the hung hermes process"
+    );
+    let gated = wait_for_gate(root, PhaseId::new(7));
+    assert_eq!(
+        gated.stage,
+        Stage::Define,
+        "a hung-then-killed hermes run must not advance its stage"
+    );
+    let _reap = MonitorReapGuard::after_launch(&gated);
+}
