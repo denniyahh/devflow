@@ -35,6 +35,35 @@ unset $(git rev-parse --local-env-vars) \
       GIT_NAMESPACE GIT_DISCOVERY_ACROSS_FILESYSTEM \
       GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 
+PUSH_LINES=()
+while read -r line; do
+    [ -n "$line" ] && PUSH_LINES+=("$line")
+done
+
+# ---------------------------------------------------------------------------
+# Branch hygiene policy: non-workspace branches (main, develop, feature/*,
+# fix/*, chore/*, release/*) must never carry personal agent setups, planning
+# state, or local databases.
+# ---------------------------------------------------------------------------
+for line in "${PUSH_LINES[@]}"; do
+    read -r local_ref local_sha remote_ref _remote_sha <<< "$line"
+    [ -z "${local_ref:-}" ] && continue
+    case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+
+    case "$remote_ref" in
+        refs/heads/develop | refs/heads/main | refs/heads/feature/* | refs/heads/fix/* | refs/heads/chore/* | refs/heads/release/*)
+            forbidden="$(git ls-tree -r --name-only "$local_sha" 2>/dev/null | grep -E '^(\.agents|\.bg-shell|\.claude|\.codex|\.gemini|\.omx|\.opencode|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.planning|\.devflow)' || true)"
+            if [ -n "$forbidden" ]; then
+                echo "pre-push: REFUSING to push personal/agent artifacts to '$remote_ref':" >&2
+                echo "$forbidden" | head -10 | sed 's/^/  /' >&2
+                echo "  Personal agent configurations, planning files, and local state belong exclusively" >&2
+                echo "  on 'workspace/<handle>' branches. Remove them before pushing to '$remote_ref'." >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
 # ---------------------------------------------------------------------------
 # Release-signing policy: a tag or a `main` push must carry the maintainer's
 # key, never the agent's.
@@ -69,7 +98,8 @@ if [ -n "$RELEASE_KEY" ]; then
     # git feeds the pre-push hook one line per ref on stdin:
     #   <local ref> <local sha> <remote ref> <remote sha>
     # A deletion has an all-zero local sha and is never a signing concern.
-    while read -r local_ref local_sha remote_ref _remote_sha; do
+    for line in "${PUSH_LINES[@]}"; do
+        read -r local_ref local_sha remote_ref _remote_sha <<< "$line"
         [ -z "${local_ref:-}" ] && continue
         case "$local_sha" in *[!0]*) ;; *) continue ;; esac
 

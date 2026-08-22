@@ -137,3 +137,18 @@ fn policy_is_opt_in_by_config_and_has_no_override_escape_hatch() {
         );
     }
 }
+
+/// Personal development artifacts (.agents, .codex, .claude, .planning, .gsd, etc.)
+/// must be rejected by pre-push on shared upstream branches (develop, main, feature/*).
+#[test]
+fn pre_push_guards_against_personal_artifacts_on_clean_branches() {
+    let source = hook();
+    assert!(
+        source.contains("git ls-tree -r --name-only") && source.contains("refs/heads/develop"),
+        "pre-push must inspect commit trees and forbid personal artifacts on develop/main/feature branches"
+    );
+    assert!(
+        source.contains(".planning") && source.contains(".codex") && source.contains(".claude"),
+        "pre-push forbidden artifact regex must cover .planning, .codex, and .claude"
+    );
+}
