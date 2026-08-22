@@ -71,14 +71,14 @@ When a GSD command covers the task, **use it** — `/gsd:phase` to add or edit a
 `/gsd:progress --next` to decide what comes next. Doing the same work by hand is the exception,
 not the default, and it needs a stated reason.
 
-This project *is* a workflow tool; hand-editing `.planning/` behind GSD's back is how STATE.md and
+This project *is* a workflow tool; hand-editing `.gsd/` behind GSD's back is how STATE.md and
 ROADMAP.md drift from what the tooling believes, and the drift is invisible until something
 downstream reads the stale value.
 
 Legitimate reasons to bypass, all of which should be said out loud rather than assumed:
 
 - The command is known-broken for this case, and the defect is recorded in
-  `.planning/UPSTREAM-GSD-ISSUES.md`.
+  `.gsd/UPSTREAM-GSD-ISSUES.md`.
 - The command produced a wrong result that needs correcting by hand afterwards — record what it
   got wrong (e.g. `phase.add` files the new entry at the document's last `---`, which lands it in
   archived prose on this roadmap; the entry then has to be moved).
@@ -131,11 +131,11 @@ root-cause history.
 
 ## Where the upstream GSD issue ledger lives
 
-`.planning/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
+`.gsd/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
 sibling `gsd-core-personal-workspace` checkout:
 
 ```
-.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md
+.gsd/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md
 ```
 
 File new GSD-core defects there, not in a new file here. If the path reads as missing, the
@@ -149,7 +149,7 @@ clone without a `gsd-core` sibling, the link dangles and the test panics.
 
 ## Keep DEV-SETUP-CHECKLIST.md in sync
 
-`.planning/DEV-SETUP-CHECKLIST.md` exists so this repo's dev setup — git policy, hooks, CI,
+`.gsd/DEV-SETUP-CHECKLIST.md` exists so this repo's dev setup — git policy, hooks, CI,
 devcontainer/toolchain pins, GSD config — can be replicated on another project. When a commit
 touches any of those, update the checklist in the **same commit**, not as an afterthought.
 
