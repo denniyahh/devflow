@@ -1,19 +1,22 @@
-## Description
+## Conventional Title Format
+<!-- PR Title must follow Conventional Commits: <type>(<scope>): <short description> -->
+<!-- Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert, release -->
 
-<!-- What does this PR do? -->
+## Summary
+<!-- What does this PR change and why? -->
 
 ## Changes
+- <!-- Bullet list of key modifications -->
 
-<!-- Brief summary of changes -->
+## Motivation & Context
+<!-- Why is this change necessary? What problem does it solve? -->
 
-## Checklist
+## Verification & Testing
+- [ ] Automated tests pass (`cargo test` / `scripts/check.sh test`)
+- [ ] Clippy checks pass (`scripts/check.sh clippy`)
+- [ ] Formatting is clean (`scripts/check.sh fmt`)
+- [ ] Negative controls / failure modes verified (if applicable)
 
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` is clean
-- [ ] `cargo fmt` applied
-- [ ] All public items documented
-- [ ] No `unwrap()` in library code
+## Related Issues & Planning
+<!-- Closes #123, refs phase-NN, etc. -->
 
-## Related
-
-<!-- Link to issues, design docs, etc. -->

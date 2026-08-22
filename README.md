@@ -3,7 +3,6 @@
 **An opinionated take on AI-driven development — not a universal agent platform, just the workflow that actually holds up under real, unattended use.**
 
 [![CI](https://github.com/denniyahh/devflow/actions/workflows/ci.yml/badge.svg)](https://github.com/denniyahh/devflow/actions/workflows/ci.yml)
-[![Website](https://img.shields.io/website?up_message=online&down_message=down&url=https://denniyahh.github.io/devflow)](https://denniyahh.github.io/devflow)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 

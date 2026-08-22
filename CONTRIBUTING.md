@@ -35,6 +35,10 @@ Two things this hook does that are load-bearing:
   hooks directory wholesale, so without that shim the command above would
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
+- [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) enforces Conventional
+  Commit formats (`feat:`, `fix:`, `chore:`, etc.) on every commit subject and
+  warns if the subject exceeds 72 characters, keeping git history and automated
+  changelog generation clean.
 - [`scripts/hooks/post-commit`](scripts/hooks/post-commit) warns when a commit
   lands a plan `*-SUMMARY.md` while `.planning/STATE.md`'s authored prose still
   describes an earlier wave. It only warns — it never edits a tracked file, so
@@ -399,15 +403,14 @@ to build the autwicky-scaffolded MkDocs wiki and push to `gh-pages`).
 
 ## Commit Conventions
 
-DevFlow uses [Conventional Commits](https://www.conventionalcommits.org/):
-`type(scope): description`, imperative mood, no period at the end.
+DevFlow strictly enforces [Conventional Commits](https://www.conventionalcommits.org/):
+`type(scope): description`, imperative mood, lowercase description, no period at the end.
 
-Common types in this repo: `feat`, `fix`, `docs`, `test`, `ci`, `chore`,
-`refactor`. Scope is typically a crate/module (`cli`, `core`) or a phase/plan
-identifier (`15-05`, `phase-15`). Phase 11's per-phase branching/merge scheme
-(feature branches completed through the gate-driven Ship flow) works alongside
-Conventional Commits, not as a replacement for it — every commit in this
-project's own history follows the format.
+- **Allowed types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`, `release`, `merge`, `sync`.
+- **Breaking changes:** Add `!` before the colon, e.g. `feat(api)!: change default timeout`.
+- **Enforcement (enforced locally via hook):** [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) automatically validates every commit message on commit creation when `git config core.hooksPath scripts/hooks` is configured.
+- **Automated SemVer & Changelog:** Commits authored with Conventional Commits allow [`scripts/cut-release.sh`](scripts/cut-release.sh) and DevFlow's version engine to automatically calculate the next SemVer bump and draft release notes.
+
 
 ## Logging Conventions
 
