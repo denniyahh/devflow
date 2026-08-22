@@ -24,11 +24,12 @@ set -uo pipefail
 
 # `git show` (rather than diff-tree) so a root commit still reports its files.
 changed=$(git show --pretty=format: --name-only HEAD 2>/dev/null) || changed=""
-summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/.*SUMMARY\.md$' || true)
+summaries=$(printf '%s\n' "$changed" | grep -E '^(\.planning|\.gsd)/phases/.*SUMMARY\.md$' || true)
 
 if [ -n "$summaries" ]; then
   root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
-  state="$root/.planning/STATE.md"
+  state="$root/.gsd/STATE.md"
+  [ -f "$state" ] || state="$root/.planning/STATE.md"
   status_line=$(grep -m1 '^status:' "$state" 2>/dev/null || echo 'status: <unreadable>')
   updated=$(grep -m1 '^last_updated:' "$state" 2>/dev/null || echo 'last_updated: <absent>')
 
@@ -67,7 +68,7 @@ fi
 # Warn when a "how this repo is set up" file changes without the portability
 # checklist moving too.
 #
-# .planning/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
+# .gsd/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
 # replicated elsewhere; it goes stale the same silent way STATE.md does above
 # — nothing else reads it, so drift is invisible until someone tries to
 # actually follow it on a new machine. Unlike the SUMMARY.md signal above,
@@ -79,20 +80,20 @@ fi
 # same reasoning as the STATE.md check above (a hook silently editing a
 # tracked file mid-commit is worse than the staleness it would fix).
 setup_changed=$(printf '%s\n' "$changed" | grep -E \
-  '^(\.gitconfig|CONTRIBUTING\.md|rust-toolchain\.toml|\.planning/config\.json)$|^scripts/hooks/|^\.github/(workflows/|PULL_REQUEST_TEMPLATE\.md|ISSUE_TEMPLATE/)|^\.devcontainer/|^scripts/(check\.sh|check-in-container\.sh|assert-image-parity\.sh)$' \
+  '^(\.gitconfig|CONTRIBUTING\.md|rust-toolchain\.toml|(\.planning|\.gsd)/(config\.json|PREFERENCES\.md))$|^scripts/hooks/|^\.github/(workflows/|PULL_REQUEST_TEMPLATE\.md|ISSUE_TEMPLATE/)|^\.devcontainer/|^scripts/(check\.sh|check-in-container\.sh|assert-image-parity\.sh)$' \
   || true)
-checklist_changed=$(printf '%s\n' "$changed" | grep -Fx '.planning/DEV-SETUP-CHECKLIST.md' || true)
+checklist_changed=$(printf '%s\n' "$changed" | grep -E '^(\.planning|\.gsd)/DEV-SETUP-CHECKLIST\.md$' || true)
 
 if [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
   {
     printf '\n\033[33m── DEV-SETUP-CHECKLIST.md may now be stale ──\033[0m\n'
     printf 'This commit touched setup file(s) but not the checklist:\n'
     printf '  %s\n' $setup_changed
-    printf 'Review .planning/DEV-SETUP-CHECKLIST.md and update it if this changes what a fresh replication needs.\n\n'
+    printf 'Review .gsd/DEV-SETUP-CHECKLIST.md and update it if this changes what a fresh replication needs.\n\n'
   } >&2
 fi
 
-# Restore .planning/UPSTREAM-GSD-ISSUES.md if it has gone missing.
+# Restore .gsd/UPSTREAM-GSD-ISSUES.md if it has gone missing.
 #
 # That path is a symlink into the sibling gsd-core-personal-workspace checkout,
 # where the ledger is
@@ -114,13 +115,16 @@ fi
 # resolve the root independently rather than reaching for a variable that is
 # unset on every commit that lands no summary.
 gsd_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
-gsd_link="$gsd_root/.planning/UPSTREAM-GSD-ISSUES.md"
-gsd_target="../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md"
-if [ ! -e "$gsd_link" ] && [ -e "$gsd_root/.planning/$gsd_target" ]; then
-  if ln -sfn "$gsd_target" "$gsd_link" 2>/dev/null; then
-    printf '\033[33mpost-commit:\033[0m restored .planning/UPSTREAM-GSD-ISSUES.md symlink\n' >&2
+for pdir in "$gsd_root/.gsd" "$gsd_root/.planning"; do
+  [ -d "$pdir" ] || continue
+  gsd_link="$pdir/UPSTREAM-GSD-ISSUES.md"
+  gsd_target="../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md"
+  if [ ! -e "$gsd_link" ] && [ -e "$pdir/$gsd_target" ]; then
+    if ln -sfn "$gsd_target" "$gsd_link" 2>/dev/null; then
+      printf '\033[33mpost-commit:\033[0m restored %s/UPSTREAM-GSD-ISSUES.md symlink\n' "$(basename "$pdir")" >&2
+    fi
   fi
-fi
+done
 
 # Chain to whatever post-commit was active before core.hooksPath displaced it,
 # matching the pre-commit hook's delegation rather than shadowing silently.
