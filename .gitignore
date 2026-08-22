@@ -26,6 +26,18 @@ CLAUDE.md
 skills/
 skills-lock.json
 
+# Agent ephemeral runtime state and caches
+**/.claude/scheduled_tasks.lock
+**/.claude/scheduled_tasks.json
+**/.claude/routines/.state/
+**/.claude/worktrees/
+**/.claude/checkpoints/
+**/.claude/mailbox/
+**/.claude/agent-registry.json
+**/.claude/agent-memory-local
+**/.claude/first-run
+**/.claude/assistant-daemon-state.json
+
 # Planning, runtime states, and local databases
 .gsd/
 .gsd-backups/
