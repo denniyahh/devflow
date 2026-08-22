@@ -13,13 +13,37 @@ site/
 .DS_Store
 Thumbs.db
 
-# Agent runtimes (local state, not project code)
-.omx/
-.claude/*
-!.claude/skills/
-!.claude/skills/**
-.opencode/
+# Agent runtimes, skills, and personal workspace configurations
+.agents/
+.bg-shell/
+.claude/
+.codex/
 .gemini/
+.omx/
+.opencode/
+CLAUDE.md
+.mcp.json
+skills/
+skills-lock.json
+
+# Agent ephemeral runtime state and caches
+**/.claude/scheduled_tasks.lock
+**/.claude/scheduled_tasks.json
+**/.claude/routines/.state/
+**/.claude/worktrees/
+**/.claude/checkpoints/
+**/.claude/mailbox/
+**/.claude/agent-registry.json
+**/.claude/agent-memory-local
+**/.claude/first-run
+**/.claude/assistant-daemon-state.json
+
+# Planning, runtime states, and local databases
+.gsd/
+.gsd-backups/
+.gsd-id
+.gsd-worktrees/
+.planning/
 
 # DevFlow own state (dogfooding) — per-phase since the 14a refactor
 .devflow/state.json
@@ -37,24 +61,6 @@ Thumbs.db
 
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
 .worktrees/
-.codex/*
-!.codex/agents/
-!.codex/agents/**
-!.codex/skills/
-!.codex/skills/**
-.codex/skills/.system/**
-!.codex/prompts/
-!.codex/prompts/**
 
-# Tracked in the gsd-core repo; symlinked here for convenience
-.planning/UPSTREAM-GSD-ISSUES.md
-
-# Bytecode cache from importing the Phase 30 experiment harnesses under .planning/
+# Bytecode cache
 __pycache__/
-
-# MemPalace capture staging. Artifacts are copied here so `mempalace mine`'s
-# detect_room() can assign a room from the folder path. The directory must PERSIST
-# rather than be cleaned up: mine's idempotency keys on absolute source_file + mtime,
-# so deleting it makes every re-run re-file duplicate drawers. Ignored so it cannot be
-# swept into an unrelated commit by a blanket `git add -A`.
-.planning/.mempalace-stage/

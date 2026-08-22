@@ -71,3 +71,11 @@
 	hotfix = hotfix/
 	support = support/
 	versiontag = v
+
+[alias]
+	# Start a clean feature branch in an isolated worktree
+	feature-start = "!f() { git worktree add .worktrees/$1 -b feature/$1 develop; }; f"
+	# Remove a merged feature worktree
+	feature-done = "!f() { git worktree remove .worktrees/$1 && git branch -d feature/$1; }; f"
+	# Sync upstream code into current workspace branch
+	workspace-sync = "!./scripts/sync-workspace.sh"

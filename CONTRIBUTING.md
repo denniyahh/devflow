@@ -35,6 +35,10 @@ Two things this hook does that are load-bearing:
   hooks directory wholesale, so without that shim the command above would
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
+- [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) enforces Conventional
+  Commit formats (`feat:`, `fix:`, `chore:`, etc.) on every commit subject and
+  warns if the subject exceeds 72 characters, keeping git history and automated
+  changelog generation clean.
 - [`scripts/hooks/post-commit`](scripts/hooks/post-commit) warns when a commit
   lands a plan `*-SUMMARY.md` while `.planning/STATE.md`'s authored prose still
   describes an earlier wave. It only warns — it never edits a tracked file, so
@@ -151,13 +155,65 @@ git config tag.gpgsign false
 See [§ AI Change Acceptance](#ai-change-acceptance) for what a test must
 demonstrate to be accepted, and which test shapes are rejected outright.
 
-## Phase Plans (`.planning/`)
+## Workspace Architecture & Branching Strategy
 
-DevFlow drives agents from per-phase plans under `.planning/`. The launch prompt
-(`crate::prompt::stage_prompt(stage, phase)`) reads `.planning/ROADMAP.md` and
-`.planning/phases/NN-*/CONTEXT.md`, so these files are tracked in the repo — they
-are DevFlow's phase-plan convention, not private scratch. When adding a phase,
-commit its `CONTEXT.md` so agents (and reviewers) can read the plan.
+DevFlow uses a **Dual-Tier Workspace Architecture** to keep shared branches clean, contributor-friendly, and reproducible, while allowing maintainers and AI agent operators to version-control their personal workflows, prompts, and planning databases.
+
+```mermaid
+gitGraph
+   commit id: "v2.9.0"
+   branch develop
+   checkout develop
+   commit id: "feature-code"
+   branch "workspace/contributor"
+   checkout "workspace/contributor"
+   commit id: "agent-prompts-and-gsd"
+   checkout develop
+   commit id: "upstream-fix"
+   checkout "workspace/contributor"
+   merge develop id: "sync-code"
+```
+
+### 1. Shared Clean Base (`main`, `develop`, `feature/*`)
+The default shared branches contain **only** source code, tests, documentation, and the baseline development container. They are kept strictly free of personal AI agent configs, prompts, local SQLite planning databases, and machine-specific MCP tool definitions.
+
+- **Pre-commit & Pre-push guards (enforced)**: `scripts/hooks/pre-commit` and `scripts/hooks/pre-push` actively refuse commits and pushes that contain personal artifacts (`.agents/`, `.codex/`, `.claude/`, `.planning/`, `.gsd/`, `.mcp.json`, `CLAUDE.md`, `skills/`) on any non-workspace branch.
+
+### 2. Personal Workspace Branches (`workspace/<handle>`)
+If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom MCP servers, or local workflow planners (GSD), keep them versioned on a personal workspace branch:
+
+- Name your branch after your GitHub handle (e.g. `workspace/<handle>` or `personal/<handle>`).
+- You can commit your agent definitions, custom prompts, skills, and planning dossiers to your workspace branch and push it to GitHub so your environment is accessible anywhere.
+
+### Contributor Workflows
+
+#### Workflow A: Standard Code Contributions (No AI tooling required)
+1. Fork and clone the repository.
+2. Cut a feature branch from `develop`:
+   ```bash
+   git checkout -b feature/my-feature develop
+   # or with tracked alias: git feature-start my-feature
+   ```
+3. Implement changes, add regression tests, and run `cargo test`.
+4. Submit a PR against `develop`.
+
+#### Workflow B: AI-Driven & Agent Workspace Contributions
+1. Keep your primary orchestrator/agent checkout on your personal workspace branch (`workspace/<handle>`).
+2. When creating code to submit upstream, develop inside a clean worktree branched from `develop`:
+   ```bash
+   git worktree add .worktrees/my-feature -b feature/my-feature develop
+   # or with tracked alias: git feature-start my-feature
+   ```
+3. Commit only source, test, and documentation changes in the feature worktree.
+4. Submit the PR from `feature/my-feature` into `develop`.
+5. After your PR is merged, sync upstream changes into your workspace branch without deleting your tracked personal artifacts:
+   ```bash
+   git checkout workspace/<handle>
+   git workspace-sync
+   # or run: ./scripts/sync-workspace.sh
+   git commit -m "chore: sync upstream develop into workspace"
+   git push origin workspace/<handle>
+   ```
 
 ## Project Structure
 
@@ -178,21 +234,22 @@ crates/
 ## PR Process
 
 1. Fork the repo
-2. Create a feature branch: `git checkout -b feature/my-feature`
+2. Create a feature branch: `git checkout -b feature/my-feature develop`
 3. Write code, add tests
 4. Ensure `cargo test` passes and `cargo clippy --workspace --all-targets -- -D warnings` is clean
 5. `cargo fmt`
 6. Submit a PR against `develop`
 7. CI runs tests + clippy + format check
 
-**Required checks** — a PR must pass all three CI jobs before it can merge
-(mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+**Required checks** — a PR must pass all four CI jobs before it can merge
+(mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/devcontainer.yml`](.github/workflows/devcontainer.yml)):
 
 - `cargo test`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo fmt --check`
+- `Build + test in devcontainer`
 
-`devflow test` runs these same three checks locally, and
+`devflow test` runs these checks locally, and
 [`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs them before a push.
 The `--all-targets` scope is load-bearing: the narrower `cargo clippy -- -D
 warnings` does not compile test targets, so lints inside `#[cfg(test)]`
@@ -317,7 +374,8 @@ through a PR.
    If that prints nothing, the link was not created and the sync must be redone.
 
 7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
-   CHANGELOG section reaches users who don't read the repo).
+   CHANGELOG section reaches users who don't read the repo): run
+   `scripts/cut-release.sh github-release`.
 
 Step 6 is not optional. Because `main` only accepts squash merges, its new
 release commit has no parent relationship back to `develop` — skip this
@@ -339,17 +397,20 @@ v1.8.1 `devflow-cli` also carries a dev-dependency on it for the
 publish` waits for the registry to make the crate available before
 returning, so the second command can follow immediately.
 
+To deploy updated documentation to GitHub Pages after release: run
+`scripts/cut-release.sh docs` (which runs [`scripts/deploy-docs.sh`](scripts/deploy-docs.sh)
+to build the autwicky-scaffolded MkDocs wiki and push to `gh-pages`).
+
 ## Commit Conventions
 
-DevFlow uses [Conventional Commits](https://www.conventionalcommits.org/):
-`type(scope): description`, imperative mood, no period at the end.
+DevFlow strictly enforces [Conventional Commits](https://www.conventionalcommits.org/):
+`type(scope): description`, imperative mood, lowercase description, no period at the end.
 
-Common types in this repo: `feat`, `fix`, `docs`, `test`, `ci`, `chore`,
-`refactor`. Scope is typically a crate/module (`cli`, `core`) or a phase/plan
-identifier (`15-05`, `phase-15`). Phase 11's per-phase branching/merge scheme
-(feature branches completed through the gate-driven Ship flow) works alongside
-Conventional Commits, not as a replacement for it — every commit in this
-project's own history follows the format.
+- **Allowed types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`, `release`, `merge`, `sync`.
+- **Breaking changes:** Add `!` before the colon, e.g. `feat(api)!: change default timeout`.
+- **Enforcement (enforced locally via hook):** [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) automatically validates every commit message on commit creation when `git config core.hooksPath scripts/hooks` is configured.
+- **Automated SemVer & Changelog:** Commits authored with Conventional Commits allow [`scripts/cut-release.sh`](scripts/cut-release.sh) and DevFlow's version engine to automatically calculate the next SemVer bump and draft release notes.
+
 
 ## Logging Conventions
 

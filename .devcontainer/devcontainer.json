@@ -7,10 +7,22 @@
 {
   "name": "DevFlow",
   "image": "mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true
+    }
+  },
   "mounts": [
     {
       "source": "devflow-cargo-registry",
       "target": "/usr/local/cargo/registry",
+      "type": "volume"
+    },
+    {
+      "source": "devflow-cargo-git",
+      "target": "/usr/local/cargo/git",
       "type": "volume"
     },
     {
@@ -20,14 +32,23 @@
     }
   ],
   // Docker creates fresh named volumes as root; claim writable Cargo volumes for the lifecycle user.
-  "postCreateCommand": "sudo chown -R \"$(id -u):$(id -g)\" /usr/local/cargo/registry \"${containerWorkspaceFolder}/target\" && rustup component add clippy rustfmt && cargo build --workspace",
+  "postCreateCommand": "sudo chown -R \"$(id -u):$(id -g)\" /usr/local/cargo/registry /usr/local/cargo/git \"${containerWorkspaceFolder}/target\" && git config --global --add safe.directory \"${containerWorkspaceFolder}\" && rustup component add clippy rustfmt && cargo build --workspace",
   "customizations": {
     "vscode": {
       "extensions": [
         "rust-lang.rust-analyzer",
         "vadimcn.vscode-lldb",
-        "tamasfe.even-better-toml"
-      ]
+        "tamasfe.even-better-toml",
+        "fill-labs.dependi",
+        "mutantdino.resourcemonitor"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.allTargets": true,
+        "files.trimTrailingWhitespace": true,
+        "files.insertFinalNewline": true
+      }
     }
-  }
+  },
+  "remoteUser": "vscode"
 }
