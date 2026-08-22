@@ -4,12 +4,11 @@ milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 42
 current_phase_name: hermes-driver
-status: "Phase 41 shipped — PR #133"
+status: "Phase 42 shipped — PR #137"
 stopped_at: Phase 42 context gathered
-last_updated: "2026-08-21T20:42:07.966Z"
+last_updated: "2026-08-22T01:30:28.703Z"
 last_activity: 2026-08-21
-last_activity_desc: Phase 42 planning complete
-state_head: 5ec2a69d3597ba7e9328a415fdad7173462efd13
+state_head: b509e8f87c96c8148d70c8652a1e4107fc45b8a8
 progress:
   total_phases: 6
   completed_phases: 2
@@ -157,8 +156,8 @@ change earns 2.0.
 
 Phase: 42 (hermes-driver) — READY TO EXECUTE
 Plan: Not started
-Status: Phase 41 shipped — PR #133
-Last activity: 2026-08-21 — Phase 42 planning complete
+Status: Phase 42 shipped — PR #137
+Last activity: 2026-08-21
 
 ## Recently Shipped
 
