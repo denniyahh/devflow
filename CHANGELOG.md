@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.9.0 — 2026-08-21
+
+### Added
+
+- unlock unattended auto mode for Antigravity after dogfood validation
+- implement Hermes driver, doctor probe, and transport tests
+
+### Fixed
+
+- address review findings for Hermes driver, cadence docs, and delegation parser
+
+### Changed
+
+- ship phase 42 — PR #137
+- cargo fmt formatting adjustments
+- add security threat model audit
+- update code review and verification artifacts
+- update generated docs
+- record raw adversarial review transcripts from Claude, Codex, and DeepSeek
+- document multi-model adversarial review findings and action items
+- add verification and UAT evidence for Phase 42
+- create phase plan
+- record phase 42 context session
+- capture phase context
+
 ## 2.8.0 — 2026-08-21
 
 Antigravity driver + test hygiene and dogfood validation (milestone v2.8.0). DevFlow adds the
