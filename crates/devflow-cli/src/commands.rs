@@ -6845,7 +6845,11 @@ mod tests {
             .expect("doctor_checks() must contain the hermes entry");
         if hermes.status == "missing" {
             assert!(
-                hermes.install_hint.as_deref().unwrap_or("").contains("hermes"),
+                hermes
+                    .install_hint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("hermes"),
                 "the hint must name the hermes binary: {:?}",
                 hermes.install_hint
             );

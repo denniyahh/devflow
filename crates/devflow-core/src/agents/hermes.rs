@@ -97,7 +97,11 @@ pub fn hermes_subagent_dispatch_available_with(
 pub fn parse_hermes_tools_list_for_delegation(stdout: &str) -> bool {
     for line in stdout.lines() {
         let lower = line.to_ascii_lowercase();
-        if lower.contains("delegation") && lower.contains("enabled") && !lower.contains("disabled") && !lower.contains("not enabled") {
+        if lower.contains("delegation")
+            && lower.contains("enabled")
+            && !lower.contains("disabled")
+            && !lower.contains("not enabled")
+        {
             return true;
         }
     }
@@ -193,7 +197,8 @@ Available Toolsets:
         let success_output = || {
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),
-                stdout: b"  \xe2\x9c\x93 enabled delegation \xf0\x9f\x91\xa5 Task Delegation\n".to_vec(),
+                stdout: b"  \xe2\x9c\x93 enabled delegation \xf0\x9f\x91\xa5 Task Delegation\n"
+                    .to_vec(),
                 stderr: Vec::new(),
             })
         };
@@ -208,7 +213,12 @@ Available Toolsets:
         };
         assert!(!hermes_subagent_dispatch_available_with(failure_output));
 
-        let io_error = || Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found"));
+        let io_error = || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not found",
+            ))
+        };
         assert!(!hermes_subagent_dispatch_available_with(io_error));
     }
 }

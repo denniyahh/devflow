@@ -1813,7 +1813,10 @@ fn hermes_marker_less_run_does_not_advance() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub("printf 'fake hermes, no marker\\n'\nexit 0\n"))]);
+    let fake_bin = fake_bin_dir(&[(
+        "hermes",
+        &hermes_stub("printf 'fake hermes, no marker\\n'\nexit 0\n"),
+    )]);
 
     run_devflow(
         root,
@@ -1845,7 +1848,10 @@ fn hermes_nonzero_exit_does_not_advance() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub("printf 'fake hermes error\\n'\nexit 1\n"))]);
+    let fake_bin = fake_bin_dir(&[(
+        "hermes",
+        &hermes_stub("printf 'fake hermes error\\n'\nexit 1\n"),
+    )]);
 
     run_devflow(
         root,
