@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# scripts/hooks/commit-msg — Conventional Commit validator
+#
+# Validates that commit messages follow the Conventional Commits specification:
+#   <type>(<optional scope>): <description>
+#
+# Allowed types:
+#   feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert, release, merge, sync
+#
+# Optional breaking change indicator '!' before colon:
+#   feat(api)!: remove deprecated endpoints
+#
+# Subject line rules:
+#   - Starts with a valid type
+#   - Colon followed by a space
+#   - Non-empty description
+#   - Does not end with a period
+#
+# Exemptions:
+#   - Merge commits (e.g. "Merge branch ...", "Merge pull request ...")
+#   - Rebase / fixup commits (e.g. "fixup! ...", "squash! ...")
+#   - Automated tooling when DEVFLOW_ALLOW_ANY_COMMIT=1
+set -euo pipefail
+
+commit_msg_file="$1"
+
+if [ "${DEVFLOW_ALLOW_ANY_COMMIT:-0}" = "1" ]; then
+    exit 0
+fi
+
+if [ ! -f "$commit_msg_file" ]; then
+    exit 0
+fi
+
+# Read first line (subject)
+subject=$(head -n 1 "$commit_msg_file" | sed 's/[[:space:]]*$//')
+
+# Skip comments or empty lines
+if [ -z "$subject" ] || [[ "$subject" =~ ^# ]]; then
+    exit 0
+fi
+
+# Allow merge / squash / fixup commits
+if [[ "$subject" =~ ^Merge\  ]] || [[ "$subject" =~ ^Merge\ pull\ request ]] || [[ "$subject" =~ ^(fixup|squash|amend)\!\  ]]; then
+    exit 0
+fi
+
+pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|merge|sync)(\([a-zA-Z0-9_.\/-]+\))?(\!)?: .+$'
+
+if ! [[ "$subject" =~ $pattern ]]; then
+    echo "commit-msg error: invalid commit message format." >&2
+    echo "" >&2
+    echo "  Commit message subject was:" >&2
+    echo "    $subject" >&2
+    echo "" >&2
+    echo "  Expected Conventional Commit format:" >&2
+    echo "    <type>(<optional-scope>): <description>" >&2
+    echo "" >&2
+    echo "  Allowed types:" >&2
+    echo "    feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert, release, merge, sync" >&2
+    echo "" >&2
+    echo "  Examples:" >&2
+    echo "    feat(cli): add hermes driver validation flag" >&2
+    echo "    fix(core): handle missing state file on initial start" >&2
+    echo "    docs: update release cut guide in contributing.md" >&2
+    echo "    chore: update workspace dependencies" >&2
+    exit 1
+fi
+
+if [ "${#subject}" -gt 72 ]; then
+    echo "commit-msg warning: commit subject is longer than 72 characters (${#subject} chars)." >&2
+    echo "  Subject: $subject" >&2
+fi
+
+# Chain to global commit-msg hook if present
+global_hooks=$(git config --global --get core.hooksPath || true)
+if [ -n "$global_hooks" ]; then
+    global_hooks="${global_hooks/#\~/$HOME}"
+    if [ -x "$global_hooks/commit-msg" ]; then
+        exec "$global_hooks/commit-msg" "$@"
+    fi
+fi
+
+# Fall back to repo-local hook if displaced
+repo_hook="$(git rev-parse --git-common-dir)/hooks/commit-msg"
+if [ -x "$repo_hook" ]; then
+    exec "$repo_hook" "$@"
+fi
+
+exit 0
