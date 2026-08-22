@@ -104,3 +104,39 @@ fn deterministic_override_is_preserved() {
          in-code `git -c user.signingkey=` override"
     );
 }
+
+/// The cut-release script must include the `docs` step in both dispatch and usage.
+#[test]
+fn docs_step_is_defined_and_dispatched() {
+    let source = script();
+    assert!(
+        source.contains("docs)") && source.contains("step_docs ;;"),
+        "cut-release.sh must dispatch the `docs` step"
+    );
+    assert!(
+        source.contains("step_docs() {"),
+        "cut-release.sh must define step_docs()"
+    );
+    assert!(
+        source.contains("scripts/deploy-docs.sh"),
+        "step_docs() must invoke scripts/deploy-docs.sh"
+    );
+}
+
+/// The cut-release script must include the `github-release` step in both dispatch and usage.
+#[test]
+fn github_release_step_is_defined_and_dispatched() {
+    let source = script();
+    assert!(
+        source.contains("github-release)") && source.contains("step_github_release ;;"),
+        "cut-release.sh must dispatch the `github-release` step"
+    );
+    assert!(
+        source.contains("step_github_release() {"),
+        "cut-release.sh must define step_github_release()"
+    );
+    assert!(
+        source.contains("gh release create"),
+        "step_github_release() must invoke gh release create"
+    );
+}

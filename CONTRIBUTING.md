@@ -370,7 +370,8 @@ through a PR.
    If that prints nothing, the link was not created and the sync must be redone.
 
 7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
-   CHANGELOG section reaches users who don't read the repo).
+   CHANGELOG section reaches users who don't read the repo): run
+   `scripts/cut-release.sh github-release`.
 
 Step 6 is not optional. Because `main` only accepts squash merges, its new
 release commit has no parent relationship back to `develop` — skip this
@@ -391,6 +392,10 @@ v1.8.1 `devflow-cli` also carries a dev-dependency on it for the
 `test-support` feature. Publishing out of order fails to build. `cargo
 publish` waits for the registry to make the crate available before
 returning, so the second command can follow immediately.
+
+To deploy updated documentation to GitHub Pages after release: run
+`scripts/cut-release.sh docs` (which runs [`scripts/deploy-docs.sh`](scripts/deploy-docs.sh)
+to build the autwicky-scaffolded MkDocs wiki and push to `gh-pages`).
 
 ## Commit Conventions
 
