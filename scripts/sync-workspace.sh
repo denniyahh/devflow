@@ -23,6 +23,9 @@ BASE_BRANCH="${2:-develop}"
 
 echo "==> Fetching latest $BASE_BRANCH from $BASE_REMOTE..."
 git fetch "$BASE_REMOTE" "$BASE_BRANCH"
+if git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
+    git fetch "$BASE_REMOTE" "$BASE_BRANCH":"$BASE_BRANCH" --quiet || true
+fi
 
 echo "==> Syncing project code into $CURRENT_BRANCH..."
 git checkout "$BASE_REMOTE/$BASE_BRANCH" -- \
