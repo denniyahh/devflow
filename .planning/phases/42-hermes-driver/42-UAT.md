@@ -35,7 +35,7 @@ evidence: `cargo test -p devflow --test phase7_cli hermes` → 3 passed (`hermes
 
 ### 5. Antigravity supervised dogfooding & cadence verification (ANTG-04, D-07)
 result: passed
-evidence: Supervised execution completed without false idle timeouts; 60m print-timeout override held across long compilation steps.
+evidence: Supervised execution completed successfully with `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS=300` accommodating ~163s workspace compilation quiet gaps; 60m print-timeout override held across long tool turns.
 
 ### 6. Unattended mode unlocked for Antigravity in preflight (ANTG-04, D-07)
 result: passed

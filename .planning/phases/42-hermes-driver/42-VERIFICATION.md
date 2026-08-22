@@ -17,12 +17,13 @@
 
 ## Dogfood Cadence & Quiet-Gap Measurement (ANTG-04)
 
-- **Idle Timeout Floor**: 120 seconds (`DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS`)
+- **Default Idle Timeout Floor**: 120 seconds (`DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS`)
 - **Print Timeout Override**: `--print-timeout 60m`
-- **Observed Cadence**:
+- **Observed Cadence & Remediation**:
   - Stream events emitted regularly during tool dispatches, file reads, and shell executions.
-  - Quiet gaps between events remained within bounds; no false-alarm idle timeout was observed.
-  - The 60m print-timeout override held continuously across multi-minute compilation and test suite passes without termination.
+  - During multi-minute compilation and workspace test passes (`cargo test --workspace`), quiet gaps exceeded the default 120s floor (~163s observed), triggering monitor watchdog terminations during the initial validation run (`.devflow/phase-42-monitor.log`).
+  - Setting `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS=300` successfully accommodated workspace test executions without triggering false-alarm idle terminations.
+  - The 60m print-timeout override held continuously across long tool executions.
 
 ---
 

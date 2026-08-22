@@ -97,7 +97,7 @@ pub fn hermes_subagent_dispatch_available_with(
 pub fn parse_hermes_tools_list_for_delegation(stdout: &str) -> bool {
     for line in stdout.lines() {
         let lower = line.to_ascii_lowercase();
-        if lower.contains("delegation") && lower.contains("enabled") {
+        if lower.contains("delegation") && lower.contains("enabled") && !lower.contains("disabled") && !lower.contains("not enabled") {
             return true;
         }
     }
@@ -175,6 +175,15 @@ Available Toolsets:
         let sample = "\
 Available Toolsets:
   ✓ enabled terminal   💻 Terminal Execution
+";
+        assert!(!parse_hermes_tools_list_for_delegation(sample));
+    }
+
+    #[test]
+    fn parse_hermes_tools_list_disabled_delegation_with_enabled_word() {
+        let sample = "\
+Available Toolsets:
+  ✗ disabled delegation 👥 Task Delegation (can be enabled in config)
 ";
         assert!(!parse_hermes_tools_list_for_delegation(sample));
     }

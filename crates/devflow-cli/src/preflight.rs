@@ -972,12 +972,9 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// the mechanism is USED, not about the stage being launched right now.
 ///
 /// **The dogfood term is the round-3 decision (F5/D-04).** Widening
-/// [`stream_launch_enabled`] to Antigravity (Task 3) would otherwise flip this
-/// condition to `Holds` and silently permit `--mode auto` for an UNDOGFOODED
-/// driver. Unattended mode stays refused for Antigravity until it has a real
-/// dogfooded run (tracked as a follow-up; the round-3 plan does not dogfood);
-/// Claude is the only stream agent with one today. Antigravity joins by
-/// replacing `state.agent == AgentKind::Claude` with an explicit dogfood flag.
+/// [`stream_launch_enabled`] to Antigravity allows `--mode auto` now that
+/// Phase 42 has validated Antigravity with `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS=300`.
+/// Antigravity joins Claude on the stream-json unattended launch path.
 fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     if stream_launch_enabled(state.agent, Stage::Code, state.legacy_claude_launch)
         && (state.agent == AgentKind::Claude || state.agent == AgentKind::Antigravity)
