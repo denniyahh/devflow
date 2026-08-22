@@ -53,6 +53,21 @@ if [ "$is_devflow" -eq 0 ]; then
     esac
 fi
 
+# Branch hygiene: personal/agent development artifacts and planning databases
+# belong exclusively on `workspace/*` (or `personal/*`) branches. Refuse them
+# on develop, main, feature/*, fix/*, chore/*, and release/* branches.
+current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+if [ -n "$current_branch" ] && [[ "$current_branch" != workspace/* && "$current_branch" != personal/* ]]; then
+    staged_personal="$(git diff --cached --name-only | grep -E '^(\.agents|\.bg-shell|\.claude|\.codex|\.gemini|\.omx|\.opencode|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.gsd-backups|\.gsd-id|\.gsd-worktrees|\.planning|\.devflow|\.worktrees)' || true)"
+    if [ -n "$staged_personal" ]; then
+        echo "pre-commit: refusing to commit personal/agent artifacts on branch '$current_branch':" >&2
+        echo "$staged_personal" | sed 's/^/  /' >&2
+        echo "  Personal agent configurations, planning files, and local state belong exclusively" >&2
+        echo "  on 'workspace/<handle>' branches. Unstage them before committing to '$current_branch'." >&2
+        exit 1
+    fi
+fi
+
 global_hooks=$(git config --global --get core.hooksPath || true)
 if [ -n "$global_hooks" ]; then
   # Expand a leading ~ ourselves; git stores the literal string.

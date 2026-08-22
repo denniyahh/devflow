@@ -151,13 +151,65 @@ git config tag.gpgsign false
 See [§ AI Change Acceptance](#ai-change-acceptance) for what a test must
 demonstrate to be accepted, and which test shapes are rejected outright.
 
-## Phase Plans (`.planning/`)
+## Workspace Architecture & Branching Strategy
 
-DevFlow drives agents from per-phase plans under `.planning/`. The launch prompt
-(`crate::prompt::stage_prompt(stage, phase)`) reads `.planning/ROADMAP.md` and
-`.planning/phases/NN-*/CONTEXT.md`, so these files are tracked in the repo — they
-are DevFlow's phase-plan convention, not private scratch. When adding a phase,
-commit its `CONTEXT.md` so agents (and reviewers) can read the plan.
+DevFlow uses a **Dual-Tier Workspace Architecture** to keep shared branches clean, contributor-friendly, and reproducible, while allowing maintainers and AI agent operators to version-control their personal workflows, prompts, and planning databases.
+
+```mermaid
+gitGraph
+   commit id: "v2.9.0"
+   branch develop
+   checkout develop
+   commit id: "feature-code"
+   branch "workspace/contributor"
+   checkout "workspace/contributor"
+   commit id: "agent-prompts-and-gsd"
+   checkout develop
+   commit id: "upstream-fix"
+   checkout "workspace/contributor"
+   merge develop id: "sync-code"
+```
+
+### 1. Shared Clean Base (`main`, `develop`, `feature/*`)
+The default shared branches contain **only** source code, tests, documentation, and the baseline development container. They are kept strictly free of personal AI agent configs, prompts, local SQLite planning databases, and machine-specific MCP tool definitions.
+
+- **Pre-commit & Pre-push guards (enforced)**: `scripts/hooks/pre-commit` and `scripts/hooks/pre-push` actively refuse commits and pushes that contain personal artifacts (`.agents/`, `.codex/`, `.claude/`, `.planning/`, `.gsd/`, `.mcp.json`, `CLAUDE.md`, `skills/`) on any non-workspace branch.
+
+### 2. Personal Workspace Branches (`workspace/<handle>`)
+If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom MCP servers, or local workflow planners (GSD), keep them versioned on a personal workspace branch:
+
+- Name your branch after your GitHub handle (e.g. `workspace/<handle>` or `personal/<handle>`).
+- You can commit your agent definitions, custom prompts, skills, and planning dossiers to your workspace branch and push it to GitHub so your environment is accessible anywhere.
+
+### Contributor Workflows
+
+#### Workflow A: Standard Code Contributions (No AI tooling required)
+1. Fork and clone the repository.
+2. Cut a feature branch from `develop`:
+   ```bash
+   git checkout -b feature/my-feature develop
+   # or with tracked alias: git feature-start my-feature
+   ```
+3. Implement changes, add regression tests, and run `cargo test`.
+4. Submit a PR against `develop`.
+
+#### Workflow B: AI-Driven & Agent Workspace Contributions
+1. Keep your primary orchestrator/agent checkout on your personal workspace branch (`workspace/<handle>`).
+2. When creating code to submit upstream, develop inside a clean worktree branched from `develop`:
+   ```bash
+   git worktree add .worktrees/my-feature -b feature/my-feature develop
+   # or with tracked alias: git feature-start my-feature
+   ```
+3. Commit only source, test, and documentation changes in the feature worktree.
+4. Submit the PR from `feature/my-feature` into `develop`.
+5. After your PR is merged, sync upstream changes into your workspace branch without deleting your tracked personal artifacts:
+   ```bash
+   git checkout workspace/<handle>
+   git workspace-sync
+   # or run: ./scripts/sync-workspace.sh
+   git commit -m "chore: sync upstream develop into workspace"
+   git push origin workspace/<handle>
+   ```
 
 ## Project Structure
 
@@ -178,21 +230,22 @@ crates/
 ## PR Process
 
 1. Fork the repo
-2. Create a feature branch: `git checkout -b feature/my-feature`
+2. Create a feature branch: `git checkout -b feature/my-feature develop`
 3. Write code, add tests
 4. Ensure `cargo test` passes and `cargo clippy --workspace --all-targets -- -D warnings` is clean
 5. `cargo fmt`
 6. Submit a PR against `develop`
 7. CI runs tests + clippy + format check
 
-**Required checks** — a PR must pass all three CI jobs before it can merge
-(mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+**Required checks** — a PR must pass all four CI jobs before it can merge
+(mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/devcontainer.yml`](.github/workflows/devcontainer.yml)):
 
 - `cargo test`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo fmt --check`
+- `Build + test in devcontainer`
 
-`devflow test` runs these same three checks locally, and
+`devflow test` runs these checks locally, and
 [`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs them before a push.
 The `--all-targets` scope is load-bearing: the narrower `cargo clippy -- -D
 warnings` does not compile test targets, so lints inside `#[cfg(test)]`

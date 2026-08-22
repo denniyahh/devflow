@@ -58,3 +58,18 @@ fn both_protected_branches_refuse_with_a_nonzero_exit() {
         "the guard must exit non-zero when it matches a protected branch"
     );
 }
+
+/// Personal development artifacts (.agents, .codex, .claude, .planning, .gsd, etc.)
+/// must be rejected by pre-commit on non-workspace branches.
+#[test]
+fn pre_commit_guards_against_personal_artifacts_on_non_workspace_branches() {
+    let source = hook();
+    assert!(
+        source.contains("workspace/*") && source.contains("staged_personal"),
+        "pre-commit must inspect staged files and forbid personal artifacts on non-workspace branches"
+    );
+    assert!(
+        source.contains(".planning") && source.contains(".codex") && source.contains(".claude"),
+        "pre-commit personal artifact regex must cover .planning, .codex, and .claude"
+    );
+}
