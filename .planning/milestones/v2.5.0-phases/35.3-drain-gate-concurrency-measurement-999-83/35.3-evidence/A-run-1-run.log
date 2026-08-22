@@ -1,0 +1,20 @@
+# Phase 35.3 — drain-gate capture provenance: Variant A run 1 (sub-agent dispatch)
+
+command invoked : scripts/drain-drill.sh --prompt A --runs 2
+child argv      : claude -p --input-format stream-json --output-format stream-json --verbose
+                  --dangerously-skip-permissions
+claude_cli_version : 2.1.228 (Claude Code)
+devflow build commit : 6314eff (branch feature/phase-35.3)
+capture source  : .planning/phases/35.3-drain-gate-concurrency-measurement-999-83/35.3-evidence/A-run-1-raw_output.jsonl
+outcome         : success in 2 turns
+
+counts (parse-based, jq):
+        2 hook_response
+        2 hook_started
+        1 init
+        1 task_notification
+        1 task_started
+        1 task_updated
+        2 thinking_tokens
+
+run_in_background:true observed : 0

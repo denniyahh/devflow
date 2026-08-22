@@ -1,0 +1,54 @@
+{
+  "commit_docs": true,
+  "workflow": {
+    "granularity": "medium",
+    "auto_mode": true,
+    "commit_docs": true,
+    "subagent_timeout": 300000,
+    "_auto_chain_active": false,
+    "nyquist_validation": true,
+    "ai_integration_phase": true,
+    "tdd_mode": true,
+    "windows_enforce": true
+  },
+  "git": {
+    "main": "main",
+    "develop": "develop",
+    "feature_prefix": "feature/",
+    "auto_branch": true,
+    "auto_cleanup": true,
+    "branching_strategy": "phase",
+    "phase_branch_template": "feature/phase-{phase}"
+  },
+  "intel": {
+    "enabled": true,
+    "last_mapped": "2026-06-17",
+    "head_sha": "bbb9fb4"
+  },
+  "review": {
+    "default_reviewers": [
+      "codex",
+      "cursor",
+      "opencode",
+      "antigravity"
+    ]
+  },
+  "model_overrides": {
+    "gsd-executor": "inherit",
+    "gsd-code-reviewer": "inherit",
+    "gsd-debugger": "inherit",
+    "gsd-doc-classifier": "haiku",
+    "gsd-intel-updater": "haiku",
+    "gsd-mempalace-curator": "haiku"
+  },
+  "mempalace": {
+    "enabled": true,
+    "capture_artifacts": true,
+    "wing": "devflow",
+    "memory_mode": "augment",
+    "mirror_kg": true,
+    "recall_on_plan": true,
+    "diary_journal": true,
+    "cross_project_tunnels": true
+  }
+}

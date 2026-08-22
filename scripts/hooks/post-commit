@@ -28,8 +28,8 @@ summaries=$(printf '%s\n' "$changed" | grep -E '^(\.planning|\.gsd)/phases/.*SUM
 
 if [ -n "$summaries" ]; then
   root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
-  state="$root/.gsd/STATE.md"
-  [ -f "$state" ] || state="$root/.planning/STATE.md"
+  state="$root/.planning/STATE.md"
+  [ -f "$state" ] || state="$root/.gsd/STATE.md"
   status_line=$(grep -m1 '^status:' "$state" 2>/dev/null || echo 'status: <unreadable>')
   updated=$(grep -m1 '^last_updated:' "$state" 2>/dev/null || echo 'last_updated: <absent>')
 
@@ -68,7 +68,7 @@ fi
 # Warn when a "how this repo is set up" file changes without the portability
 # checklist moving too.
 #
-# .gsd/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
+# .planning/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
 # replicated elsewhere; it goes stale the same silent way STATE.md does above
 # — nothing else reads it, so drift is invisible until someone tries to
 # actually follow it on a new machine. Unlike the SUMMARY.md signal above,
@@ -89,7 +89,7 @@ if [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
     printf '\n\033[33m── DEV-SETUP-CHECKLIST.md may now be stale ──\033[0m\n'
     printf 'This commit touched setup file(s) but not the checklist:\n'
     printf '  %s\n' $setup_changed
-    printf 'Review .gsd/DEV-SETUP-CHECKLIST.md and update it if this changes what a fresh replication needs.\n\n'
+    printf 'Review .planning/DEV-SETUP-CHECKLIST.md and update it if this changes what a fresh replication needs.\n\n'
   } >&2
 fi
 
