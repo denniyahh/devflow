@@ -61,6 +61,8 @@ specifically to the main-checkout case.
 - **A grep over source counts comment prose.** 35-01's region check reported a surviving
   `unwrap_or(0)` that existed only inside a comment. Strip comments before counting, or the measure
   reports on documentation rather than on code.
+- **A branch workflow run list (`gh run list`) does not establish PR check status (`gh pr checks`).**
+  Workflow runs can pass on older commits while the PR's current HEAD commit has zero reported checks (e.g. if an intermediate metadata or doc commit was pushed with `[ci skip]`, or if checks are pending/untriggered). Never report that a PR is green or CI has passed without asserting directly on `gh pr checks <PR>` against the current `HEAD_SHA`.
 
 ## Prefer GSD commands over doing it by hand
 
