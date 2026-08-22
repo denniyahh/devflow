@@ -1,0 +1,1544 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Agent-agnostic development workflow automation — architecture, guides, and API reference">
+      
+      
+      
+      
+        <link rel="prev" href="../configuration/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Unattended Mode - DevFlow Documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/extra.css">
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/panzoom.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  <meta name="panzoom-theme" content="material">
+<meta name="panzoom-data" content='{"selectors": [".d2", ".mermaid"], "initial_zoom_level": 1.0}'> </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="blue">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#unattended-mode" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="DevFlow Documentation" class="md-header__button md-logo" aria-label="DevFlow Documentation" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            DevFlow Documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Unattended Mode
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="blue"  aria-hidden="true"  type="radio" name="__palette" id="__palette_0">
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="blue"  aria-hidden="true"  type="radio" name="__palette" id="__palette_1">
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/denniyahh/devflow" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../architecture/overview/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Architecture
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../diagrams/system/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Diagrams
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../quickstart/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="DevFlow Documentation" class="md-nav__button md-logo" aria-label="DevFlow Documentation" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    DevFlow Documentation
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/denniyahh/devflow" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/overview/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/state-machine/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    State Machine
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/agent-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/git-ship/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Git & Ship Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagrams
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Diagrams
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../diagrams/system/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    System Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../diagrams/agent-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent Lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../diagrams/ship-flow/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Ship Flow
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../diagrams/module-map/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Module Map
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adding-agent/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Adding an Agent
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Unattended Mode
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Unattended Mode
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-unattended-mode-does" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What unattended mode does
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#before-you-start-what-the-preflight-checks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Before you start: what the preflight checks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Before you start: what the preflight checks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-the-gsd-config-can-hold-the-chain-flag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. The GSD config can hold the chain flag
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-the-code-stage-would-launch-on-the-pipe-owning-arm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. The Code stage would launch on the pipe-owning arm
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-no-plan-declares-a-checkpoint-gsd-never-auto-approves" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. No plan declares a checkpoint GSD never auto-approves
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-refusal-is-final" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A refusal is final
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-you-will-see-in-your-git-history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What you will see in your git history
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#known-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Known limitations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Known limitations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-an-unattended-run-can-still-stall-at-a-plan-stage-checkpoint" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. An unattended run can still stall at a Plan-stage checkpoint
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-a-legacy-arm-or-non-claude-code-stage-gets-no-chain-flag-guard-at-all" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-gsd-orchestrator-may-block-auto-approval-of-gateblocking-checkpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. GSD orchestrator may block auto-approval of gate="blocking" checkpoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-this-was-verified" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How this was verified
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-unattended-mode-does" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What unattended mode does
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#before-you-start-what-the-preflight-checks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Before you start: what the preflight checks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Before you start: what the preflight checks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-the-gsd-config-can-hold-the-chain-flag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. The GSD config can hold the chain flag
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-the-code-stage-would-launch-on-the-pipe-owning-arm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. The Code stage would launch on the pipe-owning arm
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-no-plan-declares-a-checkpoint-gsd-never-auto-approves" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. No plan declares a checkpoint GSD never auto-approves
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a-refusal-is-final" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A refusal is final
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-you-will-see-in-your-git-history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What you will see in your git history
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#known-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Known limitations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Known limitations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-an-unattended-run-can-still-stall-at-a-plan-stage-checkpoint" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. An unattended run can still stall at a Plan-stage checkpoint
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-a-legacy-arm-or-non-claude-code-stage-gets-no-chain-flag-guard-at-all" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-gsd-orchestrator-may-block-auto-approval-of-gateblocking-checkpoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. GSD orchestrator may block auto-approval of gate="blocking" checkpoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-this-was-verified" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How this was verified
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="unattended-mode">Unattended Mode<a class="headerlink" href="#unattended-mode" title="Permanent link">&para;</a></h1>
+<p><code>devflow start --mode auto</code> is for the run you start and walk away from. This
+page is what you should read before you do that: what the mode actually
+automates, what DevFlow checks before it will start one, what it writes into
+your git history, and the two places an unattended run can still stop.</p>
+<h2 id="what-unattended-mode-does">What unattended mode does<a class="headerlink" href="#what-unattended-mode-does" title="Permanent link">&para;</a></h2>
+<p>For the duration of the <strong>Code</strong> stage — and of the <code>--gaps-only</code> fix loop that
+a failing Validate sends back to Code — DevFlow sets GSD's chain flag,
+<code>workflow._auto_chain_active</code>, in your project's <code>.planning/config.json</code>. GSD
+reads that flag when a plan reaches an ordinary blocking checkpoint. With the
+flag set, GSD approves the checkpoint and keeps going instead of stopping to
+ask you.</p>
+<p>The flag is set when the stage launches and cleared when it finishes, on every
+exit path including a failure.</p>
+<p><strong>Name the boundary plainly: this is checkpoint approval only.</strong> Two things it
+is deliberately <em>not</em>:</p>
+<ul>
+<li><strong>It is not stage-chaining.</strong> DevFlow still drives the pipeline itself,
+  one stage at a time. GSD is never told to launch the next stage on its own.</li>
+<li><strong>It never writes <code>workflow.auto_advance</code>.</strong> That is your persistent
+  settings preference, and DevFlow does not touch it. Only the ephemeral
+  <code>_auto_chain_active</code> key is ever written, and only that one key.</li>
+</ul>
+<p>Checkpoints marked <code>blocking-human</code>, and <code>checkpoint:human-action</code> tasks, are
+never auto-approved by any mode. A phase whose plans declare one is refused
+before it starts — see the next section.</p>
+<h2 id="before-you-start-what-the-preflight-checks">Before you start: what the preflight checks<a class="headerlink" href="#before-you-start-what-the-preflight-checks" title="Permanent link">&para;</a></h2>
+<p>An unattended launch is checked before any agent is spawned. Three conditions
+are evaluated and <strong>all three are reported every time</strong>, in both <code>auto</code> and
+<code>supervise</code> mode, so you can rehearse a run in supervise and see exactly what
+an auto run would say. Only <code>--mode auto</code> is refused on a failure.</p>
+<p>Each condition reports one of <code>[holds]</code>, <code>[DOES NOT HOLD]</code>,
+<code>[COULD NOT BE DETERMINED]</code>, or <code>[not yet applicable]</code>. In auto mode, anything
+that is not a definite pass refuses — including <em>could not determine</em>.
+Unreadable is not the same as absent, and neither is treated as fine.</p>
+<h3 id="1-the-gsd-config-can-hold-the-chain-flag">1. The GSD config can hold the chain flag<a class="headerlink" href="#1-the-gsd-config-can-hold-the-chain-flag" title="Permanent link">&para;</a></h3>
+<p><code>.planning/config.json</code> must exist under the launch root, parse, and be a JSON
+object. If it is missing there is nowhere for the flag to live; if it does not
+parse, DevFlow cannot tell whether writing to it would destroy something.</p>
+<p>A refusal here means your project is not GSD-configured, or its config file is
+malformed. Fix the file, or run in supervise mode.</p>
+<h3 id="2-the-code-stage-would-launch-on-the-pipe-owning-arm">2. The Code stage would launch on the pipe-owning arm<a class="headerlink" href="#2-the-code-stage-would-launch-on-the-pipe-owning-arm" title="Permanent link">&para;</a></h3>
+<p>The guard that bounds the flag's lifetime lives inside DevFlow's pipe-owning
+monitor, and only the Claude launch path starts one. So two launch shapes are
+refused in auto mode:</p>
+<ul>
+<li><strong>A non-Claude agent.</strong> <code>--agent codex</code> and <code>--agent opencode</code> cannot run
+  <code>--mode auto</code>. This is a real capability removal introduced with this
+  feature; those agents still work in supervise mode.</li>
+<li><strong>The legacy launch opt-out.</strong> <code>--legacy-claude-launch</code> (or
+  <code>DEVFLOW_CLAUDE_LEGACY_LAUNCH</code>) selects a detached shell monitor with no
+  process to bound the flag's lifetime. It is now mutually exclusive with
+  <code>--mode auto</code>.</li>
+</ul>
+<p>The recovery for either is the same: drop the flag that caused it, or run in
+supervise mode.</p>
+<h3 id="3-no-plan-declares-a-checkpoint-gsd-never-auto-approves">3. No plan declares a checkpoint GSD never auto-approves<a class="headerlink" href="#3-no-plan-declares-a-checkpoint-gsd-never-auto-approves" title="Permanent link">&para;</a></h3>
+<p>DevFlow scans the phase's <code>*-PLAN.md</code> files for a <code>blocking-human</code> gate or a
+<code>checkpoint:human-action</code> task declared on a task tag. Those are human-only by
+design and no mode approves them, so an unattended run that reached one would
+simply stall. Better to say so at the start.</p>
+<p>Before the phase has been planned there is nothing to scan, and the condition
+reports <code>[not yet applicable]</code> at Define rather than refusing. At Code, plans
+are expected — their absence is <code>[COULD NOT BE DETERMINED]</code>, and that refuses.</p>
+<p>A refusal here means replanning the phase without the human-only marker, or
+running in supervise mode and answering it yourself.</p>
+<h3 id="a-refusal-is-final">A refusal is final<a class="headerlink" href="#a-refusal-is-final" title="Permanent link">&para;</a></h3>
+<p>There is no <code>--force-unattended</code> flag and no environment variable that turns a
+refusal into a warning. Your options are to fix the condition or to run in
+supervise mode.</p>
+<p><strong>Both external review lanes objected to that, on record, and the decision
+stands.</strong> The objection is real and worth stating so you know it was heard: a
+preflight that false-positives makes unattended runs impossible with no
+in-product recovery, and one reviewer characterised that as a
+denial-of-service. The counter-argument that carried is DevFlow's standing
+principle — advance as far as the rules permit and stop at the first hard gate,
+never route around one — plus the asymmetry that adding an override later is
+easy while removing one after operators have built habits around it is not. If
+the preflight's own reliability turns out to be a problem in practice, that is
+grounds to reopen the decision, not to work around it.</p>
+<h2 id="what-you-will-see-in-your-git-history">What you will see in your git history<a class="headerlink" href="#what-you-will-see-in-your-git-history" title="Permanent link">&para;</a></h2>
+<p>The chain flag lives in <code>.planning/config.json</code>, which is a <strong>tracked</strong> file.
+So:</p>
+<ul>
+<li>
+<p><strong>During the Code stage, that file is modified in your working tree.</strong> The
+  value flips to <code>true</code> when the stage launches and back to <code>false</code> when it
+  finishes. Only that one key changes — key order, formatting, and every other
+  setting are preserved byte-for-byte.</p>
+</li>
+<li>
+<p><strong>If a run is killed, the flag can be left set.</strong> A <code>SIGKILL</code> gives DevFlow's
+  in-process guard no chance to run. The next <code>devflow start</code> or
+  <code>devflow resume</code> for that phase detects the leftover value and clears it
+  before launching anything, printing a notice as it does.</p>
+</li>
+<li>
+<p><strong>That repair may write a commit.</strong> If the leaked <code>true</code> had already reached
+  the branch tip, the repair commits the corrected file so it cannot travel
+  onward through Ship into <code>develop</code>. You will see this subject in your
+  history:</p>
+</li>
+</ul>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>fix(gsd): clear a leaked auto-chain flag before launch
+</code></pre></div>
+<p>The body explains what the leaked value meant. The repair is also recorded as
+  an <code>auto_chain_flag_repaired</code> entry in <code>.devflow/events.jsonl</code>.</p>
+<ul>
+<li><strong>The repair declines to commit if you edited that file too.</strong> If
+  <code>.planning/config.json</code> carries changes of yours beyond the flag, DevFlow
+  clears the flag in your working tree, refuses to make the commit, and says so
+  loudly. It will not sweep your edit into a commit you did not ask for.</li>
+</ul>
+<h2 id="known-limitations">Known limitations<a class="headerlink" href="#known-limitations" title="Permanent link">&para;</a></h2>
+<p>Two, and neither is fixed by this feature. Both are stated here rather than
+buried in planning notes, because both are places an overnight run can stop.</p>
+<h3 id="1-an-unattended-run-can-still-stall-at-a-plan-stage-checkpoint">1. An unattended run can still stall at a Plan-stage checkpoint<a class="headerlink" href="#1-an-unattended-run-can-still-stall-at-a-plan-stage-checkpoint" title="Permanent link">&para;</a></h3>
+<p>Checkpoint auto-approval covers the Code stage and its fix loop. It does
+<strong>not</strong> cover Plan. Since DevFlow's Define stage does no agent work, Plan is
+the earliest stage where a run can stall — so unattended mode does not fully
+deliver "complete a phase with nobody present".</p>
+<p><strong>Cause.</strong> The flag that would auto-approve a Plan-stage checkpoint is the same
+flag that makes GSD's <code>plan-phase</code> chain straight into <code>execute-phase</code>. There
+is no third setting for "bypass the checkpoint without chaining": upstream,
+both behaviours read one boolean. Setting it at Plan would double-execute the
+Code stage and misattribute its commits — worse than the stall it fixes.</p>
+<p><strong>Fix owner: upstream.</strong> Closing this needs a gsd-core change splitting that
+boolean into separate bypass and chaining flags, tracked as <strong>G-01</strong>. It is not
+a DevFlow fix. The operator considered making that upstream change a
+prerequisite of this work and declined, so the limitation ships.</p>
+<p><strong>What to do meanwhile.</strong> If a phase's plan-stage work is likely to raise a
+decision, plan the phase interactively first and then start the unattended run
+— by the time <code>devflow start</code> reaches Plan with a plan already on disk, the
+stage is a no-op.</p>
+<h3 id="2-a-legacy-arm-or-non-claude-code-stage-gets-no-chain-flag-guard-at-all">2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all<a class="headerlink" href="#2-a-legacy-arm-or-non-claude-code-stage-gets-no-chain-flag-guard-at-all" title="Permanent link">&para;</a></h3>
+<p>There is no guard on those launch shapes, because the legacy arm is a detached
+shell script with no process whose lifetime could bound the flag.</p>
+<p><strong>Cause.</strong> The guard is bound inside the pipe-owning monitor, and only the
+Claude stream launch path starts one.</p>
+<p><strong>Fix owner: DevFlow, and as of this release the failure is loud rather than
+silent.</strong> Condition 2 of the preflight now <em>refuses</em> this combination in auto
+mode instead of letting the run start and stall later. That is an improvement
+in legibility, not a removal of the limitation: <code>--mode auto</code> remains
+Claude-only, and remains incompatible with the legacy launch opt-out.</p>
+<h3 id="3-gsd-orchestrator-may-block-auto-approval-of-gateblocking-checkpoints">3. GSD orchestrator may block auto-approval of <code>gate="blocking"</code> checkpoints<a class="headerlink" href="#3-gsd-orchestrator-may-block-auto-approval-of-gateblocking-checkpoints" title="Permanent link">&para;</a></h3>
+<p>When a plan contains a <code>checkpoint:human-verify</code> task with <code>gate="blocking"</code>
+(as opposed to <code>blocking-human</code>), GSD's own rules say it should auto-approve
+in auto mode. In practice, the <code>execute-phase.md</code> orchestrator may inject a
+conflicting instruction into the executor's prompt telling it to never
+auto-approve — treating <code>gate="blocking"</code> as if it were the exception rather
+than the auto-approvable default.</p>
+<p><strong>Cause.</strong> The GSD orchestrator (the parent agent running <code>execute-phase.md</code>)
+generates the executor subagent prompt dynamically. When it sees
+<code>checkpoint:human-verify</code> + <code>gate="blocking"</code>, it sometimes adds a
+<code>&lt;critical_gate&gt;</code> block that overrides the executor's own checkpoint protocol.
+This is an upstream GSD behavioral issue, not a DevFlow defect —
+<a href="https://github.com/open-gsd/gsd-core/issues/3370">open-gsd/gsd-core#3370</a>.</p>
+<p><strong>Practical impact is narrow.</strong> GSD's default <code>human_verify_mode</code>
+(<code>end-of-phase</code>, #3309) suppresses <code>checkpoint:human-verify</code> tasks from plans
+entirely. A normal unattended run never contains these tasks and never hits
+this. The limitation only affects phases whose CONTEXT.md locked decisions
+or <code>human_verify_mode = mid-flight</code> setting force these checkpoints into plans.</p>
+<p><strong>Fix owner: GSD.</strong> The orchestrator's dispatch instructions should explicitly
+state that <code>gate="blocking"</code> checkpoints are auto-approvable and the
+executor's own protocol is authoritative.</p>
+<h2 id="how-this-was-verified">How this was verified<a class="headerlink" href="#how-this-was-verified" title="Permanent link">&para;</a></h2>
+<p>The mechanism was driven end-to-end against a real Claude agent running real
+GSD commands on a throwaway fixture repository, in two arms differing by
+exactly one flag — <code>--mode auto</code> against <code>--mode supervise</code> — so that a run
+which merely never reached a checkpoint could not be mistaken for a successful
+auto-approval. The run record, including both arms side by side and the
+verbatim capture lines, is in
+<code>.planning/phases/35.1-unattended-launch-prerequisites/35.1-DRILL.md</code>.</p>
+<p><strong>What that drill does not establish:</strong> it does not establish that DevFlow sets
+and clears the flag at the right moments — that is covered separately by
+DevFlow's own end-to-end tests, including a real-<code>SIGKILL</code> leak demonstration —
+and one run is one sample. The drill also surfaced an upstream GSD behavioral
+issue (#3370) where the orchestrator blocks auto-approval of correctly-authored
+<code>gate="blocking"</code> checkpoints; this is recorded as known limitation #3 above.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.tabs", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../assets/extra.js"></script>
+      
+        <script src="../../assets/javascripts/panzoom.min.js"></script>
+      
+        <script src="../../assets/javascripts/zoompan.js"></script>
+      
+    
+  </body>
+</html>
