@@ -269,9 +269,8 @@ step_sync() {
     require_develop
     git fetch origin main develop --quiet
     scripts/sync-main-to-develop.sh
-    note "sync merge commit is now on develop; it cannot be pushed directly."
-    note "put it on a branch and PR it (MERGE commit, not squash), or run the"
-    note "step again after the PR is merged. See CONTRIBUTING.md 'Cutting a Release' step 6."
+    note "sync pull request created targeting develop (must use 'Create a merge commit')."
+    note "after merging on GitHub, run: scripts/sync-main-to-develop.sh --finish"
 }
 
 step_publish() {
