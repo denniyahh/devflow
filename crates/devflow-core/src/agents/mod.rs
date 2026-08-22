@@ -178,18 +178,21 @@ pub fn driver_for(kind: AgentKind) -> Box<dyn AgentDriver> {
         AgentKind::OpenCode => Box::new(OpenCodeDriver),
         AgentKind::Pi => Box::new(PiDriver),
         AgentKind::Antigravity => Box::new(AntigravityDriver),
+        AgentKind::Hermes => Box::new(HermesDriver),
     }
 }
 
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod hermes;
 pub mod opencode;
 pub mod pi;
 
 pub use antigravity::AntigravityDriver;
 pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
+pub use hermes::HermesDriver;
 pub use opencode::OpenCodeDriver;
 pub use pi::PiDriver;
 
@@ -206,6 +209,7 @@ mod tests {
         assert_eq!(driver_for(AgentKind::OpenCode).name(), "OpenCode");
         assert_eq!(driver_for(AgentKind::Pi).name(), "Pi");
         assert_eq!(driver_for(AgentKind::Antigravity).name(), "Antigravity");
+        assert_eq!(driver_for(AgentKind::Hermes).name(), "Hermes");
     }
 
     /// 37-02: the drivers reproduce the legacy adapter byte-for-byte (the shim
@@ -279,12 +283,13 @@ mod tests {
     /// hardcoded Codex-Define check.
     #[test]
     fn every_driver_passes_the_conformance_suite() {
-        let drivers: [Box<dyn AgentDriver>; 5] = [
+        let drivers: [Box<dyn AgentDriver>; 6] = [
             Box::new(ClaudeDriver),
             Box::new(CodexDriver),
             Box::new(OpenCodeDriver),
             Box::new(PiDriver),
             Box::new(AntigravityDriver),
+            Box::new(HermesDriver),
         ];
         for driver in &drivers {
             let results = driver.test_contract();
@@ -336,6 +341,46 @@ mod tests {
             );
         }
         // The whole suite still passes with the 5th driver present.
+        for driver in &drivers {
+            assert!(
+                driver.test_contract().iter().all(|r| r.passed),
+                "{} must pass the shared conformance suite",
+                driver.name()
+            );
+        }
+    }
+
+    /// Phase 42 Task 2 (D-06): the Hermes enrollment is PROVEN by a uniquely-named test.
+    /// Asserts the hardcoded array is now 6 drivers AND that the Hermes driver
+    /// passes all 7 contract checks.
+    #[test]
+    fn hermes_conformance_enrollment() {
+        let drivers: [Box<dyn AgentDriver>; 6] = [
+            Box::new(ClaudeDriver),
+            Box::new(CodexDriver),
+            Box::new(OpenCodeDriver),
+            Box::new(PiDriver),
+            Box::new(AntigravityDriver),
+            Box::new(HermesDriver),
+        ];
+        let hermes = drivers
+            .iter()
+            .find(|d| d.name() == "Hermes")
+            .expect("the Hermes driver must be enrolled in the shared suite");
+        let results = hermes.test_contract();
+        assert_eq!(
+            results.len(),
+            7,
+            "1 name + 5 per-stage DEVFLOW_RESULT prompts + 1 program"
+        );
+        for result in &results {
+            assert!(
+                result.passed,
+                "Hermes failed conformance case {:?}",
+                result.name
+            );
+        }
+        // The whole suite still passes with the 6th driver present.
         for driver in &drivers {
             assert!(
                 driver.test_contract().iter().all(|r| r.passed),
