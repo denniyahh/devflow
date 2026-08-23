@@ -848,6 +848,74 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
     None
 }
 
+/// Determine whether a set of parsed JSONL lines look like an OpenCode
+/// `--auto --format json` event stream — i.e. at least one line's top-level
+/// `type` is `step_start` or `step_finish`.
+///
+/// OpenCode's real captured events all carry a top-level `type` key
+/// (`step_start`, `text`, `tool_use`, `step_finish`, `error` — verified
+/// against three live captures, D-03). Gating on `step_start`/`step_finish`
+/// rather than the generic `error` shape keeps this detector OpenCode-unique:
+/// a bare `{"type":"error",...}` object is generic enough that another
+/// adapter's error envelope could otherwise be misrouted into this parser by
+/// `evaluate_layer1`'s cascade (T-43-07).
+pub(crate) fn is_opencode_event_stream(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|v| {
+        v.get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t == "step_start" || t == "step_finish")
+    })
+}
+
+/// Parse an OpenCode `--auto --format json` JSONL event stream (one JSON
+/// object per line) into an [`AgentResult`].
+///
+/// Structurally unlike [`parse_codex_event_result`]: OpenCode has NO
+/// Codex-style terminal-status event pair (`turn.completed`/`turn.failed`,
+/// D-03) — `step_finish` fires after every step, including a successful
+/// tool-use step mid-run, so it is never a reliable run-level completion
+/// signal (RESEARCH Pitfall 1). The only decisive terminal signal is a
+/// `type:"error"` event (D-05); everything else defers to the last `text`
+/// event's marker or, absent that, to Layer 2.
+///
+/// Only decisive when the captured stdout is actually an OpenCode event
+/// stream (per [`is_opencode_event_stream`]) — a Codex or Claude capture
+/// returns `None` here and is handled by its own parser instead.
+///
+/// The `error` and torn-tail branches are added in a follow-up task; this
+/// happy-path version resolves the marker-scan and marker-less-defer cases.
+pub(crate) fn parse_opencode_event_result(stdout: &str) -> Option<AgentResult> {
+    let capture = ParsedCapture::parse(stdout);
+    let events = &capture.events;
+
+    if !is_opencode_event_stream(events) {
+        return None;
+    }
+
+    // D-04: the DEVFLOW_RESULT marker lives inside a `type:"text"` event's
+    // `part.text` field, never as a raw top-level stdout line (mirroring how
+    // Codex digs it out of `item.completed.agent_message.text`). Last
+    // matching `text` event wins, same "last wins" convention as
+    // `parse_marker_lines` and the Codex marker scan.
+    let marker = events.iter().rev().find_map(|v| {
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            return None;
+        }
+        let text = v.get("part")?.get("text")?.as_str()?;
+        parse_marker_lines(text)
+    });
+
+    if let Some(result) = marker {
+        // T-43-02: overwrite any agent-planted `decided_by_layer`, exactly as
+        // every other stream-marker-consuming parser in this module does.
+        return Some(normalise_stream_marker_provenance(result));
+    }
+
+    // No marker: defer to Layer 2 rather than an unconditional Success — a
+    // marker-less OpenCode run must never silently advance a stage (P-03).
+    None
+}
+
 /// Parse a captured stdout as JSONL: one `serde_json::Value` per non-blank,
 /// parseable line. Lines that are not valid JSON are dropped, so a stream
 /// interleaved with plain-text progress noise still yields its events.
@@ -2102,8 +2170,9 @@ fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
 /// last `result` event's marker decides; a marker-less last turn defers) →
 /// DEVFLOW_RESULT marker (portable; works for plain text and a Claude
 /// envelope's unwrapped `result` text) → Codex JSONL event stream
-/// (`turn.failed` decisive; `turn.completed` defers) → Codex plain-text
-/// rate-limit heuristic (least authoritative, stays last).
+/// (`turn.failed` decisive; `turn.completed` defers) → OpenCode JSONL event
+/// stream (an `error` event is decisive; a marker-less run defers, D-03..D-06)
+/// → Codex plain-text rate-limit heuristic (least authoritative, stays last).
 ///
 /// The Claude stream parser's position is load-bearing in BOTH directions
 /// (T-30-03). The two single-document detectors stay ahead of it because they
@@ -2130,6 +2199,7 @@ pub fn evaluate_layer1(project_root: &Path, phase: PhaseId) -> Option<AgentResul
         .or_else(|| parse_antigravity_event_result(&stdout))
         .or_else(|| parse_devflow_result(&stdout))
         .or_else(|| parse_codex_event_result(&stdout))
+        .or_else(|| parse_opencode_event_result(&stdout))
         .or_else(|| detect_codex_rate_limit(&stdout).map(rate_limited_result))
 }
 
@@ -3295,6 +3365,7 @@ fn prune_history(history_dir: &Path, retain: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::AgentDriver;
     use crate::config::GitFlowConfig;
     use crate::mode::Mode;
     use crate::stage::Stage;
@@ -4919,6 +4990,90 @@ mod tests {
         assert_eq!(
             parse_devflow_result(stdout).unwrap().status,
             AgentStatus::Success
+        );
+    }
+
+    // ---- OpenCode `run --auto --format json` event stream (phase 43) -------
+    //
+    // Three fixtures are REAL, verbatim `opencode run --auto --format json`
+    // captures vendored from `.planning/phases/43-opencode-driver-completion/
+    // 43-evidence/` (OPCD-02's own success criterion: regression-tested
+    // against a real capture, not an assumed schema):
+    //   - opencode_success.jsonl   — plain-text reply, no marker
+    //   - opencode_tool_use.jsonl  — a tool-invoking multi-step turn, no marker
+    //   - opencode_error.jsonl     — negative control, invalid --model, exit 1
+    //
+    // `opencode_success_with_marker.jsonl` is DERIVED, not live: none of the
+    // three real captures contains a DEVFLOW_RESULT marker (verified this
+    // session), so the marker-extraction path is proven against a hand-built
+    // fixture instead — the real success capture with a marker line appended
+    // to the `text` event's `part.text` field. This provenance is recorded
+    // here and in the filename itself, never as a comment inside the .jsonl
+    // (which would pollute the leak scan and the JSONL line count).
+
+    const OPENCODE_SUCCESS_CAPTURE: &str =
+        include_str!("../tests/fixtures/opencode/opencode_success.jsonl");
+    /// DERIVED, not a live capture — see the file-header note above.
+    const OPENCODE_SUCCESS_WITH_MARKER_CAPTURE: &str =
+        include_str!("../tests/fixtures/opencode/opencode_success_with_marker.jsonl");
+
+    /// RED-first regression (Task 1): a DEVFLOW_RESULT marker inside a
+    /// `type:"text"` event's `part.text` resolves at Layer 1 — D-04.
+    #[test]
+    fn opencode_marker_in_text_event_resolves_at_layer1() {
+        let result = parse_opencode_event_result(OPENCODE_SUCCESS_WITH_MARKER_CAPTURE).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// The verbatim real success capture carries no marker (verified this
+    /// session: its `text` event's value is literally `"OK"`) — it must be
+    /// recognised as an OpenCode stream but defer to Layer 2, never resolve
+    /// to Success on its own (OPCD-02, P-03).
+    #[test]
+    fn opencode_real_success_capture_is_recognised_and_marker_less() {
+        let capture = ParsedCapture::parse(OPENCODE_SUCCESS_CAPTURE);
+        assert!(is_opencode_event_stream(&capture.events));
+        assert!(parse_opencode_event_result(OPENCODE_SUCCESS_CAPTURE).is_none());
+    }
+
+    /// D-03/RESEARCH Pitfall 3: the detector must key on OpenCode-unique
+    /// `step_start`/`step_finish` events, not the generic `error` shape —
+    /// a Codex or Claude capture must not be misrouted into this parser.
+    #[test]
+    fn opencode_detector_rejects_foreign_streams() {
+        let codex_capture = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        let codex_events = ParsedCapture::parse(codex_capture).events;
+        assert!(!is_opencode_event_stream(&codex_events));
+
+        let claude_capture = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"abc\"}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n",
+        );
+        let claude_events = ParsedCapture::parse(claude_capture).events;
+        assert!(!is_opencode_event_stream(&claude_events));
+    }
+
+    /// OPCD-01/D-01: `build_command` emits the real headless launch argv as
+    /// five separate elements, never a joined `--format=json`.
+    #[test]
+    fn opencode_build_command_is_headless_json() {
+        let (program, args) =
+            crate::agents::opencode::OpenCodeDriver.build_command(PhaseId::new(7), "x", &[]);
+        assert_eq!(program, "opencode");
+        assert_eq!(args, ["run", "x", "--auto", "--format", "json"]);
+    }
+
+    /// D-02: prompt rendering is unaffected by the argv/parser changes.
+    #[test]
+    fn opencode_render_prompt_unchanged() {
+        let intent = crate::prompt::StageIntent::for_stage(Stage::Code, PhaseId::new(7));
+        assert_eq!(
+            crate::agents::opencode::OpenCodeDriver.render_prompt(&intent),
+            crate::prompt::render_claude_style(&intent)
         );
     }
 
