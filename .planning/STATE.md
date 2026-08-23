@@ -2,19 +2,20 @@
 gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
-current_phase: 42
-current_phase_name: hermes-driver
-status: "Phase 42 shipped — PR #137"
-stopped_at: Phase 43 context gathered
-last_updated: "2026-08-23T10:25:13.223Z"
-last_activity: 2026-08-21
-state_head: 3e810d3b78aebb33c3e6511c3b8fbf3eb031a94e
+current_phase: 43
+current_phase_name: opencode-driver-completion
+status: "Phase 43 planned — 2 plans, ready to execute"
+stopped_at: Phase 43 planning complete
+last_updated: "2026-08-23T14:34:16.447Z"
+last_activity: 2026-08-23
+last_activity_desc: Phase 43 planning complete
+state_head: 9c3358d89110474cc97664fab5231a05c1eb956d
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 6
+  total_plans: 8
   completed_plans: 6
-  percent: 33
+  percent: 50
 ---
 
 # DevFlow — Project State
@@ -154,10 +155,18 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 42 (hermes-driver) — READY TO EXECUTE
+Phase: 43 (opencode-driver-completion) — READY TO EXECUTE
 Plan: Not started
-Status: Phase 42 shipped — PR #137
-Last activity: 2026-08-21
+Status: Phase 43 planned — 2 plans, ready to execute
+Last activity: 2026-08-23 — Phase 43 planning complete
+
+**Decision coverage gate override (2026-08-23):** `check.decision-coverage-plan` returned
+`passed: false, reason: could-not-parse, covered: 0, uncovered: []` for 43-CONTEXT.md — a known
+parser false positive (D-03/D-05 bullets have an em dash inside the bold `**D-NN: ...**` header,
+breaking the naive header/body split; `covered:0` beside `uncovered:[]` is the tell, not a real
+gap). The independent gsd-plan-checker verification separately confirmed all 12 decisions
+(D-01–D-12) have explicit implementing tasks in 43-01/43-02-PLAN.md. Proceeded without replanning
+or reformatting the already-locked CONTEXT.md decision text.
 
 ## Recently Shipped
 

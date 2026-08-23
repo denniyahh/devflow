@@ -90,7 +90,12 @@ completion/verdict is parsed from the JSON events.
 **Plans**: 2 plans across 2 waves
 
 Plans:
+**Wave 1**
+
 - [ ] 43-01-PLAN.md — Tracer: headless `--auto --format json` argv through `parse_opencode_event_result` to a Layer-1 verdict, regression-tested against the three real captures (OPCD-01, OPCD-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 43-02-PLAN.md — Fail-closed credential health check, subagent capability probe, conformance re-verification, and the corrected doctor install hint (OPCD-03)
 
 ### Phase 44: Codex End-to-End Verification
