@@ -231,10 +231,11 @@ mod tests {
             crate::prompt::render_claude_style(&intent)
         );
 
-        // OpenCode: positional `run <prompt>` + byte-identical legacy prompt.
+        // OpenCode (43-01): headless `run <prompt> --auto --format json` +
+        // byte-identical legacy prompt (D-02 unchanged by the argv update).
         let (program, args) = OpenCodeDriver.build_command(PhaseId::new(7), "x", &[]);
         assert_eq!(program, "opencode");
-        assert_eq!(args, ["run", "x"]);
+        assert_eq!(args, ["run", "x", "--auto", "--format", "json"]);
         assert_eq!(
             OpenCodeDriver.render_prompt(&intent),
             crate::prompt::render_claude_style(&intent)
@@ -578,7 +579,7 @@ mod tests {
         let (program, args) =
             driver_for(AgentKind::OpenCode).build_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "opencode");
-        assert_eq!(args, ["run", prompt.as_str()]);
+        assert_eq!(args, ["run", prompt.as_str(), "--auto", "--format", "json"]);
     }
 
     /// 13-06 dogfood regression (Codex leg): linked-worktree git metadata
