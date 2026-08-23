@@ -579,10 +579,7 @@ mod tests {
         let (program, args) =
             driver_for(AgentKind::OpenCode).build_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "opencode");
-        assert_eq!(
-            args,
-            ["run", prompt.as_str(), "--auto", "--format", "json"]
-        );
+        assert_eq!(args, ["run", prompt.as_str(), "--auto", "--format", "json"]);
     }
 
     /// 13-06 dogfood regression (Codex leg): linked-worktree git metadata

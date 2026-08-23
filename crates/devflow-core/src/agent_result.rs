@@ -5076,6 +5076,8 @@ mod tests {
         include_str!("../tests/fixtures/opencode/opencode_success.jsonl");
     const OPENCODE_ERROR_CAPTURE: &str =
         include_str!("../tests/fixtures/opencode/opencode_error.jsonl");
+    const OPENCODE_TOOL_USE_CAPTURE: &str =
+        include_str!("../tests/fixtures/opencode/opencode_tool_use.jsonl");
     /// DERIVED, not a live capture — see the file-header note above.
     const OPENCODE_SUCCESS_WITH_MARKER_CAPTURE: &str =
         include_str!("../tests/fixtures/opencode/opencode_success_with_marker.jsonl");
@@ -5226,6 +5228,96 @@ mod tests {
         let result = parse_opencode_event_result(capture).unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.as_deref(), Some("boom"));
+    }
+
+    /// The real tool-use capture ends in a `"stop"`-reason `step_finish`
+    /// after a full second step, and carries no marker (verified this
+    /// session: its final `text` event value is literally `"DONE"`). A
+    /// parser that treated the trailing `step_finish` as terminal-success
+    /// would misclassify this as Success — assert it defers instead (P-03,
+    /// RESEARCH Pitfall 1).
+    #[test]
+    fn opencode_real_tool_use_capture_defers_to_layer2() {
+        let capture = ParsedCapture::parse(OPENCODE_TOOL_USE_CAPTURE);
+        assert!(is_opencode_event_stream(&capture.events));
+        assert!(parse_opencode_event_result(OPENCODE_TOOL_USE_CAPTURE).is_none());
+    }
+
+    /// Last `text` event wins (same "last wins" convention as
+    /// `parse_codex_event_result`'s marker scan) across a multi-step run.
+    #[test]
+    fn opencode_marker_wins_from_last_text_event() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"failed\\\",\\\"reason\\\":\\\"first\\\"}\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"tool-calls\"}}\n",
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"stop\"}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// RESEARCH Pitfall 1: an intermediate `"tool-calls"`-reason `step_finish`
+    /// with no marker must return `None`, not Success.
+    #[test]
+    fn opencode_intermediate_step_finish_is_not_terminal() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"tool_use\",\"part\":{\"type\":\"tool\",\"tool\":\"bash\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"tool-calls\"}}\n",
+        );
+        assert!(parse_opencode_event_result(capture).is_none());
+    }
+
+    /// Plain prose stdout, and a literally bare `{"type":"error"}` object
+    /// with NO nested `error` details and no `step_start`/`step_finish`
+    /// sighting, both return `None` from the detector gate — neither is
+    /// distinguishably an OpenCode stream. (Contrast
+    /// `opencode_real_error_capture_is_failed`: the real negative-control
+    /// capture DOES carry the full nested `error.name`/`error.data.message`
+    /// shape and resolves to `Failed` — see the Task 2 deviation note on
+    /// `is_opencode_event_stream`.)
+    #[test]
+    fn opencode_non_stream_input_returns_none() {
+        assert!(parse_opencode_event_result("Running the plan...\nDone.\n").is_none());
+
+        let bare_error = r#"{"type":"error"}"#;
+        assert!(parse_opencode_event_result(bare_error).is_none());
+    }
+
+    /// T-43-04: adversarially-shaped events (a string `part`, an array
+    /// `part.text`, a numeric top-level `type`) must not panic the parser.
+    #[test]
+    fn opencode_malformed_events_do_not_panic() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"text\",\"part\":\"not an object\"}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":[\"not\",\"a\",\"string\"]}}\n",
+            "{\"type\":42}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"stop\"}}\n",
+        );
+        // Must not panic; a marker-less, non-error stream defers to Layer 2.
+        assert!(parse_opencode_event_result(capture).is_none());
+    }
+
+    /// T-43-02 (negative control): a marker whose own JSON sets
+    /// `decided_by_layer` to `0` must still normalise to `Some(1)` — a model
+    /// cannot forge Layer-0 external-probe provenance via its self-report.
+    #[test]
+    fn opencode_marker_cannot_forge_layer0_provenance() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\",\\\"decided_by_layer\\\":0}\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"stop\"}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(
+            result.decided_by_layer,
+            Some(1),
+            "a planted decided_by_layer:0 must be overwritten to Layer 1"
+        );
     }
 
     // ---- Claude `--output-format stream-json` fixtures (plan 30-01) --------
