@@ -859,11 +859,30 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
 /// a bare `{"type":"error",...}` object is generic enough that another
 /// adapter's error envelope could otherwise be misrouted into this parser by
 /// `evaluate_layer1`'s cascade (T-43-07).
+///
+/// A single-event-only capture never gets a `step_start`, though: the real
+/// negative-control capture (`opencode_error.jsonl`, exit 1) is exactly ONE
+/// line — the process exits the instant the `error` event lands, before any
+/// `step_start`. A step-only gate would reject this genuine OpenCode stream
+/// (Rule 1 bug fix during implementation: the fixture proved it, `cargo test`
+/// caught it). The fix stays narrow rather than gating on `type:"error"`
+/// alone: it also requires OpenCode's OWN nested envelope shape
+/// (`error.name` as a string, matching the verified `{"error":{"name":...,
+/// "data":{"message":...}}}` structure) — no adapter in this codebase emits
+/// that combination for anything but OpenCode (Codex's failure event is
+/// `type:"turn.failed"`, not `type:"error"`; Claude's is `is_error: true`
+/// inside `type:"result"`), so T-43-07's collision concern still holds.
 pub(crate) fn is_opencode_event_stream(events: &[serde_json::Value]) -> bool {
     events.iter().any(|v| {
-        v.get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|t| t == "step_start" || t == "step_finish")
+        let t = v.get("type").and_then(serde_json::Value::as_str);
+        if t.is_some_and(|t| t == "step_start" || t == "step_finish") {
+            return true;
+        }
+        t == Some("error")
+            && v.get("error")
+                .and_then(|e| e.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
     })
 }
 
@@ -882,14 +901,56 @@ pub(crate) fn is_opencode_event_stream(events: &[serde_json::Value]) -> bool {
 /// stream (per [`is_opencode_event_stream`]) — a Codex or Claude capture
 /// returns `None` here and is handled by its own parser instead.
 ///
-/// The `error` and torn-tail branches are added in a follow-up task; this
-/// happy-path version resolves the marker-scan and marker-less-defer cases.
 pub(crate) fn parse_opencode_event_result(stdout: &str) -> Option<AgentResult> {
     let capture = ParsedCapture::parse(stdout);
     let events = &capture.events;
 
     if !is_opencode_event_stream(events) {
         return None;
+    }
+
+    // D-06: same trailing-torn rule as Codex, verbatim rationale — a torn
+    // trailing line is exactly where an `error` event would live, so an
+    // earlier surviving marker must not stand in for it. Predicate is
+    // `|_| true`: OpenCode has no `is_top_level`-style filtered predicate to
+    // match against; every emitted event matters equally. Runs BEFORE the
+    // error scan and the marker scan, matching Codex's ordering.
+    if capture.torn_json_after_last_matching(|_| true) {
+        return Some(indeterminate_capture_failure());
+    }
+
+    // D-05: an `error` event anywhere in the stream is a hard failure
+    // signal and must not be overridden by an earlier success marker
+    // (999.107 #1 precedence lesson). Scanned for PRESENCE anywhere, not
+    // just the last line — the three real captures all show `error` as the
+    // sole and final event, but RESEARCH assumption A3 deliberately does not
+    // assume trailing placement.
+    if let Some(err_event) = events
+        .iter()
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("error"))
+    {
+        let reason = err_event
+            .get("error")
+            .and_then(|e| {
+                e.get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| e.get("name").and_then(serde_json::Value::as_str))
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| "opencode reported an error event".to_string());
+        // OpenCode's error event carries no marker-shaped fields to merge
+        // onto the Failed result the way Codex's turn.failed arm does — no
+        // fields are copied from an earlier marker.
+        return Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(reason),
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(1),
+        });
     }
 
     // D-04: the DEVFLOW_RESULT marker lives inside a `type:"text"` event's
@@ -5013,6 +5074,8 @@ mod tests {
 
     const OPENCODE_SUCCESS_CAPTURE: &str =
         include_str!("../tests/fixtures/opencode/opencode_success.jsonl");
+    const OPENCODE_ERROR_CAPTURE: &str =
+        include_str!("../tests/fixtures/opencode/opencode_error.jsonl");
     /// DERIVED, not a live capture — see the file-header note above.
     const OPENCODE_SUCCESS_WITH_MARKER_CAPTURE: &str =
         include_str!("../tests/fixtures/opencode/opencode_success_with_marker.jsonl");
@@ -5075,6 +5138,94 @@ mod tests {
             crate::agents::opencode::OpenCodeDriver.render_prompt(&intent),
             crate::prompt::render_claude_style(&intent)
         );
+    }
+
+    /// OPCD-02 (torn tail): a torn trailing line after the last parsed event
+    /// returns `indeterminate_capture_failure()`'s reason — D-06.
+    #[test]
+    fn opencode_torn_tail_after_marker_is_indeterminate() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"stop\"", // torn: missing closing braces
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("stream capture ends in an unparseable line; the final verdict is indeterminate")
+        );
+    }
+
+    /// OPCD-02 (torn tail vs. error ordering): a capture with both a torn
+    /// tail and an `error` event resolves deterministically — the torn-tail
+    /// check runs first, matching Codex's order.
+    #[test]
+    fn opencode_torn_tail_beats_error_event_ordering_is_stable() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"UnknownError\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"reason\":\"stop\"", // torn
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("stream capture ends in an unparseable line; the final verdict is indeterminate")
+        );
+    }
+
+    /// The verbatim real error capture (`opencode_error.jsonl`) resolves to
+    /// `Failed` with the provider's own message, at Layer 1 — D-05.
+    #[test]
+    fn opencode_real_error_capture_is_failed() {
+        let result = parse_opencode_event_result(OPENCODE_ERROR_CAPTURE).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("Unexpected server error. Check server logs for details.")
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// D-05 fallback: a synthetic `error` event carrying `error.name` but no
+    /// `error.data.message` yields a `reason` of the bare name.
+    #[test]
+    fn opencode_error_reason_falls_back_to_name() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"UnknownError\"}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("UnknownError"));
+    }
+
+    /// T-43-04: a non-string `error.data.message` must not panic the parser
+    /// and must fall through to the generic fallback reason.
+    #[test]
+    fn opencode_error_reason_survives_non_string_message() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"UnknownError\",\"data\":{\"message\":42}}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("UnknownError"));
+    }
+
+    /// 999.107 #1 (negative control): a success marker found EARLIER in the
+    /// stream must never override a LATER `error` event.
+    #[test]
+    fn opencode_error_event_overrides_earlier_success_marker() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"UnknownError\",\"data\":{\"message\":\"boom\"}}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("boom"));
     }
 
     // ---- Claude `--output-format stream-json` fixtures (plan 30-01) --------
