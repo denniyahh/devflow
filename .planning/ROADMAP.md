@@ -382,6 +382,82 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.109: Self-Dogfood Staleness Check's Build-Relevance Heuristic Matches Any `.rs`/`Cargo.toml` Repo-Wide, Not Just Workspace Members (BACKLOG)
+
+**Found:** 2026-08-23, dogfooding Phase 43 (OpenCode Driver Completion) via `devflow start`. A bulk
+`.planning/` git-tracking commit on `workspace/denniyahh` incidentally re-tracked
+`.planning/spikes/socket-supervisor/{Cargo.toml,main.rs}` — a standalone, non-workspace-member spike
+crate (`sockspike`, not listed in the root `Cargo.toml`'s `[workspace] members`) with zero effect on
+the compiled `devflow` binary. `affects_compiled_binary` (`crates/devflow-cli/src/staleness.rs`)
+matches by filename suffix (`.rs`/`Cargo.toml`/`Cargo.lock`/`build.rs`/`rust-toolchain.toml`)
+anywhere in the repository tree — not scoped to the actual workspace members. Because
+`workspace/denniyahh` now tracks `.planning/` while `develop` does not (a deliberate personal-branch
+choice, 2026-08-23), any phase worktree branched from `develop` shows these two files as "added" in
+the ancestry-range diff (`git diff --name-only embedded_commit HEAD`) every single time — genuine
+divergence, neither commit ever an ancestor of the other — permanently tripping the D-18 self-dogfood
+block (`self-dogfood stale build blocked`) for every future phase's `--mode auto` launch, regardless
+of rebuilding.
+
+**The item:** Scope `affects_compiled_binary` (or `ancestry_range_affects_build`, which calls it) to
+the actual compiled workspace — parse the root `Cargo.toml`'s `[workspace] members` list (or
+equivalently restrict matching to paths under `crates/`) rather than matching bare filename
+extensions repo-wide. A `.planning/` spike/experiment directory containing its own throwaway
+`Cargo.toml`/`.rs` file must never be treated as build-relevant to the actual `devflow` binary.
+
+**Immediate workaround applied:** untracked the two offending files from `workspace/denniyahh`
+(commit `8f93a5e`) rather than fixing the checker — the checker's own scope is unchanged, so this
+exact false-positive class will recur the moment any `.planning/` spike/experiment with a
+`.rs`/`Cargo.*` file gets tracked there again.
+
+**Priority:** Medium — doesn't block any single phase today (per-incident workaround: untrack the
+specific offending paths, or use `--mode supervise` which only reports-and-proceeds on the related
+but distinct unattended-chain-flag gate), but will keep recurring silently until scoped properly.
+**Size:** S — the fix is one function's matching logic plus new unit tests (a workspace-member file
+must still be flagged stale; a non-member file with the identical extension must not).
+
+**Depends on:** nothing structural. Related but separate: 999.110 (worktrees branched from `develop`
+start with no `.planning/` at all, since `develop` doesn't track it — blocks `--mode auto`'s
+"GSD config can hold the chain flag" preflight check for every phase, not just this one).
+
+---
+
+### Phase 999.110: `--mode auto` Is Structurally Blocked for Every Phase Because `develop`-Based Worktrees Carry No `.planning/` (BACKLOG)
+
+**Found:** 2026-08-23, dogfooding Phase 43 via `devflow start --agent claude --mode auto --until
+validate`. The run reached Define, then `preflight_unattended_launch_check`'s "GSD config can hold
+the chain flag" condition (`unattended_config_condition`, `crates/devflow-cli/src/preflight.rs`)
+refused with `no .planning/config.json under the launch root`. Root cause: DevFlow branches every
+phase worktree from `develop` (`git worktree add -b feature/phase-{N} … develop`), and `develop`
+does not track `.planning/` at all (confirmed: `git ls-tree -r develop -- .planning` is empty) — so
+a brand-new worktree starts with zero `.planning/` content, including `config.json`. This check is
+scoped to `Stage::Define | Stage::Code` and is **fail-closed only under `Mode::Auto`**
+(`unattended_launch_check_reporting_to`: `if state.mode != Mode::Auto { return Ok(()) }` —
+`--mode supervise` reports the same evaluation but never refuses). So today, `--mode auto` cannot
+launch Define or Code on any phase, unconditionally, until something puts a valid
+`.planning/config.json` in the worktree.
+
+**The item:** Decide and implement one of: (a) have DevFlow's own worktree creation seed the new
+worktree's `.planning/` from the launch root (copy or symlink, not a git-tracked dependency) so
+`config.json`/`ROADMAP.md`/etc. are present regardless of what `develop` tracks; (b) branch phase
+worktrees from the current branch instead of always `develop` when the current branch carries
+`.planning/`; or (c) track `.planning/` on `develop` too (rejected 2026-08-23 — the operator
+explicitly wants it personal-workspace-only). Whichever is chosen must not reintroduce the
+Phase-16-era coupling `.gitignore` groups `.planning/` under ("runtime states, local databases").
+
+**Immediate workaround applied:** used `--mode supervise` instead of `--mode auto` for the Phase 43
+dogfood run — it runs Define→Plan→Code autonomously exactly like `auto` and still gates at Validate,
+so it satisfies "full auto until validate" without hitting this block. Does not fix the underlying
+gap; every future `--mode auto` launch will hit the identical refusal.
+
+**Priority:** High — `--mode auto` (the documented "runs to Ship unattended" mode) is currently
+unusable for any phase, not a corner case. **Size:** M — touches worktree creation and/or the
+preflight condition, needs tests for both the seeding mechanism and the fail-closed check.
+
+**Depends on:** nothing structural. Related but separate: 999.109 (a different false-positive in the
+adjacent self-dogfood staleness check, found in the same dogfood run).
+
+---
+
 ### Phase 999.108: GSD Subagent Dispatch Is Unavailable From the Pi Runtime (BACKLOG)
 
 **Linear:** [DEN-114](https://linear.app/denniskim/issue/DEN-114)
