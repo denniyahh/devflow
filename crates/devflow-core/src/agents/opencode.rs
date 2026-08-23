@@ -16,13 +16,19 @@
 //! never used as the readiness probe — it always lists opencode's own free
 //! catalog entries and would false-green a machine with zero configured
 //! credentials (D-09).
+//!
+//! `capabilities` (43-02, OPCD-03/D-10) probes `opencode agent list` for a
+//! configured subagent- or all-mode agent. Any probe failure, non-zero exit,
+//! or unparseable output fails closed to `subagent_dispatch: false` — this
+//! probe must never refuse a launch; only `health` may.
 
 use crate::phase_id::PhaseId;
 
 /// The modular driver for OpenCode (37-02/43-01/43-02): headless
 /// `--auto --format json` launch, JSONL completion parsing delegated to
-/// `agent_result::parse_opencode_event_result`, legacy prompt rendering, and
-/// a fail-closed credential health check.
+/// `agent_result::parse_opencode_event_result`, legacy prompt rendering, a
+/// fail-closed credential health check, and a fail-closed subagent-dispatch
+/// capability probe.
 pub struct OpenCodeDriver;
 
 impl super::AgentDriver for OpenCodeDriver {
@@ -86,6 +92,16 @@ impl super::AgentDriver for OpenCodeDriver {
             Err("no OpenCode provider credential configured".to_string())
         }
     }
+
+    /// Fail-closed subagent-dispatch capability probe (OPCD-03, D-10,
+    /// T-43-10). This probe can never refuse a launch — only `health` may;
+    /// the return type carries that guarantee (`DriverCapabilities`, not a
+    /// `Result`).
+    fn capabilities(&self) -> super::DriverCapabilities {
+        super::DriverCapabilities {
+            subagent_dispatch: opencode_subagent_dispatch_available(),
+        }
+    }
 }
 
 /// Hand-rolled SGR escape-sequence scrubber: on `\u{1b}` followed by `[`,
@@ -139,12 +155,58 @@ fn opencode_configured_provider_count(stdout: &str) -> u32 {
         .sum()
 }
 
+/// Probe whether OpenCode has a genuinely dispatchable subagent configured.
+/// Mirrors Hermes's `_with(output_fn)` split (`hermes.rs`) rather than Pi's
+/// bare spawn, since no stub-binary spawn path itself needs testing here —
+/// only the classification of an arbitrary `Output`.
+fn opencode_subagent_dispatch_available() -> bool {
+    opencode_subagent_dispatch_available_with(|| {
+        std::process::Command::new("opencode")
+            .args(["agent", "list"])
+            .output()
+    })
+}
+
+/// Mockable inner form of [`opencode_subagent_dispatch_available`]. Fails
+/// closed to `false` on a spawn error, a non-zero exit, empty stdout, or no
+/// matching header line — never a panic, and never a signal that could
+/// refuse a launch (only `health` may refuse).
+///
+/// **Honest limit (A4):** the header-line form (`<name> (<mode>)`) is
+/// inferred from `opencode agent create --help`'s documented `--mode`
+/// choices (`primary`/`subagent`/`all`) plus one live single-agent baseline
+/// (`build (primary)`) — no live capture of a real configured subagent
+/// exists on this machine. A substring match tolerates some spacing drift
+/// but is not proven against real subagent output; a miss costs a false
+/// negative, which is the safe direction.
+fn opencode_subagent_dispatch_available_with(
+    output_fn: impl FnOnce() -> std::io::Result<std::process::Output>,
+) -> bool {
+    let Ok(output) = output_fn() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    parse_opencode_agent_list_for_subagent(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure classifier over `opencode agent list` stdout: a dispatchable
+/// subagent is any header line carrying the `(subagent)` or `(all)` mode
+/// marker. The default `build` agent is `(primary)` and must never count.
+fn parse_opencode_agent_list_for_subagent(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .any(|line| line.contains("(subagent)") || line.contains("(all)"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agents::AgentDriver;
     use crate::mode::Mode;
     use crate::state::{AgentKind, State};
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::Mutex;
 
     /// Serializes tests that mutate the process-global `PATH` (`set_var` is
@@ -341,5 +403,97 @@ mod tests {
 
         let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
         assert_eq!(argv, "providers\nlist\n");
+    }
+
+    // --- Task 2: subagent-dispatch capability probe (spawn-free, mockable
+    // `_with(output_fn)` form only — the stub-binary harness above stays
+    // confined to `health`, where the spawn path itself is under test) ---
+
+    fn mock_output(exit_code: i32, stdout: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn agent_list_baseline_reports_no_subagent() {
+        let baseline = "build (primary)\n  [\n  {\n    \"permission\": \"*\",\n";
+        assert!(!parse_opencode_agent_list_for_subagent(baseline));
+    }
+
+    #[test]
+    fn agent_list_with_subagent_mode_reports_true() {
+        let with_subagent =
+            "build (primary)\n  [\n  {\n    \"permission\": \"*\",\n  reviewer (subagent)\n";
+        assert!(parse_opencode_agent_list_for_subagent(with_subagent));
+    }
+
+    #[test]
+    fn agent_list_with_all_mode_reports_true() {
+        let with_all = "build (primary)\n  [\n  {\n    \"permission\": \"*\",\n  helper (all)\n";
+        assert!(parse_opencode_agent_list_for_subagent(with_all));
+    }
+
+    #[test]
+    fn subagent_probe_fails_closed_on_spawn_error() {
+        let result = opencode_subagent_dispatch_available_with(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not found",
+            ))
+        });
+        assert!(!result);
+    }
+
+    #[test]
+    fn subagent_probe_fails_closed_on_nonzero_exit() {
+        let result = opencode_subagent_dispatch_available_with(|| {
+            Ok(mock_output(1, "reviewer (subagent)\n"))
+        });
+        assert!(
+            !result,
+            "a non-zero exit must fail closed even when stdout would otherwise classify true"
+        );
+    }
+
+    #[test]
+    fn subagent_probe_fails_closed_on_empty_output() {
+        let result = opencode_subagent_dispatch_available_with(|| Ok(mock_output(0, "")));
+        assert!(!result);
+    }
+
+    /// Mirrors `OpenCodeDriver::capabilities`'s exact wrapping
+    /// (`super::DriverCapabilities { subagent_dispatch: ... }`) across every
+    /// failure mode above, proving the probe's return type can never be a
+    /// `Result` that would let it refuse a launch — a spawn error, a
+    /// non-zero exit, and empty output all resolve to a valid
+    /// `DriverCapabilities` value, never a panic or an early return.
+    #[test]
+    fn capabilities_never_refuses_a_launch() {
+        type OutputFn = Box<dyn FnOnce() -> std::io::Result<std::process::Output>>;
+        let cases: Vec<(&str, OutputFn)> = vec![
+            (
+                "spawn error",
+                Box::new(|| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "not found",
+                    ))
+                }),
+            ),
+            (
+                "non-zero exit",
+                Box::new(|| Ok(mock_output(1, "reviewer (subagent)\n"))),
+            ),
+            ("empty output", Box::new(|| Ok(mock_output(0, "")))),
+        ];
+        for (label, case) in cases {
+            let caps = super::super::DriverCapabilities {
+                subagent_dispatch: opencode_subagent_dispatch_available_with(case),
+            };
+            assert!(!caps.subagent_dispatch, "{label} must fail closed");
+        }
     }
 }
