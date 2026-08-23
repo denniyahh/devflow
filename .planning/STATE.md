@@ -3,16 +3,16 @@ gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 43
-current_phase_name: opencode-driver-completion
-status: "Phase 43 planned — 2 plans, ready to execute"
+current_phase_name: OpenCode Driver Completion
+status: executing
 stopped_at: Phase 43 planning complete
-last_updated: "2026-08-23T14:34:16.447Z"
+last_updated: "2026-08-23T19:22:03.751Z"
 last_activity: 2026-08-23
-last_activity_desc: Phase 43 planning complete
-state_head: 9c3358d89110474cc97664fab5231a05c1eb956d
+last_activity_desc: Phase 43 execution resumed (wave continue)
+state_head: 73fa973dc0cab79c1d1b65d854bd0200846181cc
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 8
   completed_plans: 6
   percent: 50
@@ -155,10 +155,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 43 (opencode-driver-completion) — READY TO EXECUTE
-Plan: Not started
-Status: Phase 43 planned — 2 plans, ready to execute
-Last activity: 2026-08-23 — Phase 43 planning complete
+Phase: 43 (OpenCode Driver Completion) — EXECUTING
+Plan: 1 of 2
+Status: Executing Phase 43
+Last activity: 2026-08-23 — Phase 43 execution resumed (wave continue)
 
 **Decision coverage gate override (2026-08-23):** `check.decision-coverage-plan` returned
 `passed: false, reason: could-not-parse, covered: 0, uncovered: []` for 43-CONTEXT.md — a known

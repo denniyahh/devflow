@@ -87,16 +87,16 @@ completion/verdict is parsed from the JSON events.
   3. The health check fails closed when OpenCode is not usable.
   4. The driver passes the shared conformance suite.
 
-**Plans**: 2 plans across 2 waves
+**Plans**: 2/2 plans executed across 2 waves
 
 Plans:
 **Wave 1**
 
-- [ ] 43-01-PLAN.md — Tracer: headless `--auto --format json` argv through `parse_opencode_event_result` to a Layer-1 verdict, regression-tested against the three real captures (OPCD-01, OPCD-02)
+- [x] 43-01-PLAN.md — Tracer: headless `--auto --format json` argv through `parse_opencode_event_result` to a Layer-1 verdict, regression-tested against the three real captures (OPCD-01, OPCD-02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 43-02-PLAN.md — Fail-closed credential health check, subagent capability probe, conformance re-verification, and the corrected doctor install hint (OPCD-03)
+- [x] 43-02-PLAN.md — Fail-closed credential health check, subagent capability probe, conformance re-verification, and the corrected doctor install hint (OPCD-03)
 
 ### Phase 44: Codex End-to-End Verification
 
@@ -228,7 +228,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 40 | 2/2 | Complete   | 2026-08-18 |
 | 41 | — | Not started | — |
 | 42 | — | Not started | — |
-| 43 | — | Not started | — |
+| 43 | 2/2 | In Progress|  |
 | 44 | — | Not started | — |
 | 45 | — | Not started | — |
 
