@@ -436,13 +436,18 @@ scoped to `Stage::Define | Stage::Code` and is **fail-closed only under `Mode::A
 launch Define or Code on any phase, unconditionally, until something puts a valid
 `.planning/config.json` in the worktree.
 
-**The item:** Decide and implement one of: (a) have DevFlow's own worktree creation seed the new
-worktree's `.planning/` from the launch root (copy or symlink, not a git-tracked dependency) so
-`config.json`/`ROADMAP.md`/etc. are present regardless of what `develop` tracks; (b) branch phase
-worktrees from the current branch instead of always `develop` when the current branch carries
-`.planning/`; or (c) track `.planning/` on `develop` too (rejected 2026-08-23 — the operator
-explicitly wants it personal-workspace-only). Whichever is chosen must not reintroduce the
-Phase-16-era coupling `.gitignore` groups `.planning/` under ("runtime states, local databases").
+**The item — DECIDED (operator, 2026-08-23):** modify worktree creation to check for the branch
+that has a tracked `.planning/` folder and fork off of THAT branch, instead of hardcoding `develop`
+as the base. Concretely: before `git worktree add -b feature/phase-{N} … develop`, detect which
+branch (`workspace/denniyahh` today, but the check should not hardcode that name either — it should
+detect "the branch with a tracked `.planning/`") actually carries `.planning/`, and base the new
+worktree/branch off that one instead. This directly fixes the missing-`config.json` (and missing
+`ROADMAP.md`/`CONTEXT.md`/everything else) problem at the source, without reintroducing `.planning/`
+tracking on `develop` (rejected 2026-08-23 — the operator wants it personal-workspace-only) and
+without a runtime copy/symlink workaround. Whichever exact detection mechanism is chosen (e.g. "the
+branch this session is running from, if it tracks `.planning/`" vs. a more general scan) must not
+reintroduce the Phase-16-era coupling `.gitignore` groups `.planning/` under ("runtime states, local
+databases").
 
 **Immediate workaround applied:** used `--mode supervise` instead of `--mode auto` for the Phase 43
 dogfood run — it runs Define→Plan→Code autonomously exactly like `auto` and still gates at Validate,
