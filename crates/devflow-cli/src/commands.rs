@@ -2314,12 +2314,7 @@ fn doctor_checks() -> Vec<Check> {
             "npm i -g @anthropic-ai/claude-code",
         ),
         cmd_check("codex", "codex", "--version", "npm i -g @openai/codex"),
-        cmd_check(
-            "opencode",
-            "opencode",
-            "--version",
-            "cargo install opencode",
-        ),
+        cmd_check("opencode", "opencode", "--version", "npm i -g opencode-ai"),
         cmd_check(
             "pi",
             "pi",
