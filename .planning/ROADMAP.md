@@ -16,7 +16,7 @@ change.
 | 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
 | 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Complete    |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
-| 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Not started |
+| 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Complete    |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |
 | 45 | Opportunistic Cleanup (999.94) | DECN-01 | Not started |
 
@@ -390,6 +390,48 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
+
+### Phase 999.111: `devflow` Never Detects or Runs the Security Verdict Before Ship — Discovers the Gap Only at Ship Time (BACKLOG)
+
+**Found:** 2026-08-24, dogfooding Phase 43 through Ship. The Ship-stage agent's own preflight
+(`ship:pre` hooks) correctly refused to push/create a PR: `workflow.security_enforcement` is
+`true` in this project's config, which requires a `43-SECURITY.md` with `threats_open: 0` — but
+none existed. The agent behaved correctly (reported `DEVFLOW_RESULT: {"status": "failed", ...}`
+rather than routing around a policy gate that was outside its given scope) — this item is about
+*why the gap existed in the first place*, not about the agent's handling of it.
+
+**Root cause:** `devflow` and GSD's own hook config are two disconnected systems.
+`gsd_run loop render-hooks verify:post --raw` already declares a `security` capability step
+(`capId: security`, `ref.skill: secure-phase`, `when: workflow.security_enforcement`,
+`produces: SECURITY.md`, `onError: halt`) alongside `nyquist`/`mempalace`/`ui` — this is exactly
+the mechanism that would generate `SECURITY.md` automatically. But `devflow`'s own hardcoded
+Validate→Ship hook list (`crates/devflow-core/src/hooks.rs:102`,
+`(Stage::Validate, Stage::Ship) => vec![Hook::DocsUpdate]`) never reads or wires GSD's
+`verify:post` config at all — it only ever runs `DocsUpdate`. So a `devflow start`-driven phase
+with `workflow.security_enforcement` on will **always** discover the missing `SECURITY.md` for
+the first time at Ship, after a full Ship-stage agent invocation (real cost, real time) has
+already been spent just to report the gap and halt.
+
+**The item:** `devflow`'s pipeline should detect, before or at the Validate→Ship transition,
+whether `workflow.security_enforcement` (and by the same logic, `workflow.nyquist_validation`,
+`mempalace.enabled`, `workflow.ui_review`) is active and its artifact is missing — and if so,
+either (a) invoke the corresponding GSD hook step itself as part of the Validate→Ship hook list
+in `hooks.rs` (mirroring `DocsUpdate`'s pattern), or (b) at minimum surface the gap as a Validate-
+stage finding rather than a Ship-stage hard failure, so the cost of discovering it is one aborted
+stage transition, not a wasted full agent run. Given `hooks.rs`'s `Hook` enum is devflow's own
+closed set, wiring GSD's dynamically-configured hook list in is a real design question (static
+enum arm vs. a generic "run this GSD skill" hook variant) — worth a proper phase, not a quick
+patch.
+
+**Priority:** Medium — doesn't block ship once the gap is manually closed (as done here via a
+direct `/gsd-secure-phase 43` run), but will recur for every future phase with security/nyquist/
+mempalace/ui-review enforcement on, each time costing a full wasted Ship-stage agent invocation.
+**Size:** M — touches `hooks.rs`'s hook-selection logic and needs a design decision on how a
+static Rust enum consumes a dynamically-configured GSD hook list.
+
+**Depends on:** nothing structural.
+
+---
 
 ### Phase 999.109: Self-Dogfood Staleness Check's Build-Relevance Heuristic Matches Any `.rs`/`Cargo.toml` Repo-Wide, Not Just Workspace Members (BACKLOG)
 
