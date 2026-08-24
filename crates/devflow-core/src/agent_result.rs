@@ -919,17 +919,23 @@ pub(crate) fn parse_opencode_event_result(stdout: &str) -> Option<AgentResult> {
         return Some(indeterminate_capture_failure());
     }
 
-    // D-05: an `error` event anywhere in the stream is a hard failure
-    // signal and must not be overridden by an earlier success marker
-    // (999.107 #1 precedence lesson). Scanned for PRESENCE anywhere, not
-    // just the last line — the three real captures all show `error` as the
-    // sole and final event, but RESEARCH assumption A3 deliberately does not
-    // assume trailing placement.
-    if let Some(err_event) = events
-        .iter()
-        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("error"))
-    {
-        let reason = err_event
+    // 43-REVIEW.md WR-03/WR-04: find the LAST error event and the LAST
+    // marker-bearing text event (each independently "last wins", matching
+    // every other decisive scan in this module — Codex's `terminal` scan,
+    // both marker scans, Claude's `last_top_level_result`), then let
+    // whichever occurs LATER in the stream decide the verdict. This
+    // replaces the old "an error anywhere unconditionally beats any marker"
+    // rule: that rule was right about an error that OUTLASTS a marker
+    // (999.107 #1 — an earlier success marker must not survive a later
+    // failure) but wrong about the reverse (an error that is itself
+    // superseded by a later, genuine success marker). D-04's own comment
+    // conceded this was unproven; chronological precedence is the strictly
+    // more correct version of the same rule, not a weakening of it.
+    let error = events.iter().enumerate().rev().find_map(|(i, v)| {
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+            return None;
+        }
+        let reason = v
             .get("error")
             .and_then(|e| {
                 e.get("data")
@@ -939,42 +945,50 @@ pub(crate) fn parse_opencode_event_result(stdout: &str) -> Option<AgentResult> {
             })
             .map(str::to_string)
             .unwrap_or_else(|| "opencode reported an error event".to_string());
-        // OpenCode's error event carries no marker-shaped fields to merge
-        // onto the Failed result the way Codex's turn.failed arm does — no
-        // fields are copied from an earlier marker.
-        return Some(AgentResult {
-            status: AgentStatus::Failed,
-            exit_code: None,
-            reason: Some(reason),
-            commits: None,
-            summary: None,
-            verdict: None,
-            decided_by_layer: Some(1),
-        });
-    }
+        Some((i, reason))
+    });
 
     // D-04: the DEVFLOW_RESULT marker lives inside a `type:"text"` event's
     // `part.text` field, never as a raw top-level stdout line (mirroring how
-    // Codex digs it out of `item.completed.agent_message.text`). Last
-    // matching `text` event wins, same "last wins" convention as
-    // `parse_marker_lines` and the Codex marker scan.
-    let marker = events.iter().rev().find_map(|v| {
+    // Codex digs it out of `item.completed.agent_message.text`).
+    let marker = events.iter().enumerate().rev().find_map(|(i, v)| {
         if v.get("type").and_then(serde_json::Value::as_str) != Some("text") {
             return None;
         }
         let text = v.get("part")?.get("text")?.as_str()?;
-        parse_marker_lines(text)
+        parse_marker_lines(text).map(|result| (i, result))
     });
 
-    if let Some(result) = marker {
-        // T-43-02: overwrite any agent-planted `decided_by_layer`, exactly as
-        // every other stream-marker-consuming parser in this module does.
-        return Some(normalise_stream_marker_provenance(result));
+    match (error, marker) {
+        (Some((error_idx, _reason)), Some((marker_idx, result))) if marker_idx > error_idx => {
+            // The marker is chronologically LATER than the error — a genuine
+            // success (or self-reported failure) that supersedes it.
+            // T-43-02: overwrite any agent-planted `decided_by_layer`, same
+            // as every other stream-marker-consuming parser in this module.
+            Some(normalise_stream_marker_provenance(result))
+        }
+        (Some((_, reason)), _) => {
+            // No later marker exists, or the marker is earlier than (or
+            // superseded by) this error — the error is decisive.
+            // OpenCode's error event carries no marker-shaped fields to
+            // merge onto the Failed result the way Codex's turn.failed arm
+            // does — no fields are copied from an earlier marker.
+            Some(AgentResult {
+                status: AgentStatus::Failed,
+                exit_code: None,
+                reason: Some(reason),
+                commits: None,
+                summary: None,
+                verdict: None,
+                decided_by_layer: Some(1),
+            })
+        }
+        (None, Some((_, result))) => Some(normalise_stream_marker_provenance(result)),
+        // No marker: defer to Layer 2 rather than an unconditional Success —
+        // a marker-less OpenCode run must never silently advance a stage
+        // (P-03).
+        (None, None) => None,
     }
-
-    // No marker: defer to Layer 2 rather than an unconditional Success — a
-    // marker-less OpenCode run must never silently advance a stage (P-03).
-    None
 }
 
 /// Parse a captured stdout as JSONL: one `serde_json::Value` per non-blank,
@@ -5056,10 +5070,15 @@ mod tests {
 
     // ---- OpenCode `run --auto --format json` event stream (phase 43) -------
     //
-    // Three fixtures are REAL, verbatim `opencode run --auto --format json`
-    // captures vendored from `.planning/phases/43-opencode-driver-completion/
-    // 43-evidence/` (OPCD-02's own success criterion: regression-tested
-    // against a real capture, not an assumed schema):
+    // Three fixtures are REDACTED from real, live `opencode run --auto
+    // --format json` captures vendored from
+    // `.planning/phases/43-opencode-driver-completion/43-evidence/` (OPCD-02's
+    // own success criterion: regression-tested against a real capture, not an
+    // assumed schema) — event types, structure, text content, and error
+    // messages are byte-for-byte the real capture; session/message/part IDs
+    // and per-call cost/token figures are synthetic placeholders (43-REVIEW.md
+    // WR-05: the original values were real operational metadata from an
+    // authenticated session, not test-relevant):
     //   - opencode_success.jsonl   — plain-text reply, no marker
     //   - opencode_tool_use.jsonl  — a tool-invoking multi-step turn, no marker
     //   - opencode_error.jsonl     — negative control, invalid --model, exit 1
@@ -5228,6 +5247,38 @@ mod tests {
         let result = parse_opencode_event_result(capture).unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.as_deref(), Some("boom"));
+    }
+
+    /// 43-REVIEW.md WR-04 fix: the OTHER direction of the same precedence
+    /// rule — an `error` event found EARLIER in the stream must not override
+    /// a LATER, genuine success marker (a recovered transient error followed
+    /// by real completion). Before this fix, "error anywhere unconditionally
+    /// wins" would have wrongly resolved this to Failed.
+    #[test]
+    fn opencode_later_success_marker_overrides_earlier_error() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"TransientError\",\"data\":{\"message\":\"retrying\"}}}\n",
+            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// 43-REVIEW.md WR-03: the error scan itself must be last-match, not
+    /// first-match, consistent with every other decisive scan in this
+    /// module. Two error events with different messages and no marker at
+    /// all — the LATER message must be reported, not the first.
+    #[test]
+    fn opencode_error_scan_reports_the_last_error_not_the_first() {
+        let capture = concat!(
+            "{\"type\":\"step_start\"}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"First\",\"data\":{\"message\":\"first-error\"}}}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"Second\",\"data\":{\"message\":\"second-error\"}}}\n",
+        );
+        let result = parse_opencode_event_result(capture).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("second-error"));
     }
 
     /// The real tool-use capture ends in a `"stop"`-reason `step_finish`

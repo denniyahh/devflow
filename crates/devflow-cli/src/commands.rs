@@ -2339,6 +2339,7 @@ fn doctor_checks() -> Vec<Check> {
             "Install the Hermes Agent CLI so `hermes` is on PATH",
         ),
         pi_subagent_dispatch_check(),
+        opencode_subagent_dispatch_check(),
         Check {
             name: format!("devflow v{devflow_version}"),
             status: "ok".into(),
@@ -2487,6 +2488,43 @@ fn pi_subagent_dispatch_check_for(dispatch: bool) -> Check {
         } else {
             Some(
                 "optional — `pi install npm:@bacnh85/pi-subagent` (user scope) enables subagent dispatch"
+                    .into(),
+            )
+        },
+    }
+}
+
+/// The `opencode subagent dispatch` doctor check (43-REVIEW.md WR-01): reports
+/// whether OpenCode has a genuinely dispatchable subagent configured, mirroring
+/// `pi_subagent_dispatch_check` exactly. Without this, `OpenCodeDriver::capabilities()`
+/// — built for OPCD-03/D-10 — had no production caller and was dead code outside
+/// its own test module.
+fn opencode_subagent_dispatch_check() -> Check {
+    let dispatch = agents::driver_for(AgentKind::OpenCode)
+        .capabilities()
+        .subagent_dispatch;
+    opencode_subagent_dispatch_check_for(dispatch)
+}
+
+/// The pure boolean→`Check` mapping behind [`opencode_subagent_dispatch_check`],
+/// separated from the `opencode agent list` probe so the doctor rendering is
+/// testable without spawning a process — same split as
+/// [`pi_subagent_dispatch_check_for`].
+fn opencode_subagent_dispatch_check_for(dispatch: bool) -> Check {
+    Check {
+        name: "opencode subagent dispatch".into(),
+        status: if dispatch { "ok".into() } else { "warn".into() },
+        version: Some(if dispatch {
+            "available".into()
+        } else {
+            "not configured".into()
+        }),
+        install_hint: if dispatch {
+            None
+        } else {
+            Some(
+                "optional — configure a (subagent)/(all)-mode agent via `opencode agent create` \
+                 to enable subagent dispatch"
                     .into(),
             )
         },
@@ -3766,6 +3804,30 @@ mod tests {
                 .as_deref()
                 .is_some_and(|h| h.contains("@bacnh85/pi-subagent")),
             "the absent hint must name the vetted install command"
+        );
+    }
+
+    /// 43-REVIEW.md WR-01: same pure-mapping test as
+    /// `pi_subagent_dispatch_check_renders_both_arms`, for the OpenCode check
+    /// this fix wires into `doctor_checks()`.
+    #[test]
+    fn opencode_subagent_dispatch_check_renders_both_arms() {
+        let available = opencode_subagent_dispatch_check_for(true);
+        assert_eq!(available.name, "opencode subagent dispatch");
+        assert_eq!(available.status, "ok");
+        assert_eq!(available.version.as_deref(), Some("available"));
+        assert_eq!(available.install_hint, None);
+
+        let missing = opencode_subagent_dispatch_check_for(false);
+        assert_eq!(missing.name, "opencode subagent dispatch");
+        assert_eq!(missing.status, "warn");
+        assert_eq!(missing.version.as_deref(), Some("not configured"));
+        assert!(
+            missing
+                .install_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("opencode agent create")),
+            "the absent hint must name the configuration command"
         );
     }
 

@@ -86,9 +86,9 @@ impl super::AgentDriver for OpenCodeDriver {
     /// this repository has three prior instances of exactly this leak class
     /// (999.10, WR-02).
     fn health(&self, _state: &crate::state::State) -> Result<(), String> {
-        let output = std::process::Command::new("opencode")
-            .args(["providers", "list"])
-            .output()
+        let mut cmd = std::process::Command::new("opencode");
+        cmd.args(["providers", "list"]);
+        let output = spawn_with_timeout(&mut cmd, PROBE_TIMEOUT)
             .map_err(|e| format!("could not run `opencode providers list`: {e}"))?;
         if output.status.success()
             && opencode_configured_provider_count(&String::from_utf8_lossy(&output.stdout)) > 0
@@ -110,6 +110,67 @@ impl super::AgentDriver for OpenCodeDriver {
     }
 }
 
+/// Bound on how long a `health`/`capabilities` probe subprocess may run
+/// before being killed (43-REVIEW.md WR-02). `opencode providers list` and
+/// `opencode agent list` are local, non-interactive, small-output commands —
+/// 5s is generous headroom, not a tuned budget.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often [`spawn_with_timeout`] polls the child for exit.
+const PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Run `cmd` to completion, killing it if it does not exit within `timeout`
+/// (43-REVIEW.md WR-02). Without this, a blocked `opencode` subprocess
+/// (hung credential re-auth prompt, network stall) stalls `health()`/
+/// `capabilities()` forever — for `capabilities()` specifically, an unbounded
+/// hang is a de facto launch refusal that never surfaces as an `Err`, directly
+/// contradicting the "this probe can never refuse a launch" contract.
+///
+/// Reads stdout/stderr only AFTER the child exits, not via a concurrent
+/// reader thread — safe here because both probed subcommands produce at most
+/// a few KB, far under the OS pipe buffer, so neither can block on a full
+/// pipe before exiting. This is not a general-purpose bounded-exec primitive;
+/// a probe with unbounded output would need a reader thread instead.
+fn spawn_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("probe did not exit within {timeout:?}"),
+            ));
+        }
+        std::thread::sleep(PROBE_POLL_INTERVAL);
+    }
+
+    let status = child.wait()?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_end(&mut stdout)?;
+    }
+    if let Some(mut err) = child.stderr.take() {
+        err.read_to_end(&mut stderr)?;
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Hand-rolled CSI escape-sequence scrubber: on `\u{1b}` followed by `[`,
 /// consumes through the sequence's final byte (ECMA-48 range `0x40..=0x7E`)
 /// — not just `m` (SGR/color codes), which would over-consume into
@@ -120,15 +181,41 @@ impl super::AgentDriver for OpenCodeDriver {
 /// (`agent_result.rs`) is the standing precedent for a single-purpose manual
 /// text scrubber over pulling in a crate.
 fn strip_ansi_escapes(s: &str) -> String {
+    // 43-REVIEW.md IN-01: a legitimate CSI sequence's parameter bytes are a
+    // handful of characters at most; this bounds how far the scrubber will
+    // consume looking for a final byte before giving up. Without a bound, an
+    // ESC `[` with no final byte anywhere in the REST of a truncated capture
+    // (a genuinely malformed/cut-off input this function is explicitly meant
+    // to be resilient to) silently discards everything after it — including
+    // a real terminal footer line the caller needs.
+    const MAX_CSI_PARAM_CHARS: usize = 32;
+
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next(); // consume '['
-            for next in chars.by_ref() {
+            let mut consumed = String::new();
+            let mut terminated = false;
+            while let Some(&next) = chars.peek() {
                 if ('\u{40}'..='\u{7e}').contains(&next) {
+                    chars.next();
+                    terminated = true;
                     break;
                 }
+                if consumed.chars().count() >= MAX_CSI_PARAM_CHARS {
+                    break;
+                }
+                consumed.push(next);
+                chars.next();
+            }
+            if !terminated {
+                // Malformed or truncated — preserve the escape and whatever
+                // was scanned literally rather than silently dropping it;
+                // normal processing resumes from here for the rest of `s`.
+                out.push('\u{1b}');
+                out.push('[');
+                out.push_str(&consumed);
             }
             continue;
         }
@@ -176,9 +263,9 @@ fn opencode_configured_provider_count(stdout: &str) -> u32 {
 /// only the classification of an arbitrary `Output`.
 fn opencode_subagent_dispatch_available() -> bool {
     opencode_subagent_dispatch_available_with(|| {
-        std::process::Command::new("opencode")
-            .args(["agent", "list"])
-            .output()
+        let mut cmd = std::process::Command::new("opencode");
+        cmd.args(["agent", "list"]);
+        spawn_with_timeout(&mut cmd, PROBE_TIMEOUT)
     })
 }
 
@@ -215,11 +302,24 @@ fn opencode_subagent_dispatch_available_with(
 /// agent's header in real output can never coincidentally flip this `true`
 /// from body text (the real baseline capture's dump lines all start with
 /// `[` or `{`).
+/// 43-REVIEW.md IN-02 fix: beyond the JSON-dump-line exclusion above, the
+/// marker must be preceded by exactly one space and the name token before
+/// it must itself contain no whitespace (`<name> (mode)`, matching the real
+/// `build (primary)` baseline shape) — so free-form prose that merely ends
+/// with the literal marker text (e.g. a crafted agent description reading
+/// "...acts like a fallback (subagent)") cannot flip this `true`; only a
+/// genuine single-token header line can.
 fn parse_opencode_agent_list_for_subagent(stdout: &str) -> bool {
     stdout.lines().any(|line| {
-        let line = line.trim_start();
-        !line.starts_with(['[', '{'])
-            && (line.trim_end().ends_with("(subagent)") || line.trim_end().ends_with("(all)"))
+        let line = line.trim();
+        if line.starts_with(['[', '{']) {
+            return false;
+        }
+        ["(subagent)", "(all)"].into_iter().any(|marker| {
+            line.strip_suffix(marker)
+                .and_then(|prefix| prefix.strip_suffix(' '))
+                .is_some_and(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+        })
     })
 }
 
@@ -281,6 +381,25 @@ mod tests {
         dir
     }
 
+    /// Like [`stub_opencode_on_path`], but the stub sleeps for `sleep_secs`
+    /// before it would ever print or exit — for exercising
+    /// [`spawn_with_timeout`]'s kill path (43-REVIEW.md WR-02) without
+    /// depending on a real hung `opencode`.
+    fn stub_hanging_opencode_on_path(sleep_secs: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create stub dir");
+        let stub = dir.path().join("opencode");
+        let script = format!("#!/bin/sh\nsleep {sleep_secs}\necho should-never-print\n");
+        std::fs::write(&stub, script).expect("write hanging opencode stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        }
+        dir
+    }
+
     /// RAII guard that replaces `PATH` with `path` and restores the previous
     /// value on `Drop` — including the panic path, so a failing test never
     /// hands the next test a mutated `PATH`. Copied verbatim from `pi.rs`.
@@ -310,7 +429,12 @@ mod tests {
     /// this session (43-RESEARCH.md Pattern 3) — three credentials from
     /// `auth.json`, three provider environment variables, ANSI SGR codes and
     /// box-drawing glyphs intact.
-    const LIVE_PROVIDER_LIST_OUTPUT: &str = "\x1b[0m\n┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\x1b[0m\n│\n●  Google \x1b[90mapi\x1b[0m\n│\n●  OpenAI \x1b[90moauth\x1b[0m\n│\n●  DeepSeek \x1b[90mapi\x1b[0m\n│\n└  3 credentials\n\n┌  Environment\n│\n●  DeepSeek \x1b[90mDEEPSEEK_API_KEY\x1b[0m\n│\n●  Google \x1b[90mGOOGLE_API_KEY\x1b[0m\n│\n●  OpenRouter \x1b[90mOPENROUTER_API_KEY\x1b[0m\n│\n└  3 environment variables\n";
+    // 43-REVIEW.md IN-03: real provider/env-var names swapped for fictional
+    // ones — the original values (still verified live, just not this
+    // operator's actual configured providers) revealed which providers this
+    // machine has configured, which is metadata worth not committing even
+    // though it is not a secret.
+    const LIVE_PROVIDER_LIST_OUTPUT: &str = "\x1b[0m\n┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\x1b[0m\n│\n●  Acme \x1b[90mapi\x1b[0m\n│\n●  Widgetcorp \x1b[90moauth\x1b[0m\n│\n●  Contoso \x1b[90mapi\x1b[0m\n│\n└  3 credentials\n\n┌  Environment\n│\n●  Contoso \x1b[90mCONTOSO_API_KEY\x1b[0m\n│\n●  Acme \x1b[90mACME_API_KEY\x1b[0m\n│\n●  Fabrikam \x1b[90mFABRIKAM_API_KEY\x1b[0m\n│\n└  3 environment variables\n";
 
     #[test]
     fn provider_count_sums_credentials_and_environment() {
@@ -374,6 +498,26 @@ mod tests {
         assert_eq!(stripped, "└  3 environment variables\n");
     }
 
+    /// 43-REVIEW.md IN-01: a malformed/truncated CSI sequence with no final
+    /// byte anywhere in the rest of the buffer must not silently discard
+    /// everything after it — a real terminal footer line beyond the bounded
+    /// scan point must survive. The sequence's own parameter bytes plus the
+    /// interleaved digits/box-glyphs before that footer are ALL outside the
+    /// `0x40..=0x7E` final-byte range, so this reproduces the pre-fix
+    /// full-buffer data loss (a bare digit/box-drawing run is not itself
+    /// evidence of the bug — the credentials line surviving past the 32-char
+    /// bound is).
+    #[test]
+    fn strip_ansi_escapes_preserves_content_after_an_unterminated_sequence() {
+        let junk = "0".repeat(50); // exceeds MAX_CSI_PARAM_CHARS unterminated
+        let input = format!("\x1b[{junk}└  3 credentials\n");
+        let stripped = strip_ansi_escapes(&input);
+        assert!(
+            stripped.ends_with("└  3 credentials\n"),
+            "the footer line must survive an unterminated escape earlier in the buffer: {stripped:?}"
+        );
+    }
+
     #[test]
     fn preflight_accepts_configured_credentials() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -428,6 +572,49 @@ mod tests {
         let err = OpenCodeDriver
             .health(&test_state())
             .expect_err("missing opencode binary must fail closed, not panic");
+        assert!(!err.is_empty());
+    }
+
+    /// 43-REVIEW.md WR-02: a hung probe subprocess must be killed within its
+    /// bound, not stall the caller forever. Uses a short custom timeout
+    /// (well under the stub's `sleep 10`) so the test itself stays fast —
+    /// the production `PROBE_TIMEOUT` constant is exercised by the plain
+    /// `health()`/`capabilities()` call sites, not re-tested at its full
+    /// duration here.
+    #[test]
+    fn spawn_with_timeout_kills_a_hung_child() {
+        // The stub script's own `sleep` invocation is PATH-resolved even
+        // though this test spawns the stub itself by absolute path — a
+        // concurrent test's PathGuard nulling PATH races with it otherwise
+        // (found by running this test: `sleep: command not found`).
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_hanging_opencode_on_path(10);
+        let mut cmd = std::process::Command::new(stub_dir.path().join("opencode"));
+        let start = std::time::Instant::now();
+        let err = spawn_with_timeout(&mut cmd, std::time::Duration::from_millis(200))
+            .expect_err("a child sleeping 10s must not be allowed to finish under a 200ms bound");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the timeout must actually bound the wait, not merely be advisory: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 43-REVIEW.md WR-02: `health()` itself must fail closed (not hang) when
+    /// the real `opencode providers list` invocation stalls, using the small
+    /// custom `PROBE_TIMEOUT` bound rather than blocking forever. Runs
+    /// against the actual production timeout constant, so this test's
+    /// runtime is bounded by `PROBE_TIMEOUT`, not instantaneous.
+    #[test]
+    fn health_fails_closed_on_a_hung_probe() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_hanging_opencode_on_path(60);
+        let _path = PathGuard::set(stub_dir.path());
+
+        let err = OpenCodeDriver
+            .health(&test_state())
+            .expect_err("a hung `opencode providers list` must fail closed, not hang forever");
         assert!(!err.is_empty());
     }
 
@@ -504,6 +691,20 @@ mod tests {
         let body_text_only =
             "build (primary)\n  [\n  {\n    \"description\": \"acts like a (subagent) proxy\",\n";
         assert!(!parse_opencode_agent_list_for_subagent(body_text_only));
+    }
+
+    /// 43-REVIEW.md IN-02 fix: the previous test above never actually
+    /// exercised the bracket-prefix guard — its crafted line didn't end with
+    /// the literal marker text, so the ends-with anchor alone already
+    /// rejected it regardless of the guard. This line does NOT start with
+    /// `[`/`{` (so the bracket guard would NOT exclude it) but DOES end
+    /// with the literal marker text with free-form multi-word prose before
+    /// it — only the name-token anchor (43-REVIEW.md IN-02's actual fix)
+    /// prevents this from flipping the result.
+    #[test]
+    fn agent_list_ignores_prose_line_ending_in_the_literal_marker_text() {
+        let prose_line = "build (primary)\na fallback description mentions (subagent)\n";
+        assert!(!parse_opencode_agent_list_for_subagent(prose_line));
     }
 
     #[test]
