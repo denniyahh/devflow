@@ -11,8 +11,11 @@
 //! spawns `opencode providers list`, strips its ANSI escape codes, and sums
 //! the terminal `N credentials` / `N environment variables` count lines. The
 //! subcommand's exit code is always 0 regardless of credential state
-//! (verified live), so readiness is decided solely from the parsed count,
-//! never from `output.status.success()`. `opencode models` is deliberately
+//! (verified live), so a zero-credential machine cannot be distinguished
+//! from a non-zero exit by status alone — readiness therefore requires BOTH
+//! `output.status.success()` AND a positive parsed count, narrowing the
+//! false-green window without reintroducing the false-red risk a
+//! status-only check would carry. `opencode models` is deliberately
 //! never used as the readiness probe — it always lists opencode's own free
 //! catalog entries and would false-green a machine with zero configured
 //! credentials (D-09).
@@ -70,10 +73,11 @@ impl super::AgentDriver for OpenCodeDriver {
     /// Fail-closed credential check (OPCD-03, D-07/D-08/D-09, T-43-09).
     ///
     /// `opencode providers list` has no JSON output mode (D-08) and exits 0
-    /// regardless of credential state (verified live), so readiness is
-    /// decided by summing the ANSI-stripped output's terminal
-    /// `N credentials` / `N environment variables` count lines — never by
-    /// `output.status.success()`. A spawn failure (e.g. no `opencode` on
+    /// regardless of credential state (verified live), so exit status alone
+    /// cannot decide readiness — but it is still consulted: readiness
+    /// requires BOTH `output.status.success()` AND a positive sum of the
+    /// ANSI-stripped output's terminal `N credentials` / `N environment
+    /// variables` count lines. A spawn failure (e.g. no `opencode` on
     /// `PATH`) also fails closed to `Err`, never a panic.
     ///
     /// The returned `Err` is a fixed message naming only the derived state.
@@ -86,7 +90,9 @@ impl super::AgentDriver for OpenCodeDriver {
             .args(["providers", "list"])
             .output()
             .map_err(|e| format!("could not run `opencode providers list`: {e}"))?;
-        if opencode_configured_provider_count(&String::from_utf8_lossy(&output.stdout)) > 0 {
+        if output.status.success()
+            && opencode_configured_provider_count(&String::from_utf8_lossy(&output.stdout)) > 0
+        {
             Ok(())
         } else {
             Err("no OpenCode provider credential configured".to_string())
@@ -104,11 +110,15 @@ impl super::AgentDriver for OpenCodeDriver {
     }
 }
 
-/// Hand-rolled SGR escape-sequence scrubber: on `\u{1b}` followed by `[`,
-/// consumes through the terminating `m`. No `regex` crate is added for this
-/// — this workspace has no `regex` dependency anywhere, and
-/// `strip_corruption_padding` (`agent_result.rs`) is the standing precedent
-/// for a single-purpose manual text scrubber over pulling in a crate.
+/// Hand-rolled CSI escape-sequence scrubber: on `\u{1b}` followed by `[`,
+/// consumes through the sequence's final byte (ECMA-48 range `0x40..=0x7E`)
+/// — not just `m` (SGR/color codes), which would over-consume into
+/// following text on any other CSI sequence (cursor movement, erase-line,
+/// etc.) and could corrupt the very count lines this scrubber exists to
+/// preserve. No `regex` crate is added for this — this workspace has no
+/// `regex` dependency anywhere, and `strip_corruption_padding`
+/// (`agent_result.rs`) is the standing precedent for a single-purpose manual
+/// text scrubber over pulling in a crate.
 fn strip_ansi_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -116,7 +126,7 @@ fn strip_ansi_escapes(s: &str) -> String {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next(); // consume '['
             for next in chars.by_ref() {
-                if next == 'm' {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
                     break;
                 }
             }
@@ -142,11 +152,16 @@ fn strip_ansi_escapes(s: &str) -> String {
 /// performed. This function's zero-credential behavior is proven only
 /// against constructed fixtures reasoned from the live positive-credential
 /// capture below, never against a real credential-less run.
+///
+/// Anchored to the `└` footer glyph specifically (not `┌`/`│`/`●`, which mark
+/// header/body lines) so a coincidentally-matching substring elsewhere in the
+/// output — a header, a body line, a future diagnostic line that happens to
+/// start with a number and the word "credential" — can never be summed in.
 fn opencode_configured_provider_count(stdout: &str) -> u32 {
     strip_ansi_escapes(stdout)
         .lines()
         .filter_map(|line| {
-            let trimmed = line.trim_start_matches(['└', '┌', '│', '●', ' ']);
+            let trimmed = line.trim_start().strip_prefix('└')?.trim_start();
             let (num, rest) = trimmed.split_once(' ')?;
             let n: u32 = num.parse().ok()?;
             (rest.starts_with("credential") || rest.starts_with("environment variable"))
@@ -194,10 +209,18 @@ fn opencode_subagent_dispatch_available_with(
 /// Pure classifier over `opencode agent list` stdout: a dispatchable
 /// subagent is any header line carrying the `(subagent)` or `(all)` mode
 /// marker. The default `build` agent is `(primary)` and must never count.
+///
+/// Anchored to a trailing mode-marker on a non-JSON line — not a raw
+/// substring scan — so the permission-rule JSON dump that follows each
+/// agent's header in real output can never coincidentally flip this `true`
+/// from body text (the real baseline capture's dump lines all start with
+/// `[` or `{`).
 fn parse_opencode_agent_list_for_subagent(stdout: &str) -> bool {
-    stdout
-        .lines()
-        .any(|line| line.contains("(subagent)") || line.contains("(all)"))
+    stdout.lines().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with(['[', '{'])
+            && (line.trim_end().ends_with("(subagent)") || line.trim_end().ends_with("(all)"))
+    })
 }
 
 #[cfg(test)]
@@ -324,11 +347,31 @@ mod tests {
         assert_eq!(opencode_configured_provider_count(stray_bullet), 0);
     }
 
+    /// WR-03 regression: a non-footer line that coincidentally starts with a
+    /// number followed by "credential"/"environment variable" must not be
+    /// summed — only a genuine `└`-prefixed footer line counts.
+    #[test]
+    fn provider_count_ignores_unanchored_matching_substring() {
+        let coincidental =
+            "┌  Credentials\n3 credential refresh events pending\n│\n└  1 credentials\n";
+        assert_eq!(opencode_configured_provider_count(coincidental), 1);
+    }
+
     #[test]
     fn strip_ansi_escapes_removes_sgr_and_preserves_box_glyphs() {
         let input = "\x1b[90m┌│●└\x1b[0m plain \x1b[1;31mtext\x1b[0m";
         let stripped = strip_ansi_escapes(input);
         assert_eq!(stripped, "┌│●└ plain text");
+    }
+
+    /// WR-02 regression: a non-SGR CSI sequence (erase-line, `\x1b[2K`) must
+    /// not over-consume into following text — only SGR (`...m`) previously
+    /// terminated the scrubber's hunt loop, corrupting adjacent count lines.
+    #[test]
+    fn strip_ansi_escapes_terminates_on_non_sgr_csi_sequence() {
+        let input = "\x1b[2K└  3 environment variables\n";
+        let stripped = strip_ansi_escapes(input);
+        assert_eq!(stripped, "└  3 environment variables\n");
     }
 
     #[test]
@@ -357,6 +400,22 @@ mod tests {
         let err = OpenCodeDriver
             .health(&test_state())
             .expect_err("zero configured credentials must refuse preflight even with exit 0");
+        assert!(err.contains("no OpenCode provider credential configured"));
+    }
+
+    /// WR-01 regression: a non-zero exit must refuse preflight even when the
+    /// stdout it flushed before failing happens to contain a well-formed,
+    /// credential-bearing count line — the exit status is now consulted in
+    /// addition to the parsed count, not ignored entirely.
+    #[test]
+    fn preflight_rejects_nonzero_exit_with_credential_bearing_stdout() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let stub_dir = stub_opencode_on_path(LIVE_PROVIDER_LIST_OUTPUT, 1);
+        let _path = PathGuard::set(stub_dir.path());
+
+        let err = OpenCodeDriver.health(&test_state()).expect_err(
+            "a non-zero exit must fail closed even when stdout would otherwise report credentials",
+        );
         assert!(err.contains("no OpenCode provider credential configured"));
     }
 
@@ -434,6 +493,17 @@ mod tests {
     fn agent_list_with_all_mode_reports_true() {
         let with_all = "build (primary)\n  [\n  {\n    \"permission\": \"*\",\n  helper (all)\n";
         assert!(parse_opencode_agent_list_for_subagent(with_all));
+    }
+
+    /// WR-04 regression: a permission-dump line that contains the literal
+    /// text "(subagent)" as part of body content (not as a trailing header
+    /// mode marker) must not flip the result — only an actual header line
+    /// counts.
+    #[test]
+    fn agent_list_ignores_marker_text_inside_json_dump_line() {
+        let body_text_only =
+            "build (primary)\n  [\n  {\n    \"description\": \"acts like a (subagent) proxy\",\n";
+        assert!(!parse_opencode_agent_list_for_subagent(body_text_only));
     }
 
     #[test]
