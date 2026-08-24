@@ -182,13 +182,18 @@ fn spawn_with_timeout(
 /// text scrubber over pulling in a crate.
 fn strip_ansi_escapes(s: &str) -> String {
     // 43-REVIEW.md IN-01: a legitimate CSI sequence's parameter bytes are a
-    // handful of characters at most; this bounds how far the scrubber will
-    // consume looking for a final byte before giving up. Without a bound, an
-    // ESC `[` with no final byte anywhere in the REST of a truncated capture
-    // (a genuinely malformed/cut-off input this function is explicitly meant
-    // to be resilient to) silently discards everything after it — including
-    // a real terminal footer line the caller needs.
-    const MAX_CSI_PARAM_CHARS: usize = 32;
+    // handful of characters in ordinary SGR output (e.g. `90` in `\x1b[90m`);
+    // this bounds how far the scrubber will consume looking for a final byte
+    // before giving up. Without a bound, an ESC `[` with no final byte
+    // anywhere in the REST of a truncated capture (a genuinely malformed/
+    // cut-off input this function is explicitly meant to be resilient to)
+    // silently discards everything after it — including a real terminal
+    // footer line the caller needs. 128 (not a tighter bound like 32) is
+    // deliberately generous headroom above ordinary SGR sequences — a real
+    // CSI sequence with more parameter characters than that is rare, but a
+    // false-positive "malformed" classification of one is the cost of too
+    // tight a bound, so this errs wide (codex review, quick pass on 823cc58).
+    const MAX_CSI_PARAM_CHARS: usize = 128;
 
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -309,6 +314,18 @@ fn opencode_subagent_dispatch_available_with(
 /// with the literal marker text (e.g. a crafted agent description reading
 /// "...acts like a fallback (subagent)") cannot flip this `true`; only a
 /// genuine single-token header line can.
+///
+/// **Known tradeoff (codex quick-review on 823cc58):** a real OpenCode agent
+/// whose configured name itself contains whitespace (e.g. `code reviewer
+/// (subagent)`) would NOT match this anchor and would be reported as
+/// unavailable. This is the accepted direction: this function's own contract
+/// (see `capabilities()` above) is that it must NEVER cause a false
+/// `subagent_dispatch: true` — a false negative here only under-detects a
+/// real capability (safe, degrades to the baseline single-agent path); the
+/// false positive this anchor prevents (arbitrary prose ending in the marker
+/// text) is the actually dangerous direction. No live capture of a
+/// multi-word configured agent name exists to confirm whether OpenCode
+/// permits one at all (same A4 honest-limit as the rest of this probe).
 fn parse_opencode_agent_list_for_subagent(stdout: &str) -> bool {
     stdout.lines().any(|line| {
         let line = line.trim();
@@ -509,7 +526,7 @@ mod tests {
     /// bound is).
     #[test]
     fn strip_ansi_escapes_preserves_content_after_an_unterminated_sequence() {
-        let junk = "0".repeat(50); // exceeds MAX_CSI_PARAM_CHARS unterminated
+        let junk = "0".repeat(150); // exceeds MAX_CSI_PARAM_CHARS unterminated
         let input = format!("\x1b[{junk}└  3 credentials\n");
         let stripped = strip_ansi_escapes(&input);
         assert!(
