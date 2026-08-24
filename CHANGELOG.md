@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.10.0 — 2026-08-24
+
+OpenCode driver completion (Phase 43). Completes the under-built `AgentDriver` for OpenCode: a
+real headless launch, JSONL event-stream completion/verdict parsing, and fail-closed health and
+subagent-dispatch capability probes.
+
+### Added
+
+- OpenCode headless launch (`opencode run --auto --format json`) and Layer-1 JSONL marker parsing
+- OpenCode error-event and torn-tail precedence in completion/verdict detection
+- fail-closed credential health check for OpenCode
+- fail-closed subagent-dispatch capability probe for OpenCode
+
+### Fixed
+
+- close 4 fail-closed gaps in OpenCode health/capability probes found in Ship-stage review
+- correct stale `cargo install` OpenCode doctor hint
+
+### Changed
+
+- workspace isolation, conventional commits hook, and release tooling
+- automate sync branch and PR workflow for sync-main-to-develop
+
 ## 2.9.0 — 2026-08-21
 
 ### Added
