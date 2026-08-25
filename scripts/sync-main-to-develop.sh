@@ -1,57 +1,80 @@
 #!/usr/bin/env bash
 #
-# Sync main back into develop after a release.
+# Sync main back into develop after a release or PR merge into main.
 #
 # Every release lands on `main` via a squash-merge PR (GitHub's merge-button
 # settings on this repo only allow "squash", not a real merge commit). A
 # squash commit has no parent relationship to develop, so develop never
 # learns that main moved — the NEXT release PR then conflicts against the
-# stale merge-base. This bit us going into v1.5.0 (main and develop had
-# diverged since v1.4.0 / PR #10, producing 11 file conflicts on the
-# release PR).
+# stale merge-base.
 #
-# The fix is this script: after every squash-merge release, run it once to
-# record main's new tip as a real ancestor of develop. `-X ours` keeps
-# develop's own content untouched (verified: the resulting tree is
-# byte-identical to develop's pre-merge tree) while still linking the
-# history, so the next release PR has a clean merge-base again.
+# Because `develop` is a protected branch, direct pushes are rejected.
+# This script:
+#   1. Fetches latest main and develop.
+#   2. Fast-forwards local develop if origin/develop is ahead.
+#   3. If origin/main is not yet merged into develop:
+#      - Creates/resets a temporary `sync/main-into-develop` branch off origin/develop.
+#      - Performs a content-preserving `-X ours` merge of `origin/main`.
+#      - Pushes the branch to origin and creates a PR into develop via `gh pr create`.
+#   4. If --finish is passed (or if origin/main is already merged upstream):
+#      - Fast-forwards local develop to origin/develop and cleans up the temporary branch.
 #
-# Usage: scripts/sync-main-to-develop.sh
-# Run from a clean, up-to-date local checkout after main has been fetched.
+# Usage:
+#   scripts/sync-main-to-develop.sh           # Merge, branch, push, and open PR
+#   scripts/sync-main-to-develop.sh --finish  # Post-merge cleanup and local develop sync
 #
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+FINISH_MODE=false
+if [ "${1:-}" = "--finish" ]; then
+    FINISH_MODE=true
+fi
+
+echo "==> Fetching latest main and develop from origin..."
+git fetch origin main develop --quiet
+
+# Fast-forward local develop if it's behind origin/develop
+if git show-ref --verify --quiet refs/heads/develop; then
+    git fetch origin develop:develop --quiet || true
+fi
+
+# Check if origin/main is already an ancestor of origin/develop
+if git merge-base --is-ancestor origin/main origin/develop; then
+    echo "==> origin/main is already an ancestor of origin/develop — upstream is in sync."
+    if git show-ref --verify --quiet refs/heads/sync/main-into-develop; then
+        echo "==> Cleaning up local sync/main-into-develop branch..."
+        git branch -D sync/main-into-develop --quiet || true
+    fi
+    exit 0
+fi
+
+if [ "$FINISH_MODE" = true ]; then
+    echo "ERROR: origin/main is NOT yet merged into origin/develop." >&2
+    echo "  Merge the sync PR on GitHub first (using 'Create a merge commit'), then run --finish." >&2
+    exit 1
+fi
+
 if [ -n "$(git status --porcelain)" ]; then
     echo "ERROR: working tree is not clean. Commit, stash, or discard changes first." >&2
     exit 1
 fi
 
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-if [ "$CURRENT_BRANCH" != "develop" ]; then
-    echo "ERROR: must be run from 'develop' (currently on '$CURRENT_BRANCH')." >&2
-    exit 1
-fi
+SYNC_BRANCH="sync/main-into-develop"
+echo "==> Preparing sync branch '$SYNC_BRANCH' from origin/develop..."
+git checkout -B "$SYNC_BRANCH" origin/develop --quiet
 
-echo "Fetching latest main and develop..."
-git fetch origin main develop --quiet
-
-if git merge-base --is-ancestor origin/main HEAD; then
-    echo "origin/main is already an ancestor of develop — nothing to sync."
-    exit 0
-fi
-
-echo "Merging origin/main into develop (-X ours; develop's content wins on any overlap)..."
+echo "==> Merging origin/main into $SYNC_BRANCH (-X ours; develop's content wins on any overlap)..."
 BEFORE_TREE="$(git rev-parse HEAD^{tree})"
 
-git merge -X ours origin/main --no-edit -m "merge: sync main back into develop after release
+git merge -X ours origin/main --no-edit -m "merge: sync main back into develop
 
-Standing post-release step (scripts/sync-main-to-develop.sh) — keeps main
-a real ancestor of develop so the next release PR doesn't conflict against
-a stale merge-base. -X ours: develop's content is authoritative; this
-should be a no-op content-wise (verified below)."
+Standing post-release/post-main sync step (scripts/sync-main-to-develop.sh) —
+keeps main a real ancestor of develop so the next release PR doesn't conflict
+against a stale merge-base. -X ours: develop's content is authoritative;
+this should be a no-op content-wise (verified below)."
 
 AFTER_TREE="$(git rev-parse HEAD^{tree})"
 if [ "$BEFORE_TREE" != "$AFTER_TREE" ]; then
@@ -60,7 +83,24 @@ if [ "$BEFORE_TREE" != "$AFTER_TREE" ]; then
     exit 1
 fi
 
-echo "Confirmed: develop's tree is unchanged — this was a pure history-linking merge."
-echo
-echo "Review with: git show HEAD --stat"
-echo "Push with:   git push origin develop"
+echo "==> Confirmed: tree is unchanged — pure history-linking merge."
+echo "==> Pushing $SYNC_BRANCH to origin..."
+git push -u origin "$SYNC_BRANCH" --force-with-lease
+
+echo "==> Creating sync pull request targeting develop..."
+if command -v gh >/dev/null 2>&1; then
+    gh pr create --base develop --head "$SYNC_BRANCH" \
+        --title "merge: sync main back into develop" \
+        --body "Sync \`main\` back into \`develop\` following merge to maintain accurate ancestry and clean merge-bases.
+
+**NOTE:** This PR MUST be merged with **'Create a merge commit'**, NOT squashed." || true
+else
+    echo "gh CLI not found; please create a PR from '$SYNC_BRANCH' into 'develop' manually."
+fi
+
+echo ""
+echo "────────────────────────────────────────────────────────────────────────"
+echo "Next Steps:"
+echo "  1. Merge the PR on GitHub using 'Create a merge commit' (DO NOT SQUASH)."
+echo "  2. Once merged, run: scripts/sync-main-to-develop.sh --finish"
+echo "────────────────────────────────────────────────────────────────────────"
