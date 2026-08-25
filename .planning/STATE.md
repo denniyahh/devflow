@@ -20,7 +20,7 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-08-06
+> Last updated: 2026-08-24
 
 ## Deferred Items
 
@@ -33,56 +33,11 @@ Items acknowledged and deferred at milestone close on 2026-08-04:
 
 ## Active Phase
 
-**Phase 30 — Keep the Session Alive Past Turn End (999.64)** — **planned and
-cross-AI reviewed 2026-08-02; ready to execute.** 5 plans across 3 waves on
-`feature/phase-30`: 30b is the Claude stream parser (30-01 tracer, 30-03 rate
-limit / envelope failure / `session_id`, 30-05 checkpoint prompt-echo
-hardening), 30c is the production-environment delivery experiment (30-02), 30d
-is the exit-timing measurement (30-04). A Codex review (`30-REVIEWS.md`) raised
-4 HIGH findings; 15 of 16 were incorporated, 1 rejected with rationale, and the
-phase goal was split from the 999.64 arc goal so Phase 30 can satisfy it —
-Phase 31 owns the launch-path change. 30-03 and 30-05 are gated on 30-02's
-verdict and will not land if delivery is refuted.
+**Phase 44 — Codex End-to-End Verification** — not started. Phase 43 is complete
+and shipped via PR #149; the project is ready to plan Phase 44 against CODE-01.
 
-**Status 2026-08-02 — all 5 plans executed; ready for verification.** All three
-waves are complete: wave 1 = 30-01 + 30-02, wave 2 = 30-03 + 30-04, wave 3 =
-30-05. The 30-02 delivery gate resolved `delivery: confirmed`, which is what
-allowed 30-03 and 30-05 to land.
-
-`cargo test -p devflow-core --lib agent_result::` reports 132 passed / 0 failed / 0
-ignored — the constraint-9 sweep is live, no longer `#[ignore]`d.
-`scripts/check.sh all` (host) and `scripts/check-in-container.sh all` (pinned CI
-image) both exit 0. Nothing has been pushed.
-
-**Four adversarial passes followed execution, and their findings drove a
-root-cause refactor** (`a557805`; full trail in `30-CODE-REVIEW.md`,
-`30-VERIFICATION.md`, and the pass-3/pass-4 fix commits `f34756c`, `4867207`).
-Eight defects across the passes traced to three root causes, all three now
-structural: `ParsedCapture` makes dropped lines representable (R1), `classify()`
-decides capture kind once instead of per-call-site heuristics (R2), and
-`is_top_level` is the single provenance predicate for gate and verdict paths
-(R3). Constraint 9's two deferred items are **CLOSED in phase 30**; what
-survives for Phase 31 is the boundary-truncation residual — a stream-derived
-Success must not short-circuit a contradicting exit code, because a capture cut
-at an exact line boundary is content-indistinguishable from a healthy shorter
-run. The last code-review Medium is backlog **999.70**; the torn-line frequency
-measurement is **999.71**.
-
-**A correction on reachability, twice wrong before it was right:** the claim
-"`evaluate_layer1` has zero callers" was false — `evaluate_agent_result` runs it
-on every result evaluation from `pipeline_launch.rs:416`. What kept the two
-deferred defects latent was the capture FORMAT (the stream branch requires a
-parsed `init`, which only `stream-json` emits), not a missing caller. Checkpoint
-detection and `claude_stream_session_id` were live the whole time, which is why
-the gate findings were urgent. And **no fixture is a real capture** — no
-archived capture contains checkpoint gate text, and none contains a prompt echo
-at all, so the prompt-echo false positive is closed as reasoned rather than
-witnessed.
-
-30-04 also revised two binding review constraints against measurement: the
-idle-timeout floor moved from ~12s to ≥30s, and the drain gate is now
-characterised as defensive rather than load-bearing (kept as an `AND`
-regardless — see ROADMAP.md constraints 7 and 8).
+Current v2.8.0 milestone progress: phases 40-43 are complete, 44 and 45 remain
+planned/not started, with 8/8 completed plans across the completed phase scope.
 
 ---
 

@@ -15,7 +15,7 @@ change.
 |---|---|---|---|
 | 40 | Pi Dogfood | PIDG-01, MAINT-01 | Complete    |
 | 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Complete    |
-| 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Not started |
+| 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Complete    |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Complete    |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |
 | 45 | Opportunistic Cleanup (999.94) | DECN-01 | Not started |
@@ -69,10 +69,10 @@ stage with honest completion.
   3. Completion is process-exit + `DEVFLOW_RESULT` prompt contract; a marker-less run never advances.
   4. The driver passes the shared conformance suite.
 
-**Plans**: 2 plans planned (42-01, 42-02)
+**Plans**: 2/2 plans complete (42-01, 42-02)
 
-- [ ] 42-01-PLAN.md — Hermes Driver implementation, unit tests, conformance suite enrollment, doctor checks, and Phase-7 integration regressions
-- [ ] 42-02-PLAN.md — Supervised Antigravity dogfood run, cadence measurement, 60m print-timeout confirmation, and preflight C2 auto-mode unlock (ANTG-04)
+- [x] 42-01-PLAN.md — Hermes Driver implementation, unit tests, conformance suite enrollment, doctor checks, and Phase-7 integration regressions
+- [x] 42-02-PLAN.md — Supervised Antigravity dogfood run, cadence measurement, 60m print-timeout confirmation, and preflight C2 auto-mode unlock (ANTG-04)
 
 ### Phase 43: OpenCode Driver Completion
 
@@ -226,9 +226,9 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 38 | — | Complete    | 2026-08-17 |
 | 39 | 1/1 | Complete    | 2026-08-18 |
 | 40 | 2/2 | Complete   | 2026-08-18 |
-| 41 | — | Not started | — |
-| 42 | — | Not started | — |
-| 43 | 2/2 | In Progress|  |
+| 41 | — | Complete | 2026-08-20 |
+| 42 | — | Complete | 2026-08-21 |
+| 43 | 2/2 | Complete | 2026-08-24 |
 | 44 | — | Not started | — |
 | 45 | — | Not started | — |
 
