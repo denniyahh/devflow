@@ -391,6 +391,40 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.112: `OpenCodeDriver::capabilities()` Never ANSI-Strips `opencode agent list` Output Before Matching (BACKLOG)
+
+**Found:** 2026-08-26, backfilling Phase 43's missing `43-VERIFICATION.md`/`43-REVIEW.md` into git
+(999.109-class personal-record gap) and running an independent code-review pass over the OpenCode
+driver as part of that backfill.
+
+**The item:** `opencode_subagent_dispatch_available_with` (`crates/devflow-core/src/agents/
+opencode.rs`) parses `opencode agent list` stdout directly —
+`parse_opencode_agent_list_for_subagent(&String::from_utf8_lossy(&output.stdout))` — with no
+ANSI-escape stripping. `health()`'s sibling probe explicitly strips `opencode providers list`
+output first (`strip_ansi_escapes`, documented as necessary because that command's real output is
+colorized) before summing credential-count lines. `capabilities()`'s own doc comment (A4, "Honest
+limit") already admits no live capture of a real configured-subagent line was ever taken — the
+`(subagent)`/`(all)` marker match is inferred, not observed. If `opencode agent list` colorizes its
+mode marker the same way `providers list` colorizes credential counts (the same CLI, plausible
+convention), the marker match silently fails on every machine with a real subagent configured,
+permanently reporting `subagent_dispatch: false`.
+
+**Fails safe:** `capabilities()` can never refuse a launch (its contract, verified by
+`capabilities_never_refuses_a_launch`) — this is a false-negative on an advisory field, not a
+launch-blocking bug. That is why it was filed rather than hotfixed directly against shipped code.
+
+**Priority:** Low — advisory-only field, no launch-refusal risk, and no live capture exists yet to
+even confirm whether `agent list` colorizes its output at all.
+**Size:** S — call `strip_ansi_escapes(&String::from_utf8_lossy(&output.stdout))` before passing to
+`parse_opencode_agent_list_for_subagent`, plus a regression test using a synthetic ANSI-wrapped
+`(subagent)` line (mirrors `strip_ansi_escapes_removes_sgr_and_preserves_box_glyphs`'s pattern).
+Real fix ultimately wants a live `opencode agent list` capture with a configured subagent, same gap
+the A4 doc comment already flags.
+
+**Depends on:** nothing structural.
+
+---
+
 ### Phase 999.111: `devflow` Never Detects or Runs the Security Verdict Before Ship — Discovers the Gap Only at Ship Time (BACKLOG)
 
 **Found:** 2026-08-24, dogfooding Phase 43 through Ship. The Ship-stage agent's own preflight
