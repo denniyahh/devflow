@@ -1,0 +1,15 @@
+# Memory Recall (MemPalace)
+
+_Wing: devflow · Mode: augment · Transport: cli_
+
+## Prior decisions
+- AgentAdapter → AgentDriver migration carries a deprecation deadline once Claude, Codex, and OpenCode are all migrated — the old trait must not persist across multiple phases (D-04, decisions/CONTEXT.md, Phase 31 planning).
+- Codex driver dogfood evidence bar (Phase 13, 13-06-PLAN.md): a live dogfood run must exercise a REAL gate + notification round-trip via the operator's `DEVFLOW_GATE_NOTIFY_CMD` (not unit coverage alone) and record commands, verbatim Codex `--json` capture, PR link, and a DevFlow-vs-external-workflow failure classification for anything that goes wrong. Any failure found mid-dogfood follows a defined loop: capture → patch in source → re-run targeted test + full workspace suite → restart from the failed checkpoint.
+
+## Patterns
+- Rate-limit/cron scheduling bug class (12-02-PLAN.md, WR-06): when a coding agent's rate-limit reason string lacks the expected `rate limited until ` prefix, `retry_after_from_reason` used to fall through to the raw unparseable reason via `.or(reason)`, and `cron_schedule_from_retry_after` degraded that into `"* * * * *"` — a cron that fires every minute until a human intervenes. The prior fix: `write_rate_limit_cron` must print a clear "no parseable retry time — auto-resume cron not scheduled; resume manually" message instead of ever emitting an every-minute schedule, with a regression test asserting `build_cron_instructions(...).hermes_cron.schedule` is not the every-minute pattern for an unparseable retry time. Directly relevant to #148 (Hermes cron `--from-devflow` / UTC-vs-local fix) — the same `build_cron_instructions`/`write_rate_limit_cron` machinery is in scope again this phase.
+- Cron/resume display code should only ever *read* an existing rate-limit field, never reimplement detection (21-02-PLAN.md: `cron_hint_line` composition explicitly forbids introducing `detect_rate_limit`/`detect_claude_rate_limit`/`detect_codex_rate_limit` — verified by grep returning zero hits).
+- Resume/handoff machinery precedent (28-03-PLAN.md): a correct, fully-flagged resume invocation is built from an inherent method + a dedicated prompt builder + a bounded `MAX_CHECKPOINT_RESUMES` counter with a documented reset condition and exhaustion behavior — relevant shape for #147's `devflow resume --phase N --agent <agent>` handoff work.
+
+## Surprises / gotchas
+- No KG facts included this run — the installed `mempalace` CLI (this machine) has no `kg-query`/`kg-timeline` subcommand (checked `mempalace --help`; only `init/mine/sweep/sync/search/compress/wake-up/split/hook/instructions/repair/repair-status/daemon/mcp/serve/migrate/migrate-wings/hallways/status/logstream/artifact/palace` are available). This is a CLI-surface gap, not a palace-unreachable condition — `search`/`wake-up` both responded normally. Native `.planning/graphs/` remains the fallback per `augment` mode; the planner should consult it directly for any KG-shaped facts.
