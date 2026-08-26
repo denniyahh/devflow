@@ -231,10 +231,11 @@ mod tests {
             crate::prompt::render_claude_style(&intent)
         );
 
-        // OpenCode: positional `run <prompt>` + byte-identical legacy prompt.
+        // OpenCode (43-01): headless `run <prompt> --auto --format json` +
+        // byte-identical legacy prompt (D-02 unchanged by the argv update).
         let (program, args) = OpenCodeDriver.build_command(PhaseId::new(7), "x", &[]);
         assert_eq!(program, "opencode");
-        assert_eq!(args, ["run", "x"]);
+        assert_eq!(args, ["run", "x", "--auto", "--format", "json"]);
         assert_eq!(
             OpenCodeDriver.render_prompt(&intent),
             crate::prompt::render_claude_style(&intent)
@@ -578,7 +579,7 @@ mod tests {
         let (program, args) =
             driver_for(AgentKind::OpenCode).build_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "opencode");
-        assert_eq!(args, ["run", prompt.as_str()]);
+        assert_eq!(args, ["run", prompt.as_str(), "--auto", "--format", "json"]);
     }
 
     /// 13-06 dogfood regression (Codex leg): linked-worktree git metadata
@@ -624,9 +625,17 @@ mod tests {
     }
 
     /// D-13: `preflight`'s default body is `Ok(())` for every built-in
-    /// adapter — none of Claude/Codex/OpenCode override it in Phase 17 (no
+    /// adapter — none of Claude/Codex override it in Phase 17 (no
     /// reviewer-set storage exists yet in `state.rs`/`config.rs`, review
-    /// consensus #6).
+    /// consensus #6). OpenCode is deliberately excluded here as of Phase 43
+    /// (43-02, OPCD-03/D-07): `OpenCodeDriver::health` now does a real
+    /// `Command::new("opencode")` credential check, so asserting on it in
+    /// this shared test would spawn the operator's real `opencode` binary on
+    /// every `cargo test` run (non-hermetic) and fail outright on any
+    /// machine/CI runner without OpenCode credentials configured (RESEARCH
+    /// Pitfall 4). OpenCode's own `health` behavior is covered by
+    /// `opencode.rs`'s `#[cfg(test)] mod tests` using the stub-binary
+    /// pattern instead.
     #[test]
     fn default_preflight_is_ok_for_built_in_adapters() {
         let state = crate::state::State::new(
@@ -637,6 +646,5 @@ mod tests {
         );
         assert!(driver_for(AgentKind::Claude).health(&state).is_ok());
         assert!(driver_for(AgentKind::Codex).health(&state).is_ok());
-        assert!(driver_for(AgentKind::OpenCode).health(&state).is_ok());
     }
 }
