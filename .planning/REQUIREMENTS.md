@@ -51,11 +51,11 @@ phase.
 
 ### OpenCode
 
-- [ ] **OPCD-01**: OpenCode driver launches headless with `--auto` + `--format json`.
-- [ ] **OPCD-02**: OpenCode completion/verdict is parsed from `--format json` events
+- [x] **OPCD-01**: OpenCode driver launches headless with `--auto` + `--format json`.
+- [x] **OPCD-02**: OpenCode completion/verdict is parsed from `--format json` events
   (regression-tested), modeled on Codex's `parse_codex_event_result`.
 
-- [ ] **OPCD-03**: OpenCode has a fail-closed health check + capability discovery.
+- [x] **OPCD-03**: OpenCode has a fail-closed health check + capability discovery.
 
 ### Codex
 
@@ -111,9 +111,9 @@ Which phases cover which requirements. Filled during roadmap creation.
 | HRMS-01 | Phase 42 | Pending |
 | HRMS-02 | Phase 42 | Pending |
 | HRMS-03 | Phase 42 | Pending |
-| OPCD-01 | Phase 43 | Pending |
-| OPCD-02 | Phase 43 | Pending |
-| OPCD-03 | Phase 43 | Pending |
+| OPCD-01 | Phase 43 | Complete |
+| OPCD-02 | Phase 43 | Complete |
+| OPCD-03 | Phase 43 | Complete |
 | CODE-01 | Phase 44 | Pending |
 | PIDG-01 | Phase 40 | Complete |
 | DECN-01 | Phase 45 | Pending |

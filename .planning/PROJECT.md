@@ -260,6 +260,20 @@ version is still derived automatically from conventional-commit classification a
   position and the graft's status filter — instead of the mechanism Phase 34 deleted (keeping the
   instruction intact and unweakened), and three Pi-transport regression tests (marker-less,
   non-zero-exit, hung) closed the failure-mode gap (D-05) — Phase 40, milestone v2.8.0.
+- ✓ **OPCD-01, OPCD-02, OPCD-03** — the OpenCode stub driver is complete: `build_command` emits
+  the real headless `opencode run "<prompt>" --auto --format json` argv; completion/verdict is
+  parsed by `parse_opencode_event_result` (torn-tail → error-anywhere → last-marker precedence)
+  regression-tested against three real captures (`opencode_success.jsonl`,
+  `opencode_tool_use.jsonl`, `opencode_error.jsonl`) plus one derived marker fixture, not an
+  assumed schema; `health` fails closed on `opencode providers list` requiring both a successful
+  exit status AND a positive parsed credential count (not exit code alone, not the free-model
+  catalog); `capabilities` probes `opencode agent list` for a genuine header-anchored
+  subagent/all-mode marker, failing closed to `false` on any probe failure; `OpenCodeDriver`
+  passes the shared 6-driver conformance suite with real (non-default) trait bodies — Phase 43,
+  milestone v2.8.0. A code review (`43-REVIEW.md`) found 4 Warning-severity gaps in the initial
+  implementation (exit-status ignored, an ANSI stripper unsound on non-SGR sequences, two
+  unanchored substring matches) — all 4 fixed same-phase (`43-REVIEW-FIX.md`), independently
+  re-verified against source by both a fresh code-reviewer pass and the phase verifier.
 
 ### Active
 
@@ -399,7 +413,13 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-19 after Phase 40 (Pi Dogfood) — the shipped Pi driver proven through a
+*Last updated: 2026-08-23 after Phase 43 (OpenCode Driver Completion) — the OpenCode stub driver
+completed (launch argv, JSON-event completion parsing against real captures, fail-closed
+health/capability probes, conformance suite), OPCD-01/02/03 validated. A code review found and
+same-phase fixed 4 fail-closed correctness gaps in the health-check/capability-probe code.*
+
+---
+*Previous: 2026-08-19 after Phase 40 (Pi Dogfood) — the shipped Pi driver proven through a
 real supervised Define→Validate run, the 999.85 comments corrected (MAINT-01), and Pi-transport
 regression tests added. Prior: the v2.7.0 milestone (Pi End-to-End + Driver Contract Completion)*
 

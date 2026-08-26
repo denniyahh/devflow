@@ -2,20 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
-current_phase: 43
-current_phase_name: OpenCode Driver Completion
-status: executing
-stopped_at: Phase 43 planning complete
-last_updated: "2026-08-23T19:22:03.751Z"
-last_activity: 2026-08-23
-last_activity_desc: Phase 43 execution resumed (wave continue)
-state_head: 73fa973dc0cab79c1d1b65d854bd0200846181cc
+current_phase: 44
+current_phase_name: Codex End-to-End Verification
+status: "Phase 43 shipped — PR #149"
+stopped_at: Phase 43 complete, ready to plan Phase 44
+last_updated: "2026-08-24T15:14:48.186Z"
+last_activity: 2026-08-24
+state_head: 87bb6ed21b765dafcde2c0a431a830db5ab5835a
 progress:
   total_phases: 6
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 8
-  completed_plans: 6
-  percent: 50
+  completed_plans: 8
+  percent: 67
 ---
 
 # DevFlow — Project State
@@ -110,10 +109,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 43 (OpenCode Driver Completion) — EXECUTING
-Plan: 1 of 2
-Status: Executing Phase 43
-Last activity: 2026-08-23 — Phase 43 execution resumed (wave continue)
+Phase: 44 — Codex End-to-End Verification
+Plan: Not started
+Status: Phase 43 shipped — PR #149
+Last activity: 2026-08-24
 
 **Decision coverage gate override (2026-08-23):** `check.decision-coverage-plan` returned
 `passed: false, reason: could-not-parse, covered: 0, uncovered: []` for 43-CONTEXT.md — a known
@@ -803,7 +802,7 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ## Session
 
 **Last session:** 2026-08-23T10:25:13.074Z
-**Stopped at:** Phase 43 context gathered
+**Stopped at:** Phase 43 complete, ready to plan Phase 44
 **Resume file:** .planning/phases/43-opencode-driver-completion/43-CONTEXT.md
 
 ## Operator Next Steps
