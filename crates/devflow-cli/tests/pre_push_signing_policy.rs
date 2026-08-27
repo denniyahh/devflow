@@ -140,15 +140,94 @@ fn policy_is_opt_in_by_config_and_has_no_override_escape_hatch() {
 
 /// Personal development artifacts (.agents, .codex, .claude, .planning, .gsd, etc.)
 /// must be rejected by pre-push on shared upstream branches (develop, main, feature/*).
+///
+/// Scans the full commit range (`git log --name-only`), not an endpoint diff
+/// (`git diff --diff-filter=A`) or a whole-tree `git ls-tree` — a range scan is
+/// the only one of the three that catches every case: content added then
+/// removed within the same push (net-zero at the endpoints, but permanently
+/// reachable via the intermediate commit), a rename into a forbidden path
+/// (git classifies renames separately from adds), and a modification of an
+/// already-existing forbidden path — while an endpoint diff misses all three
+/// and a whole-tree check false-positives on every push once any commit ever
+/// added a legitimately-tracked file under one of these prefixes. Each of
+/// these was verified against real git fixtures during review, not asserted
+/// from reasoning alone (999.11x).
 #[test]
 fn pre_push_guards_against_personal_artifacts_on_clean_branches() {
     let source = hook();
     assert!(
-        source.contains("git ls-tree -r --name-only") && source.contains("refs/heads/develop"),
-        "pre-push must inspect commit trees and forbid personal artifacts on develop/main/feature branches"
+        source.contains("git log --name-only") && source.contains("refs/heads/develop"),
+        "pre-push must scan the full commit range (not an endpoint diff or a whole-tree \
+         ls-tree) to forbid personal artifacts on develop/main/feature branches"
+    );
+    let regex_line = source
+        .lines()
+        .find(|line| line.contains("forbidden=") && line.contains("grep -E"))
+        .expect("pre-push must build forbidden via a grep -E regex line");
+    assert!(
+        regex_line.contains(".planning")
+            && regex_line.contains(".codex")
+            && regex_line.contains(".claude")
+            && regex_line.contains(".worktrees"),
+        "pre-push's forbidden-artifact regex must cover .planning, .codex, .claude, and \
+         .worktrees (this last one predates this test but was missing from pre-push despite \
+         being present in pre-commit's equivalent regex -- a --no-verify commit containing \
+         .worktrees/ would reach this branch unchallenged otherwise)\n  regex line: {regex_line}"
+    );
+}
+
+/// A push whose commit range cannot be resolved (e.g. `remote_sha` names an
+/// object this clone has never fetched — a real, not hypothetical, state) must
+/// refuse the push, not silently treat an unreadable range as "nothing
+/// forbidden found." The prior endpoint-diff version piped stderr to
+/// `/dev/null` and `|| true`-d the exit code, which fails OPEN: a `fatal: bad
+/// object` from git collapsed to an empty result and the push proceeded.
+#[test]
+fn pre_push_fails_closed_when_the_commit_range_is_unresolvable() {
+    let source = hook();
+    let range_lines: Vec<&str> = source
+        .lines()
+        .filter(|line| line.contains("git log --name-only"))
+        .collect();
+    assert!(
+        !range_lines.is_empty(),
+        "expected at least one `git log --name-only` invocation building the commit range"
     );
     assert!(
-        source.contains(".planning") && source.contains(".codex") && source.contains(".claude"),
-        "pre-push forbidden artifact regex must cover .planning, .codex, and .claude"
+        source.contains("range_rc") || source.contains("range_files\" 2>&1"),
+        "the range-scan command's exit status must be captured (not `2>/dev/null | ... || true`) \
+         so an unresolvable range can be distinguished from a genuinely empty one and refused"
+    );
+}
+
+/// A brand-new branch's first-ever push reports an all-zero `remote_sha` —
+/// there is no old tip to diff against. Scanning `git log "$local_sha"` alone
+/// in that case walks the WHOLE history back to the repo's first commit, not
+/// just what this push introduces: on this repo that includes
+/// personal-artifact commits from before this hygiene policy existed, so
+/// every branch's first push would be refused regardless of what it actually
+/// contains. Verified directly: `git log --name-only "$local_sha"` on this
+/// repo's real `develop` finds 1847 forbidden-pattern matches purely from
+/// history, while `git log --name-only "$local_sha" --not --remotes=origin`
+/// (scoped to commits not already reachable from any known remote ref) finds
+/// zero on that same commit and still catches a genuinely new forbidden file
+/// added on a fresh branch.
+#[test]
+fn pre_push_scopes_a_new_branchs_first_push_to_what_it_actually_introduces() {
+    let source = hook();
+    let zero_sha_line = source
+        .lines()
+        .find(|line| line.trim_start().starts_with("*)") && line.contains("git log --name-only"))
+        .expect(
+            "pre-push must have a `*)` (all-zero remote_sha) case arm building the commit range",
+        );
+
+    assert!(
+        zero_sha_line.contains("--not") && zero_sha_line.contains("--remotes"),
+        "the all-zero-remote_sha arm must scope its `git log` to commits not already reachable \
+         from a known remote ref (`--not --remotes=...`), not scan `\"$local_sha\"` alone — \
+         otherwise a brand-new branch's first push walks the entire repo history and is refused \
+         over content this push does not introduce.\n  offending line: {}",
+        zero_sha_line.trim()
     );
 }

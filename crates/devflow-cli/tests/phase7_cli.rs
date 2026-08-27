@@ -784,10 +784,22 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     let output = run_devflow(root, &fake_bin.path, &["status"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains(&format!(
-        "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
-        root.display()
-    )));
+    // D-10 (44-03) replaced the old `--from-devflow <root>` invocation with a
+    // runnable `hermes cron create` command carrying an ISO-8601 UTC instant
+    // schedule. Build the expected line from `instructions`' own fields
+    // (the exact values the CLI reads back off disk) rather than
+    // hand-duplicating cron_hint_line's quoting logic here.
+    let expected = format!(
+        "Cron instruction pending (phase 7): hermes cron create \"{}\" {} --repeat 1 --name {} (rate-limit resets: {})",
+        instructions.hermes_cron.schedule,
+        devflow_core::ship::shell_quote(&instructions.hermes_cron.command),
+        instructions.hermes_cron.name,
+        instructions.retry_after,
+    );
+    assert!(
+        stdout.contains(&expected),
+        "stdout was:\n{stdout}\nexpected substring:\n{expected}"
+    );
 }
 
 #[test]

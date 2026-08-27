@@ -68,8 +68,22 @@ fn pre_commit_guards_against_personal_artifacts_on_non_workspace_branches() {
         source.contains("workspace/*") && source.contains("staged_personal"),
         "pre-commit must inspect staged files and forbid personal artifacts on non-workspace branches"
     );
+    // Scoped to the actual regex line, not `source.contains(...)` anywhere in
+    // the file -- a bare substring check is satisfied by prose in a comment
+    // just as easily as by the regex itself (999.11x: this exact test passed
+    // on ".planning" matching a comment explaining why .planning was REMOVED
+    // from the regex, while the regex itself no longer covered it at all).
+    let regex_line = source
+        .lines()
+        .find(|line| line.contains("staged_personal=") && line.contains("grep -E"))
+        .expect("pre-commit must build staged_personal via a grep -E regex line");
     assert!(
-        source.contains(".planning") && source.contains(".codex") && source.contains(".claude"),
-        "pre-commit personal artifact regex must cover .planning, .codex, and .claude"
+        !regex_line.contains(".planning")
+            && regex_line.contains(".codex")
+            && regex_line.contains(".claude"),
+        "pre-commit's personal-artifact regex must cover .codex and .claude, and must NOT cover \
+         .planning -- GSD's per-phase worktree convention commits .planning content on \
+         feature/phase-N; the never-reaches-develop/main guarantee is enforced at push time \
+         instead (see pre_push_guards_against_personal_artifacts_on_clean_branches)"
     );
 }
