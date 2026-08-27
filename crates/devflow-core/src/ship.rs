@@ -712,6 +712,18 @@ mod tests {
     fn consume_cron_instructions_preserves_unreadable_legacy_record() {
         use std::os::unix::fs::PermissionsExt;
 
+        // 999.113: root (the container pre-push gate's default user) bypasses
+        // Unix permission bits, so chmod 0o000 does not block root's own read
+        // and the fixture below cannot produce its precondition. Skip rather
+        // than assert a guarantee this process is not subject to.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping consume_cron_instructions_preserves_unreadable_legacy_record: \
+                 running as root, which bypasses the 0o000 fixture (999.113)"
+            );
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(7);
         let record =
