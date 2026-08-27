@@ -53,12 +53,21 @@ if [ "$is_devflow" -eq 0 ]; then
     esac
 fi
 
-# Branch hygiene: personal/agent development artifacts and planning databases
-# belong exclusively on `workspace/*` (or `personal/*`) branches. Refuse them
-# on develop, main, feature/*, fix/*, chore/*, and release/* branches.
+# Branch hygiene: personal/agent tooling configuration belongs exclusively on
+# `workspace/*` (or `personal/*`) branches. Refuse it on develop, main,
+# feature/*, fix/*, chore/*, and release/* branches.
+#
+# `.planning/` is deliberately NOT in this list. GSD's per-phase worktree
+# convention (CLAUDE.md) commits PLAN.md/SUMMARY.md/STATE.md/ROADMAP.md on the
+# active feature/phase-N branch as work happens, and isolated per-plan
+# executor worktrees fork from that branch's committed HEAD — so `.planning`
+# content that never commits there is invisible to them (999.11x). The
+# guarantee that `.planning/**` never reaches develop/main is enforced at
+# push time instead (scripts/hooks/pre-push), which is the actual boundary
+# that matters, not every intermediate commit on a working branch.
 current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
 if [ -n "$current_branch" ] && [[ "$current_branch" != workspace/* && "$current_branch" != personal/* ]]; then
-    staged_personal="$(git diff --cached --name-only | grep -E '^(\.agents|\.bg-shell|\.claude|\.codex|\.gemini|\.omx|\.opencode|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.gsd-backups|\.gsd-id|\.gsd-worktrees|\.planning|\.devflow|\.worktrees)' || true)"
+    staged_personal="$(git diff --cached --name-only | grep -E '^(\.agents|\.bg-shell|\.claude|\.codex|\.gemini|\.omx|\.opencode|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.gsd-backups|\.gsd-id|\.gsd-worktrees|\.devflow|\.worktrees)' || true)"
     if [ -n "$staged_personal" ]; then
         echo "pre-commit: refusing to commit personal/agent artifacts on branch '$current_branch':" >&2
         echo "$staged_personal" | sed 's/^/  /' >&2

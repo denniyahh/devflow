@@ -1958,7 +1958,7 @@ fn agent_pid_from_file(project_root: &Path, phase: PhaseId) -> Option<u32> {
 fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
     devflow_core::ship::list_cron_instructions(project_root)
         .iter()
-        .map(|instructions| cron_hint_line(instructions, project_root))
+        .map(cron_hint_line)
         .collect()
 }
 
@@ -1967,22 +1967,41 @@ fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
 /// the reset time is already computed and persisted (`CronInstructions.
 /// retry_after`, ship.rs), this only presents it; no new detection logic.
 /// Pure so it's unit-testable without capturing process stdout.
-fn cron_hint_line(
-    instructions: &devflow_core::ship::CronInstructions,
-    project_root: &Path,
-) -> String {
-    let base = format!(
-        "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
-        instructions.phase,
-        project_root.display()
-    );
+fn cron_hint_line(instructions: &devflow_core::ship::CronInstructions) -> String {
     let retry_after = instructions.retry_after.trim();
-    if retry_after.is_empty() {
-        base
-    } else {
-        let reset = render_gate_context(retry_after, 100);
-        format!("{base} (rate-limit resets: {reset})")
+    if instructions.hermes_cron.schedule.is_empty() {
+        return format!(
+            "Cron instruction pending (phase {}): unparseable retry-after (rate-limit resets: {}); resume manually with: devflow resume --phase {}",
+            instructions.phase,
+            render_gate_context(retry_after, 100),
+            instructions.phase,
+        );
     }
+    let repeat = if instructions.hermes_cron.once {
+        " --repeat 1"
+    } else {
+        ""
+    };
+    let reset = if retry_after.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (rate-limit resets: {})",
+            render_gate_context(retry_after, 100)
+        )
+    };
+    // `hermes_cron.command` is an unquoted composite shell command (e.g.
+    // `cd <path> && devflow resume --phase N`); this is the single place it
+    // gets quoted as one shell word — do not also quote it in `ship.rs`, or
+    // the raw path inside it, or the quotes nest and break/inject (44-CORE-
+    // REVIEW-FINDINGS.md finding 1).
+    format!(
+        "Cron instruction pending (phase {}): hermes cron create \"{}\" {}{repeat} --name {}{reset}",
+        instructions.phase,
+        instructions.hermes_cron.schedule,
+        devflow_core::ship::shell_quote(&instructions.hermes_cron.command),
+        instructions.hermes_cron.name,
+    )
 }
 
 /// Print active phase worktrees with branch and inferred phase/agent.
@@ -4139,25 +4158,20 @@ mod tests {
     #[test]
     fn cron_instruction_hints_include_hermes_command_per_phase() {
         let dir = tempfile::tempdir().unwrap();
-        // Empty retry_after here so the exact-match assertion below isolates
-        // the base hermes-command hint from 21a's reset-time fragment
-        // (covered separately by cron_hint_line_* below).
         for phase in [PhaseId::new(7), PhaseId::new(9)] {
-            let instructions =
-                devflow_core::ship::build_single_agent_cron_instructions(dir.path(), phase, "");
+            let instructions = devflow_core::ship::build_single_agent_cron_instructions(
+                dir.path(),
+                phase,
+                "2026-06-18T15:45:30Z",
+            );
             devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
         }
 
         let hints = cron_instruction_hints(dir.path());
 
         assert_eq!(hints.len(), 2);
-        assert_eq!(
-            hints[0],
-            format!(
-                "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
-                dir.path().display()
-            )
-        );
+        assert!(hints[0].contains("hermes cron create \"2026-06-18T15:46:00Z\""));
+        assert!(hints[0].contains("--repeat 1 --name devflow-phase-07-resume"));
         assert!(hints[1].contains("(phase 9)"));
     }
 
@@ -4170,12 +4184,10 @@ mod tests {
             "2026-06-18T15:45:30Z",
         );
 
-        let hint = cron_hint_line(&instructions, dir.path());
+        let hint = cron_hint_line(&instructions);
 
-        assert!(hint.starts_with(&format!(
-            "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
-            dir.path().display()
-        )));
+        assert!(hint.contains("hermes cron create \"2026-06-18T15:46:00Z\""));
+        assert!(hint.contains("--repeat 1 --name devflow-phase-07-resume"));
         assert!(hint.contains("(rate-limit resets: 2026-06-18T15:45:30Z)"));
     }
 
@@ -4185,19 +4197,66 @@ mod tests {
         let instructions = devflow_core::ship::build_single_agent_cron_instructions(
             dir.path(),
             PhaseId::new(7),
-            "",
+            "unknown",
         );
 
-        let hint = cron_hint_line(&instructions, dir.path());
+        let hint = cron_hint_line(&instructions);
 
-        assert_eq!(
-            hint,
-            format!(
-                "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
-                dir.path().display()
-            )
+        assert!(hint.contains("resume manually with: devflow resume --phase 7"));
+        assert!(!hint.contains("hermes cron create"));
+    }
+
+    #[test]
+    fn cron_hint_line_never_emits_the_unsupported_devflow_intake_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(7),
+            "2026-06-18T15:45:30Z",
         );
-        assert!(!hint.contains("resets"));
+        assert!(!cron_hint_line(&instructions).contains("--from-devflow"));
+    }
+
+    /// Regression for 44-CORE-REVIEW-FINDINGS.md finding 1: `ship.rs` used to
+    /// pre-quote the project path inside `hermes_cron.command`, and this
+    /// function then wrapped that already-quoted command in a second, raw
+    /// quote layer. POSIX single quotes don't nest, so a path containing a
+    /// space split into unquoted word fragments, and a path containing an
+    /// apostrophe closed the outer quote early (a shell-injection vector).
+    /// This asserts the fix holds: `cron_hint_line` embeds `shell_quote`'s
+    /// output verbatim (no re-wrap), and the result round-trips through a
+    /// real shell back to the original, unquoted command.
+    #[test]
+    fn cron_hint_line_command_quoting_roundtrips_through_shell_for_space_and_apostrophe_paths() {
+        for raw_path in ["/tmp/My Project", "/tmp/o'connor/repo"] {
+            let instructions = devflow_core::ship::build_single_agent_cron_instructions(
+                Path::new(raw_path),
+                PhaseId::new(7),
+                "2026-06-18T15:45:30Z",
+            );
+            let hint = cron_hint_line(&instructions);
+            let quoted = devflow_core::ship::shell_quote(&instructions.hermes_cron.command);
+
+            assert!(
+                hint.contains(&quoted),
+                "hint does not embed the singly-quoted command verbatim for {raw_path:?}: {hint}"
+            );
+
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {quoted}"))
+                .output()
+                .expect("sh must be available to run this test");
+            assert!(
+                output.status.success(),
+                "sh failed to parse quoted command for {raw_path:?}: {quoted}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                instructions.hermes_cron.command,
+                "quoting did not round-trip for {raw_path:?}"
+            );
+        }
     }
 
     #[test]

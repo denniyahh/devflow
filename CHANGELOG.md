@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.11.0 — 2026-08-27
+
+Codex end-to-end verification (Phase 44). Proves `devflow resume --phase N --agent codex`
+end-to-end through a real phase run and closes every gap the run and its reviews surfaced.
+
+### Added
+
+- `devflow resume --phase N --agent <AGENT>` handoff: preflights the candidate driver against the
+  full generic preflight bundle before persisting the new agent
+- per-phase cron-instruction lifecycle, with TOCTOU-safe deletion under concurrent consumers
+- Hermes resume schedules as runnable UTC instants via a real `hermes cron create` invocation
+
+### Fixed
+
+- quoting bug in the composite Hermes cron command string that broke (and, for a path containing
+  an apostrophe, made exploitable) project paths containing shell metacharacters
+- `consume_cron_instructions_preserves_unreadable_legacy_record` asserted a `chmod 0o000` guarantee
+  that root — the container pre-push gate's default user — bypasses; now skips under root instead
+  of failing
+
 ## 2.10.0 — 2026-08-24
 
 OpenCode driver completion (Phase 43). Completes the under-built `AgentDriver` for OpenCode: a

@@ -30,7 +30,7 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, lock, registry, workflow};
+use devflow_core::{events, lock, registry, ship, workflow};
 use std::path::Path;
 use tracing::info;
 
@@ -277,6 +277,26 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     // phase) from the machine-global registry so `devflow gate list
     // --all-roots` stops naming a phase that no longer exists.
     registry::deregister(project_root, state.phase);
+    match ship::consume_cron_instructions(project_root, state.phase) {
+        Ok(Some(path_kind)) => {
+            let path_kind = match path_kind {
+                ship::CronInstructionPathKind::PerPhase => "per-phase",
+                ship::CronInstructionPathKind::Legacy => "legacy",
+                ship::CronInstructionPathKind::Both => "both",
+            };
+            events::emit(
+                project_root,
+                state.phase,
+                "cron_instructions_consumed",
+                serde_json::json!({
+                    "trigger": "ship_complete",
+                    "path_kind": path_kind,
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => info!(phase = %state.phase, "could not consume cron instructions: {err}"),
+    }
     // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
     // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
     // reads — deliberately NOT `workflow_finished` below, which is also
@@ -762,6 +782,8 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
+        let cron = ship::build_single_agent_cron_instructions(root, phase, "2026-06-18T15:45:30Z");
+        ship::write_cron_instructions(root, &cron).unwrap();
 
         std::fs::write(
             agent_result::stdout_path(root, phase),
@@ -794,6 +816,14 @@ mod tests {
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("events recorded for phase");
         assert_eq!(last["event"], "workflow_finished");
+        assert!(!ship::cron_instructions_path(root, phase).exists());
+        let consumed = std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "cron_instructions_consumed")
+            .expect("ship completion must audit cron consumption");
+        assert_eq!(consumed["trigger"], "ship_complete");
     }
 
     /// 23-06 Task 1's named blocker regression guard (BLOCKER 1,
