@@ -168,6 +168,9 @@ enum Command {
         /// Phase to resume.
         #[arg(long)]
         phase: PhaseId,
+        /// Hand the saved run to a different agent driver; omit to keep its saved agent.
+        #[arg(long)]
+        agent: Option<AgentKind>,
         /// Force the pre-31 single-document Claude launch for the rest of this
         /// run (D-11, `31-CONTEXT.md`). Same semantics as `devflow start
         /// --legacy-claude-launch`, offered here so a run already in flight can
@@ -588,9 +591,10 @@ fn run() -> Result<(), CliError> {
         ),
         Command::Resume {
             phase,
+            agent,
             legacy_claude_launch,
             project,
-        } => resume(&project_root(project)?, phase, legacy_claude_launch),
+        } => resume(&project_root(project)?, phase, agent, legacy_claude_launch),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {

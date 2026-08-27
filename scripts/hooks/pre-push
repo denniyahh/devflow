@@ -43,16 +43,76 @@ done
 # ---------------------------------------------------------------------------
 # Branch hygiene policy: non-workspace branches (main, develop, feature/*,
 # fix/*, chore/*, release/*) must never carry personal agent setups, planning
-# state, or local databases.
+# state, or local databases. `.planning/` is INCLUDED here (unlike
+# pre-commit's copy of this list): 2a2ce97 deliberately purged it from
+# develop entirely, so nothing under `.planning/**` is ever meant to reach
+# these branches, not even STATE.md/ROADMAP.md/PROJECT.md.
+#
+# Scans the FULL commit range this push introduces (`git log --name-only`
+# over remote_sha..local_sha), not just the net diff between the two
+# endpoints, and not a `git ls-tree` of the whole pushed tree either.
+#
+# Neither of those alternatives is safe:
+#   - A whole-tree `ls-tree` check treats "exists anywhere in this branch's
+#     history" as forbidden, firing on every push once ANY commit ever added
+#     a tracked file under one of these prefixes -- including files
+#     legitimately committed before this policy existed.
+#   - An endpoint diff (remote_sha vs local_sha directly) only sees the NET
+#     change. A commit that adds a forbidden file, followed by a later commit
+#     in the SAME push that removes it, nets to zero difference at the
+#     endpoints -- but the forbidden content is still permanently reachable
+#     in the pushed history via the intermediate commit. Verified directly:
+#     add-then-remove-within-one-push produces an empty endpoint diff while
+#     `git log --diff-filter=A` over the same range still finds the commit
+#     that added it. An endpoint diff also can't see a rename: `--diff-filter=A`
+#     only matches git's own Added classification, and a path renamed INTO a
+#     forbidden prefix is classified Renamed, not Added -- confirmed directly
+#     (`git mv old.txt CLAUDE.md` does not appear under `--diff-filter=A`).
+#     `git log --name-only` has neither problem: it lists every path touched
+#     by every commit in the range, add/modify/delete/rename all included.
+#
+# Fails CLOSED, not open: if `git log` cannot resolve the range (e.g.
+# `remote_sha` is a real object the remote has but this clone has never
+# fetched -- a legitimate, not-hypothetical state), refuse the push rather
+# than silently treating an unreadable range as "nothing forbidden found."
+# The prior version piped stderr to /dev/null and `|| true`-d the exit code,
+# which is exactly the fail-open shape: a `fatal: bad object` from git
+# collapsed to an empty `$forbidden` and the push proceeded (999.11x).
 # ---------------------------------------------------------------------------
 for line in "${PUSH_LINES[@]}"; do
-    read -r local_ref local_sha remote_ref _remote_sha <<< "$line"
+    read -r local_ref local_sha remote_ref remote_sha <<< "$line"
     [ -z "${local_ref:-}" ] && continue
     case "$local_sha" in *[!0]*) ;; *) continue ;; esac
 
     case "$remote_ref" in
         refs/heads/develop | refs/heads/main | refs/heads/feature/* | refs/heads/fix/* | refs/heads/chore/* | refs/heads/release/*)
-            forbidden="$(git ls-tree -r --name-only "$local_sha" 2>/dev/null | grep -E '^(\.agents|\.bg-shell|\.claude|\.codex|\.gemini|\.omx|\.opencode|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.planning|\.devflow)' || true)"
+            range_rc=0
+            case "$remote_sha" in
+                *[!0]*) range_files="$(git log --name-only --format='' "${remote_sha}..${local_sha}" 2>&1)" || range_rc=$? ;;
+                # A brand-new ref (this branch's first-ever push) reports an
+                # all-zero remote_sha -- there is no "old tip" to diff
+                # against. Bounding against `--not --remotes=origin` (commits
+                # reachable from local_sha that are NOT already reachable
+                # from any known origin/* ref) scans exactly the commits this
+                # push actually introduces to the remote, the same as the
+                # `remote_sha..local_sha` branch above does for an existing
+                # ref. Without this, `git log local_sha` alone walks the
+                # WHOLE history back to the repo's first commit -- on this
+                # repo that includes personal-artifact commits from before
+                # this policy existed, so literally every branch's first
+                # push would be refused, independent of what the push
+                # actually introduces.
+                *)      range_files="$(git log --name-only --format='' "${local_sha}" --not --remotes=origin 2>&1)" || range_rc=$? ;;
+            esac
+            if [ "$range_rc" -ne 0 ]; then
+                echo "pre-push: FATAL — could not inspect the commit range for '$remote_ref':" >&2
+                echo "$range_files" | sed 's/^/  /' >&2
+                echo "  Refusing to push rather than silently allowing forbidden content through" >&2
+                echo "  a range this hook could not actually check. If the remote has moved ahead" >&2
+                echo "  of this clone, fetch first." >&2
+                exit 1
+            fi
+            forbidden="$(printf '%s\n' "$range_files" | grep -E '^(\.agents|\.bg-shell|\.claude|\.codex|\.gemini|\.omx|\.opencode|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.gsd-worktrees|\.planning|\.devflow|\.worktrees)' | sort -u || true)"
             if [ -n "$forbidden" ]; then
                 echo "pre-push: REFUSING to push personal/agent artifacts to '$remote_ref':" >&2
                 echo "$forbidden" | head -10 | sed 's/^/  /' >&2

@@ -604,7 +604,10 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 /// itself produces. `HeadlessSafe` is never refused; `RequiresTypedSubagents`
 /// / `InteractiveOnly` have no headless path at all. Routes the failure
 /// through the preflight gate (D-15) rather than a hard error.
-fn preflight_interactivity_check(project_root: &Path, state: &State) -> Result<(), String> {
+pub(crate) fn preflight_interactivity_check(
+    project_root: &Path,
+    state: &State,
+) -> Result<(), String> {
     use devflow_core::agents::InteractivityMode;
     let driver = agents::driver_for(state.agent);
     match driver.interactivity_mode(state.stage) {
@@ -1202,7 +1205,7 @@ fn unattended_launch_check_reporting_to(
 /// `.and_then`) is deliberately NOT folded into this aggregation —
 /// `25-VERIFICATION.md`'s gap-closure scope names only these three generic
 /// checks; this is a scope boundary, not an oversight.
-fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
+pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
     let mut reasons = Vec::new();
     if let Err(reason) = preflight_major_bump_check(project_root, state) {
         reasons.push(reason);
