@@ -27,7 +27,10 @@ use crate::pipeline_outcomes::{
     handle_ship_failure, handle_ship_outcome, handle_stage_failure, handle_validate_outcome,
     truncate_reason,
 };
-use crate::preflight::{ensure_agent_binary, run_preflight, worktree_writable_roots};
+use crate::preflight::{
+    agent_program, ensure_agent_binary, generic_preflight_checks, run_preflight,
+    worktree_writable_roots,
+};
 use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
@@ -1028,6 +1031,26 @@ fn spawn_agent_and_record(
     // (18b).
     state.monitor_pid = Some(pid);
     workflow::save_state(state)?;
+    match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
+        Ok(Some(path_kind)) => {
+            let path_kind = match path_kind {
+                devflow_core::ship::CronInstructionPathKind::PerPhase => "per-phase",
+                devflow_core::ship::CronInstructionPathKind::Legacy => "legacy",
+                devflow_core::ship::CronInstructionPathKind::Both => "both",
+            };
+            events::emit(
+                &state.project_root,
+                state.phase,
+                "cron_instructions_consumed",
+                serde_json::json!({
+                    "trigger": "resume_consumed",
+                    "path_kind": path_kind,
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => warn!(phase = %state.phase, "could not consume cron instructions: {err}"),
+    }
     // 23b: register this (project_root, phase) in the machine-global
     // registry on the same code path that just recorded monitor_pid, so a
     // running phase cannot be missing from `devflow gate list --all-roots`.
@@ -1237,6 +1260,7 @@ pub(crate) fn handle_ambiguous_outcome(
 pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
+    agent: Option<AgentKind>,
     legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root, phase) {
@@ -1249,6 +1273,53 @@ pub(crate) fn resume(
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
     let mut state = workflow::load_state(project_root, phase)?;
+    if let Some(requested) = agent
+        && requested != state.agent
+    {
+        let from_agent = state.agent;
+        let mut candidate = state.clone();
+        candidate.agent = requested;
+        // Runs the FULL generic preflight bundle (major-bump, unattended-
+        // launch-shape, interactivity, gh-auth) against the candidate, not
+        // just interactivity. `launch_stage` runs this same bundle again a
+        // few lines below via `run_preflight`, and it is stricter than plain
+        // interactivity: e.g. a Claude/Antigravity-only chain-flag guard
+        // means a same-stage handoff to any other agent in Auto mode fails
+        // the unattended-launch-shape check even though the target driver
+        // declares the stage headless-safe. Checking only interactivity here
+        // let such a handoff commit (`state.agent` mutated, `agent_handoff`
+        // emitted) and then immediately hit that later gate — leaving the
+        // phase "handed off" to a driver whose launch never actually ran
+        // (44-CORE-REVIEW-FINDINGS.md finding 2b). Checking the full bundle
+        // up front refuses it before anything is mutated, same as the
+        // existing byte-identical-on-refusal guarantee below.
+        generic_preflight_checks(project_root, &candidate).map_err(|reason| {
+            CliError::Message(format!(
+                "handoff to {requested} refused at saved {} stage: {reason}",
+                state.stage
+            ))
+        })?;
+        ensure_agent_binary(agent_program(requested))
+            .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
+        agents::driver_for(requested)
+            .health(&candidate)
+            .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
+
+        state.agent = requested;
+        workflow::save_state(&state)?;
+        events::emit(
+            project_root,
+            phase,
+            "agent_handoff",
+            serde_json::json!({
+                "stage": state.stage.to_string(),
+                "from_agent": from_agent.to_string(),
+                "to_agent": requested.to_string(),
+                "reason": "resume --agent",
+            }),
+        );
+        println!("handoff: {from_agent} → {requested}");
+    }
     if state.stopped {
         state.stopped = false;
         state.stop_reason = None;
@@ -1282,7 +1353,29 @@ pub(crate) fn resume(
         AUTO_CHAIN_REPAIR_FROM_RESUME,
     );
     workflow::save_state(&state)?;
-    launch_stage(&mut state, None, None)
+    match launch_stage(&mut state, None, None) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // `state.stopped` was just persisted as `false` above (needed so
+            // a reload mid-relaunch already sees the phase as active — D-15/
+            // 999.60, see the doc comment above). If `launch_stage` then
+            // fails outright (as opposed to routing through its own gate,
+            // which returns `Ok(())`), that save is now a lie: the state
+            // file claims an active, running phase, but nothing launched.
+            // `check_dead_agent`/`check_dead_monitor` both skip a phase
+            // marked `stopped` (commands.rs), so this "zombie" combination
+            // is exactly the one case those checks cannot flag
+            // (44-CORE-REVIEW-FINDINGS.md finding 2a). Re-mark the phase
+            // stopped, with a reason naming what failed, so it is visible
+            // and actionable again rather than silently stalled. Best-effort
+            // save — the original launch error is what the caller needs to
+            // see either way.
+            state.stopped = true;
+            state.stop_reason = Some(format!("resume launch failed: {err}"));
+            let _ = workflow::save_state(&state);
+            Err(err)
+        }
+    }
 }
 
 /// The single active phase: `Ok(Some)` when exactly one is active, `Ok(None)`
@@ -1792,7 +1885,7 @@ mod tests {
             std::env::set_var("PATH", &stubbed_path);
         }
 
-        let result = resume(root, phase, false);
+        let result = resume(root, phase, None, false);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -1896,7 +1989,7 @@ mod tests {
             std::env::set_var("PATH", &stubbed_path);
         }
 
-        let result = resume(root, phase, false);
+        let result = resume(root, phase, None, false);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -1977,7 +2070,7 @@ mod tests {
             std::env::set_var("PATH", &stubbed_path);
         }
 
-        let result = resume(root, phase, false);
+        let result = resume(root, phase, None, false);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -2005,6 +2098,386 @@ mod tests {
             reloaded.monitor_pid.is_some(),
             "resume() must still relaunch and record a monitor pid with no cap present"
         );
+    }
+
+    #[test]
+    fn resume_with_agent_hands_off_and_relaunches_under_the_new_driver() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(74);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let record = devflow_core::ship::build_single_agent_cron_instructions(
+            root,
+            phase,
+            "2026-06-18T15:45:30Z",
+        );
+        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
+
+        let stub_dir = stub_agent_binary("codex");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+        assert!(reloaded.monitor_pid.is_some());
+        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
+        let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+        let handoff = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "agent_handoff")
+            .expect("handoff event must exist");
+        assert_eq!(handoff["stage"], "code");
+        assert_eq!(handoff["from_agent"], "claude");
+        assert_eq!(handoff["to_agent"], "codex");
+        assert_eq!(handoff["reason"], "resume --agent");
+    }
+
+    #[test]
+    fn resume_without_agent_leaves_the_saved_agent_untouched() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(75);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+        let result = resume(root, phase, None, false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().agent,
+            AgentKind::Claude
+        );
+    }
+
+    #[test]
+    fn resume_with_agent_refuses_before_touching_state_when_target_cannot_run_the_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(76);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        workflow::save_state(&state).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let err = resume(root, phase, Some(AgentKind::Codex), false).unwrap_err();
+
+        assert!(err.to_string().contains("refused"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .all(|event| event["event"] != "agent_handoff")
+        );
+    }
+
+    /// Regression for 44-CORE-REVIEW-FINDINGS.md finding 2b: Codex declares
+    /// Code headless-safe (`codex.rs`), so the early handoff check used to
+    /// approve this handoff on interactivity grounds alone — only for
+    /// `launch_stage`'s later, stricter unattended-launch-shape check (the
+    /// Claude/Antigravity-only chain-flag guard, Auto mode only) to refuse
+    /// it a moment later, after `state.agent` and the `agent_handoff` event
+    /// were already committed. The handoff must now be refused up front,
+    /// before anything is mutated — same as any other refused handoff.
+    #[test]
+    fn resume_with_agent_refuses_auto_mode_handoff_that_would_fail_the_later_unattended_launch_check()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(81);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let err = resume(root, phase, Some(AgentKind::Codex), false).unwrap_err();
+
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert!(err.to_string().contains("codex"), "{err}");
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .all(|event| event["event"] != "agent_handoff")
+        );
+    }
+
+    #[test]
+    fn resume_with_same_agent_is_an_ordinary_idempotent_resume() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(77);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+        let result = resume(root, phase, Some(AgentKind::Claude), false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .all(|event| event["event"] != "agent_handoff")
+        );
+    }
+
+    /// Pitfall 1: Plan is deliberately not gated by the Define-only artifact check.
+    #[test]
+    fn resume_with_agent_allows_plan_stage() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(78);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+        let stub_dir = stub_agent_binary("codex");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().agent,
+            AgentKind::Codex
+        );
+    }
+
+    /// Whole-state comparison keeps this handoff check current when State gains fields.
+    #[test]
+    fn resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(79);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.consecutive_failures = 3;
+        state.infra_failures = 2;
+        workflow::save_state(&state).unwrap();
+        let mut before = serde_json::to_value(&state).unwrap();
+        let stub_dir = stub_agent_binary("codex");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        let mut after = serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap();
+        for value in [&mut before, &mut after] {
+            value.as_object_mut().unwrap().remove("agent");
+            value.as_object_mut().unwrap().remove("monitor_pid");
+        }
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn resume_with_agent_from_a_rate_limited_state_relaunches() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(80);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("rate limited".to_string());
+        workflow::save_state(&state).unwrap();
+        let record = devflow_core::ship::build_single_agent_cron_instructions(
+            root,
+            phase,
+            "2026-06-18T15:45:30Z",
+        );
+        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
+        let stub_dir = stub_agent_binary("codex");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+        let result = resume(root, phase, Some(AgentKind::Codex), false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.agent, AgentKind::Codex);
+        assert!(!reloaded.stopped);
+        assert!(reloaded.monitor_pid.is_some());
+        assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
+    }
+
+    /// Regression for 44-CORE-REVIEW-FINDINGS.md finding 2a: `resume` clears
+    /// and persists `stopped`/`stop_reason`/`stop_until` BEFORE calling
+    /// `launch_stage` (needed so a reload mid-relaunch already sees the
+    /// phase as active — D-15/999.60). If `launch_stage` then fails outright
+    /// — here, the agent binary is simply missing — that save must not be
+    /// left standing: a state file claiming `stopped: false` with nothing
+    /// actually running is a zombie invisible to `check_dead_agent`/
+    /// `check_dead_monitor`, which both skip any phase already marked
+    /// `stopped`. `resume` must re-mark the phase `stopped` (with a reason)
+    /// on this failure path, not leave it looking falsely active.
+    #[test]
+    fn resume_re_marks_stopped_when_launch_stage_fails_outright() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(82);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.stop_reason = Some("rate limited".to_string());
+        workflow::save_state(&state).unwrap();
+
+        // An empty directory on PATH: no `claude` binary anywhere on it, so
+        // `ensure_agent_binary` inside `launch_stage` fails deterministically
+        // regardless of what's installed on the host running this test.
+        let empty_path_dir = tempfile::tempdir().unwrap();
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", empty_path_dir.path());
+        }
+        let result = resume(root, phase, None, false);
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(
+            reloaded.stopped,
+            "a failed resume must leave the phase marked stopped, not a false-active zombie"
+        );
+        assert!(reloaded.stop_reason.is_some_and(|r| r.contains("claude")));
+        assert!(reloaded.monitor_pid.is_none());
     }
 
     /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
@@ -2129,6 +2602,85 @@ mod tests {
         assert_eq!(
             reloaded.monitor_pid, None,
             "the monitor_pid clear must be persisted to state.json, not just in-memory"
+        );
+    }
+
+    /// D-15 (44-02): a failed monitor relaunch must leave the phase cron
+    /// instructions available for a later retry. The invalid worktree is
+    /// deliberate: archive bookkeeping has no capture to process, while the
+    /// monitor's child spawn fails at its working-directory validation.
+    /// Consumption is after the successful spawn in `spawn_agent_and_record`,
+    /// so this test is the negative control for the successful resume tests.
+    #[test]
+    fn failed_relaunch_preserves_the_phase_cron_instructions_record() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(144);
+        let missing_worktree = root.join("worktree-that-does-not-exist");
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.worktree_path = Some(missing_worktree.clone());
+        workflow::save_state(&state).unwrap();
+
+        let record = devflow_core::ship::build_single_agent_cron_instructions(
+            root,
+            phase,
+            "2026-06-18T15:45:30Z",
+        );
+        devflow_core::ship::write_cron_instructions(root, &record).unwrap();
+        assert!(
+            devflow_core::ship::cron_instructions_path(root, phase).exists(),
+            "the fixture must contain a phase cron record before relaunch"
+        );
+        assert!(
+            !missing_worktree.exists(),
+            "the failure fixture must be absent"
+        );
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
+        }
+
+        let result = spawn_agent_and_record(
+            &mut state,
+            "claude",
+            &[],
+            &[],
+            None,
+            monitor::MonitorLaunch::Legacy,
+        );
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "monitor spawn must fail for an absent worktree"
+        );
+        assert!(
+            devflow_core::ship::cron_instructions_path(root, phase).exists(),
+            "a failed monitor relaunch must preserve the phase cron record"
+        );
+        assert!(
+            events_of_kind(root, "cron_instructions_consumed").is_empty(),
+            "a failed monitor relaunch must not emit cron_instructions_consumed"
         );
     }
     /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`

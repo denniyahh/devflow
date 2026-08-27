@@ -431,4 +431,43 @@ mod tests {
             .collect();
         assert_eq!(remaining, vec![PhaseId::new(5)]);
     }
+
+    /// D-19: recover::clean remains a reset path, distinct from lifecycle
+    /// consumption, and deletes a deliberately unconsumed record.
+    #[test]
+    fn clean_still_deletes_unconsumed_cron_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(30);
+        let state = state_aged_phase(root, phase, STALE_THRESHOLD.as_secs() + 60, None);
+        crate::workflow::save_state(&state).unwrap();
+        let record = crate::ship::build_single_agent_cron_instructions(root, phase, "");
+        crate::ship::write_cron_instructions(root, &record).unwrap();
+        assert!(crate::ship::cron_instructions_path(root, phase).exists());
+
+        clean(root).unwrap();
+
+        assert!(!crate::ship::cron_instructions_path(root, phase).exists());
+    }
+
+    /// D-19: explicit clean_phase reset remains distinct from consumption and
+    /// deletes only the named phase's deliberately unconsumed record.
+    #[test]
+    fn clean_phase_deletes_only_the_named_phase_cron_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let first = PhaseId::new(31);
+        let second = PhaseId::new(32);
+        let first_state = state_aged_phase(root, first, 0, None);
+        crate::workflow::save_state(&first_state).unwrap();
+        let first_record = crate::ship::build_single_agent_cron_instructions(root, first, "");
+        let second_record = crate::ship::build_single_agent_cron_instructions(root, second, "");
+        crate::ship::write_cron_instructions(root, &first_record).unwrap();
+        crate::ship::write_cron_instructions(root, &second_record).unwrap();
+
+        clean_phase(root, first).unwrap();
+
+        assert!(!crate::ship::cron_instructions_path(root, first).exists());
+        assert!(crate::ship::cron_instructions_path(root, second).exists());
+    }
 }
