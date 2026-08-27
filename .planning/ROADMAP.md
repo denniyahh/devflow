@@ -391,6 +391,37 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.113: `consume_cron_instructions_preserves_unreadable_legacy_record` Passes Silently Under Root, Defeating Its Own Fixture (RESOLVED 2026-08-27)
+
+**Found:** 2026-08-27, phase 44, pushing that phase's PR branch through the container-based
+`check-in-container.sh` pre-push gate for the first time.
+
+**The item:** the test sets a legacy cron-instructions file to `0o000` via `std::fs::set_permissions`
+and asserts `consume_cron_instructions` returns `None` because the record can't be read to confirm
+phase ownership. On the host (non-root) this correctly blocks the read and the test passes. Inside
+the pinned devcontainer image, `docker run` defaults to `uid=0` (confirmed directly:
+`docker run --rm mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm id` → `uid=0(root)`), and
+root bypasses Unix permission bits entirely — `std::fs::read_to_string` on the `0o000` file
+succeeds, `has_matching_legacy` becomes `true`, and the function returns `Some(Legacy)` instead of
+the asserted `None`. The test failed only in the container, deterministically, on every run.
+
+**Blast radius:** blocked the container-based pre-push gate for *any* branch's first push through
+it, not specific to phase 44's changes — the test predates that phase and the code path it covers
+(`has_matching_legacy`'s read) was not touched by any of its fixes.
+
+**Resolved 2026-08-27**, same session, closing out phase 44's ship:
+`consume_cron_instructions_preserves_unreadable_legacy_record` now checks
+`unsafe { libc::geteuid() } == 0` and skips with an explanatory message when running as root,
+instead of asserting a guarantee the process is not subject to. Verified both directions: on the
+host (non-root), the real assertion still runs and passes; run directly inside the pinned
+devcontainer image via `docker run -v $(pwd):/workspace ... cargo test`, the guard fires and the
+test skips cleanly rather than failing. `feature/phase-44-pr`'s push through `check-in-container.sh`
+then passed (`check.sh: all OK`), unblocking PR #154.
+
+**Size:** S. **Depends on:** nothing structural.
+
+---
+
 ### Phase 999.112: `OpenCodeDriver::capabilities()` Never ANSI-Strips `opencode agent list` Output Before Matching (BACKLOG)
 
 **Found:** 2026-08-26, backfilling Phase 43's missing `43-VERIFICATION.md`/`43-REVIEW.md` into git

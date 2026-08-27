@@ -2,24 +2,25 @@
 gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
-current_phase: 44
-current_phase_name: Codex End-to-End Verification
-status: "Phase 43 shipped — PR #149"
-stopped_at: Phase 43 complete, ready to plan Phase 44
-last_updated: "2026-08-24T15:14:48.186Z"
-last_activity: 2026-08-24
-state_head: 87bb6ed21b765dafcde2c0a431a830db5ab5835a
+current_phase: 45
+current_phase_name: Opportunistic Cleanup (999.94)
+status: planning
+stopped_at: Phase 44 shipped (PR #154), ready to plan Phase 45
+last_updated: "2026-08-27T20:15:00.000Z"
+last_activity: 2026-08-27
+last_activity_desc: Phase 44 shipped via PR #154; 999.113 backlog item resolved
+state_head: 563c193db04631973bbcf0cb66c2712fb65ce816
 progress:
   total_phases: 6
-  completed_phases: 4
-  total_plans: 8
-  completed_plans: 8
-  percent: 67
+  completed_phases: 5
+  total_plans: 13
+  completed_plans: 13
+  percent: 83
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-08-24
+> Last updated: 2026-08-27
 
 ## Deferred Items
 
@@ -32,11 +33,15 @@ Items acknowledged and deferred at milestone close on 2026-08-04:
 
 ## Active Phase
 
-**Phase 44 — Codex End-to-End Verification** — not started. Phase 43 is complete
-and shipped via PR #149; the project is ready to plan Phase 44 against CODE-01.
+**Phase 44 — Codex End-to-End Verification — shipped.** CODE-01 satisfied: `devflow resume
+--phase 900 --agent codex` drove a throwaway phase's Code and Validate stages to a clean finish
+(one attempt, 2 real commits, 0-finding review, passing validation). Full outcome record and gap
+disposition in `44-codex-end-to-end-verification/44-CODEX-E2E.md`. PR #154
+(`feature/phase-44-pr` → `develop`) merged 2026-08-27; also closed backlog item 999.113
+(container-root permission test fragility) discovered while pushing.
 
-Current v2.8.0 milestone progress: phases 40-43 are complete, 44 and 45 remain
-planned/not started, with 8/8 completed plans across the completed phase scope.
+Current v2.8.0 milestone progress: phases 40-44 are complete, 45 remains not started, with 13/13
+completed plans across the completed phase scope.
 
 ---
 
