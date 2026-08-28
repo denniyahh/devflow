@@ -9,6 +9,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "DevFlow CLI — an opinionated take on AI-driven development automation"
 
+[lints]
+workspace = true
+
+
 [dependencies]
 devflow-core.workspace = true
 clap.workspace = true

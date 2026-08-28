@@ -202,6 +202,9 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   needed to reproduce the publish step, not the dev-loop itself.
 - [ ] Publish order matters and is enforced by convention, not tooling: `devflow-core` before
   `devflow`.
+- [ ] **[GLOBAL / PROJECT]** Rust AI harness tooling: `cargo-deny` (`deny.toml`), `cargo-machete`,
+  `cargo-semver-checks`, `cargo-mutants`, `cargo-llvm-cov`, `cargo-nextest`, and `miri` (via nightly).
+
 
 ## 9. Token/usage tracking (from earlier conversation, for completeness)
 

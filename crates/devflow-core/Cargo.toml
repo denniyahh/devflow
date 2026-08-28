@@ -9,6 +9,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "Opinionated AI-driven development workflow state machine"
 
+[lints]
+workspace = true
+
+
 [features]
 # Exposes `test_support` (hermetic git command construction, 999.37) to other
 # crates' test targets. Off by default — it adds no runtime behavior and is
