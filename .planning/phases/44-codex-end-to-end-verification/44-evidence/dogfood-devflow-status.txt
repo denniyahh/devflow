@@ -1,0 +1,32 @@
+[2m2026-08-27T10:34:54.552282Z[0m [33m WARN[0m [2mdevflow_core::workflow[0m[2m:[0m skipping unreadable state file state-stale.json: state JSON failed: missing field `stage` at line 5 column 1
+project_root: /var/home/denniyahh/Github/devflow
+active phases: 900
+
+phase 900:
+  stage: validate | mode: supervise | gate: pending
+  agent: OpenAI Codex
+  started: 1787821637 (1h ago)
+  worktree: /var/home/denniyahh/Github/devflow/.worktrees/phase-900
+  agent_pid: 2846026 (running: false)
+  monitor_pid: 2846025 (running: true)
+  liveness: between stages
+  in stage validate: 5m ago
+  last action: notify_fired (validate) (3m ago)
+
+==================== PENDING GATE ====================
+!!!: phase 900 validate (3m ago)
+  Validation passed — approve to ship?
+  approve: devflow gate approve 900 --stage validate
+  reject:  devflow gate reject 900 --stage validate --note <reason>
+======================================================
+
+open branches:
+  feature/phase-44 — 42 ahead (25 behind develop)
+  feature/phase-900 — 2 ahead
+
+active worktrees:
+  /var/home/denniyahh/Github/devflow/.worktrees/phase-44 [feature/phase-44] — phase 44
+  /var/home/denniyahh/Github/devflow/.worktrees/phase-900 [feature/phase-900] — phase 900 *
+  /var/home/denniyahh/Github/devflow/.worktrees/throwaway-codex-dogfood [throwaway/codex-dogfood-900]
+
+Cron instruction pending (phase 43): hermes cron create --from-devflow /var/home/denniyahh/Github/devflow (rate-limit resets: 1787582400)

@@ -1,0 +1,7 @@
+557877c feat(900-01): implement buckets_needed ceiling division
+ crates/devflow-core/src/dogfood_scratch.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+154162c test(900-01): add failing test for buckets_needed
+ crates/devflow-core/src/dogfood_scratch.rs | 31 ++++++++++++++++++++++++++++++
+ crates/devflow-core/src/lib.rs             |  1 +
+ 2 files changed, 32 insertions(+)

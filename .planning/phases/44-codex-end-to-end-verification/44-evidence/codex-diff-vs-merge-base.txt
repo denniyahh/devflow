@@ -1,0 +1,11 @@
+$ git merge-base HEAD origin/develop
+0e1a94dc3d7e07de108e077a96909abaaef6fa3b
+
+$ git diff 0e1a94dc3d7e07de108e077a96909abaaef6fa3b -- crates/devflow-core/src/agents/codex.rs
+(no output — zero-line diff)
+
+Interpretation: crates/devflow-core/src/agents/codex.rs is byte-identical between the
+merge-base with origin/develop and the current worktree HEAD (8074d1d). None of the
+44-00/44-01/44-02/44-03 work touched the Codex driver file itself, so D-04 (driver parity
+guard: launch argv, writable roots, signing-disable env, workflow-style prompt rendering,
+existing conformance tests) is satisfied trivially — there is nothing to diff against.

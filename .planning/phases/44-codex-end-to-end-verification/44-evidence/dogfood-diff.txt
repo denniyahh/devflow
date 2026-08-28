@@ -1,0 +1,52 @@
+diff --git a/crates/devflow-core/src/dogfood_scratch.rs b/crates/devflow-core/src/dogfood_scratch.rs
+new file mode 100644
+index 0000000..fdbac98
+--- /dev/null
++++ b/crates/devflow-core/src/dogfood_scratch.rs
+@@ -0,0 +1,34 @@
++//! Scratch module for driving the Codex Code stage end to end (Phase 900).
++//!
++//! Throwaway: this file is local to the phase-900 worktree and is never
++//! committed to develop or main. It exists only so a dogfood run has a real,
++//! self-contained Code-stage change to make and verify.
++
++/// Number of fixed-size buckets needed to hold `item_count` items when each
++/// bucket holds `bucket_size` items. A partial final bucket still counts as a
++/// whole bucket. Returns `0` when `bucket_size` is `0`, since no positive
++/// bucket count is meaningful without a bucket size.
++#[must_use]
++pub fn buckets_needed(item_count: u64, bucket_size: u64) -> u64 {
++    if bucket_size == 0 {
++        return 0;
++    }
++    item_count.div_ceil(bucket_size)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn buckets_needed_rounds_a_partial_bucket_up() {
++        assert_eq!(buckets_needed(0, 4), 0);
++        assert_eq!(buckets_needed(4, 4), 1);
++        assert_eq!(buckets_needed(5, 4), 2);
++        assert_eq!(buckets_needed(13, 4), 4);
++        assert_eq!(buckets_needed(9, 0), 0);
++        assert_eq!(buckets_needed(10, 3), 4);
++        assert_eq!(buckets_needed(9, 3), 3);
++        assert_eq!(buckets_needed(0, 3), 0);
++    }
++}
+diff --git a/crates/devflow-core/src/lib.rs b/crates/devflow-core/src/lib.rs
+index 53f4fe0..d49de5c 100644
+--- a/crates/devflow-core/src/lib.rs
++++ b/crates/devflow-core/src/lib.rs
+@@ -58,6 +58,7 @@ pub mod canary;
+ pub mod config;
+ #[cfg(test)]
+ mod doc_check;
++pub mod dogfood_scratch;
+ pub mod events;
+ pub mod gates;
+ pub mod git;

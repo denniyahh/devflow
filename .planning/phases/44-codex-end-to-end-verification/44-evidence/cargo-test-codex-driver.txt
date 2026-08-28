@@ -1,0 +1,15 @@
+   Compiling tracing-core v0.1.36
+   Compiling tracing v0.1.44
+   Compiling devflow-core v2.10.0 (/var/home/denniyahh/Github/devflow/.claude/worktrees/agent-a1a98e3fc918c2fc4/crates/devflow-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.21s
+     Running unittests src/lib.rs (target/debug/deps/devflow_core-d207f127c1b8f263)
+
+running 5 tests
+test agents::tests::codex_define_and_plan_require_an_existing_artifact ... ok
+test agents::tests::codex_disables_signing_via_env_others_do_not ... ok
+test agents::tests::codex_and_pi_drivers_reproduce_legacy_behavior ... ok
+test agents::tests::codex_grants_writable_roots_for_worktree_git_metadata ... ok
+test agents::tests::codex_wraps_prompt_in_exec_and_json ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 730 filtered out; finished in 0.00s
+

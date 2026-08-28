@@ -1,0 +1,5 @@
+$ codex --version
+codex-cli 0.150.0
+
+$ command -v codex
+/home/linuxbrew/.linuxbrew/bin/codex

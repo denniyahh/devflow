@@ -1,0 +1,5 @@
+$ git rev-parse HEAD
+8074d1d12b65d2dc52e429c6a009dac97bdf95ae
+
+$ git status --short
+(no output — working tree clean at capture time)

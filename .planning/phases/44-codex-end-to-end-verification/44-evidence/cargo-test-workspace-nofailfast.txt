@@ -1,0 +1,1530 @@
+   Compiling devflow v2.10.0 (/var/home/denniyahh/Github/devflow/.claude/worktrees/agent-a1a98e3fc918c2fc4/crates/devflow-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.85s
+     Running unittests src/main.rs (target/debug/deps/devflow-895cb3e5851e3236)
+
+running 347 tests
+test commands::tests::all_roots_row_includes_gate_with_non_numeric_timestamp ... ok
+test commands::tests::a_corrupt_state_file_warns_while_an_absent_one_is_silent ... ok
+test commands::tests::changelog_version_check_flags_mismatch_and_passes_on_agreement ... ok
+test commands::tests::cron_hint_line_appends_sanitized_reset_when_retry_after_present ... ok
+test commands::tests::cron_hint_line_never_emits_the_unsupported_devflow_intake_flag ... ok
+test commands::tests::cron_hint_line_omits_reset_fragment_when_retry_after_empty ... ok
+test commands::tests::default_logs_phase_errors_with_nothing_to_show ... ok
+test commands::tests::cron_instruction_hints_include_hermes_command_per_phase ... ok
+test commands::tests::default_logs_phase_is_ambiguous_with_two_active_states ... ok
+test commands::tests::describe_worktree_dir_infers_phase_and_agent ... ok
+test commands::tests::default_logs_phase_prefers_single_active_state ... ok
+test commands::tests::default_logs_phase_falls_back_to_newest_capture_file ... ok
+test commands::tests::a_deleted_root_contributes_nothing_to_the_reachable_set ... ok
+test commands::tests::doctor_reconciliation::doctor_json_is_a_single_object_with_environment_and_reconciliation ... ok
+test commands::tests::doctor_reconciliation::doctor_reports_gate_pending_without_gate_file ... ok
+test commands::tests::doctor_reconciliation::doctor_reports_no_active_phases_when_idle ... ok
+test commands::tests::doctor_reconciliation::reconcile_is_silent_when_monitor_alive_and_agent_dead ... ok
+test commands::tests::doctor_reconciliation::reconcile_is_silent_when_monitor_pid_is_unrecorded ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_flags_dead_agent_at_agent_stage ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_flags_gate_pending_without_open_gate ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_flags_missing_feature_branch ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_flags_orphan_open_gate ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_flags_stage_event_drift ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_ignores_dead_agent_when_stopped ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_ignores_dead_monitor_when_stopped ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_ordering_is_input_order_independent ... ok
+test commands::tests::doctor_reconciliation::reconcile_phase_returns_no_findings_when_all_agree ... ok
+test commands::tests::doctor_reconciliation::reconcile_reports_stuck_when_monitor_and_agent_are_both_dead ... ok
+test commands::tests::evidence_require_shipped_exits_ok_iff_the_phase_has_shipped ... ok
+test commands::tests::evidence_require_shipped_failure_message_is_single_line_and_names_phase ... ok
+test commands::tests::evidence_require_shipped_names_stopped_at_rather_than_generic_not_shipped ... ok
+test commands::tests::gate_approve_arg_parsing_accepts_positional_stage ... ok
+test commands::tests::gate_respond_auto_resolves_single_open_gate ... ok
+test commands::tests::gate_respond_requires_stage_when_ambiguous_and_errors_when_none_open ... ok
+test commands::tests::gate_show_arg_parsing_accepts_phase_and_optional_stage ... ok
+test commands::tests::gate_show_auto_resolves_single_open_gate ... ok
+test commands::tests::gate_show_errors_asking_for_stage_with_several_open_gates ... ok
+test commands::tests::gate_show_errors_naming_gate_list_when_no_open_gate ... ok
+test commands::tests::gate_show_renders_full_untruncated_sanitized_context ... ok
+test commands::tests::gate_sweep_dry_run_does_not_write_a_response ... ok
+test commands::tests::gate_sweep_emits_gate_reaped_event_on_reap ... ok
+test commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling ... ok
+test commands::tests::gate_sweep_skips_already_responded_gate_without_clobbering ... ok
+test commands::tests::gate_sweep_without_reap_strays_flag_ignores_a_live_stray ... ok
+test commands::tests::liveness_matrix_covers_all_four_rows ... ok
+test commands::tests::liveness_treats_zero_and_overflow_pids_as_dead ... ok
+test commands::tests::liveness_unknown_when_no_monitor_recorded ... ok
+test commands::tests::monitor_pid_persisted_for_one_phase_does_not_disturb_a_sibling ... ok
+test commands::tests::opencode_subagent_dispatch_check_renders_both_arms ... ok
+test commands::tests::phase_artifact_on_develop_detects_context_and_fails_open ... ok
+test commands::tests::phase_validate_failures_reset_when_the_phase_completes ... ok
+test commands::tests::phase_validate_failures_survive_a_forced_restart ... ok
+test commands::tests::pi_subagent_dispatch_check_renders_both_arms ... ok
+test commands::tests::planning_doc_staleness::collect_planning_doc_findings_missing_files_yield_no_findings_not_error ... ok
+test commands::tests::planning_doc_staleness::collect_planning_doc_findings_reconciles_against_main ... ok
+test commands::tests::planning_doc_staleness::doctor_json_body_carries_planning_doc_staleness_as_a_third_key ... ok
+test commands::tests::planning_doc_staleness::parse_planning_doc_versions_accepts_v_prefixed_cells ... ok
+test commands::tests::planning_doc_staleness::parse_planning_doc_versions_skips_non_semver_cells ... ok
+test commands::tests::planning_doc_staleness::parse_semver_rejects_ranges_and_em_dash ... ok
+test commands::tests::planning_doc_staleness::reconcile_planning_docs_downgrades_pre_cutoff_mismatch_to_warn ... ok
+test commands::tests::planning_doc_staleness::reconcile_planning_docs_flags_problem_for_unreachable_post_cutoff_version ... ok
+test commands::tests::planning_doc_staleness::reconcile_planning_docs_normalizes_bare_cell_to_v_prefixed_tag ... ok
+test commands::tests::planning_doc_staleness::reconcile_planning_docs_numeric_cutoff_is_not_lexicographic ... ok
+test commands::tests::planning_doc_staleness::reconcile_planning_docs_produces_no_finding_when_tag_is_reachable ... ok
+test commands::tests::planning_doc_staleness::reconcile_planning_docs_skips_a_malformed_row_defensively ... ok
+test commands::tests::planning_doc_staleness::render_planning_doc_findings_json_is_an_array_of_objects ... ok
+test commands::tests::planning_doc_staleness::render_planning_doc_text_lists_each_finding_detail ... ok
+test commands::tests::planning_doc_staleness::render_planning_doc_text_reports_consistent_when_no_findings ... ok
+test commands::tests::planning_doc_staleness::tag_exists_and_reachable_false_for_a_missing_tag ... ok
+test commands::tests::planning_doc_staleness::tag_exists_and_reachable_false_for_a_tag_unreachable_from_base ... ok
+
+running 1 test
+test commands::tests::planning_doc_staleness::tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.01s
+
+test commands::tests::planning_doc_staleness::tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir ... ok
+test commands::tests::planning_doc_staleness::tag_exists_and_reachable_true_for_a_tagged_ancestor ... ok
+test commands::tests::print_capture_from_tracks_offsets_across_appends ... ok
+test commands::tests::doctor_includes_hermes_check_in_the_seam ... ok
+test commands::tests::reap_stray_candidates_clears_a_real_child_with_verified_death ... ok
+test commands::tests::reap_stray_candidates_dry_run_never_signals ... ok
+test commands::tests::doctor_includes_antigravity_check_in_the_seam ... ok
+test commands::tests::reap_stray_candidates_reaps_when_the_floor_is_zero ... ok
+test commands::tests::reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age ... ok
+test commands::tests::reap_stray_candidates_refuses_a_dead_pid_as_identity_mismatch_before_the_age_check_runs ... ok
+test commands::tests::reap_stray_candidates_refuses_on_identity_mismatch_without_signalling ... ok
+test commands::tests::recovery_hints_empty_for_healthy ... ok
+test commands::tests::recovery_hints_includes_advance_when_stuck_and_gate_pending ... ok
+test commands::tests::recovery_hints_includes_resume_for_stuck ... ok
+test commands::tests::render_gate_age_marks_escalated_gate_urgent ... ok
+test commands::tests::render_gate_age_no_marker_for_fresh_gate ... ok
+test commands::tests::render_gate_age_unknown_for_non_numeric_timestamp ... ok
+test commands::tests::render_stage_progress_line_omits_age_without_stage_launched_event ... ok
+test commands::tests::rollover_offset_resets_on_shrunken_capture ... ok
+test commands::tests::stage_launched_ts_none_without_event ... ok
+test commands::tests::stage_launched_ts_reflects_event_age_not_phase_started_at ... ok
+test commands::tests::status_reading_monitor_liveness_writes_no_state_and_no_event ... ok
+test commands::tests::status_shows_pending_gate_prominently ... ok
+test commands::tests::stop_is_a_success_no_op_when_the_lock_names_a_dead_pid ... ok
+test commands::tests::stop_is_a_success_no_op_with_no_gate_and_no_lock ... ok
+test commands::tests::stop_never_treats_monitor_pid_as_a_signalling_target ... ok
+test commands::tests::stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check ... ok
+test commands::tests::stop_refuses_when_the_recorded_start_time_does_not_match ... ok
+test commands::tests::stop_signals_the_holder_when_the_recorded_identity_matches ... ok
+test commands::tests::stray_finding_detail_states_only_what_was_checked ... ok
+test commands::tests::stray_process_finding::build_stray_process_findings_is_empty_for_no_strays ... ok
+test commands::tests::stray_process_finding::build_stray_process_findings_names_advance_child_layer ... ok
+test commands::tests::stray_process_finding::build_stray_process_findings_names_pid_layer_and_repair ... ok
+test commands::tests::reap_stray_candidates_escalates_to_kill_for_a_term_ignoring_child ... ok
+test commands::tests::stray_process_finding::doctor_json_body_carries_stray_processes_as_a_fourth_key ... ok
+test commands::tests::stray_process_finding::render_stray_process_text_is_empty_when_no_strays ... ok
+test commands::tests::stray_process_finding::render_stray_process_text_names_pid_and_repair_when_present ... ok
+test commands::tests::workflow_started_payload_carries_build_provenance ... ok
+test config_parse::tests::max_unattended_age_defaults_on_explicit_zero ... ok
+test config_parse::tests::max_unattended_age_defaults_on_unparsable ... ok
+test config_parse::tests::max_unattended_age_defaults_when_absent ... ok
+test config_parse::tests::max_unattended_age_parses_explicit_value ... ok
+test config_parse::tests::parse_checkout_lock_timeout_defaults_and_parses ... ok
+test config_parse::tests::parse_foreground_gate_timeout_env_override ... ok
+test config_parse::tests::parse_gate_timeout_env_override ... ok
+test config_parse::tests::sweep_threshold_is_not_shorter_than_the_gate_poll_timeout ... ok
+test parallel::tests::pairs_default_all_to_claude_without_agents ... ok
+test parallel::tests::pairs_default_missing_agents_to_claude ... ok
+test parallel::tests::pairs_match_agents_positionally ... ok
+test parallel::tests::pairs_reject_invalid_phase ... ok
+test parallel::tests::pairs_reject_more_agents_than_phases ... ok
+test parallel::tests::retry_after_from_reason_strips_prefix ... ok
+test commands::tests::reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates ... ok
+test pipeline_gate::tests::advance_ship_success_emits_workflow_shipped_and_ship_evidence_reports_shipped ... ok
+test pipeline_gate::tests::advance_ship_success_runs_finish_workflow ... ok
+test pipeline_gate::tests::abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response ... ok
+test commands::tests::doctor_reconciliation::doctor_is_read_only_on_a_mismatched_project ... ok
+test pipeline_gate::tests::concurrent_ship_advances_finish_both_phases_independently ... ok
+test pipeline_gate::tests::consecutive_failures_are_independent_across_phases ... ok
+test pipeline_gate::tests::repeated_code_to_validate_transition_is_idempotent_on_the_counter ... ok
+test pipeline_gate::tests::ship_completion_cron_deletion_precedes_the_terminal_workflow_finished_event ... ok
+test pipeline_gate::tests::ship_override_abort_routes_through_abort ... ok
+test pipeline_gate::tests::ship_completion_deletes_any_remaining_cron_instructions_record ... ok
+test pipeline_gate::tests::ship_override_advances_via_written_response ... ok
+test pipeline_gate::tests::ship_override_refuses_when_lock_contended ... ok
+test pipeline_gate::tests::ship_override_refuses_when_no_response_written ... ok
+test pipeline_gate::tests::ship_override_refuses_when_not_at_ship_stage ... ok
+test pipeline_gate::tests::ship_override_refuses_when_response_already_acked ... ok
+test pipeline_gate::tests::finalization_retry_gate_never_auto_approves_even_with_yes_ship_set ... ok
+test pipeline_gate::tests::terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished ... ok
+test pipeline_gate::tests::until_stop_never_emits_workflow_shipped_and_ship_evidence_reports_not_shipped ... ok
+test pipeline_gate::tests::ship_override_bounds_foreground_wait_on_terminal_hook_failure ... ok
+test pipeline_gate::tests::transition_resets_infra_failures ... ok
+test pipeline_launch::tests::advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed ... ok
+test pipeline_launch::tests::advance_at_checkpoint_resume_ceiling_falls_through_to_generic_gate ... ok
+test pipeline_launch::tests::advance_with_confirmed_checkpoint_and_no_session_id_falls_through ... ok
+test pipeline_launch::tests::absent_canary_refuses_to_launch ... ok
+test pipeline_launch::tests::advance_with_declared_checkpoint_but_unreported_gate_falls_through ... ok
+test pipeline_launch::tests::advance_with_non_claude_agent_never_resumes ... ok
+test pipeline_launch::tests::advance_without_declared_checkpoint_falls_through_to_generic_gate ... ok
+test pipeline_launch::tests::advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records ... ok
+test pipeline_launch::tests::auto_chain_eligibility_is_code_and_auto_mode_only ... ok
+test pipeline_launch::tests::auto_chain_flag_repaired_event_is_absent_on_a_clean_launch ... ok
+test pipeline_launch::tests::advance_with_worktree_declared_checkpoint_reads_the_execution_root ... ok
+test pipeline_launch::tests::auto_chain_guard_antigravity_engages_on_auto_code ... ok
+test pipeline_launch::tests::auto_chain_flag_repaired_event_names_the_entry_point_that_found_the_leak ... ok
+test pipeline_launch::tests::canary_gate_only_applies_to_the_stream_launch_path ... ok
+test pipeline_launch::tests::canary_launcher_for_selects_antigravity_canary ... ok
+test pipeline_launch::tests::antigravity_canary_outcome_emits_antigravity_provenance ... ok
+test pipeline_launch::tests::canary_gate_still_fires_for_a_widened_stage_without_the_opt_out ... ok
+test pipeline_launch::tests::canary_outcome_is_persisted_and_emitted ... ok
+test pipeline_launch::tests::failed_relaunch_preserves_the_phase_cron_instructions_record ... ok
+test pipeline_launch::tests::canary_runs_once_per_run ... ok
+test pipeline_launch::tests::launch_stage_inner_clears_monitor_pid_on_early_failure ... ok
+test pipeline_launch::tests::launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm ... ok
+test pipeline_launch::tests::launch_stage_inner_stamps_the_validate_dispatch_nonce_with_its_baseline ... ok
+test pipeline_launch::tests::launch_stage_inner_resets_checkpoint_resumes_counter ... ok
+unattended-launch prerequisites — phase 65, stage define, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+test pipeline_launch::tests::launch_stage_persists_monitor_pid_for_reload ... ok
+test pipeline_launch::tests::legacy_launch_env_var_is_parsed_as_a_bool ... ok
+test pipeline_launch::tests::legacy_launch_flag_forces_the_single_document_path ... ok
+test pipeline_launch::tests::legacy_launch_is_off_by_default ... ok
+test pipeline_launch::tests::legacy_launch_skips_the_delivery_canary ... ok
+test pipeline_launch::tests::legacy_launch_use_is_recorded_in_provenance ... ok
+test pipeline_launch::tests::pi_resolves_to_legacy_launch ... ok
+test pipeline_launch::tests::parse_failure_does_not_trigger_a_fallback ... ok
+test pipeline_launch::tests::relaunch_checkpoint_session_does_not_change_stage ... ok
+test pipeline_launch::tests::relaunch_checkpoint_session_emits_exactly_one_audit_event ... ok
+test pipeline_launch::tests::relaunch_checkpoint_session_increments_and_persists_counter ... ok
+test pipeline_launch::tests::resume_clears_stop_marker_and_advances_past_stop_point ... ok
+test pipeline_launch::tests::resume_does_not_clear_a_persisted_legacy_launch ... ok
+test pipeline_launch::tests::resume_with_agent_allows_plan_stage ... ok
+unattended-launch prerequisites — phase 67, stage define, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+test pipeline_launch::tests::code_unknown_does_not_transition_to_validate ... ok
+test pipeline_launch::tests::resume_preserves_unfired_until_cap ... ok
+unattended-launch prerequisites — phase 80, stage code, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test pipeline_launch::tests::resume_with_agent_from_a_rate_limited_state_relaunches ... ok
+unattended-launch prerequisites — phase 74, stage code, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test pipeline_launch::tests::resume_with_agent_refuses_before_touching_state_when_target_cannot_run_the_stage ... ok
+test pipeline_launch::tests::resume_with_agent_hands_off_and_relaunches_under_the_new_driver ... ok
+unattended-launch prerequisites — phase 79, stage code, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test pipeline_launch::tests::resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid ... ok
+unattended-launch prerequisites — phase 77, stage code, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test pipeline_launch::tests::resume_with_same_agent_is_an_ordinary_idempotent_resume ... ok
+test pipeline_launch::tests::stream_launch_includes_antigravity_ignores_claude_legacy_opt_out ... ok
+test pipeline_launch::tests::stream_launch_includes_antigravity_on_stream_stages ... ok
+test pipeline_launch::tests::stream_launch_includes_antigravity_resolves_to_pipe_owning ... ok
+unattended-launch prerequisites — phase 68, stage define, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+test pipeline_launch::tests::resume_without_a_cap_is_unchanged ... ok
+test pipeline_outcomes::tests::a_checkout_between_dispatches_does_not_read_as_authored_this_run ... ok
+unattended-launch prerequisites — phase 75, stage code, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test pipeline_launch::tests::resume_without_agent_leaves_the_saved_agent_untouched ... ok
+test pipeline_outcomes::tests::ambiguous_gate_loop_back_respects_the_mid_arc_check ... ok
+test pipeline_outcomes::tests::a_passing_validate_at_the_ceiling_explains_why_it_gated ... ok
+test pipeline_launch::tests::unverified_canary_refuses_to_launch_with_a_distinct_message ... ok
+test pipeline_outcomes::tests::both_dispatch_directions_are_demonstrated_in_one_run ... ok
+test pipeline_outcomes::tests::an_idempotent_rewrite_is_authored_not_inherited ... ok
+test pipeline_outcomes::tests::an_uncaptured_baseline_does_not_claim_an_inherited_artifact ... ok
+test pipeline_outcomes::tests::classify_validate_outcome_sweeps_all_forty_two_cells ... ok
+test pipeline_outcomes::tests::consecutive_failures_increment_saturates ... ok
+test commands::tests::stray_process_finding::doctor_finds_a_real_stray_and_never_signals_it_across_two_runs ... ok
+test pipeline_outcomes::tests::content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root ... ok
+test pipeline_outcomes::tests::ceiling_clause_appears_only_at_the_ceiling_even_in_supervise_mode ... ok
+test pipeline_outcomes::tests::checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout ... ok
+test pipeline_outcomes::tests::consecutive_failures_reaches_ceiling_across_cycles ... ok
+test pipeline_outcomes::tests::evaluate_agent_result_with_real_git_and_empty_branch_still_reports_failed ... ok
+test pipeline_outcomes::tests::evaluate_agent_result_with_unrunnable_git_does_not_report_failed ... ok
+test pipeline_outcomes::tests::external_verify_absent_verdict_is_ambiguous_only_when_layer0_decided ... ok
+test pipeline_outcomes::tests::evaluate_layer2_unrunnable_git_falls_through_to_layer3 ... ok
+test pipeline_outcomes::tests::evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage ... ok
+test pipeline_outcomes::tests::evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed ... ok
+test pipeline_outcomes::tests::external_verify_gaps_is_ambiguous_only_when_layer0_decided ... ok
+test pipeline_outcomes::tests::external_verify_disagreement_gates_immediately ... ok
+test pipeline_outcomes::tests::external_verify_agreement_advances_to_ship ... ok
+test pipeline_outcomes::tests::external_verify_no_verdict_gates_immediately ... ok
+test pipeline_outcomes::tests::gate_context_rendering_neutralizes_all_controls_and_obeys_limit ... ok
+test pipeline_outcomes::tests::grafted_failure_shape_gates_instead_of_shipping ... ok
+test pipeline_outcomes::tests::external_verify_cycles_reach_ceiling_without_unbounded_loop ... ok
+test pipeline_outcomes::tests::failure_gate_loop_back_respects_the_mid_arc_check ... ok
+test pipeline_outcomes::tests::genuine_gaps_loop_back_still_issues_gaps_only ... ok
+test pipeline_outcomes::tests::infra_ceiling_aborts_instead_of_gating ... ok
+test pipeline_outcomes::tests::handle_ship_outcome_with_yes_ship_auto_approves_exactly_once_with_attribution ... ok
+test pipeline_outcomes::tests::healthy_multi_wave_progress_does_not_reach_the_ceiling ... ok
+test pipeline_outcomes::tests::non_success_status_never_classifies_as_passed_even_with_verdict_pass ... ok
+test pipeline_outcomes::tests::loop_back_reason_is_distinct_when_no_commit_baseline_exists ... ok
+test pipeline_outcomes::tests::mid_arc_loop_back_issues_plain_execute_command ... ok
+test pipeline_outcomes::tests::non_validate_failure_fires_gate_and_hook ... ok
+test pipeline_outcomes::tests::phase_validate_failure_ceiling_gates_despite_trivial_commit_progress ... ok
+test pipeline_outcomes::tests::primary_loop_rate_limited_writes_single_agent_cron_instructions ... ok
+test pipeline_outcomes::tests::rate_limited_at_infra_ceiling_stops_resuming_and_aborts ... ok
+test pipeline_outcomes::tests::rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently ... ok
+test pipeline_outcomes::tests::phase_validate_failures_increment_saturates ... ok
+test pipeline_outcomes::tests::resource_killed_on_code_bumps_infra_failures_not_consecutive_failures ... ok
+test pipeline_outcomes::tests::resource_killed_on_validate_bumps_infra_not_consecutive_failures ... ok
+test pipeline_outcomes::tests::phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate ... ok
+test pipeline_outcomes::tests::repeated_failure_without_new_commits_still_reaches_the_ceiling ... ok
+test pipeline_outcomes::tests::ship_loop_back_still_issues_gaps_only_when_verification_absent ... ok
+test pipeline_outcomes::tests::ship_review_failed_loops_to_code ... ok
+test pipeline_outcomes::tests::ship_review_failed_uses_audit_fix ... ok
+test pipeline_outcomes::tests::run_checkout_hooks_keeps_changelog_in_sync_with_tag_when_no_version_file ... ok
+test pipeline_outcomes::tests::stale_verification_artifact_dispatches_full_execute ... ok
+test pipeline_outcomes::tests::state_new_alone_never_derives_yes_ship_from_config ... ok
+test pipeline_outcomes::tests::terminal_hook_failure_stops_before_branch_cleanup ... ok
+test pipeline_outcomes::tests::the_ceiling_reset_records_the_total_it_spent ... ok
+test pipeline_outcomes::tests::truncate_reason_caps_long_reasons_and_keeps_short_ones ... ok
+test pipeline_outcomes::tests::validate_failure_threshold_forces_gate_then_aborts ... ok
+test pipeline_outcomes::tests::validate_failure_with_unmeasurable_count_accumulates_the_streak ... ok
+test pipeline_outcomes::tests::handle_ship_outcome_without_yes_ship_writes_gate_but_no_response ... ok
+test pipeline_outcomes::tests::validate_gate_message_leads_with_the_per_phase_total ... ok
+test pipeline_outcomes::tests::ship_agent_failed_fires_gate ... ok
+test pipeline_outcomes::tests::stage_failure_retry_cleans_stale_response ... ok
+test pipeline_outcomes::tests::verdict_pass_classifies_as_passed_regardless_of_layer ... ok
+test pipeline_outcomes::tests::verification_freshness_truth_table_is_exhaustive ... ok
+test pipeline_outcomes::tests::verification_written_this_run_dispatches_gaps_only ... ok
+test pipeline_outcomes::tests::worktree_mode_genuine_gaps_loop_back_issues_gaps_only ... ok
+test pipeline_outcomes::tests::worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator ... ok
+test pipeline_outcomes::tests::worktree_mode_mid_arc_loop_back_issues_plain_execute ... ok
+test preflight::tests::base_is_checked_out_anywhere_sees_a_linked_worktree ... ok
+test pipeline_outcomes::tests::validate_gaps_does_not_advance_to_ship ... ok
+test preflight::tests::currency_behind_and_checked_out_refuses_with_actionable_message ... ok
+test preflight::tests::currency_behind_and_not_checked_out_fast_forwards_and_proceeds ... ok
+test preflight::tests::currency_behind_refuses_when_base_is_checked_out_in_another_worktree ... ok
+test preflight::tests::currency_behind_fast_forward_failure_falls_through_to_refusal ... ok
+test preflight::tests::currency_fetch_failure_falls_back_to_existing_remote_ref ... ok
+test preflight::tests::currency_is_ahead_for_unpushed_local_work ... ok
+test preflight::tests::currency_is_current_when_local_equals_remote ... ok
+test preflight::tests::currency_is_undeterminable_with_no_remote_configured ... ok
+test preflight::tests::currency_message_contains_no_absolute_path ... ok
+test preflight::tests::currency_is_diverged_when_local_and_remote_both_moved_independently ... ok
+test preflight::tests::enforcement_does_not_refuse_when_only_the_phase_dir_is_absent ... ok
+test preflight::tests::ensure_agent_binary_diagnoses_missing_program ... ok
+test preflight::tests::enforcement_still_refuses_when_the_roadmap_heading_is_absent ... ok
+test pipeline_outcomes::tests::validate_missing_verdict_does_not_advance ... ok
+test preflight::tests::fast_forward_base_ref_refuses_a_stale_expected_old_value ... ok
+test preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first ... ok
+test preflight::tests::gh_auth_check_applies_only_to_ship_stage ... ok
+test preflight::tests::major_bump_check_applies_only_to_ship_stage ... ok
+unattended-launch prerequisites — phase 90, stage define, mode auto:
+  [holds] GSD config can hold the chain flag
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::generic_preflight_checks_surfaces_the_unattended_reason_alongside_an_earlier_failure ... ok
+test preflight::tests::major_bump_errs_naming_bump_baseline_and_version_for_major_at_ship ... ok
+test preflight::tests::major_bump_short_circuits_for_non_ship_stage ... ok
+test preflight::tests::fast_forward_base_ref_never_writes_into_a_hostile_git_dir ... ok
+test preflight::tests::major_bump_surfaces_unreachable_baseline_refusal ... ok
+test preflight::tests::major_bump_ok_for_patch_or_minor_bump_at_ship ... ok
+test preflight::tests::phase_heading_probe_does_not_confuse_a_phase_number_prefix ... ok
+test preflight::tests::preflight_interactivity_check_flags_auto_define_without_context_md ... ok
+test preflight::tests::preflight_retries_reset_on_pass ... ok
+test preflight::tests::phase_reachability_resolves_caller_root_under_a_hostile_git_dir ... ok
+test preflight::tests::reachability_is_undeterminable_outside_a_git_repo ... ok
+test pipeline_outcomes::tests::validate_pass_advances ... ok
+test preflight::tests::preflight_major_bump_check_fires_against_the_worktree_head ... ok
+test preflight::tests::reachability_is_undeterminable_when_base_has_no_roadmap_at_all ... ok
+test preflight::tests::reachability_is_reachable_when_roadmap_entry_and_phase_dir_are_both_on_base ... ok
+test preflight::tests::run_preflight_adapter_hook_override_fires ... ok
+test preflight::tests::reachability_is_unreachable_when_the_phase_dir_is_absent_from_base ... ok
+test preflight::tests::reachability_is_unreachable_when_the_roadmap_entry_is_absent_from_base ... ok
+unattended-launch prerequisites — phase 61, stage define, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+test preflight::tests::run_preflight_failing_check_gates_and_never_reaches_spawn_monitor ... ok
+test preflight::tests::run_preflight_advance_gate_launches_agent_exactly_once ... ok
+unattended-launch prerequisites — phase 620, stage define, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+test preflight::tests::run_preflight_advance_skips_recheck_on_idempotently_failing_check ... ok
+unattended-launch prerequisites — phase 621, stage define, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+unattended-launch prerequisites — phase 621, stage define, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+test preflight::tests::run_preflight_loopback_bounds_recursion ... ok
+unattended-launch prerequisites — phase 80, stage code, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active and the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test preflight::tests::unattended_check_does_not_apply_outside_define_and_code ... ok
+unattended-launch prerequisites — phase 89, stage code, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+unattended-launch prerequisites — phase 89, stage code, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::unattended_check_is_not_bypassed_by_yes_ship ... ok
+unattended-launch prerequisites — phase 85, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [holds] no plan declares a human-only checkpoint
+unattended-launch prerequisites — phase 85, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `codex`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [holds] no plan declares a human-only checkpoint
+unattended-launch prerequisites — phase 85, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the agent is `opencode`, not claude or antigravity — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [holds] no plan declares a human-only checkpoint
+unattended-launch prerequisites — phase 85, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::unattended_check_refuses_a_legacy_or_non_claude_launch_shape ... ok
+unattended-launch prerequisites — phase 86, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [DOES NOT HOLD] no plan declares a human-only checkpoint — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6)
+unattended-launch prerequisites — phase 86, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::unattended_check_refuses_a_phase_whose_plan_declares_a_human_only_checkpoint ... ok
+unattended-launch prerequisites — phase 83, stage code, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+unattended-launch prerequisites — phase 83, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::unattended_check_refuses_when_the_gsd_config_is_absent ... ok
+unattended-launch prerequisites — phase 84, stage code, mode auto:
+  [COULD NOT BE DETERMINED] GSD config can hold the chain flag — `.planning/config.json` does not parse (key must be a string at line 1 column 3) — unreadable is not absent
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+unattended-launch prerequisites — phase 84, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::unattended_check_refuses_when_the_gsd_config_is_malformed ... ok
+unattended-launch prerequisites — phase 88, stage code, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+unattended-launch prerequisites — phase 88, stage code, mode supervise:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [DOES NOT HOLD] Code would launch on the pipe-owning arm — the legacy launch opt-out is active — the chain-flag guard binds only inside the pipe-owning monitor, which this launch shape never starts
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test preflight::tests::unattended_check_reports_but_does_not_refuse_in_supervise_mode ... ok
+test preflight::tests::unattended_check_reports_every_condition_in_both_modes ... ok
+unattended-launch prerequisites — phase 87, stage define, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [not yet applicable] no plan declares a human-only checkpoint — the phase has no plan files yet — re-evaluated at Code
+unattended-launch prerequisites — phase 87, stage code, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [COULD NOT BE DETERMINED] no plan declares a human-only checkpoint — the phase has no plan files yet, but Code expects them
+test preflight::tests::unattended_check_treats_an_unplanned_phase_as_pending_at_define_and_undetermined_at_code ... ok
+test preflight::tests::unattended_launch_shape_condition_antigravity_allowed ... ok
+test preflight::tests::unattended_launch_shape_condition_claude_unchanged ... ok
+test preflight::tests::unattended_launch_shape_condition_non_stream_agent_refused ... ok
+unattended-launch prerequisites — phase 82, stage code, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+test preflight::tests::unattended_refusal_reason_contains_no_absolute_path ... ok
+test preflight::tests::unreachable_message_contains_no_absolute_path ... ok
+test preflight::tests::unreachable_message_names_the_base_branch_and_each_missing_half ... ok
+test preflight::tests::run_preflight_loopback_gate_launches_agent_exactly_once ... ok
+test staleness::tests::combined_staleness_dirty_flag_arm_flags_modified_tree_when_build_was_clean ... ok
+test staleness::tests::combined_staleness_dirty_flag_arm_is_indeterminate_when_build_was_already_dirty ... ok
+test staleness::tests::dirty_flag_arm_ignores_non_build_files_but_still_flags_sources ... ok
+test staleness::tests::divergent_lineage_docs_only_range_is_fresh ... ok
+test staleness::tests::divergent_lineage_with_source_change_is_stale ... ok
+test staleness::tests::docs_only_range_is_fresh ... ok
+test staleness::tests::embedded_commit_is_stale_maps_ancestry_exit_codes ... ok
+
+running 1 test
+test staleness::tests::embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.01s
+
+test staleness::tests::embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir ... ok
+test preflight::tests::run_preflight_major_bump_gate_not_auto_approved_by_yes_ship ... ok
+test preflight::tests::run_preflight_major_bump_gates_and_never_ships_unattended ... ok
+test staleness::tests::enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring ... ok
+test staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking ... ok
+test staleness::tests::enforce_build_staleness_never_blocks_on_indeterminate ... ok
+test staleness::tests::enforce_build_staleness_does_not_block_self_dogfood_on_divergent_docs_only_lineage ... ok
+test staleness::tests::embedded_commit_is_stale_uses_worktree_head ... ok
+test staleness::tests::is_self_dogfood_workspace_anchors_on_members_not_default_members ... ok
+test staleness::tests::is_self_dogfood_workspace_matches_both_member_paths_only ... ok
+test staleness::tests::is_self_dogfood_workspace_requires_exact_member_paths_not_substrings ... ok
+test staleness::tests::git_error_range_fails_toward_stale ... ok
+test staleness::tests::enforce_build_staleness_warns_for_ordinary_project_with_stale_commit ... ok
+test staleness::tests::run_git_stdout_ignores_a_hostile_git_dir ... ok
+test staleness::tests::enforce_build_staleness_blocks_self_dogfood_behind_worktree_head ... ok
+test staleness::tests::mixed_range_docs_and_source_is_stale ... ok
+test staleness::tests::wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks ... ok
+test test_support::tests::reap_guard_reaps_the_monitor_when_a_later_assertion_panics ... ok
+test staleness::tests::mid_run_stage_transition_does_not_readjudicate_staleness ... ok
+test tests::project_root_walks_up_to_nearest_devflow_ancestor ... ok
+test test_support::tests::trailing_reap_call_is_skipped_when_a_later_assertion_panics ... ok
+test staleness::tests::staleness_without_worktree_is_unchanged ... ok
+test test_support::tests::no_git_path_makes_git_unresolvable_and_restores_it ... ok
+
+test result: ok. 347 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.58s
+
+     Running tests/auto_chain_flag_e2e.rs (target/debug/deps/auto_chain_flag_e2e-60789f686e98c873)
+
+running 3 tests
+test guard_clears_the_flag_when_the_supervised_child_fails ... ok
+test supervise_mode_code_stage_child_observes_the_flag_clear ... ok
+test auto_mode_code_stage_child_observes_the_flag_set ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/auto_chain_leak_repair_e2e.rs (target/debug/deps/auto_chain_leak_repair_e2e-94795b4a496c2e5f)
+
+running 2 tests
+[2m2026-08-26T23:59:47.785873Z[0m [32m INFO[0m [2mdevflow::pipeline_launch[0m[2m:[0m GSD chain flag set to true for this stage at /tmp/.tmpIpiCzp/.planning/config.json
+test a_leak_that_reached_the_branch_tip_is_repaired_in_the_commit_too ... ok
+test auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/build_provenance.rs (target/debug/deps/build_provenance-79f0efcb057af54b)
+
+running 3 tests
+test build_commit_is_empty_or_a_full_hex_sha ... ok
+test build_dirty_is_exactly_true_or_false ... ok
+test build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild ... FAILED
+
+failures:
+
+---- build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild stdout ----
+
+thread 'build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild' (1439518) panicked at crates/devflow-cli/tests/build_provenance.rs:138:54:
+copy .planning/UPSTREAM-GSD-ISSUES.md: No such file or directory (os error 2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p devflow --test build_provenance`
+     Running tests/ci_parity_guards.rs (target/debug/deps/ci_parity_guards-bb24d6961c4be576)
+
+running 7 tests
+test check_script_fails_fast_before_any_cargo_invocation ... ok
+test check_script_clippy_lints_test_targets ... ok
+test ci_workflow_delegates_to_the_shared_check_script ... ok
+test ci_workflow_runs_the_pinned_devcontainer_image ... ok
+test devcontainer_job_name_matches_the_required_status_check ... ok
+test devcontainer_runcmd_fails_fast_before_any_check ... ok
+test devflow_test_clippy_matches_ci_scope ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cut_release_guard.rs (target/debug/deps/cut_release_guard-91e05e2ec1c7498a)
+
+running 3 tests
+test deterministic_override_is_preserved ... ok
+test unreadable_key_file_fails_loudly ... ok
+test unset_signing_key_fails_loudly_before_tagging ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/doctor_antigravity.rs (target/debug/deps/doctor_antigravity-947580ac5aad093d)
+
+running 2 tests
+test doctor_reports_antigravity_absent_without_agy ... ok
+test doctor_reports_antigravity_present_with_stub_on_path ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/gate_sweep_e2e.rs (target/debug/deps/gate_sweep_e2e-8d2098fc201690ef)
+
+running 4 tests
+test sweep_help_documents_max_age_and_dry_run ... ok
+test sweep_leaves_a_fresh_gate_untouched ... ok
+stage code finished with status Unknown
+  detail: unverified — agent process is gone but 1 commits exist on feature/phase-95
+[2m2026-08-26T23:59:48.163977Z[0m [32m INFO[0m [2mdevflow_core::gates[0m[2m:[0m writing gate code for phase 95
+gate written: .devflow/gates/95-code.json — awaiting response
+[2m2026-08-26T23:59:48.164114Z[0m [32m INFO[0m [2mdevflow::pipeline_gate[0m[2m:[0m never-silent gate: code failed in Auto mode — surfacing an unattended gate this mode would not normally fire
+test sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort ... ok
+workflow aborted for phase 95: abort: reaped by devflow gate sweep (unattended gate exceeded max age)
+test sweep_ends_a_real_advance_process_through_its_own_abort_path ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running tests/git_env_hermeticity.rs (target/debug/deps/git_env_hermeticity-5abcfad3f65eceaa)
+
+running 1 test
+test suite_does_not_inherit_repo_local_git_env ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gitignore_coverage.rs (target/debug/deps/gitignore_coverage-341ec4556a16c23f)
+
+running 1 test
+test gitignore_covers_devflow_runtime_state_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/help_snapshot.rs (target/debug/deps/help_snapshot-27d9d6ab7b985eea)
+
+running 1 test
+test help_output_matches_committed_snapshot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/log_format_env.rs (target/debug/deps/log_format_env-776bec8316e930f1)
+
+running 3 tests
+test rust_log_unset_still_shows_info_level_logs_by_default ... ok
+test rust_log_default_suppresses_debug_under_json_log_format ... ok
+test rust_log_debug_is_honored_under_json_log_format ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/phase7_cli.rs (target/debug/deps/phase7_cli-d676e71931731a7a)
+
+running 28 tests
+test cleanup_force_refuses_on_dead_monitor_live_agent ... ok
+test cleanup_force_refuses_on_live_agent_unknown_monitor ... ok
+test cleanup_force_removes_worktree_for_until_stopped_phase ... ok
+test cleanup_is_idempotent_when_worktree_already_removed ... ok
+test antigravity_init_without_marker_gates_at_plan ... ok
+test antigravity_parses_devflow_result_from_stream ... ok
+test cleanup_keeps_worktree_for_until_stopped_phase_without_force ... ok
+test marker_less_antigravity_never_advances ... ok
+test parallel_creates_two_worktrees_and_spawns_two_monitors ... ok
+test hermes_nonzero_exit_does_not_advance ... ok
+test hermes_marker_less_run_does_not_advance ... ok
+test hermes_hung_process_is_detected_not_left_running ... ok
+test pi_hung_process_is_detected_not_left_running ... ok
+test start_codex_without_context_fails_preflight ... ok
+test reference_and_cleanup_worktree_cli_flow ... ok
+test start_dry_run_annotates_until_stage ... ok
+test start_dry_run_without_until_has_no_stop_annotation ... ok
+test pi_nonzero_exit_does_not_advance ... ok
+test pi_marker_less_run_does_not_advance ... ok
+test start_until_ship_is_rejected ... ok
+test start_until_unknown_stage_is_rejected_by_clap ... ok
+test start_until_plan_halts_cleanly ... ok
+test status_prints_cron_hint_when_cron_instructions_exist ... FAILED
+test start_defaults_to_worktree ... ok
+test unguarded_monitor_is_detected_by_the_registry ... ok
+test start_no_worktree_uses_feature_branch ... ok
+test start_worktree_mode_ignores_main_checkout_divergence ... ok
+test suite_reap_audit ... ok
+
+failures:
+
+---- status_prints_cron_hint_when_cron_instructions_exist stdout ----
+
+thread 'status_prints_cron_hint_when_cron_instructions_exist' (1440882) panicked at crates/devflow-cli/tests/phase7_cli.rs:787:5:
+assertion failed: stdout.contains(&format!("Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+            root.display()))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    status_prints_cron_hint_when_cron_instructions_exist
+
+test result: FAILED. 27 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.82s
+
+error: test failed, to rerun pass `-p devflow --test phase7_cli`
+     Running tests/pre_commit_branch_guard.rs (target/debug/deps/pre_commit_branch_guard-6ad721c5efd93bd0)
+
+running 3 tests
+test both_protected_branches_refuse_with_a_nonzero_exit ... ok
+test branch_is_detected_via_symbolic_ref_not_rev_parse ... ok
+test pre_commit_guards_against_personal_artifacts_on_non_workspace_branches ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/pre_push_signing_policy.rs (target/debug/deps/pre_push_signing_policy-111424fbc1631b6f)
+
+running 6 tests
+test direct_pushes_to_main_are_refused ... ok
+test policy_compares_key_fingerprints_not_signer_identity ... ok
+test policy_runs_before_the_expensive_container_check ... ok
+test pre_push_guards_against_personal_artifacts_on_clean_branches ... ok
+test policy_is_opt_in_by_config_and_has_no_override_escape_hatch ... ok
+test unsigned_tag_extraction_cannot_abort_the_hook_before_it_explains_itself ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reap_strays_e2e.rs (target/debug/deps/reap_strays_e2e-b7b584fed291bfbb)
+
+running 2 tests
+shell-init: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory
+test reap_clears_a_process_whose_root_was_deleted_which_devflow_stop_cannot_see ... ok
+test reap_clears_a_sigterm_ignoring_stray_with_a_deleted_root ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.16s
+
+     Running tests/release_check.rs (target/debug/deps/release_check-61c5464e2c842f5f)
+
+running 6 tests
+test release_check_flags_self_pin_drift ... ok
+test release_check_passes_when_pins_match ... ok
+test release_without_check_is_rejected ... ok
+test release_check_states_publish_order ... ok
+test release_check_divergence_degrades_when_origin_main_absent ... ok
+test release_check_reports_divergence_when_main_not_ancestor ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/start_reachability_e2e.rs (target/debug/deps/start_reachability_e2e-99b5cd247bbe3d78)
+
+running 2 tests
+test start_refuses_a_phase_promoted_only_on_the_working_branch_and_scaffolds_nothing ... ok
+test start_refuses_before_creating_the_feature_branch_in_no_worktree_mode ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/stop_e2e.rs (target/debug/deps/stop_e2e-3eb65673562d614b)
+
+running 9 tests
+test stop_against_a_hand_written_response_is_a_success_no_op ... ok
+test stop_against_a_root_with_no_state_is_a_success ... ok
+test stop_is_idempotent_against_an_already_answered_gate ... ok
+test stop_help_documents_phase_flag ... ok
+test stop_leaves_stop_until_unchanged ... ok
+test stop_marks_state_stopped_and_records_reason ... ok
+test stop_preserves_pre_existing_stop_reason ... ok
+stage code finished with status Unknown
+  detail: unverified — agent process is gone but 1 commits exist on feature/phase-95
+[2m2026-08-27T00:00:06.060057Z[0m [32m INFO[0m [2mdevflow_core::gates[0m[2m:[0m writing gate code for phase 95
+gate written: .devflow/gates/95-code.json — awaiting response
+[2m2026-08-27T00:00:06.060274Z[0m [32m INFO[0m [2mdevflow::pipeline_gate[0m[2m:[0m never-silent gate: code failed in Auto mode — surfacing an unattended gate this mode would not normally fire
+test stop_then_cleanup_composes_refuse_then_force ... ok
+workflow aborted for phase 95: abort: stopped by `devflow stop`
+test stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests/workspace_version_pin.rs (target/debug/deps/workspace_version_pin-ec2952cdda4dbc6e)
+
+running 1 test
+test workspace_member_pins_match_the_workspace_version ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/yes_ship_config.rs (target/debug/deps/yes_ship_config-bad5d8aceb5b7141)
+
+running 5 tests
+test config_false_no_flag_is_not_preauthorized ... ok
+test config_true_no_flag_is_preauthorized_and_announces_source ... ok
+test flag_no_config_is_preauthorized_without_config_claim ... ok
+test flag_overrides_false_config ... ok
+test no_config_no_flag_is_not_preauthorized ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running unittests src/lib.rs (target/debug/deps/devflow_core-f1652bce7a87e04f)
+
+running 735 tests
+test agent::tests::agent_running_false_for_dead_pid ... ok
+test agent::tests::agent_running_rejects_corrupt_pid_values ... ok
+test agent::tests::agent_running_detects_self ... ok
+test agent::tests::agent_running_is_false_for_an_unreaped_zombie ... ok
+test agent::tests::discover_stray_devflow_processes_excludes_an_unrelated_process ... ok
+test agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process ... ok
+test agent::tests::looks_like_devflow_process_is_false_when_proc_cannot_be_read ... ok
+test agent::tests::looks_like_devflow_process_is_true_for_the_current_process ... ok
+test agent::tests::process_age_is_below_the_floor_for_a_fresh_child_and_grows_monotonically_for_self ... ok
+test agent::tests::process_age_returns_none_for_a_dead_pid ... ok
+test agent::tests::process_age_returns_some_for_the_current_process ... ok
+test agent::tests::terminate_and_verify_clears_a_normal_child_before_the_wait_elapses ... ok
+test agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape ... ok
+test agent::tests::terminate_and_verify_rejects_pid_zero_and_out_of_range_without_signalling ... ok
+test agent::tests::terminate_and_verify_returns_true_immediately_for_a_dead_pid ... ok
+test agent::tests::terminate_rejects_pid_above_i32_max ... ok
+test agent::tests::terminate_rejects_pid_zero ... ok
+test agent::tests::terminate_signals_a_live_child_and_it_exits ... ok
+test agent_result::tests::a_current_attempts_idle_timeout_verdict_is_still_authoritative ... ok
+test agent_result::tests::a_quota_denial_in_the_capture_is_visible_to_the_monitor ... ok
+test agent_result::tests::absent_side_channel_leaves_the_cascade_unchanged ... ok
+test agent_result::tests::an_ordinary_capture_is_not_mistaken_for_a_quota_denial ... ok
+test agent_result::tests::an_unreadable_idle_timeout_record_still_produces_the_verdict ... ok
+test agent_result::tests::antigravity_event_marker_close_predicate_discriminates ... ok
+test agent_result::tests::antigravity_event_parser_rejects_foreign_shapes ... ok
+test agent_result::tests::antigravity_event_result_error_envelope_survives_layer1 ... ok
+test agent_result::tests::antigravity_event_result_extracts_marker_from_live_shape ... ok
+test agent_result::tests::antigravity_event_result_marker_less_defers ... ok
+test agent_result::tests::antigravity_event_stream_detects_init_only ... ok
+test agent_result::tests::antigravity_event_torn_tail_fails_closed ... ok
+test agent_result::tests::antigravity_real_error_envelope_still_failed ... ok
+test agent_result::tests::antigravity_transport_cancel_with_failed_marker_is_failed ... ok
+test agent_result::tests::antigravity_transport_cancel_with_success_marker_is_ambiguous ... ok
+test agent_result::tests::antigravity_transport_cancel_without_marker_is_failed ... ok
+test agent_result::tests::arbitration_preserves_layer2s_resource_and_unavailable_codes ... ok
+test agent::tests::discover_stray_devflow_processes_finds_a_monitor_wrapper ... ok
+test agent_result::tests::archive_failure_preserves_live_capture_for_retry ... ok
+test agent_result::tests::archive_clears_a_previous_attempts_idle_timeout_verdict ... ok
+test agent_result::tests::archive_handles_missing_devflow_dir ... ok
+test agent_result::tests::archive_is_noop_when_nothing_to_archive ... ok
+test agent_result::tests::archive_moves_captures_into_history_and_removes_pid_file ... ok
+test agent_result::tests::archive_review_copy_failure_rolls_back_complete_live_pair ... ok
+test agent_result::tests::archive_second_publish_failure_rolls_back_complete_live_pair ... ok
+test agent_result::tests::archive_snapshots_current_review_into_same_generation ... ok
+test agent_result::tests::archive_prunes_history_to_retain_count ... ok
+test agent_result::tests::as_wire_str_matches_serde_form_for_every_variant ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_detects_human_gate_line ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_for_code_spanned_plain_blocking ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_for_gate_text_in_user_event ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_for_plain_blocking ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_for_subagent_forwarded_gate_text ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_when_init_is_absent ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_for_top_level_assistant_narration ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_when_init_is_torn ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_false_when_no_gate_field ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_matches_live_observed_rendering ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_matches_live_rendering_in_envelope ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_tolerates_whitespace_and_emphasis ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_true_for_top_level_result_declaration ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_true_inside_escaped_envelope ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_true_when_echo_co_occurs_with_declaration ... ok
+test agent_result::tests::blocking_human_checkpoint_reported_true_when_only_first_result_declares_gate ... ok
+test agent_result::tests::changed_external_probe_never_inherits_prior_approval ... ok
+test agent_result::tests::checkpoint_reported_in_capture_missing_file_returns_false ... ok
+test agent_result::tests::checkpoint_reported_in_capture_reads_true_from_file ... ok
+test agent::tests::discover_stray_devflow_processes_rejects_devflow_named_argv0_with_wrong_argv1 ... ok
+test agent_result::tests::checkpoint_reported_in_capture_scopes_stream_gate_text_to_result_events ... ok
+test agent_result::tests::claude_envelope_is_error_false_defers ... ok
+test agent_result::tests::claude_envelope_is_error_detected ... ok
+test agent_result::tests::claude_envelope_marker_still_wins ... ok
+test agent_result::tests::claude_envelope_not_consumed_by_codex_parser ... ok
+test agent_result::tests::claude_is_error_overrides_success_marker ... ok
+test agent_result::tests::claude_stream_denial_before_final_turn_does_not_outrank_final_result ... ok
+test agent_result::tests::claude_stream_final_turn_denial_rate_limit_event_is_rate_limited ... ok
+test agent_result::tests::claude_stream_final_turn_denial_outranks_failed_marker ... ok
+test agent_result::tests::claude_stream_last_result_event_wins_over_earlier_results ... ok
+test agent_result::tests::claude_stream_is_error_overrides_success_marker ... ok
+test agent_result::tests::claude_stream_last_result_is_error_without_marker_is_failed ... ok
+test agent_result::tests::claude_stream_not_consumed_by_codex_parser ... ok
+test agent_result::tests::claude_stream_overwrites_agent_planted_decided_by_layer ... ok
+test agent_result::tests::claude_stream_last_result_without_marker_defers ... ok
+test agent_result::tests::claude_stream_session_id_declines_non_stream_shapes ... ok
+test agent_result::tests::claude_stream_real_allowed_rate_limit_event_is_not_rate_limited ... ok
+test agent_result::tests::claude_stream_session_id_from_capture_reads_jsonl ... ok
+test agent_result::tests::claude_stream_session_id_ignores_agent_planted_value ... ok
+test agent_result::tests::claude_stream_session_id_reads_cli_emitted_init_value ... ok
+test agent_result::tests::claude_stream_unrecognised_rate_limit_status_defers ... ok
+test agent_result::tests::claude_stream_wiring_leaves_single_document_capture_unchanged ... ok
+test agent_result::tests::codex_agent_message_marker_failed_wins_over_bare_turn_completed ... ok
+test agent_result::tests::codex_agent_message_marker_success_short_circuits ... ok
+test agent_result::tests::codex_event_stream_ignores_progress_and_unparseable_lines ... ok
+test agent_result::tests::codex_event_stream_parses_turn_failed ... ok
+test agent_result::tests::codex_marker_cannot_forge_layer0_provenance ... ok
+test agent_result::tests::codex_stream_not_consumed_by_claude_stream_parser ... ok
+test agent_result::tests::codex_rate_limit_heuristic_excludes_recovered_json_and_embedded_429 ... ok
+test agent_result::tests::codex_turn_completed_no_marker_defers ... ok
+test agent_result::tests::codex_torn_tail_does_not_resurrect_earlier_success_marker ... ok
+test agent_result::tests::codex_turn_failed_beats_an_earlier_success_marker ... ok
+test agent_result::tests::corrupt_byte_inside_a_marker_is_never_repaired_into_success ... ok
+test agent_result::tests::corruption_prefixed_event_line_is_not_prose_noise ... ok
+test agent_result::tests::detect_claude_json_rate_limit_by_429 ... ok
+test agent_result::tests::detect_claude_json_rate_limit_by_subtype ... ok
+test agent_result::tests::detect_codex_try_again_rate_limit ... ok
+test agent_result::tests::detect_rate_limit_ignores_json_event_lines ... ok
+test agent_result::tests::detect_rate_limit_finds_marker_in_deeply_nested_json_without_overflow ... ok
+test agent_result::tests::detect_rate_limit_still_reads_codex_plain_text ... ok
+test agent_result::tests::edge_corrupt_rate_limit_envelope_stays_rate_limited ... ok
+test agent_result::tests::detect_rate_limit_ignores_normal_stdout ... ok
+test agent_result::tests::evaluate_layer1_finds_devflow_result_in_file ... ok
+test agent_result::tests::evaluate_agent_result_reads_files_end_to_end ... ok
+test agent_result::tests::evaluate_layer1_finds_marker_despite_invalid_utf8_bytes ... ok
+test agent_result::tests::evaluate_layer1_rate_limit_envelope_with_is_error_is_rate_limited ... ok
+test agent_result::tests::evaluate_layer1_parses_claude_stream_capture ... ok
+test agent_result::tests::evaluate_layer1_reports_rate_limited_without_marker ... ok
+test agent::tests::terminate_and_verify_escalates_to_kill_for_a_term_ignoring_child ... ok
+test agent_result::tests::branch_evidence_resolves_caller_root_under_a_hostile_git_dir ... ok
+test agent_result::tests::evaluate_layer2_exit_137_is_resource_killed ... ok
+test agent_result::tests::evaluate_layer2_exit_127_is_agent_unavailable ... ok
+test agent_result::tests::evaluate_layer2_exit_zero_no_commits_is_failed ... ok
+test agent_result::tests::evaluate_layer3_unmeasurable_count_is_unknown_not_failed ... ok
+test agent_result::tests::evaluate_layer2_falls_back_to_exit_code_and_commit_count ... ok
+test agent_result::tests::existing_variants_keep_wire_form ... ok
+test agent_result::tests::external_probe_discovers_from_project_root_across_every_stage_without_a_worktree ... ok
+test agent_result::tests::external_probe_discovers_from_the_worktree_when_the_main_checkout_lacks_the_plan ... ok
+test agent_result::tests::failing_external_probe_outranks_success_marker ... ok
+test agent_result::tests::generic_marker_cannot_forge_layer0_provenance ... ok
+test agent_result::tests::idle_timeout_result_carries_the_commits_it_enumerated ... ok
+test agent_result::tests::idle_timeout_side_channel_is_read_even_when_the_capture_is_missing ... ok
+test agent_result::tests::idle_timeout_side_channel_wins_over_stale_stream_result ... ok
+test agent_result::tests::idle_timeout_verdict_is_not_arbitrated_by_exit_code ... ok
+test agent_result::tests::evaluate_layer3_zero_commits_is_failed_and_flags_human_review ... ok
+test agent_result::tests::layer0_affirmative_success_keeps_none_verdict_off_validate ... ok
+test agent_result::tests::layer0_affirmative_success_on_non_code_stage_with_zero_commits ... ok
+test agent_result::tests::evaluate_layer2_nonzero_exit_is_failed ... ok
+test agent_result::tests::layer0_disabled_routes_a_self_reported_failure_to_gate_review ... ok
+test agent_result::tests::layer0_affirmative_success_outranks_layer1_failure_marker ... ok
+test agent_result::tests::layer0_affirmative_success_consults_layer1_verdict_at_validate ... ok
+test agent_result::tests::layer0_verdict_graft_still_transplants_a_passing_layer1_verdict ... ok
+test agent_result::tests::evaluate_layer3_falls_back_to_commit_count ... ok
+test agent_result::tests::layer0_verdict_graft_declines_when_layer1_status_is_not_success ... ok
+test agent_result::tests::multi_word_variants_serialize_with_word_boundary ... ok
+test agent_result::tests::marker_tail_scan_survives_corruption_length_and_case ... ok
+test agent_result::tests::no_external_declaration_preserves_layer1_result ... ok
+test agent_result::tests::non_stream_captures_still_use_the_raw_scan_after_widening ... ok
+test agent_result::tests::multiple_declared_probes_first_failure_vetoes_regardless_of_order ... ok
+test agent_result::tests::one_stray_json_line_does_not_suppress_a_plain_text_gate ... ok
+test agent_result::tests::opencode_build_command_is_headless_json ... ok
+test agent_result::tests::opencode_detector_rejects_foreign_streams ... ok
+test agent_result::tests::opencode_error_event_overrides_earlier_success_marker ... ok
+test agent_result::tests::opencode_error_reason_falls_back_to_name ... ok
+test agent_result::tests::opencode_error_reason_survives_non_string_message ... ok
+test agent_result::tests::opencode_error_scan_reports_the_last_error_not_the_first ... ok
+test agent_result::tests::opencode_intermediate_step_finish_is_not_terminal ... ok
+test agent_result::tests::opencode_later_success_marker_overrides_earlier_error ... ok
+test agent_result::tests::opencode_malformed_events_do_not_panic ... ok
+test agent_result::tests::opencode_marker_cannot_forge_layer0_provenance ... ok
+test agent_result::tests::opencode_marker_wins_from_last_text_event ... ok
+test agent_result::tests::opencode_marker_in_text_event_resolves_at_layer1 ... ok
+test agent_result::tests::opencode_non_stream_input_returns_none ... ok
+test agent_result::tests::opencode_real_error_capture_is_failed ... ok
+test agent_result::tests::opencode_real_success_capture_is_recognised_and_marker_less ... ok
+test agent_result::tests::opencode_render_prompt_unchanged ... ok
+test agent_result::tests::opencode_torn_tail_after_marker_is_indeterminate ... ok
+test agent_result::tests::opencode_torn_tail_beats_error_event_ordering_is_stable ... ok
+test agent_result::tests::opencode_real_tool_use_capture_defers_to_layer2 ... ok
+test agent_result::tests::parse_devflow_result_non_string_verdict_type_is_none_not_parse_error ... ok
+test agent_result::tests::parse_devflow_result_malformed_verdict_is_none_not_parse_error ... ok
+test agent_result::tests::parse_devflow_result_reads_verdict_pass ... ok
+test agent_result::tests::parse_devflow_result_reads_verdict ... ok
+test agent_result::tests::parse_devflow_result_verdict_absent_is_none ... ok
+test agent_result::tests::parse_failed_marker_inside_json_envelope ... ok
+test agent_result::tests::parse_finds_last_marker_in_tail ... ok
+test agent_result::tests::parse_json_envelope_without_marker_returns_none ... ok
+test agent_result::tests::parse_failed_marker_with_reason ... ok
+test agent_result::tests::parse_lowercase_no_space_marker ... ok
+test agent_result::tests::parse_malformed_json_returns_none ... ok
+test agent_result::tests::parse_lowercase_marker ... ok
+test agent_result::tests::parse_marker_inside_json_result_envelope ... ok
+test agent_result::tests::parse_marker_lines_returns_last_marker_in_long_output ... ok
+test agent_result::tests::parse_marker_only_in_last_4000_chars ... ok
+test agent_result::tests::parse_marker_with_commits_and_summary ... ok
+test agent_result::tests::parse_marker_without_space_after_colon ... ok
+test agent_result::tests::parse_missing_marker_returns_none ... ok
+test agent_result::tests::parse_success_marker ... ok
+test agent_result::tests::phase_commit_count_reports_none_when_git_cannot_run ... ok
+test agent_result::tests::layer2_skips_commit_gate_for_define_and_validate ... ok
+test agent_result::tests::phase_verification_exists_finds_the_artifact_by_prefix ... ok
+test agent_result::tests::phase_verification_fingerprint_differs_when_content_differs ... ok
+test agent_result::tests::phase_verification_fingerprint_is_none_when_the_artifact_is_absent ... ok
+test agent_result::tests::plain_text_not_consumed_by_claude_stream_parser ... ok
+test agent_result::tests::prose_noise_does_not_block_session_recovery ... ok
+test agent_result::tests::layer2_nonzero_exit_is_failed_all_stages ... ok
+test agent_result::tests::rate_limited_verdict_is_not_arbitrated_by_exit_code ... ok
+test agent_result::tests::prune_history_retains_a_full_five_stage_run_with_loop_backs ... ok
+test agent_result::tests::session_id_from_capture_lossy_reads_invalid_utf8 ... ok
+test agent_result::tests::removed_external_probe_fails_closed_against_prior_approval ... ok
+test agent_result::tests::session_id_from_capture_missing_file_returns_none ... ok
+test agent_result::tests::session_id_missing_key_returns_none ... ok
+test agent_result::tests::session_id_in_devflow_result_marker_is_not_returned ... ok
+test agent_result::tests::session_id_non_string_type_returns_none_not_panic ... ok
+test agent_result::tests::session_id_plain_text_stdout_returns_none ... ok
+test agent_result::tests::session_id_reads_top_level_string ... ok
+test agent_result::tests::single_doc_envelope_not_consumed_by_claude_stream_parser ... ok
+test agent_result::tests::phase_commit_count_reports_zero_when_the_range_is_invalid ... ok
+test agent_result::tests::stray_invalid_byte_does_not_hide_an_envelope_failure ... ok
+test agent_result::tests::stream_json_capture_is_not_consumed_by_the_single_document_path ... ok
+test agent_result::tests::stream_success_cannot_stand_against_nonzero_exit_code ... ok
+test agent_result::tests::stream_success_stands_when_no_exit_file_exists ... ok
+test agent_result::tests::subagent_result_event_never_decides_the_verdict ... ok
+test agent_result::tests::token_matches_only_inside_top_level_result ... ok
+test agent_result::tests::torn_later_init_does_not_resurrect_a_stale_session_id ... ok
+test agent_result::tests::stream_success_stands_when_the_exit_code_is_zero ... ok
+test agent_result::tests::torn_gate_bearing_user_event_does_not_reopen_raw_scanning ... ok
+test agent_result::tests::phase_commit_count_reports_zero_without_a_branch ... ok
+test agents::antigravity::tests::antigravity_driver_build_command_is_exact ... ok
+test agents::antigravity::tests::antigravity_driver_name_is_correct ... ok
+test agents::antigravity::tests::antigravity_driver_parse_completion_delegates ... ok
+test agents::antigravity::tests::antigravity_driver_render_prompt_delegates_to_claude_style ... ok
+test agents::antigravity::tests::antigravity_driver_spawn_argv_smoke ... ok
+test agents::claude::tests::exec_command_carries_no_positional_prompt ... ok
+test agents::claude::tests::exec_command_uses_stream_json_on_both_input_and_output ... ok
+test agents::claude::tests::resume_command_carries_print_flag_and_instruction ... ok
+test agents::claude::tests::resume_command_includes_permission_bypass ... ok
+test agents::claude::tests::resume_command_names_claude_program ... ok
+test agents::claude::tests::resume_command_resume_flag_immediately_precedes_session_id ... ok
+test agents::claude::tests::single_document_command_preserves_pre31_shape ... ok
+test agents::codex::tests::codex_writable_roots_escape_del ... ok
+test agents::codex::tests::codex_writable_roots_escape_hostile_paths ... ok
+test agents::codex::tests::codex_writable_roots_refuses_non_utf8_paths - should panic ... ok
+test agents::hermes::tests::hermes_driver_build_command ... ok
+test agents::hermes::tests::hermes_driver_environment ... ok
+test agents::hermes::tests::hermes_driver_name ... ok
+test agents::hermes::tests::hermes_driver_render_prompt ... ok
+test agents::hermes::tests::hermes_subagent_dispatch_with_mock ... ok
+test agents::hermes::tests::parse_hermes_tools_list_delegation_disabled ... ok
+test agents::hermes::tests::parse_hermes_tools_list_delegation_enabled ... ok
+test agents::hermes::tests::parse_hermes_tools_list_disabled_delegation_with_enabled_word ... ok
+test agents::hermes::tests::parse_hermes_tools_list_missing_delegation ... ok
+test agents::opencode::tests::agent_list_baseline_reports_no_subagent ... ok
+test agents::opencode::tests::agent_list_ignores_marker_text_inside_json_dump_line ... ok
+test agents::opencode::tests::agent_list_ignores_prose_line_ending_in_the_literal_marker_text ... ok
+test agents::opencode::tests::agent_list_with_all_mode_reports_true ... ok
+test agents::opencode::tests::agent_list_with_subagent_mode_reports_true ... ok
+test agents::opencode::tests::capabilities_never_refuses_a_launch ... ok
+test agents::opencode::tests::health_error_leaks_no_provider_detail ... ok
+test agents::opencode::tests::health_fails_closed_on_a_hung_probe ... ok
+test agents::opencode::tests::health_probe_argv_is_providers_list ... ok
+test agents::opencode::tests::preflight_accepts_configured_credentials ... ok
+test agents::opencode::tests::preflight_rejects_constructed_zero_credential_output ... ok
+test agents::opencode::tests::preflight_rejects_nonzero_exit_with_credential_bearing_stdout ... ok
+test agents::opencode::tests::preflight_rejects_when_probe_cannot_run ... ok
+test agents::opencode::tests::provider_count_ignores_bullet_provider_lines ... ok
+test agents::opencode::tests::provider_count_ignores_unanchored_matching_substring ... ok
+test agents::opencode::tests::provider_count_is_zero_for_constructed_credentialless_output ... ok
+test agents::opencode::tests::provider_count_sums_credentials_and_environment ... ok
+test agent_result::tests::truncation_sweep_never_widens_gate_detection ... ok
+test agents::opencode::tests::strip_ansi_escapes_preserves_content_after_an_unterminated_sequence ... ok
+test agents::opencode::tests::strip_ansi_escapes_removes_sgr_and_preserves_box_glyphs ... ok
+test agents::opencode::tests::strip_ansi_escapes_terminates_on_non_sgr_csi_sequence ... ok
+test agents::opencode::tests::subagent_probe_fails_closed_on_empty_output ... ok
+test agents::opencode::tests::subagent_probe_fails_closed_on_nonzero_exit ... ok
+test agents::opencode::tests::subagent_probe_fails_closed_on_spawn_error ... ok
+test agents::pi::tests::classify_auth_check_accepts_ready ... ok
+test agents::pi::tests::classify_auth_check_rejects_not_ready ... ok
+test agents::pi::tests::classify_auth_check_rejects_ready_text_with_failed_exit ... ok
+test agents::pi::tests::classify_auth_check_tolerates_formatted_json ... ok
+test agents::pi::tests::exec_command_shape ... ok
+test agent_result::tests::truncation_sweep_never_forges_session_id ... ok
+test agents::pi::tests::pi_capabilities_detect_subagent_dispatch ... ok
+test agents::pi::tests::pi_capabilities_exclude_unvetted_subagent_packages ... ok
+test agents::pi::tests::pi_capabilities_fail_closed_when_no_subagent ... ok
+test agents::pi::tests::pi_capabilities_fail_closed_when_probe_fails ... ok
+test agents::pi::tests::preflight_falls_back_to_google_when_no_default_provider ... ok
+test agents::pi::tests::preflight_invokes_pi_auth_check_and_accepts_ready ... ok
+test agents::opencode::tests::spawn_with_timeout_kills_a_hung_child ... ok
+test agents::tests::antigravity_conformance_enrollment ... ok
+test agents::tests::claude_and_opencode_stay_identical_but_codex_renders_native ... ok
+test agents::tests::claude_launches_headless_stream_json_without_positional_prompt ... ok
+test agents::tests::codex_and_pi_drivers_reproduce_legacy_behavior ... ok
+test agents::tests::codex_define_and_plan_require_an_existing_artifact ... ok
+test agents::tests::codex_disables_signing_via_env_others_do_not ... ok
+test agents::pi::tests::preflight_rejects_ready_body_with_failed_exit ... ok
+test agents::tests::codex_grants_writable_roots_for_worktree_git_metadata ... ok
+test agents::tests::codex_wraps_prompt_in_exec_and_json ... ok
+test agents::tests::conformance_suite_fails_a_broken_driver ... ok
+test agents::tests::default_preflight_is_ok_for_built_in_adapters ... ok
+test agents::tests::driver_for_returns_correct_names ... ok
+test agents::tests::drivers_reproduce_legacy_adapter_behavior ... ok
+test agents::tests::every_driver_passes_the_conformance_suite ... ok
+test agents::tests::hermes_conformance_enrollment ... ok
+test agents::tests::opencode_wraps_prompt_in_run ... ok
+test agents::tests::workflow_render_preserves_stage_contracts ... ok
+test canary::tests::canary_absent_when_token_appears_only_in_a_non_top_level_event ... ok
+test agents::pi::tests::preflight_reports_credentialless_when_auth_check_says_not_ready ... ok
+test canary::tests::canary_antigravity_absent_when_token_only_in_echoed_user_event ... ok
+test canary::tests::canary_absent_when_token_appears_only_as_a_prompt_echo ... ok
+test canary::tests::canary_antigravity_confirmed_when_token_returns_in_event_result_response ... ok
+test canary::tests::canary_antigravity_trust_predicate_does_not_cross_schemas ... ok
+test canary::tests::canary_confirmed_when_token_returns_in_a_top_level_result ... ok
+test canary::tests::canary_unverified_when_the_launcher_fails ... ok
+test canary::tests::declared_tokens_differ_between_runs ... ok
+test config::tests::default_uses_hardcoded_constants ... ok
+test config::tests::env_overrides_file_capture_retention ... ok
+test config::tests::env_overrides_file_external_verification ... ok
+test config::tests::env_overrides_file_review_angles ... ok
+test config::tests::env_overrides_file_yes_ship ... ok
+test config::tests::file_overrides_capture_retention_default ... ok
+test config::tests::malformed_file_falls_back_to_defaults ... ok
+test config::tests::yes_ship_defaults_to_false ... ok
+test config::tests::missing_file_uses_devflow_defaults ... ok
+test config::tests::yes_ship_file_sets_false ... ok
+test config::tests::yes_ship_missing_file_returns_false ... ok
+test config::tests::yes_ship_unparseable_env_falls_back_to_file ... ok
+test config::tests::yes_ship_unrelated_keys_returns_default ... ok
+test doc_check::allowlist_entries_require_reasons ... ok
+test config::tests::yes_ship_file_sets_true ... ok
+test doc_check::devflow_core_dependency_pin_matches_workspace_version ... ok
+test doc_check::gitignore_covers_all_devflow_paths ... ok
+test doc_check::pinned_doc_claims_match_source ... ok
+test events::tests::describe_prefers_detail_fields ... ok
+test events::tests::emit_appends_parseable_lines_with_envelope_fields ... ok
+test events::tests::emit_is_fail_soft_on_unwritable_path ... ok
+test events::tests::emit_never_lets_payload_forge_envelope_keys ... ok
+test events::tests::last_event_for_phase_filters_by_phase ... ok
+test events::tests::last_event_of_kind_for_phase_filters_by_phase_and_event_name ... ok
+test events::tests::last_event_of_kind_for_phase_skips_corrupt_lines ... ok
+test events::tests::last_event_skips_corrupt_lines ... ok
+test events::tests::last_events_by_phase_collects_latest_per_phase_in_one_pass ... ok
+test events::tests::last_events_by_phase_tracks_newest_stage_launched_ts_across_the_pass ... ok
+test gates::tests::ack_writes_received_true ... ok
+test gates::tests::cleanup_removes_all_three_files_idempotently ... ok
+test gates::tests::gate_action_aborts_when_note_says_abort ... ok
+test gates::tests::gate_action_advances_on_approval ... ok
+test gates::tests::gate_action_loops_back_on_fixable_rejection ... ok
+test gates::tests::gate_file_round_trips_through_serde ... ok
+test gates::tests::list_open_is_empty_without_gates_dir ... ok
+test gates::tests::list_open_shows_unanswered_gates_only ... ok
+test gates::tests::notify_hook_failure_is_fail_soft ... ok
+test gates::tests::notify_hook_runs_configured_command ... ok
+test gates::tests::notify_hook_sets_non_silent_flag ... ok
+test gates::tests::notify_hook_unset_is_noop ... ok
+test gates::tests::poll_response_returns_immediately_at_full_timeout ... ok
+test gates::tests::poll_response_returns_when_file_appears ... ok
+test gates::tests::poll_response_times_out_when_absent ... ok
+test gates::tests::respond_refuses_to_clobber_unconsumed_response ... ok
+test gates::tests::respond_refuses_when_no_gate_is_open ... ok
+test gates::tests::respond_writes_a_response_poll_response_consumes ... ok
+test gates::tests::write_gate_creates_file_with_correct_path ... ok
+test git::tests::cleanup_merged_deletes_when_head_is_not_on_develop ... ok
+test agent_result::tests::truncation_sweep_never_upgrades_verdict_to_success ... ok
+test git::tests::cleanup_merged_is_relative_to_develop_not_current_head ... ok
+test git::tests::cleanup_merged_removes_merged_but_keeps_protected ... ok
+test git::tests::commit_path_on_nonexistent_path_still_errors ... ok
+test git::tests::cleanup_merged_skips_worktree_branch_and_continues_sweep ... ok
+test git::tests::commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted ... ok
+test git::tests::commit_path_twice_with_identical_content_creates_only_one_commit ... ok
+test git::tests::commit_path_with_no_changes_returns_ok_without_committing ... ok
+test git::tests::delete_branch_removes_unmerged_with_force_and_protects_trunk ... ok
+test git::tests::feature_start_branches_from_develop ... ok
+test git::tests::git_command_marks_every_redirecting_var_for_removal ... ok
+test git::tests::git_command_preserves_git_exec_path ... ok
+test doc_check::source_devflow_env_vars_and_subcommands_are_documented ... ok
+test git::tests::feature_finish_merges_into_develop_and_deletes ... ok
+test git::tests::local_env_vars_match_git ... ok
+test git::tests::member_depends_on_matches_dotted_workspace_shorthand ... ok
+test git::tests::member_depends_on_matches_long_form_dependency_section ... ok
+test git::tests::hermetic_command_resolves_caller_root_even_under_a_hostile_git_dir ... ok
+test git::tests::merge_of_missing_branch_is_an_error ... ok
+test git::tests::origin_main_ancestor_status_holds_under_a_hostile_git_dir ... ok
+test git::tests::origin_main_ancestor_status_is_ancestor_when_head_is_up_to_date ... ok
+test git::tests::package_name_reads_the_package_section ... ok
+test git::tests::publish_order_derives_core_before_cli_from_a_fixture_workspace ... ok
+test git::tests::publish_order_recognizes_long_form_dependency_section_self_dependency ... ok
+test git::tests::list_feature_branches_reports_ahead_and_behind_semantics ... ok
+test git::tests::origin_main_ancestor_status_is_ref_absent_without_a_remote ... ok
+test git::tests::ref_is_ancestor_is_ref_absent_without_remote_refs ... ok
+test git::tests::ref_is_ancestor_is_ancestor_when_the_refs_are_in_order ... ok
+test git::tests::ref_is_ancestor_is_diverged_for_unrelated_commits ... ok
+test git::tests::release_start_and_finish_tags_main_and_merges_both ... ok
+test git::tests::topo_sort_falls_back_to_input_order_on_a_cycle ... ok
+test git::tests::topo_sort_orders_dependency_before_dependent ... ok
+test git::tests::workspace_member_paths_parses_multiline_array ... ok
+test gsd_config::tests::a_malformed_config_is_an_error_not_a_panic ... ok
+test git::tests::tag_stays_lightweight_when_gpgsign_is_forced_on ... ok
+test gsd_config::tests::a_missing_workflow_object_is_created_rather_than_rejected ... ok
+test gsd_config::tests::a_non_object_config_root_is_an_error_not_a_replacement ... ok
+test gsd_config::tests::an_absent_config_is_an_error_not_a_panic ... ok
+test git::tests::release_start_branches_from_current_head_not_develop ... ok
+test gsd_config::tests::force_clear_on_a_project_without_a_gsd_config_is_a_clean_no_op ... ok
+test gsd_config::tests::force_clear_on_a_malformed_config_is_an_error ... ok
+test gsd_config::tests::force_clear_on_an_already_clean_config_reports_nothing_and_writes_nothing ... ok
+test gsd_config::tests::force_clear_commits_when_the_leak_reached_head ... ok
+test gsd_config::tests::reading_the_flag_defaults_to_the_inactive_value_on_a_shape_it_does_not_recognise ... ok
+test gsd_config::tests::setting_the_value_it_already_holds_is_a_no_op ... ok
+test gsd_config::tests::the_atomic_write_leaves_no_temp_file_behind ... ok
+test gsd_config::tests::the_trailing_newline_convention_survives_a_write ... ok
+test gsd_config::tests::writing_the_flag_leaves_every_other_key_byte_identical ... ok
+test gsd_config::tests::writing_the_flag_never_touches_auto_advance ... ok
+test history::tests::empty_phase_has_clean_no_attempts_result ... ok
+test history::tests::orphaned_capture_and_review_artifacts_remain_visible ... ok
+test history::tests::timeline_orders_events_and_correlates_retained_captures ... ok
+test gsd_config::tests::force_clear_refuses_to_commit_when_the_file_carries_other_changes ... ok
+test gsd_config::tests::force_clear_repairs_a_leaked_working_tree_value ... ok
+test hooks::tests::after_ship_runs_version_changelog_then_cleanup ... ok
+test doc_check::doc_referenced_identifiers_exist_in_source ... ok
+test hooks::tests::branch_cleanup_is_fail_soft_when_branch_absent ... ok
+test hooks::tests::branch_create_makes_feature_branch ... ok
+test hooks::tests::changelog_append_writes_entry ... ok
+test hooks::tests::changelog_append_commits_its_own_write ... ok
+test hooks::tests::after_ship_batch_with_no_version_file_keeps_tag_and_changelog_in_sync ... ok
+test hooks::tests::merge_fails_closed_when_branch_absent ... ok
+test hooks::tests::after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean ... ok
+test hooks::tests::merge_fails_closed_when_branch_absent_emits_no_merge_result_event ... ok
+test hooks::tests::changelog_append_writes_the_generated_body_end_to_end ... ok
+test hooks::tests::transition_map_finalizes_docs_only_before_ship ... ok
+test hooks::tests::merge_succeeds_while_feature_branch_is_checked_out_in_linked_worktree ... ok
+test hooks::tests::merge_through_hook_records_true_merged_result_after_ancestry_reconfirmed ... ok
+test lock::tests::acquire_creates_devflow_directory_when_absent ... ok
+test lock::tests::acquire_creates_lock_and_records_pid ... ok
+test lock::tests::acquire_reclaims_lock_from_dead_holder ... ok
+test lock::tests::acquire_reclaims_lock_with_corrupt_pid ... ok
+test lock::tests::acquire_reclaims_lock_with_pid_zero ... ok
+test lock::tests::different_phases_do_not_contend ... ok
+test lock::tests::dropping_guard_releases_lock ... ok
+test lock::tests::holder_cleans_up_empty_lock_file ... ok
+test lock::tests::holder_is_none_without_lock_file ... ok
+test hooks::tests::validate_to_ship_hooks_do_not_touch_changelog ... ok
+test hooks::tests::version_bump_tags_repo ... ok
+test lock::tests::project_lock_contends_with_itself ... ok
+test lock::tests::project_lock_is_independent_of_phase_locks ... ok
+test lock::tests::remove_stale_locks_keeps_live_holder_and_sweeps_dead ... ok
+test lock::tests::second_acquire_is_contended ... ok
+test mode::tests::auto_does_not_gate_validate_until_failure_threshold ... ok
+test mode::tests::auto_loops_validate_supervise_does_not ... ok
+test mode::tests::consecutive_reset_fires_on_every_other_transition ... ok
+test mode::tests::consecutive_reset_skips_the_code_to_validate_hop ... ok
+test mode::tests::display_round_trips_through_from_str ... ok
+test mode::tests::from_str_accepts_canonical_and_alias ... ok
+test mode::tests::from_str_rejects_unknown ... ok
+test mode::tests::made_progress_requires_a_strictly_higher_count ... ok
+test mode::tests::made_progress_treats_no_prior_record_as_progress ... ok
+test mode::tests::non_gate_stages_never_gate ... ok
+test mode::tests::phase_failure_ceiling_gates_at_the_ceiling_not_below_it ... ok
+test mode::tests::phase_failure_ceiling_predicate_agrees_with_should_gate ... ok
+test mode::tests::phase_failure_ceiling_reached_has_the_same_boundary ... ok
+test mode::tests::ship_always_gates_in_both_modes ... ok
+test mode::tests::supervise_always_gates_validate ... ok
+test hooks::tests::terminal_hooks_version_post_merge_develop ... ok
+test monitor::tests::a_signal_killed_child_records_128_plus_signal_not_minus_one ... ok
+test monitor::tests::a_stage_that_backgrounds_nothing_is_unaffected ... ok
+test monitor::tests::an_unrecognised_task_status_leaves_the_task_open ... ok
+test monitor::tests::close_rule_antigravity_closes_on_event_key_marker ... ok
+test monitor::tests::close_rule_antigravity_drain_arms_vacuously_satisfied ... ok
+test monitor::tests::close_rule_is_vacuously_drained_when_no_background_tasks_event_appears ... ok
+test monitor::tests::close_rule_requires_both_marker_and_drained_background_tasks ... ok
+test monitor::tests::coalesced_completions_do_not_undercount_children ... ok
+test lock::tests::project_lock_blocking_times_out_against_live_holder ... ok
+test lock::tests::project_lock_blocking_waits_for_release ... ok
+test monitor::tests::idle_timeout_secs_accepts_values_above_floor ... ok
+test monitor::tests::idle_timeout_secs_clamps_below_floor_and_logs ... ok
+test monitor::tests::idle_timeout_secs_defaults_to_the_floor ... ok
+test monitor::tests::idle_timeout_setting_for_is_agent_specific ... ok
+test monitor::tests::idle_timeout_does_not_roll_back_commits ... ok
+test monitor::tests::a_quota_denial_is_not_recorded_as_an_idle_timeout ... ok
+test monitor::tests::idle_timeout_still_fires_when_no_background_task_is_open ... ok
+test monitor::tests::marker_inside_a_non_top_level_result_does_not_satisfy_the_close_rule ... ok
+test monitor::tests::idle_timer_resets_on_every_stream_line ... ok
+test monitor::tests::non_utf8_byte_does_not_truncate_the_capture ... ok
+test monitor::tests::open_tasks_are_learned_from_the_events_production_actually_emits ... ok
+test monitor::tests::pipe_owning_monitor_delivers_prompt_via_stdin_and_captures_stream ... ok
+test monitor::tests::pipe_owning_writer_delivers_antigravity_event_key_turn ... ok
+test monitor::tests::shell_escape_handles_empty_string ... ok
+test monitor::tests::shell_escape_handles_single_quotes ... ok
+test monitor::tests::shell_escape_wraps_basic_strings ... ok
+test monitor::tests::sigterm_to_monitor_also_kills_the_agent ... ok
+test monitor::tests::idle_timeout_does_not_fire_while_a_background_task_is_open ... ok
+test monitor::tests::spawn_monitor_captures_agent_pid_and_output ... ok
+test monitor::tests::spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir ... ok
+test monitor::tests::spawn_monitor_runs_agent_in_worktree_but_captures_in_project_root ... ok
+test monitor::tests::unreadable_first_announcement_does_not_satisfy_the_drain_arm ... ok
+test monitor::tests::user_turn_line_for_antigravity_uses_event_key ... ok
+test monitor::tests::spawn_monitor_treats_agent_args_as_literal_argv ... ok
+test monitor::tests::idle_timeout_writes_side_channel_before_terminating_child ... ok
+test monitor::tests::wait_for_agent_pid_returns_pid_when_file_exists ... ok
+test outcome_policy::tests::agent_unavailable_gates_infra ... ok
+test outcome_policy::tests::ambiguous_auto_resumes_never_advances ... ok
+test outcome_policy::tests::failed_gates_review ... ok
+test outcome_policy::tests::idle_timeout_gates_review ... ok
+test outcome_policy::tests::idle_timeout_is_never_auto_resumed ... ok
+test outcome_policy::tests::rate_limited_auto_resumes ... ok
+test outcome_policy::tests::resource_killed_gates_infra ... ok
+test outcome_policy::tests::success_advances ... ok
+test outcome_policy::tests::the_never_auto_resume_loop_can_actually_fail ... ok
+test outcome_policy::tests::unknown_gates_review_never_advances ... ok
+test phase_id::tests::a_decimal_phase_serializes_as_a_string ... ok
+test phase_id::tests::a_phase_does_not_match_its_decimal_sibling ... ok
+test phase_id::tests::an_absent_or_malformed_phase_field_reads_as_none ... ok
+test phase_id::tests::an_integer_phase_still_serializes_as_a_number ... ok
+test phase_id::tests::deserializes_both_persisted_shapes ... ok
+test phase_id::tests::display_ignores_width_specifiers ... ok
+test phase_id::tests::display_is_the_unpadded_label ... ok
+test phase_id::tests::gsd_computes_the_same_phase_branch_name_when_available ... ok
+test phase_id::tests::orders_a_decimal_phase_after_its_major ... ok
+test phase_id::tests::padded_is_the_path_form ... ok
+test phase_id::tests::parses_a_decimal_phase ... ok
+test phase_id::tests::parses_an_integer_phase ... ok
+test phase_id::tests::phase_branch_name_matches_the_convention_gsd_computes ... ok
+test phase_id::tests::reads_a_phase_field_in_either_shape ... ok
+test phase_id::tests::rejects_what_is_not_a_phase_number ... ok
+test phase_id::tests::round_trips_through_json ... ok
+test prompt::tests::checkpoint_auto_decide_prompt_is_deterministic ... ok
+test prompt::tests::checkpoint_auto_decide_prompt_states_no_operator_judgment_and_record_reasoning ... ok
+test prompt::tests::checkpoint_auto_decide_prompt_substitutes_phase_for_legibility ... ok
+test prompt::tests::checkpoint_auto_decide_prompt_terminates_with_completion_protocol ... ok
+test prompt::tests::code_stage_prompt_is_unchanged_single_command_template ... ok
+test prompt::tests::define_prompt_never_invokes_discuss_phase ... ok
+test prompt::tests::each_stage_prompt_carries_its_gsd_command_and_marker ... ok
+test prompt::tests::fix_prompts_carry_the_chain_flag_token_only_where_it_reaches_execute_phase ... ok
+test prompt::tests::fix_prompts_select_the_right_command ... ok
+test prompt::tests::phase_placeholder_is_substituted ... ok
+test prompt::tests::plan_prompt_is_idempotent ... ok
+test prompt::tests::ship_prompt_defines_critical_gate_and_review_failed_contract ... ok
+test prompt::tests::ship_prompt_includes_multi_angle_conditional_review ... ok
+test prompt::tests::ship_prompt_sequences_code_review_before_ship ... ok
+test prompt::tests::ship_prompt_uses_project_review_angle_override ... ok
+test prompt::tests::the_code_prompt_carries_the_chain_flag_token ... ok
+test prompt::tests::the_plan_prompt_never_carries_the_chain_flag_token ... ok
+test prompt::tests::validate_stage_prompt_requires_verdict ... ok
+test recover::tests::clean_clears_stale_phase_state ... ok
+test recover::tests::clean_keeps_fresh_phase ... ok
+test recover::tests::clean_keeps_phase_with_live_agent ... ok
+test recover::tests::clean_phase_clears_only_the_named_phase ... ok
+test recover::tests::clean_phase_deletes_only_the_named_phase_cron_record ... ok
+test recover::tests::clean_removes_corrupt_legacy_state_json ... ok
+test recover::tests::clean_still_deletes_unconsumed_cron_instructions ... ok
+test recover::tests::format_age_buckets_by_magnitude ... ok
+test recover::tests::fresh_state_is_not_stale ... ok
+test recover::tests::inspect_all_enumerates_every_active_phase ... ok
+test recover::tests::inspect_all_missing_state_reports_nothing_to_recover ... ok
+test recover::tests::old_state_with_dead_agent_is_stale ... ok
+test recover::tests::old_state_with_live_agent_is_not_stale ... ok
+test recover::tests::old_state_with_no_agent_is_stale ... ok
+test recover::tests::state_age_secs_parses_epoch ... ok
+test recover::tests::unparseable_timestamp_is_never_stale ... ok
+test registry::tests::concurrent_registration_of_different_pairs_both_survive ... ok
+test registry::tests::concurrent_registration_of_same_pair_results_in_one_valid_entry ... ok
+test registry::tests::dereg_is_idempotent_when_entry_already_removed ... ok
+test registry::tests::dereg_is_scoped_to_one_root_and_leaves_sibling_root_intact ... ok
+test registry::tests::dereg_on_never_registered_pair_is_a_noop ... ok
+test registry::tests::dereg_removes_matching_pair_and_leaves_sibling_phase_intact ... ok
+test registry::tests::load_roots_in_on_absent_directory_returns_empty_without_panicking ... ok
+test registry::tests::load_roots_in_skips_one_corrupt_entry_and_keeps_its_sibling ... ok
+test registry::tests::path_digest_is_stable_and_distinguishes_different_paths ... ok
+test registry::tests::prune_missing_in_keeps_entry_for_existing_root ... ok
+test registry::tests::prune_missing_in_removes_and_counts_unparsable_entry ... ok
+test registry::tests::prune_missing_in_removes_entry_for_deleted_root_and_reports_count ... ok
+test registry::tests::register_in_creates_cache_and_roots_dirs_with_mode_0700 ... ok
+test registry::tests::register_in_same_pair_twice_results_in_exactly_one_entry ... ok
+test registry::tests::register_in_same_root_two_phases_survive_as_distinct_files ... ok
+test registry::tests::register_in_two_different_pairs_both_survive_and_load_sorted ... ok
+test ship::tests::consume_cron_instructions_deletes_matching_legacy_record ... ok
+test ship::tests::consume_cron_instructions_deletes_per_phase_record ... ok
+test ship::tests::consume_cron_instructions_preserves_foreign_legacy_record ... ok
+test ship::tests::consume_cron_instructions_preserves_unreadable_legacy_record ... ok
+test ship::tests::consume_cron_instructions_reports_both_deleted_records ... ok
+test ship::tests::cron_instructions_are_per_phase ... ok
+test ship::tests::cron_instructions_reject_unparseable_retry_time ... ok
+test ship::tests::cron_instructions_save_load_round_trips ... ok
+test ship::tests::cron_schedule_parses_all_iso8601_offset_forms ... ok
+test ship::tests::delete_cron_instructions_is_idempotent ... ok
+test ship::tests::hermes_schedule_formats_unix_seconds ... ok
+test ship::tests::hermes_schedule_normalizes_negative_offset ... ok
+test ship::tests::hermes_schedule_rounds_up_to_nearest_minute ... ok
+test ship::tests::legacy_cron_instructions_are_read_and_deleted ... ok
+test ship::tests::parse_offset_minutes_bounds_and_forms ... ok
+test ship::tests::prepend_changelog_creates_header_when_empty ... ok
+test ship::tests::prepend_changelog_inserts_after_header ... ok
+test ship::tests::prepend_changelog_uses_the_generated_body ... ok
+test ship::tests::shell_quote_leaves_common_safe_chars_unquoted ... ok
+test ship::tests::shell_quote_quotes_unsafe_input ... ok
+test ship::tests::single_agent_cron_instructions_resume_command_is_devflow_resume ... ok
+test ship_evidence::tests::collect_reports_stage_and_state_present_from_live_state ... ok
+test ship_evidence::tests::missing_devflow_dir_degrades_safely_without_panicking ... ok
+test ship_evidence::tests::shipped_event_is_true_only_for_the_phase_it_names ... ok
+test ship_evidence::tests::shipped_predicate_consults_no_git_field ... ok
+test ship_evidence::tests::stopped_at_phase_reports_not_shipped_but_corroborates_finished ... ok
+test ship_evidence::tests::torn_final_line_does_not_hide_an_earlier_shipped_event ... ok
+test stage::tests::agent_stages_are_define_plan_code ... ok
+test stage::tests::display_is_lowercase ... ok
+test stage::tests::from_str_round_trips_display_and_rejects_unknown ... ok
+test stage::tests::gate_stages_are_validate_and_ship ... ok
+test stage::tests::gsd_commands_match_stage ... ok
+test stage::tests::next_walks_linear_chain_then_terminates ... ok
+test stage::tests::serde_round_trips_each_stage ... ok
+test state::tests::agent_from_str_accepts_canonical_and_aliases ... ok
+test state::tests::agent_from_str_rejects_unknown ... ok
+test state::tests::agent_kind_antigravity_display_is_lowercase ... ok
+test state::tests::agent_kind_antigravity_driver_for_resolves ... ok
+test state::tests::agent_kind_antigravity_error_message_lists_it ... ok
+test state::tests::agent_kind_antigravity_from_str_is_case_insensitive ... ok
+test state::tests::agent_kind_antigravity_serde_round_trips_lowercase ... ok
+test state::tests::agent_kind_hermes_display_is_lowercase ... ok
+test state::tests::agent_kind_hermes_driver_for_resolves ... ok
+test state::tests::agent_kind_hermes_error_message_lists_it ... ok
+test state::tests::agent_kind_hermes_from_str_is_case_insensitive ... ok
+test state::tests::agent_kind_hermes_serde_round_trips_lowercase ... ok
+test state::tests::agent_name_and_display ... ok
+test state::tests::checkpoint_resumes_absent_from_json_defaults_to_zero ... ok
+test state::tests::checkpoint_resumes_round_trips_through_serde ... ok
+test state::tests::consecutive_failures_persists_across_advance_calls ... ok
+test state::tests::infra_failures_absent_from_json_defaults_to_zero ... ok
+test state::tests::infra_failures_round_trips_through_serde ... ok
+test state::tests::last_validate_failure_commit_count_absent_from_json_defaults_to_none ... ok
+test state::tests::last_validate_failure_commit_count_round_trips_through_serde ... ok
+test state::tests::last_verification_fingerprint_absent_from_json_defaults_to_none ... ok
+test state::tests::last_verification_fingerprint_round_trips_through_serde ... ok
+test state::tests::monitor_pid_absent_from_json_defaults_to_none ... ok
+test state::tests::monitor_pid_round_trips_through_serde ... ok
+test state::tests::new_state_starts_at_define ... ok
+test state::tests::phase_validate_failures_absent_from_json_defaults_to_zero ... ok
+test state::tests::phase_validate_failures_round_trips_through_serde ... ok
+test state::tests::preflight_retries_round_trips_through_serde ... ok
+test state::tests::session_id_absent_from_json_defaults_to_none ... ok
+test state::tests::session_id_round_trips_through_serde ... ok
+test state::tests::state_serde_round_trips ... ok
+test state::tests::stop_fields_absent_from_json_default ... ok
+test state::tests::stop_fields_round_trip_through_serde ... ok
+test state::tests::verification_baseline_captured_round_trips_through_serde ... ok
+test state::tests::verification_run_nonce_absent_from_json_defaults_to_none ... ok
+test state::tests::verification_run_nonce_round_trips_through_serde ... ok
+test state::tests::yes_ship_absent_from_json_defaults_to_false ... ok
+test state::tests::yes_ship_round_trips_through_serde ... ok
+test test_support::tests::wait_for_exec_visibility_detects_a_real_child_and_leaves_it_exec_visible ... ok
+test monitor::tests::wait_for_agent_pid_returns_none_for_garbage_content ... ok
+test test_support::tests::wait_for_exec_visibility_returns_false_promptly_for_a_dead_pid ... ok
+test monitor::tests::wait_for_agent_pid_returns_none_when_file_missing ... ok
+test verify::tests::approval_parser_accepts_only_nonempty_json_command_arrays ... ok
+test verify::tests::human_only_checkpoint_detects_the_gate_marker_on_a_task_tag ... ok
+test verify::tests::human_only_checkpoint_detects_the_human_action_type_on_a_task_tag ... ok
+test verify::tests::human_only_checkpoint_ignores_a_marker_mentioned_only_in_prose ... ok
+test verify::tests::human_only_checkpoint_ignores_an_ordinary_blocking_gate ... ok
+test verify::tests::human_only_checkpoint_is_false_for_a_phase_with_no_plans ... ok
+test verify::tests::human_only_checkpoint_still_matches_a_task_tag_inside_a_fenced_example ... ok
+test verify::tests::ignores_empty_external_verify_commands ... ok
+test verify::tests::ignores_external_verify_outside_frontmatter ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_detects_declared_gate ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_false_for_missing_phase_directory ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_false_for_plain_blocking_gate ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_false_when_no_gate_attribute ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_ignores_non_plan_files ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_reads_the_execution_root_in_worktree_mode ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_still_reads_the_project_root_without_a_worktree ... ok
+test verify::tests::phase_has_blocking_human_checkpoint_true_when_only_second_plan_carries_attribute ... ok
+test verify::tests::reads_external_verify_only_from_plan_frontmatter ... ok
+test verify::tests::runs_probe_from_project_root_and_reports_exit_status ... ok
+test monitor::tests::no_idle_timeout_is_recorded_when_the_child_is_merely_slow_to_exit ... ok
+test test_support::tests::wait_for_exec_visibility_rejects_a_self_match_on_unchanged_cmdline ... ok
+test version::tests::breaking_change_footer_yields_major_even_with_fix_subject ... ok
+test version::tests::changelog_sections_returns_no_sections_for_an_empty_range ... ok
+test version::tests::changelog_sections_groups_a_feat_commit_under_added ... ok
+test test_support::tests::wait_for_exec_visibility_times_out_bounded_when_it_never_matches ... ok
+test version::tests::changelog_sections_routes_breaking_changes_to_their_own_heading ... ok
+test version::tests::changelog_sections_sanitizes_subjects_before_grouping ... ok
+test version::tests::detect_prefers_cargo_then_pyproject_then_package_json ... ok
+test version::tests::changelog_sections_maps_every_recognized_type ... ok
+test version::tests::changelog_sections_treats_unparseable_messages_as_changed ... ok
+test version::tests::exclamation_before_colon_yields_major ... ok
+test version::tests::docs_only_commits_after_tag_yield_patch_floor ... ok
+test version::tests::exclamation_only_in_description_does_not_yield_major ... ok
+test version::tests::inline_table_version_does_not_shadow_workspace_package ... ok
+test version::tests::feat_commit_after_tag_yields_minor_bump ... ok
+test version::tests::fix_commit_after_tag_yields_patch_bump ... ok
+test version::tests::malformed_commit_message_yields_patch_not_crash_or_major ... ok
+test version::tests::read_major_from_package_json ... ok
+test version::tests::read_major_from_workspace_package ... ok
+test version::tests::no_semver_tag_at_all_yields_documented_empty_repo_contract ... ok
+test version::tests::read_version_errors_without_version_file ... ok
+test version::tests::read_version_extracts_clean_value_with_trailing_comment ... ok
+test version::tests::read_version_extracts_clean_value_without_trailing_comment ... ok
+test version::tests::read_version_round_trips_through_write_version_in_package_json ... ok
+test version::tests::read_version_round_trips_through_write_version_in_plain_cargo_toml ... ok
+test version::tests::read_version_round_trips_through_write_version_in_workspace_cargo_toml ... ok
+test version::tests::read_workspace_self_pins_extracts_clean_workspace_version_with_trailing_comment ... ok
+test version::tests::render_changelog_body_renders_heading_and_bullets ... ok
+test version::tests::sanitize_changelog_subject_neutralizes_controls_and_caps_length ... ok
+test version::tests::feature_merge_after_sync_merge_does_not_move_the_anchor ... ok
+test version::tests::read_version_does_not_recompute_from_git_tags ... ok
+test version::tests::range_with_no_bumping_commits_yields_patch_floor ... ok
+test version::tests::squash_sync_topology_classifies_only_post_merge_commits ... ok
+test version::tests::tag_reads_resolve_caller_root_under_a_hostile_git_dir ... ok
+test version::tests::write_version_errors_without_version_file ... ok
+test version::tests::write_version_leaves_third_party_version_only_dep_untouched ... ok
+test version::tests::write_version_no_ops_on_member_with_no_version_key ... ok
+test version::tests::write_version_no_ops_on_missing_workspace_dependencies_section ... ok
+test version::tests::write_version_preserves_comment_and_quote_in_workspace_dependency_pin ... ok
+test version::tests::write_version_preserves_trailing_comma_in_package_json ... ok
+test version::tests::write_version_preserves_trailing_comment_in_single_quoted_toml ... ok
+test version::tests::write_version_preserves_trailing_comment_in_toml ... ok
+test version::tests::write_version_replaces_in_cargo_toml ... ok
+test version::tests::write_version_replaces_in_workspace_cargo_toml ... ok
+test version::tests::write_version_rewrites_self_pin_regardless_of_key_order ... ok
+test version::tests::write_version_rewrites_workspace_dependency_self_pin ... ok
+test workflow::tests::clear_only_touches_its_own_phase ... ok
+test workflow::tests::clear_removes_state_and_is_idempotent ... ok
+test workflow::tests::ensure_devflow_dir_concurrent_calls_both_succeed ... ok
+test workflow::tests::ensure_devflow_dir_is_idempotent_and_preserves_existing_gitignore ... ok
+test workflow::tests::ensure_devflow_dir_on_nested_subpath_marks_the_devflow_ancestor ... ok
+test workflow::tests::ensure_devflow_dir_on_relative_devflow_leaf_path_marks_it ... ok
+test workflow::tests::ensure_devflow_dir_preserves_foreign_gitignore_content ... ok
+test workflow::tests::ensure_devflow_dir_without_a_devflow_ancestor_only_creates_dirs ... ok
+test workflow::tests::ensure_devflow_dir_writes_star_gitignore ... ok
+test workflow::tests::legacy_migration_never_overwrites_existing_per_phase_state ... ok
+test workflow::tests::legacy_state_json_migrates_on_list ... ok
+test workflow::tests::legacy_state_json_migrates_on_load ... ok
+test workflow::tests::list_states_empty_when_no_devflow_dir ... ok
+test workflow::tests::list_states_enumerates_sorted_by_phase ... ok
+test workflow::tests::list_states_skips_corrupt_files ... ok
+test workflow::tests::load_missing_state_errors ... ok
+test workflow::tests::migrate_legacy_state_warning_names_recovery_command ... ok
+test workflow::tests::paths_are_per_phase_under_devflow_dir ... ok
+test workflow::tests::save_state_writes_atomically_and_leaves_no_temp ... ok
+test workflow::tests::save_then_load_round_trips ... ok
+test workflow::tests::two_phases_states_coexist_without_clobbering ... ok
+test version::tests::unreachable_highest_tag_refuses_rather_than_falling_back ... ok
+test worktree::tests::add_creates_worktree_on_new_branch ... ok
+test version::tests::trunk_commit_between_tag_and_sync_merge_still_anchors_at_the_sync_merge ... ok
+test worktree::tests::add_existing_branch_without_creating ... ok
+test worktree::tests::add_errors_when_path_exists ... ok
+test version::tests::two_squash_sync_cycles_anchor_to_the_second_merge_only ... ok
+test worktree::tests::path_helpers_format_phase_numbers ... ok
+test worktree::tests::parse_porcelain_handles_detached_and_trailing_record ... ok
+test worktree::tests::list_includes_main_and_added_worktrees ... ok
+test worktree::tests::prune_succeeds_on_clean_repo ... ok
+test worktree::tests::list_resolves_caller_root_under_a_hostile_git_dir ... ok
+test worktree::tests::remove_deletes_the_worktree ... ok
+
+test result: ok. 735 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.22s
+
+     Running tests/agent_kind_antigravity.rs (target/debug/deps/agent_kind_antigravity-028798719d7c8023)
+
+running 5 tests
+test antigravity_driver_for_returns_the_driver ... ok
+test antigravity_parse_error_names_it ... ok
+test antigravity_parses_from_the_operator_string ... ok
+test antigravity_serde_round_trips_through_lowercase ... ok
+test antigravity_displays_lowercase_for_the_cli ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/decimal_phase_paths.rs (target/debug/deps/decimal_phase_paths-07ce56cd518e5abe)
+
+running 3 tests
+test a_decimal_phase_never_shares_a_path_with_its_integer_sibling ... ok
+test an_integer_phase_keeps_its_pre_widening_paths ... ok
+test a_decimal_phase_spells_its_paths_with_the_minor_number ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/devflow_dir_gitignore.rs (target/debug/deps/devflow_dir_gitignore-3b428b7683b918c4)
+
+running 2 tests
+test all_seven_devflow_constructors_produce_the_gitignore ... ok
+test git_add_all_no_longer_sweeps_devflow_into_a_commit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/monitor_e2e.rs (target/debug/deps/monitor_e2e-5c4c919f0ba67ac8)
+
+running 2 tests
+test advance_state_loading_fails_cleanly_for_missing_and_corrupt_state ... ok
+test monitor_owns_fake_agent_and_records_devflow_result ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Doc-tests devflow_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 2 targets failed:
+    `-p devflow --test build_provenance`
+    `-p devflow --test phase7_cli`
