@@ -203,9 +203,9 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
    git checkout workspace/<handle>
    ./scripts/sync-workspace.sh
    ```
-2. Fork your feature worktree directly from `workspace/<handle>` using the `workspace/<handle>/<feature>` naming convention so agent harnesses, `.planning/`, and skills remain available without triggering hook rejections:
+2. Fork your feature worktree directly from `workspace/<handle>` using `workspace/<feature>` (e.g. `workspace/my-feature` or `workspace/<handle>-my-feature`) so agent harnesses, `.planning/`, and skills remain available without triggering hook rejections (avoid nested slashes like `workspace/<handle>/<feature>` due to Git ref D/F conflicts with the base branch):
    ```bash
-   git worktree add .worktrees/my-feature -b workspace/<handle>/my-feature workspace/<handle>
+   git worktree add .worktrees/my-feature -b workspace/my-feature workspace/<handle>
    cd .worktrees/my-feature
    ```
 3. Implement changes, run agent planning and verification, and commit code and planning artifacts freely.
@@ -227,12 +227,12 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
    # In your base checkout:
    git checkout workspace/<handle>
    # 1. Archive planning notes and verification records from the feature
-   git merge workspace/<handle>/my-feature -m "chore: archive my-feature planning records"
+   git merge workspace/my-feature -m "chore: archive my-feature planning records"
    # 2. Sync latest code from develop
    ./scripts/sync-workspace.sh
    # 3. Clean up the feature worktree and branch
    git worktree remove .worktrees/my-feature
-   git branch -d workspace/<handle>/my-feature
+   git branch -d workspace/my-feature
    git push origin workspace/<handle>
    ```
 

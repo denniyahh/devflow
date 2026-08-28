@@ -50,20 +50,21 @@ gitGraph
    merge "feature/phase-45" id: "PR #158 (merged to develop)"
    
    checkout "workspace/denniyahh"
-   merge "workspace/denniyahh/phase-45" id: "archive planning records"
+   merge "workspace/phase-45" id: "archive planning records"
    merge develop id: "sync upstream code"
 ```
 
 ### Tier 1: Personal Development Workspace (`workspace/*` and `personal/*`)
 * **Base Workspace Branch (`workspace/<handle>`):** The primary long-lived personal branch. Tracks personal agent harnesses, `.planning/`, and local scripts. Kept in sync with `origin/develop` via true Git merge commits.
-* **Feature Development Branch (`workspace/<handle>/<feature>`):** Created as an isolated Git worktree forked from `workspace/<handle>`.
+* **Feature Development Branch (`workspace/<feature>` or `workspace/<handle>-<feature>`):** Created as an isolated Git worktree forked from `workspace/<handle>`.
+  * **Naming Rule:** Do NOT use nested subdirectories matching the base branch (e.g. `workspace/<handle>/<feature>`) as Git refs suffer from directory/file (D/F) conflicts when `workspace/<handle>` exists. Use `workspace/<feature>` (e.g., `workspace/phase-45`) or `workspace/<handle>-<feature>`.
   * **Benefit:** Because the branch name begins with `workspace/` or `personal/`, `scripts/hooks/pre-commit` and `scripts/hooks/pre-push` allow all planning and agent files.
   * **Benefit:** Agents have immediate access to `.planning/config.json`, skills, and roadmap context.
   * **Benefit:** The branch can be pushed to GitHub to back up WIP state without triggering pre-push security rejections.
 
 ### Tier 2: Pristine Upstream Delivery (`feature/*` and `origin/develop`)
 * **Clean PR Branch (`feature/<feature>`):** A transient branch created directly off `origin/develop`.
-* **Automated Extraction:** A tool (`scripts/cut-pr-branch.sh`) inspects the commits between `origin/develop` and `workspace/<handle>/<feature>`, cherry-picks code commits, and strips out all personal directories (`.planning/`, `.agents/`, `.claude/`, etc.).
+* **Automated Extraction:** A tool (`scripts/cut-pr-branch.sh`) inspects the commits between `origin/develop` and `workspace/<feature>`, cherry-picks code commits, and strips out all personal directories (`.planning/`, `.agents/`, `.claude/`, etc.).
 * **Validation & Push:** The clean branch runs through `scripts/check-in-container.sh` and pushes to GitHub. The pre-push hook passes cleanly because the branch carries zero forbidden files.
 
 ---
@@ -78,7 +79,7 @@ gitGraph
    ```
 2. Create an isolated worktree for the feature:
    ```bash
-   git worktree add .worktrees/<feature> -b workspace/<handle>/<feature> workspace/<handle>
+   git worktree add .worktrees/<feature> -b workspace/<feature> workspace/<handle>
    cd .worktrees/<feature>
    ```
 
