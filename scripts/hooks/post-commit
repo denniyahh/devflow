@@ -53,15 +53,14 @@ if [ -n "$summaries" ]; then
   printf 'Derived counters:  gsd_run query state.update-progress\n' >&2
   printf 'Authored prose (status:/stopped_at:) has to be written by hand.\n\n' >&2
 
-  mkdir -p "$root/.devflow" 2>/dev/null
-  [ -f "$root/.devflow/.gitignore" ] || printf '*\n' > "$root/.devflow/.gitignore" 2>/dev/null
+  mkdir -p "$root/.planning/user/errors" 2>/dev/null
   {
     printf '{\n  "stale_since_commit": "%s",\n' "$(git rev-parse --short HEAD 2>/dev/null)"
     printf '  "summaries_landed": ['
     printf '"%s",' $summaries | sed 's/,$//'
     printf '],\n  "state_status_at_detection": %s\n}\n' \
       "$(printf '%s' "${status_line#status: }" | sed 's/^"//; s/"$//; s/.*/"&"/')"
-  } > "$root/.devflow/state-stale.json" 2>/dev/null
+  } > "$root/.planning/user/errors/state-stale.json" 2>/dev/null
 fi
 
 # Warn when a "how this repo is set up" file changes without the portability

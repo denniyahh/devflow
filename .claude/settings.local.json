@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Linear__get_issue",
+      "mcp__claude_ai_Linear__list_milestones",
+      "Bash(rg -v '^\\\\S+:[0-9]+:\\\\s*$')",
+      "mcp__claude_ai_Linear__save_milestone",
+      "mcp__claude_ai_Linear__save_issue",
+      "mcp__claude_ai_Linear__list_issues",
+      "mcp__claude_ai_Linear__save_comment",
+      "Bash(cd *)",
+      "mcp__claude_ai_Linear__create_attachment",
+      "WebSearch",
+      "Bash(sort -t. -k2 -n)",
+      "Bash(mkdir -p .planning/phases/999.25-release-cut-executor)",
+      "Bash(mkdir -p .planning/phases/999.26-parallel-object-store-race)",
+      "Bash(sed 's/\\\\$$/<EOL>/')",
+      "mcp__claude_ai_Linear__list_projects",
+      "Read(//var/home/denniyahh/.claude/skills/gsd-review/**)",
+      "Read(//var/home/denniyahh/.claude/**)",
+      "Bash(hermes --help)",
+      "Bash(hermes -h)",
+      "Bash(hermes chat *)",
+      "Skill(gsd-review)",
+      "Bash(chmod +x /tmp/repro_debug.sh)",
+      "Bash(/tmp/repro_debug.sh /var/home/denniyahh/Github/devflow/.claude/worktrees/agent-afc0f1e1aaeec3419/target/debug/devflow)",
+      "Bash(chmod +x /tmp/repro_debug2.sh)",
+      "Bash(/tmp/repro_debug2.sh /var/home/denniyahh/Github/devflow/.claude/worktrees/agent-afc0f1e1aaeec3419/target/debug/devflow)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "gsd-workflow",
+    "gsd-browser"
+  ],
+  "worktree": {
+    "baseRef": "head"
+  }
+}

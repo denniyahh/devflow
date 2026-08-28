@@ -325,8 +325,8 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 | Phase | Name | Version |
 |---|---|---|
 | 1–5 | Core workflow, versioning, state machine | 0.1.0–0.6.0 |
-| 6 | Agent Completion Protocol | 1.0.0 |
-| 7 | Worktrees & PR Integration | 1.0.0 |
+| 6 | Agent Completion Protocol | — |
+| 7 | Worktrees & PR Integration | — |
 | 8 | Docs & Onboarding | 1.0.1 |
 | 9 | Open-Source Polish | 1.2.0 |
 | 10 | Logging + Planning Step | — |

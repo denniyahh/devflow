@@ -577,8 +577,8 @@ item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 | 3 | Verify & Docs Execution | — | 2026-06-17 |
 | 4 | Hermes Skill | — | 2026-06-17 |
 | 5 | Agent Trait Refactor | — | 2026-06-17 |
-| 6 | Agent Completion + Ship Readiness | v0.5.1 | 2026-06-17 |
-| 7 | Git Worktrees + PR Integration | v1.0.0 | 2026-06-18 |
+| 6 | Agent Completion + Ship Readiness | — | 2026-06-17 |
+| 7 | Git Worktrees + PR Integration | — | 2026-06-18 |
 | 8 | Docs + OSS Onboarding | v1.0.1 | 2026-06-18 |
 | 9 | OSS Polish | v1.2.0 | 2026-06-18 |
 | 10 | Logging + Planning Step | — | 2026-06-19 |
