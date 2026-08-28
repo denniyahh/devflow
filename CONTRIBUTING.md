@@ -198,20 +198,41 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
 4. Submit a PR against `develop`.
 
 #### Workflow B: AI-Driven & Agent Workspace Contributions
-1. Keep your primary orchestrator/agent checkout on your personal workspace branch (`workspace/<handle>`).
-2. When creating code to submit upstream, develop inside a clean worktree branched from `develop`:
-   ```bash
-   git worktree add .worktrees/my-feature -b feature/my-feature develop
-   # or with tracked alias: git feature-start my-feature
-   ```
-3. Commit only source, test, and documentation changes in the feature worktree.
-4. Submit the PR from `feature/my-feature` into `develop`.
-5. After your PR is merged, sync upstream changes into your workspace branch without deleting your tracked personal artifacts:
+1. Keep your primary orchestrator/agent checkout on your personal workspace branch (`workspace/<handle>`). Ensure it is up to date:
    ```bash
    git checkout workspace/<handle>
-   git workspace-sync
-   # or run: ./scripts/sync-workspace.sh
-   git commit -m "chore: sync upstream develop into workspace"
+   ./scripts/sync-workspace.sh
+   ```
+2. Fork your feature worktree directly from `workspace/<handle>` using the `workspace/<handle>/<feature>` naming convention so agent harnesses, `.planning/`, and skills remain available without triggering hook rejections:
+   ```bash
+   git worktree add .worktrees/my-feature -b workspace/<handle>/my-feature workspace/<handle>
+   cd .worktrees/my-feature
+   ```
+3. Implement changes, run agent planning and verification, and commit code and planning artifacts freely.
+4. When ready to submit upstream, extract a clean, review-ready PR branch:
+   ```bash
+   ./scripts/cut-pr-branch.sh
+   # Cuts a pristine feature/my-feature branch off origin/develop,
+   # cherry-picks code commits, and strips personal/planning artifacts.
+   ```
+5. Test, push, and submit the clean PR:
+   ```bash
+   git checkout feature/my-feature
+   ./scripts/check-in-container.sh
+   git push -u origin feature/my-feature
+   gh pr create --base develop --head feature/my-feature
+   ```
+6. After your PR is merged upstream:
+   ```bash
+   # In your base checkout:
+   git checkout workspace/<handle>
+   # 1. Archive planning notes and verification records from the feature
+   git merge workspace/<handle>/my-feature -m "chore: archive my-feature planning records"
+   # 2. Sync latest code from develop
+   ./scripts/sync-workspace.sh
+   # 3. Clean up the feature worktree and branch
+   git worktree remove .worktrees/my-feature
+   git branch -d workspace/<handle>/my-feature
    git push origin workspace/<handle>
    ```
 
