@@ -14,6 +14,18 @@
 # --cpuset-cpus fails outright.
 set -euo pipefail
 
+# Flatpak sandboxes (e.g. GitHub Desktop) bundle git under resources or rely on host tools
+if ! command -v git >/dev/null 2>&1; then
+    for git_candidate in \
+        /app/github-desktop/resources/app/git/bin/git \
+        /app/lib/desktop/resources/app/git/bin/git; do
+        if [ -x "$git_candidate" ]; then
+            export PATH="$(dirname "$git_candidate"):$PATH"
+            break
+        fi
+    done
+fi
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
@@ -30,7 +42,15 @@ if [ -z "$IMAGE" ]; then
     exit 1
 fi
 
-if ! docker info >/dev/null 2>&1; then
+# Support running inside Flatpak sandboxes (e.g. GitHub Desktop) by routing to host docker
+DOCKER=(docker)
+if [ -n "${FLATPAK_ID:-}" ] || [ -f /.flatpak-info ]; then
+    if command -v flatpak-spawn >/dev/null 2>&1; then
+        DOCKER=(flatpak-spawn --host docker)
+    fi
+fi
+
+if ! "${DOCKER[@]}" info >/dev/null 2>&1; then
     cat >&2 <<'EOF'
 error: Docker daemon is not reachable.
 
@@ -59,8 +79,8 @@ fi
 CACHE_SUFFIX="$(printf '%s' "$REPO_ROOT" | sha256sum | cut -c1-12)"
 TARGET_VOLUME="devflow-ci-target-${CACHE_SUFFIX}"
 REGISTRY_VOLUME="devflow-ci-registry-${CACHE_SUFFIX}"
-docker volume create "$TARGET_VOLUME" >/dev/null
-docker volume create "$REGISTRY_VOLUME" >/dev/null
+"${DOCKER[@]}" volume create "$TARGET_VOLUME" >/dev/null
+"${DOCKER[@]}" volume create "$REGISTRY_VOLUME" >/dev/null
 
 # CPU pinning: match CI's core count so test-thread interleaving is
 # comparable. GitHub's standard hosted runners are 2-core; a 4-core host
@@ -110,7 +130,7 @@ echo "==> image:  $IMAGE"
 echo "==> target: $TARGET"
 echo "==> cpus:   $CPUS"
 
-exec docker run --rm -t \
+exec "${DOCKER[@]}" run --rm -t \
     "${GITDIR_MOUNT[@]}" \
     -v "$REPO_ROOT":/workspace \
     -v "$TARGET_VOLUME":/ctarget \
