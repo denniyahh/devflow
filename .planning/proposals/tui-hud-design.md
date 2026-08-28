@@ -3,6 +3,7 @@
 **Status:** Proposed  
 **Author:** Pair Programming Session  
 **Target:** DevFlow CLI (`devflow hud` / `devflow tui`)  
+**GitHub:** [#160](https://github.com/denniyahh/devflow/issues/160) (migrated from Linear DEN-115)
 
 ---
 

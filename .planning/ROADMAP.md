@@ -605,7 +605,7 @@ runtime) exists. **Size:** M.
 
 ### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (BACKLOG)
 
-**Linear:** [DEN-113](https://linear.app/denniskim/issue/DEN-113/99992-the-99947-regression-test-loses-its-own-fixture-shape-before-it)
+**GitHub:** [#161](https://github.com/denniyahh/devflow/issues/161) (migrated from Linear DEN-113)
 **Found:** 2026-08-07 by `/gsd-validate-phase 35`. Surfaced as a one-off flake during the phase
 audit; the weak-coverage half was found while diagnosing the flake, and is the more serious of the two.
 
@@ -659,7 +659,7 @@ does not depend on reproducing the flake**; it was verified directly and holds o
 
 ### Phase 999.91: Add a Doc Gate to `check.sh` That Denies Only the Rustdoc Lints Which Catch Real Errors (BACKLOG)
 
-**Linear:** [DEN-112](https://linear.app/denniskim/issue/DEN-112/99991-add-a-doc-gate-to-checksh-that-denies-only-the-rustdoc-lints)
+**GitHub:** [#162](https://github.com/denniyahh/devflow/issues/162) (migrated from Linear DEN-112)
 **Found:** 2026-08-07, Phase 35. The five concrete falsehoods this surfaced were fixed in-phase
 (commit `8350340`); this entry is the **gate** that would have caught them when they were written.
 
@@ -705,7 +705,7 @@ The gate above is deliberately neutral on it.
 
 ### Phase 999.90: `handle_validate_outcome` Counts Commits Against `GitFlowConfig::default()`, Not the Project's Configured Git-Flow (BACKLOG)
 
-**Linear:** [DEN-111](https://linear.app/denniskim/issue/DEN-111/99990-handle-validate-outcome-counts-commits-against)
+**GitHub:** [#163](https://github.com/denniyahh/devflow/issues/163) (migrated from Linear DEN-111)
 **Found:** 2026-08-07, Phase 35 code review (35-REVIEW.md, IN-02). **Pre-existing** — the line was
 moved by 35-04, not introduced by it. Filed rather than fixed in-phase per the 34/D-04 precedent
 (a defect a fix *reveals* is filed, not fixed in the same phase).
@@ -736,7 +736,7 @@ Add a test with a non-default `develop` asserting the count is taken against the
 
 ### Phase 999.89: The Verification-Freshness Rule Infers Provenance From Bytes, and Is Only Safe Because Two Branch-Naming Conventions Happen to Agree (BACKLOG)
 
-**Linear:** [DEN-110](https://linear.app/denniskim/issue/DEN-110/99989-verification-freshness-infers-provenance-from-bytes-and-is-only)
+**GitHub:** [#164](https://github.com/denniyahh/devflow/issues/164) (migrated from Linear DEN-110)
 **Found:** 2026-08-07, Phase 35 execution, reviewing what 35-05 shipped.
 
 **Priority:** Medium | **Size:** M — a run identifier in the artifact, plus one convention-pinning
@@ -1178,7 +1178,7 @@ for the other.
 
 ### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
 
-**Linear:** [DEN-103](https://linear.app/denniskim/issue/DEN-103/99981-phase-33-advisory-cleanup-the-loop-back-prompt-calls-a-normal)
+**GitHub:** [#167](https://github.com/denniyahh/devflow/issues/167) (migrated from Linear DEN-103)
 **Found:** 2026-08-05, Phase 33 code review (IN-05, IN-01, IN-03, IN-04), each verified in source
 before filing. Grouped as one entry per the 21-REVIEW advisory-cleanup precedent.
 
@@ -1203,7 +1203,7 @@ landmine for any future Validate→Ship pairing.
 
 ### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (BACKLOG)
 
-**Linear:** [DEN-102](https://linear.app/denniskim/issue/DEN-102/99980-three-test-sites-are-protected-from-spawning-a-real-agent-only)
+**GitHub:** [#168](https://github.com/denniyahh/devflow/issues/168) (migrated from Linear DEN-102)
 **Found:** 2026-08-05, Phase 33 code review (WR-06); **corrected the same day** by the Phase 33
 security audit, which mapped it to the registered trust boundary "cargo test process → spawned
 agent CLI" (T-33-09 / T-33-17).
@@ -1936,7 +1936,7 @@ Plans:
 ### Phase 999.5: ChangelogAppend Placeholder Content (PROMOTED — Phase 26)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
-**Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. Linear: DEN-30.
+**Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. GitHub: [#198](https://github.com/denniyahh/devflow/issues/198) (migrated from Linear DEN-30).
 **Requirements:** TBD — see `superseded/26-release-cut-automation/999.5-BACKLOG-DOSSIER.md`
 **Promoted:** Phase 26, 2026-07-29 — added using capacity freed by dropping 999.54/999.50/999.4; content source resolved by reusing Phase 25's conventional-commit classifier (see `26-CONTEXT.md` D-12).
 **Plans:** 0 plans
@@ -1948,7 +1948,7 @@ Plans:
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
 **Goal:** 17-REVIEW.md WR-04 — coverage debt on a *deliberate* trade, not a defect. 17-03 removed `evaluate_layer0`'s `Stage::Code` guard by design (D-05 gap 1), so a forgotten `DEVFLOW_TRUST_EXTERNAL_VERIFY` now vetoes at all five stages instead of one, a 5× blast-radius increase. Two verified gaps at HEAD: (a) of the three veto arms, only "approval mismatch" is tested (`agent_result.rs:1644`) — the "not approved" arm a forgotten env var actually hits has no test at any stage; (b) `docs/guides/configuration.md` states the requirement for "the parent DevFlow process" but never that the **detached monitor subprocess must inherit it**, which is where the failure manifests. Deliberately not folded into Phase 18's 18-05 (same file) — that plan had already passed the checker clean, and adding coverage debt to a verified bug-fix plan is scope creep.
-**Priority:** Medium | **Size:** S — reviewed 2026-07-21: confirmed still only "approval mismatch" tested at `agent_result.rs`. Test/doc debt on an already-shipped, intentional decision, not a live bug. Linear: DEN-37.
+**Priority:** Medium | **Size:** S — reviewed 2026-07-21: confirmed still only "approval mismatch" tested at `agent_result.rs`. Test/doc debt on an already-shipped, intentional decision, not a live bug. GitHub: [#196](https://github.com/denniyahh/devflow/issues/196) (migrated from Linear DEN-37).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -1959,7 +1959,7 @@ Plans:
 ### Phase 999.9: Dependency Update Review (BACKLOG)
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
-**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. Linear: DEN-34.
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. GitHub: [#197](https://github.com/denniyahh/devflow/issues/197) (migrated from Linear DEN-34).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -1980,7 +1980,7 @@ Plans:
 ### Phase 999.15: Hermetic Tests for Shell Entry Points (BACKLOG)
 
 **Goal:** `scripts/install.sh`, `scripts/sync-main-to-develop.sh`, and `scripts/deploy.sh` have user-facing, side-effecting behavior (network downloads, git history mutation, docs deployment) with no direct behavioral tests — only source-text inspection. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
-**Priority:** High | **Size:** L — re-scoped 2026-07-21 (Claude review): the source document treated all three scripts as equally P0; `deploy.sh` only touches `gh-pages` (docs), meaningfully lower blast radius than `install.sh` (every new user's first run) or `sync-main-to-develop.sh` (mutates real branch history). Demoted `deploy.sh` within this item rather than splitting it out. Linear: DEN-40.
+**Priority:** High | **Size:** L — re-scoped 2026-07-21 (Claude review): the source document treated all three scripts as equally P0; `deploy.sh` only touches `gh-pages` (docs), meaningfully lower blast radius than `install.sh` (every new user's first run) or `sync-main-to-develop.sh` (mutates real branch history). Demoted `deploy.sh` within this item rather than splitting it out. GitHub: [#195](https://github.com/denniyahh/devflow/issues/195) (migrated from Linear DEN-40).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -1991,7 +1991,7 @@ Plans:
 ### Phase 999.17: Mutation Testing (`cargo-mutants`) (BACKLOG)
 
 **Goal:** Introduce `cargo-mutants` as a scheduled/manual gate (not a blocking PR check — too slow at this codebase's size), scoped initially to `verify.rs`, `outcome_policy::decide_action`, `agent_result.rs`'s Layer 0–3 evaluators, and git safety logic (`commit_path`/tag functions). Track surviving mutants rather than treating line coverage as the primary quality score. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
-**Priority:** Medium | **Size:** M — initial scope re-prioritized 2026-07-21 (Claude review): `verify.rs` first, since this session's own QA review found a real fail-open bug there, making it the highest-confidence-return target in the codebase. `main.rs`'s display/dispatch code deliberately excluded from initial scope. Linear: DEN-42.
+**Priority:** Medium | **Size:** M — initial scope re-prioritized 2026-07-21 (Claude review): `verify.rs` first, since this session's own QA review found a real fail-open bug there, making it the highest-confidence-return target in the codebase. `main.rs`'s display/dispatch code deliberately excluded from initial scope. GitHub: [#194](https://github.com/denniyahh/devflow/issues/194) (migrated from Linear DEN-42).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2002,7 +2002,7 @@ Plans:
 ### Phase 999.18: Property and Fuzz Testing for Protocol Parsers (BACKLOG)
 
 **Goal:** DevFlow parses agent markers, JSON event streams, rate-limit responses, YAML frontmatter, shell commands, and git output with extensive example-based tests but no fuzzing/property testing for malformed or adversarial input. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
-**Priority:** Medium | **Size:** M — re-scoped 2026-07-21 (Claude review): the source document listed six targets needing both `proptest` and `cargo-fuzz` undifferentiated. Most (agent markers, JSON envelopes, frontmatter, event logs, git porcelain) are format-aware business logic better suited to `proptest`; only `shell_quote` is a genuine byte-level adversarial `cargo-fuzz` target (command-injection-adjacent). Fuzzing the full original list would be more investment than the risk justifies. Linear: DEN-43.
+**Priority:** Medium | **Size:** M — re-scoped 2026-07-21 (Claude review): the source document listed six targets needing both `proptest` and `cargo-fuzz` undifferentiated. Most (agent markers, JSON envelopes, frontmatter, event logs, git porcelain) are format-aware business logic better suited to `proptest`; only `shell_quote` is a genuine byte-level adversarial `cargo-fuzz` target (command-injection-adjacent). Fuzzing the full original list would be more investment than the risk justifies. GitHub: [#193](https://github.com/denniyahh/devflow/issues/193) (migrated from Linear DEN-43).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2013,7 +2013,7 @@ Plans:
 ### Phase 999.19: Fast and Slow Validation Lanes (BACKLOG)
 
 **Goal:** Keep deterministic unit/integration tests in the fast PR lane; move nested-build provenance tests (`build_provenance.rs`, which dominates suite runtime today), mutation testing (999.17), and fuzz smoke runs (999.18) into explicit slow/scheduled lanes that stay visible and required at an appropriate release boundary. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
-**Priority:** Medium | **Size:** S — mostly mechanical CI-workflow restructuring once 999.17/999.18 exist to route into a slow lane; not much to put there yet beyond `build_provenance.rs`. Linear: DEN-44.
+**Priority:** Medium | **Size:** S — mostly mechanical CI-workflow restructuring once 999.17/999.18 exist to route into a slow lane; not much to put there yet beyond `build_provenance.rs`. GitHub: [#192](https://github.com/denniyahh/devflow/issues/192) (migrated from Linear DEN-44).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2024,7 +2024,7 @@ Plans:
 ### Phase 999.20: Differential Coverage Enforcement (BACKLOG)
 
 **Goal:** Enforce high coverage on changed lines rather than optimizing for a global percentage (currently 92.81%), requiring a written justification when new branches are intentionally left uncovered. Coverage should support review, not replace behavioral inspection or mutation-testing results. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
-**Priority:** Medium | **Size:** M — real risk if implemented naively: blocking merges on any uncovered line (including legitimately-hard-to-test OS-failure paths) creates friction without catching defects. Keep the written-justification escape hatch. Linear: DEN-45.
+**Priority:** Medium | **Size:** M — real risk if implemented naively: blocking merges on any uncovered line (including legitimately-hard-to-test OS-failure paths) creates friction without catching defects. Keep the written-justification escape hatch. GitHub: [#191](https://github.com/denniyahh/devflow/issues/191) (migrated from Linear DEN-45).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2035,7 +2035,7 @@ Plans:
 ### Phase 999.21: AI Change Acceptance Contract — Review Wiring (BACKLOG)
 
 **Goal:** Make the `.claude/skills/ai-change-acceptance/` contract actually govern AI change review rather than only existing in the repo. Phase 19's 19-05 dogfood proved the contract's *wording* discriminates correctly (every non-compliant diff flagged, compliant control untouched) but found its *wiring* incomplete: a context-isolated reviewer independently reached the same verdicts yet never cited the project contract as its authority, and graded the findings `warning`/`info` rather than acceptance-blocking. Today the contract binds only when the dispatcher already knows to load it.
-**Priority:** High | **Size:** M — the contract exists precisely because a green suite isn't evidence; if it only applies when explicitly invoked, it doesn't close the unattended-AI-change case it was written for. Note part of the wiring surface lives in the GSD code-review workflow *outside this repo*, so an in-repo fix may not fully close it. Linear: DEN-46.
+**Priority:** High | **Size:** M — the contract exists precisely because a green suite isn't evidence; if it only applies when explicitly invoked, it doesn't close the unattended-AI-change case it was written for. Note part of the wiring surface lives in the GSD code-review workflow *outside this repo*, so an in-repo fix may not fully close it. GitHub: [#190](https://github.com/denniyahh/devflow/issues/190) (migrated from Linear DEN-46).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2046,7 +2046,7 @@ Plans:
 ### Phase 999.22: Refactor Equivalence Guard in CI (BACKLOG)
 
 **Goal:** Give pure-move refactors an automated equivalence check on CI. Phase 19 proved its 8,487-line `main.rs` split behavior-preserving via symbol reconciliation, test name-set identity against a committed baseline, and per-target pass counts — but all three ran locally by hand. CI runs only `cargo test --workspace`, clippy, and fmt, so Phase 19 shipped with an explicit user-accepted verification override recording this gap.
-**Priority:** Medium | **Size:** M — a green suite doesn't prove a refactor preserved behavior: a move that silently drops a test still shows green, just with a quietly smaller count. Scope to refactor-shaped changes only; a name-set check on ordinary feature work would fail constantly and get disabled. Phase 19 also found the plan's literal `rg '::tests::'` extraction was itself buggy, so any committed script needs its own test. Relates to 999.19, 999.20. Linear: DEN-47.
+**Priority:** Medium | **Size:** M — a green suite doesn't prove a refactor preserved behavior: a move that silently drops a test still shows green, just with a quietly smaller count. Scope to refactor-shaped changes only; a name-set check on ordinary feature work would fail constantly and get disabled. Phase 19 also found the plan's literal `rg '::tests::'` extraction was itself buggy, so any committed script needs its own test. Relates to 999.19, 999.20. GitHub: [#189](https://github.com/denniyahh/devflow/issues/189) (migrated from Linear DEN-47).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2056,7 +2056,7 @@ Plans:
 
 ### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (CLOSED — WON'T DO, superseded by Phase 30)
 
-**CLOSED 2026-07-31 as won't-do**, after two failed attempts (Phases 26 and 29, ~120 commits, neither shipped). DevFlow is withdrawing from release automation entirely — see **Phase 30**. Code from both attempts is archived on `origin` at `archive/phase-26-release-executor` and `archive/phase-29-release-executor`. Everything below is retained as the record of why, and as the brief any future attempt would have to answer. Linear: DEN-50 — close as won't-do.
+**CLOSED 2026-07-31 as won't-do**, after two failed attempts (Phases 26 and 29, ~120 commits, neither shipped). DevFlow is withdrawing from release automation entirely — see **Phase 30**. Code from both attempts is archived on `origin` at `archive/phase-26-release-executor` and `archive/phase-29-release-executor`. Everything below is retained as the record of why, and as the brief any future attempt would have to answer. GitHub: [#188](https://github.com/denniyahh/devflow/issues/188) (migrated from Linear DEN-50) — close as won't-do.
 
 **RE-OPENED 2026-07-31, after the SECOND failed attempt.** Phase 29 built all 7 plans, merged
 6 waves, and reached 921 passing tests with clean clippy and fmt. An independent cross-AI code
@@ -2158,7 +2158,7 @@ consequence.
   produced; `29-VALIDATION.md` is a stale wave-1 artifact.
 
 **Priority:** High | **Size:** M for the reduced scope above (was L). Two failed attempts at the
-wider scope. Linear: DEN-50.
+wider scope. GitHub: [#188](https://github.com/denniyahh/devflow/issues/188) (migrated from Linear DEN-50).
 
 ---
 
@@ -2204,14 +2204,14 @@ Phase 26's direct-push design was fighting a rule it could simply have followed.
 
 **Design lesson worth keeping.** This phase automated three irreversible operations (`push`, `tag`, `publish`) whose failure modes are invisible to unit tests by construction — every defect was found by reading code, never by a red test. A future attempt should treat adversarial review as the primary gate and the suite as necessary-but-far-from-sufficient, and should consider whether each irreversible step can be made independently re-runnable before composing them into a sequence.
 
-**Priority:** High | **Size:** L — unchanged, but now with a known-defective starting point and a hard prerequisite (999.39). Linear: DEN-50.
+**Priority:** High | **Size:** L — unchanged, but now with a known-defective starting point and a hard prerequisite (999.39). GitHub: [#188](https://github.com/denniyahh/devflow/issues/188) (migrated from Linear DEN-50).
 
 ---
 
 *Original entry follows, retained for provenance:*
 
 **Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
-**Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
+**Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). GitHub: [#188](https://github.com/denniyahh/devflow/issues/188) (migrated from Linear DEN-50) (blocked by DEN-49, DEN-38).
 **Requirements:** TBD — see `superseded/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md`
 **Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.54, 999.50, 999.52 (same release-mechanics area).
 **Re-opened:** 2026-07-30 — Phase 26 delivered it PARTIAL and not shippable; see the RE-OPENED block above for the five open Criticals and the 999.39 prerequisite.
@@ -2224,7 +2224,7 @@ Plans:
 ### Phase 999.26: `devflow parallel` Git Object-Store Race (BACKLOG)
 
 **Goal:** Confirm-or-refute whether `devflow parallel`'s concurrent per-worktree commits can hit the same git object-store corruption seen in Phase 20's 20b instance 2 (`invalid object` mid-commit-loop, a fsync-ordering flake fixed fixture-side per D-05), and fix it at the product level if the race is real. 20-RESEARCH.md assumption A1 flagged the analog as plausible but unconfirmed — `devflow parallel` has no DevFlow-level lock serializing its concurrent commits.
-**Priority:** Medium | **Size:** M — low likelihood but high severity: if the product shares the hole, the next occurrence is a corrupted user repo with an opaque `invalid object` error, not a re-runnable red CI job. Dominated by a deliberate reproduction attempt (a code read can't settle it); the fix if needed is bounded. Relates to 999.4 / DEN-29 (concurrent-ship contention — same concurrency family). Source: Phase 20 D-08 / 20-RESEARCH A1 (2026-07-22). Linear: DEN-51.
+**Priority:** Medium | **Size:** M — low likelihood but high severity: if the product shares the hole, the next occurrence is a corrupted user repo with an opaque `invalid object` error, not a re-runnable red CI job. Dominated by a deliberate reproduction attempt (a code read can't settle it); the fix if needed is bounded. Relates to 999.4 / DEN-29 (concurrent-ship contention — same concurrency family). Source: Phase 20 D-08 / 20-RESEARCH A1 (2026-07-22). GitHub: [#187](https://github.com/denniyahh/devflow/issues/187) (migrated from Linear DEN-51).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2247,7 +2247,7 @@ Plans:
 ### Phase 999.28: Explicit `--base` Branch Override for `devflow start` (BACKLOG)
 
 **Goal:** Add an explicit `--base <branch>` flag to `devflow start` (default `develop`) so an operator can cut `feature/phase-NN` onto a base other than `develop` — chiefly an unmerged predecessor phase branch, to honor a `depends_on` chain and stack dependent phases. Keep the default `develop`; do **not** implicitly base on the operator's current branch (base must be explicit, never inferred from shell state).
-**Priority:** Medium | **Size:** M — base is hardcoded to `develop` (`crates/devflow-core/src/git.rs:54`) and the hardcode is load-bearing for `ship` (Merge→develop→VersionBump) and `parallel` (develop-rooted shared base), so `--base` must thread through launch, and the ship/merge-target semantics for a non-`develop` base need a design pass. The gap: the ROADMAP encodes 22→21→20 but no phase can build on an unmerged predecessor. Source: Phase 21 dogfood-launch design discussion (2026-07-23). **Reassigned to Phase 22** (concurrency/stacking value). Linear: DEN-53.
+**Priority:** Medium | **Size:** M — base is hardcoded to `develop` (`crates/devflow-core/src/git.rs:54`) and the hardcode is load-bearing for `ship` (Merge→develop→VersionBump) and `parallel` (develop-rooted shared base), so `--base` must thread through launch, and the ship/merge-target semantics for a non-`develop` base need a design pass. The gap: the ROADMAP encodes 22→21→20 but no phase can build on an unmerged predecessor. Source: Phase 21 dogfood-launch design discussion (2026-07-23). **Reassigned to Phase 22** (concurrency/stacking value). GitHub: [#186](https://github.com/denniyahh/devflow/issues/186) (migrated from Linear DEN-53).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -2315,6 +2315,8 @@ Plans:
 
 ### Phase 999.38: Test-Suite PATH Race Between ENV_MUTEX Mutators and Concurrent Git Callers (BACKLOG)
 
+**GitHub:** [#181](https://github.com/denniyahh/devflow/issues/181) (migrated from Linear DEN-65)
+
 **Goal:** `run_git_stdout` (`crates/devflow-cli/src/staleness.rs:106`) resolves `git` through `PATH`, while several tests replace `PATH` **entirely** with a stub directory containing no `git` — `pipeline_launch.rs:590`, `pipeline_outcomes.rs:879/1132/1246`, `preflight.rs:627/701`. `ENV_MUTEX` serializes those mutators against *each other* but not against the ~155 other tests in the same binary that shell out to git concurrently, so `Command::new("git")` intermittently fails to spawn and `run_git_stdout` returns `None`.
 
 **Evidence:** reproduced once in four full-suite runs — `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking` panicking at `staleness.rs:891` (`rev-parse HEAD`). This is a genuine flake source, distinct from 999.37, and was found while investigating it.
@@ -2360,7 +2362,9 @@ Plans:
 <!--
 RENUMBERED 2026-07-26. The four findings below were originally filed as
 999.40–999.43 by Phase 23, but 999.40/41/42 were already taken in Linear by
-DEN-63 / DEN-64 / DEN-67 respectively — three unrelated items that had never
+[#183](https://github.com/denniyahh/devflow/issues/183) (migrated from Linear DEN-63) /
+[#182](https://github.com/denniyahh/devflow/issues/182) (migrated from Linear DEN-64) /
+[#180](https://github.com/denniyahh/devflow/issues/180) (migrated from Linear DEN-67) respectively — three unrelated items that had never
 been mirrored back into this file, so the collision was invisible here. The
 three colliding entries moved to 999.44/45/46; 999.43 was free and kept its
 number. Next free backlog number is 999.47.
@@ -2407,7 +2411,7 @@ Plans:
 
 **Why it matters:** low functional severity — the sweep is idempotent and no double-reap occurred — but the dry-run count is exactly what an operator reads before authorizing a destructive sweep, and it over-reports. Trust in the preview matters more than the two-entry delta.
 
-**Priority:** Low | **Size:** S — dedup on `(root, phase, stage)` at write or read; add a regression test asserting dry-run count equals executed count. Linear: DEN-69.
+**Priority:** Low | **Size:** S — dedup on `(root, phase, stage)` at write or read; add a regression test asserting dry-run count equals executed count. GitHub: [#179](https://github.com/denniyahh/devflow/issues/179) (migrated from Linear DEN-69).
 
 Plans:
 
@@ -2446,7 +2450,7 @@ Plans:
 
 **Fix direction:** a `Drop` guard or explicit teardown that stops each spawned child, ideally exercising `devflow stop` so the cleanup path is itself under test.
 
-**Priority:** Low (downgraded from Medium with the scope correction — no process leak on clean runs) | **Size:** S — test-harness only, no production change. It is a contributing source of the population 999.44 is about, not the whole of it. Linear: DEN-70.
+**Priority:** Low (downgraded from Medium with the scope correction — no process leak on clean runs) | **Size:** S — test-harness only, no production change. It is a contributing source of the population 999.44 is about, not the whole of it. GitHub: [#178](https://github.com/denniyahh/devflow/issues/178) (migrated from Linear DEN-70).
 
 Plans:
 
@@ -2460,7 +2464,7 @@ Plans:
 
 **Why it matters:** the whole point of establishing a recovery point before a one-way operation is that it survives until the operator retires it. A cleanup verb that removes it — even locally, even while the remote persists — undermines the mitigation at exactly the moment it is supposed to be load-bearing.
 
-**Fix direction:** skip a configurable ref prefix (`recovery/*` by default), or have cleanup refuse to delete refs it did not create. Linear: DEN-71.
+**Fix direction:** skip a configurable ref prefix (`recovery/*` by default), or have cleanup refuse to delete refs it did not create. GitHub: [#177](https://github.com/denniyahh/devflow/issues/177) (migrated from Linear DEN-71).
 
 **Priority:** Low | **Size:** S — one predicate plus a test.
 
@@ -2559,7 +2563,7 @@ Plans:
 
 **Keep the module; do not delete it.** `staleness.rs` (1,794 lines, 21 tests) is gated entirely on `is_self_dogfood_workspace` and so is genuine dogfooding-only overhead — a fair deletion candidate on cost grounds. It is retained because the outstanding work is a single line, and discarding a tested, working module to avoid one guard is the worse trade. Note the module's tests are a known flake source (999.38's PATH race is `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking`, `staleness.rs:891`), which argues for fixing 999.38 rather than for deletion.
 
-**Priority:** High | **Size:** S — one guard on an existing parameter. Linear: DEN-73.
+**Priority:** High | **Size:** S — one guard on an existing parameter. GitHub: [#176](https://github.com/denniyahh/devflow/issues/176) (migrated from Linear DEN-73).
 
 Plans:
 
@@ -2620,7 +2624,7 @@ Plans:
 
 **Fix direction:** ship the capability, not just the diagnosis. A `devflow sync` subcommand carrying the script's logic — `-X ours`, verify the resulting tree is byte-identical before proceeding, refuse if it is not — plus a pointer to it from the `release --check` divergence message, so the tool that reports the problem also names the command that fixes it. Folding it into 999.25's release executor is the alternative; doing neither leaves users with a diagnosis and no cure.
 
-**Priority:** Medium — no data loss and the divergence is detected, but it degrades silently into painful merge conflicts at exactly the moment (a release) when a user least wants them, and DevFlow created the condition by imposing the branch model. | **Size:** S–M — the logic already exists in shell and is proven; the work is porting it, wiring the subcommand, and cross-referencing the check. Linear: DEN-77.
+**Priority:** Medium — no data loss and the divergence is detected, but it degrades silently into painful merge conflicts at exactly the moment (a release) when a user least wants them, and DevFlow created the condition by imposing the branch model. | **Size:** S–M — the logic already exists in shell and is proven; the work is porting it, wiring the subcommand, and cross-referencing the check. GitHub: [#175](https://github.com/denniyahh/devflow/issues/175) (migrated from Linear DEN-77).
 **Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25 as its executor's sync step.
 
 Plans:
@@ -2637,7 +2641,7 @@ Plans:
 
 *Surfaced by the operator during Phase 25's 25-13 human sign-off (2026-07-28), while questioning whether the 999.47 closure evidence could be taken from GitHub CI instead of the local push gate. Recorded as a follow-up in `25-13-SUMMARY.md` Part A; explicitly out of scope for 25-13, which changes no source file by design.*
 
-**Priority:** Medium — no active defect and 999.47's sites are now barriered, but this is the only standing guard that would catch a reintroduction, and its absence is why Phase 25's closure evidence had to be gathered by hand. | **Size:** S — one job block in `ci.yml` plus a comment stating the probabilistic limit. Linear: DEN-78.
+**Priority:** Medium — no active defect and 999.47's sites are now barriered, but this is the only standing guard that would catch a reintroduction, and its absence is why Phase 25's closure evidence had to be gathered by hand. | **Size:** S — one job block in `ci.yml` plus a comment stating the probabilistic limit. GitHub: [#174](https://github.com/denniyahh/devflow/issues/174) (migrated from Linear DEN-78).
 
 Plans:
 
@@ -2706,7 +2710,7 @@ Plans:
 
 **Do not fix this by auto-approving.** `checkpoints.md` is explicit that `gate="blocking-human"` is never bypassed in any mode, and Phase 26's own run proved why: the executor found and fixed a plan that had mistakenly tagged these two irreversible authorizations `gate="blocking"` (auto-bypassable, auto-selects the *first* option) — that bug would have silently authorized `cargo publish` with no human input. The gate is correct; only the return path is missing.
 
-**Priority:** High — it is the one defect that makes a *correctly written* plan unable to finish unattended, and the workaround requires an operator who knows an undocumented manual-SUMMARY trick. | **Size:** M — (A) is bounded but touches launch/prompt/gate plumbing and needs a new gate classification; (C) is S; (B) is M and may not be needed. Source: Phase 26 dogfood run (2026-07-29), full write-up in `superseded/26-release-cut-automation/26-01-SUMMARY.md` § "Issues Encountered". Linear: DEN-82.
+**Priority:** High — it is the one defect that makes a *correctly written* plan unable to finish unattended, and the workaround requires an operator who knows an undocumented manual-SUMMARY trick. | **Size:** M — (A) is bounded but touches launch/prompt/gate plumbing and needs a new gate classification; (C) is S; (B) is M and may not be needed. Source: Phase 26 dogfood run (2026-07-29), full write-up in `superseded/26-release-cut-automation/26-01-SUMMARY.md` § "Issues Encountered". GitHub: [#173](https://github.com/denniyahh/devflow/issues/173) (migrated from Linear DEN-82).
 
 Plans:
 
@@ -2874,7 +2878,7 @@ Plans:
 
 ### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (BACKLOG)
 
-**Linear:** [DEN-104](https://linear.app/denniskim/issue/DEN-104/99983-the-drain-gate-never-saw-8-concurrent-sub-agents-its-fixtures)
+**GitHub:** [#166](https://github.com/denniyahh/devflow/issues/166) (migrated from Linear DEN-104)
 **Found:** 2026-08-06, phase 34 plan 34-05's capture campaign (D-04: file capture-revealed defects,
 do not fix them in the capture plan).
 
@@ -2915,7 +2919,7 @@ fixture to match whatever is found.
 
 ### Phase 999.82: Re-File 31/D-14 — Per-Child Declared Tokens, Deferred on Size for the Second Time (BACKLOG)
 
-**Linear:** [DEN-105](https://linear.app/denniskim/issue/DEN-105/99982-re-file-31d-14-per-child-declared-tokens-deferred-on-size-for)
+**GitHub:** [#165](https://github.com/denniyahh/devflow/issues/165) (migrated from Linear DEN-105)
 **Found:** re-filed 2026-08-06 by phase 34 plan 34-05 under D-12. Originally CONTEXT.md D-14 in
 phase 31, deferred there; carried into phase 34's discussion and deferred again.
 
@@ -3515,7 +3519,7 @@ for the DevFlow-side prompt policy plus its tests; M if the upstream marker is p
 
 ### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
 
-**Linear:** [DEN-92](https://linear.app/denniskim/issue/DEN-92/99971-measure-whether-the-capture-writer-actually-leaves-torn-terminal)
+**GitHub:** [#169](https://github.com/denniyahh/devflow/issues/169) (migrated from Linear DEN-92)
 **Found:** 2026-08-02, phase 30 adversarial pass over the malformed-input defect class. Flagged as
 unmeasured by the cross-AI code review (`30-CODE-REVIEW.md`) and again in
 `30-H1-CONTEXT-FOR-31.md`.
@@ -3554,7 +3558,7 @@ prerequisite.
 
 ### Phase 999.70: Checkpoint Detection Cannot Tell a Gate DECLARATION From a Gate MENTION (BACKLOG)
 
-**Linear:** [DEN-91](https://linear.app/denniskim/issue/DEN-91/99970-checkpoint-detection-cannot-tell-a-gate-declaration-from-a-gate)
+**GitHub:** [#170](https://github.com/denniyahh/devflow/issues/170) (migrated from Linear DEN-91)
 **Found:** 2026-08-02, cross-AI code review of phase 30 (codex/gpt-5.6-sol, high effort), Medium
 finding 1. Recorded in `30-CODE-REVIEW.md`.
 
@@ -3594,7 +3598,7 @@ rather than authorizing anything.
 
 ### Phase 999.69: Re-Publish the Three Committed `30a-evidence` Captures Through the Redaction Pipeline (BACKLOG)
 
-**Linear:** [DEN-90](https://linear.app/denniskim/issue/DEN-90/99969-re-publish-the-three-committed-30a-evidence-captures-through-the)
+**GitHub:** [#171](https://github.com/denniyahh/devflow/issues/171) (migrated from Linear DEN-90)
 **Found:** 2026-08-02, Phase 30 plan 30-02 Task 1, while proving the new publish pipeline against a
 real capture rather than only a synthetic fixture. Logged in the phase's `deferred-items.md`.
 
@@ -3641,7 +3645,7 @@ blocking a phase's ship on a pre-existing artifact it scoped out is a policy cal
 
 ### Phase 999.68: Planning-Artifact Architecture — Requirements, a Constitution, and the Linear Boundary (BACKLOG)
 
-**Linear:** [DEN-89](https://linear.app/denniskim/issue/DEN-89/99968-planning-artifact-architecture-requirements-a-constitution-and)
+**GitHub:** [#172](https://github.com/denniyahh/devflow/issues/172) (migrated from Linear DEN-89)
 **Found:** 2026-08-02, operator review of long-horizon tracking during Phase 30. Not a code defect —
 a planning-system gap. Filed because the symptom ("GSD doesn't track long-term product requirements")
 has a different cause than it appears to.
@@ -4069,7 +4073,7 @@ Units (operator-decided 2026-07-25; sequencing is load-bearing):
   confirms the supervisor is the blocker or surfaces something cheaper that bites
   before it, and it is the only unit that can invalidate the rest of this scope.
 
-- **23b** — **Socket-addressable supervisor** (999.33 / DEN-58). Replace the
+- **23b** — **Socket-addressable supervisor** (999.33 / [#185](https://github.com/denniyahh/devflow/issues/185) (migrated from Linear DEN-58)). Replace the
   `sh -c` monitor with a socket-addressable supervisor. Two properties carry this
   phase: the `advance` tail stops being a separate forkable process and runs
   in-process — **removing the Phase 17 failure mode by construction** — and
@@ -4085,17 +4089,17 @@ Units (operator-decided 2026-07-25; sequencing is load-bearing):
   its own state machine.
 
 - **23d** *(subtractive)* — **Drop `sequentagent`.** ~110 references across 11
-  files. Shrinks 23b and closes DEN-58's explicitly-untested
+  files. Shrinks 23b and closes [#185](https://github.com/denniyahh/devflow/issues/185)'s explicitly-untested
   `wait_for_agent_exit` gap in the riskiest part of the migration. Coherent with
   Claude-only: token-exhaustion failover has no second agent to reach. The
-  capability itself is preserved as an intent in 999.42 / DEN-67, to be
+  capability itself is preserved as an intent in 999.42 / [#180](https://github.com/denniyahh/devflow/issues/180) (migrated from Linear DEN-67), to be
   reimplemented on the supervisor if and when a second agent is supported.
 
 **Acceptance criterion is behavioural, not code-shaped:** one phase driven
 start-to-finish by `devflow` with Claude, unattended, reaching a completed Ship
 stage without manual intervention.
 
-**macOS note:** DEN-58 flags macOS as entirely unverified (no host, no CI) and
+**macOS note:** [#185](https://github.com/denniyahh/devflow/issues/185) (migrated from Linear DEN-58) flags macOS as entirely unverified (no host, no CI) and
 the 104-byte `sun_path` limit as documented-not-measured. Out of scope here —
 the operator platform is Linux; do not claim macOS support from this phase.
 
@@ -4720,7 +4724,7 @@ have caught this the moment it happened.
 `29-CONTEXT.md` decision IDs, consistent with Phases 21/22/26/27/28.
 **Depends on:** Phase 27 (999.39, `GIT_DIR` scrubbing — CR-01's prerequisite, delivered).
 **Priority:** High | **Size:** L — but with two points at which it can stop and still have
-delivered something. Linear: DEN-50.
+delivered something. GitHub: [#188](https://github.com/denniyahh/devflow/issues/188) (migrated from Linear DEN-50).
 
 Plans:
 

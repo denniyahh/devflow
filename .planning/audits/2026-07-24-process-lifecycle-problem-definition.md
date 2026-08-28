@@ -4,7 +4,7 @@ Date: 2026-07-24
 Purpose: **design input**, not a review recap. Everything here is context for
 building a real solution to DevFlow's process-management problem.
 Related: `.planning/ROADMAP.md` 999.33 (open problem) / 999.34 (blocked),
-Linear DEN-58 / DEN-59.
+GitHub: [#185](https://github.com/denniyahh/devflow/issues/185) (migrated from Linear DEN-58) / DEN-59.
 
 Status of prior work: branch `feature/monitor-process-group-stop` is
 **unmerged and being abandoned** as an implementation. Its *findings* are

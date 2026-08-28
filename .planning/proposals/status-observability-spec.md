@@ -3,6 +3,7 @@
 **Status:** Proposed  
 **Author:** Pair Programming Session  
 **Target Component:** `crates/devflow-cli/src/commands.rs` (`status` command)  
+**GitHub:** [#159](https://github.com/denniyahh/devflow/issues/159) (migrated from Linear DEN-116)
 
 ---
 
