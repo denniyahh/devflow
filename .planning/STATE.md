@@ -5,17 +5,17 @@ milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 45
 current_phase_name: Opportunistic Cleanup (999.94)
 status: planning
-stopped_at: Phase 44 shipped (PR #154), ready to plan Phase 45
-last_updated: "2026-08-27T20:15:00.000Z"
+stopped_at: Phase 45 context gathered
+last_updated: "2026-09-01T23:09:58.799Z"
 last_activity: 2026-08-27
-last_activity_desc: Phase 44 shipped via PR #154; 999.113 backlog item resolved
-state_head: 563c193db04631973bbcf0cb66c2712fb65ce816
+state_head: 7b8b266054113d7f43a0fa3f54e84dacc716966a
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 13
   completed_plans: 13
   percent: 83
+last_activity_desc: Phase 44 shipped via PR
 ---
 
 # DevFlow — Project State
@@ -806,9 +806,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-23T10:25:13.074Z
-**Stopped at:** Phase 43 complete, ready to plan Phase 44
-**Resume file:** .planning/phases/43-opencode-driver-completion/43-CONTEXT.md
+**Last session:** 2026-09-01T23:09:58.450Z
+**Stopped at:** Phase 45 context gathered
+**Resume file:** .planning/phases/45-unattended-auto-mode-hardening-999-110-999-109-999-94/45-CONTEXT.md
 
 ## Operator Next Steps
 
