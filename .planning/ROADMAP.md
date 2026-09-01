@@ -1896,7 +1896,7 @@ reachable, at which point 999.49 fires on its first success. Taking either alone
 leaves the goal blocked. 999.47 is unrelated but cheap and is currently taxing
 every PR.
 
-### Phase 999.1: Hermes Support (BACKLOG)
+### Phase 999.1: Hermes Support (DELIVERED — Phase 42 / HRMS-01..03)
 
 **Goal:** `HermesAgent` adapter with native-envelope completion parsing, rewrite of the stale `skills/hermes/devflow/SKILL.md`, and the Hermes plugin session mode with an events.jsonl-driven gate watcher. Held Phase 18's slot until 2026-07-20, when pipeline-reliability work took priority — personal-infrastructure work that doesn't gate anything else.
 **Priority:** Low | **Size:** L — reviewed 2026-07-21: structurally lowest (gates nothing else), operator confirmed still low priority. Linear: DEN-26.
@@ -2275,7 +2275,7 @@ Plans:
 
 - [x] Delivered by Phase 22 (22-01, 22-02) — absorbed as the phase's narrow trial scope, not separately promoted
 
-### Phase 999.31: Modular Agent Driver Architecture (BACKLOG)
+### Phase 999.31: Modular Agent Driver Architecture (DELIVERED — Phase 37 / AGDR-01..04)
 
 **Goal:** Replace the thin `AgentAdapter` trait with a modular `AgentDriver` contract — capability discovery, driver-owned prompt rendering, command building, completion parsing, and health probes — so agent-specific execution semantics stop being scattered across `prompt.rs`, `agents/*.rs`, `agent_result.rs`, and `preflight.rs`. Root cause of a confirmed dogfood failure: `Stage::gsd_command()` bakes raw `/gsd-*` slash-command strings into core, rendered identically for every adapter (enforced by a test), and Codex received them as literal shell commands during the Phase 22 trial.
 
