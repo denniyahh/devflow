@@ -18,7 +18,7 @@ change.
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Complete    |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Complete    |
 | 44 | Codex End-to-End Verification | CODE-01 | Not started |
-| 45 | Opportunistic Cleanup (999.94) | DECN-01 | Not started |
+| 45 | Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94) | AUTO-01, AUTO-02, DECN-01 | Not started |
 
 ### Phase 40: Pi Dogfood
 
@@ -111,14 +111,16 @@ Plans:
 
 **Plans**: TBD
 
-### Phase 45: Opportunistic Cleanup (999.94)
+### Phase 45: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94)
 
-**Goal**: Close 999.94 (unattended `decision` checkpoint blind-first-option, HIGH) if capacity permits.
+**Goal**: Make `--mode auto` launchable and safe out of the box by fixing worktree base detection for `.planning/`, scoping staleness detection to workspace crates, and enforcing merit-based decision checkpoint resolution.
 **Depends on**: Nothing (independent of the driver phases)
-**Requirements**: DECN-01
+**Requirements**: AUTO-01, AUTO-02, DECN-01
 **Success Criteria** (what must be TRUE):
 
-  1. An unattended `decision` checkpoint no longer blindly takes the first option — acceptance-tested, since it alters unattended-run policy.
+  1. Worktree creation automatically forks from the branch tracking `.planning/` (e.g. `workspace/denniyahh`) rather than hardcoding `develop`, so `.planning/config.json` is present and `preflight_unattended_launch_check` passes out of the box (AUTO-01 / 999.110).
+  2. The self-dogfood staleness check (`affects_compiled_binary`) only inspects Cargo workspace members (`crates/*`) rather than repo-wide `.rs`/`Cargo.toml` files, ignoring `.planning/spikes/` and non-workspace crates (AUTO-02 / 999.109).
+  3. An unattended `decision` checkpoint no longer blindly takes the first option — Code-stage prompt policy instructs the agent to evaluate options on merit and record its reasoning (DECN-01 / 999.94).
 
 **Plans**: TBD
 
@@ -2032,16 +2034,13 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.21: AI Change Acceptance Contract — Review Wiring (BACKLOG)
+### Phase 999.21: Mechanical Lint Enforcement for AI Test Anti-Patterns (BACKLOG)
 
-**Goal:** Make the `.claude/skills/ai-change-acceptance/` contract actually govern AI change review rather than only existing in the repo. Phase 19's 19-05 dogfood proved the contract's *wording* discriminates correctly (every non-compliant diff flagged, compliant control untouched) but found its *wiring* incomplete: a context-isolated reviewer independently reached the same verdicts yet never cited the project contract as its authority, and graded the findings `warning`/`info` rather than acceptance-blocking. Today the contract binds only when the dispatcher already knows to load it.
-**Priority:** High | **Size:** M — the contract exists precisely because a green suite isn't evidence; if it only applies when explicitly invoked, it doesn't close the unattended-AI-change case it was written for. Note part of the wiring surface lives in the GSD code-review workflow *outside this repo*, so an in-repo fix may not fully close it. GitHub: [#190](https://github.com/denniyahh/devflow/issues/190) (migrated from Linear DEN-46).
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Refocused 2026-09-01.** Separated repo-local enforcement from upstream GSD dispatch wording.
 
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+**Goal:** Make the `.claude/skills/ai-change-acceptance/` anti-pattern rules enforceable within this repository without relying on upstream GSD prompt obedience.
+**The item:** Implement a mechanical lint or AST check in CI (`check.sh` / `cargo test`) that statically flags the 4 banned test anti-pattern shapes (e.g. tautological `assert_eq!(x, x)` assertions, or tests that duplicate the production algorithm inline rather than asserting independent properties).
+**Priority:** Medium | **Size:** M — independent of external AI reviewer prompt adherence.
 
 ### Phase 999.22: Refactor Equivalence Guard in CI (BACKLOG)
 
@@ -3030,41 +3029,17 @@ reusable core.
 
 ---
 
-### Phase 999.104: The Release-Signing Key Workflow Is Fragile and Has Caused Repeated Mistakes (BACKLOG — discuss in Phase 36)
+### Phase 999.104: Fix `release --check` Signing-Key Probe Target & Fingerprint Validation (BACKLOG)
 
-**Found:** repeatedly, across at least the last ten phases. The v2.5.0 cut (2026-08-15) hit it
-again: `release --check`'s "tag-signing viability" probes `user.signingkey` (the **agent's** key,
-`9BPy…`), not `devflow.releaseSigningKey` (the **maintainer's** key, `u84t…`), so the preflight
-reports "signing viable" for the wrong key and the real enforcement only fires later, in the
-pre-push fingerprint comparison.
+**Refocused 2026-09-01.** Narrowed from an open-ended workflow discussion to a concrete probe and validation fix.
 
-**The recurring shape.** Two signing keys coexist on the same machine, both configured with the
-same `user.email`, so a tag signed with the wrong one renders identically everywhere a human looks
-(`git log`, `git tag -v`, GitHub's "Verified" badge). Only the fingerprint differs. The intended
-workflow:
+**The defect:** `release --check`'s tag-signing viability probe inspects `user.signingkey` (the agent's commit key) instead of `devflow.releaseSigningKey` (the maintainer's release tag signing key), giving a false-positive "signing viable" report that only fails later at pre-push fingerprint comparison.
 
-- ordinary commits → agent key (`user.signingkey`)
-- release tags + `main` → maintainer key (`devflow.releaseSigningKey`), via an explicit
-  `git -c user.signingkey=…` override
+**The item:**
+1. Direct `release --check` to specifically probe `devflow.releaseSigningKey` for release tags instead of falling back to `user.signingkey`.
+2. Add an explicit error message when the key loaded in `ssh-agent` / `gpg` does not match the configured maintainer fingerprint.
 
-Every recent release has tripped on some facet: the override forgotten, the preflight probing the
-wrong key, or the "it looks correct but isn't" trap (both keys share the email).
-
-**What to decide in Phase 36 — not fix here.** This is a workflow-design question, not a single
-bug. Open decisions to settle in discuss-phase:
-
-1. Should `release --check`'s signing probe target `devflow.releaseSigningKey` rather than the
-   agent's `user.signingkey`? (The obvious one-line fix — but see 2.)
-
-2. Is the two-key model itself the right shape? Alternatives: a single release-only signing
-   identity, or making the maintainer key the only key on the release path so there is no "wrong
-   key" to select — and no `-c` override to forget.
-
-3. Should the fingerprint check surface earlier (in `release --check` / `--verify`) so a wrong-key
-   tag fails at preflight instead of at push?
-
-**Priority:** High-for-annoyance (recurring; the wrong-key trap is silent until push).
-**Size:** TBD — depends on which of (1)–(3) Phase 36 chooses; (1) alone is S.
+**Priority:** Medium | **Size:** S — touches `crates/devflow-cli/src/release.rs` and `preflight.rs` with unit tests.
 
 ---
 
@@ -3440,41 +3415,13 @@ for the fix; the gating decision is separate and smaller.
 
 ---
 
-### Phase 999.93: Unattended Runs Have No Preflight for the Conditions They Require (BACKLOG — HIGH)
+### Phase 999.93: Unattended Preflight Policy & Validation Completeness Audit (BACKLOG)
 
-**Found:** 2026-08-07, phase 35 verify-work, tracing why 35-01 and 35-05 both hit a GSD checkpoint
-with no way to answer it.
+**Refocused 2026-09-01.** Originally filed because `devflow start --mode auto` lacked preflight checks for auto-mode conditions. `preflight_unattended_launch_check` and `unattended_config_condition` have since been implemented in `preflight.rs` (which caught the 999.110 missing-`.planning/` failure).
 
-**The defect, in one line:** `devflow start --mode auto` will launch a run that is structurally
-guaranteed to park on the first ordinary GSD checkpoint, and nothing checks first.
+**The item:** Once Phase 45 lands, run a completeness audit of `preflight.rs` to verify that all true prerequisites for unattended execution (config keys, agent headless mode, driver capabilities) are validated with clear diagnostic error messages without redundant or brittle checks.
 
-**What is missing.** GSD auto-approves `gate="blocking"` checkpoints only when `check auto-mode`
-reports active — which requires `workflow.auto_advance` or `workflow._auto_chain_active` to be true
-in `.planning/config.json`. On DevFlow today it reports
-`{"active": false, "source": "none", "auto_chain_active": false, "auto_advance": false}`. So an
-unattended run meets its first ordinary checkpoint and stalls into a gate. DevFlow already handles
-the *harder* case — `blocking-human` checkpoints, via resume plus `checkpoint_auto_decide_prompt`
-(28-03, D-03/D-07) — so the gap is only the ordinary ones, which is exactly why it went unnoticed.
-
-**Why a preflight rather than only a fix.** The plumbing fix (999.94's sibling work, below) makes
-auto-mode active for the Code stage. A preflight is what stops the *next* silent regression: it
-states the run's own prerequisites and refuses, loudly, when they do not hold. `devflow release
---check` is the established precedent in this codebase for a read-only preflight that reports
-viability by checking rather than predicting (HARDEN-05, phase 35-03) — this is the same shape for
-`start --mode auto`.
-
-**What it should check.** At minimum: `check auto-mode` reports active for the stages that need it;
-the agent binary exists (already checked elsewhere — fold it in rather than duplicating); no
-unknown `workflow.*` keys that suggest a stale config (see G-04 in
-`.planning/UPSTREAM-GSD-ISSUES.md` — `workflow.auto_mode` is dead upstream and cost this project two
-escalations). Report each as viable/not-viable with a reason, and refuse the launch rather than
-warn, since a warning in an unattended run is read by nobody.
-
-**Negative control it must carry.** A preflight that cannot fail is the defect it exists to prevent
-(the 999.86 lesson, one phase earlier). Whatever ships must include a fixture where the check
-reports NOT viable.
-
-**Priority:** High — it gates the first real unattended end-to-end run (phase 35.3). **Size:** S–M.
+**Priority:** Low | **Size:** S — post-Phase 45 hardening/verification audit.
 
 ---
 
