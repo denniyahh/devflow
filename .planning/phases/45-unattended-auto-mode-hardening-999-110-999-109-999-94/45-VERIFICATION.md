@@ -1,10 +1,10 @@
 ---
 phase: 45-unattended-auto-mode-hardening-999-110-999-109-999-94
 verified: 2026-09-02T18:08:14Z
-status: human_needed
-score: 3/3 roadmap success criteria verified (20/20 plan must-have truths, 2 by override)
-behavior_unverified: 1
-overrides_applied: 2
+status: passed
+score: 3/3 roadmap success criteria verified (20/20 plan must-have truths, 3 by override)
+behavior_unverified: 0
+overrides_applied: 3
 overrides:
 
   - must_have: "The Code stage prompt delivered to Codex and Pi carries the byte-identical policy, so the two agent families do not have different unattended semantics (45-03 must_have truth 2; ROADMAP criterion 3 / DECN-01)."
@@ -28,38 +28,34 @@ overrides:
       phase's terminal state.
     accepted_by: "Dennis Kim"
     accepted_at: "2026-09-02T00:00:00Z"
+  - must_have: "Worktree creation forks from the branch tracking `.planning/` so `preflight_unattended_launch_check` passes out of the box (ROADMAP criterion 1 / AUTO-01) — live end-to-end behavior."
+    reason: >-
+      AUTO-01 is verified at unit/integration level with a real negative
+      control on the fork point (parallel::tests::ensure_phase_worktree_forks_from_the_supplied_base),
+      plus the four run-scoped git_flow_for_run consumers and the
+      State::base_branch round-trip. No automated test drives `devflow start`
+      end to end, and this repo has no committed `base_branch`, so the "out of
+      the box" live run is not reachable here without a dedicated setup step.
+      Operator decision 2026-09-02: defer the live `devflow start --mode auto`
+      end-to-end verification to a later phase and track it as backlog 999.119
+      (ROADMAP.md), rather than block the v2.8.0 milestone close on an
+      environment limitation that is not a code defect. This reclassifies the
+      former `behavior_unverified_items` / `human_needed` entry to a tracked
+      deferred override; the live run was NOT performed.
+    accepted_by: "Dennis Kim"
+    accepted_at: "2026-09-02T00:00:00Z"
 re_verification: null
 gaps: []
 deferred: []
-behavior_unverified_items:
-
-  - truth: "Worktree creation forks from the branch tracking `.planning/` so `preflight_unattended_launch_check` passes out of the box (ROADMAP criterion 1 / AUTO-01)."
-    test: "Configure `base_branch = \"workspace/denniyahh\"` in `devflow.toml` (or export `DEVFLOW_BASE_BRANCH`), then run a real `devflow start --phase N --mode auto` on this repository."
-    expected: "The worktree at `.worktrees/phase-NN` is forked from the planning branch and carries `.planning/config.json`; `preflight_unattended_launch_check`'s `unattended_config_condition` reports Holds and the launch proceeds with no operator intervention; the merge target at Ship is the same branch."
-    why_human: >-
-      Every link in the chain is unit-tested (including the fork point with a
-      real negative control), but no test drives `devflow start` end to end.
-      45-EXTERNAL-REVIEW.md states this plainly: 'None of these fixes were
-      exercised against a live unattended run. They are verified at unit level
-      only.' Additionally this repository has NO `devflow.toml` and no
-      committed `base_branch`, so the criterion's 'out of the box' end state is
-      not currently reachable here without that one setup step.
-human_verification:
-
-  - test: "Configure `base_branch` and run a live `devflow start --mode auto` end to end (see behavior_unverified_items)."
-    expected: "Preflight passes unattended; fork point and merge target are the configured base."
-    why_human: "No automated test drives a live unattended run; the phase is verified at unit level only."
-audit_acknowledged:
-  milestone: v2.8.0
-  at: 2026-09-02
-  status: human_needed
+behavior_unverified_items: []
+human_verification: []
 ---
 
 # Phase 45: Unattended Auto-Mode Hardening — Verification Report
 
 **Phase Goal:** Make `--mode auto` launchable and safe out of the box by fixing worktree base detection for `.planning/`, scoping staleness detection to workspace crates, and enforcing merit-based decision checkpoint resolution.
 **Verified:** 2026-09-02T18:08:14Z
-**Status:** human_needed (initial pass: gaps_found — see Post-Verification Disposition)
+**Status:** passed (initial pass: gaps_found; then human_needed; then passed by operator override — see Post-Verification Disposition)
 **Re-verification:** No — initial verification, updated by hand post-verification per the documented override workflow (`verification-overrides.md`)
 
 ## Headline
@@ -234,15 +230,19 @@ rewriting the narrative above it.
 | Criterion 3 / 45-03 truth 4 (CR-04) | ✗ FAILED (partial) | **PASSED (override)** — accepted by Dennis Kim, citing backlog 999.116. See frontmatter `overrides:`. |
 | REQUIREMENTS.md traceability (gap 3) | ✗ FAILED | **✓ VERIFIED** — AUTO-01 marked Complete in `REQUIREMENTS.md` (checkbox + traceability table); `45-03-SUMMARY.md`'s `requirements-completed: [DECN-01]` overclaim corrected to `requirements-partial`, naming both backlog items. |
 | Undischarged review deferral (gap 4) | ✗ FAILED | **✓ VERIFIED** — `write_state_atomic`'s fixed-`.tmp`-filename TOCTOU filed as backlog **999.118** (`ROADMAP.md`). `45-EXTERNAL-REVIEW.md`'s own disposition table updated to point at it. |
+| Criterion 1 / AUTO-01 live end-to-end run (`behavior_unverified_items`) | ⚠ human_needed | **PASSED (override)** — deferred to a later phase by operator decision 2026-09-02 (`/gsd-verify-work 45`), tracked as backlog **999.119**. Live run NOT performed; AUTO-01 stays unit/integration-verified. |
 
-**Not resolved, and not overridden:** the sole `behavior_unverified_items` entry — a live
-`devflow start --mode auto` end-to-end run exercising the configured-base fork/preflight/merge
-chain. Nothing in this session's instruction extended acceptance to it, and per this project's
-own convention (`verification-overrides.md`: overrides never suppress a `human_needed` item),
-it is not swept into `passed` by the overrides above. `status:` is therefore `human_needed`,
-not `passed` — `gsd_run query phase.complete` will refuse a phase in that state
-(`readVerificationStatus(...).status !== 'passed'`), and this was reported to the operator as
-an open decision rather than resolved unilaterally.
+**Deferred to a later phase (2026-09-02, second disposition pass, by operator instruction):**
+the sole `behavior_unverified_items` entry — a live `devflow start --mode auto` end-to-end run
+exercising the configured-base fork/preflight/merge chain — was NOT performed. The operator
+decided in `/gsd-verify-work 45` (2026-09-02) that this live run "is most likely not possible
+yet" in this environment and deferred it to a later phase, filed as backlog **999.119**
+(`ROADMAP.md`). It is accepted here as a third `PASSED (override)` (see frontmatter `overrides:`),
+which reclassifies the former `human_needed` item to a tracked deferred override. This is a
+deliberate, operator-authorized reclassification recorded in full — not a silent suppression.
+`status:` is now `passed`; `gsd_run query phase.complete` will accept the phase. The AUTO-01
+code is verified at unit/integration level (with a real fork-point negative control); what
+remains unverified is only the live end-to-end behavior, and 999.119 owns closing that gap.
 
 Also untouched by this disposition: the anti-pattern entry above naming `run_test`,
 `run_test.rs`, `test_parse.rs`, and the stray `.opencode/opencode.json`/`.gsd/`/
@@ -254,4 +254,4 @@ history around this timestamp).
 
 _Verified: 2026-09-02T18:08:14Z_
 _Verifier: Claude (gsd-verifier)_
-_Disposition: Claude, 2026-09-02, by direct operator instruction_
+_Disposition: Claude, 2026-09-02, by direct operator instruction (two passes: gap resolution, then the AUTO-01 live-run deferral via /gsd-verify-work 45)_

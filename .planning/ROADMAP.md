@@ -407,6 +407,41 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.119: Live `devflow start --mode auto` End-to-End Verification of the Configured-Base Fork/Preflight/Merge Chain (BACKLOG)
+
+**Found:** 2026-09-02, phase 45 UAT (`45-UAT.md` test 1) and verification
+(`45-VERIFICATION.md` `behavior_unverified_items`). Phase 45 shipped AUTO-01 verified at
+unit/integration level only — including a real negative control on the fork point — but no
+automated test drives `devflow start` end to end, and this repository currently has no
+`devflow.toml` / committed `base_branch`, so the criterion's "out of the box" end state is not
+reachable here without that setup step. The operator deferred the live run to a later phase
+(2026-09-02) and it is accepted as a `PASSED (override)` on 45-VERIFICATION.md citing this entry.
+
+**What must be verified.** With `base_branch = "workspace/denniyahh"` configured (a `devflow.toml`
+key or `DEVFLOW_BASE_BRANCH`), a real `devflow start --phase N --mode auto` on this repo:
+
+- forks the worktree at `.worktrees/phase-NN` from the planning branch, **not** `develop`;
+- that worktree carries `.planning/config.json`;
+- `preflight_unattended_launch_check`'s `unattended_config_condition` reports **Holds** and the
+  launch proceeds with zero operator intervention;
+- if the run reaches Ship, the merge target is the same configured base.
+
+**Not yet done.** No live unattended run has exercised this chain. Every link is unit-tested
+(`parallel::tests::ensure_phase_worktree_forks_from_the_supplied_base` with an in-body `develop`
+negative control; the four run-scoped `git_flow_for_run` consumers; `State::base_branch`
+round-trip), but 45-EXTERNAL-REVIEW.md states plainly: "None of these fixes were exercised against
+a live unattended run. They are verified at unit level only."
+
+**Next step:** either land a committed `base_branch` config in this repo and run the live
+`--mode auto` verification as a dedicated phase, or build a harness test that drives the real
+`devflow start` binary through preflight + worktree creation against a configured base (the
+`crates/devflow-cli/tests/phase7_cli.rs` family is the closest existing analog).
+
+**Acceptance:** a recorded live-run (or binary-driving harness test) showing the fork point,
+`unattended_config_condition = Holds`, unattended progression, and the Ship merge target all
+resolving to the configured base — with a negative control that an unconfigured repo still forks
+from `develop`.
+
 ### Phase 999.118: `write_state_atomic` Uses a Fixed `.tmp` Filename, So Two Processes Saving the Same Phase Race (BACKLOG)
 
 **Found:** 2026-09-02, phase 45 external adversarial code review (agy / gemini-3.1-pro-high;

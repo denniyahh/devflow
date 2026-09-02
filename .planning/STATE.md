@@ -4,18 +4,18 @@ milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 45
 current_phase_name: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94
-status: verifying
-stopped_at: External adversarial review (codex+agy) done, 8 fixed/2 filed to backlog (999.117/999.118); 45-VERIFICATION.md ran gaps_found, then operator overrode the two DECN-01 partial-truths (CR-03→999.115, CR-04→999.116) and AUTO-01/write_state_atomic gaps were fixed directly; status is human_needed pending one live `devflow start --mode auto` end-to-end run (see 45-VERIFICATION.md behavior_unverified_items) — run `/gsd-verify-work 45` when ready to close it
-last_updated: "2026-09-02T19:00:00.000Z"
+status: verified
+stopped_at: Phase 45 verification resolved. `/gsd-verify-work 45` (2026-09-02): 4 UAT checks auto-passed from coverage blocks; the sole live `devflow start --mode auto` end-to-end check was deferred by operator to a later phase (not possible in this env yet), filed as backlog 999.119 and accepted as a third PASSED (override) on 45-VERIFICATION.md. Verification status now `passed`. Next: ship feature/phase-45 → develop, then `/gsd-audit-milestone` + `/gsd-complete-milestone` for v2.8.0.
+last_updated: "2026-09-02T23:12:00.000Z"
 last_activity: 2026-09-02
 state_head: b39d316f385afb61066fc47fd1cf102dd1e3da76
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 16
   completed_plans: 16
-  percent: 83
-last_activity_desc: External review (codex+agy) fixed, gate closed on 2 authorized overrides; human_needed pending a live unattended-run UAT
+  percent: 100
+last_activity_desc: Phase 45 verification resolved via /gsd-verify-work 45 — live --mode auto run deferred to 999.119 as a PASSED (override); all 6 v2.8.0 phases now verified
 ---
 
 # DevFlow — Project State
@@ -40,8 +40,10 @@ disposition in `44-codex-end-to-end-verification/44-CODEX-E2E.md`. PR #154
 (`feature/phase-44-pr` → `develop`) merged 2026-08-27; also closed backlog item 999.113
 (container-root permission test fragility) discovered while pushing.
 
-Current v2.8.0 milestone progress: phases 40-44 are complete, 45 remains not started, with 13/13
-completed plans across the completed phase scope.
+Current v2.8.0 milestone progress: all 6 phases (40-45) complete and verified. Phase 45's live
+`devflow start --mode auto` end-to-end check is deferred to backlog 999.119 (PASSED override).
+feature/phase-45 is not yet merged to develop — ship it, then run /gsd-audit-milestone and
+/gsd-complete-milestone for v2.8.0.
 
 ---
 
