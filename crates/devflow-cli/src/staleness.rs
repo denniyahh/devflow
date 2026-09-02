@@ -274,6 +274,19 @@ fn affects_compiled_binary(rel_path: &str, workspace_scoped: bool) -> bool {
         return true;
     }
 
+    // 2b. `.cargo/config.toml` sets rustflags, the linker and the default
+    //     target: it changes the compiled binary without touching a single
+    //     `.rs` file or manifest, so a build after editing it is genuinely
+    //     stale. It is outside `crates/` and is not one of the four names,
+    //     so both rules above miss it. Added to the SCOPED branch only —
+    //     widening the unscoped rule would change behaviour for every
+    //     downstream project DevFlow drives, which T-45-11's zero-regression
+    //     prohibition forbids. The widening is in this predicate's stated
+    //     fail direction (toward Stale), so it cannot mask a real staleness.
+    if rel_path == ".cargo/config.toml" || rel_path == ".cargo/config" {
+        return true;
+    }
+
     // 3. Otherwise a workspace member: the prefix carries its own trailing
     //    separator, so this is a path-SEGMENT prefix — `crates-extras/` and
     //    `vendor/crates/` cannot satisfy it.
@@ -720,6 +733,47 @@ mod tests {
 
     /// T-45-11: the scoped rule must not change what DevFlow reports for
     /// downstream projects, whose conventional Cargo layout uses `src/`.
+    /// codex + agy (external review, 2026-09-02, CR-45-05): `.cargo/config.toml`
+    /// sets rustflags, the linker and the default target — it changes the
+    /// compiled binary without touching a `.rs` file or any of the four
+    /// manifest names, and it lives outside `crates/`, so both the prefix
+    /// rule and the exact-name rule missed it. That is the UNSAFE direction:
+    /// the scoped branch is the one place a Stale verdict hard-BLOCKS (D-18),
+    /// so a miss here reports a genuinely stale binary as Fresh.
+    #[test]
+    fn affects_compiled_binary_in_workspace_scope_accepts_root_cargo_config() {
+        for path in [".cargo/config.toml", ".cargo/config"] {
+            assert!(
+                affects_compiled_binary(path, true),
+                "{path:?} changes the compiler invocation; a build after editing it is stale"
+            );
+        }
+
+        // NEGATIVE CONTROL: the widening must be anchored at the ROOT, not a
+        // `contains`. A spike carrying its own `.cargo/config.toml` is not a
+        // build input for THIS workspace, and accepting it would re-open the
+        // `.planning/spikes/` false positive AUTO-02 exists to remove.
+        for path in [
+            ".planning/spikes/probe/.cargo/config.toml",
+            "crates/devflow-cli/.cargo/config.toml",
+        ] {
+            assert!(
+                !affects_compiled_binary(path, true),
+                "{path:?} is not the root cargo configuration and must not be build-affecting"
+            );
+        }
+
+        // ZERO-REGRESSION CONTROL (T-45-11): the widening is scoped-branch
+        // only. Every other project DevFlow drives keeps the pre-Phase-45
+        // rule byte-for-byte, so this same path must stay FALSE unscoped.
+        // Without this half the test also passes against a change that
+        // widened both branches.
+        assert!(
+            !affects_compiled_binary(".cargo/config.toml", false),
+            "the unscoped rule is frozen; widening it changes behaviour for every downstream project"
+        );
+    }
+
     #[test]
     fn affects_compiled_binary_unscoped_preserves_the_pre_phase_45_rule() {
         for path in [
