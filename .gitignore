@@ -58,3 +58,8 @@ graphify-out/cache/
 graphify-out/.graphify_root
 graphify-out/.graphify_semantic_marker
 .planning/graphs/
+
+# External-review raw traces (regenerable, hundreds of KB each)
+.planning/phases/**/codex.err
+.planning/phases/**/codex.clean
+.planning/phases/**/agy.err
