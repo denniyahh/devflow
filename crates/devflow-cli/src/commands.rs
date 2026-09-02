@@ -331,6 +331,14 @@ pub(crate) fn start(
         // fall-open for a clone with no local `develop` is untouched.
         ensure_base_is_a_local_branch(project_root, base)?;
     }
+    // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
+    // the first `save_state`" idiom `yes_ship` uses directly above, and for
+    // the same reason — `advance`, `resume` and the checkout hooks that
+    // merge this phase branch all run in SEPARATE processes whose
+    // environment need not carry `DEVFLOW_BASE_BRANCH`. Without this the
+    // resolved value dies with the `start` process and every later site
+    // silently re-resolves `develop`.
+    state.base_branch = Some(resolved_base.value.clone());
     // T-45-02's compensating control, the same shape as D-12's above: a
     // standing or ambient trunk redirect is never silent.
     if base != DEVELOP {

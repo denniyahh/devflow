@@ -1471,7 +1471,13 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
     // Project-resolved (45-01): `evaluate_agent_result`'s Layer 2 counts
     // commits in a `{trunk}..{feature}` range, so a defaulted trunk
     // over- or under-reports the agent's work.
-    let git_flow = devflow_core::config::git_flow_for_project(project_root);
+    //
+    // CR-02: the run's persisted base wins over ambient configuration —
+    // `advance` is a separate process from the `start` that resolved it, so
+    // re-resolving here counts commits against the wrong trunk whenever the
+    // environment differs.
+    let git_flow =
+        devflow_core::config::git_flow_for_run(project_root, state.base_branch.as_deref());
     let result = agent_result::evaluate_agent_result(project_root, &state, &git_flow)
         .map_err(|err| CliError::Message(format!("could not evaluate agent result: {err}")))?;
     let stage = state.stage;

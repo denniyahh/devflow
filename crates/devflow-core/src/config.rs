@@ -417,6 +417,31 @@ pub fn git_flow_for_project(project_root: &Path) -> GitFlowConfig {
     }
 }
 
+/// The trunk model for a run that already recorded its base at `start`.
+///
+/// CR-02 (45-REVIEW.md): [`git_flow_for_project`] re-resolves from ambient
+/// configuration every time it is called, but `DEVFLOW_BASE_BRANCH` lives in
+/// the environment of whichever shell ran `devflow start`. A monitor death
+/// followed by the documented `devflow resume` recovery — from a fresh shell
+/// without the export — resolved `develop` instead, merged the phase branch
+/// there, and confirmed success against the wrong branch.
+///
+/// The value `start` resolved is persisted on `State::base_branch`, so prefer
+/// it. Fall back to the resolver only when there is nothing persisted, which
+/// is both "nothing configured" and "state written before the field existed".
+///
+/// Takes the persisted value rather than reading it from a `&State` so
+/// `devflow-core`'s config layer stays independent of the state layer.
+pub fn git_flow_for_run(project_root: &Path, persisted_base: Option<&str>) -> GitFlowConfig {
+    match persisted_base {
+        Some(base) => GitFlowConfig {
+            develop: base.to_string(),
+            ..GitFlowConfig::default()
+        },
+        None => git_flow_for_project(project_root),
+    }
+}
+
 fn env_value(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
@@ -771,6 +796,36 @@ mod tests {
         assert_eq!(config.develop, "workspace/example");
         assert_eq!(config.main, MAIN);
         assert_eq!(config.feature_prefix, FEATURE_PREFIX);
+    }
+
+    /// CR-02 (45-REVIEW.md): a run's persisted base outranks whatever the
+    /// CURRENT process would resolve, because the process that merges the
+    /// phase branch is not the process that read `DEVFLOW_BASE_BRANCH`.
+    #[test]
+    fn git_flow_for_run_prefers_the_persisted_base_over_ambient_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvOverride::clear("DEVFLOW_BASE_BRANCH");
+        // Ambient configuration deliberately disagrees with the persisted
+        // value, so the two sources are distinguishable.
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "base_branch = \"workspace/from-file\"\n",
+        )
+        .unwrap();
+
+        let persisted = git_flow_for_run(dir.path(), Some("workspace/persisted"));
+        assert_eq!(persisted.develop, "workspace/persisted");
+        assert_eq!(persisted.main, MAIN);
+        assert_eq!(persisted.feature_prefix, FEATURE_PREFIX);
+
+        // NEGATIVE CONTROL: the SAME call on the SAME root with nothing
+        // persisted must fall through to the resolver and pick up the file
+        // value. Without this half the test also passes against a function
+        // that ignores the project root entirely, and against one that
+        // simply echoes whatever it is handed.
+        let ambient = git_flow_for_run(dir.path(), None);
+        assert_eq!(ambient.develop, "workspace/from-file");
     }
 
     #[test]
