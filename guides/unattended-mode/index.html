@@ -60,7 +60,7 @@
     
     
   <meta name="panzoom-theme" content="material">
-<meta name="panzoom-data" content='{"selectors": [".d2", ".mermaid"], "initial_zoom_level": 1.0}'> </head>
+<meta name="panzoom-data" content='{"selectors": [".mermaid", ".d2"], "initial_zoom_level": 1.0}'> </head>
   
   
     
@@ -1011,6 +1011,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#if-your-planning-artifacts-do-not-live-on-develop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        If your planning artifacts do not live on develop
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1197,6 +1208,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#if-your-planning-artifacts-do-not-live-on-develop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        If your planning artifacts do not live on develop
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1374,6 +1396,33 @@ never route around one — plus the asymmetry that adding an override later is
 easy while removing one after operators have built habits around it is not. If
 the preflight's own reliability turns out to be a problem in practice, that is
 grounds to reopen the decision, not to work around it.</p>
+<h3 id="if-your-planning-artifacts-do-not-live-on-develop">If your planning artifacts do not live on <code>develop</code><a class="headerlink" href="#if-your-planning-artifacts-do-not-live-on-develop" title="Permanent link">&para;</a></h3>
+<p>The first preflight condition reads <code>.planning/config.json</code> <strong>from the phase
+worktree</strong>, and that worktree is forked from your project's base branch. If
+your <code>.planning/</code> lives on a branch other than <code>develop</code> — a personal tracking
+branch, say — a worktree forked from <code>develop</code> does not carry it, the condition
+cannot hold, and every <code>--mode auto</code> launch is refused with nothing you can fix
+inside the run.</p>
+<p>Set the base branch and the problem goes away:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># devflow.toml</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">base_branch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"workspace/yourname"</span>
+</code></pre></div>
+<p>or export <code>DEVFLOW_BASE_BRANCH</code>, which outranks the file.</p>
+<p>Three things to know before you set it:</p>
+<ul>
+<li><strong>It is the whole trunk, not just a start point.</strong> Phase worktrees fork
+  <em>from</em> this branch and the git-flow lifecycle merges phase work back <em>into</em>
+  it. Both resolve from the one value, so they cannot drift apart. The
+  alternative — forking from your planning branch and merging into <code>develop</code> —
+  would drag unrelated history into the integration branch.</li>
+<li><strong><code>main</code> is refused.</strong> So is a blank value and anything beginning with <code>-</code>.
+  An explicitly configured bad value is a hard error naming the value and where
+  it came from, never a quiet fallback to <code>develop</code>.</li>
+<li><strong>It must be an existing local branch.</strong> A remote-tracking name
+  (<code>origin/foo</code>), a <code>refs/heads/</code> path, <code>HEAD</code>, or a commit SHA is refused,
+  because a merge target has to be a branch.</li>
+</ul>
+<p>Leave it unset and nothing changes: the base is <code>develop</code>, exactly as before.</p>
 <h2 id="what-you-will-see-in-your-git-history">What you will see in your git history<a class="headerlink" href="#what-you-will-see-in-your-git-history" title="Permanent link">&para;</a></h2>
 <p>The chain flag lives in <code>.planning/config.json</code>, which is a <strong>tracked</strong> file.
 So:</p>
@@ -1397,7 +1446,7 @@ So:</p>
   history:</p>
 </li>
 </ul>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>fix(gsd): clear a leaked auto-chain flag before launch
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>fix(gsd): clear a leaked auto-chain flag before launch
 </code></pre></div>
 <p>The body explains what the leaked value meant. The repair is also recorded as
   an <code>auto_chain_flag_repaired</code> entry in <code>.devflow/events.jsonl</code>.</p>
