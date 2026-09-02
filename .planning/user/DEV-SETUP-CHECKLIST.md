@@ -93,6 +93,8 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   check could never pass: it warned on every setup commit even when the checklist *was* updated,
   and no input could silence it. A guard now fails loudly when `checklist_path` names a file that
   does not exist, so the next move surfaces immediately instead of degrading to noise.
+  Note the block resolves its own `checklist_root` — the script's `root` variable is assigned
+  only inside the SUMMARY.md branch and is unbound elsewhere under `set -u`.
 - [ ] **[GLOBAL]** Machine-wide `core.hooksPath` at `~/.config/git/hooks/pre-commit` runs
   **gitleaks** (`gitleaks protect --staged --verbose`, brew-installed, v8.30.1) on every commit
   across every repo, then chains to the repo-local hook if one exists. This is what the

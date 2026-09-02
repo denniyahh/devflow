@@ -84,10 +84,13 @@ setup_changed=$(printf '%s\n' "$changed" | grep -E \
 # this one value — and the existence guard below turns a wrong value into a loud
 # failure rather than a check that can never pass (the state it was in from the
 # move to .planning/user/ until 2026-09-02).
+# `root` above is assigned only inside the SUMMARY.md branch, so it is unbound here
+# whenever a commit carries no summary. Resolve our own copy (set -u is active).
+checklist_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
 checklist_path='.planning/user/DEV-SETUP-CHECKLIST.md'
 checklist_changed=$(printf '%s\n' "$changed" | grep -Fx "$checklist_path" || true)
 
-if [ -n "$setup_changed" ] && [ ! -f "$root/$checklist_path" ]; then
+if [ -n "$setup_changed" ] && [ ! -f "$checklist_root/$checklist_path" ]; then
   # Fail loudly: a missing checklist means this check cannot discriminate at all.
   {
     printf '\n\033[33m── post-commit: checklist not found at %s ──\033[0m\n' "$checklist_path"
