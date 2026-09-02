@@ -46,3 +46,15 @@ Thumbs.db
 
 # Bytecode cache
 __pycache__/
+
+# Graphify knowledge graph — the portable payload (graph.json, manifest.json,
+# .graphify_analysis.json) IS tracked on the personal workspace branch so the
+# graph travels between machines. Everything below is deliberately not:
+#   cache/                    tool-version-pinned AST cache (v0.9.53-s2); dead on upgrade
+#   .graphify_root            absolute host path — wrong on any other checkout
+#   .graphify_semantic_marker local token-count marker, no cross-machine meaning
+#   .planning/graphs/         byte-identical duplicate of graphify-out/graph.json
+graphify-out/cache/
+graphify-out/.graphify_root
+graphify-out/.graphify_semantic_marker
+.planning/graphs/
