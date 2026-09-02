@@ -54,6 +54,40 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
 
+/// Shared policy for full-execute Code prompts. This advises the agent during
+/// one-shot Code execution, while [`checkpoint_auto_decide_prompt`] is injected
+/// into a resumed session after DevFlow's own human-blocking gate finds no
+/// operator. They are complementary, not duplicates; neither should replace or
+/// be deleted as the other.
+const CODE_STAGE_POLICY: &str = "\
+## Advisory incremental self-review\n\
+\n\
+After each plan or wave lands, perform a quick, shallow self-check \
+for doc accuracy, leaked data, CI/build correctness, and \
+external-state claims. Record any drift in the working output and \
+continue execution; the authoritative review happens during Ship. \
+This check must not pause execution or request human input.\n\
+\n\
+## Unattended decision checkpoints\n\
+\n\
+When you reach a `decision` checkpoint and no operator is available, resolve \
+it rather than pausing: this run is unattended and nobody is coming. Compare \
+the presented options against the phase goal and constraints, and do not choose \
+an option merely because it is the first option in the list. The GSD workflow \
+being invoked describes selecting the first option; this instruction supersedes \
+that positional procedure for merit-based choices.\n\
+\n\
+An option marked recommended is evidence to weigh, not an automatically \
+decisive answer. In your final message, record the comparison that produced the \
+choice: which options you considered and why the chosen one won, not merely a \
+sentence asserting the choice. The final message is the only record of the \
+decision.\n\
+\n\
+This authority does not extend to a `blocking-human` gate or a \
+package-verification checkpoint. Those remain human-only: do not self-resolve \
+or approve them; report them instead. This policy must not pause execution or \
+request human input.";
+
 /// The data a stage wants rendered, with NO agent-specific syntax.
 ///
 /// This is the de-Claude-ification artifact (999.31 / 37-01): the old
@@ -342,13 +376,7 @@ fn code_stage_prompt(phase: PhaseId) -> String {
     );
     format!(
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
-        ## Advisory incremental self-review\n\
-        \n\
-        After each plan or wave lands, perform a quick, shallow self-check \
-        for doc accuracy, leaked data, CI/build correctness, and \
-        external-state claims. Record any drift in the working output and \
-        continue execution; the authoritative review happens during Ship. \
-        This check must not pause execution or request human input.\n\
+        {CODE_STAGE_POLICY}\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -438,13 +466,7 @@ fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &st
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
             must be preserved verbatim.\n\n\
-            ## Advisory incremental self-review\n\
-            \n\
-            After each plan or wave lands, perform a quick, shallow self-check \
-            for doc accuracy, leaked data, CI/build correctness, and \
-            external-state claims. Record any drift in the working output and \
-            continue execution; the authoritative review happens during Ship. \
-            This check must not pause execution or request human input.\n\
+            {CODE_STAGE_POLICY}\n\
             \n\
             {COMPLETION_PROTOCOL}"
         ),
