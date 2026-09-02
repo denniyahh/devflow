@@ -10,3 +10,4 @@ Rules:
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- In a temporary plan worktree, update locally but do not commit Graphify output. After the phase's source changes are integrated, refresh once and make one standalone snapshot commit on `workspace/denniyahh`, containing only `graph.json`, `manifest.json`, and `.graphify_analysis.json`; never carry that snapshot into a `develop` or `main` PR.
