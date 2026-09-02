@@ -5,7 +5,7 @@ milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 45
 current_phase_name: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94
 status: verified
-stopped_at: Phase 45 verification resolved. `/gsd-verify-work 45` (2026-09-02): 4 UAT checks auto-passed from coverage blocks; the sole live `devflow start --mode auto` end-to-end check was deferred by operator to a later phase (not possible in this env yet), filed as backlog 999.119 and accepted as a third PASSED (override) on 45-VERIFICATION.md. Verification status now `passed`. Next: ship feature/phase-45 → develop, then `/gsd-audit-milestone` + `/gsd-complete-milestone` for v2.8.0.
+stopped_at: Phase 45 verification resolved via `/gsd-verify-work 45` (2026-09-02): 4 UAT checks auto-passed from coverage blocks; the sole live `devflow start --mode auto` end-to-end check was deferred by operator to a later phase (not possible in this env yet), filed as backlog 999.119 and accepted as a third PASSED (override) on 45-VERIFICATION.md — verification status now `passed`. Phase 45 CODE shipped as v2.12.0 (PR #201, merged 2026-09-02; main==develop). Remaining for v2.8.0-milestone close: reconcile ROADMAP phase tables (44/45 still read Not started), clear/ack 8 legacy audit items, run /gsd-audit-milestone, then /gsd-complete-milestone.
 last_updated: "2026-09-02T23:12:00.000Z"
 last_activity: 2026-09-02
 state_head: b39d316f385afb61066fc47fd1cf102dd1e3da76
@@ -40,10 +40,11 @@ disposition in `44-codex-end-to-end-verification/44-CODEX-E2E.md`. PR #154
 (`feature/phase-44-pr` → `develop`) merged 2026-08-27; also closed backlog item 999.113
 (container-root permission test fragility) discovered while pushing.
 
-Current v2.8.0 milestone progress: all 6 phases (40-45) complete and verified. Phase 45's live
-`devflow start --mode auto` end-to-end check is deferred to backlog 999.119 (PASSED override).
-feature/phase-45 is not yet merged to develop — ship it, then run /gsd-audit-milestone and
-/gsd-complete-milestone for v2.8.0.
+Current v2.8.0 milestone progress: all 6 phases (40-45) complete, verified, and SHIPPED
+(40→v2.8.0 … 44→v2.11.0, 45→v2.12.0; main==develop). Phase 45's live `devflow start --mode auto`
+end-to-end check is deferred to backlog 999.119 (PASSED override). Remaining before the
+v2.8.0-milestone close: reconcile the ROADMAP phase tables, clear 8 legacy audit items, run
+/gsd-audit-milestone, then /gsd-complete-milestone.
 
 ---
 

@@ -17,8 +17,8 @@ change.
 | 41 | Antigravity Driver | ANTG-01, ANTG-02, ANTG-03, HYG-01, HYG-02 | Complete    |
 | 42 | Hermes Driver | HRMS-01, HRMS-02, HRMS-03 | Complete    |
 | 43 | OpenCode Driver Completion | OPCD-01, OPCD-02, OPCD-03 | Complete    |
-| 44 | Codex End-to-End Verification | CODE-01 | Not started |
-| 45 | Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94) | AUTO-01, AUTO-02, DECN-01 | Not started |
+| 44 | Codex End-to-End Verification | CODE-01 | Complete    |
+| 45 | Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94) | AUTO-01, AUTO-02, DECN-01 | Complete    |
 
 ### Phase 40: Pi Dogfood
 
@@ -109,7 +109,15 @@ Plans:
   2. Each surfaced gap is closed or re-filed with evidence.
   3. No regression to the existing Codex driver behavior (workspace tests green).
 
-**Plans**: TBD
+**Plans**: 5/5 plans complete (44-00 … 44-04) — shipped v2.11.0 (PR #154, 2026-08-27)
+
+Plans:
+
+- [x] 44-00-PLAN.md
+- [x] 44-01-PLAN.md
+- [x] 44-02-PLAN.md
+- [x] 44-03-PLAN.md
+- [x] 44-04-PLAN.md
 
 ### Phase 45: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94)
 
@@ -237,8 +245,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 41 | — | Complete | 2026-08-20 |
 | 42 | — | Complete | 2026-08-21 |
 | 43 | 2/2 | Complete | 2026-08-24 |
-| 44 | — | Not started | — |
-| 45 | 3/3 | In Progress|  |
+| 44 | 5/5 | Complete | 2026-08-27 |
+| 45 | 3/3 | Complete | 2026-09-02 |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
