@@ -15,6 +15,14 @@ use std::path::Path;
 
 use crate::CliError;
 
+/// 45-02 (AUTO-02 / D-02): the directory prefix every Cargo workspace member
+/// of DevFlow's own root manifest lives under (`crates/devflow-core`,
+/// `crates/devflow-cli` — the same two paths `is_self_dogfood_workspace`
+/// matches). The trailing separator is load-bearing, not cosmetic: it makes
+/// this a path-SEGMENT prefix, so `crates-extras/foo/src/lib.rs` and
+/// `vendor/crates/devflow-core/src/lib.rs` cannot satisfy it (T-45-10).
+const WORKSPACE_MEMBER_PREFIX: &str = "crates/";
+
 /// Whether the build embedded in `embedded_commit` is stale relative to
 /// `execution_root`'s current `HEAD` — the tree where the code under test
 /// actually lives (18c: the phase's worktree when one is set, else
@@ -45,7 +53,11 @@ pub(crate) enum Staleness {
     Indeterminate,
 }
 
-fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Staleness {
+fn embedded_commit_is_stale(
+    execution_root: &Path,
+    embedded_commit: &str,
+    workspace_scoped: bool,
+) -> Staleness {
     if embedded_commit.is_empty() {
         return Staleness::Indeterminate;
     }
@@ -56,7 +68,7 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
         Ok(Some(0)) => match run_git_stdout(execution_root, &["rev-parse", "HEAD"]) {
             Some(head) if head.trim() == embedded_commit.trim() => Staleness::Fresh,
             Some(_) => {
-                if ancestry_range_affects_build(execution_root, embedded_commit) {
+                if ancestry_range_affects_build(execution_root, embedded_commit, workspace_scoped) {
                     Staleness::Stale
                 } else {
                     Staleness::Fresh
@@ -81,7 +93,11 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
                 // divergent range that touches nothing build-affecting
                 // (e.g. only `.planning/` docs) must not hard-block.
                 Ok(Some(1)) => {
-                    if ancestry_range_affects_build(execution_root, embedded_commit) {
+                    if ancestry_range_affects_build(
+                        execution_root,
+                        embedded_commit,
+                        workspace_scoped,
+                    ) {
                         Staleness::Stale
                     } else {
                         Staleness::Fresh
@@ -107,12 +123,22 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
 /// — mirrors `tree_has_modified_build_inputs`'s `None => Indeterminate`
 /// posture, adapted here to "assume the worse outcome" since this helper
 /// only returns a `bool`, not a tri-state.
-fn ancestry_range_affects_build(execution_root: &Path, embedded_commit: &str) -> bool {
+///
+/// 45-02 (AUTO-02): `workspace_scoped` is threaded straight through to
+/// `affects_compiled_binary` — this helper applies no rule of its own.
+fn ancestry_range_affects_build(
+    execution_root: &Path,
+    embedded_commit: &str,
+    workspace_scoped: bool,
+) -> bool {
     run_git_stdout(
         execution_root,
         &["diff", "--name-only", embedded_commit, "HEAD"],
     )
-    .map(|out| out.lines().any(affects_compiled_binary))
+    .map(|out| {
+        out.lines()
+            .any(|line| affects_compiled_binary(line, workspace_scoped))
+    })
     .unwrap_or(true)
 }
 
@@ -140,7 +166,7 @@ pub(crate) fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<Strin
 /// (Indeterminate — cannot tell "same dirt" from "more dirt" without a
 /// timestamp, Pitfall 4). Returns `None` when git itself is unavailable, so
 /// the composite check falls back to the ancestry arm alone.
-fn tree_has_modified_build_inputs(execution_root: &Path) -> Option<bool> {
+fn tree_has_modified_build_inputs(execution_root: &Path, workspace_scoped: bool) -> Option<bool> {
     let status = run_git_stdout(execution_root, &["status", "--porcelain"])?;
     if status.trim().is_empty() {
         return Some(false);
@@ -151,11 +177,10 @@ fn tree_has_modified_build_inputs(execution_root: &Path) -> Option<bool> {
     // That fell through to the ancestry arm as Fresh, letting a stale binary
     // drive its own workspace — the exact false-evidence class this gate exists
     // to catch. Untracked files stay excluded, as under `ls-files -m`.
-    Some(
-        status
-            .lines()
-            .any(|line| porcelain_tracked_path(line).is_some_and(affects_compiled_binary)),
-    )
+    Some(status.lines().any(|line| {
+        porcelain_tracked_path(line)
+            .is_some_and(|path| affects_compiled_binary(path, workspace_scoped))
+    }))
 }
 
 /// The repo-relative path a `git status --porcelain` line refers to, or `None`
@@ -163,6 +188,14 @@ fn tree_has_modified_build_inputs(execution_root: &Path) -> Option<bool> {
 /// renames/copies rendered as `ORIG -> PATH`; the destination is the path that
 /// exists in the worktree. Paths containing special characters are quoted by
 /// git, so surrounding quotes are stripped.
+///
+/// 45-02 (REVIEWS finding 2, `./`-prefix sub-item — REJECTED with a reason
+/// rather than implemented): a leading `./` is deliberately NOT stripped.
+/// Neither producer feeding `affects_compiled_binary` emits one — `git status
+/// --porcelain` and `git diff --name-only` both emit repo-relative paths
+/// without a `./` prefix — so a stripping branch here would be speculative
+/// code that no test could reach in the failing direction. Recorded so a
+/// future reader does not re-raise it as an oversight.
 fn porcelain_tracked_path(line: &str) -> Option<&str> {
     if line.len() < 4 || line.starts_with("??") {
         return None;
@@ -180,17 +213,76 @@ fn porcelain_tracked_path(line: &str) -> Option<&str> {
 /// Found live — DevFlow's own `ChangelogAppend` hook dirtied `CHANGELOG.md`
 /// during the Validate→Ship transition, which an unfiltered check read as
 /// a stale build, hard-blocking Ship on a file the pipeline had just written.
-fn affects_compiled_binary(rel_path: &str) -> bool {
+///
+/// 45-02 (AUTO-02 / D-02): `workspace_scoped` selects between two rules.
+///
+/// - `false` — every project DevFlow drives that is NOT DevFlow's own
+///   workspace. The pre-Phase-45 rule, preserved byte-for-byte: any path
+///   ending in `.rs`, or equal to / suffixed by a separator plus one of the
+///   four build-affecting names. Standard Cargo layout keeps its sources in
+///   `src/`, not `crates/`, so narrowing here would silently delete the
+///   stale-build warning for every downstream project (T-45-11).
+/// - `true` — DevFlow's own workspace, as decided by
+///   `is_self_dogfood_workspace`, the only place a Stale verdict hard-BLOCKS
+///   (D-18). Only Cargo workspace members (`WORKSPACE_MEMBER_PREFIX`) and the
+///   four root build files can change the compiled binary, so
+///   `.planning/spikes/foo/src/main.rs` — throwaway probe code no
+///   `cargo build` of this workspace can reach — is no longer a build input.
+///
+/// **Fail direction.** This predicate fails toward Stale everywhere it is
+/// uncertain: its callers treat a git failure as build-affecting
+/// (`ancestry_range_affects_build`'s `unwrap_or(true)`) and an unreadable
+/// tree as Indeterminate, never Fresh. The scoped branch deliberately trades
+/// a narrower true-positive surface for eliminating the `.planning/spikes/`
+/// false positive; the surface it gives up is limited to paths a `cargo
+/// build` of this workspace cannot reach, so no give-up path can make a real
+/// build stale. A narrowing that lost a reachable true positive would be
+/// worse than the false positive it fixes (T-45-09, the Phase 16
+/// false-evidence incident).
+fn affects_compiled_binary(rel_path: &str, workspace_scoped: bool) -> bool {
     const BUILD_AFFECTING_FILES: [&str; 4] = [
         "Cargo.toml",
         "Cargo.lock",
         "build.rs",
         "rust-toolchain.toml",
     ];
-    rel_path.ends_with(".rs")
-        || BUILD_AFFECTING_FILES
-            .iter()
-            .any(|name| rel_path == *name || rel_path.ends_with(&format!("/{name}")))
+
+    if !workspace_scoped {
+        // Pre-Phase-45 rule, unchanged. No parent-segment rejection here:
+        // adding one would change behaviour for every non-DevFlow project,
+        // which the zero-regression prohibition forbids.
+        return rel_path.ends_with(".rs")
+            || BUILD_AFFECTING_FILES
+                .iter()
+                .any(|name| rel_path == *name || rel_path.ends_with(&format!("/{name}")));
+    }
+
+    // 1. Reject any path carrying a parent-directory SEGMENT, evaluated
+    //    first and unconditionally. `crates/../foo.rs` satisfies both halves
+    //    of the prefix rule below, so without this it would classify as a
+    //    workspace member while escaping the workspace entirely (T-45-10).
+    //    Compared segment-wise, never via `str::contains`, which would also
+    //    reject a legitimately-named file such as
+    //    `crates/devflow-core/src/a..b.rs`.
+    if rel_path.split('/').any(|segment| segment == "..") {
+        return false;
+    }
+
+    // 2. The four root build files, by EXACT equality — a root `Cargo.toml`
+    //    changes the build; `.planning/spikes/foo/Cargo.toml` does not.
+    if BUILD_AFFECTING_FILES.contains(&rel_path) {
+        return true;
+    }
+
+    // 3. Otherwise a workspace member: the prefix carries its own trailing
+    //    separator, so this is a path-SEGMENT prefix — `crates-extras/` and
+    //    `vendor/crates/` cannot satisfy it.
+    rel_path.starts_with(WORKSPACE_MEMBER_PREFIX)
+        && (rel_path.ends_with(".rs")
+            || rel_path
+                .rsplit('/')
+                .next()
+                .is_some_and(|last| BUILD_AFFECTING_FILES.contains(&last)))
 }
 
 /// D-19: composite staleness (CR-02, 17-11: the dirty-flag arm replaces the
@@ -210,12 +302,13 @@ fn combined_staleness(
     execution_root: &Path,
     embedded_commit: &str,
     build_dirty: bool,
+    workspace_scoped: bool,
 ) -> Staleness {
-    let ancestry = embedded_commit_is_stale(execution_root, embedded_commit);
+    let ancestry = embedded_commit_is_stale(execution_root, embedded_commit, workspace_scoped);
     if ancestry == Staleness::Stale {
         return Staleness::Stale;
     }
-    match tree_has_modified_build_inputs(execution_root) {
+    match tree_has_modified_build_inputs(execution_root, workspace_scoped) {
         Some(true) if build_dirty => Staleness::Indeterminate,
         Some(true) => Staleness::Stale,
         _ => ancestry,
@@ -328,8 +421,19 @@ pub(crate) fn enforce_build_staleness(
     build_dirty: bool,
 ) -> Result<(), CliError> {
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-    let staleness = combined_staleness(execution_root, embedded_commit, build_dirty);
+    // 45-02 (AUTO-02): this ordering is now LOAD-BEARING — `self_dogfood` is
+    // no longer only the Block-vs-Warn selector, it is also the
+    // `workspace_scoped` flag threaded down into `affects_compiled_binary`,
+    // so it must be computed BEFORE `combined_staleness`, not after.
+    //
+    // `is_self_dogfood_workspace` deliberately stays anchored on
+    // `project_root`, NOT `execution_root` — the reorder must not quietly
+    // change which root decides the scope. The reason is unchanged and
+    // documented above (Assumption A3): it answers "is this workspace
+    // DevFlow's own repo at all", which is a property of the main checkout's
+    // root manifest, not of whichever tree the code under test lives in.
     let self_dogfood = is_self_dogfood_workspace(project_root);
+    let staleness = combined_staleness(execution_root, embedded_commit, build_dirty, self_dogfood);
     match staleness_outcome(self_dogfood, staleness) {
         StalenessOutcome::Block => {
             let message = format!(
@@ -597,8 +701,15 @@ mod tests {
         git(&["config", "user.name", "t"], &project_root);
         git(&["config", "commit.gpgsign", "false"], &project_root);
         git(&["config", "core.hooksPath", "/dev/null"], &project_root);
-        std::fs::create_dir_all(project_root.join("src")).unwrap();
-        std::fs::write(project_root.join("src/lib.rs"), "// base\n").unwrap();
+        // This is a DevFlow-workspace fixture when callers add the matching
+        // root manifest below, so its source must live in a real workspace
+        // member rather than the ordinary-project `src/` layout.
+        std::fs::create_dir_all(project_root.join("crates/devflow-core/src")).unwrap();
+        std::fs::write(
+            project_root.join("crates/devflow-core/src/lib.rs"),
+            "// base\n",
+        )
+        .unwrap();
         git(&["add", "."], &project_root);
         git(&["commit", "-q", "-m", "base"], &project_root);
         let embedded_commit = run_git_stdout(&project_root, &["rev-parse", "HEAD"])
@@ -622,10 +733,18 @@ mod tests {
         // project_root's HEAD (develop) never moves. This asymmetry (Fresh
         // against project_root, Stale against the worktree) is exactly the
         // Round 4 CR-01 mechanism.
-        std::fs::write(worktree_path.join("src/lib.rs"), "// wt commit 1\n").unwrap();
+        std::fs::write(
+            worktree_path.join("crates/devflow-core/src/lib.rs"),
+            "// wt commit 1\n",
+        )
+        .unwrap();
         git(&["add", "."], &worktree_path);
         git(&["commit", "-q", "-m", "wt commit 1"], &worktree_path);
-        std::fs::write(worktree_path.join("src/lib.rs"), "// wt commit 2\n").unwrap();
+        std::fs::write(
+            worktree_path.join("crates/devflow-core/src/lib.rs"),
+            "// wt commit 2\n",
+        )
+        .unwrap();
         git(&["add", "."], &worktree_path);
         git(&["commit", "-q", "-m", "wt commit 2"], &worktree_path);
 
@@ -663,12 +782,12 @@ mod tests {
         let project_root = outer.path().join("project");
 
         assert_eq!(
-            embedded_commit_is_stale(&project_root, &embedded_commit),
+            embedded_commit_is_stale(&project_root, &embedded_commit, false),
             Staleness::Fresh,
             "project_root's HEAD never moved, so the embedded commit is still an exact match"
         );
         assert_eq!(
-            embedded_commit_is_stale(&worktree_path, &embedded_commit),
+            embedded_commit_is_stale(&worktree_path, &embedded_commit, false),
             Staleness::Stale,
             "the worktree branch advanced two commits past the embedded commit — Round 4 \
              CR-01's mechanism: evaluated against the wrong tree, this same commit reads Fresh"
@@ -778,7 +897,7 @@ mod tests {
         // would silently classify `Indeterminate` via a foreign-SHA
         // ancestry lookup and never actually reproduce the pre-fix block.
         std::fs::write(
-            worktree_path.join("src/lib.rs"),
+            worktree_path.join("crates/devflow-core/src/lib.rs"),
             "// wt uncommitted dirty change (not committed)\n",
         )
         .unwrap();
@@ -992,13 +1111,25 @@ mod tests {
         // this previously asserted Fresh, which encoded the WR-01 bug (a
         // clean-tree binary built from `base` would have been misclassified
         // Fresh even though two commits landed on top of it since).
-        assert_eq!(embedded_commit_is_stale(root, &base), Staleness::Stale);
-        // The genuine Fresh case: an exact match to the current HEAD.
-        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
-        assert_eq!(embedded_commit_is_stale(root, &side), Staleness::Stale);
-        assert_eq!(embedded_commit_is_stale(root, ""), Staleness::Indeterminate);
         assert_eq!(
-            embedded_commit_is_stale(root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            embedded_commit_is_stale(root, &base, false),
+            Staleness::Stale
+        );
+        // The genuine Fresh case: an exact match to the current HEAD.
+        assert_eq!(
+            embedded_commit_is_stale(root, &head, false),
+            Staleness::Fresh
+        );
+        assert_eq!(
+            embedded_commit_is_stale(root, &side, false),
+            Staleness::Stale
+        );
+        assert_eq!(
+            embedded_commit_is_stale(root, "", false),
+            Staleness::Indeterminate
+        );
+        assert_eq!(
+            embedded_commit_is_stale(root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", false),
             Staleness::Indeterminate
         );
     }
@@ -1040,7 +1171,7 @@ mod tests {
             // scoped to this child process only.
             let commit = std::env::var(INNER_COMMIT).expect("inner commit env set by parent");
             assert_eq!(
-                embedded_commit_is_stale(Path::new(&root), &commit),
+                embedded_commit_is_stale(Path::new(&root), &commit, false),
                 Staleness::Stale,
                 "a hostile GIT_DIR pointed at an unrelated repository must not \
                  change embedded_commit_is_stale's verdict for execution_root"
@@ -1137,8 +1268,21 @@ mod tests {
         // 21d/D-07: this must stay a genuine code change after the build, or
         // the content-aware ancestry arm would (correctly) reclassify this
         // fixture Fresh, breaking this test's Stale/hard-block intent.
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        //
+        // 45-02 (AUTO-02): the file lives under `crates/devflow-cli/` — a
+        // real member of the `members` array this fixture declares two
+        // commits above — rather than at a root `src/`. The assertions are
+        // unchanged; the path is. A self-dogfood workspace by definition
+        // keeps its sources in its declared members, so a root `src/main.rs`
+        // in a workspace whose members are `crates/*` is a shape DevFlow's
+        // own repo cannot have, and under the scoped rule it is correctly
+        // not a build input.
+        std::fs::create_dir_all(root.join("crates/devflow-cli/src")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "unrelated follow-up"]);
 
@@ -1152,11 +1296,11 @@ mod tests {
         );
 
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Stale
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, false),
+            combined_staleness(root, &embedded_commit, false, false),
             Staleness::Stale
         );
         assert!(is_self_dogfood_workspace(root));
@@ -1277,7 +1421,7 @@ mod tests {
         );
 
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Ahead,
             "a descendant embedded commit is newer than HEAD, not stale"
         );
@@ -1358,12 +1502,12 @@ mod tests {
             "fixture must have exactly one dirty tracked file"
         );
         assert_eq!(
-            tree_has_modified_build_inputs(root),
+            tree_has_modified_build_inputs(root, false),
             Some(false),
             "a dirty CHANGELOG.md cannot change the compiled binary"
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, build_dirty),
+            combined_staleness(root, &embedded_commit, build_dirty, false),
             Staleness::Fresh,
             "a doc-only dirty tree must not be Stale"
         );
@@ -1384,7 +1528,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            tree_has_modified_build_inputs(root),
+            tree_has_modified_build_inputs(root, false),
             Some(true),
             "a modified .rs file is genuine staleness input"
         );
@@ -1401,18 +1545,18 @@ mod tests {
             "fixture precondition: `ls-files -m` is blind to the staged .rs edit"
         );
         assert_eq!(
-            tree_has_modified_build_inputs(root),
+            tree_has_modified_build_inputs(root, false),
             Some(true),
             "a STAGED source edit is just as much a staleness input as an unstaged one"
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, build_dirty),
+            combined_staleness(root, &embedded_commit, build_dirty, false),
             Staleness::Stale,
             "a staged, uncommitted source edit on a clean build is Stale"
         );
         git(&["reset", "-q"]);
         assert_eq!(
-            combined_staleness(root, &embedded_commit, build_dirty),
+            combined_staleness(root, &embedded_commit, build_dirty, false),
             Staleness::Stale
         );
         assert!(
@@ -1467,11 +1611,20 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
-        assert_eq!(combined_staleness(root, &head, false), Staleness::Fresh);
+        assert_eq!(
+            embedded_commit_is_stale(root, &head, false),
+            Staleness::Fresh
+        );
+        assert_eq!(
+            combined_staleness(root, &head, false, false),
+            Staleness::Fresh
+        );
 
         std::fs::write(root.join("src/lib.rs"), "// modified after build\n").unwrap();
-        assert_eq!(combined_staleness(root, &head, false), Staleness::Stale);
+        assert_eq!(
+            combined_staleness(root, &head, false, false),
+            Staleness::Stale
+        );
     }
 
     /// 21d/D-07 (999.29): a strict-ancestor range whose ONLY intervening
@@ -1519,12 +1672,12 @@ mod tests {
         git(&["commit", "-q", "-m", "docs only"]);
 
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Fresh,
             "a docs-only strict-ancestor range must not hard-block (999.29)"
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, false),
+            combined_staleness(root, &embedded_commit, false, false),
             Staleness::Fresh
         );
     }
@@ -1580,12 +1733,12 @@ mod tests {
         git(&["commit", "-q", "-m", "docs + nested source"]);
 
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Stale,
             "a mixed docs+source range must still hard-block (real-change protection preserved)"
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, false),
+            combined_staleness(root, &embedded_commit, false, false),
             Staleness::Stale
         );
     }
@@ -1666,11 +1819,11 @@ mod tests {
         );
 
         assert!(
-            ancestry_range_affects_build(root, &embedded_commit),
+            ancestry_range_affects_build(root, &embedded_commit, false),
             "a git failure in the ancestry arm must fail toward Stale (true), never a false Fresh"
         );
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Stale,
             "a git diff failure over the ancestry range must never yield a false Fresh"
         );
@@ -1721,16 +1874,19 @@ mod tests {
         // the embedded build's own dirty flag says it was ALSO built from a
         // dirty tree. Ancestry alone says Fresh (embedded_commit == HEAD).
         std::fs::write(root.join("src/lib.rs"), "// modified\n").unwrap();
-        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
         assert_eq!(
-            tree_has_modified_build_inputs(root),
+            embedded_commit_is_stale(root, &head, false),
+            Staleness::Fresh
+        );
+        assert_eq!(
+            tree_has_modified_build_inputs(root, false),
             Some(true),
             "fixture must have a dirty, build-affecting tree"
         );
 
         let build_was_dirty = true;
         assert_eq!(
-            combined_staleness(root, &head, build_was_dirty),
+            combined_staleness(root, &head, build_was_dirty, false),
             Staleness::Indeterminate,
             "cannot distinguish \"same dirt\" from \"more dirt\" without a timestamp"
         );
@@ -1961,7 +2117,7 @@ mod tests {
         );
 
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Fresh,
             "23g / 2026-07-26 acceptance-run regression shape: a docs-only divergent \
              range must not hard-block"
@@ -2038,7 +2194,7 @@ mod tests {
         );
 
         assert_eq!(
-            embedded_commit_is_stale(root, &embedded_commit),
+            embedded_commit_is_stale(root, &embedded_commit, false),
             Staleness::Stale,
             "a divergent range touching a real source file must still hard-block, \
              even after the 23g content-check fix"
@@ -2260,13 +2416,21 @@ mod tests {
         );
     }
 
-    /// TEMPORARY RED PROBE (45-02) — deleted in the GREEN commit. It asserts
-    /// the SCOPED half of `non_dogfood_project_keeps_the_broad_build_input_rule`
-    /// against HEAD's single-argument `tree_has_modified_build_inputs`, which
-    /// is the only way to observe that half failing before the
-    /// `workspace_scoped` parameter exists to express it.
+    /// T-45-11: narrowing the predicate for DevFlow's own workspace must not
+    /// make the staleness gate quieter for any OTHER project. Standard Cargo
+    /// layout puts sources in `src/`, not `crates/`, so an unconditional
+    /// `crates/` rule would classify a modified `src/main.rs` as
+    /// not-build-affecting and silently delete that project's stale-build
+    /// warning — DevFlow is published to crates.io and drives other people's
+    /// repositories.
+    ///
+    /// NEGATIVE CONTROL in the same body: the IDENTICAL input evaluated with
+    /// `workspace_scoped = true` returns `Some(false)`. The pair is what
+    /// proves the flag is load-bearing rather than ignored — a single
+    /// direction would pass equally well against a parameter the body never
+    /// reads.
     #[test]
-    fn red_probe_scoped_rule_rejects_root_src_main_rs() {
+    fn non_dogfood_project_keeps_the_broad_build_input_rule() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2292,10 +2456,28 @@ mod tests {
         git(&["commit", "-q", "-m", "base"]);
         std::fs::write(root.join("src/main.rs"), "fn main() { /* changed */ }\n").unwrap();
 
+        assert!(
+            !is_self_dogfood_workspace(root),
+            "fixture precondition: this must NOT be DevFlow's own workspace, or the \
+             unscoped half below would not be testing the downstream-project case"
+        );
+
         assert_eq!(
-            tree_has_modified_build_inputs(root),
+            tree_has_modified_build_inputs(root, false),
+            Some(true),
+            "T-45-11: outside DevFlow's own workspace the pre-Phase-45 rule stands — a \
+             modified `src/main.rs` still reads as a build input, or every downstream \
+             Rust project silently loses its stale-build warning"
+        );
+
+        // NEGATIVE CONTROL: the same tree, the same function, only the flag
+        // differs. If both directions agreed, the flag would be inert and
+        // the assertion above would be measuring nothing.
+        assert_eq!(
+            tree_has_modified_build_inputs(root, true),
             Some(false),
-            "scoped rule: a root `src/main.rs` is not a `crates/` workspace member"
+            "in workspace scope a root `src/main.rs` is not a `crates/` workspace member — \
+             this is the half AUTO-02 adds, and it must differ from the unscoped half"
         );
     }
 }
