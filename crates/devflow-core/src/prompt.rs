@@ -78,10 +78,10 @@ being invoked describes selecting the first option; this instruction supersedes 
 that positional procedure for merit-based choices.\n\
 \n\
 An option marked recommended is evidence to weigh, not an automatically \
-decisive answer. In your final message, record the comparison that produced the \
-choice: which options you considered and why the chosen one won, not merely a \
-sentence asserting the choice. The final message is the only record of the \
-decision.\n\
+decisive answer. In your final message, record the reasoning and comparison that \
+produced the choice: which options you considered and why the chosen one won, \
+not merely a sentence asserting the choice. The final message is the only record \
+of the decision.\n\
 \n\
 This authority does not extend to a `blocking-human` gate or a \
 package-verification checkpoint. Those remain human-only: do not self-resolve \
