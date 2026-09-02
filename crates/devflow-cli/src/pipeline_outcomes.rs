@@ -20,7 +20,6 @@ use crate::pipeline_gate::{
     transition,
 };
 use crate::pipeline_launch::launch_stage;
-use devflow_core::config::GitFlowConfig;
 use devflow_core::gates::{GateAction, GateResponse, Gates};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
@@ -596,8 +595,11 @@ pub(crate) fn handle_validate_outcome(
         // point: the Code stage's fix command is a GSD command that commits
         // `.planning/` artifacts on cycles that changed no source.
         state.phase_validate_failures = state.phase_validate_failures.saturating_add(1);
-        match agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase)
-        {
+        match agent_result::phase_commit_count(
+            project_root,
+            &devflow_core::config::git_flow_for_project(project_root),
+            state.phase,
+        ) {
             Some(current) => {
                 if mode::consecutive_failures_made_progress(
                     state.last_validate_failure_commit_count,
@@ -1053,7 +1055,11 @@ pub(crate) fn run_checkout_hooks(
             return false;
         }
     };
-    let git_flow = GitFlowConfig::default();
+    // The single production `HookContext` construction, and therefore the one
+    // point where the project-resolved branch model reaches every checkout
+    // hook (45-01 Task 3). Defaulted here, every hook silently re-defaulted
+    // the trunk regardless of what `start` forked from.
+    let git_flow = devflow_core::config::git_flow_for_project(project_root);
     let mut all_succeeded = true;
     let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
     let hook_root = hook_context_root(project_root, state, terminal_batch);
@@ -1097,9 +1103,12 @@ pub(crate) fn run_checkout_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: production code resolves its branch model from the
+    // project (45-01), so the defaults survive here as fixture input only.
     use crate::pipeline_gate::prepare_loop_back_to_code;
     use crate::pipeline_launch::advance;
     use crate::test_support::*;
+    use devflow_core::config::GitFlowConfig;
     use devflow_core::git::GitFlow;
     use devflow_core::mode::Mode;
     use devflow_core::prompt;

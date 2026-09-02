@@ -650,7 +650,11 @@ pub(crate) fn reference(
     branch: Option<String>,
     refresh: bool,
 ) -> Result<(), CliError> {
-    let branch = branch.unwrap_or_else(|| DEVELOP.to_string());
+    // Project-resolved (45-01, review round 2): defaulting to the DEVELOP
+    // constant snapshotted the wrong branch on a project whose trunk is
+    // configured elsewhere — and then printed a message naming the branch it
+    // snapshotted, so the operator was told the wrong thing confidently.
+    let branch = branch.unwrap_or_else(|| config::git_flow_for_project(project_root).develop);
     let path = worktree::reference_path(project_root);
 
     // Detached snapshot: `branch` may already be checked out in the main
@@ -770,7 +774,10 @@ fn remove_worktree_with_retry(
 /// `cleanup --force` run could delete a worktree a live agent/monitor is
 /// still writing into (review: Codex HIGH, fail-closed on a live agent).
 pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
-    let git = GitFlow::new(project_root);
+    // Project-resolved (45-01): `cleanup_merged` computes "merged" relative
+    // to the trunk and treats it as protected — both must be the configured
+    // one, or this sweep can delete a branch that was never merged.
+    let git = GitFlow::for_project(project_root);
     let worktrees_dir = worktree::worktrees_dir(project_root);
     let reference = worktree::reference_path(project_root);
     let states = workflow::list_states(project_root);
@@ -2150,7 +2157,7 @@ fn describe_worktree_dir(name: &str) -> String {
 }
 
 pub(crate) fn list(project_root: &Path) -> Result<(), CliError> {
-    let git = GitFlow::new(project_root);
+    let git = GitFlow::for_project(project_root);
     let branches = git.list_feature_branches()?;
     if branches.is_empty() {
         println!("no open feature branches");
@@ -2170,7 +2177,8 @@ pub(crate) fn list(project_root: &Path) -> Result<(), CliError> {
 }
 
 fn print_open_branches(project_root: &Path) {
-    let git = GitFlow::new(project_root);
+    let git = GitFlow::for_project(project_root);
+    let base = config::git_flow_for_project(project_root).develop;
     let branches = match git.list_feature_branches() {
         Ok(b) => b,
         Err(_) => return,
@@ -2180,8 +2188,12 @@ fn print_open_branches(project_root: &Path) {
     }
     println!("\nopen branches:");
     for b in &branches {
+        // Interpolated, not literal (45-01): the comparison this suffix
+        // reports was computed against whatever trunk `list_feature_branches`
+        // actually used, and naming a different one is a false statement to
+        // the operator that reads as authoritative.
         let staleness = if b.behind > 0 {
-            format!(" ({} behind develop)", b.behind)
+            format!(" ({} behind {base})", b.behind)
         } else {
             String::new()
         };

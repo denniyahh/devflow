@@ -155,10 +155,13 @@ pub fn collect(project_root: &Path, phase: PhaseId) -> ShipEvidence {
         Err(_) => (None, false),
     };
 
-    let git = GitFlow::new(project_root);
+    // Project-resolved (45-01): `is_merged_into_develop` below asks whether
+    // the phase branch is an ancestor of the TRUNK, and against a mismatched
+    // trunk that answer is confidently wrong.
+    let git = GitFlow::for_project(project_root);
     let branch = format!(
         "{}phase-{}",
-        crate::config::GitFlowConfig::default().feature_prefix,
+        crate::config::git_flow_for_project(project_root).feature_prefix,
         phase.padded()
     );
     let feature_branch_exists = git.branch_exists(&branch);

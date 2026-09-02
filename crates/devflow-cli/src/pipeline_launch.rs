@@ -31,7 +31,7 @@ use crate::preflight::{
     agent_program, ensure_agent_binary, generic_preflight_checks, run_preflight,
     worktree_writable_roots,
 };
-use devflow_core::config::{GitFlowConfig, capture_retention};
+use devflow_core::config::capture_retention;
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
@@ -1468,7 +1468,10 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
     // the lock itself.
     let mut state = workflow::load_state(project_root, phase)?;
 
-    let git_flow = GitFlowConfig::default();
+    // Project-resolved (45-01): `evaluate_agent_result`'s Layer 2 counts
+    // commits in a `{trunk}..{feature}` range, so a defaulted trunk
+    // over- or under-reports the agent's work.
+    let git_flow = devflow_core::config::git_flow_for_project(project_root);
     let result = agent_result::evaluate_agent_result(project_root, &state, &git_flow)
         .map_err(|err| CliError::Message(format!("could not evaluate agent result: {err}")))?;
     let stage = state.stage;
