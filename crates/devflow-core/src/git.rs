@@ -116,11 +116,38 @@ pub struct BranchInfo {
 impl GitFlow {
     /// Create a git-flow helper for a project root, using the hardcoded
     /// git-flow constants (`main`, `develop`, `feature/`).
+    ///
+    /// Behaviourally unchanged since before 45-01, deliberately: library
+    /// callers with no project context keep the defaults. When the caller
+    /// DOES have a project root and the operation touches the trunk, prefer
+    /// [`Self::for_project`], which resolves `develop` from the project's
+    /// `base_branch` configuration (D-01 / AUTO-01). This constructor is
+    /// still correct for trunk-irrelevant work such as `commit_path`.
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
             config: GitFlowConfig::default(),
         }
+    }
+
+    /// Create a git-flow helper with an explicitly supplied branch model.
+    ///
+    /// The constructor the hooks use, so `HookContext.git_flow` reaches every
+    /// git operation inside a hook instead of being silently re-defaulted.
+    pub fn with_config(root: impl AsRef<Path>, config: GitFlowConfig) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+            config,
+        }
+    }
+
+    /// Create a git-flow helper whose trunk is resolved from the project's
+    /// configuration (`base_branch` / `DEVFLOW_BASE_BRANCH`), falling back to
+    /// the built-in constants when nothing is configured.
+    pub fn for_project(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        let config = crate::config::git_flow_for_project(root);
+        Self::with_config(root, config)
     }
 
     /// Create a feature branch from the develop branch.
@@ -315,7 +342,21 @@ impl GitFlow {
     /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
-        let protected = [self.config.main.as_str(), self.config.develop.as_str()];
+        // CR-01 (45-REVIEW.md): the configured trunk cannot be the SOLE
+        // source of the protected set. Once `config.develop` became the
+        // project's configured base (45-01), a base such as
+        // `workspace/denniyahh` dropped the literal `develop` out of
+        // protection while the `--merged` baseline above still listed it —
+        // a planning branch kept ahead of `develop` has `develop` as an
+        // ancestor — and the `-D` below then force-deleted it. The built-in
+        // trunk constants stay protected no matter what the trunk resolves
+        // to; a sweep must never be able to remove them.
+        let protected = [
+            self.config.main.as_str(),
+            self.config.develop.as_str(),
+            crate::config::MAIN,
+            crate::config::DEVELOP,
+        ];
         let mut deleted = Vec::new();
         for line in output.lines() {
             // git's porcelain marker is an exact two-char prefix ("* " for
@@ -822,6 +863,50 @@ mod tests {
         GitFlow::new(root)
     }
 
+    /// 45-01 / D-01: `with_config` is what makes the trunk configurable.
+    /// `new` keeps the hardcoded constants for library callers with no
+    /// project context, so the two constructors must give DIFFERENT answers
+    /// on the same repository — that difference is the whole test.
+    #[test]
+    fn with_config_uses_the_supplied_develop_not_the_default() {
+        let repo = init_repo();
+        let root = repo.path();
+
+        // A third branch off `develop` carrying a file `develop` never sees.
+        git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        commit_file(root, "planning-only.txt");
+        git(root, &["checkout", "-q", "develop"]);
+
+        let configured = GitFlow::with_config(
+            root,
+            GitFlowConfig {
+                develop: "workspace/example".to_string(),
+                ..GitFlowConfig::default()
+            },
+        );
+        configured
+            .feature_start(PhaseId::new(7))
+            .expect("feature_start off the configured base");
+        assert!(
+            root.join("planning-only.txt").exists(),
+            "a branch forked via with_config must descend from the supplied develop"
+        );
+
+        // NEGATIVE CONTROL: the same operation through `GitFlow::new` on the
+        // same repository resolves against `develop`, where the file is
+        // absent. Without this half the test passes against a constructor
+        // that ignored its argument and happened to be pointed at a repo
+        // where both branches carry the file.
+        git(root, &["checkout", "-q", "develop"]);
+        flow(root)
+            .feature_start(PhaseId::new(8))
+            .expect("feature_start off the default develop");
+        assert!(
+            !root.join("planning-only.txt").exists(),
+            "GitFlow::new must still fork from the hardcoded develop"
+        );
+    }
+
     #[test]
     fn feature_start_branches_from_develop() {
         let repo = init_repo();
@@ -1134,6 +1219,59 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    /// CR-01 (45-REVIEW.md): 45-01 moved `commands::cleanup` onto
+    /// `GitFlow::for_project`, which makes `config.develop` the CONFIGURED
+    /// base. `cleanup_merged` used that one value for two different jobs —
+    /// the `--merged` baseline AND the protected set — so a configured base
+    /// simultaneously dropped `develop` out of protection and listed it as
+    /// merged (a planning branch kept ahead of `develop` has `develop` as an
+    /// ancestor). Deletion is `-D`, so being unmerged was no barrier either.
+    ///
+    /// The built-in trunk constants must stay protected regardless of what
+    /// the trunk is configured to.
+    #[test]
+    fn cleanup_merged_never_sweeps_the_builtin_trunks_under_a_configured_base() {
+        let repo = init_repo();
+        let root = repo.path();
+
+        // The motivating shape: a personal planning branch one commit ahead
+        // of `develop`, so `develop` is an ancestor and `--merged` lists it.
+        git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        commit_file(root, "planning-only.txt");
+        // An ordinary merged branch off the configured base.
+        git(root, &["branch", "stale-merged"]);
+
+        let configured = GitFlow::with_config(
+            root,
+            GitFlowConfig {
+                develop: "workspace/example".to_string(),
+                ..GitFlowConfig::default()
+            },
+        );
+        let deleted = configured.cleanup_merged().expect("cleanup");
+
+        assert!(
+            !deleted.contains(&crate::config::DEVELOP.to_string()),
+            "the built-in develop must never be swept, whatever the trunk is configured to"
+        );
+        assert!(
+            configured.branch_exists(crate::config::DEVELOP),
+            "develop must still exist on disk after a sweep under a configured base"
+        );
+        assert!(
+            configured.branch_exists(crate::config::MAIN),
+            "main must still exist on disk after a sweep under a configured base"
+        );
+
+        // NEGATIVE CONTROL: without this half the test passes against a
+        // `cleanup_merged` that deletes nothing at all — which is the other
+        // way to make the assertions above true.
+        assert!(
+            deleted.contains(&"stale-merged".to_string()),
+            "an ordinary merged branch must still be swept"
+        );
     }
 
     /// WR-04 (13-REVIEW.md): `cleanup_merged` must compute "merged" relative

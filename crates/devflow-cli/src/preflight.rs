@@ -18,7 +18,7 @@
 //! any future change to either side of the pair.
 
 use crate::CliError;
-use crate::commands::phase_artifact_on_develop;
+use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
@@ -136,13 +136,16 @@ pub(crate) enum PhaseReachability {
 /// Probe whether `phase` is reachable from `base` in the repository at
 /// `project_root`: four ordered git invocations, each a spawn error or
 /// non-success status short-circuiting to `Undeterminable` per the
-/// fail-open-where-blind contract this project's `phase_artifact_on_develop`
+/// fail-open-where-blind contract this project's `phase_artifact_on_base`
 /// (`commands.rs`) already establishes.
 ///
-/// NOTE: `base` is always `devflow_core::config::DEVELOP` at the one call
-/// site today. If the base branch ever becomes configurable (999.30 WR-02
-/// already flagged the sibling hardcoded `"main"`), this function's callers
-/// must be re-pointed at that configuration alongside it.
+/// `base` is the project-resolved integration trunk from
+/// `devflow_core::config::base_branch` (45-01 / D-01), not a constant: a
+/// project whose planning artifacts live on a branch other than `develop`
+/// configures it via `base_branch` in `devflow.toml` or
+/// `DEVFLOW_BASE_BRANCH`. Callers must pass the same resolved value the run
+/// actually forks from. The REMOTE name remains non-configurable — see the
+/// [`ORIGIN`] constant's own note for why.
 pub(crate) fn phase_reachability_on_base(
     project_root: &Path,
     phase: PhaseId,
@@ -181,7 +184,7 @@ pub(crate) fn phase_reachability_on_base(
 
     // Step 4: does the phase directory exist on the base branch? Same
     // `strip_prefix` + `rest.contains('/')` idiom as
-    // `commands::phase_artifact_on_develop` — a directory holding only a
+    // `commands::phase_artifact_on_base` — a directory holding only a
     // `.gitkeep` still counts as present, and phase numbers are
     // zero-padded (phase 7 is `07-`, phase 24 is `24-`).
     let ls_tree = git_command(project_root)
@@ -500,6 +503,22 @@ pub(crate) fn fast_forward_base_ref(
         .unwrap_or(false)
 }
 
+/// The warning [`ensure_base_ref_current`] prints when a base branch's
+/// currency cannot be determined.
+///
+/// A pure function rather than an inline `format!` for one reason: the arm
+/// that emits it has no injectable writer anywhere in its call path, so a
+/// test asserting only that `ensure_base_ref_current` returns `Ok(())` stays
+/// green after this message is deleted or reworded. Extracting it is what
+/// makes the message contract assertable at all.
+pub(crate) fn undeterminable_currency_warning(base: &str) -> String {
+    format!(
+        "warning: could not determine whether `{base}` is current with `{ORIGIN}/{base}` \
+         — proceeding without a currency check (fail-open, per this module's \
+         fail-open-where-blind contract)"
+    )
+}
+
 /// Refuse before `devflow start` forks anything when `base` is stale
 /// relative to its remote. `Current`, `Ahead` and `Undeterminable` all
 /// return `Ok(())` (the last with a warning — the guard fails open where it
@@ -537,12 +556,20 @@ pub(crate) fn fast_forward_base_ref(
 pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result<(), CliError> {
     match base_ref_currency(project_root, base) {
         BaseRefCurrency::Current | BaseRefCurrency::Ahead => Ok(()),
+        // FAIL DIRECTION: OPEN. This arm is what allows a local-only
+        // planning branch — one with no `origin/<base>` tracking ref, the
+        // shape 45-01/AUTO-01 exists to support — to launch at all. Refusing
+        // here would convert "we cannot see the remote" into "your base is
+        // stale", which is the AUTO-01 defect wearing a different hat.
+        // Guarded by
+        // `base_ref_currency_is_undeterminable_when_the_remote_ref_is_absent`
+        // (the classification) and
+        // `ensure_base_ref_current_fails_open_for_a_local_only_planning_branch`
+        // (the disposition); the WARNING's own text is guarded separately by
+        // `undeterminable_currency_warning_names_the_branch_and_its_disposition`,
+        // because a bare `println!` here is unobservable from a unit test.
         BaseRefCurrency::Undeterminable => {
-            println!(
-                "warning: could not determine whether `{base}` is current with `{ORIGIN}/{base}` \
-                 — proceeding without a currency check (fail-open, per this module's \
-                 fail-open-where-blind contract)"
-            );
+            println!("{}", undeterminable_currency_warning(base));
             Ok(())
         }
         BaseRefCurrency::Diverged => {
@@ -613,12 +640,31 @@ pub(crate) fn preflight_interactivity_check(
     match driver.interactivity_mode(state.stage) {
         InteractivityMode::HeadlessSafe => Ok(()),
         InteractivityMode::RequiresExistingArtifact => {
+            // The base is resolved per project (45-01 / D-01), but the run's
+            // OWN base is the one that matters: `DEVFLOW_BASE_BRANCH` lives
+            // in the environment of whichever shell ran `devflow start`, and
+            // a `devflow resume` from a fresh shell re-enters here without
+            // it. Re-resolving from ambient configuration would then probe
+            // `develop` for a `-CONTEXT.md` that only ever existed on the
+            // configured base, and refuse a valid run as unrunnable
+            // (CR-45-01). `State::base_branch` is what `start` recorded, so
+            // prefer it and fall back to the resolver only when absent.
+            //
+            // Still a fail-open advisory on the resolver's `Err`: it falls
+            // back to the default trunk rather than propagating, because
+            // `commands::start` already refuses on that same `Err` before any
+            // run reaches here.
+            let base = state.base_branch.clone().unwrap_or_else(|| {
+                devflow_core::config::base_branch(project_root)
+                    .map(|resolved| resolved.value)
+                    .unwrap_or_else(|_| devflow_core::config::DEVELOP.to_string())
+            });
             if state.mode == Mode::Auto
                 && state.stage == Stage::Define
-                && !phase_artifact_on_develop(project_root, state.phase, "-CONTEXT.md")
+                && !phase_artifact_on_base(project_root, state.phase, "-CONTEXT.md", &base)
             {
                 return Err(format!(
-                    "phase {} has no -CONTEXT.md on develop — {} cannot run the {} \
+                    "phase {} has no -CONTEXT.md on `{base}` — {} cannot run the {} \
                      stage headlessly in auto mode",
                     state.phase,
                     driver.name(),
@@ -1430,6 +1476,85 @@ mod tests {
 
         state.stage = Stage::Define;
         assert!(preflight_interactivity_check(root, &state).is_ok());
+    }
+
+    /// codex (external review, 2026-09-02, CR-45-01): this check re-resolved
+    /// the base from AMBIENT configuration while holding the `State` that
+    /// records the run's OWN base. `DEVFLOW_BASE_BRANCH` lives in the
+    /// environment of whichever shell ran `devflow start`, so the documented
+    /// `devflow resume` recovery — from a fresh shell, without the export —
+    /// probed `develop` for a `-CONTEXT.md` that only ever existed on the
+    /// configured base, and refused a perfectly valid run as unrunnable with
+    /// no way forward.
+    #[test]
+    fn preflight_interactivity_check_probes_the_runs_persisted_base() {
+        let _guard = env_lock();
+        // The defect only reproduces when the environment does NOT carry the
+        // variable, which is the whole point: that is the resumed-shell case.
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe { std::env::remove_var("DEVFLOW_BASE_BRANCH") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+
+        // CONTEXT.md exists ONLY on the planning branch — the shape 999.110
+        // describes, and the reason a configurable base exists at all.
+        git(&["checkout", "-q", "-b", "workspace/example"]);
+        std::fs::create_dir_all(root.join(".planning/phases/60-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/60-widget/60-CONTEXT.md"), "ctx").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "context on the planning branch"]);
+        git(&["checkout", "-q", "develop"]);
+
+        let mut state = State::new(
+            PhaseId::new(60),
+            AgentKind::Codex,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Define;
+
+        // NEGATIVE CONTROL, asserted FIRST so the positive case cannot be
+        // satisfied by a check that passes unconditionally: with nothing
+        // persisted the resolver falls to `develop`, which genuinely has no
+        // CONTEXT.md, and the run is refused.
+        assert!(
+            state.base_branch.is_none(),
+            "fixture precondition: no base persisted yet"
+        );
+        let refused = preflight_interactivity_check(root, &state)
+            .expect_err("develop has no CONTEXT.md — this must still be refused");
+        assert!(
+            refused.contains("develop"),
+            "the refusal must name the branch it probed: {refused}"
+        );
+
+        // The run recorded its base at `start`. Nothing else changes.
+        state.base_branch = Some("workspace/example".to_string());
+        assert!(
+            preflight_interactivity_check(root, &state).is_ok(),
+            "the run's own base carries CONTEXT.md; the check must probe THAT branch"
+        );
+
+        // A persisted base that genuinely lacks the artifact is still
+        // refused — the fix must not have turned the probe into a no-op.
+        state.base_branch = Some("main".to_string());
+        assert!(
+            preflight_interactivity_check(root, &state).is_err(),
+            "a persisted base without CONTEXT.md must still be refused"
+        );
     }
 
     /// D-14 gh-auth scope: hardcoded to Stage::Ship, not a dynamic hook-scan.
@@ -3215,6 +3340,97 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("develop"), "{msg}");
         assert!(msg.contains("origin/develop"), "{msg}");
+    }
+
+    /// 45-01 / AUTO-01 (REVIEWS risk 1.2). A configured base branch that has
+    /// never been pushed has no `origin/<base>` ref, and that must classify
+    /// as `Undeterminable` — the fail-open disposition — rather than as
+    /// staleness. Pinned as a REGRESSION test: the behaviour already exists,
+    /// and the risk is that a future change silently converts a local-only
+    /// planning branch into a hard refusal.
+    #[test]
+    fn base_ref_currency_is_undeterminable_when_the_remote_ref_is_absent() {
+        let (_remote, local) = currency_fixture();
+        let root = local.path();
+
+        // A local-only planning branch: no `origin/workspace/example` exists,
+        // even though this clone DOES have a remote and DOES have
+        // `origin/develop`.
+        run_git(root, &["checkout", "-q", "-b", "workspace/example"]);
+
+        assert_eq!(
+            base_ref_currency(root, "workspace/example"),
+            BaseRefCurrency::Undeterminable
+        );
+
+        // NEGATIVE CONTROL: a branch that DOES have a matching `origin/` ref
+        // in the same repository classifies as `Current`. Without this the
+        // test cannot distinguish "correctly detected the absence" from
+        // "always returns Undeterminable".
+        assert_eq!(
+            base_ref_currency(root, "develop"),
+            BaseRefCurrency::Current,
+            "a branch with a matching origin ref must not be Undeterminable"
+        );
+    }
+
+    /// The disposition half of the same contract: `Undeterminable` returns
+    /// `Ok(())`, so an unpushed planning branch launches.
+    #[test]
+    fn ensure_base_ref_current_fails_open_for_a_local_only_planning_branch() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let root = local.path();
+
+        run_git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        assert!(
+            ensure_base_ref_current(root, "workspace/example").is_ok(),
+            "a local-only planning branch must launch, not be refused"
+        );
+
+        // NEGATIVE CONTROL: a genuinely diverged base still returns `Err` in
+        // the same repository, proving the function did not simply become
+        // unconditionally permissive.
+        advance_remote(remote_root, "remote-only.txt");
+        run_git(root, &["checkout", "-q", "develop"]);
+        std::fs::write(root.join("local-only.txt"), "x").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-q", "-m", "local-only divergent commit"]);
+        assert!(
+            ensure_base_ref_current(root, "develop").is_err(),
+            "a diverged base must still refuse"
+        );
+    }
+
+    /// The warning's TEXT, asserted where the disposition test cannot reach
+    /// it. `ensure_base_ref_current` emits it through a bare `println!` with
+    /// no injectable writer, so a test asserting only `Ok(())` stays green
+    /// after the message is deleted or reworded — review round 2 found
+    /// exactly that gap.
+    #[test]
+    fn undeterminable_currency_warning_names_the_branch_and_its_disposition() {
+        let message = undeterminable_currency_warning("workspace/example");
+
+        assert!(
+            message.contains("workspace/example"),
+            "the warning must name the base: {message}"
+        );
+        assert!(
+            message.contains("origin/workspace/example"),
+            "the warning must name the remote ref it could not compare against: {message}"
+        );
+        assert!(
+            message.contains("fail-open"),
+            "the warning must state its disposition: {message}"
+        );
+
+        // NEGATIVE CONTROL: the assertion must discriminate between the two
+        // dispositions, not match any message this module produces. The
+        // `Diverged` refusal is the other one.
+        assert!(
+            !message.contains("have diverged"),
+            "the fail-open warning must not read like the Diverged refusal: {message}"
+        );
     }
 
     #[test]

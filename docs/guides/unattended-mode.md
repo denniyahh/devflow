@@ -99,6 +99,40 @@ easy while removing one after operators have built habits around it is not. If
 the preflight's own reliability turns out to be a problem in practice, that is
 grounds to reopen the decision, not to work around it.
 
+### If your planning artifacts do not live on `develop`
+
+The first preflight condition reads `.planning/config.json` **from the phase
+worktree**, and that worktree is forked from your project's base branch. If
+your `.planning/` lives on a branch other than `develop` — a personal tracking
+branch, say — a worktree forked from `develop` does not carry it, the condition
+cannot hold, and every `--mode auto` launch is refused with nothing you can fix
+inside the run.
+
+Set the base branch and the problem goes away:
+
+```toml
+# devflow.toml
+base_branch = "workspace/yourname"
+```
+
+or export `DEVFLOW_BASE_BRANCH`, which outranks the file.
+
+Three things to know before you set it:
+
+- **It is the whole trunk, not just a start point.** Phase worktrees fork
+  *from* this branch and the git-flow lifecycle merges phase work back *into*
+  it. Both resolve from the one value, so they cannot drift apart. The
+  alternative — forking from your planning branch and merging into `develop` —
+  would drag unrelated history into the integration branch.
+- **`main` is refused.** So is a blank value and anything beginning with `-`.
+  An explicitly configured bad value is a hard error naming the value and where
+  it came from, never a quiet fallback to `develop`.
+- **It must be an existing local branch.** A remote-tracking name
+  (`origin/foo`), a `refs/heads/` path, `HEAD`, or a commit SHA is refused,
+  because a merge target has to be a branch.
+
+Leave it unset and nothing changes: the base is `develop`, exactly as before.
+
 ## What you will see in your git history
 
 The chain flag lives in `.planning/config.json`, which is a **tracked** file.
