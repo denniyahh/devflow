@@ -122,7 +122,12 @@ Plans:
   2. The self-dogfood staleness check (`affects_compiled_binary`) only inspects Cargo workspace members (`crates/*`) rather than repo-wide `.rs`/`Cargo.toml` files, ignoring `.planning/spikes/` and non-workspace crates (AUTO-02 / 999.109).
   3. An unattended `decision` checkpoint no longer blindly takes the first option — Code-stage prompt policy instructs the agent to evaluate options on merit and record its reasoning (DECN-01 / 999.94).
 
-**Plans**: TBD
+**Plans**: 3 plans (all wave 1 — disjoint `files_modified`, fully parallel)
+
+Plans:
+- [ ] 45-01-PLAN.md — AUTO-01: configurable base branch resolution (`base_branch` / `DEVFLOW_BASE_BRANCH`), `GitFlow::with_config`, and the call-site audit keeping fork point == merge target
+- [ ] 45-02-PLAN.md — AUTO-02: scope `affects_compiled_binary` to `crates/` workspace members plus root build files, with direct unit tests and negative controls
+- [ ] 45-03-PLAN.md — DECN-01: shared Code-stage decision-checkpoint policy constant delivered identically to both agent renderers
 
 ---
 
