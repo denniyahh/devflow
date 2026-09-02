@@ -68,6 +68,16 @@ phase.
   (at least one live gate), proving Pi driver reliability; the deferred isolated-context Pi dispatch
   item is re-filed (not built this phase).
 
+### Unattended Auto-Mode (Phase 45)
+
+- [ ] **AUTO-01**: (999.110, HIGH) — worktree creation forks from the branch tracking `.planning/`
+  rather than hardcoding `develop`, so `.planning/config.json` is present and
+  `preflight_unattended_launch_check` passes out of the box.
+
+- [ ] **AUTO-02**: (999.109, HIGH) — the self-dogfood staleness check (`affects_compiled_binary`)
+  inspects only Cargo workspace members (`crates/*`) plus root build files, ignoring
+  `.planning/spikes/` and non-workspace crates.
+
 ### Opportunistic (capacity-permitting)
 
 - [ ] **DECN-01**: (999.94, HIGH) — an unattended `decision` checkpoint no longer takes the first
@@ -108,6 +118,7 @@ Which phases cover which requirements. Filled during roadmap creation.
 | ANTG-03 | Phase 41 | Complete |
 | HYG-01 | Phase 41 | Complete |
 | HYG-02 | Phase 41 | Complete |
+| ANTG-04 | Phase 42 | Pending |
 | HRMS-01 | Phase 42 | Pending |
 | HRMS-02 | Phase 42 | Pending |
 | HRMS-03 | Phase 42 | Pending |
@@ -116,13 +127,15 @@ Which phases cover which requirements. Filled during roadmap creation.
 | OPCD-03 | Phase 43 | Complete |
 | CODE-01 | Phase 44 | Pending |
 | PIDG-01 | Phase 40 | Complete |
+| AUTO-01 | Phase 45 | Pending |
+| AUTO-02 | Phase 45 | Pending |
 | DECN-01 | Phase 45 | Pending |
 | MAINT-01 | Phase 40 | Complete |
 
 **Coverage:**
 
-- v2.8.0 requirements: 15 total
-- Mapped to phases: 15
+- v2.8.0 requirements: 18 total
+- Mapped to phases: 18
 - Unmapped: 0 ✓
 
 ---

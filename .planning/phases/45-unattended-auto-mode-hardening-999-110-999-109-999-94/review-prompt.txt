@@ -1,0 +1,46 @@
+You are conducting an independent adversarial peer review of the implementation decisions and scope for Phase 45 of DevFlow.
+
+Context & Problem Statement:
+DevFlow is an opinionated Rust CLI driving agentic AI pipelines through Git worktrees and multi-stage workflows (Define -> Plan -> Code -> Validate -> Ship).
+Phase 45 addresses 3 issues to harden unattended `--mode auto` execution:
+1. AUTO-01 / 999.110: Worktrees currently fork hardcoded from `develop` (`develop` does not track `.planning/` in developer setups where `.planning/` is tracked on personal branches like `workspace/denniyahh`). Preflight fails in `--mode auto` because `.planning/config.json` is missing in the new worktree. Decision D-01: Add configurable base branch resolution (`git.base_branch` / `git.planning_branch`) with `develop` as default.
+2. AUTO-02 / 999.109: The self-dogfood staleness check (`affects_compiled_binary` in staleness.rs) currently checks `.rs` / `Cargo.toml` anywhere in repo. Divergent commits containing `.planning/spikes/socket-supervisor/Cargo.toml` permanently trigger the D-18 self-dogfood stale build block. Decision D-02: Scope `affects_compiled_binary` to Cargo workspace members (`crates/*`) + root build files (`Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`), ignoring `.planning/spikes/`.
+3. DECN-01 / 999.94: When GSD runs unattended, `execute-phase` resolves `decision` checkpoints by taking the first option blindly. Decision D-03: Add a prompt policy instruction layer to `code_stage_prompt` instructing the agent to evaluate checkpoint options on merit and record its reasoning.
+
+Phase 45 CONTEXT.md content:
+```markdown
+# Phase 45: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94) - Context
+
+<domain>
+## Phase Boundary
+This phase hardens `--mode auto` execution so that unattended phase runs can launch cleanly out of the box and run safely. Specifically:
+1. Resolving the worktree base branch / start point from configuration (e.g. `base_branch` or `planning_branch` with fallback to `develop`) so that `.planning/` and `.planning/config.json` are present in freshly created phase worktrees (AUTO-01 / 999.110).
+2. Scoping the self-dogfood staleness check's `affects_compiled_binary` predicate to Cargo workspace members (`crates/*`) plus root build files, ignoring `.planning/spikes/` and other non-workspace code (AUTO-02 / 999.109).
+3. Establishing a prompt policy layer in the Code stage instructing the agent to evaluate `decision` checkpoints on merit and record its reasoning rather than blindly taking the first option (DECN-01 / 999.94).
+</domain>
+
+<decisions>
+## Implementation Decisions
+
+### Worktree Base Branch Resolution (AUTO-01 / 999.110)
+- **D-01:** Add configurable base branch resolution in DevFlow config (`git.base_branch` or `git.planning_branch`) with `develop` as the default. When creating a phase worktree or checking base ref reachability/currency, use the configured base branch so personal tracking branches like `workspace/denniyahh` carrying `.planning/` can be targeted cleanly. — **Reversibility:** costly — changes configuration fields and worktree creation call sites across CLI commands and preflight.
+
+### Workspace Member Scoping for Staleness Check (AUTO-02 / 999.109)
+- **D-02:** Scope `affects_compiled_binary` to Cargo workspace member paths (`crates/*`) and root build files (`Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`). Any path outside `crates/` (e.g. `.planning/spikes/*`) must return `false` so non-workspace spikes never trip the D-18 self-dogfood stale build block. — **Reversibility:** reversible — pure path predicate update in `staleness.rs`.
+
+### Unattended Decision Checkpoint Policy (DECN-01 / 999.94)
+- **D-03:** Add a dedicated policy instruction layer to `code_stage_prompt` in `prompt.rs`. When unattended, the agent is instructed to resolve any `decision` checkpoint by evaluating all presented options on their merits, respecting explicit recommended markings where present, and recording the rationale in the final response. — **Reversibility:** reversible — prompt template enhancement in `prompt.rs`.
+</decisions>
+```
+
+Instructions for Reviewer:
+Provide an adversarial, critical assessment of these decisions and their potential pitfalls, edge cases, or unintended consequences:
+1. For D-01: What happens during Ship stage (`hooks_after_ship`, branch cleanup, merge into base)? Does `develop` vs `base_branch` create branch divergence or merge issues if feature branches merge back into `develop` instead of `base_branch`, or vice versa? What happens to base ref currency checks against `origin`?
+2. For D-02: Are there edge cases where workspace crates are located outside `crates/` (or what if root `src/` existed)? Does path prefix matching `crates/` handle relative paths correctly across `git status --porcelain` and `git diff --name-only`?
+3. For D-03: How does the prompt policy in `code_stage_prompt` interact with GSD's internal auto-resume or auto-decision loops? Can prompt instructions effectively override GSD's hardcoded script/workflow behavior?
+4. What gaps or missing constraints should the planner address before implementation?
+
+Format your response with:
+- Summary verdict (APPROVED / APPROVED WITH CONCERNS / REJECTED)
+- Critical findings / risks (if any)
+- Recommendations for planning

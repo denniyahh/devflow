@@ -1,0 +1,1209 @@
+OpenAI Codex v0.152.0
+--------
+workdir: /var/home/denniyahh/Github/devflow
+model: gpt-5.6-luna
+provider: openai
+approval: on-request
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: low
+reasoning summaries: none
+session id: 01a05f40-2166-73f1-9fc8-9b05a232dbc3
+--------
+user
+Please perform an adversarial review based on the prompt below: You are conducting an independent adversarial peer review of the implementation decisions and scope for Phase 45 of DevFlow.
+
+Context & Problem Statement:
+DevFlow is an opinionated Rust CLI driving agentic AI pipelines through Git worktrees and multi-stage workflows (Define -> Plan -> Code -> Validate -> Ship).
+Phase 45 addresses 3 issues to harden unattended `--mode auto` execution:
+1. AUTO-01 / 999.110: Worktrees currently fork hardcoded from `develop` (`develop` does not track `.planning/` in developer setups where `.planning/` is tracked on personal branches like `workspace/denniyahh`). Preflight fails in `--mode auto` because `.planning/config.json` is missing in the new worktree. Decision D-01: Add configurable base branch resolution (`git.base_branch` / `git.planning_branch`) with `develop` as default.
+2. AUTO-02 / 999.109: The self-dogfood staleness check (`affects_compiled_binary` in staleness.rs) currently checks `.rs` / `Cargo.toml` anywhere in repo. Divergent commits containing `.planning/spikes/socket-supervisor/Cargo.toml` permanently trigger the D-18 self-dogfood stale build block. Decision D-02: Scope `affects_compiled_binary` to Cargo workspace members (`crates/*`) + root build files (`Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`), ignoring `.planning/spikes/`.
+3. DECN-01 / 999.94: When GSD runs unattended, `execute-phase` resolves `decision` checkpoints by taking the first option blindly. Decision D-03: Add a prompt policy instruction layer to `code_stage_prompt` instructing the agent to evaluate checkpoint options on merit and record its reasoning.
+
+Phase 45 CONTEXT.md content:
+```markdown
+# Phase 45: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94) - Context
+
+<domain>
+## Phase Boundary
+This phase hardens `--mode auto` execution so that unattended phase runs can launch cleanly out of the box and run safely. Specifically:
+1. Resolving the worktree base branch / start point from configuration (e.g. `base_branch` or `planning_branch` with fallback to `develop`) so that `.planning/` and `.planning/config.json` are present in freshly created phase worktrees (AUTO-01 / 999.110).
+2. Scoping the self-dogfood staleness check's `affects_compiled_binary` predicate to Cargo workspace members (`crates/*`) plus root build files, ignoring `.planning/spikes/` and other non-workspace code (AUTO-02 / 999.109).
+3. Establishing a prompt policy layer in the Code stage instructing the agent to evaluate `decision` checkpoints on merit and record its reasoning rather than blindly taking the first option (DECN-01 / 999.94).
+</domain>
+
+<decisions>
+## Implementation Decisions
+
+### Worktree Base Branch Resolution (AUTO-01 / 999.110)
+- **D-01:** Add configurable base branch resolution in DevFlow config (`git.base_branch` or `git.planning_branch`) with `develop` as the default. When creating a phase worktree or checking base ref reachability/currency, use the configured base branch so personal tracking branches like `workspace/denniyahh` carrying `.planning/` can be targeted cleanly. — **Reversibility:** costly — changes configuration fields and worktree creation call sites across CLI commands and preflight.
+
+### Workspace Member Scoping for Staleness Check (AUTO-02 / 999.109)
+- **D-02:** Scope `affects_compiled_binary` to Cargo workspace member paths (`crates/*`) and root build files (`Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`). Any path outside `crates/` (e.g. `.planning/spikes/*`) must return `false` so non-workspace spikes never trip the D-18 self-dogfood stale build block. — **Reversibility:** reversible — pure path predicate update in `staleness.rs`.
+
+### Unattended Decision Checkpoint Policy (DECN-01 / 999.94)
+- **D-03:** Add a dedicated policy instruction layer to `code_stage_prompt` in `prompt.rs`. When unattended, the agent is instructed to resolve any `decision` checkpoint by evaluating all presented options on their merits, respecting explicit recommended markings where present, and recording the rationale in the final response. — **Reversibility:** reversible — prompt template enhancement in `prompt.rs`.
+</decisions>
+```
+
+Instructions for Reviewer:
+Provide an adversarial, critical assessment of these decisions and their potential pitfalls, edge cases, or unintended consequences:
+1. For D-01: What happens during Ship stage (`hooks_after_ship`, branch cleanup, merge into base)? Does `develop` vs `base_branch` create branch divergence or merge issues if feature branches merge back into `develop` instead of `base_branch`, or vice versa? What happens to base ref currency checks against `origin`?
+2. For D-02: Are there edge cases where workspace crates are located outside `crates/` (or what if root `src/` existed)? Does path prefix matching `crates/` handle relative paths correctly across `git status --porcelain` and `git diff --name-only`?
+3. For D-03: How does the prompt policy in `code_stage_prompt` interact with GSD's internal auto-resume or auto-decision loops? Can prompt instructions effectively override GSD's hardcoded script/workflow behavior?
+4. What gaps or missing constraints should the planner address before implementation?
+
+Format your response with:
+- Summary verdict (APPROVED / APPROVED WITH CONCERNS / REJECTED)
+- Critical findings / risks (if any)
+- Recommendations for planning
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+I’m using the adversarial-review skill to structure an independent, hostile review of the Phase 45 decisions and surface implementation gaps before planning.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/bash -lc "sed -n '1,240p' /var/home/denniyahh/.agents/skills/adversarial-review/SKILL.md" in /var/home/denniyahh/Github/devflow
+ succeeded in 0ms:
+---
+name: adversarial-review
+description: Run an adversarial cross-model review of documents by invoking multiple AI CLIs (pi, claude, codex, antigravity, opencode) with selectable model and effort levels. Use when you want independent, hostile scrutiny of specs, plans, CONTEXT.md, or other docs before acting on them.
+---
+
+# Adversarial Review
+
+Purpose: get N independent models to *attack* a set of documents — find
+contradictions, unstated assumptions, decisions that don't survive contact with
+the code, scope leaks, and non-falsifiable criteria — rather than summarize or
+praise them.
+
+The skill fans out one headless CLI invocation per reviewer, collects the raw
+responses, and writes a consolidated verdict. Model + effort are selected per
+reviewer. Where a provider exposes a catalog command it is queried; otherwise the
+provider's *current* model/effort is read from its config (read-only) and
+overridden per-run via flags — never a stale hardcode, and never a global config
+write (antigravity accepts `--model`/`--effort` per-run flags, so no config write is needed).
+
+## Interface
+
+```
+adversarial-review \
+  --targets <files...>                # required — documents to review
+  --reviewers <cli:model:effort,...>  # default: claude, codex, antigravity
+  --lens <name>                       # default: adversarial (see below)
+  --out <dir>                         # default: ./reviews/ (use .planning/reviews/ in GSD projects)
+  --no-query                          # skip catalog/config discovery; use explicit args only
+```
+
+`--reviewers` grammar: `cli[:model[:effort]]`. Omit `model` and/or `effort` to
+discover from the provider (catalog or config) and default to `high` effort.
+Example: `--reviewers claude:opus:high,codex::high,antigravity` — `codex::high`
+keeps codex's current model at high effort; bare `antigravity` uses its config model.
+
+## Per-provider reference
+
+| CLI | headless | model selection | catalog | effort selection |
+|---|---|---|---|---|
+| `pi` | `pi -p "<prompt>"` | `--model <id>` | ✅ `pi --list-models` | `--thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
+| `claude` | `claude -p --output-format json "<prompt>"` | `--model sonnet\|opus\|haiku\|fable` | ❌ fixed small set | `--settings '{"effortLevel":"high"}'` |
+| `codex` | `codex exec "<prompt>"` | `-m <model>` or `-c model="..."` | ❌ | `-c model_reasoning_effort=low\|medium\|high` |
+| `antigravity` | `antigravity -p "<prompt>"` | `--model <id>` | ✅ `antigravity models` | `--effort low\|medium\|high` |
+| `opencode` | `opencode run "<prompt>"` | `-m provider/model` | ✅ `opencode models [provider]` | `--variant minimal\|high\|max` |
+
+### Config files (read-only; learn the *current* value, never mutate by default)
+
+- claude — `~/.claude/settings.json` keys `model`, `effortLevel`.
+- codex — `~/.codex/config.toml` keys `model`, `model_reasoning_effort`.
+- antigravity — `~/.gemini/antigravity-cli/settings.json` key `model` (e.g. `"Gemini 3.6 Flash (Low)"`).
+
+These live in HOME, not the repo. The repo's `.claude/` and `.codex/` hold
+permissions/hooks/skills, not the model catalog. Config stores only the
+*current* model, not the full available list.
+
+Normalized effort vocabulary: `low | medium | high | max`. Map per provider where
+the vocab differs (`xhigh`≈`max` for pi; `minimal`≈`low`, `high`→`high`,
+`max`→`max` for opencode; codex caps at `high`; antigravity takes `--effort low|medium|high`).
+
+## Procedure
+
+1. **Resolve reviewers.** Parse `--reviewers` (default: `claude,codex,antigravity`).
+   Resolution per reviewer:
+   - **Model**: explicit arg > provider catalog (pi/opencode) > config current
+     value (claude/codex/antigravity) > omit-flag (CLI's own default).
+   - **Effort**: explicit arg > `high` default. The provider's *configured*
+     effort is read and reported but is **not** the default — adversarial
+     review warrants deep reasoning, and a config `low` (e.g. codex) would
+     defeat it. antigravity takes `--effort` (and `--model`) as per-run flags.
+
+2. **Discover (skip with `--no-query`).**
+   - Catalog where available: `pi --list-models`, `opencode models`.
+   - Config (read-only) where not: read the three files above to learn the
+     current model + effort. This is the "default" — grounded in what the
+     operator has configured, not a hardcode.
+   Present the discovered values if the operator wants to choose; otherwise
+   proceed with the resolved defaults and say what was chosen.
+
+3. **Build the review prompt.** Feed each reviewer the lens, the list of target files, **and the
+   full planning context they would otherwise resolve themselves** (SPEC.md, CONTEXT.md,
+   RESEARCH.md, the ROADMAP phase section, prior reviews) — all inlined. This makes doc reads
+   CWD-independent, which matters because reviewers read the codebase themselves (the adversarial
+   lens tells them to). Use the adversarial lens below unless `--lens` overrides it.
+
+4. **Invoke in parallel, from the review root.** Resolve the directory that owns the target docs
+   (a phase worktree `.worktrees/phase-N` if it exists, else the checkout) — this is the tree the
+   reviewers must read. Launch each reviewer with its CWD set to that root: `cd <root>` in a
+   subshell, plus the CLI's own flag where one exists (`codex exec --cd <root>`, `claude --add-dir
+   <root>`, `antigravity --add-dir <root>`). **Why this is load-bearing:** the reviewer's own file
+   reads resolve against its CWD, so a wrong CWD hands it a stale tree — this exact mistake
+   produced a review that quoted the previous checkout's SPEC. Note `codex` anchors its project to
+   `~/.codex/config.toml`'s trusted dir, not CWD — pass `--cd <root>` explicitly and still
+   sanity-check its citations in step 5. One shell per reviewer, with a timeout (default 5m;
+   antigravity's `--print-timeout` is 5m — raise it for long prompts). A reviewer whose CLI is
+   absent or times out is recorded as `skipped`, never silently dropped.
+
+5. **Collect, verify, consolidate.** Write `{out}/{cli}.md` per reviewer (raw response + the exact
+   invocation + the review root used, so the result is reproducible). **Sanity-check before
+   trusting a reviewer:** its citations must match the review root's current files — a reviewer
+   quoting a different checkout's SPEC (or reporting a target file "not on disk") means its CWD was
+   wrong; discard those specific citations and flag the reviewer. Dedupe a reviewer whose body
+   repeats itself (antigravity and codex both emitted their findings twice in testing) — keep one
+   copy. Then write `{out}/SUMMARY.md` synthesizing: which findings are agreed across reviewers,
+   which conflict, and which are actionable — grouped by target file.
+
+## Default adversarial lens
+
+> You are an adversarial reviewer. Attack the following documents. Do not
+> summarize or praise them. Find, with the exact file and the exact line/quoted
+> text for each:
+> 1. contradictions between the documents,
+> 2. unstated assumptions that would break under real use,
+> 3. decisions that do not survive contact with the actual codebase or tool,
+> 4. scope leaks (work that belongs in another phase/item),
+> 5. acceptance criteria that are not falsifiable or have no negative control,
+> 6. missing edge cases or failure modes.
+> Be specific and hostile. Prefer 5 sharp findings to 20 vague ones. Where a
+> finding is speculation, label it as such.
+
+## Notes
+
+- **antigravity accepts `--model`/`--effort`/`--print-timeout` per-run flags**
+  (the per-provider table above was corrected 2026-08-15 — it previously claimed
+  antigravity was config-bound with no flag, which was wrong). The model ID for
+  the flags is the short form from `antigravity models` (e.g. `gemini-3.1-pro-high`),
+  NOT the display name (`"Gemini 3.1 Pro"` is rejected as an invalid model).
+- **antigravity print-mode timeouts are usually the MCP servers, not the prompt.**
+  If `antigravity -p` hangs to `--print-timeout` (default 5m) with
+  `Error: timeout waiting for response`, check the log (`~/.gemini/antigravity-cli/cli.log`)
+  for `MCP: N server(s) still connecting` — a hung MCP server (e.g. the `linear`/`vercel`
+  entries in `~/.gemini/config/mcp_config.json`) blocks print mode regardless of the timeout
+  value. Fix by temporarily disabling those MCP servers, then re-run; raise `--print-timeout`
+  only for genuinely slow responses.
+- **antigravity's `-p`/`--print`/`--prompt` take the prompt as their ARGUMENT**,
+  not stdin and not a positional: `antigravity -p "$(cat prompt.txt)"`. Piping
+  via `cat prompt.txt | antigravity -p` fails with `flag needs an argument: -p`.
+- claude effort is set via `--settings '{"effortLevel":"…"}'` (a per-run
+  override), not by editing `~/.claude/settings.json`.
+- The consolidated `SUMMARY.md` is the actionable artifact — the per-reviewer
+  files are evidence. Delete or keep them per project convention.
+- This skill reviews *documents*; it does not edit them. Hand findings back to
+  the planning flow (e.g. `gsd-plan-phase --reviews` if you convert the output,
+  or fix the docs directly).
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/bash -lc "rg -n \"affects_compiled_binary|code_stage_prompt|hooks_after_ship|base_branch|planning_branch|execute-phase|auto\" crates src .planning --glob '"'!target/**'"' --glob '"'!**/Cargo.lock'"' | head -240" in /var/home/denniyahh/Github/devflow
+ succeeded in 0ms:
+rg: src: No such file or directory (os error 2)
+.planning/STATE.md:175:  auto-mode classifier blocked the first attempt) — `devflow-core` published
+.planning/STATE.md:332:    `execute-phase.md` — wave-number gating already enforces order
+.planning/STATE.md:545:coverage (999.12, Medium), release-cut automation (999.13, High), doctor
+.planning/STATE.md:636:| 2026-07-23 | **Phase 20 executed on `feat/phase-20-release-correctness-operator-control` via parallel worktrees, not the #683 sequential degrade.** HEAD was 11 planning-only commits ahead of `origin/develop`, tripping the auto-degrade; operator chose to set `worktree.baseRef:"head"` and branch properly rather than commit straight onto `develop` (per the standing git-flow preference). Wave 1 (20-01+20-02, disjoint files) ran genuinely parallel; waves 2-4 were single-plan by DAG construction (20-03→20-04→20-05 share `main.rs`). Code review found 2 blockers (CR-01 version-read/comment asymmetry, CR-02 a genuine cross-plan regression where `cleanup` never learned 20c's `state.stopped`) + 3 warnings — operator chose to fix all 5 inline (11 new regression tests) rather than ship-then-backlog, since the branch wasn't merged yet. PR #20 opened `feat/... → develop`, CI green (8/8 checks, both named ex-flaky fixtures pass). Phase marked complete via `/gsd-verify-work 20` after live-verifying the ssh-signing UAT item against the real operator ssh-agent (4 states) and confirming CI-on-branch sign-off from PR #20's logs. `/gsd-secure-phase 20` ran State B (18 threats built from all 5 plans' `<threat_model>` blocks, 0 open, L1 short-circuit) since `workflow.security_enforcement=true` gated completion. **Milestone-boundary bug caught and corrected:** `phase.complete`'s next-phase detection picked up backlog heading `999.1` (Hermes Support) as if it were the next sequential phase — STATE.md's `current_phase`/`status` were corrected back to reflect that the v2.0.0 milestone (Phase 11-20) is 100% complete (`progress.percent: 100`, 9/9 phases) and awaiting an explicit `/gsd-complete-milestone` decision, not auto-continuation into a backlog item. PROJECT.md was also 3 phases stale (still described Phase 18 as "Hermes Support," which was rescoped away 2026-07-20) — evolved through Phases 18/19/20 in the same pass. INF-01 (signing-key inline-classification, Info-severity) deferred to backlog `999.27`/Linear DEN-52 rather than blocking the fix pass. |
+.planning/STATE.md:641:| 2026-07-18 | **Phase 17 scoped to four units; P5/P6 deferred to Phase 18:** source verification against final HEAD resolved decision-gate Q2 — `Unknown` auto-advance is not an edge case but an explicit design choice (`main.rs:854` classifies only `Failed \| RateLimited` as failure; `main.rs:871`'s comment states "Success (or Unknown — advance…)"). It is also broader than the retrospective recorded: `evaluate_layer3` (`agent_result.rs:610-620`) returns `Unknown` for the zero-commit "agent process gone, no commits" case too, so a vanished agent that did nothing advances Code→Validate. Two retrospective assumptions corrected: `devflow doctor` already exists but is project-blind (`_project_root` unused), and `RateLimited` is already typed — the missing outcomes are `resource_killed` (exit 137, absent workspace-wide) and `agent_unavailable`. Provenance has no foundation at all (no `build.rs`, no `vergen`; `workflow_started` carries only agent/mode/worktree). Phase 17 keeps 17a `Unknown` non-advance, 17b typed outcomes + retry policy, 17c preflight gate, 17d build provenance. Q4 answered: focused Phase 17 repair, **not** a Phase 16 remediation — only 17d traces to the proven Phase 16 defect; the rest is capability Phase 16 never claimed. Deferred to Phase 18 as 18d/18e: doctor reconciliation (forensic tooling, depends on 17b+17d) and the WR-03 test fix (test-only debt). Q3 (universal vs. adapter-specific preflight checks) remains open for discuss-phase. |
+.planning/STATE.md:649:| 2026-06-19 | **v2.0.0 architecture:** DevFlow is a GSD-native execution engine with gate file protocol. Two modes (full auto, supervise). State machine: Define→Plan→Code→Validate→Ship. All skip logic removed. Conventional commits permanently deprecated. |
+.planning/STATE.md:651:| 2026-06-19 | **Config eliminated:** No `.devflow.yaml` needed. Hardcode git-flow (main/develop/feature/), auto-detect version file, CLI flag for mode. |
+.planning/STATE.md:659:| 2026-07-14 | **MVP restructure:** priority shifted to getting the core loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow can be dogfooded on real projects again. Operator-confirmed scope: agents = Claude + Codex (Hermes/Antigravity deferred); gates answered via pluggable notify hook (ntfy/desktop), not terminal babysitting or Hermes plugin; MVP includes the automated Ship stage. Phase 13 repurposed as **MVP Core Loop** — claims the previously unclaimed `ship.rs` GSD-native rewrite (11h-1…4) and absorbs old-14's verdict-vs-ran split, native envelope parsing, WR-11 silent-halt fix, notify hook + configurable gate timeout, and worktree-by-default; exit criterion is a real dogfood run incl. the Full-Ship verification left BLOCKED in 12-12. Old Phase 13 (OSS + Hermes plugin) renumbered to **Phase 15** unchanged (+ actual crates.io publish). Phase 14 rescoped to pure observability (`logs`/`events.jsonl`/`status`) and now claims the previously unclaimed `capture_agent_output()` sync-path decision — both flagged-unclaimed items from the 2026-07-08 audit are now assigned. |
+.planning/STATE.md:686:- [Phase 17]: 17-04: advance() dispatches exhaustively on outcome_policy::decide_action (Unknown/Failed/RateLimited/ResourceKilled/AgentUnavailable each gate/resume/abort, never silently advance); GateInfra path (handle_infra_outcome) bumps infra_failures on every stage incl. Validate/Ship, never consecutive_failures; new devflow resume --phase N relaunches saved state (no State::new/branch/worktree reset) as the safe rate-limit auto-resume target; advance_evaluated now emits decided_by_layer + AgentStatus::as_wire_str()
+.planning/STATE.md:692:- [Phase 17]: 17-12: WR-04 resolved -- ChangelogAppend reordered strictly after VersionBump in hooks_after_ship() (removed from the Validate->Ship transition), reads version::read_version (new, git-free) instead of compute_version to avoid deriving a version one higher than the tag VersionBump just cut, and commits its own write via a new GitFlow::commit_path; version_bump had the identical uncommitted-write defect on its own version-file write and is fixed the same way
+.planning/STATE.md:804:| Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
+.planning/STATE.md:811:**Resume file:** .planning/phases/45-unattended-auto-mode-hardening-999-110-999-109-999-94/45-CONTEXT.md
+crates/devflow-core/src/lib.rs:1://! DevFlow — an opinionated take on AI-driven development automation.
+crates/devflow-core/src/lib.rs:25://! RUST_LOG=info devflow start --phase 3 --agent claude --mode auto   # Default: shows state transitions
+crates/devflow-core/src/lib.rs:26://! RUST_LOG=debug devflow start --phase 3 --agent claude --mode auto  # Also shows git commands and file I/O
+crates/devflow-core/src/recover.rs:84:/// have state — self-describing "auto-re-run this phase" records that must
+crates/devflow-core/src/agent_result.rs:214:    // to auto-resume) decayed into a generic Failed (routes to review/gating).
+crates/devflow-core/src/agent_result.rs:272:    // into auto-resume. A neighbor that is alphanumeric or '#' means the
+crates/devflow-core/src/agent_result.rs:610:/// (`gsd-executor.md:356`, `execute-phase.md:1053`) and predicted a bare
+crates/devflow-core/src/agent_result.rs:628:/// unconditionally recorded by the `checkpoint_auto_decided` audit event
+crates/devflow-core/src/agent_result.rs:852:/// `--auto --format json` event stream — i.e. at least one line's top-level
+crates/devflow-core/src/agent_result.rs:889:/// Parse an OpenCode `--auto --format json` JSONL event stream (one JSON
+crates/devflow-core/src/agent_result.rs:1424:/// failure is silent — a checkpoint auto-decide fires, or the resume ceiling is
+crates/devflow-core/src/agent_result.rs:1513:/// so every stage would be auto-resumed against a fabricated retry time
+crates/devflow-core/src/agent_result.rs:1540:/// operator loses automatic resume) but a never-silent one that still gates.
+crates/devflow-core/src/agent_result.rs:1541:/// Over-classifying means a healthy stream is auto-resumed against a retry time
+crates/devflow-core/src/agent_result.rs:1653:///    rate-limit resume cron, the one automated path that exists to recover
+crates/devflow-core/src/agent_result.rs:2135:/// not retried automatically", when the truth is `RateLimited`, which
+crates/devflow-core/src/agent_result.rs:2136:/// `outcome_policy` routes to auto-resume.
+crates/devflow-core/src/agent_result.rs:2197:             what to keep — this run is TERMINAL and is not retried automatically.",
+crates/devflow-core/src/agent_result.rs:2832:/// to a human gate instead of the auto-resume cron it needs, and an
+crates/devflow-core/src/agent_result.rs:3925:    /// A failure here means a checkpoint auto-decide can fire, or the resume
+crates/devflow-core/src/agent_result.rs:4309:    /// auto-resume while the verdict parser accepted the same capture. An
+crates/devflow-core/src/agent_result.rs:4760:    /// stray byte inverted the precedence — auto-resume became review/gating.
+crates/devflow-core/src/agent_result.rs:5071:    // ---- OpenCode `run --auto --format json` event stream (phase 43) -------
+crates/devflow-core/src/agent_result.rs:5073:    // Three fixtures are REDACTED from real, live `opencode run --auto
+crates/devflow-core/src/agent_result.rs:5151:        assert_eq!(args, ["run", "x", "--auto", "--format", "json"]);
+crates/devflow-core/src/agent_result.rs:5404:    const V3_INIT_EVENT: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/scratchpad/999.64-experiment","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","tools":["Task","Bash","Read","Write"],"mcp_servers":[{"name":"github","status":"pending"}],"model":"claude-opus-5[1m]","permissionMode":"bypassPermissions","slash_commands":["gsd-execute-phase"],"capabilities":["interrupt_receipt_v1","interrupt_cancel_queued_v1","msg_lifecycle_v1"],"uuid":"597e1613-77cb-4cdd-a716-2aa75dc58c0b"}"#;
+crates/devflow-core/src/agent_result.rs:5506:            "The next task is declared **Gate:** `{HUMAN_GATE_VALUE}` in the plan, so the executor must stop rather than auto-select."
+crates/devflow-core/src/agent_result.rs:5722:    /// real degradation (the operator loses automatic resume) but a never-silent
+crates/devflow-core/src/agent_result.rs:5723:    /// one that still gates. The opposite error auto-resumes a healthy stream
+crates/devflow-core/src/agent_result.rs:7671:    /// auto-resume cron it needs — the exact harm `rate_limited_result`'s
+crates/devflow-core/src/doc_check.rs:484:/// auto-inherit from the workspace, unlike ordinary `.workspace = true`
+crates/devflow-core/src/version.rs:734:/// Write `version` into the project's auto-detected version file.
+crates/devflow-core/src/verify.rs:116:/// is the PRIMARY gate for the auto-decide path added in plan 28-03: an
+crates/devflow-core/src/verify.rs:139:/// The two checkpoint markers GSD will not auto-approve in ANY mode, each
+crates/devflow-core/src/verify.rs:144:///   this gate stops for a human in *every* mode, including auto-mode,
+crates/devflow-core/src/verify.rs:147:///   auto-approves human-verify and auto-selects decision but says
+crates/devflow-core/src/verify.rs:148:///   "human-action still stops (auth gates cannot be automated)". The type
+crates/devflow-core/src/verify.rs:153:/// checkpoint class phase 35.1 exists to make auto-approvable — and every
+crates/devflow-core/src/verify.rs:165:/// that GSD will not auto-approve in any mode.
+crates/devflow-core/src/verify.rs:192:/// pair is not an accident.** That function serves the plan-28-03 auto-decide
+crates/devflow-core/src/verify.rs:334:    /// The second marker GSD never auto-approves in any mode
+crates/devflow-core/src/verify.rs:379:            "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
+crates/devflow-core/src/verify.rs:405:            "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
+crates/devflow-core/src/verify.rs:439:    /// returned `false` and the plan-28-03 checkpoint auto-decide path was
+crates/devflow-core/src/verify.rs:495:    // scan for the two markers GSD never auto-approves in any mode.
+crates/devflow-core/src/verify.rs:516:        // human-action checkpoint in auto-mode on its TYPE alone, so the
+crates/devflow-core/src/verify.rs:529:    /// 35.1 exists to make auto-approvable. A substring match that dropped the
+crates/devflow-core/src/verify.rs:543:            "the ordinary `blocking` gate is exactly the class auto-mode may approve \
+crates/devflow-core/src/verify.rs:583:             <task type=\"auto\">\n</task>\n"
+crates/devflow-core/src/state.rs:42:    /// How the pipeline is driven (auto vs. supervise).
+crates/devflow-core/src/state.rs:295:    /// auto-decide relaunch (plan 28-03) can `--resume` the exact session
+crates/devflow-core/src/state.rs:301:    /// checkpoint auto-decide resume (D-04, 28-03). Bounds a stuck
+crates/devflow-core/src/state.rs:609:            "mode": "auto",
+crates/devflow-core/src/state.rs:655:            "mode": "auto",
+crates/devflow-core/src/state.rs:699:            "mode": "auto",
+crates/devflow-core/src/state.rs:745:            "mode": "auto",
+crates/devflow-core/src/state.rs:818:            "mode": "auto",
+crates/devflow-core/src/state.rs:858:            "mode": "auto",
+crates/devflow-core/src/state.rs:898:            "mode": "auto",
+crates/devflow-core/src/state.rs:938:            "mode": "auto",
+crates/devflow-core/src/state.rs:977:            "mode": "auto",
+crates/devflow-core/src/state.rs:1016:            "mode": "auto",
+crates/devflow-core/src/state.rs:1067:            "mode": "auto",
+crates/devflow-core/src/stage.rs:21:    /// Wave-based parallel execution (`/gsd-execute-phase`).
+crates/devflow-core/src/stage.rs:64:            Stage::Code => "/gsd-execute-phase {N}",
+crates/devflow-core/src/stage.rs:139:        assert_eq!(Stage::Code.gsd_command(), "/gsd-execute-phase {N}");
+crates/devflow-core/src/ship_evidence.rs:39:/// `hooks_after_ship` batch has succeeded — after which this module's
+crates/devflow-core/src/ship_evidence.rs:69:    /// entire `hooks_after_ship` batch succeeding. The second is
+crates/devflow-core/src/ship_evidence.rs:82:    /// strictly after the `hooks_after_ship` batch's success loop breaks and
+crates/devflow-core/src/ship_evidence.rs:95:    /// immediately after `Merge` in the very same `hooks_after_ship` batch —
+crates/devflow-core/src/prompt.rs:20:/// The token that stops GSD from wiping `workflow._auto_chain_active` before
+crates/devflow-core/src/prompt.rs:23:/// `execute-phase.md:161-165` clears that flag at the top of every invocation
+crates/devflow-core/src/prompt.rs:27:/// auto-approves anything.
+crates/devflow-core/src/prompt.rs:29:/// **The token alone enables nothing.** GSD's `check auto-mode` reads
+crates/devflow-core/src/prompt.rs:31:/// `execute-phase.md` for `--auto` / `--chain` / `AUTO_CHAIN` / `auto_advance`
+crates/devflow-core/src/prompt.rs:33:/// `execute-phase.md` this token's only effect is to skip the clear. The
+crates/devflow-core/src/prompt.rs:34:/// mode gate that decides whether checkpoints may actually be auto-approved
+crates/devflow-core/src/prompt.rs:35:/// lives on the config write, in `pipeline_launch::auto_chain_flag_eligible`.
+crates/devflow-core/src/prompt.rs:38:/// (Code, and `fix_prompt`'s two `execute-phase` arms) cannot drift apart, and
+crates/devflow-core/src/prompt.rs:40:const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
+crates/devflow-core/src/prompt.rs:153:    /// `/gsd-execute-phase {N}` command, because the phase is mid-arc rather
+crates/devflow-core/src/prompt.rs:335:/// Pitfall 1): `execute-phase.md` wipes `workflow._auto_chain_active` at the top
+crates/devflow-core/src/prompt.rs:338:fn code_stage_prompt(phase: PhaseId) -> String {
+crates/devflow-core/src/prompt.rs:367:        StageIntent::Code { phase, fix: None } => code_stage_prompt(*phase),
+crates/devflow-core/src/prompt.rs:382:/// points at the GSD workflow file to follow, carries the `--auto` token where
+crates/devflow-core/src/prompt.rs:433:            "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
+crates/devflow-core/src/prompt.rs:434:            phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
+crates/devflow-core/src/prompt.rs:438:            "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
+crates/devflow-core/src/prompt.rs:439:            phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
+crates/devflow-core/src/prompt.rs:511:/// the `checkpoint_auto_decided` audit event (D-07, plan 28-03) can quote
+crates/devflow-core/src/prompt.rs:515:pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
+crates/devflow-core/src/prompt.rs:531:/// Both arms that dispatch to `execute-phase` carry
+crates/devflow-core/src/prompt.rs:533:/// they reach `execute-phase.md`'s sync-clear step, and without the token that
+crates/devflow-core/src/prompt.rs:540:/// reaches `execute-phase.md`, and so never meets the sync-clear step.
+crates/devflow-core/src/prompt.rs:549:            format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
+crates/devflow-core/src/prompt.rs:552:            format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
+crates/devflow-core/src/prompt.rs:570:            (Stage::Code, "/gsd-execute-phase 11"),
+crates/devflow-core/src/prompt.rs:583:        assert!(stage_prompt(Stage::Code, PhaseId::new(7)).contains("/gsd-execute-phase 7"));
+crates/devflow-core/src/prompt.rs:661:    fn code_stage_prompt_is_unchanged_single_command_template() {
+crates/devflow-core/src/prompt.rs:670:        assert!(prompt.contains("/gsd-execute-phase 9"));
+crates/devflow-core/src/prompt.rs:772:        assert!(full_execute_prompt.contains("/gsd-execute-phase 11"));
+crates/devflow-core/src/prompt.rs:781:    /// reach `execute-phase.md`'s sync-clear step, and nowhere else.
+crates/devflow-core/src/prompt.rs:793:            "the --gaps-only fix loop reaches execute-phase.md, so it meets the \
+crates/devflow-core/src/prompt.rs:798:            "the full-execute loop-back reaches execute-phase.md too"
+crates/devflow-core/src/prompt.rs:802:            "audit-fix routes to /gsd-audit-fix and never reaches execute-phase.md, \
+crates/devflow-core/src/prompt.rs:813:            "/gsd-execute-phase 11 {AUTO_CHAIN_PRESERVING_FLAG}"
+crates/devflow-core/src/prompt.rs:819:    /// The flag that would enable checkpoint auto-approval at Plan is the same
+crates/devflow-core/src/prompt.rs:820:    /// flag that makes `plan-phase.md` chain into `execute-phase.md`
+crates/devflow-core/src/prompt.rs:830:            "the Plan prompt must not chain into execute-phase (D-04)"
+crates/devflow-core/src/prompt.rs:841:    fn checkpoint_auto_decide_prompt_is_deterministic() {
+crates/devflow-core/src/prompt.rs:843:            checkpoint_auto_decide_prompt(PhaseId::new(28)),
+crates/devflow-core/src/prompt.rs:844:            checkpoint_auto_decide_prompt(PhaseId::new(28))
+crates/devflow-core/src/prompt.rs:849:    fn checkpoint_auto_decide_prompt_terminates_with_completion_protocol() {
+crates/devflow-core/src/prompt.rs:850:        let prompt = checkpoint_auto_decide_prompt(PhaseId::new(28));
+crates/devflow-core/src/prompt.rs:860:    fn checkpoint_auto_decide_prompt_states_no_operator_judgment_and_record_reasoning() {
+crates/devflow-core/src/prompt.rs:861:        let prompt = checkpoint_auto_decide_prompt(PhaseId::new(28)).to_lowercase();
+crates/devflow-core/src/prompt.rs:878:    fn checkpoint_auto_decide_prompt_substitutes_phase_for_legibility() {
+crates/devflow-core/src/prompt.rs:879:        assert!(checkpoint_auto_decide_prompt(PhaseId::new(42)).contains("phase 42"));
+crates/devflow-core/src/outcome_policy.rs:69:        // has surveyed. `idle_timeout_is_never_auto_resumed` pins this across
+crates/devflow-core/src/outcome_policy.rs:88:    fn rate_limited_auto_resumes() {
+crates/devflow-core/src/outcome_policy.rs:96:    /// auto-resume, never Advance and never a gate — the agent self-reported
+crates/devflow-core/src/outcome_policy.rs:99:    fn ambiguous_auto_resumes_never_advances() {
+crates/devflow-core/src/outcome_policy.rs:179:    fn idle_timeout_is_never_auto_resumed() {
+crates/devflow-core/src/outcome_policy.rs:187:                "IdleTimeout must never auto-resume at {stage:?}"
+crates/devflow-core/src/outcome_policy.rs:199:    /// auto-resume, so running the same loop over it must produce the opposite
+crates/devflow-core/src/outcome_policy.rs:203:    fn the_never_auto_resume_loop_can_actually_fail() {
+crates/devflow-core/src/outcome_policy.rs:208:                "negative control: RateLimited must auto-resume at {stage:?}"
+crates/devflow-core/src/monitor.rs:11://! This is the core automation primitive — no cron, no scheduler,
+crates/devflow-core/src/monitor.rs:1153:    //    `outcome_policy` routes to auto-resume. Writing an idle-timeout record
+crates/devflow-core/src/monitor.rs:1158:    //    not retried automatically".
+crates/devflow-core/src/monitor.rs:2025:    /// not retried automatically".
+crates/devflow-core/src/mode.rs:6://! - **Auto:** Define and Plan run once. Code ↔ Validate auto-loop until clean.
+crates/devflow-core/src/mode.rs:83:/// checkpoint auto-decide relaunch (D-03/D-04, 28-03) stops resuming and
+crates/devflow-core/src/mode.rs:262:    /// Whether a failed Validate at `stage` may auto-loop back to Code without a
+crates/devflow-core/src/mode.rs:264:    pub fn should_auto_loop(self, stage: Stage) -> bool {
+crates/devflow-core/src/mode.rs:272:            Mode::Auto => "auto",
+crates/devflow-core/src/mode.rs:284:            "auto" => Ok(Mode::Auto),
+crates/devflow-core/src/mode.rs:293:#[error("unsupported mode `{0}`; expected auto or supervise")]
+crates/devflow-core/src/mode.rs:302:        assert_eq!("auto".parse::<Mode>().unwrap(), Mode::Auto);
+crates/devflow-core/src/mode.rs:315:    fn auto_does_not_gate_validate_until_failure_threshold() {
+crates/devflow-core/src/mode.rs:391:    fn auto_loops_validate_supervise_does_not() {
+crates/devflow-core/src/mode.rs:392:        assert!(Mode::Auto.should_auto_loop(Stage::Validate));
+crates/devflow-core/src/mode.rs:393:        assert!(!Mode::Supervise.should_auto_loop(Stage::Validate));
+crates/devflow-core/src/mode.rs:394:        assert!(!Mode::Auto.should_auto_loop(Stage::Code));
+crates/devflow-core/src/hooks.rs:98:/// actually cut the tag, and `VersionBump` runs in [`hooks_after_ship`],
+crates/devflow-core/src/hooks.rs:115:pub fn hooks_after_ship() -> Vec<Hook> {
+crates/devflow-core/src/hooks.rs:162:/// exists — because this is the only place in `hooks_after_ship` where the
+crates/devflow-core/src/hooks.rs:173:/// `develop` by the time the re-check runs, and automatically resetting a
+crates/devflow-core/src/hooks.rs:254:    // hook in hooks_after_ship()) actually tagged, handed through
+crates/devflow-core/src/hooks.rs:423:        // runs in hooks_after_ship, strictly after this transition) cuts the
+crates/devflow-core/src/hooks.rs:453:            hooks_after_ship(),
+crates/devflow-core/src/hooks.rs:535:        for hook in hooks_after_ship() {
+crates/devflow-core/src/hooks.rs:565:        // Full regression for WR-04 (17-12): drives the whole hooks_after_ship
+crates/devflow-core/src/hooks.rs:572:        // exist after running only hooks_after_ship().
+crates/devflow-core/src/hooks.rs:587:        for hook in hooks_after_ship() {
+crates/devflow-core/src/hooks.rs:650:        for hook in hooks_after_ship() {
+crates/devflow-core/src/gsd_config.rs:6://! `workflow._auto_chain_active`, the flag GSD's `checkpoint_handling` consults
+crates/devflow-core/src/gsd_config.rs:8://! auto-approved — and must leave every other key, its position, and its
+crates/devflow-core/src/gsd_config.rs:38:const AUTO_CHAIN_KEY: &str = "_auto_chain_active";
+crates/devflow-core/src/gsd_config.rs:65:/// worktree copy is the one the agent's `check auto-mode` actually reads.
+crates/devflow-core/src/gsd_config.rs:85:/// Whether `workflow._auto_chain_active` is currently set under `root`.
+crates/devflow-core/src/gsd_config.rs:99:pub fn auto_chain_active(root: &Path) -> Result<bool, GsdConfigError> {
+crates/devflow-core/src/gsd_config.rs:114:/// Set `workflow._auto_chain_active` under `root`, returning whether the file
+crates/devflow-core/src/gsd_config.rs:133:pub fn set_auto_chain_active(root: &Path, active: bool) -> Result<bool, GsdConfigError> {
+crates/devflow-core/src/gsd_config.rs:181:/// What [`force_clear_auto_chain`] actually did, so the CLI call sites can
+crates/devflow-core/src/gsd_config.rs:220:/// Clear `workflow._auto_chain_active` under `root` unconditionally, repairing
+crates/devflow-core/src/gsd_config.rs:230:/// this checkpoint" but "chain into execute-phase". Rather than try to make
+crates/devflow-core/src/gsd_config.rs:245:pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigError> {
+crates/devflow-core/src/gsd_config.rs:248:    match set_auto_chain_active(root, false) {
+crates/devflow-core/src/gsd_config.rs:348:fix(gsd): clear a leaked auto-chain flag before launch
+crates/devflow-core/src/gsd_config.rs:351:clear workflow._auto_chain_active, and the leaked value reached this branch.
+crates/devflow-core/src/gsd_config.rs:353:plan-phase invocation reads the same boolean as \"chain into execute-phase\"
+crates/devflow-core/src/gsd_config.rs:442:    /// owns, in the order the file has them, plus `workflow.auto_advance` and
+crates/devflow-core/src/gsd_config.rs:457:    "auto_mode": true,
+crates/devflow-core/src/gsd_config.rs:458:    "auto_advance": true,
+crates/devflow-core/src/gsd_config.rs:461:    "_auto_chain_active": false,
+crates/devflow-core/src/gsd_config.rs:501:            "\"_auto_chain_active\": false",
+crates/devflow-core/src/gsd_config.rs:502:            &format!("\"_auto_chain_active\": {active}"),
+crates/devflow-core/src/gsd_config.rs:505:            replaced.contains(&format!("\"_auto_chain_active\": {active}")),
+crates/devflow-core/src/gsd_config.rs:539:    /// in `force_clear_auto_chain` is expressed against `HEAD`, and a repo with
+crates/devflow-core/src/gsd_config.rs:579:        value["workflow"]["_auto_chain_active"].clone()
+crates/devflow-core/src/gsd_config.rs:595:        let outcome = force_clear_auto_chain(&root).unwrap();
+crates/devflow-core/src/gsd_config.rs:607:            !auto_chain_active(&root).unwrap(),
+crates/devflow-core/src/gsd_config.rs:633:        let outcome = force_clear_auto_chain(&root).unwrap();
+crates/devflow-core/src/gsd_config.rs:667:        let outcome = force_clear_auto_chain(&root).unwrap();
+crates/devflow-core/src/gsd_config.rs:686:            !auto_chain_active(&root).unwrap(),
+crates/devflow-core/src/gsd_config.rs:714:        let outcome = force_clear_auto_chain(&root).unwrap();
+crates/devflow-core/src/gsd_config.rs:735:        let outcome = force_clear_auto_chain(&root).expect("an absent config is not an error");
+crates/devflow-core/src/gsd_config.rs:748:        let malformed = "{ \"workflow\": { \"_auto_chain_active\": tru";
+crates/devflow-core/src/gsd_config.rs:752:            force_clear_auto_chain(&root),
+crates/devflow-core/src/gsd_config.rs:787:        assert!(set_auto_chain_active(&root, true).unwrap());
+crates/devflow-core/src/gsd_config.rs:791:            "\"_auto_chain_active\": false",
+crates/devflow-core/src/gsd_config.rs:792:            "\"_auto_chain_active\": true",
+crates/devflow-core/src/gsd_config.rs:808:        assert!(auto_chain_active(&root).unwrap());
+crates/devflow-core/src/gsd_config.rs:812:    /// chaining. Nothing in this codebase may write `workflow.auto_advance`.
+crates/devflow-core/src/gsd_config.rs:814:    /// Why it matters concretely: GSD's `check auto-mode` ORs the two flags
+crates/devflow-core/src/gsd_config.rs:816:    /// `auto_advance` would silently enable the stage-chaining ROADMAP
+crates/devflow-core/src/gsd_config.rs:820:    fn writing_the_flag_never_touches_auto_advance() {
+crates/devflow-core/src/gsd_config.rs:822:        // The fixture has `auto_advance: true` BEFORE the call, deliberately.
+crates/devflow-core/src/gsd_config.rs:826:            serde_json::from_str::<Value>(REAL_SHAPE).unwrap()["workflow"]["auto_advance"],
+crates/devflow-core/src/gsd_config.rs:830:        set_auto_chain_active(&root, true).unwrap();
+crates/devflow-core/src/gsd_config.rs:831:        set_auto_chain_active(&root, false).unwrap();
+crates/devflow-core/src/gsd_config.rs:836:            after["workflow"]["auto_advance"],
+crates/devflow-core/src/gsd_config.rs:838:            "auto_advance is the operator's, and neither setting nor clearing \
+crates/devflow-core/src/gsd_config.rs:855:            !set_auto_chain_active(&root, false).unwrap(),
+crates/devflow-core/src/gsd_config.rs:866:        // change. Without this, a `set_auto_chain_active` that always returned
+crates/devflow-core/src/gsd_config.rs:868:        assert!(set_auto_chain_active(&root, true).unwrap());
+crates/devflow-core/src/gsd_config.rs:877:        assert!(set_auto_chain_active(&root, true).unwrap());
+crates/devflow-core/src/gsd_config.rs:878:        assert!(auto_chain_active(&root).unwrap());
+crates/devflow-core/src/gsd_config.rs:895:        let malformed = "{ \"workflow\": { \"auto_advance\": tru";
+crates/devflow-core/src/gsd_config.rs:900:            set_auto_chain_active(&root, true),
+crates/devflow-core/src/gsd_config.rs:904:            auto_chain_active(&root),
+crates/devflow-core/src/gsd_config.rs:921:            set_auto_chain_active(&root, true),
+crates/devflow-core/src/gsd_config.rs:938:            set_auto_chain_active(&root, true),
+crates/devflow-core/src/gsd_config.rs:942:            auto_chain_active(&root),
+crates/devflow-core/src/gsd_config.rs:954:    /// Reading via `value["workflow"]["_auto_chain_active"]` would panic on the
+crates/devflow-core/src/gsd_config.rs:965:            "{ \"workflow\": { \"_auto_chain_active\": \"true\" } }",
+crates/devflow-core/src/gsd_config.rs:969:                !auto_chain_active(&root).unwrap(),
+crates/devflow-core/src/gsd_config.rs:977:        let (_dir, root) = project("{ \"workflow\": { \"_auto_chain_active\": true } }");
+crates/devflow-core/src/gsd_config.rs:978:        assert!(auto_chain_active(&root).unwrap());
+crates/devflow-core/src/gsd_config.rs:986:        set_auto_chain_active(&root, true).unwrap();
+crates/devflow-core/src/gsd_config.rs:995:        set_auto_chain_active(&root2, true).unwrap();
+crates/devflow-core/src/gsd_config.rs:1007:        set_auto_chain_active(&root, true).unwrap();
+crates/devflow-core/src/git.rs:222:    /// on a live `devflow start --mode auto` run).
+crates/devflow-core/src/git.rs:914:    /// `devflow start --mode auto` run because the operator's global
+crates/devflow-core/src/config.rs:85:    /// automatically and attributed in the gate ledger, exactly as if
+crates/devflow-core/src/config.rs:91:    /// a standing unattended auto-merge can never become the silent
+.planning/proposals/workspace-branching-and-pr-automation-spec.md:27:The architecture separates **personal working environment tracking** from **upstream contribution delivery** through structured branch naming and automated PR extraction:
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/bash -lc "sed -n '1,220p' crates/devflow-core/src/hooks.rs; sed -n '330,380p' crates/devflow-core/src/prompt.rs; rg -n \"worktree|base ref|origin|is_ancestor|merge\" crates/devflow-core/src/git.rs crates/devflow-core/src | head -100" in /var/home/denniyahh/Github/devflow
+ succeeded in 0ms:
+//! Stage-transition hooks.
+//!
+//! Branching, docs, changelog, and version bumps are no longer workflow stages
+//! (as they were in v0.x). They are *hooks* that fire at specific stage
+//! transitions. [`hooks_for_transition`] maps a `(from, to)` stage move to the
+//! hooks that should run, and [`Hook::run`] executes one.
+
+use crate::config::GitFlowConfig;
+use crate::git::GitFlow;
+use crate::phase_id::PhaseId;
+use crate::stage::Stage;
+use crate::version;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tracing::{info, warn};
+
+/// A side-effecting action that fires at a stage transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hook {
+    /// Create the `feature/phase-NN` branch from develop.
+    BranchCreate,
+    /// Delete the merged feature branch after Ship.
+    BranchCleanup,
+    /// Regenerate and commit docs.
+    DocsUpdate,
+    /// Merge the phase feature branch into develop before release bookkeeping.
+    Merge,
+    /// Append a CHANGELOG entry.
+    ChangelogAppend,
+    /// Compute and write the next version, then tag it.
+    VersionBump,
+}
+
+/// Context passed to every hook.
+#[derive(Debug, Clone)]
+pub struct HookContext {
+    /// Phase the workflow is on.
+    pub phase: PhaseId,
+    /// Project root.
+    pub project_root: PathBuf,
+    /// Stage the workflow is entering.
+    pub stage: Stage,
+    /// Git-flow branch model.
+    pub git_flow: GitFlowConfig,
+    /// The version `VersionBump` actually tagged, set once it runs (GAP-7).
+    /// `ChangelogAppend` reads this instead of re-deriving the version from
+    /// disk, so the changelog heading and the git tag never desync — in
+    /// particular when there is no version file and `version::read_version`
+    /// would otherwise error and fall back to the `unreleased` literal.
+    pub shipped_version: Option<String>,
+    /// The Keep-a-Changelog-grouped body `VersionBump` computed, set once it
+    /// runs (D-12, T-26-11). `ChangelogAppend` reads this instead of
+    /// re-deriving it from live git state, for the same reason
+    /// `shipped_version` must be handed forward rather than re-derived:
+    /// once `VersionBump` has created the release tag, the range this body
+    /// was computed over collapses to empty (the tag is now the baseline),
+    /// so a re-derivation after the fact would silently produce an empty
+    /// changelog entry.
+    pub shipped_changelog_body: Option<String>,
+}
+
+/// Errors produced by hooks.
+#[derive(Debug, thiserror::Error)]
+pub enum HookError {
+    /// A git-flow operation failed.
+    #[error(transparent)]
+    Git(#[from] crate::git::GitError),
+    /// A version operation failed.
+    #[error(transparent)]
+    Version(#[from] version::VersionError),
+    /// Filesystem operation failed.
+    #[error("hook I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl Hook {
+    /// Run this hook against the given context.
+    pub fn run(&self, ctx: &mut HookContext) -> Result<(), HookError> {
+        match self {
+            Hook::BranchCreate => branch_create(ctx),
+            Hook::BranchCleanup => branch_cleanup(ctx),
+            Hook::DocsUpdate => docs_update(ctx),
+            Hook::Merge => merge_feature(ctx),
+            Hook::ChangelogAppend => changelog_append(ctx),
+            Hook::VersionBump => version_bump(ctx),
+        }
+    }
+}
+
+/// Which hooks fire when moving `from` → `to`.
+///
+/// - Validate → Ship: docs are finalized before shipping.
+/// - Ship → (done): merge + version bump + changelog + branch cleanup.
+/// - everything else: none.
+///
+/// `ChangelogAppend` deliberately does NOT run here (WR-04, 17-12): a
+/// changelog heading naming a release is only true once `VersionBump` has
+/// actually cut the tag, and `VersionBump` runs in [`hooks_after_ship`],
+/// strictly after this transition.
+pub fn hooks_for_transition(from: Stage, to: Stage) -> Vec<Hook> {
+    match (from, to) {
+        (Stage::Validate, Stage::Ship) => vec![Hook::DocsUpdate],
+        _ => Vec::new(),
+    }
+}
+
+/// Hooks that fire after Ship completes (the workflow's terminal transition).
+///
+/// `ChangelogAppend` runs strictly after `VersionBump` (WR-04, 17-12) — the
+/// entry must describe the version `VersionBump` actually wrote and tagged,
+/// never a version computed independently of it. It runs before
+/// `BranchCleanup` so a changelog failure still stops short of deleting the
+/// feature branch (`run_checkout_hooks`' terminal-batch fail-fast breaks on
+/// the first error in this batch).
+pub fn hooks_after_ship() -> Vec<Hook> {
+    vec![
+        Hook::Merge,
+        Hook::VersionBump,
+        Hook::ChangelogAppend,
+        Hook::BranchCleanup,
+    ]
+}
+
+fn branch_create(ctx: &HookContext) -> Result<(), HookError> {
+    let git = GitFlow::new(&ctx.project_root);
+    let branch = git.feature_start(ctx.phase)?;
+    info!("BranchCreate: created {branch}");
+    Ok(())
+}
+
+fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
+    let git = GitFlow::new(&ctx.project_root);
+    let branch = format!(
+        "{}phase-{}",
+        ctx.git_flow.feature_prefix,
+        ctx.phase.padded()
+    );
+    if git.branch_exists(&branch) {
+        // Non-force cleanup is intentional: never discard unmerged work.
+        match git.delete_branch(&branch, false) {
+            Ok(()) => info!("BranchCleanup: deleted {branch}"),
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("not fully merged") || message.contains("not yet merged") {
+                    warn!(
+                        "BranchCleanup: feature branch {branch} is not merged yet — left in place"
+                    );
+                } else {
+                    warn!("BranchCleanup: could not delete {branch}: {err}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge the phase's feature branch into develop, then re-assert ancestry
+/// (23-06 / T-23-62) before reporting success.
+///
+/// **The post-merge ancestry re-check runs here — immediately after
+/// `merge_feature_into_develop` returns `Ok`, while the feature branch still
+/// exists — because this is the only place in `hooks_after_ship` where the
+/// assertion is both meaningful and safe.** `BranchCleanup` runs later in the
+/// same batch and deletes the branch; after that, an ancestry check fails
+/// closed on an absent branch (`git.rs:89-92`: "an absent branch is not proof
+/// of a merge") and would report `false` for every successfully shipped
+/// phase, so this check can never be moved after the batch without inverting
+/// its meaning.
+///
+/// **No-rollback policy, stated here because it must not be re-derived
+/// later:** on the ancestry re-check's failure path below, `merge_feature`
+/// does NOT undo the merge. `git merge --no-ff` has already committed on
+/// `develop` by the time the re-check runs, and automatically resetting a
+/// shared integration branch is a far more dangerous operation than the
+/// inconsistency it would be papering over. Instead, this returns `Err`; the
+/// containing `run_checkout_hooks` batch fails; `finish_workflow_with_gate_timeout`
+/// reopens an actionable Ship gate whose context tells a human to resolve the
+/// git error, and the operator decides. Plan 23-10's recovery-path artifact
+/// must know this exact state.
+fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
+    let git = GitFlow::new(&ctx.project_root);
+    let branch = format!(
+        "{}phase-{}",
+        ctx.git_flow.feature_prefix,
+        ctx.phase.padded()
+    );
+    if !git.branch_exists(&branch) {
+        return Err(crate::git::GitError::Command(format!(
+            "feature branch `{branch}` is missing; refusing to report an unproven merge"
+        ))
+        .into());
+    }
+    if git.is_merged_into_develop(ctx.phase) {
+        info!("Merge: {branch} is already merged; nothing to merge");
+        crate::events::emit(
+            &ctx.project_root,
+            ctx.phase,
+            "merge_result",
+            serde_json::json!({"merged": false, "branch": branch}),
+        );
+        return Ok(());
+    }
+
+    git.merge_feature_into_develop(ctx.phase)?;
+
+    if !git.is_merged_into_develop(ctx.phase) {
+        crate::events::emit(
+            &ctx.project_root,
+            ctx.phase,
+            "merge_result",
+            serde_json::json!({"merged": false, "branch": branch}),
+        );
+        return Err(crate::git::GitError::Command(format!(
+            "merge of `{branch}` reported success but the branch is still not an ancestor of \
+             develop; refusing to report an unproven merge"
+        ))
+        .into());
+    }
+
+    info!("Merge: merged {branch} into develop");
+}
+
+/// The Code stage's dedicated prompt.
+///
+/// The Code arm ONLY carries [`AUTO_CHAIN_PRESERVING_FLAG`] (D-04/D-05, 35.1-01
+/// Pitfall 1): `execute-phase.md` wipes `workflow._auto_chain_active` at the top
+/// of every invocation whose `$ARGUMENTS` lacks this token, which would clear
+/// the flag DevFlow just set before `checkpoint_handling` ever reads it.
+fn code_stage_prompt(phase: PhaseId) -> String {
+    let command = format!(
+        "{} {AUTO_CHAIN_PRESERVING_FLAG}",
+        gsd_command_for(Stage::Code, phase)
+    );
+    format!(
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+        ## Advisory incremental self-review\n\
+        \n\
+        After each plan or wave lands, perform a quick, shallow self-check \
+        for doc accuracy, leaked data, CI/build correctness, and \
+        external-state claims. Record any drift in the working output and \
+        continue execution; the authoritative review happens during Ship. \
+        This check must not pause execution or request human input.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
+/// Render a [`StageIntent`] as the legacy Claude/OpenCode slash-command text.
+///
+/// This is the byte-identical renderer: Claude and OpenCode produce exactly
+/// what `stage_prompt` produced before the migration (CONTEXT D-01 zero
+/// regression). It lives here — not in the adapters — so the two agents cannot
+/// drift apart, and the per-stage snapshot tests pin it.
+pub fn render_claude_style(intent: &StageIntent) -> String {
+    match intent {
+        StageIntent::Define { phase } => define_stage_prompt(*phase),
+        StageIntent::Plan { phase } => idempotent_stage_prompt(*phase),
+        StageIntent::Code { phase, fix: None } => code_stage_prompt(*phase),
+        StageIntent::Code {
+            phase,
+            fix: Some(fix),
+        } => fix_prompt(*fix, *phase),
+        StageIntent::Validate { phase } => validate_stage_prompt(*phase),
+        StageIntent::Ship {
+            phase,
+            review_angles,
+        } => ship_stage_prompt(*phase, review_angles),
+    }
+}
+
+/// Render a [`StageIntent`] as a workflow-reference instruction for agents that
+crates/devflow-core/src/git.rs:149:        let branch = self.merge_feature_into_develop(phase)?;
+crates/devflow-core/src/git.rs:157:    /// worktree, so deletion belongs to the later best-effort cleanup hook.
+crates/devflow-core/src/git.rs:158:    pub fn merge_feature_into_develop(&self, phase: PhaseId) -> Result<String, GitError> {
+crates/devflow-core/src/git.rs:162:        self.git(["merge", "--no-ff", &branch])?;
+crates/devflow-core/src/git.rs:166:    /// Whether a phase feature branch has nothing left to merge into develop.
+crates/devflow-core/src/git.rs:168:    /// An absent branch is not proof of a merge. Callers must fail closed
+crates/devflow-core/src/git.rs:170:    pub fn is_merged_into_develop(&self, phase: PhaseId) -> bool {
+crates/devflow-core/src/git.rs:177:            .args(["merge-base", "--is-ancestor", &branch, &self.config.develop])
+crates/devflow-core/src/git.rs:201:        self.git(["merge", "--no-ff", &branch])?;
+crates/devflow-core/src/git.rs:210:        self.git(["merge", "--no-ff", &branch])?;
+crates/devflow-core/src/git.rs:230:    /// With `force`, uses `git branch -D` (deletes even if unmerged); otherwise
+crates/devflow-core/src/git.rs:231:    /// `git branch -d` (refuses to delete unmerged work). Protected branches
+crates/devflow-core/src/git.rs:276:    /// Check out an existing branch in the main worktree.
+crates/devflow-core/src/git.rs:282:    /// Delete `branch` on `origin` (best-effort; errors if no remote/branch).
+crates/devflow-core/src/git.rs:285:        self.git(["push", "origin", "--delete", branch])
+crates/devflow-core/src/git.rs:295:    /// Push `branch` to `origin`, setting upstream.
+crates/devflow-core/src/git.rs:298:        self.git(["push", "-u", "origin", branch])
+crates/devflow-core/src/git.rs:301:    /// Delete local branches already merged into `develop`.
+crates/devflow-core/src/git.rs:304:    /// on `git branch --merged`'s default of "whatever HEAD currently is" —
+crates/devflow-core/src/git.rs:307:    /// merged into that other branch instead.
+crates/devflow-core/src/git.rs:309:    /// Deletion uses `-D`, not `-d`: `-d` verifies merged-into-HEAD, which
+crates/devflow-core/src/git.rs:310:    /// contradicts the `--merged develop` listing above in exactly the
+crates/devflow-core/src/git.rs:312:    /// merged branch would be refused as "not fully merged"). The listing IS
+crates/devflow-core/src/git.rs:313:    /// the merge safety check. A branch git still refuses to delete (e.g.
+crates/devflow-core/src/git.rs:314:    /// checked out in a worktree) is logged and skipped so one failure
+crates/devflow-core/src/git.rs:316:    pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
+crates/devflow-core/src/git.rs:317:        let output = self.git_output(["branch", "--merged", &self.config.develop])?;
+crates/devflow-core/src/git.rs:322:            // the current branch, "+ " for a worktree checkout, "  "
+crates/devflow-core/src/git.rs:336:            info!("cleaning up merged branch: {branch}");
+crates/devflow-core/src/git.rs:339:                Err(err) => warn!("could not delete merged branch {branch}: {err}"),
+crates/devflow-core/src/git.rs:528:/// Result of checking whether `origin/main` is already an ancestor of
+crates/devflow-core/src/git.rs:534:    /// `origin/main` is an ancestor of `HEAD` — sync would be a no-op.
+crates/devflow-core/src/git.rs:536:    /// `origin/main` resolves locally but is NOT an ancestor of `HEAD` —
+crates/devflow-core/src/git.rs:540:    /// `origin/main` does not resolve locally at all (never fetched, or no
+crates/devflow-core/src/git.rs:547:/// Check whether `origin/main` is an ancestor of `HEAD`, against
+crates/devflow-core/src/git.rs:549:/// `scripts/sync-main-to-develop.sh`'s own `git merge-base --is-ancestor
+crates/devflow-core/src/git.rs:550:/// origin/main HEAD` invocation (`:41`), minus the preceding `git fetch`
+crates/devflow-core/src/git.rs:553:pub fn origin_main_ancestor_status(project_root: &Path) -> AncestorStatus {
+crates/devflow-core/src/git.rs:555:        .args(["rev-parse", "--verify", "--quiet", "origin/main"])
+crates/devflow-core/src/git.rs:562:    let is_ancestor = git_command(project_root)
+crates/devflow-core/src/git.rs:563:        .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+crates/devflow-core/src/git.rs:567:    if is_ancestor {
+crates/devflow-core/src/git.rs:576:/// [`origin_main_ancestor_status`] to an arbitrary ref pair (used by
+crates/devflow-core/src/git.rs:582:pub fn ref_is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> AncestorStatus {
+crates/devflow-core/src/git.rs:593:    let is_ancestor = git_command(project_root)
+crates/devflow-core/src/git.rs:594:        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+crates/devflow-core/src/git.rs:598:    if is_ancestor {
+crates/devflow-core/src/git.rs:859:    fn feature_finish_merges_into_develop_and_deletes() {
+crates/devflow-core/src/git.rs:882:    fn release_start_and_finish_tags_main_and_merges_both() {
+crates/devflow-core/src/git.rs:1105:        let is_ancestor = crate::test_support::git_command(root)
+crates/devflow-core/src/git.rs:1106:            .args(["merge-base", "--is-ancestor", &feature_tip, &release_tip])
+crates/devflow-core/src/git.rs:1112:            is_ancestor,
+crates/devflow-core/src/git.rs:1119:    fn cleanup_merged_removes_merged_but_keeps_protected() {
+crates/devflow-core/src/git.rs:1124:        // Create and merge a feature branch into develop.
+crates/devflow-core/src/git.rs:1129:        // Create an already-merged stray branch off develop.
+crates/devflow-core/src/git.rs:1130:        git(root, &["branch", "stale-merged"]);
+crates/devflow-core/src/git.rs:1132:        let deleted = gf.cleanup_merged().expect("cleanup");
+crates/devflow-core/src/git.rs:1133:        assert!(deleted.contains(&"stale-merged".to_string()));
+crates/devflow-core/src/git.rs:1139:    /// WR-04 (13-REVIEW.md): `cleanup_merged` must compute "merged" relative
+crates/devflow-core/src/git.rs:1143:    /// delete) a branch that's merged into that other branch but was never
+crates/devflow-core/src/git.rs:1144:    /// actually merged into `develop`.
+crates/devflow-core/src/git.rs:1146:    fn cleanup_merged_is_relative_to_develop_not_current_head() {
+crates/devflow-core/src/git.rs:1153:        // `premature` is merged into `topic` but NOT into `develop`.
+crates/devflow-core/src/git.rs:1159:        // calling cleanup_merged, mirroring an operator who forgot to
+crates/devflow-core/src/git.rs:1161:        // "merged into HEAD" under an implicit baseline since it IS HEAD,
+crates/devflow-core/src/git.rs:1167:        let _ = gf.cleanup_merged();
+crates/devflow-core/src/git.rs:1170:            "premature is merged into topic (current HEAD) but not into \
+crates/devflow-core/src/git.rs:1171:             develop — it must survive cleanup_merged when the baseline is develop"
+crates/devflow-core/src/git.rs:1175:    /// WR-03 (13-REVIEW.md), revised: `git branch --merged` prefixes a
+crates/devflow-core/src/git.rs:1176:    /// branch checked out in a linked worktree with `+ `. The prefix must be
+crates/devflow-core/src/git.rs:1179:    /// to delete — a worktree checkout can never be deleted, by design —
+crates/devflow-core/src/git.rs:1181:    /// the remaining merged branches.
+crates/devflow-core/src/git.rs:1183:    fn cleanup_merged_skips_worktree_branch_and_continues_sweep() {
+crates/devflow-core/src/git.rs:1189:        // deletes on merge, which would leave nothing to check out).
+crates/devflow-core/src/git.rs:1192:            &["checkout", "-q", "-b", "worktree-merged", "develop"],
+crates/devflow-core/src/git.rs:1196:        git(root, &["merge", "-q", "--no-ff", "worktree-merged"]);
+crates/devflow-core/src/git.rs:1198:        // Check the merged branch out in a linked worktree so
+crates/devflow-core/src/git.rs:1199:        // `git branch --merged` reports it with a `+ ` prefix.
+crates/devflow-core/src/git.rs:1204:                "worktree",
+crates/devflow-core/src/git.rs:1207:                "worktree-merged",
+crates/devflow-core/src/git.rs:1211:        // A second merged branch that sorts after "worktree-merged" would be
+crates/devflow-core/src/git.rs:1212:        // reached only if the sweep survives the worktree refusal; "zz-" also
+crates/devflow-core/src/git.rs:1218:            .cleanup_merged()
+crates/devflow-core/src/git.rs:1219:            .expect("a skipped worktree branch must not abort the sweep");
+crates/devflow-core/src/git.rs:1223:            !deleted.contains(&"worktree-merged".to_string()),
+crates/devflow-core/src/git.rs:1224:            "worktree checkout cannot be deleted"
+crates/devflow-core/src/git.rs:1226:        assert!(gf.branch_exists("worktree-merged"));
+crates/devflow-core/src/git.rs:1229:    /// The delete side must agree with the `--merged develop` listing: `-d`
+crates/devflow-core/src/git.rs:1230:    /// verifies merged-into-HEAD, so with the main checkout parked on a
+crates/devflow-core/src/git.rs:1231:    /// stale branch every genuinely-merged branch was refused as "not fully
+crates/devflow-core/src/git.rs:1232:    /// merged" — in exactly the scenario WR-04 exists for.
+crates/devflow-core/src/git.rs:1234:    fn cleanup_merged_deletes_when_head_is_not_on_develop() {
+crates/devflow-core/src/git.rs:1239:        // `old` is parked before the merge below, so nothing merged later is
+crates/devflow-core/src/git.rs:1243:        git(root, &["checkout", "-q", "-b", "merged-feature", "develop"]);
+crates/devflow-core/src/git.rs:1246:        git(root, &["merge", "-q", "--no-ff", "merged-feature"]);
+crates/devflow-core/src/git.rs:1249:        let deleted = gf.cleanup_merged().expect("cleanup");
+crates/devflow-core/src/git.rs:1251:            deleted.contains(&"merged-feature".to_string()),
+crates/devflow-core/src/git.rs:1252:            "merged-into-develop branch must be deleted even when HEAD is elsewhere: {deleted:?}"
+crates/devflow-core/src/git.rs:1254:        assert!(!gf.branch_exists("merged-feature"));
+crates/devflow-core/src/git.rs:1258:    fn delete_branch_removes_unmerged_with_force_and_protects_trunk() {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+/bin/bash -lc "command -v adversarial-review || true; sed -n '130,215p' crates/devflow-core/src/git.rs; sed -n '560,610p' crates/devflow-core/src/git.rs; rg -n \"fn affects_compiled_binary|affects_compiled_binary\" crates/devflow-core/src" in /var/home/denniyahh/Github/devflow
+ exited 1 in 0ms:
+    pub fn feature_start(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
+        info!("creating feature branch: {branch}");
+        self.git(["checkout", &self.config.develop])?;
+        self.git(["checkout", "-b", &branch])?;
+        Ok(branch)
+    }
+
+    /// Create or reset a feature branch, overwriting it if it already exists.
+    pub fn feature_start_force(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
+        warn!("force-creating feature branch: {branch}");
+        self.git(["checkout", &self.config.develop])?;
+        self.git(["checkout", "-B", &branch])?;
+        Ok(branch)
+    }
+
+    /// Merge a feature branch into develop and delete it.
+    pub fn feature_finish(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = self.merge_feature_into_develop(phase)?;
+        self.git(["branch", "-d", &branch])?;
+        Ok(branch)
+    }
+
+    /// Merge a feature branch into develop without deleting it.
+    ///
+    /// Default DevFlow runs keep the feature branch checked out in a linked
+    /// worktree, so deletion belongs to the later best-effort cleanup hook.
+    pub fn merge_feature_into_develop(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
+        info!("merging feature branch: {branch}");
+        self.git(["checkout", &self.config.develop])?;
+        self.git(["merge", "--no-ff", &branch])?;
+        Ok(branch)
+    }
+
+    /// Whether a phase feature branch has nothing left to merge into develop.
+    ///
+    /// An absent branch is not proof of a merge. Callers must fail closed
+    /// rather than treating a deleted or never-created branch as shipped.
+    pub fn is_merged_into_develop(&self, phase: PhaseId) -> bool {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
+        if !self.branch_exists(&branch) {
+            return false;
+        }
+
+        git_command(&self.root)
+            .args(["merge-base", "--is-ancestor", &branch, &self.config.develop])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Create or reset a release branch from the current `HEAD`.
+    ///
+    /// The release branch is cut from wherever the caller currently is — the
+    /// branch being shipped — not from `develop`. `devflow ship` writes the
+    /// version bump into the working tree first, so branching from `HEAD`
+    /// keeps any commits unique to the shipped branch in the release.
+    pub fn release_start(&self, version: &str) -> Result<String, GitError> {
+        let branch = format!("release/{version}");
+        info!("creating release branch: {branch}");
+        self.git(["checkout", "-B", &branch])?;
+        Ok(branch)
+    }
+
+    /// Merge a release branch into main and develop, tag it, and delete it.
+    pub fn release_finish(&self, version: &str) -> Result<String, GitError> {
+        let branch = format!("release/{version}");
+        info!("finishing release branch: {branch}");
+        self.git(["checkout", &self.config.main])?;
+        self.git(["merge", "--no-ff", &branch])?;
+        // `-c tag.gpgSign=false` scopes the override to this invocation only
+        // (never the user's global/repo config) — without it, a global
+        // `tag.gpgsign=true` forces this lightweight tag into an
+        // annotated+signed one requiring a message, which blocks on
+        // `$EDITOR` in what must be a headless, unattended flow (Phase 13
+        // dogfood finding).
+        self.git(["-c", "tag.gpgSign=false", "tag", &format!("v{version}")])?;
+        self.git(["checkout", &self.config.develop])?;
+        self.git(["merge", "--no-ff", &branch])?;
+        self.git(["branch", "-d", &branch])?;
+        Ok(branch)
+    }
+
+    /// Create an annotated-free lightweight tag at the current `HEAD`.
+        return AncestorStatus::RefAbsent;
+    }
+    let is_ancestor = git_command(project_root)
+        .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if is_ancestor {
+        AncestorStatus::Ancestor
+    } else {
+        AncestorStatus::Diverged
+    }
+}
+
+/// Whether the `ancestor` ref is an ancestor of the `descendant` ref, against
+/// ALREADY-FETCHED local refs — issues NO `git fetch`. Generalises
+/// [`origin_main_ancestor_status`] to an arbitrary ref pair (used by
+/// `release --verify`'s post-cut checks: is the release tag on `main`, and
+/// has the `main`→`develop` sync run). Distinguishes "not an ancestor"
+/// (exit 1) from "a ref is absent" (exit 128) so the caller can degrade to
+/// an actionable `git fetch` message instead of reporting a false
+/// divergence.
+pub fn ref_is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> AncestorStatus {
+    let both_exist = [ancestor, descendant].iter().all(|r| {
+        git_command(project_root)
+            .args(["rev-parse", "--verify", "--quiet", r])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    });
+    if !both_exist {
+        return AncestorStatus::RefAbsent;
+    }
+    let is_ancestor = git_command(project_root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if is_ancestor {
+        AncestorStatus::Ancestor
+    } else {
+        AncestorStatus::Diverged
+    }
+}
+
+/// Derive the crates.io publish order for a workspace's local-path members
+/// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
+/// `[workspace] members` list and each member's own `[dependencies]`
+/// section (which member depends on which), never a hardcoded prose string
+/// (20d). Read-only; returns an empty `Vec` (never panics) if the workspace
+/// Cargo.toml or a member manifest cannot be read.
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+## Summary verdict
+
+**REJECTED as currently specified; APPROVED WITH CONCERNS after mandatory replanning.**
+
+The three decisions identify real failure modes, but D-01 and D-03 are underspecified enough that implementing them literally could produce a system that launches from one branch and ships into another, while still silently making the same checkpoint decision. D-02 is directionally sound but its proposed path rule is narrower than “Cargo workspace members.”
+
+## Critical findings / risks
+
+### D-01 — base-branch configuration is not propagated through the lifecycle
+
+The current GitFlow implementation is structurally hardcoded to `develop`:
+
+- `feature_start()` checks out `self.config.develop`.
+- `merge_feature_into_develop()` checks out and merges into `self.config.develop`.
+- `is_merged_into_develop()` tests ancestry against `self.config.develop`.
+- `cleanup_merged()` uses `git branch --merged <develop>`.
+- `hooks_after_ship()` invokes merge and cleanup without a separate target-baseline concept.
+
+Therefore, changing only worktree creation or preflight resolution is unsafe. A phase could be created from `workspace/denniyahh`, then Ship would merge it into `develop`, or cleanup would evaluate merge status against `develop`. This can cause:
+
+- false “not merged” results;
+- feature branches retained or deleted incorrectly;
+- phase commits landing on an unintended integration branch;
+- release/version hooks operating on a branch that does not contain the planning changes;
+- divergence between local configured branches and their remote tracking branches.
+
+D-01 also conflates at least three concepts that should be modeled separately:
+
+1. worktree start point;
+2. feature-branch integration target;
+3. release synchronization target.
+
+A configured planning branch may be suitable for bootstrapping `.planning/` but not intended as the merge destination.
+
+The context says “base branch resolution,” while the implementation question includes merge and cleanup. The plan must explicitly define whether the configured branch replaces `develop` globally or only serves as a worktree start point.
+
+`origin/<branch>` currency is also unresolved. Existing ancestry helpers operate on already-fetched local refs and return `RefAbsent` when the remote ref is unavailable; they do not fetch. A config such as `workspace/denniyahh` needs explicit behavior for:
+
+- no local branch;
+- no `origin/<configured-branch>`;
+- stale remote-tracking ref;
+- branch existing locally but not remotely;
+- configured branch diverging from `develop`.
+
+### D-02 — `crates/*` is not equivalent to Cargo workspace membership
+
+The proposed predicate excludes valid layouts:
+
+- root-package source under `src/`;
+- workspace members in `components/*`, `packages/*`, or arbitrary paths;
+- workspace members declared explicitly or through glob patterns in `[workspace].members`;
+- excluded members and nested workspaces;
+- generated/build inputs referenced by `build.rs` outside the listed root files.
+
+Conversely, a simple `starts_with("crates/")` may include paths that are not workspace members.
+
+Path handling needs a defined canonical representation. Git status and diff output can contain:
+
+- `./` prefixes;
+- quoted or escaped paths;
+- rename pairs;
+- deleted paths;
+- paths with spaces;
+- platform-specific separators;
+- directory names such as `crates-old/` that must not match `crates/`.
+
+The rule must be tested against positive and negative controls, including `.planning/spikes/.../Cargo.toml`, `crates-old/foo.rs`, root `src/main.rs`, renamed files, and workspace members outside `crates/`.
+
+### D-03 — prompt text cannot override hardcoded workflow behavior
+
+The repository already contains dedicated checkpoint auto-decision machinery (`checkpoint_auto_decide_prompt`, `workflow._auto_chain_active`, and `execute-phase` auto-mode handling). If `execute-phase` selects the first option in code or shell logic, adding prose to `code_stage_prompt` cannot reliably change that behavior.
+
+Potential outcomes include:
+
+- the prompt is never consulted by the internal decision loop;
+- the agent follows the instruction but the executor still records the first option;
+- the instruction applies only to Code-stage invocation, while auto-resume occurs in another process or prompt;
+- rationale is generated in free text but not persisted in the gate/audit ledger;
+- recommended-option markings are treated as mandatory despite the stated “on merits” requirement.
+
+This decision requires an explicit distinction between:
+
+- policy supplied to the LLM;
+- deterministic executor behavior;
+- checkpoint parser/selector;
+- persisted decision evidence.
+
+If the hardcoded “first option” behavior belongs to GSD’s scripts rather than DevFlow, DevFlow cannot claim to fix it through `prompt.rs` alone. The plan must identify the actual authority and add an integration test proving that option order changes the selected decision.
+
+## Recommendations for planning
+
+1. **Split D-01 into separate configuration fields or explicitly constrain scope.** Define `worktree_start_ref`, `integration_target`, and any release target semantics. Update feature creation, merge, ancestry checks, cleanup, preflight, and release hooks consistently. Add tests for configured branch, default fallback, missing refs, stale `origin/*`, and divergence.
+
+2. **Resolve the configured branch against both local and remote refs deliberately.** Specify whether DevFlow fetches, requires a prior fetch, or degrades with an actionable error. Test `RefAbsent`, stale remote tracking, and local-only branches.
+
+3. **Implement D-02 from Cargo metadata rather than a directory prefix.** Prefer `cargo metadata --no-deps` or equivalent workspace parsing, cache the member roots, normalize Git paths, and define treatment of root packages, nested workspaces, excluded members, renames, and build-script inputs. If the intended scope really is only `crates/*`, rename the decision accordingly and document the deliberate limitation.
+
+4. **Trace D-03 to the real decision authority before coding.** Locate the exact GSD loop that chooses the first option. If it is deterministic DevFlow code, change the selector and persist structured rationale. If it is external GSD behavior, treat prompt text as advisory only and add a verification gate that rejects an unreasoned or inconsistent decision.
+
+5. **Add negative-control acceptance tests.**
+
+   - D-01: start from configured planning branch, then verify Ship merges/checks/cleans against the intended target; repeat with default `develop`.
+   - D-02: `.planning/spikes/.../Cargo.toml` must be false while a real workspace member change must be true; include root-package and outside-`crates` cases.
+   - D-03: present two decisions in reversed order and assert the selected option follows merits, not position, with rationale persisted.
+
+6. **Add an explicit compatibility and migration rule.** Existing configs must continue using `develop`; conflicting `git.base_branch` and `git.planning_branch` values must fail clearly rather than silently choosing one.
+
+
+hook: Stop
+hook: Stop Completed
+tokens used
+48,103
+## Summary verdict
+
+**REJECTED as currently specified; APPROVED WITH CONCERNS after mandatory replanning.**
+
+The three decisions identify real failure modes, but D-01 and D-03 are underspecified enough that implementing them literally could produce a system that launches from one branch and ships into another, while still silently making the same checkpoint decision. D-02 is directionally sound but its proposed path rule is narrower than “Cargo workspace members.”
+
+## Critical findings / risks
+
+### D-01 — base-branch configuration is not propagated through the lifecycle
+
+The current GitFlow implementation is structurally hardcoded to `develop`:
+
+- `feature_start()` checks out `self.config.develop`.
+- `merge_feature_into_develop()` checks out and merges into `self.config.develop`.
+- `is_merged_into_develop()` tests ancestry against `self.config.develop`.
+- `cleanup_merged()` uses `git branch --merged <develop>`.
+- `hooks_after_ship()` invokes merge and cleanup without a separate target-baseline concept.
+
+Therefore, changing only worktree creation or preflight resolution is unsafe. A phase could be created from `workspace/denniyahh`, then Ship would merge it into `develop`, or cleanup would evaluate merge status against `develop`. This can cause:
+
+- false “not merged” results;
+- feature branches retained or deleted incorrectly;
+- phase commits landing on an unintended integration branch;
+- release/version hooks operating on a branch that does not contain the planning changes;
+- divergence between local configured branches and their remote tracking branches.
+
+D-01 also conflates at least three concepts that should be modeled separately:
+
+1. worktree start point;
+2. feature-branch integration target;
+3. release synchronization target.
+
+A configured planning branch may be suitable for bootstrapping `.planning/` but not intended as the merge destination.
+
+The context says “base branch resolution,” while the implementation question includes merge and cleanup. The plan must explicitly define whether the configured branch replaces `develop` globally or only serves as a worktree start point.
+
+`origin/<branch>` currency is also unresolved. Existing ancestry helpers operate on already-fetched local refs and return `RefAbsent` when the remote ref is unavailable; they do not fetch. A config such as `workspace/denniyahh` needs explicit behavior for:
+
+- no local branch;
+- no `origin/<configured-branch>`;
+- stale remote-tracking ref;
+- branch existing locally but not remotely;
+- configured branch diverging from `develop`.
+
+### D-02 — `crates/*` is not equivalent to Cargo workspace membership
+
+The proposed predicate excludes valid layouts:
+
+- root-package source under `src/`;
+- workspace members in `components/*`, `packages/*`, or arbitrary paths;
+- workspace members declared explicitly or through glob patterns in `[workspace].members`;
+- excluded members and nested workspaces;
+- generated/build inputs referenced by `build.rs` outside the listed root files.
+
+Conversely, a simple `starts_with("crates/")` may include paths that are not workspace members.
+
+Path handling needs a defined canonical representation. Git status and diff output can contain:
+
+- `./` prefixes;
+- quoted or escaped paths;
+- rename pairs;
+- deleted paths;
+- paths with spaces;
+- platform-specific separators;
+- directory names such as `crates-old/` that must not match `crates/`.
+
+The rule must be tested against positive and negative controls, including `.planning/spikes/.../Cargo.toml`, `crates-old/foo.rs`, root `src/main.rs`, renamed files, and workspace members outside `crates/`.
+
+### D-03 — prompt text cannot override hardcoded workflow behavior
+
+The repository already contains dedicated checkpoint auto-decision machinery (`checkpoint_auto_decide_prompt`, `workflow._auto_chain_active`, and `execute-phase` auto-mode handling). If `execute-phase` selects the first option in code or shell logic, adding prose to `code_stage_prompt` cannot reliably change that behavior.
+
+Potential outcomes include:
+
+- the prompt is never consulted by the internal decision loop;
+- the agent follows the instruction but the executor still records the first option;
+- the instruction applies only to Code-stage invocation, while auto-resume occurs in another process or prompt;
+- rationale is generated in free text but not persisted in the gate/audit ledger;
+- recommended-option markings are treated as mandatory despite the stated “on merits” requirement.
+
+This decision requires an explicit distinction between:
+
+- policy supplied to the LLM;
+- deterministic executor behavior;
+- checkpoint parser/selector;
+- persisted decision evidence.
+
+If the hardcoded “first option” behavior belongs to GSD’s scripts rather than DevFlow, DevFlow cannot claim to fix it through `prompt.rs` alone. The plan must identify the actual authority and add an integration test proving that option order changes the selected decision.
+
+## Recommendations for planning
+
+1. **Split D-01 into separate configuration fields or explicitly constrain scope.** Define `worktree_start_ref`, `integration_target`, and any release target semantics. Update feature creation, merge, ancestry checks, cleanup, preflight, and release hooks consistently. Add tests for configured branch, default fallback, missing refs, stale `origin/*`, and divergence.
+
+2. **Resolve the configured branch against both local and remote refs deliberately.** Specify whether DevFlow fetches, requires a prior fetch, or degrades with an actionable error. Test `RefAbsent`, stale remote tracking, and local-only branches.
+
+3. **Implement D-02 from Cargo metadata rather than a directory prefix.** Prefer `cargo metadata --no-deps` or equivalent workspace parsing, cache the member roots, normalize Git paths, and define treatment of root packages, nested workspaces, excluded members, renames, and build-script inputs. If the intended scope really is only `crates/*`, rename the decision accordingly and document the deliberate limitation.
+
+4. **Trace D-03 to the real decision authority before coding.** Locate the exact GSD loop that chooses the first option. If it is deterministic DevFlow code, change the selector and persist structured rationale. If it is external GSD behavior, treat prompt text as advisory only and add a verification gate that rejects an unreasoned or inconsistent decision.
+
+5. **Add negative-control acceptance tests.**
+
+   - D-01: start from configured planning branch, then verify Ship merges/checks/cleans against the intended target; repeat with default `develop`.
+   - D-02: `.planning/spikes/.../Cargo.toml` must be false while a real workspace member change must be true; include root-package and outside-`crates` cases.
+   - D-03: present two decisions in reversed order and assert the selected option follows merits, not position, with rationale persisted.
+
+6. **Add an explicit compatibility and migration rule.** Existing configs must continue using `develop`; conflicting `git.base_branch` and `git.planning_branch` values must fail clearly rather than silently choosing one.
+
+
