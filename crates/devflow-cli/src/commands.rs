@@ -83,18 +83,30 @@ pub(crate) fn resolve_gate_target(
 
 #[allow(clippy::too_many_arguments)]
 /// Whether phase `{NN}`'s GSD planning artifact (a `.planning/phases/{NN}-*/`
-/// file ending in `suffix`, e.g. `-CONTEXT.md`) exists on `develop` — the
-/// branch phase worktrees fork from. Fail-open on git errors (missing
-/// develop, not a repo): pre-flight must never block a run the later, more
-/// specific checks would allow.
-pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: PhaseId, suffix: &str) -> bool {
+/// file ending in `suffix`, e.g. `-CONTEXT.md`) exists on `base` — the branch
+/// phase worktrees fork from, resolved per project by
+/// `config::base_branch` (45-01 / D-01) rather than hardcoded. A project
+/// whose planning artifacts live on a planning branch was previously
+/// invisible to this probe, so a `RequiresExistingArtifact` driver was
+/// refused at Define for an artifact that existed.
+///
+/// Fail-open on git errors (base branch missing, not a repo): pre-flight must
+/// never block a run the later, more specific checks would allow. That
+/// fail-open is why every test of this function must assert BOTH directions —
+/// `true` is also what a failed `git` invocation returns.
+pub(crate) fn phase_artifact_on_base(
+    project_root: &Path,
+    phase: PhaseId,
+    suffix: &str,
+    base: &str,
+) -> bool {
     let prefix = format!(".planning/phases/{padded}-", padded = phase.padded());
     let output = git_command(project_root)
         .args([
             "ls-tree",
             "-r",
             "--name-only",
-            "develop",
+            base,
             "--",
             ".planning/phases/",
         ])
@@ -365,28 +377,29 @@ pub(crate) fn start(
     // 999.106 driver-driven pre-flight: whether a fresh headless run can pass
     // a stage is declared by the driver's `interactivity_mode`, not a
     // hardcoded `agent == Codex`. A `RequiresExistingArtifact` Define must
-    // have CONTEXT.md on develop; a `RequiresExistingArtifact` Plan warns
-    // without a PLAN.md. Fail in one second with instructions instead of after
-    // a burned agent run and a dead-end gate. Checked on `develop` (the
-    // branch worktrees fork from), so the result does not depend on what the
-    // primary checkout happens to have checked out.
+    // have CONTEXT.md on the base branch; a `RequiresExistingArtifact` Plan
+    // warns without a PLAN.md. Fail in one second with instructions instead of
+    // after a burned agent run and a dead-end gate. Checked on the RESOLVED
+    // base (the branch worktrees fork from), so the result does not depend on
+    // what the primary checkout happens to have checked out — and, since
+    // 45-01, does not silently probe a branch the run will not use.
     let driver = agents::driver_for(agent);
     if driver.interactivity_mode(Stage::Define)
         == agents::InteractivityMode::RequiresExistingArtifact
-        && !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md")
+        && !phase_artifact_on_base(project_root, phase, "-CONTEXT.md", base)
     {
         return Err(CliError::Message(format!(
-            "phase {phase} has no CONTEXT.md on develop, and {} cannot run an \
+            "phase {phase} has no CONTEXT.md on `{base}`, and {} cannot run an \
              interactive discussion headless. Run /gsd-discuss-phase {phase} \
              interactively first (any agent), or use --agent claude.",
             driver.name()
         )));
     }
     if driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
-        && !phase_artifact_on_develop(project_root, phase, "-PLAN.md")
+        && !phase_artifact_on_base(project_root, phase, "-PLAN.md", base)
     {
         println!(
-            "warning: phase {phase} has no PLAN.md on develop — headless {} \
+            "warning: phase {phase} has no PLAN.md on `{base}` — headless {} \
              planning is untested and may need input; pre-writing plans is safer",
             driver.name()
         );
@@ -5306,9 +5319,9 @@ mod tests {
 
     /// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
     /// never pass Define, so `start --agent codex` pre-flights on the
-    /// phase's CONTEXT.md existing on develop.
+    /// phase's CONTEXT.md existing on the base branch.
     #[test]
-    fn phase_artifact_on_develop_detects_context_and_fails_open() {
+    fn phase_artifact_on_base_detects_context_and_fails_open() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -5329,29 +5342,33 @@ mod tests {
         run(&["commit", "-q", "-m", "init"]);
         run(&["branch", "develop"]);
 
-        assert!(phase_artifact_on_develop(
+        assert!(phase_artifact_on_base(
             root,
             PhaseId::new(3),
-            "-CONTEXT.md"
+            "-CONTEXT.md",
+            "develop"
         ));
-        assert!(!phase_artifact_on_develop(
+        assert!(!phase_artifact_on_base(
             root,
             PhaseId::new(3),
-            "-PLAN.md"
+            "-PLAN.md",
+            "develop"
         ));
-        assert!(!phase_artifact_on_develop(
+        assert!(!phase_artifact_on_base(
             root,
             PhaseId::new(4),
-            "-CONTEXT.md"
+            "-CONTEXT.md",
+            "develop"
         ));
 
         // Fail-open: outside a repo (or with no develop branch) the
         // pre-flight must not block.
         let empty = tempfile::tempdir().unwrap();
-        assert!(phase_artifact_on_develop(
+        assert!(phase_artifact_on_base(
             empty.path(),
             PhaseId::new(3),
-            "-CONTEXT.md"
+            "-CONTEXT.md",
+            "develop"
         ));
     }
 
@@ -5440,6 +5457,63 @@ mod tests {
                 "`{spelling}` is not a local branch and must be refused"
             );
         }
+    }
+
+    /// Review round 2 (F4): the artifact-presence probe carried the trunk as
+    /// a literal in its `ls-tree` argument array, so a planning branch
+    /// holding CONTEXT.md/PLAN.md was invisible to it and a
+    /// `RequiresExistingArtifact` driver was refused at Define for an
+    /// artifact that existed — the same class of false refusal AUTO-01 exists
+    /// to remove.
+    ///
+    /// BOTH directions are asserted here and both are required: the probe
+    /// FAILS OPEN by returning `true` on a git error, so a test asserting
+    /// only `true` cannot distinguish "found the artifact on the right
+    /// branch" from "the git invocation failed" — the same answer for the
+    /// wrong reason.
+    #[test]
+    fn phase_artifact_probe_reads_the_supplied_base_not_the_default_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "develop"]);
+        run(&["config", "user.email", "t@e.st"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        // The phase artifact exists ONLY on the planning branch.
+        run(&["checkout", "-q", "-b", "workspace/example"]);
+        std::fs::create_dir_all(root.join(".planning/phases/45-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/45-widget/45-CONTEXT.md"), "ctx").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "planning"]);
+        run(&["checkout", "-q", "develop"]);
+
+        assert!(
+            phase_artifact_on_base(root, PhaseId::new(45), "-CONTEXT.md", "workspace/example"),
+            "the probe must see an artifact on the branch it was pointed at"
+        );
+
+        // NEGATIVE CONTROL: the identical repo and phase, probed against the
+        // default trunk, must report absence.
+        assert!(
+            !phase_artifact_on_base(root, PhaseId::new(45), "-CONTEXT.md", "develop"),
+            "the probe must not report an artifact that is absent from the branch probed"
+        );
     }
 
     /// Review round 2 (F3): `devflow start --no-worktree` forked its feature
