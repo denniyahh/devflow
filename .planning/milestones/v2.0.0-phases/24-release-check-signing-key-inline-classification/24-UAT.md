@@ -4,6 +4,10 @@ phase: 24-release-check-signing-key-inline-classification
 source: [24-VERIFICATION.md]
 started: 2026-07-27T09:40:02Z
 updated: 2026-07-27T10:16:00Z
+audit_acknowledged:
+  milestone: v2.8.0
+  at: 2026-09-02
+  gap_snapshot: "passed::scenarios=0"
 ---
 
 ## Current Test

@@ -4,6 +4,10 @@ phase: 40-pi-dogfood
 source: [40-VERIFICATION.md, .devflow/events.jsonl]
 started: 2026-08-19T01:20:00Z
 updated: 2026-08-19T01:51:10Z
+audit_acknowledged:
+  milestone: v2.8.0
+  at: 2026-09-02
+  gap_snapshot: "passed::scenarios=0"
 ---
 
 ## Current Test
@@ -22,6 +26,7 @@ resolved: 2026-08-19T01:51:10Z — see test 1 evidence
 ## Tests
 
 ### 1. Live Validate gate answered and honored
+
 expected: |
   The operator answers the Validate gate; the run's next transition reflects the
   operator's decision (advance or reject), never a silent auto-advance.

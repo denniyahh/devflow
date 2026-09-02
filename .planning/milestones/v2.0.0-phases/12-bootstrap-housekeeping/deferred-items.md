@@ -29,3 +29,4 @@ auto-fixed).
   against a scratch copy simulating a Phase 20 kickoff (`1 of 5` → `2 of 5`).
   No changes made to `gsd-tools` itself; the gap was this project's STATE.md
   missing the section the parser expects, not a tooling bug.
+  status: acknowledged

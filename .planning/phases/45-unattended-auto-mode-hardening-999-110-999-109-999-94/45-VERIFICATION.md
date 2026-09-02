@@ -6,6 +6,7 @@ score: 3/3 roadmap success criteria verified (20/20 plan must-have truths, 2 by 
 behavior_unverified: 1
 overrides_applied: 2
 overrides:
+
   - must_have: "The Code stage prompt delivered to Codex and Pi carries the byte-identical policy, so the two agent families do not have different unattended semantics (45-03 must_have truth 2; ROADMAP criterion 3 / DECN-01)."
     reason: >-
       CR-03 confirmed in shipped source (prompt.rs:396-399 -> prompt.rs:567-580):
@@ -31,6 +32,7 @@ re_verification: null
 gaps: []
 deferred: []
 behavior_unverified_items:
+
   - truth: "Worktree creation forks from the branch tracking `.planning/` so `preflight_unattended_launch_check` passes out of the box (ROADMAP criterion 1 / AUTO-01)."
     test: "Configure `base_branch = \"workspace/denniyahh\"` in `devflow.toml` (or export `DEVFLOW_BASE_BRANCH`), then run a real `devflow start --phase N --mode auto` on this repository."
     expected: "The worktree at `.worktrees/phase-NN` is forked from the planning branch and carries `.planning/config.json`; `preflight_unattended_launch_check`'s `unattended_config_condition` reports Holds and the launch proceeds with no operator intervention; the merge target at Ship is the same branch."
@@ -43,9 +45,14 @@ behavior_unverified_items:
       committed `base_branch`, so the criterion's 'out of the box' end state is
       not currently reachable here without that one setup step.
 human_verification:
+
   - test: "Configure `base_branch` and run a live `devflow start --mode auto` end to end (see behavior_unverified_items)."
     expected: "Preflight passes unattended; fork point and merge target are the configured base."
     why_human: "No automated test drives a live unattended run; the phase is verified at unit level only."
+audit_acknowledged:
+  milestone: v2.8.0
+  at: 2026-09-02
+  status: human_needed
 ---
 
 # Phase 45: Unattended Auto-Mode Hardening — Verification Report

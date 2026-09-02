@@ -59,3 +59,14 @@ the line-number citations in the four documents above.
 deliberately scoped out is a policy call for the operator, not this executor.
 Escalate if the ledger is the preferred home. (30-01's executor declined the
 same call for the same reason on finding F-1.)
+
+---
+
+## Milestone-close acknowledgment (v2.8.0, 2026-09-02)
+
+All entries above acknowledged as deferred debt at the v2.8.0 milestone close, resolving
+`audit-open`'s carried-forward flag on this file. `audit-open acknowledge --category
+deferred_items` could not machine-match these entries (multi-paragraph text exceeding its
+matcher's expected shape) — recorded manually per the documented fallback for that failure
+mode, not because the content itself changed. None of these items block v2.8.0; they were
+already historical record from the v2.3.0 close.

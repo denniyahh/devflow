@@ -38,6 +38,7 @@ phase.
   all third-party flags appearing in documentation examples.
 - **Credit where due:** 25-07's root-cause analysis of the extractor was correct
   and identified the applied fix. Only the attribution was wrong.
+  status: acknowledged
 
 ## OPEN — `doc_check::documented_flags` has no command context
 

@@ -103,3 +103,14 @@ counts are too weak to carry a conclusion.
 duration of the child spawn, so no `NeutralPath` region can be live concurrently.
 This is the same family as the trailing-`PATH`-restore hazard `NeutralPath`'s doc
 comment already describes, and as ROADMAP line 1472's recorded cascade.
+
+---
+
+## Milestone-close acknowledgment (v2.8.0, 2026-09-02)
+
+All entries above acknowledged as deferred debt at the v2.8.0 milestone close, resolving
+`audit-open`'s carried-forward flag on this file. `audit-open acknowledge --category
+deferred_items` could not machine-match these entries (multi-paragraph text exceeding its
+matcher's expected shape) — recorded manually per the documented fallback for that failure
+mode, not because the content itself changed. None of these items block v2.8.0; they were
+already historical record from the v2.4.0 close.
