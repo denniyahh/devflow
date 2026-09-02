@@ -83,18 +83,30 @@ pub(crate) fn resolve_gate_target(
 
 #[allow(clippy::too_many_arguments)]
 /// Whether phase `{NN}`'s GSD planning artifact (a `.planning/phases/{NN}-*/`
-/// file ending in `suffix`, e.g. `-CONTEXT.md`) exists on `develop` — the
-/// branch phase worktrees fork from. Fail-open on git errors (missing
-/// develop, not a repo): pre-flight must never block a run the later, more
-/// specific checks would allow.
-pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: PhaseId, suffix: &str) -> bool {
+/// file ending in `suffix`, e.g. `-CONTEXT.md`) exists on `base` — the branch
+/// phase worktrees fork from, resolved per project by
+/// `config::base_branch` (45-01 / D-01) rather than hardcoded. A project
+/// whose planning artifacts live on a planning branch was previously
+/// invisible to this probe, so a `RequiresExistingArtifact` driver was
+/// refused at Define for an artifact that existed.
+///
+/// Fail-open on git errors (base branch missing, not a repo): pre-flight must
+/// never block a run the later, more specific checks would allow. That
+/// fail-open is why every test of this function must assert BOTH directions —
+/// `true` is also what a failed `git` invocation returns.
+pub(crate) fn phase_artifact_on_base(
+    project_root: &Path,
+    phase: PhaseId,
+    suffix: &str,
+    base: &str,
+) -> bool {
     let prefix = format!(".planning/phases/{padded}-", padded = phase.padded());
     let output = git_command(project_root)
         .args([
             "ls-tree",
             "-r",
             "--name-only",
-            "develop",
+            base,
             "--",
             ".planning/phases/",
         ])
@@ -107,6 +119,54 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: PhaseId, suf
         path.strip_prefix(&prefix)
             .is_some_and(|rest| rest.contains('/') && rest.ends_with(suffix))
     })
+}
+
+/// Verify that `base` names an existing LOCAL BRANCH in `project_root`.
+///
+/// Closes a bypass the pure string check in `config::validate_base_branch`
+/// cannot: `preflight::phase_reachability_on_base` probes the base with
+/// `git rev-parse --verify <base>`, which accepts ANY commit-ish, and
+/// `worktree::add` forwards the value untouched to `git worktree add` as a
+/// raw `<start_point>`. A value naming the production branch indirectly —
+/// through a remote-tracking name (`origin/main`), a fully-qualified ref path
+/// (`refs/heads/main`), an alias (`HEAD`), or a bare SHA — therefore
+/// satisfies every other check and the "never fork from production" guard is
+/// bypassable by spelling. Anchoring on `refs/heads/{base}` rejects all four
+/// at once: none exists as a local branch under that spelling.
+///
+/// It is also the correct requirement independently of the bypass: D-01 makes
+/// the base a MERGE TARGET as well as a fork point, and a merge target must
+/// be a branch.
+///
+/// **Scoped by the caller to a non-`Default` base**, deliberately: a fresh
+/// clone can legitimately have `develop` only as `origin/develop` with no
+/// local branch, a case that falls open today through
+/// `phase_reachability_on_base`'s `Undeterminable` arm. Applying this check
+/// unconditionally would convert that fall-open into a hard refusal and
+/// regress every existing project.
+pub(crate) fn ensure_base_is_a_local_branch(
+    project_root: &Path,
+    base: &str,
+) -> Result<(), CliError> {
+    let ok = git_command(project_root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{base}"),
+        ])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if ok {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "configured base branch `{base}` is not a local branch in this repository. \
+         DevFlow forks phase worktrees from it and merges phase work back into it, so it \
+         must be a branch — not a remote-tracking name, a `refs/heads/` path, `HEAD`, or a \
+         commit SHA. Create it locally (e.g. `git branch {base} origin/{base}`) and re-run."
+    )))
 }
 
 /// Build the fresh [`State`] a `devflow start` begins with, carrying the
@@ -253,6 +313,46 @@ pub(crate) fn start(
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
     ensure_agent_binary(agent_program(agent))?;
 
+    // 45-01 / D-01 / AUTO-01: resolve the project's integration trunk once,
+    // here, and use the SAME value for every guard and both fork paths below.
+    // Resolved beside `yes_ship` and for the same reason — before anything
+    // is spawned or mutated.
+    //
+    // The resolver is fail-hard on an explicitly supplied value (see its own
+    // doc comment): a `main`, blank or flag-shaped base is refused here
+    // rather than silently falling back to `develop`, which would make the
+    // refusal unobservable for the most direct way to configure it.
+    let resolved_base = config::base_branch(project_root).map_err(CliError::Message)?;
+    let base = resolved_base.value.as_str();
+    if resolved_base.source != config::BaseBranchSource::Default {
+        // A commit-ish that is not a local branch passes `rev-parse --verify`
+        // and is forwarded raw to `git worktree add` — scoped to an
+        // explicitly configured base so the default path's existing
+        // fall-open for a clone with no local `develop` is untouched.
+        ensure_base_is_a_local_branch(project_root, base)?;
+    }
+    // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
+    // the first `save_state`" idiom `yes_ship` uses directly above, and for
+    // the same reason — `advance`, `resume` and the checkout hooks that
+    // merge this phase branch all run in SEPARATE processes whose
+    // environment need not carry `DEVFLOW_BASE_BRANCH`. Without this the
+    // resolved value dies with the `start` process and every later site
+    // silently re-resolves `develop`.
+    state.base_branch = Some(resolved_base.value.clone());
+    // T-45-02's compensating control, the same shape as D-12's above: a
+    // standing or ambient trunk redirect is never silent.
+    if base != DEVELOP {
+        let source = match resolved_base.source {
+            config::BaseBranchSource::Env => "DEVFLOW_BASE_BRANCH",
+            config::BaseBranchSource::ConfigFile => "devflow.toml (base_branch)",
+            config::BaseBranchSource::Default => "built-in default",
+        };
+        println!(
+            "note: base branch is `{base}` (from {source}) — phase worktrees fork from it \
+             and phase work merges back into it (D-01, 45-CONTEXT.md)"
+        );
+    }
+
     // 25e (999.51/D-18a): before even asking whether phase N is reachable,
     // make sure the base branch itself is current with its remote. A stale
     // base is the single most common cause of a phase heading appearing
@@ -267,43 +367,47 @@ pub(crate) fn start(
     // fast-forwards a safely-behind base and proceeds unattended, or refuses
     // loudly on divergence / an unsafe fast-forward (see that function's own
     // doc comment for the full decision).
-    ensure_base_ref_current(project_root, DEVELOP)?;
+    ensure_base_ref_current(project_root, base)?;
 
     // 23f (gap closure, 23-12): refuse before ANY git mutation when phase N
-    // is not reachable from DEVELOP — the exact branch `ensure_phase_worktree`
-    // passes to `worktree::add` as `start_point`, so the branch this guard
-    // inspects and the branch the run forks can never disagree. Precedes
-    // BOTH fork paths (`ensure_phase_worktree` below, and `GitFlow::feature_start`
-    // in the `else` branch), and precedes the Codex leg deliberately: if
-    // phase N is absent from `develop` entirely, "no CONTEXT.md on develop"
-    // is a narrower and misleading diagnosis of the same root fact.
-    ensure_phase_reachable_on_base(project_root, phase, DEVELOP)?;
+    // is not reachable from the resolved base — the exact branch
+    // `ensure_phase_worktree` passes to `worktree::add` as `start_point`, so
+    // the branch this guard inspects and the branch the run forks can never
+    // disagree. That identity is now maintained by passing one resolved value
+    // (45-01/D-01) rather than by both sites naming the same constant.
+    // Precedes BOTH fork paths (`ensure_phase_worktree` below, and
+    // `GitFlow::feature_start` in the `else` branch), and precedes the Codex
+    // leg deliberately: if phase N is absent from the base entirely, "no
+    // CONTEXT.md on the base" is a narrower and misleading diagnosis of the
+    // same root fact.
+    ensure_phase_reachable_on_base(project_root, phase, base)?;
 
     // 999.106 driver-driven pre-flight: whether a fresh headless run can pass
     // a stage is declared by the driver's `interactivity_mode`, not a
     // hardcoded `agent == Codex`. A `RequiresExistingArtifact` Define must
-    // have CONTEXT.md on develop; a `RequiresExistingArtifact` Plan warns
-    // without a PLAN.md. Fail in one second with instructions instead of after
-    // a burned agent run and a dead-end gate. Checked on `develop` (the
-    // branch worktrees fork from), so the result does not depend on what the
-    // primary checkout happens to have checked out.
+    // have CONTEXT.md on the base branch; a `RequiresExistingArtifact` Plan
+    // warns without a PLAN.md. Fail in one second with instructions instead of
+    // after a burned agent run and a dead-end gate. Checked on the RESOLVED
+    // base (the branch worktrees fork from), so the result does not depend on
+    // what the primary checkout happens to have checked out — and, since
+    // 45-01, does not silently probe a branch the run will not use.
     let driver = agents::driver_for(agent);
     if driver.interactivity_mode(Stage::Define)
         == agents::InteractivityMode::RequiresExistingArtifact
-        && !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md")
+        && !phase_artifact_on_base(project_root, phase, "-CONTEXT.md", base)
     {
         return Err(CliError::Message(format!(
-            "phase {phase} has no CONTEXT.md on develop, and {} cannot run an \
+            "phase {phase} has no CONTEXT.md on `{base}`, and {} cannot run an \
              interactive discussion headless. Run /gsd-discuss-phase {phase} \
              interactively first (any agent), or use --agent claude.",
             driver.name()
         )));
     }
     if driver.interactivity_mode(Stage::Plan) == agents::InteractivityMode::RequiresExistingArtifact
-        && !phase_artifact_on_develop(project_root, phase, "-PLAN.md")
+        && !phase_artifact_on_base(project_root, phase, "-PLAN.md", base)
     {
         println!(
-            "warning: phase {phase} has no PLAN.md on develop — headless {} \
+            "warning: phase {phase} has no PLAN.md on `{base}` — headless {} \
              planning is untested and may need input; pre-writing plans is safer",
             driver.name()
         );
@@ -313,26 +417,40 @@ pub(crate) fn start(
     // mutation. WR-10 (13-REVIEW.md): only meaningful for the --no-worktree
     // (branch-in-place) flow, where `start` actually branches from the main
     // checkout's current HEAD. In worktree mode (the default) the agent's
-    // work always forks fresh from `develop` via `worktree::add`, independent
+    // work always forks fresh from the resolved base via `worktree::add`, independent
     // of whatever happens to be checked out in the main repo — checking the
     // main checkout's divergence there is unrelated to what's about to
     // happen and can either hard-fail on a stale unrelated branch or
     // silently no-op if the main checkout happens to be on develop.
-    if !worktree && let Ok((_ahead, behind)) = GitFlow::new(project_root).divergence_from_develop()
+    // CR-45-03: `for_project` reads `devflow.toml` / the environment AGAIN,
+    // which is a second resolution of a value this function already resolved
+    // fail-hard at the top and persisted onto `State`. The two can disagree
+    // — `git_flow_for_project` falls SOFT to `develop` where `base_branch`
+    // fails hard — and the message below interpolates `{base}` from the first
+    // resolution while the number came from the second, so an operator could
+    // be told how far behind `workspace/x` they are from a count taken
+    // against `develop`. One resolution, reused.
+    let resolved_git_flow = devflow_core::config::GitFlowConfig {
+        develop: resolved_base.value.clone(),
+        ..devflow_core::config::GitFlowConfig::default()
+    };
+    if !worktree
+        && let Ok((_ahead, behind)) =
+            GitFlow::with_config(project_root, resolved_git_flow.clone()).divergence_from_develop()
     {
         if behind > 50 {
             return Err(CliError::Message(format!(
-                "develop is {behind} commits ahead — your branch is too far behind. \
-                 Rebase onto develop first, or use --force to override."
+                "{base} is {behind} commits ahead — your branch is too far behind. \
+                 Rebase onto {base} first, or use --force to override."
             )));
         }
         if behind > 10 {
-            println!("warning: develop is {behind} commits ahead — consider rebasing first");
+            println!("warning: {base} is {behind} commits ahead — consider rebasing first");
         }
     }
 
     if worktree {
-        let wt = ensure_phase_worktree(project_root, phase, force)?;
+        let wt = ensure_phase_worktree(project_root, phase, force, base)?;
         println!(
             "created worktree: {} (branch {FEATURE_PREFIX}phase-{padded})",
             wt.display(),
@@ -340,7 +458,13 @@ pub(crate) fn start(
         );
         state.worktree_path = Some(wt);
     } else {
-        let git = GitFlow::new(project_root);
+        // Review round 2 (F3): `GitFlow::new` hardcodes the default trunk,
+        // so this arm validated the configured base, checked its currency and
+        // reachability, printed a note naming it — and then forked from
+        // `develop` anyway. Both fork paths now agree, and (CR-45-03) they
+        // agree on the value resolved ONCE above and persisted onto `State`,
+        // not on a fresh read that can differ from it.
+        let git = GitFlow::with_config(project_root, resolved_git_flow.clone());
         let result = if force {
             git.feature_start_force(phase)
         } else {
@@ -549,7 +673,11 @@ pub(crate) fn reference(
     branch: Option<String>,
     refresh: bool,
 ) -> Result<(), CliError> {
-    let branch = branch.unwrap_or_else(|| DEVELOP.to_string());
+    // Project-resolved (45-01, review round 2): defaulting to the DEVELOP
+    // constant snapshotted the wrong branch on a project whose trunk is
+    // configured elsewhere — and then printed a message naming the branch it
+    // snapshotted, so the operator was told the wrong thing confidently.
+    let branch = branch.unwrap_or_else(|| config::git_flow_for_project(project_root).develop);
     let path = worktree::reference_path(project_root);
 
     // Detached snapshot: `branch` may already be checked out in the main
@@ -669,7 +797,10 @@ fn remove_worktree_with_retry(
 /// `cleanup --force` run could delete a worktree a live agent/monitor is
 /// still writing into (review: Codex HIGH, fail-closed on a live agent).
 pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
-    let git = GitFlow::new(project_root);
+    // Project-resolved (45-01): `cleanup_merged` computes "merged" relative
+    // to the trunk and treats it as protected — both must be the configured
+    // one, or this sweep can delete a branch that was never merged.
+    let git = GitFlow::for_project(project_root);
     let worktrees_dir = worktree::worktrees_dir(project_root);
     let reference = worktree::reference_path(project_root);
     let states = workflow::list_states(project_root);
@@ -2049,7 +2180,7 @@ fn describe_worktree_dir(name: &str) -> String {
 }
 
 pub(crate) fn list(project_root: &Path) -> Result<(), CliError> {
-    let git = GitFlow::new(project_root);
+    let git = GitFlow::for_project(project_root);
     let branches = git.list_feature_branches()?;
     if branches.is_empty() {
         println!("no open feature branches");
@@ -2069,7 +2200,8 @@ pub(crate) fn list(project_root: &Path) -> Result<(), CliError> {
 }
 
 fn print_open_branches(project_root: &Path) {
-    let git = GitFlow::new(project_root);
+    let git = GitFlow::for_project(project_root);
+    let base = config::git_flow_for_project(project_root).develop;
     let branches = match git.list_feature_branches() {
         Ok(b) => b,
         Err(_) => return,
@@ -2079,8 +2211,12 @@ fn print_open_branches(project_root: &Path) {
     }
     println!("\nopen branches:");
     for b in &branches {
+        // Interpolated, not literal (45-01): the comparison this suffix
+        // reports was computed against whatever trunk `list_feature_branches`
+        // actually used, and naming a different one is a false statement to
+        // the operator that reads as authoritative.
         let staleness = if b.behind > 0 {
-            format!(" ({} behind develop)", b.behind)
+            format!(" ({} behind {base})", b.behind)
         } else {
             String::new()
         };
@@ -5218,9 +5354,9 @@ mod tests {
 
     /// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
     /// never pass Define, so `start --agent codex` pre-flights on the
-    /// phase's CONTEXT.md existing on develop.
+    /// phase's CONTEXT.md existing on the base branch.
     #[test]
-    fn phase_artifact_on_develop_detects_context_and_fails_open() {
+    fn phase_artifact_on_base_detects_context_and_fails_open() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -5241,30 +5377,233 @@ mod tests {
         run(&["commit", "-q", "-m", "init"]);
         run(&["branch", "develop"]);
 
-        assert!(phase_artifact_on_develop(
+        assert!(phase_artifact_on_base(
             root,
             PhaseId::new(3),
-            "-CONTEXT.md"
+            "-CONTEXT.md",
+            "develop"
         ));
-        assert!(!phase_artifact_on_develop(
+        assert!(!phase_artifact_on_base(
             root,
             PhaseId::new(3),
-            "-PLAN.md"
+            "-PLAN.md",
+            "develop"
         ));
-        assert!(!phase_artifact_on_develop(
+        assert!(!phase_artifact_on_base(
             root,
             PhaseId::new(4),
-            "-CONTEXT.md"
+            "-CONTEXT.md",
+            "develop"
         ));
 
         // Fail-open: outside a repo (or with no develop branch) the
         // pre-flight must not block.
         let empty = tempfile::tempdir().unwrap();
-        assert!(phase_artifact_on_develop(
+        assert!(phase_artifact_on_base(
             empty.path(),
             PhaseId::new(3),
-            "-CONTEXT.md"
+            "-CONTEXT.md",
+            "develop"
         ));
+    }
+
+    /// 45-01 base fixture: a repo with a local `develop`, a local `main`, a
+    /// local `workspace/example` carrying `.planning/config.json`, and a
+    /// remote-tracking `origin/main` — the four spellings of "the production
+    /// branch" a bare `rev-parse --verify` accepts.
+    fn base_branch_fixture(root: &Path) {
+        let run = |args: &[&str]| {
+            let out = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@e.st"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["branch", "develop"]);
+        run(&["checkout", "-q", "-b", "workspace/example"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/config.json"), "{}").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "planning"]);
+        run(&["checkout", "-q", "develop"]);
+        // A remote-tracking ref with no remote configured — enough for
+        // `git rev-parse --verify origin/main` to succeed.
+        let sha = devflow_core::test_support::git_command(root)
+            .args(["rev-parse", "main"])
+            .output()
+            .expect("rev-parse main");
+        let sha = String::from_utf8_lossy(&sha.stdout).trim().to_string();
+        run(&["update-ref", "refs/remotes/origin/main", &sha]);
+    }
+
+    /// Review round 2's base-validation bypass: `validate_base_branch`'s
+    /// string comparison against `MAIN` is defeated by SPELLING. Verified at
+    /// source that `git rev-parse --verify <base>` — the probe
+    /// `phase_reachability_on_base` uses — accepts a remote-tracking name, a
+    /// fully-qualified ref path, `HEAD`, and a bare SHA, and that
+    /// `worktree::add` forwards the raw value to `git worktree add` as a
+    /// start point. Anchoring on `refs/heads/{base}` rejects all four.
+    #[test]
+    fn ensure_base_is_a_local_branch_rejects_commit_ish_that_is_not_a_local_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        base_branch_fixture(root);
+
+        // NEGATIVE CONTROL: without this, every `Err` assertion below would
+        // pass against a helper that returned `Err` unconditionally.
+        assert!(
+            ensure_base_is_a_local_branch(root, "workspace/example").is_ok(),
+            "a real local branch must be accepted"
+        );
+        assert!(ensure_base_is_a_local_branch(root, "develop").is_ok());
+
+        let head_sha = devflow_core::test_support::git_command(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse HEAD");
+        let head_sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
+
+        for spelling in ["origin/main", "refs/heads/main", "HEAD", head_sha.as_str()] {
+            // Each of these satisfies a bare `rev-parse --verify` — assert
+            // that first, so the test proves the bypass exists rather than
+            // merely that the helper is strict.
+            let bare = devflow_core::test_support::git_command(root)
+                .args(["rev-parse", "--verify", "--quiet", spelling])
+                .output()
+                .expect("rev-parse");
+            assert!(
+                bare.status.success(),
+                "fixture is wrong: `{spelling}` must resolve as a commit-ish"
+            );
+            assert!(
+                ensure_base_is_a_local_branch(root, spelling).is_err(),
+                "`{spelling}` is not a local branch and must be refused"
+            );
+        }
+    }
+
+    /// Review round 2 (F4): the artifact-presence probe carried the trunk as
+    /// a literal in its `ls-tree` argument array, so a planning branch
+    /// holding CONTEXT.md/PLAN.md was invisible to it and a
+    /// `RequiresExistingArtifact` driver was refused at Define for an
+    /// artifact that existed — the same class of false refusal AUTO-01 exists
+    /// to remove.
+    ///
+    /// BOTH directions are asserted here and both are required: the probe
+    /// FAILS OPEN by returning `true` on a git error, so a test asserting
+    /// only `true` cannot distinguish "found the artifact on the right
+    /// branch" from "the git invocation failed" — the same answer for the
+    /// wrong reason.
+    #[test]
+    fn phase_artifact_probe_reads_the_supplied_base_not_the_default_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "develop"]);
+        run(&["config", "user.email", "t@e.st"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        // The phase artifact exists ONLY on the planning branch.
+        run(&["checkout", "-q", "-b", "workspace/example"]);
+        std::fs::create_dir_all(root.join(".planning/phases/45-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/45-widget/45-CONTEXT.md"), "ctx").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "planning"]);
+        run(&["checkout", "-q", "develop"]);
+
+        assert!(
+            phase_artifact_on_base(root, PhaseId::new(45), "-CONTEXT.md", "workspace/example"),
+            "the probe must see an artifact on the branch it was pointed at"
+        );
+
+        // NEGATIVE CONTROL: the identical repo and phase, probed against the
+        // default trunk, must report absence.
+        assert!(
+            !phase_artifact_on_base(root, PhaseId::new(45), "-CONTEXT.md", "develop"),
+            "the probe must not report an artifact that is absent from the branch probed"
+        );
+    }
+
+    /// Review round 2 (F3): `devflow start --no-worktree` forked its feature
+    /// branch from the default trunk even after every preceding check had
+    /// validated the configured base — a silent failure of AUTO-01's core
+    /// promise on a supported path.
+    ///
+    /// Asserted one level BELOW the CLI entry point, on the
+    /// `GitFlow::for_project(..).feature_start(..)` call the `--no-worktree`
+    /// arm was converted to use. Driving `commands::start` itself would
+    /// require an agent binary, a network fetch and a monitor spawn, none of
+    /// which bear on the fork point.
+    #[test]
+    fn no_worktree_start_forks_the_feature_branch_from_the_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        base_branch_fixture(root);
+        std::fs::write(
+            root.join("devflow.toml"),
+            "base_branch = \"workspace/example\"\n",
+        )
+        .unwrap();
+
+        // Hermeticity precondition, asserted rather than assumed: an
+        // exported DEVFLOW_BASE_BRANCH outranks the file, so with one set
+        // this test would be measuring the developer's shell.
+        assert!(
+            std::env::var("DEVFLOW_BASE_BRANCH")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "DEVFLOW_BASE_BRANCH is exported in this environment — it outranks \
+             devflow.toml, so this test cannot measure the file"
+        );
+
+        let branch = GitFlow::for_project(root)
+            .feature_start(PhaseId::new(45))
+            .expect("feature_start off the configured base");
+
+        assert!(
+            root.join(".planning/config.json").exists(),
+            "the feature branch must descend from the configured base"
+        );
+
+        // NEGATIVE CONTROL: a branch forked from `develop` would have a tip
+        // that IS `develop`'s tip, so `--is-ancestor` would succeed. It must
+        // fail here. Asserting only "a branch was created" passes against
+        // exactly the broken behaviour this test exists to catch.
+        let is_ancestor = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", &branch, "develop"])
+            .output()
+            .expect("merge-base");
+        assert!(
+            !is_ancestor.status.success(),
+            "`{branch}` is ancestor-equal of develop — it forked from the default trunk"
+        );
     }
 
     // -----------------------------------------------------------------

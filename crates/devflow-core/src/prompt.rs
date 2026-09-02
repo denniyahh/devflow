@@ -54,6 +54,40 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
 
+/// Shared policy for full-execute Code prompts. This advises the agent during
+/// one-shot Code execution, while [`checkpoint_auto_decide_prompt`] is injected
+/// into a resumed session after DevFlow's own human-blocking gate finds no
+/// operator. They are complementary, not duplicates; neither should replace or
+/// be deleted as the other.
+const CODE_STAGE_POLICY: &str = "\
+## Advisory incremental self-review\n\
+\n\
+After each plan or wave lands, perform a quick, shallow self-check \
+for doc accuracy, leaked data, CI/build correctness, and \
+external-state claims. Record any drift in the working output and \
+continue execution; the authoritative review happens during Ship. \
+This check must not pause execution or request human input.\n\
+\n\
+## Unattended decision checkpoints\n\
+\n\
+When you reach a `decision` checkpoint and no operator is available, resolve \
+it rather than pausing: this run is unattended and nobody is coming. Compare \
+the presented options against the phase goal and constraints, and do not choose \
+an option merely because it is the first option in the list. The GSD workflow \
+being invoked describes selecting the first option; this instruction supersedes \
+that positional procedure for merit-based choices.\n\
+\n\
+An option marked recommended is evidence to weigh, not an automatically \
+decisive answer. In your final message, record the reasoning and comparison that \
+produced the choice: which options you considered and why the chosen one won, \
+not merely a sentence asserting the choice. The final message is the only record \
+of the decision.\n\
+\n\
+This authority does not extend to a `blocking-human` gate or a \
+package-verification checkpoint. Those remain human-only: do not self-resolve \
+or approve them; report them instead. This policy must not pause execution or \
+request human input.";
+
 /// The data a stage wants rendered, with NO agent-specific syntax.
 ///
 /// This is the de-Claude-ification artifact (999.31 / 37-01): the old
@@ -342,13 +376,7 @@ fn code_stage_prompt(phase: PhaseId) -> String {
     );
     format!(
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
-        ## Advisory incremental self-review\n\
-        \n\
-        After each plan or wave lands, perform a quick, shallow self-check \
-        for doc accuracy, leaked data, CI/build correctness, and \
-        external-state claims. Record any drift in the working output and \
-        continue execution; the authoritative review happens during Ship. \
-        This check must not pause execution or request human input.\n\
+        {CODE_STAGE_POLICY}\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -438,13 +466,7 @@ fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &st
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
             must be preserved verbatim.\n\n\
-            ## Advisory incremental self-review\n\
-            \n\
-            After each plan or wave lands, perform a quick, shallow self-check \
-            for doc accuracy, leaked data, CI/build correctness, and \
-            external-state claims. Record any drift in the working output and \
-            continue execution; the authoritative review happens during Ship. \
-            This check must not pause execution or request human input.\n\
+            {CODE_STAGE_POLICY}\n\
             \n\
             {COMPLETION_PROTOCOL}"
         ),
@@ -686,8 +708,134 @@ mod tests {
         ] {
             assert!(prompt.contains(angle), "Code prompt missing angle: {angle}");
         }
+        assert!(
+            prompt.contains("Unattended decision checkpoints"),
+            "Code prompt must carry the unattended decision policy"
+        );
         assert!(!prompt.contains("AskUserQuestion"));
         assert!(!prompt.contains("request_user_input"));
+    }
+
+    // These tests prove policy delivery in the rendered prompt, not model compliance.
+    // They also do not modify the GSD workflow file, whose decision branch remains positional.
+
+    #[test]
+    fn code_policy_forbids_positional_option_selection() {
+        let code_prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
+        let validate_prompt = stage_prompt(Stage::Validate, PhaseId::new(45)).to_lowercase();
+        let code_has_positional_policy = code_prompt.contains("do not choose")
+            && code_prompt.contains("first option")
+            && code_prompt.contains("merit");
+        let validate_has_positional_policy = validate_prompt.contains("do not choose")
+            && validate_prompt.contains("first option")
+            && validate_prompt.contains("merit");
+
+        assert!(
+            code_has_positional_policy,
+            "the policy must explicitly contradict GSD's first-option procedure; otherwise it \
+             adds nothing"
+        );
+        assert!(
+            !validate_has_positional_policy,
+            "the negative control must not find the Code policy on an unrelated prompt"
+        );
+    }
+
+    #[test]
+    fn code_policy_requires_the_reasoning_to_be_recorded() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
+        assert!(
+            prompt.contains("record") && prompt.contains("reasoning"),
+            "the final message is the only record of what was decided, so the policy must \
+             require recorded reasoning"
+        );
+    }
+
+    #[test]
+    fn code_policy_excludes_blocking_human_and_package_checkpoints() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
+        assert!(
+            prompt.contains("blocking-human"),
+            "the policy must exclude the human-blocking gate from self-resolution"
+        );
+        assert!(
+            prompt.contains("package-verification"),
+            "the policy must exclude package-verification checkpoints from self-resolution"
+        );
+    }
+
+    #[test]
+    fn code_stage_prompt_is_deterministic() {
+        assert_eq!(
+            stage_prompt(Stage::Code, PhaseId::new(45)),
+            stage_prompt(Stage::Code, PhaseId::new(45)),
+            "a stable policy must render identically for the same Code stage"
+        );
+    }
+
+    #[test]
+    fn code_policy_is_identical_across_both_renderers() {
+        let phase = PhaseId::new(45);
+        let claude_prompt = stage_prompt(Stage::Code, phase);
+        let workflow_prompt =
+            render_workflow_style(&StageIntent::Code { phase, fix: None }, "/workflows");
+
+        assert!(
+            claude_prompt.contains(CODE_STAGE_POLICY),
+            "the Claude/OpenCode Code prompt must deliver the shared policy"
+        );
+        assert!(
+            workflow_prompt.contains(CODE_STAGE_POLICY),
+            "the Codex/Pi Code prompt must deliver the shared policy"
+        );
+    }
+
+    #[test]
+    fn code_policy_is_absent_from_prompts_that_must_not_carry_it() {
+        let phase = PhaseId::new(45);
+        let gaps_only = render_workflow_style(
+            &StageIntent::Code {
+                phase,
+                fix: Some(FixType::GapsOnly),
+            },
+            "/workflows",
+        );
+        let audit_fix = render_workflow_style(
+            &StageIntent::Code {
+                phase,
+                fix: Some(FixType::AuditFix),
+            },
+            "/workflows",
+        );
+
+        for prompt in [
+            stage_prompt(Stage::Validate, phase),
+            stage_prompt(Stage::Ship, phase),
+            gaps_only,
+            audit_fix,
+        ] {
+            assert!(
+                !prompt.contains(CODE_STAGE_POLICY),
+                "only full-execute Code prompts may carry the shared policy"
+            );
+        }
+    }
+
+    #[test]
+    fn both_code_prompts_still_end_with_the_completion_protocol() {
+        let phase = PhaseId::new(45);
+        let claude_prompt = stage_prompt(Stage::Code, phase);
+        let workflow_prompt =
+            render_workflow_style(&StageIntent::Code { phase, fix: None }, "/workflows");
+
+        assert!(
+            claude_prompt.ends_with(COMPLETION_PROTOCOL),
+            "the Claude/OpenCode Code prompt must keep the completion protocol last"
+        );
+        assert!(
+            workflow_prompt.ends_with(COMPLETION_PROTOCOL),
+            "the Codex/Pi Code prompt must keep the completion protocol last"
+        );
     }
 
     /// 13-06 dogfood regression (Codex leg), Plan half only after the D-14

@@ -38,6 +38,19 @@ skills-lock.json
 **/.claude/first-run
 **/.claude/assistant-daemon-state.json
 
+# GSD run-scoped runtime state (session id, PID, timestamps — dead on any
+# other checkout the moment it's written; regenerated at the next command).
+# `.gsd/*/dispatch-isolation-sentinel.json` is documented as a "run-scoped
+# sentinel" (gsd-core references/dispatch-isolation-gate.md, #3045).
+# `.planning/milestone.lock` holds `{phase, session, pid, updated_at}` with a
+# TTL-based advisory lock (gsd-core milestone-lock.cjs, #3311) — never meant
+# to survive a commit. `.planning/state.json` is a best-effort derived
+# projection republished at every step boundary (gsd-core state-contract.cjs,
+# #3227), "no second answer to any question GSD already answers".
+.gsd/
+.planning/milestone.lock
+.planning/state.json
+
 # Planning, runtime states, and local databases
 .gsd/
 .gsd-backups/

@@ -20,7 +20,6 @@ use crate::pipeline_gate::{
     transition,
 };
 use crate::pipeline_launch::launch_stage;
-use devflow_core::config::GitFlowConfig;
 use devflow_core::gates::{GateAction, GateResponse, Gates};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
@@ -596,8 +595,11 @@ pub(crate) fn handle_validate_outcome(
         // point: the Code stage's fix command is a GSD command that commits
         // `.planning/` artifacts on cycles that changed no source.
         state.phase_validate_failures = state.phase_validate_failures.saturating_add(1);
-        match agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase)
-        {
+        match agent_result::phase_commit_count(
+            project_root,
+            &devflow_core::config::git_flow_for_project(project_root),
+            state.phase,
+        ) {
             Some(current) => {
                 if mode::consecutive_failures_made_progress(
                     state.last_validate_failure_commit_count,
@@ -1053,7 +1055,16 @@ pub(crate) fn run_checkout_hooks(
             return false;
         }
     };
-    let git_flow = GitFlowConfig::default();
+    // The single production `HookContext` construction, and therefore the one
+    // point where the project-resolved branch model reaches every checkout
+    // hook (45-01 Task 3). Defaulted here, every hook silently re-defaulted
+    // the trunk regardless of what `start` forked from.
+    //
+    // CR-02: prefer the base THIS RUN persisted at `start` over re-resolving
+    // from ambient configuration — the merge below runs in a different
+    // process from the one that read `DEVFLOW_BASE_BRANCH`.
+    let git_flow =
+        devflow_core::config::git_flow_for_run(project_root, state.base_branch.as_deref());
     let mut all_succeeded = true;
     let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
     let hook_root = hook_context_root(project_root, state, terminal_batch);
@@ -1097,9 +1108,12 @@ pub(crate) fn run_checkout_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: production code resolves its branch model from the
+    // project (45-01), so the defaults survive here as fixture input only.
     use crate::pipeline_gate::prepare_loop_back_to_code;
     use crate::pipeline_launch::advance;
     use crate::test_support::*;
+    use devflow_core::config::GitFlowConfig;
     use devflow_core::git::GitFlow;
     use devflow_core::mode::Mode;
     use devflow_core::prompt;
@@ -1250,6 +1264,103 @@ mod tests {
             changelog_version, tag_version,
             "changelog heading must match the git tag ({tag}) produced by the same \
              run_checkout_hooks call, even with no version file"
+        );
+    }
+
+    /// CR-02 (45-REVIEW.md): the merge target must come from the base this
+    /// run PERSISTED at `start`, not from whatever the CURRENT process's
+    /// environment resolves. `DEVFLOW_BASE_BRANCH` lives in the shell that
+    /// ran `start`; the documented recovery path (`devflow resume` after a
+    /// monitor death) runs in a different process, and re-resolving there
+    /// merged the phase branch into `develop` while `is_merged_into_develop`
+    /// confirmed success against that same wrong branch.
+    ///
+    /// Neither fixture sets `DEVFLOW_BASE_BRANCH` or writes a `devflow.toml`
+    /// — ambient configuration resolves to `develop` in both halves, so the
+    /// only thing that differs is `State::base_branch`.
+    #[test]
+    fn checkout_hooks_merge_into_the_persisted_base_not_the_ambient_default() {
+        // This test shells out to `git`, and sibling tests in this binary
+        // blank process-global `PATH` via `NeutralPath::install`, whose
+        // documented precondition is that the caller holds `ENV_MUTEX`.
+        // Without taking the same lock, a concurrent `NeutralPath` window
+        // makes every `git` spawn here fail with `NotFound` — a real,
+        // observed flake, not a theoretical one.
+        let _env = crate::test_support::env_lock();
+
+        // Returns the branch the phase work actually landed on.
+        let merged_into = |persisted_base: Option<&str>| -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo_no_version_file(root);
+
+            let phase = PhaseId::new(48);
+            let branch = format!("feature/phase-{padded}", padded = phase.padded());
+            let git = |args: &[&str]| {
+                let output = devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?} failed");
+            };
+
+            // The shape `start` would have produced: a planning branch off
+            // develop, with the phase branch forked from IT.
+            git(&["branch", "workspace/example", "develop"]);
+            git(&["branch", &branch, "workspace/example"]);
+            std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+            git(&["checkout", &branch]);
+            std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "phase work"]);
+
+            // Identify the phase work by COMMIT, not by branch name: the
+            // after-ship batch ends in `BranchCleanup`, which deletes the
+            // merged feature branch, so a branch-name probe reports "merged
+            // nowhere" for both halves and silently measures nothing.
+            // Resolve the branch by name rather than HEAD — HEAD moves with
+            // the checkout below and would capture develop's tip, making the
+            // ancestry check below trivially true for BOTH trunks.
+            let work = devflow_core::test_support::git_command(root)
+                .args(["rev-parse", &branch])
+                .output()
+                .unwrap();
+            let work = String::from_utf8_lossy(&work.stdout).trim().to_string();
+            git(&["checkout", "develop"]);
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.base_branch = persisted_base.map(str::to_string);
+            run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
+
+            // Which trunks now contain the phase work commit?
+            ["workspace/example", "develop"]
+                .into_iter()
+                .filter(|trunk| {
+                    devflow_core::test_support::git_command(root)
+                        .args(["merge-base", "--is-ancestor", &work, trunk])
+                        .status()
+                        .unwrap()
+                        .success()
+                })
+                .map(str::to_string)
+                .collect()
+        };
+
+        assert_eq!(
+            merged_into(Some("workspace/example")),
+            vec!["workspace/example".to_string()],
+            "a run that persisted `workspace/example` must merge there and NOT into develop"
+        );
+
+        // NEGATIVE CONTROL: same fixture, same ambient config, nothing
+        // persisted — the pre-existing resolver path must still target
+        // `develop`. Without this half the test passes against an
+        // implementation that hardcoded `workspace/example`, and against one
+        // that merged into every branch it could find.
+        assert_eq!(
+            merged_into(None),
+            vec!["develop".to_string()],
+            "with nothing persisted the resolver fallback must still target develop"
         );
     }
 

@@ -122,14 +122,14 @@ pub fn hooks_after_ship() -> Vec<Hook> {
 }
 
 fn branch_create(ctx: &HookContext) -> Result<(), HookError> {
-    let git = GitFlow::new(&ctx.project_root);
+    let git = GitFlow::with_config(&ctx.project_root, ctx.git_flow.clone());
     let branch = git.feature_start(ctx.phase)?;
     info!("BranchCreate: created {branch}");
     Ok(())
 }
 
 fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
-    let git = GitFlow::new(&ctx.project_root);
+    let git = GitFlow::with_config(&ctx.project_root, ctx.git_flow.clone());
     let branch = format!(
         "{}phase-{}",
         ctx.git_flow.feature_prefix,
@@ -178,7 +178,7 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
 /// git error, and the operator decides. Plan 23-10's recovery-path artifact
 /// must know this exact state.
 fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
-    let git = GitFlow::new(&ctx.project_root);
+    let git = GitFlow::with_config(&ctx.project_root, ctx.git_flow.clone());
     let branch = format!(
         "{}phase-{}",
         ctx.git_flow.feature_prefix,
@@ -191,7 +191,10 @@ fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
         .into());
     }
     if git.is_merged_into_develop(ctx.phase) {
-        info!("Merge: {branch} is already merged; nothing to merge");
+        info!(
+            "Merge: {branch} is already merged into {target}; nothing to merge",
+            target = ctx.git_flow.develop
+        );
         crate::events::emit(
             &ctx.project_root,
             ctx.phase,
@@ -212,12 +215,16 @@ fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
         );
         return Err(crate::git::GitError::Command(format!(
             "merge of `{branch}` reported success but the branch is still not an ancestor of \
-             develop; refusing to report an unproven merge"
+             `{target}`; refusing to report an unproven merge",
+            target = ctx.git_flow.develop
         ))
         .into());
     }
 
-    info!("Merge: merged {branch} into develop");
+    info!(
+        "Merge: merged {branch} into {target}",
+        target = ctx.git_flow.develop
+    );
     crate::events::emit(
         &ctx.project_root,
         ctx.phase,
@@ -236,7 +243,7 @@ fn docs_update(ctx: &HookContext) -> Result<(), HookError> {
     match output {
         Ok(out) if out.status.success() => {
             // Commit any doc changes; ignore "nothing to commit".
-            let git = GitFlow::new(&ctx.project_root);
+            let git = GitFlow::with_config(&ctx.project_root, ctx.git_flow.clone());
             if let Err(err) = git.commit_all("docs: update generated docs") {
                 warn!("DocsUpdate: commit failed: {err}");
             } else {
@@ -275,7 +282,7 @@ fn changelog_append(ctx: &mut HookContext) -> Result<(), HookError> {
     // commit_all) so this hook never sweeps in unrelated dirty state. A
     // failed commit propagates as an error so the terminal batch's fail-fast
     // stops BranchCleanup from running against an uncommitted entry.
-    let git = GitFlow::new(&ctx.project_root);
+    let git = GitFlow::with_config(&ctx.project_root, ctx.git_flow.clone());
     git.commit_path(
         "CHANGELOG.md",
         &format!("docs: add changelog entry for {version}"),
@@ -286,7 +293,7 @@ fn changelog_append(ctx: &mut HookContext) -> Result<(), HookError> {
 
 fn version_bump(ctx: &mut HookContext) -> Result<(), HookError> {
     let version = version::compute_version(&ctx.project_root)?;
-    let git = GitFlow::new(&ctx.project_root);
+    let git = GitFlow::with_config(&ctx.project_root, ctx.git_flow.clone());
 
     // D-12/T-26-11: compute the changelog body BEFORE `git.tag(&tag)` below.
     // Once that tag exists, `reachable_semver_baseline` resolves to it and
@@ -414,6 +421,89 @@ mod tests {
             shipped_version: None,
             shipped_changelog_body: None,
         }
+    }
+
+    /// 45-01 Task 3: the branch a phase worktree forks FROM and the branch
+    /// the lifecycle merges INTO must be the same resolved value.
+    /// `merge_feature` built its `GitFlow` from `GitFlow::new`, which
+    /// hardcodes the defaults, so `ctx.git_flow` was read only for
+    /// `feature_prefix` and every git operation silently re-defaulted the
+    /// trunk.
+    #[test]
+    fn merge_feature_targets_the_configured_base_not_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        git(root, &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(root.join("phase-work.txt"), "x").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "phase work"]);
+        let phase_sha = git_stdout(root, &["rev-parse", "HEAD"]);
+
+        let mut context = ctx(root, Stage::Ship);
+        context.git_flow = GitFlowConfig {
+            develop: "workspace/example".to_string(),
+            ..GitFlowConfig::default()
+        };
+        merge_feature(&context).expect("merge into the configured base");
+
+        assert!(
+            is_ancestor(root, &phase_sha, "workspace/example"),
+            "the phase commit must land on the configured base"
+        );
+        // NEGATIVE CONTROL: asserting only that the merge succeeded would
+        // pass against today's code merging into `develop`.
+        assert!(
+            !is_ancestor(root, &phase_sha, "develop"),
+            "the phase commit must NOT land on the default trunk"
+        );
+    }
+
+    /// Direct proof that `HookContext.git_flow` is READ rather than
+    /// re-defaulted: point it at a branch that does not exist and the hook
+    /// must fail naming that branch. Under the pre-45-01 code the hook
+    /// silently succeeded against the real `develop`.
+    #[test]
+    fn hook_context_git_flow_is_not_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        git(root, &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(root.join("phase-work.txt"), "x").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "phase work"]);
+
+        let mut context = ctx(root, Stage::Ship);
+        context.git_flow = GitFlowConfig {
+            develop: "no-such-base-branch".to_string(),
+            ..GitFlowConfig::default()
+        };
+        let err = merge_feature(&context)
+            .expect_err("a non-existent merge target must fail, not silently hit develop");
+        assert!(
+            err.to_string().contains("no-such-base-branch"),
+            "the error must name the configured branch: {err}"
+        );
+    }
+
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let out = crate::test_support::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn is_ancestor(root: &Path, commit: &str, branch: &str) -> bool {
+        crate::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", commit, branch])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 
     #[test]
