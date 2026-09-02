@@ -3,19 +3,19 @@ gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
 current_phase: 45
-current_phase_name: Opportunistic Cleanup (999.94)
-status: planning
-stopped_at: Phase 45 context gathered
-last_updated: "2026-09-01T23:09:58.799Z"
-last_activity: 2026-08-27
-state_head: 7b8b266054113d7f43a0fa3f54e84dacc716966a
+current_phase_name: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94
+status: verifying
+stopped_at: External adversarial review (codex+agy) done, 8 fixed/2 filed to backlog (999.117/999.118); 45-VERIFICATION.md ran gaps_found, then operator overrode the two DECN-01 partial-truths (CR-03→999.115, CR-04→999.116) and AUTO-01/write_state_atomic gaps were fixed directly; status is human_needed pending one live `devflow start --mode auto` end-to-end run (see 45-VERIFICATION.md behavior_unverified_items) — run `/gsd-verify-work 45` when ready to close it
+last_updated: "2026-09-02T19:00:00.000Z"
+last_activity: 2026-09-02
+state_head: b39d316f385afb61066fc47fd1cf102dd1e3da76
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 13
-  completed_plans: 13
+  total_plans: 16
+  completed_plans: 16
   percent: 83
-last_activity_desc: Phase 44 shipped via PR
+last_activity_desc: External review (codex+agy) fixed, gate closed on 2 authorized overrides; human_needed pending a live unattended-run UAT
 ---
 
 # DevFlow — Project State
@@ -114,10 +114,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 44 — Codex End-to-End Verification
-Plan: Not started
-Status: Phase 43 shipped — PR #149
-Last activity: 2026-08-24
+Phase: 45 (Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94)) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
+Last activity: 2026-09-02
 
 **Decision coverage gate override (2026-08-23):** `check.decision-coverage-plan` returned
 `passed: false, reason: could-not-parse, covered: 0, uncovered: []` for 43-CONTEXT.md — a known
@@ -724,6 +724,7 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase ?]: Plan 25-10 superseded (not re-run) — its 'structurally removed' premise was falsified by 25-CI-OBSERVATION.md
 - [Phase ?]: Human declined to substitute CI-shape for local push-gate observation in 25e evidence — CI's Test job lacks the taskset pin and fmt->clippy->test ordering that produced the 2/2 reproduction; conditional pre-authorised approval of truth 7 applied instead
 - [Phase ?]: Truth 7 (999.47/DEN-72) recorded as human-verified against 25-CI-TRIALS.md's 11-observation evidence, residuals stated — not upgraded to a closure claim; 25-VALIDATION.md rows 1-3 (25f) human-approved
+- [Phase 45]: Accepted workspace_scoped staleness classification: narrow only DevFlow self-dogfood workspaces and preserve broad downstream detection.
 
 ## Roadmap Evolution
 
@@ -803,12 +804,13 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 24 P02 | 8min | 2 tasks | 1 files |
 | Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
 | Phase 34 P05 | 110m | 6 tasks | 19 files |
+| Phase 45 P02 | 32min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-09-01T23:09:58.450Z
-**Stopped at:** Phase 45 context gathered
-**Resume file:** .planning/phases/45-unattended-auto-mode-hardening-999-110-999-109-999-94/45-CONTEXT.md
+**Last session:** 2026-09-02T09:28:23.614Z
+**Stopped at:** Completed 45-02-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 

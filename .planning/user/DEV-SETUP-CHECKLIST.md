@@ -150,9 +150,10 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PROJECT]** `.planning/config.json` — per-project GSD config (branching strategy, phase
   branch template, model overrides, feature toggles). This is the part that's genuinely
   project-specific even though the GSD engine itself is global.
-- [ ] **[GLOBAL]** MCP servers registered via `claude mcp list` (Linear, Google Drive/Gmail/
-  Calendar, GitHub, plus two currently broken — `gsd-workflow`, `gsd-browser` — worth fixing or
-  dropping if replicating cleanly rather than copying the breakage).
+- [ ] **[GLOBAL]** MCP servers registered via `claude mcp list` (Google Drive/Gmail/Calendar,
+  GitHub, plus two currently broken — `gsd-workflow`, `gsd-browser` — worth fixing or dropping if
+  replicating cleanly rather than copying the breakage). A Linear server may still be registered;
+  it is **not** part of this project's workflow any more (see §7) and does not need replicating.
 - [ ] **[GLOBAL, currently empty]** Auto-memory directory convention:
   `~/.claude/projects/<project-path>/memory/` — per-project persistent memory, keyed by encoded
   filesystem path, so it naturally travels with wherever the project lives on disk.
@@ -200,8 +201,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   — gitignored, self-healed by the post-commit hook (§3). Only makes sense if you keep a local
   `gsd-core-personal-workspace` source checkout alongside your projects; otherwise this is
   DevFlow-specific plumbing to skip.
-- [ ] **[PROJECT]** Linear integration: team `Denniskim`, project `DevFlow` — ROADMAP.md backlog
-  items are meant to stay in sync with Linear issues (per your own stated convention).
+- [ ] **[PROJECT]** Issue tracking is **GitHub Issues only** (`denniyahh/devflow`). ROADMAP.md
+  `999.x` backlog entries are the primary record; mirror one to a GitHub issue when it needs to be
+  visible outside the repo. **Linear is no longer used** (retired 2026-09-02). Historical
+  `**Linear:** [DEN-nnn]` links in ROADMAP.md and STATE.md are left in place deliberately — they
+  record where an item was tracked at the time, and rewriting them would falsify the history.
+  Migrated items already read `**GitHub:** [#nnn] (migrated from Linear DEN-nnn)`; follow that
+  form if you migrate more.
 
 ## 8. Language/build tooling — [PROJECT], Rust-specific
 

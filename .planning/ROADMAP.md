@@ -122,12 +122,13 @@ Plans:
   2. The self-dogfood staleness check (`affects_compiled_binary`) only inspects Cargo workspace members (`crates/*`) rather than repo-wide `.rs`/`Cargo.toml` files, ignoring `.planning/spikes/` and non-workspace crates (AUTO-02 / 999.109).
   3. An unattended `decision` checkpoint no longer blindly takes the first option — Code-stage prompt policy instructs the agent to evaluate options on merit and record its reasoning (DECN-01 / 999.94).
 
-**Plans**: 3 plans (all wave 1 — disjoint `files_modified`, fully parallel)
+**Plans**: 3/3 plans executed (all wave 1 — disjoint `files_modified`, fully parallel)
 
 Plans:
-- [ ] 45-01-PLAN.md — AUTO-01: configurable base branch resolution (`base_branch` / `DEVFLOW_BASE_BRANCH`), `GitFlow::with_config`, and the call-site audit keeping fork point == merge target
-- [ ] 45-02-PLAN.md — AUTO-02: scope `affects_compiled_binary` to `crates/` workspace members plus root build files, with direct unit tests and negative controls
-- [ ] 45-03-PLAN.md — DECN-01: shared Code-stage decision-checkpoint policy constant delivered identically to both agent renderers
+
+- [x] 45-01-PLAN.md — AUTO-01: configurable base branch resolution (`base_branch` / `DEVFLOW_BASE_BRANCH`), `GitFlow::with_config`, and the call-site audit keeping fork point == merge target
+- [x] 45-02-PLAN.md — AUTO-02: scope `affects_compiled_binary` to `crates/` workspace members plus root build files, with direct unit tests and negative controls
+- [x] 45-03-PLAN.md — DECN-01: shared Code-stage decision-checkpoint policy constant delivered identically to both agent renderers
 
 ---
 
@@ -237,7 +238,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 42 | — | Complete | 2026-08-21 |
 | 43 | 2/2 | Complete | 2026-08-24 |
 | 44 | — | Not started | — |
-| 45 | — | Not started | — |
+| 45 | 3/3 | In Progress|  |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
@@ -397,6 +398,160 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
+
+**Issue tracking is GitHub Issues only** (`denniyahh/devflow`), as of 2026-09-02.
+These `999.x` entries are the primary record; mirror one to a GitHub issue when it
+needs to be visible outside the repo, using the existing
+`**GitHub:** [#nnn](...)` form. Linear is retired — do not file there and do not
+add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
+historical: they record where an item was tracked at the time and are kept
+deliberately rather than rewritten.
+
+### Phase 999.118: `write_state_atomic` Uses a Fixed `.tmp` Filename, So Two Processes Saving the Same Phase Race (BACKLOG)
+
+**Found:** 2026-09-02, phase 45 external adversarial code review (agy / gemini-3.1-pro-high;
+`45-EXTERNAL-REVIEW-agy.md`). Filed as its own entry rather than fixed in phase 45 because
+`crates/devflow-core/src/workflow.rs` is untouched by that branch — expanding a review into
+unrelated pre-existing code is a scope decision, not a reviewer's call.
+
+`write_state_atomic` (`crates/devflow-core/src/workflow.rs:185-193`) derives its temp path as
+`path.with_extension("tmp")`. That is a pure function of the state path, so every process
+writing state for the same phase writes the SAME file:
+
+```rust
+let tmp = path.with_extension("tmp");
+std::fs::write(&tmp, contents)?;
+std::fs::rename(&tmp, path)?;
+```
+
+The rename is atomic; the write is not, and the two are not atomic together. Two interleavings
+both lose data:
+
+- A writes `.tmp`, B overwrites `.tmp`, A renames — A's rename publishes B's contents under A's
+  belief that it wrote its own. The update A thought it made is gone with no error anywhere.
+- A writes and renames, B renames — B's `rename` hits `ENOENT` because A already consumed the
+  temp file, and the save fails.
+
+**Why this matters here specifically.** DevFlow routinely runs a monitor and an agent against the
+same phase concurrently, and `State` is what carries `stage`, `yes_ship`, `stopped`, and now
+`base_branch` (45-01). A silently-lost state write is the false-evidence class this project keeps
+paying for: nothing logs, and the damage shows up a stage later as a run that resumed on the wrong
+value.
+
+**Not yet reproduced.** The mechanism is read from source; no interleaving has been observed in the
+wild. A repro would drive two `save_state` calls at a controlled interleaving (or hammer them from
+two threads) and assert a lost update, with a single-writer negative control that must NOT lose one.
+
+**Fix shape:** make the temp name unique per writer — PID plus a counter or a random nonce, e.g.
+`state-{NN}.json.{pid}.{nonce}.tmp` — and keep the `rename` as the publish step. Uniqueness is what
+restores the "atomic" the function's name already promises. `tempfile::NamedTempFile::persist_to`
+in the same directory gets this for free and is already a dependency.
+
+**Acceptance:** a test that fails on the current fixed-name implementation and passes on the fix,
+carrying a negative control that a single writer still round-trips its own state.
+
+### Phase 999.117: Scoped Staleness Accepts Any `crates/**` Path Rather Than the Declared Workspace Members (BACKLOG)
+
+**Found:** 2026-09-02, phase 45 external adversarial code review (codex / gpt-5.6-terra, CR-45-04;
+`45-EXTERNAL-REVIEW-codex.md`). **Reviewed and deliberately NOT fixed in phase 45** — recorded here
+so the reasoning survives, not because the work is queued. Promote only if the premise below
+changes.
+
+`affects_compiled_binary`'s scoped branch (`crates/devflow-cli/src/staleness.rs:280`) accepts any
+path under `crates/`, while its own doc comment and 999.109's title both say "workspace members".
+The root `Cargo.toml` declares exactly two — `crates/devflow-core` and `crates/devflow-cli` — so a
+hypothetical `crates/scratch/src/main.rs` would be treated as a build input that `cargo build`
+never reads. Codex is factually right that the code does not do what it says.
+
+**Why it was left alone.** The error direction is safe. An extra `crates/` path is a false
+POSITIVE: it hard-blocks a run that could have proceeded, which is loud and recoverable. Narrowing
+to a parsed member list inverts that — a newly added crate would be silently DROPPED from the
+staleness check until someone remembered the parse was there, which is a false negative in the one
+place a Stale verdict hard-BLOCKS (D-18). That is the Phase 16 false-evidence shape (T-45-09), and
+trading a safe false positive for an unsafe false negative is the wrong trade. `is_self_dogfood_workspace`
+already requires the member list to be exactly those two paths before the scoped rule engages at
+all, so the gap is unreachable on this repo today.
+
+**What would change the decision:** this workspace gaining a third member, or gaining a
+non-member directory under `crates/`. Either makes the divergence reachable, and the fix would
+then need to parse `[workspace] members` and — critically — fail toward Stale on an unparseable
+manifest rather than toward Fresh.
+
+### Phase 999.116: `CODE_STAGE_POLICY` Contradicts `checkpoint_auto_decide_prompt` in the Same Resumed Session (BACKLOG)
+
+**Found:** 2026-09-02, phase 45 code review (CR-04, `45-REVIEW.md`), deferred by operator
+decision the same day so 45-01's two trunk-resolution blockers could land on their own.
+
+**The item:** `CODE_STAGE_POLICY` (`prompt.rs:86-89`) forbids the agent from self-resolving a
+`blocking-human` checkpoint, while `checkpoint_auto_decide_prompt` (`prompt.rs:537-549`) —
+injected into the SAME resumed session at `pipeline_launch.rs:1095-1100` — instructs it to do
+exactly that. Two standing instructions in one context window disagree.
+
+**What the review established, and what it did not.** It proved the textual contradiction and
+proved both prompts reach the same session. It did NOT measure a stall: which instruction an
+agent actually follows is a question about model instruction-priority and is not determinable by
+reading source. Any fix needs an observed run, not just a re-read of the strings.
+
+**Size:** S–M. **Depends on:** nothing structural. Related: 999.94 / DECN-01 (the policy this
+phase added), and 45-03's own note that it deliberately preserved human-only handling.
+
+---
+
+### Phase 999.115: The Unattended Decision Policy Never Reaches the Claude Loop-Back Code Prompt (BACKLOG)
+
+**Found:** 2026-09-02, phase 45 code review (CR-03, `45-REVIEW.md`), deferred with 999.116.
+
+**The item:** DECN-01 is half-delivered. `render_claude_style`'s `Code { fix: Some(_) }` arm
+routes to `fix_prompt`, and `CODE_STAGE_POLICY` occurs **zero** times inside `fix_prompt` —
+verified with a negative control, since the same line range finds `COMPLETION_PROTOCOL` twice, so
+the count is a real zero and not an empty search range. The workflow renderer's matching
+`Some(FixType::FullExecute) | None` arm DOES carry it (`prompt.rs:469`). So a Claude/OpenCode run
+that loops back into Code after a failed Validate silently drops the merit-based decision policy
+that phase 45 exists to deliver.
+
+**Why the tests did not catch it:** 45-03's assertions (`prompt.rs:784`, `:788`) exercise
+`code_stage_prompt`, the `fix: None` path only. They pass while the loop-back path carries
+nothing — a green test over an undelivered contract.
+
+**Size:** S. **Depends on:** nothing structural.
+
+---
+
+### Phase 999.114: Test Binary Blanks Process-Global `PATH`, Failing Whichever Concurrent Test Happens to Spawn a Program (BACKLOG)
+
+**Found:** 2026-09-02, phase 45, verifying the CR-01/CR-02 fixes.
+
+**The item:** `NeutralPath::install` (`crates/devflow-cli/src/test_support.rs:328-347`) replaces
+process-global `PATH` with an empty directory. Its documented precondition is that the caller
+holds `ENV_MUTEX`, but that only serializes it against tests that ALSO take the lock. Every other
+test in the binary that spawns an external program during that window dies with
+`Os { code: 2, kind: NotFound }` — `git`, `sleep`, and the test binary re-executing itself have
+all been observed as victims.
+
+**It picks a different victim each run**, which is what makes it expensive: it reads as a
+regression in whatever code the run happened to hit. Observed victims so far:
+`pipeline_outcomes::tests::checkout_hooks_merge_into_the_persisted_base_not_the_ambient_default`,
+`staleness::tests::embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir`,
+`test_support::tests::trailing_reap_call_is_skipped_when_a_later_assertion_panics`,
+`agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape`.
+
+**Attribution (negative control).** Reproduced on the clean pre-fix commit `eb3c6af`, which
+carries none of phase 45's CR-01/CR-02 changes: `cargo test --workspace` failed 1 of 3 runs there,
+on the same `agent::tests::discover_stray_devflow_processes_...` victim that the fixed branch also
+hit. It is pre-existing and not introduced by those fixes.
+
+**Rate is only loosely bounded.** Roughly 1-in-3 on `cargo test --workspace` and not seen in 5
+consecutive `-p devflow --bin devflow` runs — small samples on both sides, enough to establish
+the defect exists and is pre-existing, nowhere near enough to quantify the rate or to claim a fix
+worked. Any fix needs a many-run harness, not a green suite.
+
+**Likely direction:** make the git/program-spawning helpers acquire `env_lock()` themselves rather
+than relying on every test author to remember, or give `NeutralPath` a `PATH` that still resolves
+the handful of real binaries the suite needs.
+
+**Size:** M. **Depends on:** nothing structural.
+
+---
 
 ### Phase 999.113: `consume_cron_instructions_preserves_unreadable_legacy_record` Passes Silently Under Root, Defeating Its Own Fixture (RESOLVED 2026-08-27)
 
@@ -3041,6 +3196,7 @@ reusable core.
 **The defect:** `release --check`'s tag-signing viability probe inspects `user.signingkey` (the agent's commit key) instead of `devflow.releaseSigningKey` (the maintainer's release tag signing key), giving a false-positive "signing viable" report that only fails later at pre-push fingerprint comparison.
 
 **The item:**
+
 1. Direct `release --check` to specifically probe `devflow.releaseSigningKey` for release tags instead of falling back to `user.signingkey`.
 2. Add an explicit error message when the key loaded in `ssh-agent` / `gpg` does not match the configured maintainer fingerprint.
 

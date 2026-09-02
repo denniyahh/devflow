@@ -70,11 +70,11 @@ phase.
 
 ### Unattended Auto-Mode (Phase 45)
 
-- [ ] **AUTO-01**: (999.110, HIGH) — worktree creation forks from the branch tracking `.planning/`
+- [x] **AUTO-01**: (999.110, HIGH) — worktree creation forks from the branch tracking `.planning/`
   rather than hardcoding `develop`, so `.planning/config.json` is present and
   `preflight_unattended_launch_check` passes out of the box.
 
-- [ ] **AUTO-02**: (999.109, HIGH) — the self-dogfood staleness check (`affects_compiled_binary`)
+- [x] **AUTO-02**: (999.109, HIGH) — the self-dogfood staleness check (`affects_compiled_binary`)
   inspects only Cargo workspace members (`crates/*`) plus root build files, ignoring
   `.planning/spikes/` and non-workspace crates.
 
@@ -127,8 +127,8 @@ Which phases cover which requirements. Filled during roadmap creation.
 | OPCD-03 | Phase 43 | Complete |
 | CODE-01 | Phase 44 | Pending |
 | PIDG-01 | Phase 40 | Complete |
-| AUTO-01 | Phase 45 | Pending |
-| AUTO-02 | Phase 45 | Pending |
+| AUTO-01 | Phase 45 | Complete |
+| AUTO-02 | Phase 45 | Complete |
 | DECN-01 | Phase 45 | Pending |
 | MAINT-01 | Phase 40 | Complete |
 
