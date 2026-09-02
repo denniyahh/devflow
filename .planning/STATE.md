@@ -31,6 +31,24 @@ Items acknowledged and deferred at milestone close on 2026-08-04:
 | debug | stale-blockers-gate-gsd-next | **resolved 2026-08-04** during gsd-hygiene's close — the STATE.md `## Blockers` fix was already live (`547a401`), and the coupled `complete`-verdict concern is now correctly resolved by Phase 32's own `## Progress` table fix. See `.planning/debug/resolved/stale-blockers-gate-gsd-next.md`. |
 | uat_gap | 24-UAT.md (Phase 24) | acknowledged — audit flagged it but the file's own frontmatter reads status:passed, 1/1 passed, 0 pending/issues/blocked; treated as an audit-tool false positive, skipped, will not revisit |
 
+Items acknowledged/deferred for the **v2.8.0 milestone close** (2026-09-02) — `audit-open` now
+reports all-clear with these suppressed:
+
+| Category | Item | Status | Deferred At | Milestone |
+|----------|------|--------|-------------|-----------|
+| uat_gap | 40-UAT.md (Phase 40) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
+| uat_gap | 41-UAT.md (Phase 41) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
+| uat_gap | 42-UAT.md (Phase 42) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | `**Status:** acknowledged` set in-file; carried v2.4.0 debt, needs a decision before any plan widens the constant | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.4.0-phases/34-…/deferred-items.md #2 — `embedded_commit_is_stale…` flake (pre-existing) | `**Status:** acknowledged` set in-file; pre-existing `PATH`/`ENV_MUTEX` race, fix identified not applied | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.3.0-phases/30-…/deferred-items.md #1 — `30a-evidence/raw_output*.jsonl` carry home path / OS username / session id | `**Status:** acknowledged` set in-file; low-but-real, no credential-shaped match; sanitiser exists | 2026-09-02 | v2.8.0 |
+| verification_override | 45-VERIFICATION.md — AUTO-01 live `devflow start --mode auto` end-to-end run | `PASSED (override)`, accepted by Dennis Kim; tracked as backlog 999.119 | 2026-09-02 | v2.8.0 |
+
+The two evidence tables inside the Phase 34 and Phase 30 entries were reformatted from GFM
+pipe-tables to bullet lists in the same edit — `audit-open`'s deferred-items scanner reads any
+`|`-prefixed line as a table row and was emitting each evidence row as its own phantom open item
+(8 fragments from 2 real entries). Content is unchanged; only the table syntax.
+
 ## Active Phase
 
 **Phase 44 — Codex End-to-End Verification — shipped.** CODE-01 satisfied: `devflow resume

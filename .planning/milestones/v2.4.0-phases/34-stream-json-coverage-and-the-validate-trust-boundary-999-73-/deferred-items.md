@@ -7,17 +7,19 @@ was measured and the control that makes the measurement mean something.
 
 ## 1. Widening `STREAM_JSON_STAGES` breaks 5 INTEGRATION tests (found by 34-06, blocks 34-05)
 
-**Status:** open — needs a decision before plan 34-05 widens the constant.
+**Status:** acknowledged
+
+_Deferred debt carried from the v2.4.0 close; re-acknowledged at the v2.8.0 milestone close (2026-09-02). Needs a decision before any plan widens the constant._
 
 Plan 34-06's acceptance is scoped to `cargo test -p devflow --bin devflow`, which
 is green under a full five-stage widening after 34-06's repairs. **That suite does
 not compile the integration tests.** `scripts/check.sh all` does, and under the
 same widening `crates/devflow-cli/tests/phase7_cli.rs` fails:
 
-| State | `phase7_cli` result | `check.sh all` exit |
-|---|---|---|
-| `STREAM_JSON_STAGES = &[Stage::Code]` (committed) | **17 passed; 0 failed** | **0** |
-| widened to all five `Stage` variants | **12 passed; 5 failed** | **101** |
+Measured (`phase7_cli` result / `check.sh all` exit):
+
+- `STREAM_JSON_STAGES = &[Stage::Code]` (committed) — **17 passed; 0 failed** / exit **0**
+- widened to all five `Stage` variants — **12 passed; 5 failed** / exit **101**
 
 Same tree, same commit, only the constant differs — so this is caused by the
 widening, not pre-existing. The unwidened row is the negative control; without it
@@ -63,7 +65,9 @@ is resolved first or explicitly budgeted for.
 
 ## 2. `embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir` is flaky (pre-existing)
 
-**Status:** open — pre-existing, unrelated to 34-06's change, not fixed.
+**Status:** acknowledged
+
+_Pre-existing flake, unrelated to 34-06's change; deferred debt re-acknowledged at the v2.8.0 milestone close (2026-09-02)._
 
 Observed failing 3 times across ~12 full-suite runs during 34-06, at both the
 widened and unwidened state, and passing in isolation
@@ -81,10 +85,10 @@ with a tempdir and then deletes that tempdir on drop, so the child can inherit a
 Reproduced directly, outside the suite, with a two-commit fixture repo and the
 test binary run in its inner mode:
 
-| Child `PATH` | Result |
-|---|---|
-| inherited/normal | `1 passed` |
-| a directory that does not exist | **`FAILED`, `left: Indeterminate, right: Stale`, `staleness.rs:1039`** |
+Reproduced with a two-commit fixture repo, test binary in inner mode:
+
+- child `PATH` inherited/normal — `1 passed` (control)
+- child `PATH` = a directory that does not exist — **`FAILED`, `left: Indeterminate, right: Stale`, `staleness.rs:1039`**
 
 The second row reproduces the observed flake's panic message and line number
 exactly; the first is the control that shows the harness is not simply broken.

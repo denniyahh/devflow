@@ -5,6 +5,10 @@ changes and therefore not auto-fixed, per the executor's scope-boundary rule.
 
 ## 1. The committed `30a-evidence/raw_output_v3.jsonl` carries an unredacted home path, OS username and session id
 
+**Status:** acknowledged
+
+_Low-but-real leak (no credential-shaped match); deferred debt carried from the v2.3.0 close, re-acknowledged at the v2.8.0 milestone close (2026-09-02)._
+
 **Found during:** 30-02 Task 1, while proving the new publish pipeline against a
 real capture rather than only a synthetic fixture.
 
@@ -24,11 +28,11 @@ every line carries the same real `session_id`
 events at lines 31 and 46 carry absolute `output_file` paths. **All three**
 archived captures were scanned and all three match the same three patterns:
 
-| Capture | Lines | Committed scan |
-|---------|-------|----------------|
-| `raw_output.jsonl` | 12 | `home_path`, `os_username`, `session_identifier` |
-| `raw_output_v2.jsonl` | 25 | `home_path`, `os_username`, `session_identifier` |
-| `raw_output_v3.jsonl` | 54 | `home_path`, `os_username`, `session_identifier` |
+All three archived captures match the same three patterns (`home_path`, `os_username`, `session_identifier`):
+
+- `raw_output.jsonl` — 12 lines
+- `raw_output_v2.jsonl` — 25 lines
+- `raw_output_v3.jsonl` — 54 lines
 
 **Why not fixed here:** 30-02's `files_modified` lists only the three 30c paths,
 and the plan carries an explicit scope fence. Rewriting a sibling unit's
