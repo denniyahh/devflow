@@ -636,6 +636,149 @@ mod tests {
         );
     }
 
+    /// AUTO-02 / T-45-09 + T-45-10: only this workspace's members and root
+    /// build inputs may make its own binary stale. The FALSE table carries
+    /// the safety cost of each miss: a false positive here hard-blocks an
+    /// unattended DevFlow run on source `cargo build` cannot reach.
+    #[test]
+    fn affects_compiled_binary_in_workspace_scope_accepts_only_members_and_root_build_files() {
+        for path in [
+            "crates/devflow-core/src/lib.rs",
+            "crates/devflow-cli/src/main.rs",
+            "crates/devflow-core/Cargo.toml",
+            "crates/devflow-cli/build.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "rust-toolchain.toml",
+        ] {
+            assert!(
+                affects_compiled_binary(path, true),
+                "workspace build input {path:?} must remain build-affecting, or a stale binary \\
+                 can report green against its own source"
+            );
+        }
+
+        for (path, cost) in [
+            (
+                ".planning/spikes/foo/Cargo.toml",
+                "a spike manifest false positive hard-blocks probe-only work",
+            ),
+            (
+                ".planning/spikes/foo/src/main.rs",
+                "a spike source false positive hard-blocks probe-only work",
+            ),
+            (
+                ".planning/45-PLAN.md",
+                "a planning-document false positive blocks an unattended phase",
+            ),
+            (
+                "vendor/crates/devflow-core/src/lib.rs",
+                "a vendored substring match blocks code outside this workspace",
+            ),
+            (
+                "crates-extras/foo/src/lib.rs",
+                "a near-prefix match blocks a non-member crate",
+            ),
+            (
+                "crates/../foo.rs",
+                "a parent-segment escape must not bypass the workspace boundary",
+            ),
+            (
+                "README.md",
+                "documentation must not make the binary appear stale",
+            ),
+            (
+                "CHANGELOG.md",
+                "release notes must not make the binary appear stale",
+            ),
+            (
+                "docs/guides/quickstart.md",
+                "guide edits must not hard-block a dogfood run",
+            ),
+            (
+                "scripts/hooks/pre-push",
+                "a hook outside Cargo members must not hard-block the run",
+            ),
+            (
+                "src/main.rs",
+                "the standard-Cargo-layout path is outside this workspace's members",
+            ),
+        ] {
+            assert!(
+                !affects_compiled_binary(path, true),
+                "{cost}: {path:?} must not classify as a workspace build input"
+            );
+        }
+
+        assert!(
+            affects_compiled_binary("crates/devflow-core/src/a..b.rs", true),
+            "a filename containing two dots is not a parent-directory segment; substring \\
+             matching would incorrectly discard a real workspace source file"
+        );
+    }
+
+    /// T-45-11: the scoped rule must not change what DevFlow reports for
+    /// downstream projects, whose conventional Cargo layout uses `src/`.
+    #[test]
+    fn affects_compiled_binary_unscoped_preserves_the_pre_phase_45_rule() {
+        for path in [
+            ".planning/spikes/foo/src/main.rs",
+            "vendor/crates/devflow-core/src/lib.rs",
+            "src/main.rs",
+            "crates/../foo.rs",
+        ] {
+            assert!(
+                affects_compiled_binary(path, false),
+                "the pre-Phase-45 unscoped rule must still classify {path:?} as build-affecting"
+            );
+        }
+
+        for path in [
+            ".planning/45-PLAN.md",
+            "README.md",
+            "docs/guides/quickstart.md",
+        ] {
+            assert!(
+                !affects_compiled_binary(path, false),
+                "the pre-Phase-45 unscoped rule must still ignore {path:?}"
+            );
+        }
+    }
+
+    /// 45-02 / REVIEWS finding 2: status normalization happens before the
+    /// build-input predicate, including the tracked/untracked distinction.
+    #[test]
+    fn porcelain_tracked_path_normalizes_status_bytes_renames_and_quotes() {
+        assert_eq!(
+            porcelain_tracked_path(" M crates/devflow-cli/src/main.rs"),
+            Some("crates/devflow-cli/src/main.rs")
+        );
+        assert_eq!(
+            porcelain_tracked_path("M  crates/devflow-cli/src/main.rs"),
+            Some("crates/devflow-cli/src/main.rs")
+        );
+        assert_eq!(
+            porcelain_tracked_path("R  old-name.rs -> crates/devflow-cli/src/main.rs"),
+            Some("crates/devflow-cli/src/main.rs"),
+            "renames must evaluate the destination, the path now present in the worktree"
+        );
+        assert_eq!(
+            porcelain_tracked_path(" M \"docs/a path.md\""),
+            Some("docs/a path.md")
+        );
+        assert_eq!(
+            porcelain_tracked_path("?? .planning/spikes/foo/src/main.rs"),
+            None,
+            "untracked files must remain outside the stale-build signal"
+        );
+        assert_eq!(
+            porcelain_tracked_path("M  "),
+            None,
+            "short porcelain lines must not be treated as tracked paths"
+        );
+    }
+
     /// WR-05: `"default-members"` contains `"members"`. A bare
     /// `contents.find("members")` locks onto that key's array instead, so the
     /// real member list is never scanned and the self-dogfood hard block
