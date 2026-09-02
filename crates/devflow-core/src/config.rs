@@ -201,6 +201,22 @@ pub fn load_config(project_root: &Path) -> DevflowConfig {
     }
 }
 
+/// The TOML parse error for `<project_root>/devflow.toml`, if the file both
+/// exists and fails to parse.
+///
+/// [`load_config`] deliberately swallows that error — every other key it
+/// carries is fail-soft. [`base_branch`] is not, so it needs the error back
+/// to honour its own fail-hard contract. Returns `None` for a missing file
+/// (no configuration is a valid state) and for an unreadable one (that is
+/// already `load_config`'s warn-and-default path, and is not evidence that a
+/// base branch was configured).
+fn config_parse_error(project_root: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(project_root.join("devflow.toml")).ok()?;
+    toml::from_str::<DevflowConfig>(&contents)
+        .err()
+        .map(|error| error.to_string())
+}
+
 /// Resolve capture retention with `DEVFLOW_CAPTURE_RETENTION` taking
 /// precedence over `devflow.toml` and the built-in default.
 pub fn capture_retention(project_root: &Path) -> usize {
@@ -374,6 +390,17 @@ pub fn base_branch(project_root: &Path) -> Result<ResolvedBaseBranch, String> {
                 source: BaseBranchSource::Env,
             });
     }
+    // The fail-hard contract above covers a *parseable* bad value only.
+    // `load_config` is fail-soft by design for every other key, so a
+    // `devflow.toml` that does not parse — an unterminated string, a stray
+    // bracket — hands back `DevflowConfig::default()`, whose `base_branch`
+    // is `None`. That is indistinguishable here from "no key configured",
+    // so the resolver would return the `Default`/`develop` arm with no
+    // error: exactly the silent trunk redirect this function's doc comment
+    // says it refuses, reached through the file rather than through the
+    // value. A configured base that cannot be read is refused, not guessed.
+    config_parse_error(project_root)
+        .map_or(Ok(()), |error| Err(format!("devflow.toml: {error}")))?;
     if let Some(value) = load_config(project_root).base_branch {
         return validate_base_branch(&value)
             .map_err(|reason| format!("devflow.toml `base_branch`: {reason}"))
@@ -434,10 +461,23 @@ pub fn git_flow_for_project(project_root: &Path) -> GitFlowConfig {
 /// `devflow-core`'s config layer stays independent of the state layer.
 pub fn git_flow_for_run(project_root: &Path, persisted_base: Option<&str>) -> GitFlowConfig {
     match persisted_base {
-        Some(base) => GitFlowConfig {
+        // `State` is a JSON file on disk, so the persisted value is not
+        // automatically the one `start` validated: a hand-edited or
+        // truncated `.devflow/state-NN.json` can carry anything. Re-checking
+        // it here keeps `start`'s production-branch refusal from being
+        // bypassable by editing state, and costs one string comparison on a
+        // path that already shells out to `git`.
+        Some(base) if validate_base_branch(base).is_ok() => GitFlowConfig {
             develop: base.to_string(),
             ..GitFlowConfig::default()
         },
+        Some(base) => {
+            tracing::warn!(
+                base,
+                "persisted base branch is not a usable trunk; re-resolving from configuration"
+            );
+            git_flow_for_project(project_root)
+        }
         None => git_flow_for_project(project_root),
     }
 }
@@ -826,6 +866,100 @@ mod tests {
         // simply echoes whatever it is handed.
         let ambient = git_flow_for_run(dir.path(), None);
         assert_eq!(ambient.develop, "workspace/from-file");
+    }
+
+    /// agy (external review, 2026-09-02): `base_branch`'s doc comment
+    /// promises it is FAIL-HARD on an explicitly supplied value, and that
+    /// promise held only for a value TOML could parse. A `devflow.toml` with
+    /// a syntax error fell into `load_config`'s warn-and-default path, whose
+    /// `base_branch: None` is indistinguishable here from "no key set" — so
+    /// the resolver returned the `Default`/`develop` arm and the operator's
+    /// configured trunk was silently substituted, which is exactly the hole
+    /// review round 2 closed for the value and left open for the file.
+    #[test]
+    fn base_branch_refuses_an_unparseable_config_rather_than_defaulting() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvOverride::clear("DEVFLOW_BASE_BRANCH");
+        // An unterminated string: the key is present and clearly intended,
+        // but the file does not parse.
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "base_branch = \"workspace/example\n",
+        )
+        .unwrap();
+
+        let err = base_branch(dir.path()).expect_err("an unparseable config must not fall back");
+        assert!(
+            err.contains("devflow.toml"),
+            "message must name the file the operator has to fix: {err}"
+        );
+
+        // NEGATIVE CONTROL 1: the same key in a file that DOES parse must
+        // still resolve. Without this the test also passes against a
+        // `base_branch` that refuses every configured value outright.
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "base_branch = \"workspace/example\"\n",
+        )
+        .unwrap();
+        let resolved = base_branch(dir.path()).expect("a parseable config still resolves");
+        assert_eq!(resolved.value, "workspace/example");
+        assert_eq!(resolved.source, BaseBranchSource::ConfigFile);
+
+        // NEGATIVE CONTROL 2: no file at all is still the infallible
+        // `Default` arm, not an error. Without this the test also passes
+        // against a `base_branch` that treats any unreadable file as fatal.
+        std::fs::remove_file(dir.path().join("devflow.toml")).unwrap();
+        let defaulted = base_branch(dir.path()).expect("a missing config is not an error");
+        assert_eq!(defaulted.value, DEVELOP);
+        assert_eq!(defaulted.source, BaseBranchSource::Default);
+    }
+
+    /// codex (external review, 2026-09-02, CR-45-02): `State` is a JSON file
+    /// on disk, so a persisted base is not automatically one `start`
+    /// validated. Trusting it verbatim made `start`'s production-branch
+    /// refusal bypassable by editing `.devflow/state-NN.json`, which then
+    /// merged the phase branch into `main`.
+    #[test]
+    fn git_flow_for_run_refuses_a_persisted_base_that_start_would_have_rejected() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvOverride::clear("DEVFLOW_BASE_BRANCH");
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "base_branch = \"workspace/from-file\"\n",
+        )
+        .unwrap();
+
+        // The production branch is what `validate_base_branch` exists to
+        // refuse, and the merge target is the consequence that matters.
+        let hijacked = git_flow_for_run(dir.path(), Some(MAIN));
+        assert_ne!(
+            hijacked.develop, MAIN,
+            "a persisted `main` must never become the merge target"
+        );
+        assert_eq!(
+            hijacked.develop, "workspace/from-file",
+            "a refused persisted base falls back to the resolver, not to a hardcoded trunk"
+        );
+
+        // A flag-shaped value is argument injection (T-45-03) and is
+        // refused on the same path.
+        assert_eq!(
+            git_flow_for_run(dir.path(), Some("--upload-pack=touch /tmp/pwn")).develop,
+            "workspace/from-file"
+        );
+
+        // NEGATIVE CONTROL: a LEGITIMATE persisted base must still win over
+        // ambient configuration. Without this half the test also passes
+        // against a `git_flow_for_run` that ignores the persisted value
+        // entirely — which would re-open CR-02, the defect the parameter
+        // was added to fix.
+        assert_eq!(
+            git_flow_for_run(dir.path(), Some("workspace/persisted")).develop,
+            "workspace/persisted"
+        );
     }
 
     #[test]

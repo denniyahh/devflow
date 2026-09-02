@@ -422,8 +422,21 @@ pub(crate) fn start(
     // main checkout's divergence there is unrelated to what's about to
     // happen and can either hard-fail on a stale unrelated branch or
     // silently no-op if the main checkout happens to be on develop.
+    // CR-45-03: `for_project` reads `devflow.toml` / the environment AGAIN,
+    // which is a second resolution of a value this function already resolved
+    // fail-hard at the top and persisted onto `State`. The two can disagree
+    // — `git_flow_for_project` falls SOFT to `develop` where `base_branch`
+    // fails hard — and the message below interpolates `{base}` from the first
+    // resolution while the number came from the second, so an operator could
+    // be told how far behind `workspace/x` they are from a count taken
+    // against `develop`. One resolution, reused.
+    let resolved_git_flow = devflow_core::config::GitFlowConfig {
+        develop: resolved_base.value.clone(),
+        ..devflow_core::config::GitFlowConfig::default()
+    };
     if !worktree
-        && let Ok((_ahead, behind)) = GitFlow::for_project(project_root).divergence_from_develop()
+        && let Ok((_ahead, behind)) =
+            GitFlow::with_config(project_root, resolved_git_flow.clone()).divergence_from_develop()
     {
         if behind > 50 {
             return Err(CliError::Message(format!(
@@ -448,8 +461,10 @@ pub(crate) fn start(
         // Review round 2 (F3): `GitFlow::new` hardcodes the default trunk,
         // so this arm validated the configured base, checked its currency and
         // reachability, printed a note naming it — and then forked from
-        // `develop` anyway. `for_project` makes both fork paths agree.
-        let git = GitFlow::for_project(project_root);
+        // `develop` anyway. Both fork paths now agree, and (CR-45-03) they
+        // agree on the value resolved ONCE above and persisted onto `State`,
+        // not on a fresh read that can differ from it.
+        let git = GitFlow::with_config(project_root, resolved_git_flow.clone());
         let result = if force {
             git.feature_start_force(phase)
         } else {

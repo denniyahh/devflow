@@ -640,14 +640,25 @@ pub(crate) fn preflight_interactivity_check(
     match driver.interactivity_mode(state.stage) {
         InteractivityMode::HeadlessSafe => Ok(()),
         InteractivityMode::RequiresExistingArtifact => {
-            // The base is resolved per project (45-01 / D-01). This probe is
-            // a fail-open advisory: on the resolver's `Err` it falls back to
-            // the default trunk rather than propagating, because
+            // The base is resolved per project (45-01 / D-01), but the run's
+            // OWN base is the one that matters: `DEVFLOW_BASE_BRANCH` lives
+            // in the environment of whichever shell ran `devflow start`, and
+            // a `devflow resume` from a fresh shell re-enters here without
+            // it. Re-resolving from ambient configuration would then probe
+            // `develop` for a `-CONTEXT.md` that only ever existed on the
+            // configured base, and refuse a valid run as unrunnable
+            // (CR-45-01). `State::base_branch` is what `start` recorded, so
+            // prefer it and fall back to the resolver only when absent.
+            //
+            // Still a fail-open advisory on the resolver's `Err`: it falls
+            // back to the default trunk rather than propagating, because
             // `commands::start` already refuses on that same `Err` before any
             // run reaches here.
-            let base = devflow_core::config::base_branch(project_root)
-                .map(|resolved| resolved.value)
-                .unwrap_or_else(|_| devflow_core::config::DEVELOP.to_string());
+            let base = state.base_branch.clone().unwrap_or_else(|| {
+                devflow_core::config::base_branch(project_root)
+                    .map(|resolved| resolved.value)
+                    .unwrap_or_else(|_| devflow_core::config::DEVELOP.to_string())
+            });
             if state.mode == Mode::Auto
                 && state.stage == Stage::Define
                 && !phase_artifact_on_base(project_root, state.phase, "-CONTEXT.md", &base)
@@ -1465,6 +1476,85 @@ mod tests {
 
         state.stage = Stage::Define;
         assert!(preflight_interactivity_check(root, &state).is_ok());
+    }
+
+    /// codex (external review, 2026-09-02, CR-45-01): this check re-resolved
+    /// the base from AMBIENT configuration while holding the `State` that
+    /// records the run's OWN base. `DEVFLOW_BASE_BRANCH` lives in the
+    /// environment of whichever shell ran `devflow start`, so the documented
+    /// `devflow resume` recovery — from a fresh shell, without the export —
+    /// probed `develop` for a `-CONTEXT.md` that only ever existed on the
+    /// configured base, and refused a perfectly valid run as unrunnable with
+    /// no way forward.
+    #[test]
+    fn preflight_interactivity_check_probes_the_runs_persisted_base() {
+        let _guard = env_lock();
+        // The defect only reproduces when the environment does NOT carry the
+        // variable, which is the whole point: that is the resumed-shell case.
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe { std::env::remove_var("DEVFLOW_BASE_BRANCH") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+
+        // CONTEXT.md exists ONLY on the planning branch — the shape 999.110
+        // describes, and the reason a configurable base exists at all.
+        git(&["checkout", "-q", "-b", "workspace/example"]);
+        std::fs::create_dir_all(root.join(".planning/phases/60-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/60-widget/60-CONTEXT.md"), "ctx").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "context on the planning branch"]);
+        git(&["checkout", "-q", "develop"]);
+
+        let mut state = State::new(
+            PhaseId::new(60),
+            AgentKind::Codex,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Define;
+
+        // NEGATIVE CONTROL, asserted FIRST so the positive case cannot be
+        // satisfied by a check that passes unconditionally: with nothing
+        // persisted the resolver falls to `develop`, which genuinely has no
+        // CONTEXT.md, and the run is refused.
+        assert!(
+            state.base_branch.is_none(),
+            "fixture precondition: no base persisted yet"
+        );
+        let refused = preflight_interactivity_check(root, &state)
+            .expect_err("develop has no CONTEXT.md — this must still be refused");
+        assert!(
+            refused.contains("develop"),
+            "the refusal must name the branch it probed: {refused}"
+        );
+
+        // The run recorded its base at `start`. Nothing else changes.
+        state.base_branch = Some("workspace/example".to_string());
+        assert!(
+            preflight_interactivity_check(root, &state).is_ok(),
+            "the run's own base carries CONTEXT.md; the check must probe THAT branch"
+        );
+
+        // A persisted base that genuinely lacks the artifact is still
+        // refused — the fix must not have turned the probe into a no-op.
+        state.base_branch = Some("main".to_string());
+        assert!(
+            preflight_interactivity_check(root, &state).is_err(),
+            "a persisted base without CONTEXT.md must still be refused"
+        );
     }
 
     /// D-14 gh-auth scope: hardcoded to Stage::Ship, not a dynamic hook-scan.

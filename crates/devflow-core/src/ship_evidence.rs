@@ -150,20 +150,22 @@ pub fn collect(project_root: &Path, phase: PhaseId) -> ShipEvidence {
         .and_then(|reason| reason.as_str())
         .map(str::to_owned);
 
-    let (stage, state_present) = match workflow::load_state(project_root, phase) {
-        Ok(state) => (Some(state.stage), true),
-        Err(_) => (None, false),
+    let (stage, state_present, persisted_base) = match workflow::load_state(project_root, phase) {
+        Ok(state) => (Some(state.stage), true, state.base_branch),
+        Err(_) => (None, false, None),
     };
 
-    // Project-resolved (45-01): `is_merged_into_develop` below asks whether
-    // the phase branch is an ancestor of the TRUNK, and against a mismatched
-    // trunk that answer is confidently wrong.
-    let git = GitFlow::for_project(project_root);
-    let branch = format!(
-        "{}phase-{}",
-        crate::config::git_flow_for_project(project_root).feature_prefix,
-        phase.padded()
-    );
+    // Run-resolved (45-01; CR-45-06's class): `is_merged_into_develop` below
+    // asks whether the phase branch is an ancestor of the TRUNK, and against
+    // a mismatched trunk that answer is confidently wrong. `for_project`
+    // re-resolves from AMBIENT configuration, so a `devflow resume` from a
+    // shell without `DEVFLOW_BASE_BRANCH` reported "merged" against
+    // `develop` for a run based elsewhere — a false negative in the evidence
+    // record that gates Ship. The state was already loaded directly above,
+    // so the run's own base costs nothing extra to honour.
+    let git_flow = crate::config::git_flow_for_run(project_root, persisted_base.as_deref());
+    let git = GitFlow::with_config(project_root, git_flow.clone());
+    let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
     let feature_branch_exists = git.branch_exists(&branch);
     let merged_into_develop = git.is_merged_into_develop(phase);
     let has_remote = git.has_remote();
@@ -215,6 +217,77 @@ mod tests {
         git(&["commit", "-q", "-m", "init"]);
         git(&["branch", "-M", "main"]);
         git(&["checkout", "-q", "-b", "develop"]);
+    }
+
+    /// Found while verifying codex's CR-45-06 (external review, 2026-09-02):
+    /// the same class, at a site codex did not enumerate. `collect` already
+    /// loads the run's `State` — for `stage` — and then threw the base away
+    /// and re-resolved from AMBIENT configuration. `is_merged_into_develop`
+    /// asks whether the phase branch is an ancestor of the TRUNK, so after a
+    /// `devflow resume` from a shell without `DEVFLOW_BASE_BRANCH` this
+    /// reported "not merged" for a phase that had merged perfectly well into
+    /// its own base — a false negative in the record that gates Ship.
+    #[test]
+    fn collect_resolves_merge_evidence_against_the_runs_persisted_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let git = |args: &[&str]| {
+            let ok = crate::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        assert!(
+            std::env::var("DEVFLOW_BASE_BRANCH")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "DEVFLOW_BASE_BRANCH is exported — it outranks the ambient default"
+        );
+
+        // The phase merged into its planning base. `develop` never saw it.
+        git(&["checkout", "-q", "-b", "workspace/example"]);
+        git(&["checkout", "-q", "-b", "feature/phase-42"]);
+        std::fs::write(root.join("work.txt"), "work\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "agent work"]);
+        git(&["checkout", "-q", "workspace/example"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "merge phase 42",
+            "feature/phase-42",
+        ]);
+
+        let mut state = crate::state::State::new(
+            PhaseId::new(42),
+            crate::state::AgentKind::Claude,
+            crate::mode::Mode::Auto,
+            root.to_path_buf(),
+        );
+        crate::workflow::save_state(&state).expect("save state");
+
+        // NEGATIVE CONTROL, asserted FIRST: with no base persisted the
+        // ambient trunk is `develop`, into which nothing was merged. This is
+        // the wrong answer the defect produced, and pinning it here is what
+        // stops the assertion below from passing against a `collect` that
+        // reports `merged_into_develop` unconditionally.
+        assert!(
+            !collect(root, PhaseId::new(42)).merged_into_develop,
+            "against develop the phase genuinely is not merged"
+        );
+
+        state.base_branch = Some("workspace/example".to_string());
+        crate::workflow::save_state(&state).expect("save state");
+        assert!(
+            collect(root, PhaseId::new(42)).merged_into_develop,
+            "the phase merged into the run's OWN base; evidence must resolve against that"
+        );
     }
 
     /// The blocker's regression guard: a phase halted by `transition`'s

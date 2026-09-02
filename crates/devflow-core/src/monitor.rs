@@ -1256,7 +1256,25 @@ fn enumerate_phase_commits(
     workdir: &Path,
     phase: PhaseId,
 ) -> (Vec<IdleTimeoutCommit>, Option<String>) {
-    let git_flow = crate::config::git_flow_for_project(project_root);
+    // CR-45-06: `git_flow_for_project` re-resolves from AMBIENT
+    // configuration, and `DEVFLOW_BASE_BRANCH` lives in the environment of
+    // whichever shell ran `devflow start`. A monitor re-launched by
+    // `devflow resume` from a clean shell therefore ranged from `develop`
+    // against a run based on something else — over- or under-reporting the
+    // phase's commits in the record that IS the operator's timeout evidence.
+    // Round 2's fix made this resolve from `project_root` rather than
+    // `workdir`, which is a different bug and left this one open.
+    //
+    // The state file is the same source of truth `git_flow_for_run` reads;
+    // consulting it here rather than threading a base through
+    // `run_pipe_owning_monitor`'s public signature keeps the fix local to
+    // the site that needs it. A missing or unreadable state degrades to the
+    // ambient resolution — the pre-existing behaviour, never an abort,
+    // because losing the verdict is worse than losing the commit names.
+    let persisted_base = crate::workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|state| state.base_branch);
+    let git_flow = crate::config::git_flow_for_run(project_root, persisted_base.as_deref());
     let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
     let range = format!("{}..{branch}", git_flow.develop);
 
@@ -1495,6 +1513,69 @@ mod tests {
         std::fs::write(root.join("agent-work.txt"), "x").unwrap();
         commit_range_git(root, &["add", "-A"]);
         commit_range_git(root, &["commit", "-q", "-m", "agent-work commit"]);
+    }
+
+    /// codex (external review, 2026-09-02, CR-45-06): this enumeration read
+    /// AMBIENT configuration, and `DEVFLOW_BASE_BRANCH` lives in the
+    /// environment of whichever shell ran `devflow start`. A monitor
+    /// re-launched by `devflow resume` from a clean shell therefore ranged
+    /// from `develop` against a run based elsewhere, and this list IS the
+    /// operator's idle-timeout evidence — the false-evidence shape the
+    /// never-silent commit gate depends on not producing. Round 2's fix
+    /// (resolve from `project_root`, not `workdir`) is a different bug and
+    /// left this one open.
+    #[test]
+    fn enumerate_phase_commits_prefers_the_runs_persisted_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        idle_commit_fixture(root);
+        // No `devflow.toml` and no environment variable: ambient resolution
+        // yields `develop`, which is precisely the resumed-shell case.
+        assert!(
+            std::env::var("DEVFLOW_BASE_BRANCH")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "DEVFLOW_BASE_BRANCH is exported — it outranks the ambient default"
+        );
+
+        let subjects = |root: &Path| -> Vec<String> {
+            let (commits, note) = enumerate_phase_commits(root, root, PhaseId::new(4));
+            assert!(note.is_none(), "enumeration must not degrade: {note:?}");
+            commits.into_iter().map(|c| c.subject).collect()
+        };
+
+        // NEGATIVE CONTROL, asserted FIRST: with no state on disk the
+        // enumeration falls back to ambient resolution and over-reports —
+        // `base-only commit` belongs to the base, not to the agent. This is
+        // the bug, and it pins that the assertion below is measuring the
+        // persisted base rather than passing for any reason at all.
+        let ambient = subjects(root);
+        assert!(
+            ambient.iter().any(|s| s == "base-only commit"),
+            "without persisted state the range runs from develop and includes base commits: \
+             {ambient:?}"
+        );
+
+        // The run recorded its base at `start`.
+        let mut state = crate::state::State::new(
+            PhaseId::new(4),
+            crate::state::AgentKind::Claude,
+            crate::mode::Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.base_branch = Some("workspace/example".to_string());
+        crate::workflow::save_state(&state).expect("save state");
+
+        let persisted = subjects(root);
+        assert!(
+            persisted.iter().any(|s| s == "agent-work commit"),
+            "a commit reachable only from the feature branch must be listed: {persisted:?}"
+        );
+        assert!(
+            !persisted.iter().any(|s| s == "base-only commit"),
+            "a commit already on the run's own base must NOT be reported as agent work: \
+             {persisted:?}"
+        );
     }
 
     #[test]
