@@ -66,7 +66,7 @@ fi
 # Warn when a "how this repo is set up" file changes without the portability
 # checklist moving too.
 #
-# .planning/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
+# .planning/user/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
 # replicated elsewhere; it goes stale the same silent way STATE.md does above
 # — nothing else reads it, so drift is invisible until someone tries to
 # actually follow it on a new machine. Unlike the SUMMARY.md signal above,
@@ -80,14 +80,26 @@ fi
 setup_changed=$(printf '%s\n' "$changed" | grep -E \
   '^(\.gitconfig|CONTRIBUTING\.md|rust-toolchain\.toml|\.planning/config\.json)$|^scripts/hooks/|^\.github/(workflows/|PULL_REQUEST_TEMPLATE\.md|ISSUE_TEMPLATE/)|^\.devcontainer/|^scripts/(check\.sh|check-in-container\.sh|assert-image-parity\.sh)$' \
   || true)
-checklist_changed=$(printf '%s\n' "$changed" | grep -Fx '.planning/DEV-SETUP-CHECKLIST.md' || true)
+# Single source of truth for the checklist location. If the file moves again, change
+# this one value — and the existence guard below turns a wrong value into a loud
+# failure rather than a check that can never pass (the state it was in from the
+# move to .planning/user/ until 2026-09-02).
+checklist_path='.planning/user/DEV-SETUP-CHECKLIST.md'
+checklist_changed=$(printf '%s\n' "$changed" | grep -Fx "$checklist_path" || true)
 
-if [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
+if [ -n "$setup_changed" ] && [ ! -f "$root/$checklist_path" ]; then
+  # Fail loudly: a missing checklist means this check cannot discriminate at all.
+  {
+    printf '\n\033[33m── post-commit: checklist not found at %s ──\033[0m\n' "$checklist_path"
+    printf 'The dev-setup staleness check cannot run. If the checklist moved, update\n'
+    printf 'checklist_path in scripts/hooks/post-commit and the path in CLAUDE.md.\n\n'
+  } >&2
+elif [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
   {
     printf '\n\033[33m── DEV-SETUP-CHECKLIST.md may now be stale ──\033[0m\n'
     printf 'This commit touched setup file(s) but not the checklist:\n'
     printf '  %s\n' $setup_changed
-    printf 'Review .planning/DEV-SETUP-CHECKLIST.md and update it if this changes what a fresh replication needs.\n\n'
+    printf 'Review %s and update it if this changes what a fresh replication needs.\n\n' "$checklist_path"
   } >&2
 fi
 

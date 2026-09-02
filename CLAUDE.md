@@ -140,7 +140,7 @@ root-cause history.
 
 ## Keep DEV-SETUP-CHECKLIST.md in sync
 
-`.planning/DEV-SETUP-CHECKLIST.md` exists so this repo's dev setup — git policy, hooks, CI,
+`.planning/user/DEV-SETUP-CHECKLIST.md` exists so this repo's dev setup — git policy, hooks, CI,
 devcontainer/toolchain pins, GSD config — can be replicated on another project. When a commit
 touches any of those, update the checklist in the **same commit**, not as an afterthought.
 

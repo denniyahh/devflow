@@ -86,6 +86,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit`: warns (never auto-edits) when a `*-SUMMARY.md`
   lands but `STATE.md`'s authored prose wasn't updated to match; also self-heals the
   `UPSTREAM-GSD-ISSUES.md` symlink (§8) if `git clean -fdx` deleted it.
+- [ ] **[PROJECT]** `scripts/hooks/post-commit` also warns when a dev-setup file changes without
+  this checklist moving too. Its path lives in one variable, `checklist_path`, at the top of that
+  block — **if this file ever moves again, change that variable**. From the move into
+  `.planning/user/` until 2026-09-02 the hook still matched the old `.planning/` path, so the
+  check could never pass: it warned on every setup commit even when the checklist *was* updated,
+  and no input could silence it. A guard now fails loudly when `checklist_path` names a file that
+  does not exist, so the next move surfaces immediately instead of degrading to noise.
 - [ ] **[GLOBAL]** Machine-wide `core.hooksPath` at `~/.config/git/hooks/pre-commit` runs
   **gitleaks** (`gitleaks protect --staged --verbose`, brew-installed, v8.30.1) on every commit
   across every repo, then chains to the repo-local hook if one exists. This is what the
