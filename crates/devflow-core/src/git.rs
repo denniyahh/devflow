@@ -342,7 +342,21 @@ impl GitFlow {
     /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
-        let protected = [self.config.main.as_str(), self.config.develop.as_str()];
+        // CR-01 (45-REVIEW.md): the configured trunk cannot be the SOLE
+        // source of the protected set. Once `config.develop` became the
+        // project's configured base (45-01), a base such as
+        // `workspace/denniyahh` dropped the literal `develop` out of
+        // protection while the `--merged` baseline above still listed it —
+        // a planning branch kept ahead of `develop` has `develop` as an
+        // ancestor — and the `-D` below then force-deleted it. The built-in
+        // trunk constants stay protected no matter what the trunk resolves
+        // to; a sweep must never be able to remove them.
+        let protected = [
+            self.config.main.as_str(),
+            self.config.develop.as_str(),
+            crate::config::MAIN,
+            crate::config::DEVELOP,
+        ];
         let mut deleted = Vec::new();
         for line in output.lines() {
             // git's porcelain marker is an exact two-char prefix ("* " for
@@ -1205,6 +1219,59 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    /// CR-01 (45-REVIEW.md): 45-01 moved `commands::cleanup` onto
+    /// `GitFlow::for_project`, which makes `config.develop` the CONFIGURED
+    /// base. `cleanup_merged` used that one value for two different jobs —
+    /// the `--merged` baseline AND the protected set — so a configured base
+    /// simultaneously dropped `develop` out of protection and listed it as
+    /// merged (a planning branch kept ahead of `develop` has `develop` as an
+    /// ancestor). Deletion is `-D`, so being unmerged was no barrier either.
+    ///
+    /// The built-in trunk constants must stay protected regardless of what
+    /// the trunk is configured to.
+    #[test]
+    fn cleanup_merged_never_sweeps_the_builtin_trunks_under_a_configured_base() {
+        let repo = init_repo();
+        let root = repo.path();
+
+        // The motivating shape: a personal planning branch one commit ahead
+        // of `develop`, so `develop` is an ancestor and `--merged` lists it.
+        git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        commit_file(root, "planning-only.txt");
+        // An ordinary merged branch off the configured base.
+        git(root, &["branch", "stale-merged"]);
+
+        let configured = GitFlow::with_config(
+            root,
+            GitFlowConfig {
+                develop: "workspace/example".to_string(),
+                ..GitFlowConfig::default()
+            },
+        );
+        let deleted = configured.cleanup_merged().expect("cleanup");
+
+        assert!(
+            !deleted.contains(&crate::config::DEVELOP.to_string()),
+            "the built-in develop must never be swept, whatever the trunk is configured to"
+        );
+        assert!(
+            configured.branch_exists(crate::config::DEVELOP),
+            "develop must still exist on disk after a sweep under a configured base"
+        );
+        assert!(
+            configured.branch_exists(crate::config::MAIN),
+            "main must still exist on disk after a sweep under a configured base"
+        );
+
+        // NEGATIVE CONTROL: without this half the test passes against a
+        // `cleanup_merged` that deletes nothing at all — which is the other
+        // way to make the assertions above true.
+        assert!(
+            deleted.contains(&"stale-merged".to_string()),
+            "an ordinary merged branch must still be swept"
+        );
     }
 
     /// WR-04 (13-REVIEW.md): `cleanup_merged` must compute "merged" relative
