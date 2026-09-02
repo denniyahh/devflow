@@ -116,11 +116,38 @@ pub struct BranchInfo {
 impl GitFlow {
     /// Create a git-flow helper for a project root, using the hardcoded
     /// git-flow constants (`main`, `develop`, `feature/`).
+    ///
+    /// Behaviourally unchanged since before 45-01, deliberately: library
+    /// callers with no project context keep the defaults. When the caller
+    /// DOES have a project root and the operation touches the trunk, prefer
+    /// [`Self::for_project`], which resolves `develop` from the project's
+    /// `base_branch` configuration (D-01 / AUTO-01). This constructor is
+    /// still correct for trunk-irrelevant work such as `commit_path`.
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
             config: GitFlowConfig::default(),
         }
+    }
+
+    /// Create a git-flow helper with an explicitly supplied branch model.
+    ///
+    /// The constructor the hooks use, so `HookContext.git_flow` reaches every
+    /// git operation inside a hook instead of being silently re-defaulted.
+    pub fn with_config(root: impl AsRef<Path>, config: GitFlowConfig) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+            config,
+        }
+    }
+
+    /// Create a git-flow helper whose trunk is resolved from the project's
+    /// configuration (`base_branch` / `DEVFLOW_BASE_BRANCH`), falling back to
+    /// the built-in constants when nothing is configured.
+    pub fn for_project(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        let config = crate::config::git_flow_for_project(root);
+        Self::with_config(root, config)
     }
 
     /// Create a feature branch from the develop branch.
@@ -820,6 +847,50 @@ mod tests {
 
     fn flow(root: &Path) -> GitFlow {
         GitFlow::new(root)
+    }
+
+    /// 45-01 / D-01: `with_config` is what makes the trunk configurable.
+    /// `new` keeps the hardcoded constants for library callers with no
+    /// project context, so the two constructors must give DIFFERENT answers
+    /// on the same repository — that difference is the whole test.
+    #[test]
+    fn with_config_uses_the_supplied_develop_not_the_default() {
+        let repo = init_repo();
+        let root = repo.path();
+
+        // A third branch off `develop` carrying a file `develop` never sees.
+        git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        commit_file(root, "planning-only.txt");
+        git(root, &["checkout", "-q", "develop"]);
+
+        let configured = GitFlow::with_config(
+            root,
+            GitFlowConfig {
+                develop: "workspace/example".to_string(),
+                ..GitFlowConfig::default()
+            },
+        );
+        configured
+            .feature_start(PhaseId::new(7))
+            .expect("feature_start off the configured base");
+        assert!(
+            root.join("planning-only.txt").exists(),
+            "a branch forked via with_config must descend from the supplied develop"
+        );
+
+        // NEGATIVE CONTROL: the same operation through `GitFlow::new` on the
+        // same repository resolves against `develop`, where the file is
+        // absent. Without this half the test passes against a constructor
+        // that ignored its argument and happened to be pointed at a repo
+        // where both branches carry the file.
+        git(root, &["checkout", "-q", "develop"]);
+        flow(root)
+            .feature_start(PhaseId::new(8))
+            .expect("feature_start off the default develop");
+        assert!(
+            !root.join("planning-only.txt").exists(),
+            "GitFlow::new must still fork from the hardcoded develop"
+        );
     }
 
     #[test]
