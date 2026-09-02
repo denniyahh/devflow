@@ -31,7 +31,7 @@ phase.
 
 ### Antigravity Dogfood + Cadence (Phase 42)
 
-- [ ] **ANTG-04**: Antigravity is dogfooded through a real supervised phase run
+- [x] **ANTG-04**: Antigravity is dogfooded through a real supervised phase run
   (`devflow start --agent antigravity --phase N --mode supervise`), which unlocks `--mode auto`
   (C2 preflight gate). During the run, event cadence is measured: the real quiet-gap distribution
   is compared against the 120s idle-timeout default (`idle_timeout_setting_for` /
@@ -118,7 +118,7 @@ Which phases cover which requirements. Filled during roadmap creation.
 | ANTG-03 | Phase 41 | Complete |
 | HYG-01 | Phase 41 | Complete |
 | HYG-02 | Phase 41 | Complete |
-| ANTG-04 | Phase 42 | Pending |
+| ANTG-04 | Phase 42 | Complete |
 | HRMS-01 | Phase 42 | Pending |
 | HRMS-02 | Phase 42 | Pending |
 | HRMS-03 | Phase 42 | Pending |

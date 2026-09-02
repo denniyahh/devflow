@@ -64,6 +64,15 @@ specifically to the main-checkout case.
 - **A branch workflow run list (`gh run list`) does not establish PR check status (`gh pr checks`).**
   Workflow runs can pass on older commits while the PR's current HEAD commit has zero reported checks (e.g. if an intermediate metadata or doc commit was pushed with `[ci skip]`, or if checks are pending/untriggered). Never report that a PR is green or CI has passed without asserting directly on `gh pr checks <PR>` against the current `HEAD_SHA`.
 
+- **`rg -c <pat> | rg '^0$'` is a constant-fail, not a zero-check.** `rg -c` prints *nothing*
+  and exits 1 when a pattern has zero matches, so the downstream `rg '^0$'` never gets an input
+  line. Verified both directions: a green suite and a red suite both exit 1 — the check never
+  discriminated at all. Codex caught this during Phase 44's own review
+  (`44-.../review_codex_terra.md:114`), Phase 44 wrote it up in `44-CODEX-E2E.md` and
+  `44-04-SUMMARY.md`, and the phase still closed `status: passed` with the dead command left in
+  `44-01`..`44-04` and `43-02`. Documenting a broken gate is not fixing it. Print the count and
+  the command's own exit code on separate lines and assert on those.
+
 ## Prefer GSD commands over doing it by hand
 
 When a GSD command covers the task, **use it** — `/gsd:phase` to add or edit a phase,
