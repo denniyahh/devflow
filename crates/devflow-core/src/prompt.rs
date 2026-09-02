@@ -690,6 +690,75 @@ mod tests {
         assert!(!prompt.contains("request_user_input"));
     }
 
+    #[test]
+    fn code_policy_is_identical_across_both_renderers() {
+        let phase = PhaseId::new(45);
+        let claude_prompt = stage_prompt(Stage::Code, phase);
+        let workflow_prompt = render_workflow_style(
+            &StageIntent::Code { phase, fix: None },
+            "/workflows",
+        );
+
+        assert!(
+            claude_prompt.contains(CODE_STAGE_POLICY),
+            "the Claude/OpenCode Code prompt must deliver the shared policy"
+        );
+        assert!(
+            workflow_prompt.contains(CODE_STAGE_POLICY),
+            "the Codex/Pi Code prompt must deliver the shared policy"
+        );
+    }
+
+    #[test]
+    fn code_policy_is_absent_from_prompts_that_must_not_carry_it() {
+        let phase = PhaseId::new(45);
+        let gaps_only = render_workflow_style(
+            &StageIntent::Code {
+                phase,
+                fix: Some(FixType::GapsOnly),
+            },
+            "/workflows",
+        );
+        let audit_fix = render_workflow_style(
+            &StageIntent::Code {
+                phase,
+                fix: Some(FixType::AuditFix),
+            },
+            "/workflows",
+        );
+
+        for prompt in [
+            stage_prompt(Stage::Validate, phase),
+            stage_prompt(Stage::Ship, phase),
+            gaps_only,
+            audit_fix,
+        ] {
+            assert!(
+                !prompt.contains(CODE_STAGE_POLICY),
+                "only full-execute Code prompts may carry the shared policy"
+            );
+        }
+    }
+
+    #[test]
+    fn both_code_prompts_still_end_with_the_completion_protocol() {
+        let phase = PhaseId::new(45);
+        let claude_prompt = stage_prompt(Stage::Code, phase);
+        let workflow_prompt = render_workflow_style(
+            &StageIntent::Code { phase, fix: None },
+            "/workflows",
+        );
+
+        assert!(
+            claude_prompt.ends_with(COMPLETION_PROTOCOL),
+            "the Claude/OpenCode Code prompt must keep the completion protocol last"
+        );
+        assert!(
+            workflow_prompt.ends_with(COMPLETION_PROTOCOL),
+            "the Codex/Pi Code prompt must keep the completion protocol last"
+        );
+    }
+
     /// 13-06 dogfood regression (Codex leg), Plan half only after the D-14
     /// split: GSD's plan-phase demands an interactive decision when PLAN.md
     /// already exists, which headless Codex can never answer — Plan must
