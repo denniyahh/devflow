@@ -112,6 +112,33 @@ commits from that accident, the same reason `devflow start` creates one. The onl
 be scripted is the branch name when a phase is renumbered (e.g. 36 → 35.3) — confirm the branch
 name against `ROADMAP.md`'s current `### Phase N:` heading before running the command.
 
+## Sync `workspace/denniyahh` before starting a new phase's branch
+
+Before creating a new phase's branch or worktree (the step above), first bring the personal
+tracking branch current with `develop`:
+
+```bash
+git checkout workspace/denniyahh
+scripts/sync-workspace.sh
+```
+
+Reason: a phase branch's fork point is computed relative to `workspace/denniyahh`, not raw
+`develop` — `scripts/cut-pr-branch.sh`'s own default (`WORKSPACE_BASE=workspace/denniyahh`) does
+this deliberately, because `workspace/denniyahh` carries `.planning/` and personal tooling that a
+raw `develop` fork wouldn't. If `workspace/denniyahh` hasn't synced recently, that merge-base sits
+however many commits behind `develop`'s actual tip the last sync left it — and every one of those
+commits rides along inside the new phase branch's own history, indistinguishable from the phase's
+own work until something tries to separate them again.
+
+Phase 45 hit this for real (2026-09-02): the last `sync-workspace.sh` run was 2026-08-28, so by
+the time the phase branch was cut five days later, cutting a clean PR from it required manually
+excluding two pre-phase-45 commits — genuinely already-superseded content whose diffs no longer
+applied cleanly to `develop`'s independently-evolved `.gitignore` and hook scripts — plus an
+unrelated `graphify-out/` exclusion the cutting script doesn't know about. Every one of those was
+individually verifiable as safe to drop, but none of it should have been reachable from the phase
+branch in the first place. Running the sync first removes the condition that produces this class
+of problem, rather than requiring it be diagnosed and unwound after the fact.
+
 ## Keep the active milestone's phase headings inside its own window
 
 `gsd-tools`' milestone-scoped parsers (`roadmap.analyze`'s `extractCurrentMilestone`,
