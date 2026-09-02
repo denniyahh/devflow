@@ -708,18 +708,77 @@ mod tests {
         ] {
             assert!(prompt.contains(angle), "Code prompt missing angle: {angle}");
         }
+        assert!(
+            prompt.contains("Unattended decision checkpoints"),
+            "Code prompt must carry the unattended decision policy"
+        );
         assert!(!prompt.contains("AskUserQuestion"));
         assert!(!prompt.contains("request_user_input"));
+    }
+
+    // These tests prove policy delivery in the rendered prompt, not model compliance.
+    // They also do not modify the GSD workflow file, whose decision branch remains positional.
+
+    #[test]
+    fn code_policy_forbids_positional_option_selection() {
+        let code_prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
+        let validate_prompt = stage_prompt(Stage::Validate, PhaseId::new(45)).to_lowercase();
+        let code_has_positional_policy = code_prompt.contains("do not choose")
+            && code_prompt.contains("first option")
+            && code_prompt.contains("merit");
+        let validate_has_positional_policy = validate_prompt.contains("do not choose")
+            && validate_prompt.contains("first option")
+            && validate_prompt.contains("merit");
+
+        assert!(
+            code_has_positional_policy,
+            "the policy must explicitly contradict GSD's first-option procedure; otherwise it \
+             adds nothing"
+        );
+        assert!(
+            !validate_has_positional_policy,
+            "the negative control must not find the Code policy on an unrelated prompt"
+        );
+    }
+
+    #[test]
+    fn code_policy_requires_the_reasoning_to_be_recorded() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
+        assert!(
+            prompt.contains("record") && prompt.contains("reasoning"),
+            "the final message is the only record of what was decided, so the policy must \
+             require recorded reasoning"
+        );
+    }
+
+    #[test]
+    fn code_policy_excludes_blocking_human_and_package_checkpoints() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(45)).to_lowercase();
+        assert!(
+            prompt.contains("blocking-human"),
+            "the policy must exclude the human-blocking gate from self-resolution"
+        );
+        assert!(
+            prompt.contains("package-verification"),
+            "the policy must exclude package-verification checkpoints from self-resolution"
+        );
+    }
+
+    #[test]
+    fn code_stage_prompt_is_deterministic() {
+        assert_eq!(
+            stage_prompt(Stage::Code, PhaseId::new(45)),
+            stage_prompt(Stage::Code, PhaseId::new(45)),
+            "a stable policy must render identically for the same Code stage"
+        );
     }
 
     #[test]
     fn code_policy_is_identical_across_both_renderers() {
         let phase = PhaseId::new(45);
         let claude_prompt = stage_prompt(Stage::Code, phase);
-        let workflow_prompt = render_workflow_style(
-            &StageIntent::Code { phase, fix: None },
-            "/workflows",
-        );
+        let workflow_prompt =
+            render_workflow_style(&StageIntent::Code { phase, fix: None }, "/workflows");
 
         assert!(
             claude_prompt.contains(CODE_STAGE_POLICY),
@@ -766,10 +825,8 @@ mod tests {
     fn both_code_prompts_still_end_with_the_completion_protocol() {
         let phase = PhaseId::new(45);
         let claude_prompt = stage_prompt(Stage::Code, phase);
-        let workflow_prompt = render_workflow_style(
-            &StageIntent::Code { phase, fix: None },
-            "/workflows",
-        );
+        let workflow_prompt =
+            render_workflow_style(&StageIntent::Code { phase, fix: None }, "/workflows");
 
         assert!(
             claude_prompt.ends_with(COMPLETION_PROTOCOL),
