@@ -2139,4 +2139,163 @@ mod tests {
              {result:?}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // 45-02 (AUTO-02 / D-02): the build-input predicate is scoped to Cargo
+    // workspace members when evaluating DevFlow's OWN workspace
+    // -----------------------------------------------------------------
+
+    /// AUTO-02 / 999.109: a tracked change confined to `.planning/spikes/`
+    /// must not hard-block DevFlow's own workspace. `.planning/spikes/foo/`
+    /// is throwaway probe code no `cargo build` of this workspace can reach,
+    /// so it cannot make the running binary stale relative to its own
+    /// source — yet the pre-Phase-45 predicate matched ANY path ending in
+    /// `.rs` and ANY `/Cargo.toml` suffix at any depth, so both spike files
+    /// read as build-affecting and the D-18 self-dogfood gate hard-blocked
+    /// the pipeline on them.
+    ///
+    /// NEGATIVE CONTROL in the same body: the identical repo with a modified
+    /// `crates/devflow-cli/src/main.rs` must still return `Err`. Without it
+    /// this test cannot distinguish "correctly ignored the spikes" from "the
+    /// gate stopped working entirely" — and a gate that never blocks is a
+    /// strictly worse outcome than the false positive being fixed (the Phase
+    /// 16 false-evidence class, T-45-09).
+    #[test]
+    fn spikes_only_dirty_tree_does_not_block_self_dogfood() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        // A workspace `is_self_dogfood_workspace` accepts — both exact
+        // member paths — so `staleness_outcome` reaches Block, not Warn.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli/src")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".planning/spikes/foo/src")).unwrap();
+        std::fs::write(
+            root.join(".planning/spikes/foo/Cargo.toml"),
+            "[package]\nname = \"spike\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".planning/spikes/foo/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        assert!(
+            is_self_dogfood_workspace(root),
+            "fixture precondition: this workspace must classify self-dogfood, or the \
+             outcome below would be a Warn and the test would pass for the wrong reason"
+        );
+
+        let phase = PhaseId::new(45);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        // Dirty ONLY the spike files. Both shapes the old predicate matched
+        // are present: a nested `Cargo.toml` and a nested `.rs`.
+        std::fs::write(
+            root.join(".planning/spikes/foo/Cargo.toml"),
+            "[package]\nname = \"spike\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".planning/spikes/foo/src/main.rs"),
+            "fn main() { /* probe */ }\n",
+        )
+        .unwrap();
+
+        let spikes_only = enforce_build_staleness(root, &state, &embedded_commit, false);
+        assert!(
+            spikes_only.is_ok(),
+            "AUTO-02: a tracked change confined to `.planning/spikes/` cannot change the \
+             compiled binary, so it must never hard-block DevFlow's own workspace: \
+             {spikes_only:?}"
+        );
+
+        // NEGATIVE CONTROL: a real workspace-member source change in the
+        // same repo must still block. If this half ever passes as `Ok`, the
+        // narrowing has deleted the gate rather than scoped it.
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() { /* changed */ }\n",
+        )
+        .unwrap();
+        let workspace_source = enforce_build_staleness(root, &state, &embedded_commit, false);
+        assert!(
+            workspace_source.is_err(),
+            "T-45-09: a modified `crates/devflow-cli/src/main.rs` must still hard-block — \
+             a narrowing that loses this true positive is worse than the false positive it \
+             fixes (the Phase 16 false-evidence incident)"
+        );
+    }
+
+    /// TEMPORARY RED PROBE (45-02) — deleted in the GREEN commit. It asserts
+    /// the SCOPED half of `non_dogfood_project_keeps_the_broad_build_input_rule`
+    /// against HEAD's single-argument `tree_has_modified_build_inputs`, which
+    /// is the only way to observe that half failing before the
+    /// `workspace_scoped` parameter exists to express it.
+    #[test]
+    fn red_probe_scoped_rule_rejects_root_src_main_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(root.join("src/main.rs"), "fn main() { /* changed */ }\n").unwrap();
+
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(false),
+            "scoped rule: a root `src/main.rs` is not a `crates/` workspace member"
+        );
+    }
 }
