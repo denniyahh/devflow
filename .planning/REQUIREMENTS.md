@@ -42,11 +42,11 @@ phase.
 
 ### Hermes
 
-- [ ] **HRMS-01**: Operator can select `--agent hermes` — full `AgentKind` registration.
-- [ ] **HRMS-02**: Hermes driver launches headless (`hermes -z "<prompt>" --yolo`) and passes the
+- [x] **HRMS-01**: Operator can select `--agent hermes` — full `AgentKind` registration.
+- [x] **HRMS-02**: Hermes driver launches headless (`hermes -z "<prompt>" --yolo`) and passes the
   conformance suite.
 
-- [ ] **HRMS-03**: Hermes completion is honest (process-exit + `DEVFLOW_RESULT` prompt contract); a
+- [x] **HRMS-03**: Hermes completion is honest (process-exit + `DEVFLOW_RESULT` prompt contract); a
   marker-less run never advances a stage.
 
 ### OpenCode
@@ -59,7 +59,7 @@ phase.
 
 ### Codex
 
-- [ ] **CODE-01**: `--agent codex` verified end-to-end through a real phase (dogfood); surfaced gaps
+- [x] **CODE-01**: `--agent codex` verified end-to-end through a real phase (dogfood); surfaced gaps
   closed.
 
 ### Pi Dogfood
@@ -123,13 +123,13 @@ Which phases cover which requirements. Filled during roadmap creation.
 | HYG-01 | Phase 41 | Complete |
 | HYG-02 | Phase 41 | Complete |
 | ANTG-04 | Phase 42 | Complete |
-| HRMS-01 | Phase 42 | Pending |
-| HRMS-02 | Phase 42 | Pending |
-| HRMS-03 | Phase 42 | Pending |
+| HRMS-01 | Phase 42 | Complete |
+| HRMS-02 | Phase 42 | Complete |
+| HRMS-03 | Phase 42 | Complete |
 | OPCD-01 | Phase 43 | Complete |
 | OPCD-02 | Phase 43 | Complete |
 | OPCD-03 | Phase 43 | Complete |
-| CODE-01 | Phase 44 | Pending |
+| CODE-01 | Phase 44 | Complete |
 | PIDG-01 | Phase 40 | Complete |
 | AUTO-01 | Phase 45 | Complete (live e2e deferred → 999.119) |
 | AUTO-02 | Phase 45 | Complete |
