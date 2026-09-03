@@ -76,6 +76,28 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   (secret scanners, etc.). `pre-commit` additionally **refuses to commit directly on
   `develop`/`main`** (both PR-protected, so the commit would be rejected at push time), with no
   override — the fix is `git switch -c <branch>` first.
+- [ ] **[PROJECT]** `scripts/hooks/commit-msg`: Conventional Commit validator — enforces
+  `<type>(<scope>)!: <description>` against the allowed type list, refuses a subject ending in a
+  period, warns (does not refuse) past 72 chars, and exempts merge/fixup/squash subjects.
+  `DEVFLOW_ALLOW_ANY_COMMIT=1` is the escape hatch for automated tooling. Chains to the global
+  hook, then to a displaced repo-local one, the same way `pre-commit`/`post-commit` do.
+- [ ] **[PATTERN]** **Every hook file must be committed mode `100755`, and that is worth checking
+  rather than assuming.** A hook git tracks as `100644` is silently skipped — git prints only a
+  one-line `hint:` about the file not being executable, which is easy to miss in a wall of commit
+  output, and *nothing else* indicates the gate is not running. This repo shipped `commit-msg` as
+  `100644` from its introduction until 2026-09-03, so Conventional Commit validation was inert
+  that whole time. Verify with `git ls-files -s scripts/hooks/` — the mode in the index is what
+  propagates to other clones, so `chmod +x` alone is not enough; the mode change has to be
+  committed. This is the same class as a gate that runs but cannot fail (see the `rg -c` dead-gate
+  note in CLAUDE.md): documenting a check is not the same as it executing.
+
+  **Root cause on this machine: `core.fileMode` is `false` in this repo, so `chmod +x` is invisible
+  to git and stages nothing.** That is why the hook was committed non-executable in the first
+  place, and it will silently do the same to the next hook added. The fix for an individual file is
+  `git update-index --chmod=+x <path>`, which writes the mode into the index directly. Do not
+  "fix" this by flipping `core.fileMode` to `true` on a whim — it is commonly set false to suppress
+  spurious mode churn on filesystems that do not preserve the bit, and turning it on can produce a
+  large unrelated diff. Prefer `update-index` per hook, and verify with `git ls-files -s`.
 - [ ] **[PROJECT]** `scripts/hooks/pre-push`:
   - Scrubs `GIT_DIR`/`GIT_WORK_TREE`/etc. before doing anything (prevents a worktree push from
     retargeting the wrong repo — a real incident here, `999.37`).
