@@ -1,5 +1,21 @@
 # Milestones
 
+## v2.8.0 Remaining Harness Support + Pi Dogfood (Shipped: 2026-09-03)
+
+**Phases completed:** 6 phases, 16 plans, 26 tasks
+
+**Key accomplishments:**
+
+- Backfilled 2026-08-23
+- Backfilled 2026-08-23
+- OpenCode driver now launches `opencode run "<prompt>" --auto --format json` and its JSONL output resolves through a new `parse_opencode_event_result` (marker, error, torn-tail) regression-tested against three real live captures.
+- `OpenCodeDriver::health` now refuses an OpenCode launch on a machine with zero configured provider credentials (parsed from `opencode providers list`, never from exit code), and `capabilities` reports `subagent_dispatch` from a real, fail-closed `opencode agent list` probe.
+- `devflow resume --phase 900 --agent codex` drove a throwaway phase's Code and Validate stages to a clean finish (2 real commits, 0-finding review, passing validation), and the phase7_cli.rs and pre_push_signing_policy.rs stale test assertions this run's own regression checks surfaced are both closed with cited commits — CODE-01 is now complete.
+- DevFlow now ignores non-workspace spikes for its self-dogfood stale-build block while retaining true-positive member-source and downstream-project detection.
+- Full-execute Code prompts now share a merit-based unattended-decision policy across all four supported agent families, with explicit human-only carve-outs and auditable-reasoning instructions.
+
+---
+
 ## v2.7.0 Pi End-to-End + Driver Contract Completion (Shipped: 2026-08-18)
 
 **Phases completed:** 3 phases, 2 plans, 15 tasks

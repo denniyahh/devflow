@@ -6,8 +6,9 @@ DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
 coding agent needs to drive a development phase end-to-end: branch creation,
 agent launch, completion detection, gated human checkpoints, versioning,
 docs/changelog updates, and cleanup. It runs a 5-stage pipeline
-(Define → Plan → Code → Validate → Ship), today against four supported
-agents (Claude Code, OpenAI Codex, OpenCode, Pi) through the modular `AgentDriver` contract — opinionated by design,
+(Define → Plan → Code → Validate → Ship), today against six supported
+agents (Claude Code, OpenAI Codex, OpenCode, Pi, Antigravity, Hermes) through the modular
+`AgentDriver` contract — opinionated by design,
 not a universal agent platform — in either `auto` (unattended) or
 `supervise` (gated) mode.
 
@@ -20,22 +21,52 @@ mid-run crash or kill.
 
 ## Current Milestone
 
-**v2.8.0 — Remaining Harness Support + Pi Dogfood** (declared 2026-08-18)
+**None declared.** v2.8.0 closed 2026-09-03 — see `/gsd-new-milestone` to start the next one.
 
-**Goal:** Onboard the remaining coding harnesses onto the `AgentDriver` contract — new drivers for
-**Antigravity CLI** and **Hermes** (backlog 999.1), complete the under-built **OpenCode** stub
-driver, verify/harden **Codex** end-to-end — and prove **Pi** holds up under real use by dogfooding
-Phase 40 through it. Closes 999.94 + 999.85 if capacity permits.
+<details>
+<summary>Previous milestone: v2.8.0 Remaining Harness Support + Pi Dogfood — CLOSED 2026-09-03</summary>
 
-**Target features:**
-- **Antigravity CLI** — new `AgentKind` variant + driver + conformance suite (currently unsupported).
-- **Hermes** — new `AgentKind` variant + driver + conformance suite (backlog 999.1).
-- **OpenCode** — complete the stub driver: completion parsing, health/discover, capabilities, workflow root.
-- **Codex** — end-to-end verification/hardening (already a native driver; dogfood + gap-closure).
-- **Phase 40** — Pi dogfood: run a real phase through DevFlow using Pi (incl. the deferred
-  isolated-context Pi dispatch item if it surfaces).
-- **999.94** (unattended `decision` checkpoint takes the first option blindly, HIGH) + **999.85**
-  (two stale comments, low) — *if capacity permits*.
+**Delivered.** All six coding harnesses now run on the modular `AgentDriver` contract:
+
+- **Antigravity CLI** — new `AgentKind` + driver; launches `agy` headless (stream-json,
+  `--print-timeout 60m`, prompt on stdin), agent-aware `CloseRule` / idle-timeout, conformance
+  enrolled (Phase 41). Plus dogfood-hygiene fixes: Phase-7 tests reap their own monitors (0
+  leaked, was 43); `check-in-container.sh` passes under uid 0 from a worktree and the main
+  checkout (HYG-01 / HYG-02).
+- **Hermes** — new `AgentKind` + driver; launches `hermes -z "<prompt>" --yolo --accept-hooks`
+  headless (Legacy monitor), process-exit + `DEVFLOW_RESULT` completion contract, conformance
+  enrolled (Phase 42). The Antigravity supervised dogfood in this phase unlocked `--mode auto`
+  for Antigravity at the C2 preflight gate (ANTG-04).
+- **OpenCode** — stub driver completed (28 → 569 lines): real `build_command`
+  (`opencode run "<prompt>" --auto --format json`), `parse_opencode_event_result` (torn-tail →
+  error-anywhere → last-marker) regression-tested against three real captures, fail-closed
+  `health` (requires exit-success AND a positive credential count), header-anchored
+  `capabilities` probe (Phase 43). A code review found 4 fail-closed gaps — all fixed same-phase.
+- **Codex** — verified end-to-end via a real `devflow resume --phase 900 --agent codex` dogfood
+  that drove Code→Validate to a clean finish; surfaced gaps + 7 post-hoc review findings all
+  closed; driver contract unchanged (D-04 empty diff). Shipped v2.11.0, PR #154 (Phase 44).
+- **Pi** — the shipped v2.7.0 driver proven under real use: a supervised Define→Validate run
+  through `--agent pi` with a witnessed reviewer-subagent dispatch and a live Validate gate; the
+  two 999.85 stale comments rewritten (MAINT-01); three Pi-transport regression tests
+  (marker-less, non-zero-exit, hung) (Phase 40).
+
+Phase 45 (added mid-milestone) hardened unattended `--mode auto`: configurable base-branch
+resolution so worktrees fork from the `.planning/`-tracking branch rather than a hardcoded
+`develop` (AUTO-01 / 999.110); `affects_compiled_binary` scoped to Cargo workspace members
+(AUTO-02 / 999.109); a shared merit-based Code-stage decision-checkpoint policy (DECN-01 /
+999.94). Shipped v2.12.0, PR #203.
+
+**Closed 2026-09-03 as `override_closeout`.** All six phases (40-45) verified/passed and the
+pre-close artifact audit was clear (9 items still suppressed from a prior close). One known gap:
+**DECN-01 is partially delivered** — `CODE_STAGE_POLICY` reaches the first Code pass for both
+agent families but not the Claude/OpenCode `fix_prompt` loop-back, and is contradicted by
+`checkpoint_auto_decide_prompt` for blocking-human gates. Both holes deferred by operator
+decision to backlog **999.115** / **999.116**; AUTO-01's live `--mode auto` end-to-end run
+deferred to **999.119**. Milestone audit: `.planning/milestones/v2.8.0-MILESTONE-AUDIT.md`
+(status `tech_debt`). Full phase detail archived to `.planning/milestones/v2.8.0-ROADMAP.md`;
+phase dirs to `.planning/milestones/v2.8.0-phases/`.
+
+</details>
 
 <details>
 <summary>Previous milestone: v2.7.0 Pi End-to-End + Driver Contract Completion — CLOSED 2026-08-18</summary>
@@ -275,12 +306,58 @@ version is still derived automatically from conventional-commit classification a
   unanchored substring matches) — all 4 fixed same-phase (`43-REVIEW-FIX.md`), independently
   re-verified against source by both a fresh code-reviewer pass and the phase verifier.
 
+- ✓ **ANTG-01, ANTG-02, ANTG-03, ANTG-04, HYG-01, HYG-02** — `--agent antigravity` resolves
+  end-to-end and launches `agy` headless (stream-json in/out, `--print-timeout 60m`, prompt on
+  stdin, no `-p`); completion parsed from the event stream with an honest process-exit fallback
+  and a marker-less run never advances; passes the shared 6-driver conformance suite; the
+  Antigravity supervised dogfood measured event cadence (raised the idle floor to 300s for
+  workspace test passes) and confirmed the 60m print-timeout holds, which unlocked `--mode auto`
+  for Antigravity at the C2 gate. Phase-7 integration tests now reap their own `devflow start`
+  monitors (0 leaked, was 43) and `check-in-container.sh` passes under uid 0 from both a worktree
+  and the main checkout — Phases 41-42, milestone v2.8.0.
+- ✓ **HRMS-01, HRMS-02, HRMS-03** — `--agent hermes` resolves end-to-end (enum / FromStr /
+  Display / serde / `driver_for` / `agent_program`) and launches
+  `hermes -z "<prompt>" --yolo --accept-hooks` headless with `HERMES_ACCEPT_HOOKS=1` on a Legacy
+  monitor; completion is process-exit + the `DEVFLOW_RESULT` prompt contract (no `parse_completion`
+  override) and a marker-less run never advances; passes the shared 6-driver conformance suite —
+  Phase 42, milestone v2.8.0.
+- ✓ **CODE-01** — `--agent codex` verified end-to-end: a real `devflow resume --phase 900 --agent
+  codex` dogfood drove a throwaway phase's Code and Validate stages to a clean finish (2 real
+  commits, 0-finding review, passing validation); the `phase7_cli.rs` and `pre_push_signing_policy.rs`
+  stale assertions the run surfaced are closed with cited commits; the Codex driver contract is
+  byte-unchanged from `develop` (D-04). Post-execution adversarial + canonical code review found 7
+  further defects — all fixed and regression-tested. Shipped v2.11.0, PR #154 — Phase 44,
+  milestone v2.8.0.
+- ✓ **AUTO-01, AUTO-02** — worktree creation forks from the branch tracking `.planning/` via a
+  configurable `config::base_branch` resolver (env `DEVFLOW_BASE_BRANCH` > `.planning/config.json`
+  > `develop`), resolved once and fed to both the fork point and the git-flow merge target so they
+  cannot drift; four run-scoped `git_flow_for_run` consumers read the persisted `State::base_branch`;
+  `affects_compiled_binary` inspects only Cargo workspace members (`crates/*`) plus root build
+  files, ignoring `.planning/spikes/`. Verified at unit/integration level with a real fork-point
+  negative control; the live `devflow start --mode auto` end-to-end run is deferred to backlog
+  999.119. Shipped v2.12.0, PR #203 — Phase 45, milestone v2.8.0.
+
+### Partially delivered
+
+- ◐ **DECN-01** (999.94) — a shared merit-based Code-stage decision-checkpoint policy
+  (`CODE_STAGE_POLICY`) that forbids blind positional selection, treats "recommended" as evidence
+  not verdict, demands the comparison that produced the choice, and carves out blocking-human /
+  package-verification checkpoints. It reaches the first-pass Code prompt for both agent families
+  (`code_stage_prompt` + `workflow_code_prompt` FullExecute). **Not delivered:** it does not reach
+  `fix_prompt` (the Claude/OpenCode post-Validate-failure loop-back — the primary agent's common
+  path), and `checkpoint_auto_decide_prompt` grants blocking-human authority the policy withholds
+  in the same resumed conversation. Both holes deferred by operator decision to backlog **999.115**
+  / **999.116** — Phase 45, milestone v2.8.0.
+
 ### Active
 
-- **HARDEN-06** (999.83) — the drain gate's concurrency guarantee, held back from Phase 35's bundle
-  specifically to avoid slowing HARDEN-01..05/07 on a harness — Phase 35.3, planned (not yet executed).
-- Phase 35.1 (999.93, unattended-launch prerequisites) and Phase 35.2 (999.89/HARDEN-03
-  provenance) — inserted 2026-08-07, not yet planned.
+- **None.** v2.8.0 closed 2026-09-03. Next milestone not yet declared — run `/gsd-new-milestone`.
+- Carried-forward follow-ups (backlog, not an active phase sequence): **999.115** / **999.116**
+  (DECN-01 remainder — the loop-back Code prompt and the resume-prompt contradiction),
+  **999.119** (AUTO-01 live `--mode auto` end-to-end verification), **999.118** (`write_state_atomic`
+  fixed `.tmp` filename TOCTOU), **999.120** (one residual ambient `git_flow_for_project`
+  re-resolution in the Validate loop-back), **999.121** (OpenCode has no `devflow start`-level
+  marker-less regression test). Promote with `/gsd-review-backlog` when ready.
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
 2026-08-04**,
@@ -337,8 +414,9 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
   bump; the `3.0.0` slot stays reserved for a genuinely breaking change,
   whenever that lands. No milestone has been declared yet for whatever comes
   next — see `/gsd-new-milestone`.
-- No `.planning/REQUIREMENTS.md` exists in this project; requirements are
-  tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
+- `.planning/REQUIREMENTS.md` is created fresh per milestone by `/gsd-new-milestone` and
+  archived at close to `.planning/milestones/v[X.Y]-REQUIREMENTS.md`. v2.8.0 used formal REQ-IDs
+  (ANTG-*, HRMS-*, OPCD-*, CODE-01, AUTO-*, DECN-01, PIDG-01, MAINT-01, HYG-*).
 
 ## Constraints
 
@@ -413,7 +491,16 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-23 after Phase 43 (OpenCode Driver Completion) — the OpenCode stub driver
+*Last updated: 2026-09-03 after milestone **v2.8.0 Remaining Harness Support + Pi Dogfood** closed
+— 6 phases (40-45), 16 plans. All six harnesses (Claude, Codex, OpenCode, Pi, Antigravity, Hermes)
+on the `AgentDriver` contract; Codex dogfood-verified; unattended `--mode auto` hardened. Closed
+`override_closeout`: DECN-01 partial (→ 999.115/999.116), AUTO-01 live run deferred (→ 999.119).
+Released incrementally v2.9.0 … v2.12.0. Milestone audit `tech_debt`
+(`.planning/milestones/v2.8.0-MILESTONE-AUDIT.md`). REQUIREMENTS.md archived + deleted (fresh for
+next milestone); no active milestone — see `/gsd-new-milestone`.*
+
+---
+*Previous: 2026-08-23 after Phase 43 (OpenCode Driver Completion) — the OpenCode stub driver
 completed (launch argv, JSON-event completion parsing against real captures, fail-closed
 health/capability probes, conformance suite), OPCD-01/02/03 validated. A code review found and
 same-phase fixed 4 fail-closed correctness gaps in the health-check/capability-probe code.*

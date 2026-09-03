@@ -2,20 +2,20 @@
 gsd_state_version: 1.0
 milestone: v2.8.0
 milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
-current_phase: 45
-current_phase_name: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94
-status: verified
-stopped_at: Phase 45 verification resolved via `/gsd-verify-work 45` (2026-09-02): 4 UAT checks auto-passed from coverage blocks; the sole live `devflow start --mode auto` end-to-end check was deferred by operator to a later phase (not possible in this env yet), filed as backlog 999.119 and accepted as a third PASSED (override) on 45-VERIFICATION.md — verification status now `passed`. Phase 45 CODE shipped as v2.12.0 (PR #201, merged 2026-09-02; main==develop). Remaining for v2.8.0-milestone close: reconcile ROADMAP phase tables (44/45 still read Not started), clear/ack 8 legacy audit items, run /gsd-audit-milestone, then /gsd-complete-milestone.
-last_updated: "2026-09-02T23:12:00.000Z"
-last_activity: 2026-09-02
-state_head: b39d316f385afb61066fc47fd1cf102dd1e3da76
+status: completed
+stopped_at: "Phase 45 verification resolved via `/gsd-verify-work 45` (2026-09-02): 4 UAT checks auto-passed from coverage blocks; the sole live `devflow start --mode auto` end-to-end check was deferred by operator to a later phase (not possible in this env yet), filed as backlog 999.119 and accepted as a third PASSED (override) on 45-VERIFICATION.md — verification status now `passed`. Phase 45 CODE shipped as v2.12.0 (PR #201, merged 2026-09-02; main==develop). Remaining for v2.8.0-milestone close: reconcile ROADMAP phase tables (44/45 still read Not started), clear/ack 8 legacy audit items, run /gsd-audit-milestone, then /gsd-complete-milestone."
+last_updated: "2026-09-03T10:41:05.966Z"
+last_activity: 2026-09-03
+last_activity_desc: Milestone v2.8.0 completed and archived
+state_head: e064dbaf0bf814ab5690669d83c846bf1f1c5c80
 progress:
   total_phases: 6
   completed_phases: 6
   total_plans: 16
   completed_plans: 16
   percent: 100
-last_activity_desc: Phase 45 verification resolved via /gsd-verify-work 45 — live --mode auto run deferred to 999.119 as a PASSED (override); all 6 v2.8.0 phases now verified
+current_phase: 45
+current_phase_name: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94
 ---
 
 # DevFlow — Project State
@@ -39,7 +39,7 @@ reports all-clear with these suppressed:
 | uat_gap | 40-UAT.md (Phase 40) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
 | uat_gap | 41-UAT.md (Phase 41) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
 | uat_gap | 42-UAT.md (Phase 42) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
-| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | `**Status:** acknowledged` set in-file; carried v2.4.0 debt, needs a decision before any plan widens the constant | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | `**Status:** v2.8.0 milestone complete
 | deferred_item | v2.4.0-phases/34-…/deferred-items.md #2 — `embedded_commit_is_stale…` flake (pre-existing) | `**Status:** acknowledged` set in-file; pre-existing `PATH`/`ENV_MUTEX` race, fix identified not applied | 2026-09-02 | v2.8.0 |
 | deferred_item | v2.3.0-phases/30-…/deferred-items.md #1 — `30a-evidence/raw_output*.jsonl` carry home path / OS username / session id | `**Status:** acknowledged` set in-file; low-but-real, no credential-shaped match; sanitiser exists | 2026-09-02 | v2.8.0 |
 | verification_override | 45-VERIFICATION.md — AUTO-01 live `devflow start --mode auto` end-to-end run | `PASSED (override)`, accepted by Dennis Kim; tracked as backlog 999.119 | 2026-09-02 | v2.8.0 |
@@ -135,18 +135,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 45 (Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94)) — EXECUTING
-Plan: 2 of 3
-Status: Ready to execute
-Last activity: 2026-09-02
-
-**Decision coverage gate override (2026-08-23):** `check.decision-coverage-plan` returned
-`passed: false, reason: could-not-parse, covered: 0, uncovered: []` for 43-CONTEXT.md — a known
-parser false positive (D-03/D-05 bullets have an em dash inside the bold `**D-NN: ...**` header,
-breaking the naive header/body split; `covered:0` beside `uncovered:[]` is the tell, not a real
-gap). The independent gsd-plan-checker verification separately confirmed all 12 decisions
-(D-01–D-12) have explicit implementing tasks in 43-01/43-02-PLAN.md. Proceeded without replanning
-or reformatting the already-locked CONTEXT.md decision text.
+Phase: Milestone v2.8.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-09-03 — Milestone v2.8.0 completed and archived
 
 ## Recently Shipped
 
