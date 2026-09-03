@@ -19,9 +19,43 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone
+## Current Milestone: v3.0.0 Unattended Run Survivability
 
-**None declared.** v2.8.0 closed 2026-09-03 — see `/gsd-new-milestone` to start the next one.
+**Declared 2026-09-03.**
+
+**Goal:** Prove DevFlow's `--mode auto` chain end to end on a live run, close the decision-policy
+and persistence holes that would make such a run misbehave silently, then replace the
+PID-addressed monitor so a stalled run is recoverable by design rather than by diagnosis.
+
+**Why a major version.** Phase work here replaces the monitor mechanism and adds a socket path to
+`state.json`, breaking state-file compatibility with 2.x. `devflow-core` is a published crate, so
+the major bump is the honest semver signal rather than a cosmetic one.
+
+**Target features:**
+- The unattended decision policy reaches every Code prompt, including the loop-back path, and
+  stops contradicting itself in a resumed session (999.115, 999.116)
+- Base-branch and project-root inputs are validated rather than assumed (#204, #206)
+- CI can reproduce the sequential load shape that catches exec-visibility races (#174)
+- Concurrent state writes cannot silently lose an update (999.118)
+- A gate with no consumer reports the recovery that exists instead of asserting a waiter that
+  does not (#200)
+- A live `devflow start --mode auto` run is recorded end to end, fork point through Ship merge
+  target, against a configured base (999.119)
+- Monitor liveness is answerable without a PID — GONE / STALE / ALIVE (#185)
+- Token exhaustion continues the run under a fallback agent instead of ending the night (#180)
+
+**Sequencing.** Five waves, in this order for a reason: correctness first (999.115, 999.116,
+\#204, #206, #174), then survivability (999.118, #200), then the live run that measures them
+(999.119), then the supervisor (#185), then failover on top of it (#180). The live run is the
+instrument — landing it before the correctness fixes would measure the defects rather than the
+chain. 999.116 is deliberately scheduled to resolve *against* that run, since the contradiction it
+describes cannot be settled by reading source.
+
+**Verified before scoping (2026-09-03).** Every candidate was re-checked against the v2.12.0 tree
+rather than trusted from its filing. Two were dropped as already delivered: 999.90/#163 (fixed by
+Phase 45's `06b42fe`) and #147 (`devflow resume --agent` already ships). #180 shrank as a result —
+the driver substitution its design needs already exists. 999.119's negative-control arm is already
+banked from a live run; only the positive arm and the Ship merge target remain.
 
 <details>
 <summary>Previous milestone: v2.8.0 Remaining Harness Support + Pi Dogfood — CLOSED 2026-09-03</summary>
@@ -351,13 +385,26 @@ version is still derived automatically from conventional-commit classification a
 
 ### Active
 
-- **None.** v2.8.0 closed 2026-09-03. Next milestone not yet declared — run `/gsd-new-milestone`.
-- Carried-forward follow-ups (backlog, not an active phase sequence): **999.115** / **999.116**
-  (DECN-01 remainder — the loop-back Code prompt and the resume-prompt contradiction),
-  **999.119** (AUTO-01 live `--mode auto` end-to-end verification), **999.118** (`write_state_atomic`
-  fixed `.tmp` filename TOCTOU), **999.120** (one residual ambient `git_flow_for_project`
-  re-resolution in the Validate loop-back), **999.121** (OpenCode has no `devflow start`-level
-  marker-less regression test). Promote with `/gsd-review-backlog` when ready.
+**v3.0.0 Unattended Run Survivability** — declared 2026-09-03. Requirement IDs in
+`REQUIREMENTS.md`; the backlog/issue each traces to is named inline.
+
+- [ ] Unattended decision policy reaches the Claude/OpenCode loop-back Code prompt (999.115)
+- [ ] `CODE_STAGE_POLICY` and `checkpoint_auto_decide_prompt` stop contradicting each other in a
+      resumed session (999.116)
+- [ ] `base_branch` validation rejects revspec suffixes on a real branch name (#204)
+- [ ] `devflow stop` accepts the positional project root every other verb accepts (#206)
+- [ ] CI runs a job that reproduces the sequential fmt→clippy→test load shape (#174)
+- [ ] `write_state_atomic` cannot lose an update to a concurrent writer (999.118)
+- [ ] A gate with no consumer reports the recovery that exists rather than asserting a waiter
+      (#200)
+- [ ] A live `devflow start --mode auto` run is recorded fork-point through Ship merge target
+      against a configured base (999.119)
+- [ ] Monitor liveness is answerable without a PID — GONE / STALE / ALIVE (#185)
+- [ ] Token exhaustion continues the run under a fallback agent (#180)
+
+Carried-forward follow-ups NOT in this milestone (backlog): **999.120** (one residual ambient
+`git_flow_for_project` re-resolution in the Validate loop-back), **999.121** (OpenCode has no
+`devflow start`-level marker-less regression test). Promote with `/gsd-review-backlog` when ready.
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
 2026-08-04**,
@@ -498,6 +545,16 @@ on the `AgentDriver` contract; Codex dogfood-verified; unattended `--mode auto` 
 Released incrementally v2.9.0 … v2.12.0. Milestone audit `tech_debt`
 (`.planning/milestones/v2.8.0-MILESTONE-AUDIT.md`). REQUIREMENTS.md archived + deleted (fresh for
 next milestone); no active milestone — see `/gsd-new-milestone`.*
+
+---
+*Last updated: 2026-09-03 after milestone **v3.0.0 Unattended Run Survivability** was declared —
+10 items in 5 waves, scoped from a full re-verification of the open issue set against the v2.12.0
+tree rather than from the filings. Two candidates dropped as already delivered (999.90/#163,
+\#147); #180 shrank because `resume --agent` already ships; #186 demoted to P2 because Phase 45
+delivered most of it. Major version chosen because #185 changes the monitor mechanism and adds a
+socket path to `state.json`, breaking state-file compatibility with 2.x on a published crate.
+Research skipped by operator decision — every item is a verified defect in this codebase with a
+known fix direction, and the #185 socket design is already spike-proven.*
 
 ---
 *Previous: 2026-08-23 after Phase 43 (OpenCode Driver Completion) — the OpenCode stub driver

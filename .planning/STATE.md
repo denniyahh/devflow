@@ -1,21 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.8.0
-milestone_name: Remaining Harness Support + Pi Dogfood (CLOSED 2026-09-03)
-status: completed
-stopped_at: "v2.8.0 milestone closed 2026-09-03 (override_closeout). All 6 phases (40-45) verified/passed; Nyquist reconstructed for 42/44/45; REQUIREMENTS register reconciled. Known gap: DECN-01 partial -> backlog 999.115/999.116; AUTO-01 live --mode auto run -> 999.119. Audit integration warnings -> 999.120/999.121. No active milestone — run /gsd-new-milestone."
-last_updated: "2026-09-03T10:41:05.966Z"
+milestone: v3.0.0
+milestone_name: Unattended Run Survivability
+status: planning
+last_updated: "2026-09-03T18:58:12.968Z"
 last_activity: 2026-09-03
-last_activity_desc: Milestone v2.8.0 completed and archived
-state_head: e064dbaf0bf814ab5690669d83c846bf1f1c5c80
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 16
-  completed_plans: 16
-  percent: 100
-current_phase: ""
-current_phase_name: ""
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -148,10 +143,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v2.8.0 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-09-03 — Milestone v2.8.0 completed and archived
+Status: Defining requirements
+Last activity: 2026-09-03 — Milestone v3.0.0 started
 
 ## Recently Shipped
 
