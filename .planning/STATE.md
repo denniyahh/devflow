@@ -1,9 +1,9 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.8.0
-milestone_name: milestone (ACTIVE — Remaining Harness Support + Pi Dogfood)
+milestone_name: Remaining Harness Support + Pi Dogfood (CLOSED 2026-09-03)
 status: completed
-stopped_at: "Phase 45 verification resolved via `/gsd-verify-work 45` (2026-09-02): 4 UAT checks auto-passed from coverage blocks; the sole live `devflow start --mode auto` end-to-end check was deferred by operator to a later phase (not possible in this env yet), filed as backlog 999.119 and accepted as a third PASSED (override) on 45-VERIFICATION.md — verification status now `passed`. Phase 45 CODE shipped as v2.12.0 (PR #201, merged 2026-09-02; main==develop). Remaining for v2.8.0-milestone close: reconcile ROADMAP phase tables (44/45 still read Not started), clear/ack 8 legacy audit items, run /gsd-audit-milestone, then /gsd-complete-milestone."
+stopped_at: "v2.8.0 milestone closed 2026-09-03 (override_closeout). All 6 phases (40-45) verified/passed; Nyquist reconstructed for 42/44/45; REQUIREMENTS register reconciled. Known gap: DECN-01 partial -> backlog 999.115/999.116; AUTO-01 live --mode auto run -> 999.119. Audit integration warnings -> 999.120/999.121. No active milestone — run /gsd-new-milestone."
 last_updated: "2026-09-03T10:41:05.966Z"
 last_activity: 2026-09-03
 last_activity_desc: Milestone v2.8.0 completed and archived
@@ -14,8 +14,8 @@ progress:
   total_plans: 16
   completed_plans: 16
   percent: 100
-current_phase: 45
-current_phase_name: Unattended Auto-Mode Hardening (999.110 + 999.109 + 999.94
+current_phase: ""
+current_phase_name: ""
 ---
 
 # DevFlow — Project State
@@ -51,18 +51,31 @@ pipe-tables to bullet lists in the same edit — `audit-open`'s deferred-items s
 
 ## Active Phase
 
-**Phase 44 — Codex End-to-End Verification — shipped.** CODE-01 satisfied: `devflow resume
---phase 900 --agent codex` drove a throwaway phase's Code and Validate stages to a clean finish
-(one attempt, 2 real commits, 0-finding review, passing validation). Full outcome record and gap
-disposition in `44-codex-end-to-end-verification/44-CODEX-E2E.md`. PR #154
-(`feature/phase-44-pr` → `develop`) merged 2026-08-27; also closed backlog item 999.113
-(container-root permission test fragility) discovered while pushing.
+**None.** Milestone **v2.8.0 — Remaining Harness Support + Pi Dogfood** closed 2026-09-03 as
+`override_closeout`. All six phases (40-45) verified and shipped (incrementally, v2.9.0 …
+v2.12.0). Phase detail archived to `.planning/milestones/v2.8.0-phases/`; ROADMAP/REQUIREMENTS/
+audit to `.planning/milestones/v2.8.0-*`.
 
-Current v2.8.0 milestone progress: all 6 phases (40-45) complete, verified, and SHIPPED
-(40→v2.8.0 … 44→v2.11.0, 45→v2.12.0; main==develop). Phase 45's live `devflow start --mode auto`
-end-to-end check is deferred to backlog 999.119 (PASSED override). Remaining before the
-v2.8.0-milestone close: reconcile the ROADMAP phase tables, clear 8 legacy audit items, run
-/gsd-audit-milestone, then /gsd-complete-milestone.
+**Known gap carried forward:** DECN-01 is partially delivered — `CODE_STAGE_POLICY` does not reach
+the Claude/OpenCode `fix_prompt` loop-back and is contradicted by `checkpoint_auto_decide_prompt`
+for blocking-human gates. Deferred to backlog **999.115** / **999.116**. AUTO-01's live
+`devflow start --mode auto` end-to-end run deferred to **999.119**. Audit integration warnings
+filed as **999.120** (residual ambient `git_flow_for_project`) / **999.121** (OpenCode CLI
+marker-less test).
+
+## Project Reference
+
+See: `.planning/PROJECT.md` (updated 2026-09-03)
+
+**Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
+pipeline, never silently corrupt state or lose a human's gate decision.
+**Current focus:** No milestone declared — run `/gsd-new-milestone`.
+
+## Operator Next Steps
+
+- `/gsd-new-milestone` to scope the next milestone.
+- `workspace/denniyahh` is ahead of `origin/develop` and unpushed — push when ready.
+- Backlog follow-ups from the v2.8.0 close: 999.115, 999.116, 999.118, 999.119, 999.120, 999.121.
 
 ---
 

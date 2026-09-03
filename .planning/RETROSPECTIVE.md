@@ -229,6 +229,48 @@ blocker on a requirement's traceability row.
 - Adversarial reviews: 1 code review (claude/codex/antigravity), plus the earlier planning review.
 - The live dispatch run: parent on `litellm` (deepseek-v4-pro), subagent on `openrouter` (free nemotron) — the subagent's model is the extension's own chain, not the parent's provider.
 
+## Milestone: v2.8.0 — Remaining Harness Support + Pi Dogfood
+
+**Shipped:** 2026-09-03 (closed `override_closeout`) — released incrementally v2.9.0 … v2.12.0
+**Phases:** 6 (40-45) | **Plans:** 16 | **Tasks:** 26
+
+### What Was Built
+- 40: Pi (shipped v2.7.0) dogfooded through a real supervised Define→Validate run with a witnessed reviewer-subagent dispatch and a live gate; 999.85 stale comments rewritten (MAINT-01); 3 Pi-transport regression tests.
+- 41: Antigravity CLI driver — `agy` headless (stream-json, `--print-timeout 60m`, prompt on stdin), agent-aware `CloseRule`/idle-timeout, conformance-enrolled. Plus HYG-01 (phase-7 tests reap their own monitors: 0 leaked, was 43) and HYG-02 (`check-in-container.sh` under uid 0 from worktree + main).
+- 42: Hermes driver — `hermes -z … --yolo --accept-hooks` on a Legacy monitor, process-exit + `DEVFLOW_RESULT` contract. The Antigravity supervised dogfood in this phase unlocked `--mode auto` for Antigravity at the C2 gate (ANTG-04); idle floor raised to 300s after a ~163s quiet gap killed a healthy run.
+- 43: OpenCode stub completed (28 → 569 lines): real launch argv, `parse_opencode_event_result` (torn-tail → error-anywhere → last-marker) against 3 real vendored captures, fail-closed `health` (exit-success AND positive credential count), header-anchored `capabilities` probe. Code review found 4 fail-closed gaps — all fixed same-phase.
+- 44: Codex verified end-to-end — a real `devflow resume --phase 900 --agent codex` drove Code→Validate to a clean finish; the run surfaced stale `phase7_cli.rs` / `pre_push_signing_policy.rs` assertions (closed); driver contract byte-unchanged (D-04); 7 post-hoc review findings all fixed. Shipped v2.11.0.
+- 45: Unattended `--mode auto` hardening — `config::base_branch` resolver (env > file > `develop`) resolved once and fed to both the worktree fork point and the git-flow merge target (AUTO-01); `affects_compiled_binary` scoped to `crates/*` + root build files (AUTO-02); shared `CODE_STAGE_POLICY` decision-checkpoint constant (DECN-01, partial). Shipped v2.12.0.
+
+### What Worked
+- The modular `AgentDriver` contract held: two brand-new drivers (Antigravity, Hermes) onboarded with no agent-specific logic leaking into core; the 6-driver conformance suite plus a `BrokenDriver` negative control kept it honest.
+- Completion parsers regression-tested against real captured streams vendored byte-identical as fixtures, never an assumed schema (OpenCode's 3 captures; Codex's dogfood evidence).
+- Verifying Codex with a real dogfood run — not only unit tests — surfaced stale test assertions a green `cargo test --workspace` was hiding.
+- Phase 45's one-value base resolution caught a dangerous regression it introduced itself (`cleanup_merged` would delete a protected trunk) before merge, via a negative-controlled test.
+
+### What Was Inefficient
+- `workspace/denniyahh` drifted 21 commits behind `develop` — the entire v2.12.0 release was absent from the branch `/gsd-audit-milestone` was invoked on. The integration checker had to verify Phase 45 against a throwaway `develop` worktree. "Sync the personal branch before phase work" is a documented rule that was skipped.
+- The REQUIREMENTS.md register lagged reality: CODE-01 + HRMS-01/02/03 stayed `[ ]` / "Pending" long after they were verified and shipped; a Phase-44 VERIFICATION.md even asserted the CODE-01 checkbox was `[x]` when the file read `[ ]`.
+- Nyquist coverage was never reconciled during execution: Phase 42's VALIDATION.md stayed `status: pending`, Phase 44's was a `44-XX-XX TBD` skeleton, Phase 45 had none. All three had to be audited/reconstructed at milestone close.
+- DECN-01 shipped partial. Both external review lanes REJECTed the Phase 45 plans across two rounds and flagged the prompt-coverage shape; the policy still went out wired to only 3 of 4 Code-prompt paths (missing the primary agent's post-Validate-failure loop-back) and was deferred to 999.115/999.116.
+
+### Patterns Established
+- New driver checklist: a `driver_for` arm in a *total* match (no `_ =>`), FromStr/Display/serde round-trip tests, conformance enrollment, a `phase7_cli.rs` marker-less-never-advances regression, and agent-aware `CloseRule`/idle-timeout **only** if the driver runs `PipeOwning`.
+- One config value feeds both the worktree fork point and the git-flow merge target, resolved once and persisted, so they cannot drift.
+- Dogfood a driver end-to-end before calling it verified — the run finds what the suite doesn't.
+- Nyquist VALIDATION.md is reconciled by `/gsd-validate-phase` at execution time, not left as a plan-phase skeleton for the milestone close to rebuild.
+
+### Key Lessons
+- A green `cargo test --workspace` over a driver that was never dogfooded proves the parser, not the pipeline.
+- "Deferred by operator decision" changes who owns the remaining work, not whether the criterion is true — DECN-01's roadmap criterion is still false on the primary agent's path.
+- Sync `workspace/denniyahh` before any phase or audit work: a stale personal branch runs the tooling against a tree missing the milestone's own shipped code.
+- Constant-pass checks keep recurring (`--exact` matches nothing and exits 0; `rg -c` prints nothing and exits 1 on zero matches). Assert on a real `N passed` with non-zero `filtered out`, and print the command's own exit code.
+
+### Cost Observations
+- 6 phases across ~2 weeks; released incrementally v2.9.0 … v2.12.0 rather than one milestone drop.
+- Adversarial review used on Phase 45 plans (2 rounds, both external lanes REJECT) and Phase 44 post-execution (3 external reviewers + canonical `/gsd-code-review`).
+- Milestone close did real remediation work: branch sync, register reconciliation, 3 Nyquist reconstructions, 2 new backlog filings (999.120/999.121).
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -237,6 +279,7 @@ blocker on a requirement's traceability row.
 |-----------|----------|--------|------------|
 | gsd-hygiene | 1 | 1 | First milestone closed by an interactive session end-to-end same-day; first use of a backfilled PLAN/SUMMARY pair to satisfy a completion-projection tooling gap; first unversioned/plain-label milestone archive |
 | v2.7.0 | 1 (multi-session) | 3 | First milestone driven end-to-end by pi — the agent DevFlow itself now supports; first live subagent-dispatch transcript as e2e evidence |
+| v2.8.0 | multi-session | 6 | All 6 harnesses on the `AgentDriver` contract; first driver verified by a real dogfood run rather than unit tests alone; released incrementally (v2.9.0–v2.12.0) instead of one milestone drop; Nyquist coverage reconstructed for half the phases at close |
 
 ### Cumulative Quality
 
@@ -244,6 +287,7 @@ blocker on a requirement's traceability row.
 |-----------|-------|----------|-------------------|
 | gsd-hygiene | N/A — no crates code | N/A | 0 |
 | v2.7.0 | 13 `agents::pi` tests + full workspace + `clippy -D warnings` | N/A | 0 |
+| v2.8.0 | 1235 workspace tests, 0 failed; 6-driver conformance suite + `BrokenDriver` control; per-driver marker-less regressions (pi/antigravity/hermes at CLI level) | N/A | 0 (serde/clap/thiserror/tracing only) |
 
 ### Top Lessons (Verified Across Milestones)
 
