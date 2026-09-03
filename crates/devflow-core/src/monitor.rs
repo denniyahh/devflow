@@ -1187,7 +1187,7 @@ fn fire_idle_timeout(
 
     // 1. Enumerate. A failure degrades to an empty list plus a note; it never
     //    aborts, because a missing commit list must not cost the verdict.
-    let (commits, enumeration_note) = enumerate_phase_commits(workdir, phase);
+    let (commits, enumeration_note) = enumerate_phase_commits(project_root, workdir, phase);
 
     // 2. Write, flush, fsync. This completing is the ONLY thing that stops
     //    Layer 2 from later scoring partial commits as Success.
@@ -1234,19 +1234,47 @@ fn fire_idle_timeout(
 /// `(commits, degradation note)`.
 ///
 /// Same range construction `evaluate_layer2`'s commit COUNT uses
-/// (`{develop}..{feature_prefix}phase-NN`) — the same question asked with
+/// (`{base}..{feature_prefix}phase-NN`) — the same question asked with
 /// `git log` instead of `rev-list --count`, so the two can never disagree
 /// about which commits are the agent's.
+///
+/// **`project_root` and `workdir` are deliberately distinct (45-01, review
+/// round 2).** The git-flow config resolves from `project_root` — the
+/// canonical checkout — while the `git log` still runs in `workdir`.
+/// Resolving from `workdir` would read a phase worktree, which need not carry
+/// a `devflow.toml` that exists only in the main checkout, and would silently
+/// fall back to the default trunk. Against a mismatched trunk this range
+/// either over- or under-reports the phase's commits, which is exactly the
+/// false-evidence shape the never-silent commit gate depends on not producing.
 ///
 /// Never returns an error. Every failure path yields an empty list and a note
 /// naming what went wrong: the operator losing the commit NAMES is bad, the
 /// operator losing the VERDICT is the failure this whole plan exists to
 /// prevent.
 fn enumerate_phase_commits(
+    project_root: &Path,
     workdir: &Path,
     phase: PhaseId,
 ) -> (Vec<IdleTimeoutCommit>, Option<String>) {
-    let git_flow = crate::config::GitFlowConfig::default();
+    // CR-45-06: `git_flow_for_project` re-resolves from AMBIENT
+    // configuration, and `DEVFLOW_BASE_BRANCH` lives in the environment of
+    // whichever shell ran `devflow start`. A monitor re-launched by
+    // `devflow resume` from a clean shell therefore ranged from `develop`
+    // against a run based on something else — over- or under-reporting the
+    // phase's commits in the record that IS the operator's timeout evidence.
+    // Round 2's fix made this resolve from `project_root` rather than
+    // `workdir`, which is a different bug and left this one open.
+    //
+    // The state file is the same source of truth `git_flow_for_run` reads;
+    // consulting it here rather than threading a base through
+    // `run_pipe_owning_monitor`'s public signature keeps the fix local to
+    // the site that needs it. A missing or unreadable state degrades to the
+    // ambient resolution — the pre-existing behaviour, never an abort,
+    // because losing the verdict is worse than losing the commit names.
+    let persisted_base = crate::workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|state| state.base_branch);
+    let git_flow = crate::config::git_flow_for_run(project_root, persisted_base.as_deref());
     let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
     let range = format!("{}..{branch}", git_flow.develop);
 
@@ -1444,6 +1472,211 @@ mod tests {
         );
         state.stage = Stage::Code;
         state
+    }
+
+    // ---- 45-01 Task 3: idle-timeout commit evidence resolves its trunk
+    //      from the project, not from the phase worktree it runs `git log` in.
+
+    fn commit_range_git(root: &Path, args: &[&str]) {
+        let out = crate::test_support::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with `develop`, a `workspace/example` branch one commit ahead
+    /// of it, and `feature/phase-04` one commit ahead of THAT. The middle
+    /// commit is the discriminator: it is reachable from the configured base,
+    /// so a correctly-scoped range excludes it and a default-trunk range
+    /// includes it.
+    fn idle_commit_fixture(root: &Path) {
+        commit_range_git(root, &["init", "-q", "-b", "develop"]);
+        commit_range_git(root, &["config", "user.email", "t@e.st"]);
+        commit_range_git(root, &["config", "user.name", "t"]);
+        commit_range_git(root, &["config", "commit.gpgsign", "false"]);
+        commit_range_git(root, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        commit_range_git(root, &["add", "-A"]);
+        commit_range_git(root, &["commit", "-q", "-m", "init"]);
+
+        commit_range_git(root, &["checkout", "-q", "-b", "workspace/example"]);
+        std::fs::write(root.join("base-only.txt"), "x").unwrap();
+        commit_range_git(root, &["add", "-A"]);
+        commit_range_git(root, &["commit", "-q", "-m", "base-only commit"]);
+
+        commit_range_git(root, &["checkout", "-q", "-b", "feature/phase-04"]);
+        std::fs::write(root.join("agent-work.txt"), "x").unwrap();
+        commit_range_git(root, &["add", "-A"]);
+        commit_range_git(root, &["commit", "-q", "-m", "agent-work commit"]);
+    }
+
+    /// codex (external review, 2026-09-02, CR-45-06): this enumeration read
+    /// AMBIENT configuration, and `DEVFLOW_BASE_BRANCH` lives in the
+    /// environment of whichever shell ran `devflow start`. A monitor
+    /// re-launched by `devflow resume` from a clean shell therefore ranged
+    /// from `develop` against a run based elsewhere, and this list IS the
+    /// operator's idle-timeout evidence — the false-evidence shape the
+    /// never-silent commit gate depends on not producing. Round 2's fix
+    /// (resolve from `project_root`, not `workdir`) is a different bug and
+    /// left this one open.
+    #[test]
+    fn enumerate_phase_commits_prefers_the_runs_persisted_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        idle_commit_fixture(root);
+        // No `devflow.toml` and no environment variable: ambient resolution
+        // yields `develop`, which is precisely the resumed-shell case.
+        assert!(
+            std::env::var("DEVFLOW_BASE_BRANCH")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "DEVFLOW_BASE_BRANCH is exported — it outranks the ambient default"
+        );
+
+        let subjects = |root: &Path| -> Vec<String> {
+            let (commits, note) = enumerate_phase_commits(root, root, PhaseId::new(4));
+            assert!(note.is_none(), "enumeration must not degrade: {note:?}");
+            commits.into_iter().map(|c| c.subject).collect()
+        };
+
+        // NEGATIVE CONTROL, asserted FIRST: with no state on disk the
+        // enumeration falls back to ambient resolution and over-reports —
+        // `base-only commit` belongs to the base, not to the agent. This is
+        // the bug, and it pins that the assertion below is measuring the
+        // persisted base rather than passing for any reason at all.
+        let ambient = subjects(root);
+        assert!(
+            ambient.iter().any(|s| s == "base-only commit"),
+            "without persisted state the range runs from develop and includes base commits: \
+             {ambient:?}"
+        );
+
+        // The run recorded its base at `start`.
+        let mut state = crate::state::State::new(
+            PhaseId::new(4),
+            crate::state::AgentKind::Claude,
+            crate::mode::Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.base_branch = Some("workspace/example".to_string());
+        crate::workflow::save_state(&state).expect("save state");
+
+        let persisted = subjects(root);
+        assert!(
+            persisted.iter().any(|s| s == "agent-work commit"),
+            "a commit reachable only from the feature branch must be listed: {persisted:?}"
+        );
+        assert!(
+            !persisted.iter().any(|s| s == "base-only commit"),
+            "a commit already on the run's own base must NOT be reported as agent work: \
+             {persisted:?}"
+        );
+    }
+
+    #[test]
+    fn enumerate_phase_commits_ranges_from_the_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        idle_commit_fixture(root);
+        std::fs::write(
+            root.join("devflow.toml"),
+            "base_branch = \"workspace/example\"\n",
+        )
+        .unwrap();
+        assert!(
+            std::env::var("DEVFLOW_BASE_BRANCH")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "DEVFLOW_BASE_BRANCH is exported — it outranks devflow.toml"
+        );
+
+        let (commits, note) = enumerate_phase_commits(root, root, PhaseId::new(4));
+        assert!(note.is_none(), "enumeration must not degrade: {note:?}");
+        let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+
+        assert!(
+            subjects.contains(&"agent-work commit"),
+            "a commit reachable only from the feature branch must be listed: {subjects:?}"
+        );
+        // NEGATIVE CONTROL: a commit present on the configured base must NOT
+        // be listed. Without this half the test passes against a range built
+        // from the default trunk, which lists both.
+        assert!(
+            !subjects.contains(&"base-only commit"),
+            "a commit already on the configured base must not be listed: {subjects:?}"
+        );
+    }
+
+    /// Review round 2's monitor-root finding: the config must resolve from
+    /// the canonical project root, not from the phase worktree the `git log`
+    /// runs in. A phase worktree need not carry a `devflow.toml` that exists
+    /// only in the main checkout, and the fallback is silent.
+    #[test]
+    fn enumerate_phase_commits_resolves_config_from_the_project_root() {
+        // The project root: carries the config AND the git history.
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path();
+        idle_commit_fixture(project_root);
+        std::fs::write(
+            project_root.join("devflow.toml"),
+            "base_branch = \"workspace/example\"\n",
+        )
+        .unwrap();
+        assert!(
+            std::env::var("DEVFLOW_BASE_BRANCH")
+                .map(|v| v.is_empty())
+                .unwrap_or(true),
+            "DEVFLOW_BASE_BRANCH is exported — it outranks devflow.toml"
+        );
+
+        // The workdir: a linked worktree of the same repository that carries
+        // NO `devflow.toml` — the shape of a phase worktree whose base branch
+        // does not track the operator's local config.
+        let wt = tempfile::tempdir().unwrap();
+        let workdir = wt.path().join("phase-04");
+        commit_range_git(
+            project_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                workdir.to_str().unwrap(),
+                "feature/phase-04",
+            ],
+        );
+        assert!(
+            !workdir.join("devflow.toml").exists(),
+            "the worktree must not carry the config, or the test proves nothing"
+        );
+
+        let (commits, note) = enumerate_phase_commits(project_root, &workdir, PhaseId::new(4));
+        assert!(note.is_none(), "enumeration must not degrade: {note:?}");
+        let configured: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert!(
+            !configured.contains(&"base-only commit"),
+            "config resolved from the project root must scope the range: {configured:?}"
+        );
+
+        // NEGATIVE CONTROL: swap the two arguments so the config lookup hits
+        // the worktree instead. Without the swap the test cannot distinguish
+        // "resolved from the right root" from "both roots gave the same
+        // answer", which is the whole of the concern.
+        let (swapped, _) = enumerate_phase_commits(&workdir, project_root, PhaseId::new(4));
+        let swapped: Vec<&str> = swapped.iter().map(|c| c.subject.as_str()).collect();
+        assert_ne!(
+            configured, swapped,
+            "resolving config from the worktree must give a DIFFERENT range"
+        );
+        assert!(
+            swapped.contains(&"base-only commit"),
+            "the worktree has no config, so the swapped range falls back to the \
+             default trunk and over-reports: {swapped:?}"
+        );
     }
 
     // ---- close-rule fixtures ------------------------------------------

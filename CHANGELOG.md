@@ -1,5 +1,42 @@
 # Changelog
 
+## 2.12.0 — 2026-09-02
+
+Unattended auto-mode hardening (Phase 45). Makes `--mode auto` launchable and safe out of the box:
+a configurable git-flow trunk so a phase worktree can fork from a personal `.planning/`-tracking
+branch instead of hardcoded `develop`, a self-dogfood staleness check scoped to actual Cargo
+workspace members, and a shared unattended-decision policy for the Code stage.
+
+### Added
+
+- configurable base branch (`base_branch` in `devflow.toml`, or `DEVFLOW_BASE_BRANCH`), resolved
+  once and shared by the worktree fork point, the merge target, and every later process
+  (`advance`/`resume`/the monitor/ship evidence) that needs to agree on the same trunk
+- `affects_compiled_binary` scoped to Cargo workspace members plus root build files (including
+  `.cargo/config.toml`) for DevFlow's own self-dogfood check, so `.planning/spikes/` no longer
+  trips a false stale-build block; every other project DevFlow drives keeps its prior repo-wide rule
+- a shared `CODE_STAGE_POLICY` instructing the agent to evaluate unattended `decision` checkpoints
+  on merit and record its reasoning, delivered to both agent-family Code-stage renderers on the
+  first pass
+
+### Fixed
+
+- the base-branch substitution's blast radius: `cleanup_merged` could delete the built-in `develop`/
+  `main` trunks under a configured base, and the resolved base was not persisted, so a later
+  `resume` in a fresh shell silently fell back to `develop` for the worktree base, the idle-timeout
+  commit evidence, and the Ship merge-evidence check — each fixed to consult the run's own recorded
+  base
+- a `devflow.toml` that fails to parse no longer silently falls back to the default trunk; the
+  base-branch resolver's fail-hard contract now covers a bad file, not only a bad value
+
+### Known gap
+
+- the unattended-decision policy does not yet reach the Claude/OpenCode loop-back Code prompt
+  (`fix_prompt`'s `FullExecute` arm), so a run that fails Validate and retries under that path gets
+  no policy while the Codex/Pi equivalent does. Confirmed in shipped source by an internal review
+  and two independent external reviews; accepted as this release's terminal state for that one path
+  rather than reopening the plan — tracked as backlog 999.115 and 999.116.
+
 ## 2.11.0 — 2026-08-27
 
 Codex end-to-end verification (Phase 44). Proves `devflow resume --phase N --agent codex`

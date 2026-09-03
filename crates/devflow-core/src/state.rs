@@ -339,6 +339,20 @@ pub struct State {
     /// written by a binary predating this field.
     #[serde(default)]
     pub yes_ship: bool,
+    /// The integration trunk this run resolved at `start` (45-01/D-01),
+    /// persisted for the same reason [`Self::yes_ship`] is: the value comes
+    /// from `DEVFLOW_BASE_BRANCH` or `devflow.toml`, but every later entry
+    /// point (`advance`, `resume`, and the checkout hooks that merge the
+    /// phase branch) runs in a SEPARATE process whose environment need not
+    /// carry the export. Re-resolving from ambient configuration there let a
+    /// `devflow resume` from a fresh shell merge phase work into `develop`
+    /// while reporting success (CR-02, 45-REVIEW.md).
+    ///
+    /// `None` means EITHER "written by a binary predating this field" OR
+    /// "nothing was configured" — both fall back to the resolver, which is
+    /// the pre-existing behaviour.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// What this run's delivery canary established (D-13/D-15, 31-03),
     /// recorded by the first stage launch that routes through the Claude
     /// `stream-json` transport. `None` means EITHER "no canary has run for
@@ -462,6 +476,7 @@ impl State {
             stopped: false,
             stop_reason: None,
             yes_ship: false,
+            base_branch: None,
             canary: None,
             legacy_claude_launch: false,
         }
@@ -1001,6 +1016,46 @@ mod tests {
         );
         let loaded: State = serde_json::from_str(&json).unwrap();
         assert!(loaded.yes_ship, "yes_ship must round-trip through serde");
+    }
+
+    /// CR-02 (45-REVIEW.md): the base resolved at `start` only survives to
+    /// the later, separate process that merges the phase branch if it is
+    /// actually written to `state.json`.
+    #[test]
+    fn base_branch_round_trips_and_tolerates_states_predating_the_field() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.base_branch = Some("workspace/example".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("base_branch"),
+            "base_branch must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.base_branch.as_deref(),
+            Some("workspace/example"),
+            "base_branch must round-trip through serde"
+        );
+
+        // NEGATIVE CONTROL: a state written before this field existed must
+        // still deserialize, landing on `None` so the caller falls back to
+        // the resolver. Without this, `#[serde(default)]` could be dropped
+        // and every pre-existing state.json on disk would fail to load.
+        let without = json
+            .replace(",\"base_branch\":\"workspace/example\"", "")
+            .replace("\"base_branch\":\"workspace/example\",", "");
+        assert!(
+            !without.contains("base_branch"),
+            "the field must actually be removed for this control to mean anything"
+        );
+        let legacy: State = serde_json::from_str(&without)
+            .expect("a state predating base_branch must still deserialize");
+        assert_eq!(legacy.base_branch, None);
     }
 
     /// A serde-absent `yes_ship` (state written by a pre-23-09 binary) must
