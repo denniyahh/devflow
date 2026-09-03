@@ -415,6 +415,81 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.121: OpenCode Has No CLI-Level `marker-less run never advances` Regression Test (BACKLOG)
+
+**Found:** 2026-09-03, v2.8.0 milestone audit (`/gsd-audit-milestone`, integration checker
+Warning 2). Not a defect — a coverage asymmetry surfaced while auditing cross-phase wiring.
+
+The "a marker-less agent run must never advance a commit-gated stage" guarantee has
+`devflow start`-level regression tests (stub binary → real launch path → assert the run gates at
+`Stage::Plan`) for **pi, antigravity, and hermes** in `crates/devflow-cli/tests/phase7_cli.rs`
+(`pi_marker_less_run_does_not_advance`, `marker_less_antigravity_never_advances`,
+`hermes_marker_less_run_does_not_advance`, plus non-zero-exit siblings). **codex, opencode, and
+claude have no CLI-level equivalent** — they are covered only at the `agent_result.rs` parser
+layer (`opencode_real_success_capture_is_recognised_and_marker_less`,
+`opencode_real_tool_use_capture_defers_to_layer2`, `codex_turn_completed_no_marker_defers`,
+`claude_envelope_is_error_false_defers`).
+
+The guarantee is structurally shared (commit-gate + Layer 1 `None` → Layer 2), codex received a
+full Phase 44 dogfood, and claude is the reference driver — so this is uneven coverage, not a
+hole. **OpenCode is the weakest of the three**: parser regression against three vendored captures
+(OPCD-02) but nothing exercises the `opencode run --auto --format json` argv through
+`devflow start` to a gate.
+
+**Fix shape:** add one `opencode_marker_less_run_does_not_advance` (and optionally
+`opencode_nonzero_exit_does_not_advance`) to `phase7_cli.rs`, mirroring the pi/hermes stub-binary
+pattern — a stubbed `opencode` that emits a well-formed `--format json` stream with no
+`DEVFLOW_RESULT` marker, then assert the run gates at `Stage::Plan` and leaves state un-advanced,
+with `MonitorReapGuard`.
+
+**Acceptance:** the new test FAILS (0 passed) against a tree where the OpenCode commit-gate wiring
+is reverted, and passes with it present; non-zero `filtered out`.
+
+### Phase 999.120: One `git_flow_for_project` Ambient Re-Resolution Survives in the Validate Loop-Back Path (BACKLOG)
+
+**Found:** 2026-09-03, v2.8.0 milestone audit (`/gsd-audit-milestone`, integration checker
+Warning 1). Confirmed by inspection; not yet reproduced.
+
+Phase 45 (AUTO-01 / 999.110) converted the base-branch resolution to a resolve-once-then-persist
+model: `commands::start` resolves `config::base_branch` a single time, persists it to
+`State::base_branch`, and every later consumer reads it back via
+`config::git_flow_for_run(project_root, state.base_branch.as_deref())`. Four sibling call sites
+were converted — `pipeline_outcomes.rs:1066`, `pipeline_launch.rs:1480`, `monitor.rs:1277`,
+`ship_evidence.rs:166`.
+
+**One site was missed.** `crates/devflow-cli/src/pipeline_outcomes.rs:598-601`, inside
+`handle_validate_outcome`, still calls:
+
+```rust
+agent_result::phase_commit_count(
+    project_root,
+    &devflow_core::config::git_flow_for_project(project_root),   // ambient re-resolution
+    state.phase,
+)
+```
+
+`state` (and therefore `state.base_branch`) is in scope. The CR-01 comment block above it
+(`:511-521`) governs *root* selection, not trunk config, so this reads as a missed conversion
+rather than a deliberate exception.
+
+**Impact — narrow.** Drift occurs only when the base is configured via the `DEVFLOW_BASE_BRANCH`
+environment variable (not a `devflow.toml` key) **and** the detached `advance` / monitor process —
+which does not inherit the operator's shell environment — reaches this line. The effect is a wrong
+`{develop}..{branch}` rev-list count feeding the `consecutive_failures_made_progress` "did this
+Validate cycle make progress" heuristic; saturating counters bound the blast radius. Not a broken
+flow.
+
+**Fix shape:** replace the call with
+`config::git_flow_for_run(project_root, state.base_branch.as_deref())`, matching the four
+already-converted sites.
+
+**Acceptance:** a test that configures `base_branch` to a non-default value, drives
+`handle_validate_outcome` from a detached-process-like context, and asserts the commit count is
+computed against the configured base — with a negative control that the default-base case is
+unchanged. `rg -n 'git_flow_for_project' crates/devflow-cli/src/pipeline_outcomes.rs` returns only
+non-production (test) sites afterward.
+
+
 ### Phase 999.119: Live `devflow start --mode auto` End-to-End Verification of the Configured-Base Fork/Preflight/Merge Chain (BACKLOG)
 
 **Found:** 2026-09-02, phase 45 UAT (`45-UAT.md` test 1) and verification
