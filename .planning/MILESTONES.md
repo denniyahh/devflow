@@ -4,15 +4,51 @@
 
 **Phases completed:** 6 phases, 16 plans, 26 tasks
 
+**Closed as `override_closeout`.** Known verification overrides: 0 newly acknowledged, 9 carried
+forward from a prior close (see STATE.md Deferred Items).
+
+### Known Gaps
+
+- **DECN-01** (999.94) — partially delivered. `CODE_STAGE_POLICY` reaches the first Code pass for
+  both agent families but not the Claude/OpenCode `fix_prompt` loop-back, and is contradicted by
+  `checkpoint_auto_decide_prompt` for blocking-human gates. Deferred by operator decision to
+  backlog **999.115** / **999.116**.
+- **AUTO-01** live `devflow start --mode auto` end-to-end run — not performed (no committed
+  `base_branch` in this repo). Deferred to backlog **999.119**; the code is unit/integration-verified
+  with a fork-point negative control.
+
 **Key accomplishments:**
 
-- Backfilled 2026-08-23
-- Backfilled 2026-08-23
-- OpenCode driver now launches `opencode run "<prompt>" --auto --format json` and its JSONL output resolves through a new `parse_opencode_event_result` (marker, error, torn-tail) regression-tested against three real live captures.
-- `OpenCodeDriver::health` now refuses an OpenCode launch on a machine with zero configured provider credentials (parsed from `opencode providers list`, never from exit code), and `capabilities` reports `subagent_dispatch` from a real, fail-closed `opencode agent list` probe.
-- `devflow resume --phase 900 --agent codex` drove a throwaway phase's Code and Validate stages to a clean finish (2 real commits, 0-finding review, passing validation), and the phase7_cli.rs and pre_push_signing_policy.rs stale test assertions this run's own regression checks surfaced are both closed with cited commits — CODE-01 is now complete.
-- DevFlow now ignores non-workspace spikes for its self-dogfood stale-build block while retaining true-positive member-source and downstream-project detection.
-- Full-execute Code prompts now share a merit-based unattended-decision policy across all four supported agent families, with explicit human-only carve-outs and auditable-reasoning instructions.
+- **Pi dogfooded** (Phase 40) — the shipped v2.7.0 Pi driver survived a real supervised
+  Define→Validate run with a witnessed reviewer-subagent dispatch and a live gate; the two 999.85
+  stale comments rewritten (MAINT-01); 3 Pi-transport regression tests (marker-less, non-zero-exit,
+  hung).
+- **Antigravity CLI driver** (Phase 41) — `--agent antigravity` launches `agy` headless
+  (stream-json, `--print-timeout 60m`, prompt on stdin), agent-aware `CloseRule`/idle-timeout,
+  6-driver conformance enrolled. Plus HYG-01 (phase-7 tests reap their own monitors: 0 leaked, was
+  43) and HYG-02 (`check-in-container.sh` under uid 0 from worktree + main checkout).
+- **Hermes driver** (Phase 42) — `hermes -z "<prompt>" --yolo --accept-hooks` headless on a Legacy
+  monitor, process-exit + `DEVFLOW_RESULT` completion contract. The Antigravity supervised dogfood
+  in this phase unlocked `--mode auto` for Antigravity at the C2 preflight gate (ANTG-04).
+- **OpenCode stub completed** (Phase 43, 28 → 569 lines) — real `opencode run … --auto --format
+  json` argv; `parse_opencode_event_result` (torn-tail → error-anywhere → last-marker)
+  regression-tested against three real live captures; fail-closed `health` (exit-success AND
+  positive credential count) and header-anchored `capabilities` probe. A code review found 4
+  fail-closed gaps — all fixed same-phase.
+- **Codex verified end-to-end** (Phase 44) — `devflow resume --phase 900 --agent codex` drove a
+  throwaway phase's Code and Validate stages to a clean finish (2 real commits, 0-finding review,
+  passing validation); surfaced stale `phase7_cli.rs` / `pre_push_signing_policy.rs` assertions
+  closed; driver contract byte-unchanged (D-04); 7 post-hoc review findings all fixed. Shipped
+  v2.11.0 (PR #154).
+- **Unattended `--mode auto` hardening** (Phase 45) — `config::base_branch` resolver (env > file >
+  `develop`) resolved once and fed to both the worktree fork point and the git-flow merge target
+  (AUTO-01); `affects_compiled_binary` scoped to Cargo workspace members, ignoring
+  `.planning/spikes/` (AUTO-02); shared merit-based `CODE_STAGE_POLICY` decision-checkpoint
+  constant (DECN-01, partial). Shipped v2.12.0 (PR #203).
+
+**Released incrementally:** v2.9.0 … v2.12.0. **Milestone audit:**
+`.planning/milestones/v2.8.0-MILESTONE-AUDIT.md` (status `tech_debt`). **Follow-up backlog:**
+999.115, 999.116, 999.118, 999.119, 999.120, 999.121.
 
 ---
 
