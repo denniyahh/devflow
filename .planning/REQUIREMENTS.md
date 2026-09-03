@@ -148,26 +148,41 @@ Acknowledged, not in this milestone.
 
 ## Traceability
 
-Populated during roadmap creation.
+Populated during roadmap creation (2026-09-03). Wave order is load-bearing — see ROADMAP.md
+§ v3.0.0 milestone.
 
-| Requirement | Phase | Status |
-|-------------|-------|--------|
-| DECN-02 | TBD | Pending |
-| DECN-03 | TBD | Pending |
-| VALID-01 | TBD | Pending |
-| VALID-02 | TBD | Pending |
-| INFRA-01 | TBD | Pending |
-| SURV-01 | TBD | Pending |
-| SURV-02 | TBD | Pending |
-| VERIFY-01 | TBD | Pending |
-| SUPV-01 | TBD | Pending |
-| SUPV-02 | TBD | Pending |
+| Requirement | Phase | Wave | Status |
+|-------------|-------|------|--------|
+| INFRA-01 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Pending |
+| VALID-01 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Pending |
+| VALID-02 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Pending |
+| DECN-02 | Phase 47 — Unattended Decision Policy Consistency | 1 | Pending |
+| DECN-03 | Phase 47 — Unattended Decision Policy Consistency (behavioural arm resolves against Phase 49) | 1 | Pending |
+| SURV-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery (field arm observed, not settled, in Phase 49) | 2 | Pending |
+| SURV-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Pending |
+| SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Pending |
+| SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**
 - v3.0.0 requirements: 10 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 10 ⚠️
+- Mapped to phases: 10
+- Unmapped: 0 ✓
+- Duplicates (a requirement owned by more than one phase): 0 ✓
+
+**Cross-phase resolution notes.** Two requirements are *owned* by an earlier phase but carry an arm
+that only a later phase can answer. The owning phase is still the single mapping — the later phase
+records an observation, it does not take ownership:
+
+- **DECN-03** — Phase 47 removes the prompt-level contradiction. Which instruction a model actually
+  follows is a question about instruction-priority and is not answerable by reading source; Phase 49's
+  live run answers it, or records explicitly that it never exercised that path.
+- **SURV-01** — Phase 48's acceptance is a test that fails on the current implementation with a
+  single-writer negative control. No interleaving has been observed in the wild; Phase 49 records
+  whether the live run produced one. A run with no observed interleaving confirms nothing and must
+  not be written up as if it did.
 
 ---
 *Requirements defined: 2026-09-03*
-*Last updated: 2026-09-03 after milestone v3.0.0 declared*
+*Last updated: 2026-09-03 after the v3.0.0 roadmap was created — 10/10 requirements mapped
+across 6 phases (46-51), 5 waves.*

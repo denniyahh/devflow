@@ -2,6 +2,222 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
+## 🚧 v3.0.0 milestone (ACTIVE — Unattended Run Survivability)
+
+**Declared 2026-09-03.** Prove DevFlow's `--mode auto` chain end to end on a live run, close the
+decision-policy and persistence holes that would make such a run misbehave silently, then replace
+the PID-addressed monitor so a stalled run is recoverable by design rather than by diagnosis.
+**Major version** because Phase 50 replaces the monitor mechanism and adds a socket path to
+`state.json`, breaking state-file compatibility with 2.x on a published crate.
+
+**Sequencing is load-bearing, not a preference.** Five waves in this order: correctness (46, 47) →
+survivability (48) → the live run that measures them (49) → the supervisor (50) → failover on top
+of it (51). **Phase 49 is the milestone's measuring instrument** — landing it before the wave-1/2
+fixes would measure the defects rather than the chain. Two requirements are deliberately scheduled
+to resolve *against* that live run because they cannot be settled by reading source: **DECN-03**
+(which of two contradictory prompts an agent actually follows) and, more weakly, **SURV-01** (no
+interleaving has ever been observed in the wild). **INFRA-01 lands first** — a workflow-file-only
+change that should be running underneath the rest of the milestone rather than alongside it.
+
+**Provenance.** Every requirement traces to a defect re-verified against the v2.12.0 tree on
+2026-09-03, not to a filing taken on trust. Where `REQUIREMENTS.md` records a **Not established**
+note, the success criteria below deliberately claim no more than the evidence supports.
+
+| Phase | Name | Requirements | Wave | Status |
+|---|---|---|---|---|
+| 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Not started |
+| 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Not started |
+| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02 | 2 | Not started |
+| 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
+| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
+| 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
+
+### Phase 46: CI Load Shape and Operator Input Validation
+
+**Goal**: CI reproduces the sequential `fmt → clippy → test` load shape the local pre-push gate
+runs, and the two operator inputs that fail confusingly today — a `base_branch` naming a computed
+revision, and `devflow stop`'s project root — behave the way the rest of the CLI does.
+**Depends on**: Nothing — first phase of the milestone.
+**Sequencing note**: A workflow-file addition plus two CLI-surface corrections; no pipeline
+behaviour change. Sequenced first so the CI job is merged and running underneath every later
+phase's pushes rather than alongside them.
+**Requirements**: INFRA-01, VALID-01, VALID-02
+**Success Criteria** (what must be TRUE):
+
+  1. A CI job runs the `scripts/check.sh` parts sequentially in one job (`fmt` → `clippy` → `test`)
+     on a 2-core runner and reports against a PR's current `HEAD_SHA` in `gh pr checks` — while the
+     three existing parallel jobs (`test`, `clippy`, `fmt`) still run and still pass, so the new
+     job is an addition rather than a re-shape. **Not claimed:** that this job catches the 999.47
+     `/proc` fork-inheritance race. CI has rejected 0 of the pushes the local gate rejected 2 of 2;
+     the criterion is that the load shape now exists in CI, not that it has caught anything.
+  2. A configured `base_branch` of `refs/heads/develop~1`, `develop@{0}` or `develop^{}` is refused
+     with a message naming the offending value — and the negative control still holds in the same
+     assertion loop: a plain local branch name is still accepted, and `refs/heads/nonexistent-xyz`
+     still fails for the pre-existing reason. Extends the existing
+     `ensure_base_is_a_local_branch_rejects_commit_ish_that_is_not_a_local_branch`
+     (`commands.rs:5459`), which already carries its own negative control, rather than adding a
+     parallel test.
+  3. `devflow stop --phase N .` accepts the positional project root exactly as `start`, `resume` and
+     `status` do; a genuinely wrong root still fails, and fails with an error that names the
+     offending argument rather than a bare usage error — the failure mode that made #200 read as
+     "stop did not work" instead of "stop rejected my input".
+
+**Plans**: TBD
+
+### Phase 47: Unattended Decision Policy Consistency
+
+**Goal**: An unattended agent receives the same merit-based decision instruction everywhere it is
+asked to make a Code-stage decision — including the Claude/OpenCode Validate loop-back, the primary
+agent's common path — and is never handed two contradictory instructions about who may resolve a
+`blocking-human` gate inside one resumed session. Closes the half of DECN-01 that v2.8.0 shipped
+undelivered.
+**Depends on**: Nothing — prompt rendering only, independent of Phase 46.
+**Sequencing note**: Wave 1 by milestone design — this must be true before Phase 49 measures a run.
+**Requirements**: DECN-02, DECN-03
+**Success Criteria** (what must be TRUE):
+
+  1. `fix_prompt` renders `CODE_STAGE_POLICY` for `Code { fix: Some(FullExecute) }`, so the two
+     renderers agree for that arm. **Negative control, and the scope constraint:** `GapsOnly` and
+     `AuditFix` still omit the policy — the existing test at `prompt.rs:810` that requires the
+     omission must still pass unmodified, not be relaxed to accommodate the fix.
+  2. A test asserting the policy's presence on the loop-back path fails against the pre-fix tree and
+     passes after — the search is proven non-empty by `COMPLETION_PROTOCOL` at `prompt.rs:578`, so
+     an absent match means absence rather than a mis-scoped search.
+  3. A prompt rendered with both `CODE_STAGE_POLICY` (`prompt.rs:62`) and
+     `checkpoint_auto_decide_prompt` (`prompt.rs:537`, injected at `pipeline_launch.rs:1100`) states
+     exactly one rule about who may resolve a `blocking-human` gate; a test that detects the
+     contradiction fails before the fix and passes after.
+  4. **Deliberately NOT closed here:** which instruction a model actually follows when both are
+     present. That is a question about model instruction-priority and is not answerable by reading
+     source. This phase closes the prompt-level contradiction and records the behavioural question
+     as an explicit observation item for Phase 49's live run — naming in advance what would count
+     as evidence either way — rather than marking DECN-03 settled on a source read.
+
+**Plans**: TBD
+
+### Phase 48: Survivable State Writes and Honest Gate Recovery
+
+**Goal**: A second writer cannot silently erase another's state update, and a gate whose consumer is
+gone tells the operator the repair that actually works instead of asserting a waiter that does not
+exist.
+**Depends on**: Phases 46, 47
+**Sequencing note**: Wave order — correctness lands before survivability. There is no code-level
+coupling; this is the milestone's stated design.
+**Requirements**: SURV-01, SURV-02
+**Success Criteria** (what must be TRUE):
+
+  1. A test drives two writers for the same phase and **fails against the current implementation** —
+     `workflow.rs:185-193` derives `path.with_extension("tmp")`, a pure function of the state path,
+     so every writer for a phase writes the same temp file. A single-writer control exercising the
+     same path must still round-trip cleanly, so a red result discriminates concurrency from a
+     broken harness. **Not established, and not claimed:** no interleaving has been observed in the
+     wild — the evidence for SURV-01 is the failing-then-passing test, not a field sighting.
+  2. After the fix, both writers' updates are observable in the final state file — neither is
+     silently dropped — and the single-writer control still round-trips.
+  3. `devflow gate reject` and `devflow stop` check whether a consumer exists before claiming one
+     will pick up the response. With no consumer, they name the repair that works —
+     `devflow resume --phase N`, which `doctor`'s `check_gate_pending_without_gate` already
+     prescribes — and specifically do not prescribe `rm -f`, which the live reproduction showed is
+     not required.
+  4. The #200 wedge is reproducible on demand and its shape is pinned in both directions: the wedge
+     requires the foreground `start` to be **interrupted**, and a run left alone self-resolves in
+     ~40s. The self-resolving arm is the negative control — if both arms wedge, the reproduction is
+     measuring something else.
+
+**Plans**: TBD
+
+### Phase 49: Live Unattended Run — The Milestone's Instrument
+
+**Goal**: A real `devflow start --mode auto` run on this repository is recorded end to end against a
+configured base — fork point, preflight, unattended progression, and Ship merge target — so the
+milestone's earlier fixes are measured on a live chain rather than asserted from unit evidence.
+**Depends on**: Phases 46, 47, 48
+**Sequencing note**: Deliberate, not incidental. This run is the measuring instrument for the whole
+milestone; landing it before the wave-1/2 fixes would measure the defects rather than the chain.
+**Requirements**: VERIFY-01
+**Success Criteria** (what must be TRUE):
+
+  1. **Setup step, inside this phase, not a precondition:** this repository has no committed
+     `devflow.toml`, so a `base_branch` is configured here first. The run's persisted
+     `State::base_branch` then reads that configured value rather than the `develop` default.
+  2. The run is recorded fork point through Ship merge target: an observed fork point on the
+     configured base, `unattended_config_condition = Holds`, unattended stage progression, and an
+     observed Ship merge target. **The Ship merge target has never been observed at all** — this
+     criterion is the first observation of it, not a re-confirmation.
+  3. The negative-control arm still holds when re-run against **this phase's binary**, not inherited
+     from the 2026-09-03 capture: an unconfigured scratch repo forks from `develop` (persisted
+     `"base_branch": "develop"`) and refuses on the missing `.planning/config.json`. Both arms must
+     be produced by the same binary or the pair discriminates build vintage rather than config.
+  4. DECN-03's carried behavioural question is answered against this run — which instruction the
+     agent follows when `CODE_STAGE_POLICY` and `checkpoint_auto_decide_prompt` are both present —
+     or the run records explicitly that it never exercised that path. Either is a result; silence
+     is not.
+  5. SURV-01's field question is recorded the same way: whether the run produced any concurrent
+     state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
+     must not be written up as if it confirmed anything.
+
+**Plans**: TBD
+
+### Phase 50: Addressable Monitor Liveness
+
+**Goal**: "Is this run's monitor alive?" is answerable from disk state alone without a PID, in three
+distinguishable states — GONE, STALE, ALIVE — so a stalled unattended run is recoverable by design
+rather than by diagnosis. This is the milestone's breaking change.
+**Depends on**: Phase 49
+**Sequencing note**: Wave order — the instrument is recorded against the existing mechanism before
+that mechanism is replaced, so the reference run is not perturbed by the change it would otherwise
+be measuring.
+**Requirements**: SUPV-01
+**Success Criteria** (what must be TRUE):
+
+  1. Liveness resolves to exactly one of GONE / STALE / ALIVE from `state.json` plus the socket at
+     the recorded path, with no PID read on the answering path. Each of the three states is produced
+     by a fixture built to produce it, and each fixture produces **only** that state — three fixtures
+     that all report ALIVE would mean the predicate is not discriminating.
+  2. `MonitorLaunch::PipeOwning` and `MonitorLaunch::Legacy` answer liveness identically for the same
+     condition. `PipeOwning` (Phase 31) is already a Rust supervisor, so this is "give an existing
+     supervisor an address" for that variant and a genuine replacement only for `Legacy` — which
+     still carries every non-Claude agent and the checkpoint-resume relaunch. A PipeOwning-only
+     answer buys nothing for most agents and does not satisfy this criterion.
+  3. The socket path is persisted in `state.json` and resolves under `~/.cache/devflow/` — not the
+     project tree, and not `$XDG_RUNTIME_DIR`, which systemd deletes at logout. A path that would
+     exceed `sun_path` (108 bytes on Linux, 104 on macOS) is refused at construction with a named
+     error rather than silently truncated.
+  4. The state-file break is explicit, not incidental: a 2.x `state.json` with no socket path is
+     detected and reported as incompatible, never silently misread as GONE. This is the observable
+     that justifies the major version.
+
+**Plans**: TBD
+
+### Phase 51: Rate-Limit Agent Failover
+
+**Goal**: An agent that exhausts its token budget mid-stage does not end the night — the run
+continues under a configured fallback agent, in the same worktree on the same branch, with no manual
+conflict resolution.
+**Depends on**: Phase 50 — a dependency to VERIFY, not to assume.
+**Sequencing note**: `devflow resume --agent` already performs the driver substitution this needs
+(a v2.8.0 delivery that shrank #180), so whether SUPV-01's liveness answer is actually required must
+be re-tested here rather than inherited from the issue's original design.
+**Requirements**: SUPV-02
+**Success Criteria** (what must be TRUE):
+
+  1. On `AgentStatus::RateLimited` with a fallback agent configured, the run continues under the
+     fallback in the same worktree on the same branch, with no manual conflict resolution, and the
+     resumed stage reaches a normal completion.
+  2. Both exhaustion answers coexist and each is asserted: fallback configured → agents switch;
+     no fallback configured → `write_rate_limit_cron` still fires. A suite that only exercises the
+     fallback arm does not satisfy this.
+  3. The SUPV-01 dependency is settled by observation, not inheritance: the phase records whether
+     failover still works with Phase 50's liveness answer unavailable, so "SUPV-02 depends on
+     SUPV-01" ends the milestone as a measured result rather than a design assumption.
+  4. The stale half of #180's "What exists today" stays dead — the `n` verb, `git.rebase_in` and the
+     rebase handoff were all removed (D-11, 23d) and none is reintroduced. Counted over source with
+     comments stripped, since a grep over raw source counts comment prose (the Phase 35-01 lesson).
+
+**Plans**: TBD
+
+---
+
 ## ✅ v2.8.0 milestone (CLOSED 2026-09-03 — Remaining Harness Support + Pi Dogfood)
 
 **Declared 2026-08-18, closed 2026-09-03.** Onboarded the last coding harnesses onto the modular
@@ -148,6 +364,12 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 43 | 2/2 | Complete | 2026-08-24 |
 | 44 | 5/5 | Complete | 2026-08-27 |
 | 45 | 3/3 | Complete | 2026-09-02 |
+| 46 | — | Not started | — |
+| 47 | — | Not started | — |
+| 48 | — | Not started | — |
+| 49 | — | Not started | — |
+| 50 | — | Not started | — |
+| 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 

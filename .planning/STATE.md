@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v3.0.0
 milestone_name: Unattended Run Survivability
 status: planning
-last_updated: "2026-09-03T18:58:12.968Z"
+last_updated: "2026-09-03T19:09:48.508Z"
 last_activity: 2026-09-03
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -46,17 +46,23 @@ pipe-tables to bullet lists in the same edit — `audit-open`'s deferred-items s
 
 ## Active Phase
 
-**None.** Milestone **v2.8.0 — Remaining Harness Support + Pi Dogfood** closed 2026-09-03 as
-`override_closeout`. All six phases (40-45) verified and shipped (incrementally, v2.9.0 …
-v2.12.0). Phase detail archived to `.planning/milestones/v2.8.0-phases/`; ROADMAP/REQUIREMENTS/
-audit to `.planning/milestones/v2.8.0-*`.
+**None yet — Phase 46 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
+declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
+requirements mapped. Nothing has been planned or executed.
 
-**Known gap carried forward:** DECN-01 is partially delivered — `CODE_STAGE_POLICY` does not reach
-the Claude/OpenCode `fix_prompt` loop-back and is contradicted by `checkpoint_auto_decide_prompt`
-for blocking-human gates. Deferred to backlog **999.115** / **999.116**. AUTO-01's live
-`devflow start --mode auto` end-to-end run deferred to **999.119**. Audit integration warnings
-filed as **999.120** (residual ambient `git_flow_for_project`) / **999.121** (OpenCode CLI
-marker-less test).
+**The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
+survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
+supervisor (50) → rate-limit failover on top of it (51). Phase 49 is the measuring instrument;
+landing it earlier would measure the defects rather than the chain.
+
+**Two open questions are deliberately carried, not closed on a source read:** DECN-03 (which of two
+contradictory prompts an agent actually follows) resolves against Phase 49's live run, and SURV-01's
+field arm (no state-write interleaving has ever been observed in the wild) is recorded — not
+settled — by that same run.
+
+**Carried forward from the v2.8.0 close, NOT in this milestone:** **999.120** (residual ambient
+`git_flow_for_project` re-resolution in the Validate loop-back) and **999.121** (OpenCode has no
+`devflow start`-level marker-less regression test). Promote with `/gsd-review-backlog` when ready.
 
 ## Project Reference
 
@@ -64,21 +70,26 @@ See: `.planning/PROJECT.md` (updated 2026-09-03)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** No milestone declared — run `/gsd-new-milestone`.
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 46 (CI Load Shape and Operator
+Input Validation), not yet planned.
 
 ## Operator Next Steps
 
-- `/gsd-new-milestone` to scope the next milestone.
+- `/gsd-plan-phase 46` to plan the first phase (INFRA-01 + VALID-01 + VALID-02).
+- Before starting Phase 46's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
+  then `git worktree add -b feature/phase-46 .worktrees/phase-46 develop` — per CLAUDE.md.
+- Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
+  `base_branch` must be configured before the live `--mode auto` run is possible.
 - `workspace/denniyahh` is ahead of `origin/develop` and unpushed — push when ready.
-- Backlog follow-ups from the v2.8.0 close: 999.115, 999.116, 999.118, 999.119, 999.120, 999.121.
+- Backlog items NOT promoted into v3.0.0: 999.120, 999.121.
 
 ---
 
 ### Historical — superseded phase notes
 
 The entries below describe earlier phases and are retained for context. They are
-**not** the active phase; the frontmatter `status` above (no `current_phase` —
-milestone v2.4.0 is closed, awaiting the next milestone) is authoritative.
+**not** the active phase; the `## Active Phase` and `## Current Position` sections above
+(milestone v3.0.0, Phase 46 next and unplanned) are authoritative.
 
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
 Claude** — **scoped 2026-07-25.** The goal was the
@@ -143,10 +154,13 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-09-03 — Milestone v3.0.0 started
+Phase: 46 of 6 (CI Load Shape and Operator Input Validation) — first phase of v3.0.0
+Plan: — (no plans yet)
+Status: Ready to plan
+Last activity: 2026-09-03 — v3.0.0 roadmap created: 6 phases (46-51), 5 waves, 10/10 requirements
+mapped, 0 orphans
+
+Progress: [░░░░░░░░░░] 0% (0 of 6 phases complete)
 
 ## Recently Shipped
 
@@ -829,13 +843,14 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-02T09:28:23.614Z
-**Stopped at:** Completed 45-02-PLAN.md
+**Last session:** 2026-09-03
+**Stopped at:** v3.0.0 roadmap created (ROADMAP.md phases 46-51, REQUIREMENTS.md traceability
+populated). Nothing planned or executed.
 **Resume file:** None
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- `/gsd-plan-phase 46` — see the fuller list under the first `## Operator Next Steps` above.
 
 ## Accumulated Context
 
