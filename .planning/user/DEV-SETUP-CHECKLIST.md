@@ -172,6 +172,27 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PROJECT]** `.planning/config.json` — per-project GSD config (branching strategy, phase
   branch template, model overrides, feature toggles). This is the part that's genuinely
   project-specific even though the GSD engine itself is global.
+- [ ] **[PATTERN]** **`~/.gsd/defaults.json` is NOT a fallback layer under a project.** Verified
+  2026-09-03: a repo containing `.planning/` but no `config.json` inherits *nothing* from the
+  global file — every key returns not-found, `commit_docs` included, even though the global sets
+  it. The global applies only in the loader's Branch D, which requires **no `.planning/` directory
+  at all** (so: `new-project` bootstrap, and GSD commands run outside a project). The lone
+  exception is the `effort` block, which the install-time effort sync does merge globally — which
+  is why `effort` is excluded from the shadowed-key warning. Consequences when replicating:
+  - Never "align" a project with the global by **deleting** the project config. You inherit
+    nothing and lose the project-only blocks (`git.*`, `mempalace`, `model_overrides`,
+    `review.default_reviewers`, `intel`) that have no global counterpart.
+  - Never align by **copying** the global verbatim either. The two files use different shapes:
+    the global puts `granularity`, `parallelization`, `runtime`, `resolve_model_ids` and `effort`
+    at the top level. Copy blindly and you import values at paths that are never read, believing
+    you changed something.
+  - Validate values against `gsd-core/references/planning-config.md` before porting. Three invalid
+    values were found here in one pass: `granularity: "medium"` (valid: `coarse`/`standard`/`fine`
+    — it had been silently falling back to the standard band), `discuss_mode: "exploratory"`
+    (valid: `discuss`/`assumptions`), and `subagent_timeout: 900` against a **milliseconds**
+    schema whose default is `300000`.
+  - When porting `effort`, carry `routing_tier_defaults` across with it. Creating an `effort` block
+    without them silently kills the tier defaults.
 - [ ] **[GLOBAL]** MCP servers registered via `claude mcp list` (Google Drive/Gmail/Calendar,
   GitHub, plus two currently broken — `gsd-workflow`, `gsd-browser` — worth fixing or dropping if
   replicating cleanly rather than copying the breakage). A Linear server may still be registered;
