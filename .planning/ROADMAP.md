@@ -426,6 +426,23 @@ a live unattended run. They are verified at unit level only."
 resolving to the configured base — with a negative control that an unconfigured repo still forks
 from `develop`.
 
+**Partial evidence banked 2026-09-03 (the negative control half only).** While reproducing #200
+against v2.12.0, a real `devflow start --phase 7 --mode auto` was driven in a scratch repo with no
+`devflow.toml` and no `.planning/config.json`. It produced, live:
+
+- worktree created at `.worktrees/phase-07` on `feature/phase-07`, and persisted
+  `"base_branch": "develop"` in `state-07.json` — i.e. **an unconfigured repo does still fork from
+  `develop`**, which is exactly this entry's required negative control;
+- `unattended_config_condition` reporting `[DOES NOT HOLD] GSD config can hold the chain flag — no
+  .planning/config.json under the launch root`, and the launch correctly refusing rather than
+  proceeding.
+
+So the "unconfigured" arm of the acceptance is now observed on a live run rather than inferred.
+**The positive arm remains entirely unverified** — nothing has yet run with `base_branch` set to a
+planning branch, and the Ship merge target has never been observed at all. `devflow.toml` is still
+absent from this repository (confirmed 2026-09-03), so the setup step this entry names is still
+outstanding.
+
 ### Phase 999.118: `write_state_atomic` Uses a Fixed `.tmp` Filename, So Two Processes Saving the Same Phase Race (BACKLOG)
 
 **Found:** 2026-09-02, phase 45 external adversarial code review (agy / gemini-3.1-pro-high;
@@ -469,6 +486,10 @@ in the same directory gets this for free and is already a dependency.
 **Acceptance:** a test that fails on the current fixed-name implementation and passes on the fix,
 carrying a negative control that a single writer still round-trips its own state.
 
+**Re-verified 2026-09-03 against v2.12.0.** Unchanged, verbatim as filed —
+`crates/devflow-core/src/workflow.rs:185-193` still derives `let tmp = path.with_extension("tmp")`
+and writes-then-renames. Still not reproduced; the entry's own "Not yet reproduced" limit stands.
+
 ### Phase 999.117: Scoped Staleness Accepts Any `crates/**` Path Rather Than the Declared Workspace Members (BACKLOG)
 
 **Found:** 2026-09-02, phase 45 external adversarial code review (codex / gpt-5.6-terra, CR-45-04;
@@ -511,6 +532,12 @@ proved both prompts reach the same session. It did NOT measure a stall: which in
 agent actually follows is a question about model instruction-priority and is not determinable by
 reading source. Any fix needs an observed run, not just a re-read of the strings.
 
+**Re-verified 2026-09-03 against v2.12.0.** Both strings still exist and still reach the same
+session: `CODE_STAGE_POLICY` at `prompt.rs:62` (its `blocking-human` carve-out at the end of the
+const), `checkpoint_auto_decide_prompt` at `prompt.rs:537`, injected at `pipeline_launch.rs:1100`.
+The entry's own limit still stands — which instruction an agent follows is not determinable by
+reading source, so this needs an observed run.
+
 **Size:** S–M. **Depends on:** nothing structural. Related: 999.94 / DECN-01 (the policy this
 phase added), and 45-03's own note that it deliberately preserved human-only handling.
 
@@ -531,6 +558,27 @@ that phase 45 exists to deliver.
 **Why the tests did not catch it:** 45-03's assertions (`prompt.rs:784`, `:788`) exercise
 `code_stage_prompt`, the `fix: None` path only. They pass while the loop-back path carries
 nothing — a green test over an undelivered contract.
+
+**Re-verified 2026-09-03 against v2.12.0, with one scoping correction the original entry got
+wrong.** The defect holds: `CODE_STAGE_POLICY` occurs at `prompt.rs:62` (definition), `:379`
+(`code_stage_prompt`), `:469` (`workflow_code_prompt`'s `FullExecute | None` arm), and `:784`,
+`:788`, `:818` (tests) — none inside `fix_prompt` (`:567-580`). Negative control holds: the same
+function body contains `COMPLETION_PROTOCOL` at `:578`, so the search range is non-empty.
+
+**The correction — the fix must be arm-scoped, not applied to `fix_prompt` wholesale.** A test at
+`prompt.rs:810` already asserts that the `GapsOnly` and `AuditFix` prompts must NOT carry the
+policy: *"only full-execute Code prompts may carry the shared policy"*. That is deliberate, and
+`workflow_code_prompt` honours it — its `AuditFix` and `GapsOnly` arms omit the policy too. So the
+real defect is narrower than "`fix_prompt` drops the policy": it is that the **two renderers
+disagree for one specific intent**, `Code { fix: Some(FullExecute) }` — `render_workflow_style`
+carries the policy, `render_claude_style` does not. Adding the policy to `fix_prompt`'s
+`FullExecute` arm only would close the asymmetry without tripping the `:810` test; adding it to
+`fix_prompt` unconditionally would break that test and would also contradict the workflow
+renderer it is supposed to match.
+
+**Add to the acceptance criteria:** a test asserting the two renderers agree for
+`Code { fix: Some(FullExecute) }`, with the existing `:810` test kept green as the negative
+control that `GapsOnly`/`AuditFix` still carry nothing.
 
 **Size:** S. **Depends on:** nothing structural.
 
