@@ -3,9 +3,9 @@ phase: 44
 slug: codex-end-to-end-verification
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: validated
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-08-26
 ---
 
@@ -38,34 +38,32 @@ created: 2026-08-26
 
 ## Per-Task Verification Map
 
-| Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
-|---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 44-XX-XX | TBD | TBD | CODE-01 (dogfood evidence) | — | A real Codex-driven phase reaches Ship or surfaces a re-filed gap | manual + capture | N/A — evidence captured per 13-06 precedent (commands, `--json` capture, PR link, failure classification) | N/A | ⬜ pending |
-| 44-XX-XX | TBD | TBD | CODE-01 (driver parity, D-04) | — | Codex argv/env/interactivity unchanged | unit | `cargo test -p devflow-core --lib codex_and_pi_drivers_reproduce_legacy_behavior codex_wraps_prompt_in_exec_and_json codex_grants_writable_roots_for_worktree_git_metadata codex_disables_signing_via_env_others_do_not codex_define_and_plan_require_an_existing_artifact` | ✅ `crates/devflow-core/src/agents/mod.rs` | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #147 (D-05/D-06/D-07) | — | `resume --agent` mutates only agent, saves before relaunch, emits handoff event | unit + integration | new tests in `pipeline_launch.rs`; extend `--help` snapshot | ❌ Wave 0 — new tests, new snapshot regen | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #147 (D-08) | — | Refuses unsafe handoff before mutation | unit | negative-control: `resume --agent codex` at `Stage::Define` in Auto mode with no `-CONTEXT.md` on develop must refuse and leave `state.agent` unchanged | ❌ Wave 0 | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #148 (D-10/D-14) | T-44-01 | `--from-devflow` string is gone; new command uses real flags | unit | rewrite `cron_instruction_hints_include_hermes_command_per_phase`, `cron_hint_line_appends_sanitized_reset_when_retry_after_present`, `cron_hint_line_omits_reset_fragment_when_retry_after_empty` (`commands.rs:4139-4200`) + new negative-control asserting absence | ✅ files exist, ❌ assertions need rewriting | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #148 (D-12) | — | Schedule is unambiguous regardless of scheduler timezone | unit | positive: ISO-with-offset schedule round-trips; negative control: OLD `M H D M W` UTC-field approach demonstrably fires at wrong instant in non-UTC zone | ✅ `ship.rs` schedule tests exist as base, ❌ new ISO-render tests needed | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #148 (D-13) | T-44-03 | Unparseable retry time still fails closed | unit | existing `cron_instructions_reject_unparseable_retry_time` (`ship.rs`) — re-verify after render-function swap | ✅ `crates/devflow-core/src/ship.rs` | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #153 (D-15/D-16) | — | Cron record deleted only after genuine relaunch; survives a failed launch | unit + integration | new test: stub failing `spawn_monitor`/agent binary, assert record survives; new test: successful relaunch deletes it | ❌ Wave 0 | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #153 (D-17) | — | Ship completion deletes any remaining record | integration | new test at `finish_workflow_with_gate_timeout` call site | ❌ Wave 0 | ⬜ pending |
-| 44-XX-XX | TBD | TBD | #153 (D-18) | — | Deletion emits an audit event | unit | assert event presence/fields on both delete paths | ❌ Wave 0 | ⬜ pending |
-| 44-XX-XX | TBD | TBD | Phase success criterion 3 | — | No regression to Codex driver behavior | full suite | `cargo test --workspace` (assert `N passed`, `0 failed`, per this repo's own false-green-avoidance rule) | ✅ existing baseline | ⬜ pending |
+> Reconstructed by `/gsd-validate-phase 44` on 2026-09-03 from the 5 shipped plans
+> (44-00…44-04), their SUMMARYs, and `44-VERIFICATION.md` (8/8 truths, independently
+> re-derived). The `44-XX-XX TBD` skeleton rows below were never reconciled during
+> execution (#2117 NOT-VALIDATED). All commands re-run green against the post-sync tree.
+
+| Task / Plan | Requirement | Behavior | Test Type | Automated Command | Status |
+|-------------|-------------|----------|-----------|-------------------|--------|
+| 44-04 (dogfood) | CODE-01 | A real Codex-driven phase reaches a clean finish OR surfaces re-filed gaps | manual + capture | N/A — evidence in `44-CODEX-E2E.md` + `44-evidence/` (21 real `--json` stream files; commits `154162c`/`557877c` resolve as git objects) | ✅ recorded (manual-only) |
+| 44-04 (parity) | CODE-01 / D-04 | Codex argv/env/interactivity unchanged | unit | `cargo test -p devflow-core --lib agents::tests::codex` + `git diff origin/develop -- crates/devflow-core/src/agents/codex.rs` | ✅ 5 passed / 759 filtered; diff = 0 lines |
+| 44-01 | #147 / D-05..D-08 | `resume --agent` mutates only agent, runs full pre-mutation preflight, re-marks `stopped` on launch failure | unit | `cargo test -p devflow --bin devflow resume_with_agent` (+ `resume_re_marks_stopped_when_launch_stage_fails_outright`, `resume_with_agent_refuses_auto_mode_handoff_that_would_fail_the_later_unattended_launch_check`) | ✅ 6 + 1 + 1 passed / 357–362 filtered |
+| 44-03 | #148 / D-10..D-14 | `--from-devflow` string gone; cron hint uses real flags; shell-quote round-trips | unit | `cargo test -p devflow --bin devflow cron_hint_line_command_quoting_roundtrips_through_shell_for_space_and_apostrophe_paths` + `cargo test -p devflow --test phase7_cli status_prints_cron_hint_when_cron_instructions_exist` | ✅ 1 + 1 passed |
+| 44-03 | #148 / D-12..D-13 | ISO-8601 UTC schedule; unparseable retry time fails closed | unit | `cargo test -p devflow-core --lib hermes_schedule` + `cargo test -p devflow-core --lib cron_instructions_reject_unparseable_retry_time` | ✅ 3 + 1 passed / 761–763 filtered |
+| 44-00 / 44-02 | #153 / D-15..D-18 | Cron record consumed only on genuine relaunch; survives failed launch; deletion is audit-safe (TOCTOU-hardened) | unit + integration | `cargo test -p devflow-core --lib consume_cron_instructions` (incl. `consume_cron_instructions_tolerates_a_racing_concurrent_consumer`) | ✅ 6 passed / 758 filtered |
+| 44-REVIEW CR-01 | Phase SC3 | `pre-push` fail-closed diagnostic reachable under `set -e` | integration | `cargo test -p devflow --test pre_push_signing_policy` | ✅ 8 passed |
+| — | Phase SC3 | No regression to Codex driver / workspace | full suite | `cargo test --workspace` | ✅ 1235 passed / 0 failed (2026-09-03, exit 0) |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
-*Task IDs, Plan, and Wave columns are TBD — the planner fills these in once plans/waves are assigned; the Requirement/Test-Type/Command/File-Exists columns above are carried verbatim from `44-RESEARCH.md`'s Phase Requirements → Test Map.*
-
----
-
 ## Wave 0 Requirements
 
-- [ ] `pipeline_launch.rs` — handoff mutation tests (D-06/D-07/D-08 positive + negative)
-- [ ] `commands.rs` — rewritten cron-hint tests + `--from-devflow`-absence negative control
-- [ ] `ship.rs` — ISO-with-offset schedule render + round-trip tests, negative control for the old UTC-cron-field approach
-- [ ] `pipeline_launch.rs` / `pipeline_gate.rs` — cron-deletion trigger tests (success deletes, failure preserves, ship-completion belt-and-braces)
-- [ ] `crates/devflow-cli/tests/snapshots/devflow-help.txt` — regenerate after the `--agent` flag lands on `Resume`
-- [ ] Codex dogfood evidence capture directory (per 13-06/34-evidence precedent): commands run, `--json` capture, PR link, failure classification if any gap surfaces
+- [x] `pipeline_launch.rs` — handoff mutation tests (D-06/D-07/D-08 positive + negative)
+- [x] `commands.rs` — rewritten cron-hint tests + `--from-devflow`-absence negative control
+- [x] `ship.rs` — ISO schedule render + round-trip tests, negative control for the old UTC-cron-field approach
+- [x] `pipeline_launch.rs` / `pipeline_gate.rs` — cron-deletion trigger tests (success deletes, failure preserves, ship-completion belt-and-braces)
+- [x] `crates/devflow-cli/tests/snapshots/devflow-help.txt` — regenerated after the `--agent` flag lands on `Resume`
+- [x] Codex dogfood evidence capture directory (per 13-06/34-evidence precedent): commands run, `--json` capture, PR link, failure classification if any gap surfaces
 
 *(Framework itself needs no install — `cargo test` is already the project's only test runner.)*
 
@@ -81,11 +79,29 @@ created: 2026-08-26
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 90s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 90s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** validated 2026-09-03 (`/gsd-validate-phase 44`) — Nyquist-compliant, 0 gaps
+
+---
+
+## Validation Audit 2026-09-03
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+State A audit against a `draft` skeleton that execution never reconciled (#2117
+NOT-VALIDATED — all rows were `44-XX-XX TBD`). Per-Task Map reconstructed from the 5
+shipped plans + `44-VERIFICATION.md`. CODE-01's automated portion (Codex driver parity
+D-04 + `cargo test --workspace` no-regression) is green; the dogfood portion is an
+inherently-manual live run, recorded in `44-CODEX-E2E.md` and `44-evidence/`. Every
+surfaced-gap fix (#147 / #148 / #153 / CR-01) has a named regression test, all re-run
+green with non-zero `filtered out`. No auditor spawn required (0 MISSING).
