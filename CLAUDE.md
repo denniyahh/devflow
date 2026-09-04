@@ -100,10 +100,11 @@ the command because hand-editing seemed quicker is not.
 
 Manual GSD lifecycle work (discuss / plan / execute done as `gsd-*` invocations rather than via
 `devflow start`) must run inside a dedicated worktree, not on the main checkout. The pattern is
-fully deterministic — branch `feature/phase-{N}`, path `.worktrees/phase-{N}`, base `develop`:
+fully deterministic — branch `feature/phase-{N}`, path `.worktrees/phase-{N}`, base
+**`workspace/denniyahh`**:
 
 ```bash
-git worktree add -b feature/phase-35.3 .worktrees/phase-35.3 develop
+git worktree add -b feature/phase-35.3 .worktrees/phase-35.3 workspace/denniyahh
 ```
 
 Reason: phase work leaves the main checkout on a half-finished branch, and a later `git commit`
@@ -111,6 +112,27 @@ Reason: phase work leaves the main checkout on a half-finished branch, and a lat
 commits from that accident, the same reason `devflow start` creates one. The only step that cannot
 be scripted is the branch name when a phase is renumbered (e.g. 36 → 35.3) — confirm the branch
 name against `ROADMAP.md`'s current `### Phase N:` heading before running the command.
+
+**The base must be `workspace/denniyahh`, not `develop`.** This rule said `develop` until
+2026-09-04 and was wrong for every phase that does GSD lifecycle work. `.gitignore` on `develop`
+ignores `.planning/` wholesale (`2a2ce97` purged it deliberately), so `develop` tracks **zero**
+files under `.planning/` while `workspace/denniyahh` tracks ~1000. A `develop`-based worktree
+therefore cannot commit CONTEXT.md, PLAN.md, SUMMARY.md or STATE.md at all: `git add` refuses an
+ignored path without `-f`, so the phase's entire planning record sits ignored on disk until the
+worktree is removed. **Not established** — whether `gsd-tools query commit` fails loudly or
+silently reports success on that empty file list was not tested; it is already known to no-op
+silently on *untracked* files, so assume the quiet failure mode until someone checks. Verify the
+base before trusting either branch:
+
+```bash
+git ls-tree -r --name-only develop             | grep -c '^\.planning/'   # 0
+git ls-tree -r --name-only workspace/denniyahh | grep -c '^\.planning/'   # ~1000
+```
+
+This is consistent with the sync rule below, not an exception to it: `scripts/cut-pr-branch.sh`
+already treats `workspace/denniyahh` as the fork point (`WORKSPACE_BASE=workspace/denniyahh`),
+which is exactly why that branch must be synced with `develop` *first* — the sync is what makes
+this base current, and cutting the eventual PR is what strips `.planning/` back out again.
 
 ## Sync `workspace/denniyahh` before starting a new phase's branch
 
