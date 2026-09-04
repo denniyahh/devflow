@@ -62,7 +62,18 @@ specifically to the main-checkout case.
   `unwrap_or(0)` that existed only inside a comment. Strip comments before counting, or the measure
   reports on documentation rather than on code.
 - **A branch workflow run list (`gh run list`) does not establish PR check status (`gh pr checks`).**
-  Workflow runs can pass on older commits while the PR's current HEAD commit has zero reported checks (e.g. if an intermediate metadata or doc commit was pushed with `[ci skip]`, or if checks are pending/untriggered). Never report that a PR is green or CI has passed without asserting directly on `gh pr checks <PR>` against the current `HEAD_SHA`.
+  Workflow runs can pass on older commits while the PR's current HEAD commit has zero reported checks (e.g. if an intermediate metadata or doc commit was pushed with `[ci skip]`, or if checks are pending/untriggered). Never report that a PR is green or CI has passed without asserting directly on `gh pr checks <PR> --required` against the current `HEAD_SHA`.
+
+  **Use `--required`, not a bare `gh pr checks`.** This repo deliberately runs advisory CI jobs —
+  jobs kept out of branch protection's required checks because their whole point is timing
+  sensitivity, which also makes them the most likely to flake (phase 46's 2-CPU sequential job is
+  the first). A bare `gh pr checks` lists *all* checks, so one advisory flake reads as a not-green
+  PR and stops an agent that has nothing actually wrong with it. `--required` narrows the listing
+  to what genuinely gates the merge, and does **not** weaken the rule above: the rule's target is
+  `gh run list` branch-history proxying, and `--required` still asserts against the PR's current
+  `HEAD_SHA`. The one exception is accepting a newly added advisory job itself — that job is by
+  definition absent from `--required`, so read the unfiltered listing and assert on its own row,
+  or the check reports green without having looked at the thing being accepted.
 
 - **`rg -c <pat> | rg '^0$'` is a constant-fail, not a zero-check.** `rg -c` prints *nothing*
   and exits 1 when a pattern has zero matches, so the downstream `rg '^0$'` never gets an input
