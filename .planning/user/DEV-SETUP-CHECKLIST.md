@@ -106,8 +106,7 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
     `scripts/check-in-container.sh all`, with `DEVFLOW_SKIP_CONTAINER_CHECK=1` as an explicit,
     loudly-non-equivalent escape hatch.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit`: warns (never auto-edits) when a `*-SUMMARY.md`
-  lands but `STATE.md`'s authored prose wasn't updated to match; also self-heals the
-  `UPSTREAM-GSD-ISSUES.md` symlink (§8) if `git clean -fdx` deleted it.
+  lands but `STATE.md`'s authored prose wasn't updated to match.
 - [ ] **[PROJECT]** `scripts/hooks/post-commit` also warns when a dev-setup file changes without
   this checklist moving too. Its path lives in one variable, `checklist_path`, at the top of that
   block — **if this file ever moves again, change that variable**. From the move into
@@ -239,11 +238,26 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   per milestone), `phases/`, `milestones/` (archives), `debug/` (+ `debug/resolved/`),
   `superseded/`, `codebase/` — the standard GSD document set; content is project-specific but the
   *shape* is entirely reusable via `/gsd-new-project`.
-- [ ] **[PATTERN]** `.planning/UPSTREAM-GSD-ISSUES.md` as a **symlink** into a sibling
-  `gsd-core-personal-workspace` checkout (`../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md`)
-  — gitignored, self-healed by the post-commit hook (§3). Only makes sense if you keep a local
-  `gsd-core-personal-workspace` source checkout alongside your projects; otherwise this is
-  DevFlow-specific plumbing to skip.
+- [ ] **[PROJECT]** **Upstream GSD-core defects are filed as GitHub issues against
+  `@opengsd/gsd-core`**, in that project's own tracker — not held in a local document. This is
+  already the rule CLAUDE.md states for bypassing a known-broken GSD command: the bypass is
+  legitimate only when the defect is filed upstream. File it there, then reference the upstream
+  issue number from the ROADMAP entry or DevFlow issue that hit it.
+
+  **Retired 2026-09-03:** `.planning/UPSTREAM-GSD-ISSUES.md` — a gitignored symlink into a sibling
+  `gsd-core-personal-workspace/scratch/` checkout. Nothing replicating this setup should recreate
+  it. Two notes for anyone reading older commits that reference it: the symlink was already absent
+  from `.planning/` when this entry was retired, and the claim elsewhere in this checklist that
+  `scripts/hooks/post-commit` self-healed it was **never true of the shipped hook** — verified
+  2026-09-03, zero occurrences of `upstream` or `symlink` in that file, against a control showing
+  the behaviours the hook *does* have (`checklist_path`, `SUMMARY`) present 6 times each. So the
+  document had no automated upkeep and drifted unnoticed; that is a large part of why it is being
+  replaced by a tracker that other people can see.
+
+  Numbering tells the two trackers apart at a glance: DevFlow issues are low (≤ #206 as of
+  2026-09-03); gsd-core issue numbers are in the thousands and turn up inside warning strings
+  emitted by the installed package (e.g. the `#3532` shadowed-global-defaults diagnostic). A
+  four-digit number in GSD output is never one of yours.
 - [ ] **[PROJECT]** Issue tracking is **GitHub Issues only** (`denniyahh/devflow`). ROADMAP.md
   `999.x` backlog entries are the primary record; mirror one to a GitHub issue when it needs to be
   visible outside the repo. **Linear is no longer used** (retired 2026-09-02). Historical
