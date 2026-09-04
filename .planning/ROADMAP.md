@@ -3907,7 +3907,7 @@ only to `blocking-human` checkpoints reached through DevFlow's own resume path.
   instructs the agent to deviate from the workflow file it is concurrently executing.
 
 - **Upstream (better, slower):** an explicit `recommended` attribute in the checkpoint format, plus
-  auto-select honouring it. Belongs in `.planning/UPSTREAM-GSD-ISSUES.md` if pursued.
+  auto-select honouring it. File as a GitHub issue against `@opengsd/gsd-core` if pursued.
 
 **Priority:** High — it is a correctness risk on every unattended run, not a papercut. **Size:** S
 for the DevFlow-side prompt policy plus its tests; M if the upstream marker is pursued too.

@@ -48,4 +48,4 @@ lacked.
 
 - `~/.codex/gsd-core/references/runtime-aware-dispatch.md` — GSD's current dispatch model.
 - `~/.pi/agent/npm/node_modules/@bacnh85/pi-subagent/README.md` — Pi's subagent tool and bundled roles.
-- `.planning/UPSTREAM-GSD-ISSUES.md` — if this lands as a GSD-core change, upstream coordination may be needed.
+- Upstream GSD-core GitHub issues (`@opengsd/gsd-core`) — if this lands as a GSD-core change, upstream coordination may be needed; file it there. (Was `.planning/UPSTREAM-GSD-ISSUES.md`, retired 2026-09-03.)

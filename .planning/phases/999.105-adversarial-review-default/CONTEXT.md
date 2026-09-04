@@ -52,5 +52,6 @@ default, gated part of the phase lifecycle — not an operator's ad-hoc step.
   selection, review-root/CWD discipline, citation verification, consolidation).
 - `.planning/reviews/plan/SUMMARY.md` (Phase 36 worktree) — the concrete findings that motivated
   this item.
-- `.planning/UPSTREAM-GSD-ISSUES.md` — if the promotion is wired as GSD lifecycle hooks, upstream
-  coordination may be needed.
+- Upstream GSD-core GitHub issues (`@opengsd/gsd-core`) — if the promotion is wired as GSD
+  lifecycle hooks, upstream coordination may be needed; file it there. (Was
+  `.planning/UPSTREAM-GSD-ISSUES.md`, retired 2026-09-03.)
