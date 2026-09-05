@@ -361,3 +361,96 @@ fn ci_workflow_runs_the_sequential_check_under_a_cpu_pin() {
         fragment.display()
     );
 }
+
+/// The CPU list the pinned CI job and the local pre-push gate share must have
+/// exactly ONE definition site (46-CONTEXT.md D-03). Two copies let the gate
+/// and CI measure different load shapes while both report green — and the
+/// whole reason the pinned job exists is that its load shape matches the
+/// gate's.
+///
+/// This repository has already been bitten by precisely this class once: the
+/// container image tag is duplicated into `ci.yml` because GitHub Actions
+/// cannot interpolate `env` into `jobs.*.container.image`, and the fix was
+/// `scripts/assert-image-parity.sh` — a mechanism, not a "keep in sync"
+/// comment. A comment cannot fail a build. This test can.
+///
+/// Comment lines are stripped before counting, so prose that merely *mentions*
+/// the value cannot trip the guard; the third demonstration in 46-01 confirms
+/// that direction passes for the right reason.
+#[test]
+fn cpu_pin_has_exactly_one_definition_site() {
+    let root = repo_root();
+
+    fn code_lines(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    }
+
+    // (a) The fragment defines the value exactly once.
+    let fragment_path = root.join("scripts/lib/ci-cpus.sh");
+    let fragment = read(&fragment_path);
+    let definitions: Vec<&str> = code_lines(&fragment)
+        .into_iter()
+        .filter(|l| l.starts_with("CPUS="))
+        .collect();
+    assert_eq!(
+        definitions.len(),
+        1,
+        "{} must contain exactly one `CPUS=` assignment — it is the single \
+         definition site for the CI CPU pin (46-CONTEXT.md D-03), and a \
+         second assignment makes which one wins depend on line order. \
+         Found: {definitions:?}",
+        fragment_path.display()
+    );
+
+    // (b) The local gate reads it rather than re-declaring it.
+    let gate_path = root.join("scripts/check-in-container.sh");
+    let gate = read(&gate_path);
+    let redeclared: Vec<&str> = code_lines(&gate)
+        .into_iter()
+        .filter(|l| l.starts_with("CPUS="))
+        .collect();
+    assert!(
+        redeclared.is_empty(),
+        "{} must not assign `CPUS=` itself — it sources \
+         scripts/lib/ci-cpus.sh, and re-typing the value here is exactly the \
+         drift that lets the local gate and CI pin different core counts \
+         while both look green (46-CONTEXT.md D-03). Found: {redeclared:?}",
+        gate_path.display()
+    );
+    assert!(
+        gate.contains("scripts/lib/ci-cpus.sh"),
+        "{} must source scripts/lib/ci-cpus.sh — without it the gate runs \
+         with CPUS unset, and `set -u` fails it rather than silently \
+         unpinning, but the shared definition site is gone either way.",
+        gate_path.display()
+    );
+
+    // (c) CI reads it rather than re-typing the literal.
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci = read(&ci_path);
+    let retyped: Vec<&str> = code_lines(&ci)
+        .into_iter()
+        .filter(|l| l.contains("0,1"))
+        .collect();
+    assert!(
+        retyped.is_empty(),
+        "{} must not re-type the CPU list literal — the \
+         `Sequential 2-CPU check` job sources scripts/lib/ci-cpus.sh so the \
+         pin has one definition site (46-CONTEXT.md D-03). A literal here \
+         drifts from the local gate the moment either is bumped. \
+         Found: {retyped:?}",
+        ci_path.display()
+    );
+    assert!(
+        ci.contains("scripts/lib/ci-cpus.sh"),
+        "{} must source scripts/lib/ci-cpus.sh in the \
+         `Sequential 2-CPU check` job. Dropping the source line while keeping \
+         `taskset -c \"$CPUS\"` would expand to an empty list and change what \
+         the job measures.",
+        ci_path.display()
+    );
+}
