@@ -84,6 +84,16 @@ specifically to the main-checkout case.
   `44-01`..`44-04` and `43-02`. Documenting a broken gate is not fixing it. Print the count and
   the command's own exit code on separate lines and assert on those.
 
+- **Agent subagents run Bash under zsh, not bash — `${PIPESTATUS[0]}` expands to nothing there.**
+  zsh spells it `$pipestatus` and indexes from 1, so a verify command written as
+  `cargo test … | tee log; echo "exit=${PIPESTATUS[0]}"` prints `exit=` and every assertion about
+  that exit code passes *without ever reading it*. Same class as the `rg -c` dead gate above: a
+  green check over a result nobody looked at. All three phase-46 plans shipped with it and each
+  executor rediscovered it on the clock. Write plan `<automated>` commands as `bash -c '…'`;
+  `scripts/hooks/pre-commit` now refuses a staged `*PLAN.md` that does not. The same applies to
+  `${v,,}`/`${v^^}` and `declare -A`, and to unquoted globs in `for` word lists, which abort the
+  whole block under zsh rather than iterating zero times.
+
 ## Prefer GSD commands over doing it by hand
 
 When a GSD command covers the task, **use it** — `/gsd:phase` to add or edit a phase,
@@ -144,6 +154,40 @@ This is consistent with the sync rule below, not an exception to it: `scripts/cu
 already treats `workspace/denniyahh` as the fork point (`WORKSPACE_BASE=workspace/denniyahh`),
 which is exactly why that branch must be synced with `develop` *first* — the sync is what makes
 this base current, and cutting the eventual PR is what strips `.planning/` back out again.
+
+## Executor dispatch is sequential here — pin the worktree root in every prompt
+
+`.planning/config.json` sets `workflow.use_worktrees: false` deliberately (2026-09-05). Do not
+"fix" it back to `true`. On Claude Code the harness forks executor worktrees from `origin/HEAD`
+and ignores the project's `worktree.baseRef` (#48, upstream claude-code#44965); a phase branch is
+ahead of `origin/HEAD` for its whole life, so parallel executor worktrees are structurally
+unavailable, not merely unavailable today. Declaring it in config also makes it the one degrade
+the isolation guard re-derives when its sentinel is stale — that sentinel has a 10-minute TTL and
+`execute-phase` writes it once at `initialize`, so without the config key any executor running
+over 10 minutes gets the *next* plan's dispatch denied (gsd-core#4317, #4222).
+
+**Because dispatch is sequential, every executor prompt must carry the orchestrator's absolute
+worktree root and a branch assertion.** Sequential mode has no hard-pin to the orchestrator's
+worktree (gsd-core#4254): the subagent's cwd has been observed to resolve to the **primary
+checkout** rather than the orchestrator's worktree, whereupon it commits to the wrong branch
+silently — every guard in `gsd-executor.md` that would catch this is scoped "worktree mode only"
+and no-ops. Put this at the top of the prompt, not in a trailing note:
+
+```
+cd /var/home/denniyahh/Github/devflow/.worktrees/phase-N
+git rev-parse --show-toplevel    # must print that path
+git rev-parse --abbrev-ref HEAD  # must print feature/phase-N
+```
+
+`cd` does not persist across separate Bash tool calls, so also tell the executor to re-assert the
+branch before every `git commit`, or to use `git -C <root>`. If either assertion fails it must
+stop, not proceed.
+
+Do not add `isolation="worktree"` to a dispatch to satisfy the guard when it complains. On this
+host that forks the executor from `origin/HEAD`, which does not contain the phase's own plan
+files — the executor lands in a tree with nothing to execute. Refresh the sentinel instead
+(`gsd-tools query dispatch-isolation --raw --phase N --force-isolation none`, run from the
+session's cwd), or rely on the config key above.
 
 ## Sync `workspace/denniyahh` before starting a new phase's branch
 
