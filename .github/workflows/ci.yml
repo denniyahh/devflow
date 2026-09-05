@@ -6,12 +6,22 @@ name: CI
 # identical between a local check and a CI check — the divergence that made
 # 999.47 cost hours to chase.
 #
-# Job names `Test`, `Clippy` and `Format` are REQUIRED STATUS CHECKS on the
-# protected `main` branch. Renaming or removing one blocks every future merge
-# to main, because the required check would never report. Verify with:
-#   gh api repos/denniyahh/devflow/branches/main/protection \
-#     --jq .required_status_checks.contexts
-# before touching them.
+# BOTH `main` and `develop` require FOUR status contexts: `Test`, `Clippy`
+# and `Format` from this file, plus `Build + test in devcontainer` from
+# .github/workflows/devcontainer.yml. Renaming or removing one blocks every
+# future merge to that branch, because the required check would never report.
+#
+# Check BOTH before touching a workflow's job name or existence — classic
+# branch protection UNDER-REPORTS, because the contexts are declared in the
+# `develop-merge-or-squash` / `main-squash-only` rulesets, a separate
+# mechanism it does not read:
+#   gh api repos/denniyahh/devflow/branches/<branch>/protection
+#   gh api repos/denniyahh/devflow/rules/branches/<branch>
+#
+# `Sequential 2-CPU check` below is deliberately NOT among those four. It is
+# advisory (46-CONTEXT.md D-05): it carries the local gate's load shape, which
+# is the most timing-sensitive and therefore the most flake-prone thing CI
+# runs, and making it a merge blocker on day one is the reverse of the point.
 #
 # The image tag is repeated per job because GitHub Actions does not expand
 # `env` inside `jobs.<id>.container.image`. scripts/assert-image-parity.sh
@@ -75,3 +85,43 @@ jobs:
       - name: Trust the workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: scripts/check.sh fmt
+
+  # ADVISORY, not required (46-CONTEXT.md D-05) — see the header comment.
+  # This is the one job that reproduces the local pre-push gate's load shape:
+  # fmt -> clippy -> test sequentially, in ONE job, squeezed onto two CPUs.
+  # The three jobs above run in parallel on an unpinned runner, and have
+  # rejected 0 of the pushes the local gate rejected 2 of 2.
+  sequential:
+    name: Sequential 2-CPU check
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      # Must precede the parity step below; see the Test job above for why.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Assert CI image matches the devcontainer definition
+        run: scripts/assert-image-parity.sh "mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm"
+      # Sourced, never parsed. A `sed -n ...p` extraction exits 0 whether or
+      # not it printed anything, and would run the suite unpinned while the
+      # log claimed nothing was wrong.
+      - name: Read the CPU pin from its single definition site
+        run: |
+          set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          echo "CPUS=$CPUS" >> "$GITHUB_ENV"
+      # D-04. Echoing the CPU list alone proves nothing: a partially-invalid
+      # list narrows SILENTLY and still exits 0. The unpinned count is the
+      # negative control for the pinned one -- they must differ.
+      - name: Record the load shape this job actually got
+        run: |
+          set -euo pipefail
+          echo "unpinned_nproc=$(nproc)"
+          echo "cpu_list=$CPUS"
+          echo "pinned_nproc=$(taskset -c "$CPUS" nproc)"
+      # CPU affinity is inherited across fork/exec, so rustc and the test
+      # harness threads all land under this mask. `--test-threads=N` is not a
+      # substitute: it throttles the harness only, leaving compilation free.
+      - run: taskset -c "$CPUS" scripts/check.sh all

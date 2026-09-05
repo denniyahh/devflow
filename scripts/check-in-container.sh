@@ -62,11 +62,20 @@ REGISTRY_VOLUME="devflow-ci-registry-${CACHE_SUFFIX}"
 docker volume create "$TARGET_VOLUME" >/dev/null
 docker volume create "$REGISTRY_VOLUME" >/dev/null
 
-# CPU pinning: match CI's core count so test-thread interleaving is
-# comparable. GitHub's standard hosted runners are 2-core; a 4-core host
-# hides races that CI sees. Override with DEVFLOW_CI_CPUS=all to use every
-# core (faster, less faithful).
-CPUS="${DEVFLOW_CI_CPUS:-0,1}"
+# CPU pinning: match the pin CI applies so test-thread interleaving is
+# comparable. This is NOT the runner's core count — denniyahh/devflow is
+# public, and public-repo ubuntu-24.04 runners are 4 vCPU, not the 2 this
+# comment used to claim. The value is still right; the reason is that
+# ci.yml's `Sequential 2-CPU check` job pins the suite to the same list, so
+# a 4-core host here would hide races that the pinned CI job sees.
+#
+# The value itself lives in scripts/lib/ci-cpus.sh — one definition site,
+# read by this gate and by that CI job. Re-typing it here re-opens the drift
+# that file exists to close. Sourced relative to REPO_ROOT (cd'd to above);
+# `set -euo pipefail` makes a missing fragment fail loudly rather than run
+# the suite unpinned. Override with DEVFLOW_CI_CPUS=all to use every core
+# (faster, less faithful).
+. scripts/lib/ci-cpus.sh
 if [ "$CPUS" = "all" ]; then
     PIN=()
 else
