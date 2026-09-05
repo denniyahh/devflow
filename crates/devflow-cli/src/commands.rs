@@ -5455,6 +5455,36 @@ mod tests {
     /// fully-qualified ref path, `HEAD`, and a bare SHA, and that
     /// `worktree::add` forwards the raw value to `git worktree add` as a
     /// start point. Anchoring on `refs/heads/{base}` rejects all four.
+    ///
+    /// **46-02 extension (VALID-01).** The four arms above are all spellings
+    /// the `refs/heads/` prefix already defeats. Revision **suffix** syntax
+    /// survives that prefix, and `rev-parse --verify` — a revision PARSER
+    /// being used as a ref existence check — accepts it. Measured against a
+    /// faithful replica of `base_branch_fixture` (46-RESEARCH.md's truth
+    /// table, re-measured under git 2.55.0 at execution): `workspace/example~1`,
+    /// `develop@{0}` and `develop^{}` all exit 0 under
+    /// `rev-parse --verify --quiet refs/heads/<v>` and 1 under
+    /// `show-ref --verify --quiet refs/heads/<v>`. Those three arms are the
+    /// live bug (46-CONTEXT.md D-07).
+    ///
+    /// The remaining arms pin D-08's **two distinguishable messages**. A
+    /// well-formed but merely MISSING branch keeps today's message verbatim,
+    /// `git branch {base} origin/{base}` advice included; a MALFORMED value
+    /// gets its own message and must NOT repeat that advice, which would
+    /// instruct the operator to create a branch literally named `develop@{0}`.
+    /// The `contains("git branch …")` and `!contains("git branch")` assertions
+    /// are a PAIR: drop either half and two messages can silently collapse
+    /// into one while the test stays green. Extended in place rather than
+    /// duplicated because this test already carries its own accept-arm
+    /// negative control (D-10).
+    ///
+    /// `develop~1` is deliberately NOT among the arms. `base_branch_fixture`
+    /// creates `develop` at the fixture's ROOT commit, so `develop~1` has no
+    /// parent to resolve, is already refused today, and would pass identically
+    /// before and after the fix — proving nothing. ROADMAP Success Criterion 2
+    /// names `refs/heads/develop~1`; the `refs/heads/` spelling class is
+    /// already covered by the `refs/heads/main` arm above, and
+    /// `workspace/example~1` is the substitution that actually discriminates.
     #[test]
     fn ensure_base_is_a_local_branch_rejects_commit_ish_that_is_not_a_local_branch() {
         let dir = tempfile::tempdir().unwrap();
@@ -5492,6 +5522,71 @@ mod tests {
                 "`{spelling}` is not a local branch and must be refused"
             );
         }
+
+        // 46-02 / D-07: revision SUFFIX syntax, which survives the
+        // `refs/heads/` prefix the helper applies. Unlike the arms above,
+        // these are bypasses only AFTER the prefix — so the prove-the-bypass
+        // probe runs on the QUALIFIED form the helper actually builds. A bare
+        // probe would be asserting a different fact.
+        for spelling in ["workspace/example~1", "develop@{0}", "develop^{}"] {
+            let qualified = format!("refs/heads/{spelling}");
+            let bare = devflow_core::test_support::git_command(root)
+                .args(["rev-parse", "--verify", "--quiet", qualified.as_str()])
+                .output()
+                .expect("rev-parse");
+            assert!(
+                bare.status.success(),
+                "fixture is wrong: `{qualified}` must resolve as a commit-ish today"
+            );
+            let refusal = ensure_base_is_a_local_branch(root, spelling);
+            assert!(
+                refusal.is_err(),
+                "`{spelling}` is revision syntax surviving the `refs/heads/` \
+                 prefix, not a local branch, and must be refused"
+            );
+            let msg = refusal.unwrap_err().to_string();
+            assert!(
+                msg.contains(spelling),
+                "the refusal must name the offending value `{spelling}`: {msg}"
+            );
+            // D-08, first half of the discriminator.
+            assert!(
+                !msg.contains("git branch"),
+                "a revision-syntax refusal must not repeat the create-a-branch \
+                 advice, which would say to create `{spelling}`: {msg}"
+            );
+        }
+
+        // EDGE VALID-01/empty — MEASURED, not predicted (46-02 Task 1 Step 0,
+        // git 2.55.0, replica fixture). An empty base yields the qualified
+        // string `refs/heads/`, on which `show-ref --verify --quiet` exits 1
+        // AND `check-ref-format` also exits 1 (trailing slash). It therefore
+        // lands in the MALFORMED arm. Asserting `contains("")` would be
+        // trivially true and prove nothing, so the arm is asserted only.
+        let empty_refusal = ensure_base_is_a_local_branch(root, "");
+        assert!(empty_refusal.is_err(), "an empty base must be refused");
+        let empty_msg = empty_refusal.unwrap_err().to_string();
+        assert!(
+            !empty_msg.contains("git branch"),
+            "an empty base is not a well-formed ref name and must land in the \
+             malformed arm, which carries no create-a-branch advice: {empty_msg}"
+        );
+
+        // D-08, second half of the discriminator, and its negative control: a
+        // well-formed but merely MISSING branch keeps today's message with its
+        // advice intact. Without this arm every `!contains` above would pass
+        // against an implementation that emitted ONE generic message.
+        let missing_refusal = ensure_base_is_a_local_branch(root, "nonexistent-xyz");
+        assert!(
+            missing_refusal.is_err(),
+            "`nonexistent-xyz` does not exist and must be refused"
+        );
+        let missing_msg = missing_refusal.unwrap_err().to_string();
+        assert!(
+            missing_msg.contains("git branch nonexistent-xyz origin/nonexistent-xyz"),
+            "a well-formed but missing branch must keep the create-a-branch \
+             advice verbatim: {missing_msg}"
+        );
     }
 
     /// Review round 2 (F4): the artifact-presence probe carried the trunk as
