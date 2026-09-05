@@ -15,6 +15,8 @@ use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -309,8 +311,14 @@ fn stop_leaves_stop_until_unchanged() {
     assert_eq!(reloaded.stop_until, Some(Stage::Plan));
 }
 
-/// CLI discoverability: `--phase` must be documented in the subcommand's own
-/// `--help`.
+/// CLI discoverability: BOTH ways of naming the target must be documented in
+/// the subcommand's own `--help` — the `--phase` flag, and (phase 46 / D-11)
+/// the `[PROJECT]` positional root.
+///
+/// The name of this function is cited verbatim as the VALID-02 acceptance
+/// command in `46-RESEARCH.md:886` and in `46-VALIDATION.md`; it is widened in
+/// place rather than renamed, because a rename silently invalidates the
+/// verification map.
 #[test]
 fn stop_help_documents_phase_flag() {
     let output = Command::new(devflow_bin())
@@ -322,6 +330,13 @@ fn stop_help_documents_phase_flag() {
     assert!(
         stdout.contains("--phase"),
         "--help missing --phase:\n{stdout}"
+    );
+    // The BRACKETED form specifically: the bare word "project" already occurs
+    // case-insensitively in the long flag's own description text, so only
+    // `[PROJECT]` unambiguously indicates the positional was added.
+    assert!(
+        stdout.contains("[PROJECT]"),
+        "--help missing the [PROJECT] positional:\n{stdout}"
     );
 }
 
@@ -519,5 +534,277 @@ fn stop_then_cleanup_composes_refuse_then_force() {
     assert!(
         !wt_path.is_dir(),
         "cleanup --force must remove the worktree after stop"
+    );
+}
+
+/// Phase 46 / D-11 (VALID-02): `stop` must accept its project root as a
+/// POSITIONAL argument, the way `start`, `resume`, `status`, `ship` and
+/// `approve` already do.
+///
+/// Asserting only the exit code here would not prove the positional was USED:
+/// a subcommand that silently ignored it and defaulted to the current
+/// directory would also exit zero. So the state is reloaded from the named
+/// root and the stop is asserted to have landed THERE.
+#[test]
+fn stop_accepts_the_project_root_as_a_positional_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(103);
+
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string()])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "devflow stop with a positional root failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reloaded = devflow_core::workflow::load_state(root, phase).unwrap();
+    assert!(
+        reloaded.stopped,
+        "the positional root must be the root that actually gets stopped"
+    );
+    assert!(
+        reloaded
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("devflow stop")),
+        "stop_reason must name devflow stop as the cause, got {:?}",
+        reloaded.stop_reason
+    );
+}
+
+/// Phase 46 / D-12 (VALID-02): when BOTH spellings are supplied the FLAG
+/// wins, and the both-supplied case is NOT an error.
+///
+/// Proven in BOTH orderings deliberately. A single direction is equally
+/// consistent with the POSITIONAL silently winning, so one direction alone
+/// does not discriminate between the two hypotheses — it is a negative
+/// control for the precedence claim, not a redundant second case.
+///
+/// Both roots carry their own saved state before either invocation runs, so
+/// each resolves at depth zero and neither escapes upward through
+/// `project_root`'s `.devflow` ancestor walk. That keeps the assertion a
+/// measurement of PRECEDENCE rather than of the walk.
+#[test]
+fn stop_root_flag_takes_precedence_over_the_positional() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+    let phase = PhaseId::new(104);
+
+    let seed = |root: &Path| {
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        devflow_core::workflow::save_state(&state).unwrap();
+    };
+    let stopped = |root: &Path| {
+        devflow_core::workflow::load_state(root, phase)
+            .expect("state must be loadable")
+            .stopped
+    };
+
+    // Ordering 1 — flag names A, positional names B.
+    seed(root_a);
+    seed(root_b);
+    let first = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root_a)
+        .arg(root_b)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        first.status.success(),
+        "supplying both spellings must not be an error: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(stopped(root_a), "ordering 1: the flag's root (A) must stop");
+    assert!(
+        !stopped(root_b),
+        "ordering 1: the positional's root (B) must be left alone"
+    );
+
+    // Ordering 2 — roles reversed: flag names B, positional names A.
+    seed(root_a);
+    seed(root_b);
+    let second = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root_b)
+        .arg(root_a)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        second.status.success(),
+        "supplying both spellings must not be an error: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(stopped(root_b), "ordering 2: the flag's root (B) must stop");
+    assert!(
+        !stopped(root_a),
+        "ordering 2: the positional's root (A) must be left alone"
+    );
+}
+
+/// Phase 46 / D-13 (VALID-02): a genuinely wrong positional root must fail
+/// with `project_root`'s own path-naming message, not with a bare clap usage
+/// error that names no offending argument.
+///
+/// The non-zero-exit assertion ALONE is a FALSE POSITIVE and is not
+/// acceptable evidence: the clap usage error this case exists to eliminate
+/// also exits non-zero, so a bare exit-code check reads green both before and
+/// after the fix. The two stderr assertions are the only halves that
+/// discriminate.
+#[test]
+fn stop_against_a_nonexistent_positional_root_names_the_offending_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-project-root");
+    let phase = PhaseId::new(105);
+
+    assert!(
+        !missing.exists(),
+        "fixture error: the offending path must NOT exist"
+    );
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string()])
+        .arg(&missing)
+        .output()
+        .expect("run devflow stop");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a wrong root must fail:\n{stderr}"
+    );
+    let missing_display = missing.display().to_string();
+    assert!(
+        stderr.contains("project path does not exist:"),
+        "a wrong root must reach project_root's message, not a clap usage error:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&missing_display),
+        "the message must NAME the offending path ({missing_display}):\n{stderr}"
+    );
+}
+
+/// Phase 46 / VALID-02 edge "empty": what BOTH spellings do with an empty
+/// root, MEASURED against the binary rather than predicted.
+///
+/// The measurement CORRECTS this plan's own stated expectation. The plan
+/// predicted both spellings would reach `project_root` and render
+/// `project path does not exist: ` with nothing after the colon. They do not.
+/// clap rejects an empty value at the PARSER for both, exit code 2, with its
+/// own `a value is required for '<ARG>' but none was supplied`. The two
+/// spellings therefore CONVERGE on parser rejection while DIVERGING in which
+/// argument the message names — `'--root <ROOT>'` for the flag, `'[PROJECT]'`
+/// for the positional. Both name the offending argument, which is what D-13
+/// asks for.
+///
+/// Each half asserts the ABSENCE of `project path does not exist:` as its
+/// negative control. Without that, this test would still pass on a build that
+/// let the empty value through to a message naming an invisible value — which
+/// is the precise legibility failure the plan was worried about.
+#[test]
+fn stop_with_an_empty_project_root_is_refused_identically_for_both_spellings() {
+    let phase = PhaseId::new(106);
+
+    // Spelling 1 — empty POSITIONAL.
+    let positional = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string()])
+        .arg("")
+        .output()
+        .expect("run devflow stop");
+    let positional_stderr = String::from_utf8_lossy(&positional.stderr);
+    assert!(
+        !positional.status.success(),
+        "an empty positional root must be refused:\n{positional_stderr}"
+    );
+    assert!(
+        positional_stderr.contains("a value is required for"),
+        "the empty positional must be refused by clap:\n{positional_stderr}"
+    );
+    assert!(
+        positional_stderr.contains("[PROJECT]"),
+        "the refusal must NAME the positional it rejected:\n{positional_stderr}"
+    );
+    assert!(
+        !positional_stderr.contains("project path does not exist:"),
+        "an empty value must never reach project_root:\n{positional_stderr}"
+    );
+
+    // Spelling 2 — empty value supplied to the long FLAG.
+    let flag = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg("")
+        .output()
+        .expect("run devflow stop");
+    let flag_stderr = String::from_utf8_lossy(&flag.stderr);
+    assert!(
+        !flag.status.success(),
+        "an empty --root value must be refused:\n{flag_stderr}"
+    );
+    assert!(
+        flag_stderr.contains("a value is required for"),
+        "the empty flag value must be refused by clap:\n{flag_stderr}"
+    );
+    assert!(
+        flag_stderr.contains("--root"),
+        "the refusal must NAME the flag it rejected:\n{flag_stderr}"
+    );
+    assert!(
+        !flag_stderr.contains("project path does not exist:"),
+        "an empty value must never reach project_root:\n{flag_stderr}"
+    );
+}
+
+/// Phase 46 / VALID-02 edge "encoding": the positional is typed `PathBuf`, so
+/// clap parses it from the raw `OsString` and a byte-invalid path SURVIVES to
+/// `project_root` rather than being rejected as invalid UTF-8. A
+/// `String`-typed argument would have failed earlier, with different text.
+///
+/// No assertion is made on the rendered path bytes: `Path::display` is lossy
+/// by design, and asserting on its output would pin an implementation detail
+/// of `std` rather than a behaviour DevFlow owns.
+#[cfg(unix)]
+#[test]
+fn stop_positional_root_survives_a_non_utf8_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let phase = PhaseId::new(107);
+
+    // A lone 0xFF byte is not valid UTF-8 in any position.
+    let mut raw = b"root-".to_vec();
+    raw.push(0xFF);
+    let name = std::ffi::OsStr::from_bytes(&raw);
+    assert!(
+        name.to_str().is_none(),
+        "fixture error: the name must NOT be valid UTF-8"
+    );
+
+    let missing = dir.path().join(name);
+    assert!(
+        !missing.exists(),
+        "fixture error: the offending path must NOT exist"
+    );
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string()])
+        .arg(&missing)
+        .output()
+        .expect("run devflow stop");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a non-existent non-UTF-8 root must fail:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("project path does not exist:"),
+        "a non-UTF-8 root must survive clap and reach project_root:\n{stderr}"
     );
 }

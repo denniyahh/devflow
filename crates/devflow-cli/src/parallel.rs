@@ -152,6 +152,7 @@ pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
 
     #[test]
     fn pairs_default_missing_agents_to_claude() {
@@ -208,6 +209,7 @@ mod tests {
     /// happened to carry the same file.
     #[test]
     fn ensure_phase_worktree_forks_from_the_supplied_base() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {

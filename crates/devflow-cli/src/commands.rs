@@ -144,28 +144,76 @@ pub(crate) fn phase_artifact_on_base(
 /// `phase_reachability_on_base`'s `Undeterminable` arm. Applying this check
 /// unconditionally would convert that fall-open into a hard refusal and
 /// regress every existing project.
+///
+/// **Two ORDERED calls (46-02, D-07/D-08).** `rev-parse --verify` is a
+/// revision PARSER, and using one as a ref existence check is the root of
+/// VALID-01: revision SUFFIX syntax survives the `refs/heads/` prefix, so
+/// `workspace/example~1`, `develop@{0}` and `develop^{}` all satisfied it.
+/// `show-ref --verify` is a ref LOOKUP and refuses all three. It runs FIRST
+/// and alone decides accept-versus-reject. `check-ref-format` then runs only
+/// on an ALREADY-DECIDED refusal, purely to label it — it cannot decide
+/// existence (it accepts `nonexistent-xyz`), so reversing the order would
+/// accept and reject nothing correctly. Ref-name validity is delegated wholly
+/// to that plumbing rather than to a hand-rolled denylist, which would drift
+/// from git's own rules (`..`, trailing `.lock`, a bare `@`, control
+/// characters) while the plumbing cannot.
+///
+/// **What this does NOT close (R-01, `46-REVIEWS.md`).** This function
+/// qualifies `refs/heads/{base}`, but `crates/devflow-core/src/worktree.rs:64-83`
+/// forwards the RAW `{base}` to `git worktree add`. A value that is both a
+/// legal literal ref name and a revision expression (`@` is the demonstrated
+/// case) passes here and then forks from something else. That asymmetry is
+/// pre-existing, is not narrowed by the switch to `show-ref`, and is tracked
+/// as R-01 — closing it needs validator and consumer to agree on one spelling.
 pub(crate) fn ensure_base_is_a_local_branch(
     project_root: &Path,
     base: &str,
 ) -> Result<(), CliError> {
-    let ok = git_command(project_root)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{base}"),
-        ])
+    // Bound ONCE and shared by both calls, so the two can never diverge. The
+    // raw `base` is passed to neither: it is option-shaped for a value
+    // beginning with `-` (`check-ref-format -x` exits 129, parsed as a flag),
+    // and it also misclassifies plain one-level branch names as malformed
+    // unless `--allow-onelevel` is added. The qualified form needs no flags.
+    let qualified = format!("refs/heads/{base}");
+
+    // D-07: existence.
+    let exists = git_command(project_root)
+        .args(["show-ref", "--verify", "--quiet", qualified.as_str()])
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
-    if ok {
+    if exists {
         return Ok(());
     }
+
+    // D-08: classify the refusal that has already been decided above.
+    //
+    // The two `unwrap_or` defaults deliberately differ. Existence fails CLOSED
+    // (`false`): an unspawnable git refuses the base, exactly as before this
+    // change. Classification fails OPEN toward the EXISTING message (`true`):
+    // an unspawnable git must not emit a new "malformed" claim it has no
+    // evidence for. `check-ref-format` needs no repository — it is a pure text
+    // check — so it cannot be perturbed by repository state.
+    let well_formed = git_command(project_root)
+        .args(["check-ref-format", qualified.as_str()])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(true);
+
+    if well_formed {
+        return Err(CliError::Message(format!(
+            "configured base branch `{base}` is not a local branch in this repository. \
+             DevFlow forks phase worktrees from it and merges phase work back into it, so it \
+             must be a branch — not a remote-tracking name, a `refs/heads/` path, `HEAD`, or a \
+             commit SHA. Create it locally (e.g. `git branch {base} origin/{base}`) and re-run."
+        )));
+    }
+
     Err(CliError::Message(format!(
-        "configured base branch `{base}` is not a local branch in this repository. \
-         DevFlow forks phase worktrees from it and merges phase work back into it, so it \
-         must be a branch — not a remote-tracking name, a `refs/heads/` path, `HEAD`, or a \
-         commit SHA. Create it locally (e.g. `git branch {base} origin/{base}`) and re-run."
+        "configured base branch `{base}` is not a well-formed branch name — git rejects \
+         `{qualified}` as a ref. DevFlow forks phase worktrees from the base and merges phase \
+         work back into it, so it must name a branch, not a revision expression such as \
+         `~1`, `@{{0}}` or `^{{}}`. Set the base to the branch itself and re-run."
     )))
 }
 
@@ -325,10 +373,12 @@ pub(crate) fn start(
     let resolved_base = config::base_branch(project_root).map_err(CliError::Message)?;
     let base = resolved_base.value.as_str();
     if resolved_base.source != config::BaseBranchSource::Default {
-        // A commit-ish that is not a local branch passes `rev-parse --verify`
-        // and is forwarded raw to `git worktree add` — scoped to an
-        // explicitly configured base so the default path's existing
-        // fall-open for a clone with no local `develop` is untouched.
+        // A commit-ish that is not a local branch is forwarded raw to
+        // `git worktree add`, so the base is checked with `show-ref --verify`
+        // — a ref lookup, not the revision parser that let suffix syntax
+        // through (46-02, D-07). Still scoped to an explicitly configured
+        // base so the default path's existing fall-open for a clone with no
+        // local `develop` is untouched.
         ensure_base_is_a_local_branch(project_root, base)?;
     }
     // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
@@ -3933,6 +3983,7 @@ fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
 
@@ -4090,6 +4141,7 @@ mod tests {
     /// is the one a reader should check first.
     #[test]
     fn a_corrupt_state_file_warns_while_an_absent_one_is_silent() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(73);
@@ -5357,6 +5409,7 @@ mod tests {
     /// phase's CONTEXT.md existing on the base branch.
     #[test]
     fn phase_artifact_on_base_detects_context_and_fails_open() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -5455,8 +5508,39 @@ mod tests {
     /// fully-qualified ref path, `HEAD`, and a bare SHA, and that
     /// `worktree::add` forwards the raw value to `git worktree add` as a
     /// start point. Anchoring on `refs/heads/{base}` rejects all four.
+    ///
+    /// **46-02 extension (VALID-01).** The four arms above are all spellings
+    /// the `refs/heads/` prefix already defeats. Revision **suffix** syntax
+    /// survives that prefix, and `rev-parse --verify` — a revision PARSER
+    /// being used as a ref existence check — accepts it. Measured against a
+    /// faithful replica of `base_branch_fixture` (46-RESEARCH.md's truth
+    /// table, re-measured under git 2.55.0 at execution): `workspace/example~1`,
+    /// `develop@{0}` and `develop^{}` all exit 0 under
+    /// `rev-parse --verify --quiet refs/heads/<v>` and 1 under
+    /// `show-ref --verify --quiet refs/heads/<v>`. Those three arms are the
+    /// live bug (46-CONTEXT.md D-07).
+    ///
+    /// The remaining arms pin D-08's **two distinguishable messages**. A
+    /// well-formed but merely MISSING branch keeps today's message verbatim,
+    /// `git branch {base} origin/{base}` advice included; a MALFORMED value
+    /// gets its own message and must NOT repeat that advice, which would
+    /// instruct the operator to create a branch literally named `develop@{0}`.
+    /// The `contains("git branch …")` and `!contains("git branch")` assertions
+    /// are a PAIR: drop either half and two messages can silently collapse
+    /// into one while the test stays green. Extended in place rather than
+    /// duplicated because this test already carries its own accept-arm
+    /// negative control (D-10).
+    ///
+    /// `develop~1` is deliberately NOT among the arms. `base_branch_fixture`
+    /// creates `develop` at the fixture's ROOT commit, so `develop~1` has no
+    /// parent to resolve, is already refused today, and would pass identically
+    /// before and after the fix — proving nothing. ROADMAP Success Criterion 2
+    /// names `refs/heads/develop~1`; the `refs/heads/` spelling class is
+    /// already covered by the `refs/heads/main` arm above, and
+    /// `workspace/example~1` is the substitution that actually discriminates.
     #[test]
     fn ensure_base_is_a_local_branch_rejects_commit_ish_that_is_not_a_local_branch() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         base_branch_fixture(root);
@@ -5492,6 +5576,71 @@ mod tests {
                 "`{spelling}` is not a local branch and must be refused"
             );
         }
+
+        // 46-02 / D-07: revision SUFFIX syntax, which survives the
+        // `refs/heads/` prefix the helper applies. Unlike the arms above,
+        // these are bypasses only AFTER the prefix — so the prove-the-bypass
+        // probe runs on the QUALIFIED form the helper actually builds. A bare
+        // probe would be asserting a different fact.
+        for spelling in ["workspace/example~1", "develop@{0}", "develop^{}"] {
+            let qualified = format!("refs/heads/{spelling}");
+            let bare = devflow_core::test_support::git_command(root)
+                .args(["rev-parse", "--verify", "--quiet", qualified.as_str()])
+                .output()
+                .expect("rev-parse");
+            assert!(
+                bare.status.success(),
+                "fixture is wrong: `{qualified}` must resolve as a commit-ish today"
+            );
+            let refusal = ensure_base_is_a_local_branch(root, spelling);
+            assert!(
+                refusal.is_err(),
+                "`{spelling}` is revision syntax surviving the `refs/heads/` \
+                 prefix, not a local branch, and must be refused"
+            );
+            let msg = refusal.unwrap_err().to_string();
+            assert!(
+                msg.contains(spelling),
+                "the refusal must name the offending value `{spelling}`: {msg}"
+            );
+            // D-08, first half of the discriminator.
+            assert!(
+                !msg.contains("git branch"),
+                "a revision-syntax refusal must not repeat the create-a-branch \
+                 advice, which would say to create `{spelling}`: {msg}"
+            );
+        }
+
+        // EDGE VALID-01/empty — MEASURED, not predicted (46-02 Task 1 Step 0,
+        // git 2.55.0, replica fixture). An empty base yields the qualified
+        // string `refs/heads/`, on which `show-ref --verify --quiet` exits 1
+        // AND `check-ref-format` also exits 1 (trailing slash). It therefore
+        // lands in the MALFORMED arm. Asserting `contains("")` would be
+        // trivially true and prove nothing, so the arm is asserted only.
+        let empty_refusal = ensure_base_is_a_local_branch(root, "");
+        assert!(empty_refusal.is_err(), "an empty base must be refused");
+        let empty_msg = empty_refusal.unwrap_err().to_string();
+        assert!(
+            !empty_msg.contains("git branch"),
+            "an empty base is not a well-formed ref name and must land in the \
+             malformed arm, which carries no create-a-branch advice: {empty_msg}"
+        );
+
+        // D-08, second half of the discriminator, and its negative control: a
+        // well-formed but merely MISSING branch keeps today's message with its
+        // advice intact. Without this arm every `!contains` above would pass
+        // against an implementation that emitted ONE generic message.
+        let missing_refusal = ensure_base_is_a_local_branch(root, "nonexistent-xyz");
+        assert!(
+            missing_refusal.is_err(),
+            "`nonexistent-xyz` does not exist and must be refused"
+        );
+        let missing_msg = missing_refusal.unwrap_err().to_string();
+        assert!(
+            missing_msg.contains("git branch nonexistent-xyz origin/nonexistent-xyz"),
+            "a well-formed but missing branch must keep the create-a-branch \
+             advice verbatim: {missing_msg}"
+        );
     }
 
     /// Review round 2 (F4): the artifact-presence probe carried the trunk as
@@ -5508,6 +5657,7 @@ mod tests {
     /// wrong reason.
     #[test]
     fn phase_artifact_probe_reads_the_supplied_base_not_the_default_trunk() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -5563,6 +5713,7 @@ mod tests {
     /// which bear on the fork point.
     #[test]
     fn no_worktree_start_forks_the_feature_branch_from_the_configured_base() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         base_branch_fixture(root);
@@ -6976,6 +7127,7 @@ mod tests {
         /// it.
         #[test]
         fn tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir() {
+            let _guard = env_lock();
             const INNER_ROOT: &str = "DEVFLOW_27_04_TAG_INNER_ROOT";
             const INNER_TAG: &str = "DEVFLOW_27_04_TAG_INNER_TAG";
             const INNER_BASE: &str = "DEVFLOW_27_04_TAG_INNER_BASE";
