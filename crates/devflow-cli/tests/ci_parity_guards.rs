@@ -295,3 +295,69 @@ fn devflow_test_clippy_matches_ci_scope() {
         path.display()
     );
 }
+
+/// CI must carry the **load shape** the local pre-push gate already runs:
+/// `fmt` → `clippy` → `test` sequentially, in one job, squeezed onto two
+/// CPUs. Every reproduction of the 999.47 `/proc` fork-inheritance race
+/// needed the sequential ordering *under CPU pressure*; `devcontainer.yml`
+/// supplies the ordering but runs unpinned on the whole runner, so the pin is
+/// the missing ingredient. See 46-CONTEXT.md D-01/D-02 (a new job in `ci.yml`
+/// inside the pinned image, not a change to the required devcontainer job),
+/// D-03 (the pin has ONE definition site, sourced by both consumers — a
+/// re-typed literal is exactly the drift this forbids), and D-04 (the job
+/// prints the shape it actually got).
+///
+/// Deleting the job, dropping the `taskset` wrapper, or re-typing the CPU
+/// list into the workflow all fail here rather than silently reverting CI to
+/// the three-parallel-jobs shape that has rejected 0 of the pushes the local
+/// gate rejected 2 of 2.
+#[test]
+fn ci_workflow_runs_the_sequential_check_under_a_cpu_pin() {
+    let root = repo_root();
+    let path = root.join(".github/workflows/ci.yml");
+    let workflow = read(&path);
+
+    assert!(
+        workflow.contains("name: Sequential 2-CPU check"),
+        "{} must define a job named exactly `Sequential 2-CPU check` — it is \
+         the only place CI runs the local gate's sequential-under-CPU-pressure \
+         load shape (46-CONTEXT.md D-01/D-02). Without it CI runs three \
+         parallel jobs on an unpinned runner and cannot see the interleaving \
+         the local gate sees.",
+        path.display()
+    );
+
+    let pinned: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("taskset -c") && l.contains("scripts/check.sh all"))
+        .collect();
+    assert!(
+        !pinned.is_empty(),
+        "{} must run `scripts/check.sh all` wrapped in `taskset -c` — CPU \
+         affinity is inherited across fork/exec, so the pin is what puts \
+         rustc and the test harness threads under the same mask \
+         (46-CONTEXT.md D-02). `--test-threads=N` is not a substitute: it \
+         throttles the harness only, leaving compilation unpinned. \
+         Found: {pinned:?}",
+        path.display()
+    );
+
+    assert!(
+        workflow.contains("scripts/lib/ci-cpus.sh"),
+        "{} must read the CPU list from `scripts/lib/ci-cpus.sh` rather than \
+         re-typing it — the local gate reads the same file, and a second \
+         definition site is the drift 46-CONTEXT.md D-03 exists to prevent.",
+        path.display()
+    );
+
+    let fragment = root.join("scripts/lib/ci-cpus.sh");
+    assert!(
+        fragment.is_file(),
+        "{} must exist — it is the single definition site both \
+         scripts/check-in-container.sh and .github/workflows/ci.yml source \
+         (46-CONTEXT.md D-03). A missing fragment makes the CI sourcing step \
+         fail loudly under `set -e` rather than running the suite unpinned.",
+        fragment.display()
+    );
+}
