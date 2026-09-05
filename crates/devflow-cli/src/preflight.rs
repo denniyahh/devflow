@@ -1430,6 +1430,7 @@ mod tests {
     /// does exist are all unaffected.
     #[test]
     fn preflight_interactivity_check_flags_auto_define_without_context_md() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1676,6 +1677,7 @@ mod tests {
     /// `unreachable_highest_tag_refuses_rather_than_falling_back` fixture.
     #[test]
     fn major_bump_surfaces_unreachable_baseline_refusal() {
+        let _guard = env_lock();
         let dir = major_bump_fixture();
         let root = dir.path();
         let main_branch = {
@@ -2664,6 +2666,7 @@ mod tests {
     /// `.planning/ROADMAP.md`) — why the guard is not a breaking change.
     #[test]
     fn reachability_is_undeterminable_when_base_has_no_roadmap_at_all() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -2803,6 +2806,7 @@ mod tests {
     /// below passes.
     #[test]
     fn phase_reachability_resolves_caller_root_under_a_hostile_git_dir() {
+        let _guard = env_lock();
         let real_dir = reachability_fixture("### Phase 500: Something\n", None);
         let real_root = real_dir.path();
 
@@ -2927,6 +2931,7 @@ mod tests {
 
     #[test]
     fn currency_behind_and_not_checked_out_fast_forwards_and_proceeds() {
+        let _guard = env_lock();
         let (remote, local) = currency_fixture();
         let remote_root = remote.path();
         let local_root = local.path();
@@ -2987,6 +2992,7 @@ mod tests {
 
     #[test]
     fn currency_behind_fast_forward_failure_falls_through_to_refusal() {
+        let _guard = env_lock();
         let (remote, local) = currency_fixture();
         let remote_root = remote.path();
         let local_root = local.path();
@@ -3008,6 +3014,7 @@ mod tests {
 
     #[test]
     fn base_is_checked_out_anywhere_sees_a_linked_worktree() {
+        let _guard = env_lock();
         let (_remote, local) = currency_fixture();
         let local_root = local.path();
         // Move the local clone off `develop` first — `git worktree add`
@@ -3040,6 +3047,7 @@ mod tests {
 
     #[test]
     fn currency_behind_refuses_when_base_is_checked_out_in_another_worktree() {
+        let _guard = env_lock();
         let (remote, local) = currency_fixture();
         let remote_root = remote.path();
         let local_root = local.path();
@@ -3092,6 +3100,7 @@ mod tests {
 
     #[test]
     fn fast_forward_base_ref_refuses_a_stale_expected_old_value() {
+        let _guard = env_lock();
         let (remote, local) = currency_fixture();
         let remote_root = remote.path();
         let local_root = local.path();
@@ -3188,6 +3197,7 @@ mod tests {
     /// correctly targets `real_root`.
     #[test]
     fn fast_forward_base_ref_never_writes_into_a_hostile_git_dir() {
+        let _guard = env_lock();
         let rev_parse_in = |root: &Path, rref: &str| {
             let out = devflow_core::test_support::git_command(root)
                 .args(["rev-parse", rref])
@@ -3299,6 +3309,7 @@ mod tests {
 
     #[test]
     fn currency_is_ahead_for_unpushed_local_work() {
+        let _guard = env_lock();
         let (_remote, local) = currency_fixture();
         let local_root = local.path();
         std::fs::write(local_root.join("local-only.txt"), "x").unwrap();
@@ -3317,6 +3328,7 @@ mod tests {
 
     #[test]
     fn currency_is_diverged_when_local_and_remote_both_moved_independently() {
+        let _guard = env_lock();
         let (remote, local) = currency_fixture();
         let remote_root = remote.path();
         let local_root = local.path();
@@ -3350,6 +3362,7 @@ mod tests {
     /// planning branch into a hard refusal.
     #[test]
     fn base_ref_currency_is_undeterminable_when_the_remote_ref_is_absent() {
+        let _guard = env_lock();
         let (_remote, local) = currency_fixture();
         let root = local.path();
 
@@ -3378,6 +3391,7 @@ mod tests {
     /// `Ok(())`, so an unpushed planning branch launches.
     #[test]
     fn ensure_base_ref_current_fails_open_for_a_local_only_planning_branch() {
+        let _guard = env_lock();
         let (remote, local) = currency_fixture();
         let remote_root = remote.path();
         let root = local.path();

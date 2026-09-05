@@ -2497,6 +2497,7 @@ mod tests {
     /// prove the dispatch never took the success/Advance arm.
     #[test]
     fn code_unknown_does_not_transition_to_validate() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
