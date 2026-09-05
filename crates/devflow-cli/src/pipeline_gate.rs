@@ -717,6 +717,7 @@ mod tests {
     /// `run_gate`'s poll returns immediately instead of blocking.
     #[test]
     fn advance_ship_success_runs_finish_workflow() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -767,6 +768,7 @@ mod tests {
     /// event this module emits is exactly the one the oracle consumes.
     #[test]
     fn advance_ship_success_emits_workflow_shipped_and_ship_evidence_reports_shipped() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -864,6 +866,7 @@ mod tests {
 
     #[test]
     fn terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -993,6 +996,7 @@ mod tests {
     /// `merge_feature`).
     #[test]
     fn finalization_retry_gate_never_auto_approves_even_with_yes_ship_set() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1456,6 +1460,7 @@ mod tests {
     /// cleared, gate/response/ack files gone, `workflow_finished` emitted.
     #[test]
     fn ship_override_advances_via_written_response() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);

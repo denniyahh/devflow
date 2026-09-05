@@ -3983,6 +3983,7 @@ fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
 
@@ -4140,6 +4141,7 @@ mod tests {
     /// is the one a reader should check first.
     #[test]
     fn a_corrupt_state_file_warns_while_an_absent_one_is_silent() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(73);
@@ -5407,6 +5409,7 @@ mod tests {
     /// phase's CONTEXT.md existing on the base branch.
     #[test]
     fn phase_artifact_on_base_detects_context_and_fails_open() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -5537,6 +5540,7 @@ mod tests {
     /// `workspace/example~1` is the substitution that actually discriminates.
     #[test]
     fn ensure_base_is_a_local_branch_rejects_commit_ish_that_is_not_a_local_branch() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         base_branch_fixture(root);
@@ -5653,6 +5657,7 @@ mod tests {
     /// wrong reason.
     #[test]
     fn phase_artifact_probe_reads_the_supplied_base_not_the_default_trunk() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -5708,6 +5713,7 @@ mod tests {
     /// which bear on the fork point.
     #[test]
     fn no_worktree_start_forks_the_feature_branch_from_the_configured_base() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         base_branch_fixture(root);
@@ -7121,6 +7127,7 @@ mod tests {
         /// it.
         #[test]
         fn tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir() {
+            let _guard = env_lock();
             const INNER_ROOT: &str = "DEVFLOW_27_04_TAG_INNER_ROOT";
             const INNER_TAG: &str = "DEVFLOW_27_04_TAG_INNER_TAG";
             const INNER_BASE: &str = "DEVFLOW_27_04_TAG_INNER_BASE";

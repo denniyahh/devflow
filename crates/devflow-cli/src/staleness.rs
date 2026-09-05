@@ -530,6 +530,7 @@ mod tests {
     /// same answer.
     #[test]
     fn run_git_stdout_ignores_a_hostile_git_dir() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1296,6 +1297,7 @@ mod tests {
     /// an EXACT match to HEAD -> Fresh.
     #[test]
     fn embedded_commit_is_stale_maps_ancestry_exit_codes() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (base, side) = init_repo_with_diverged_commit(root);
@@ -1359,6 +1361,7 @@ mod tests {
     /// shape would prove nothing about this function specifically.
     #[test]
     fn embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir() {
+        let _guard = env_lock();
         const INNER_ROOT: &str = "DEVFLOW_27_04_STALE_INNER_ROOT";
         const INNER_COMMIT: &str = "DEVFLOW_27_04_STALE_INNER_COMMIT";
 
@@ -1426,6 +1429,7 @@ mod tests {
     /// forgot to rebuild" incident class this gate exists to catch.
     #[test]
     fn wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1649,6 +1653,7 @@ mod tests {
     /// unchanged, only the timestamp mechanism is gone).
     #[test]
     fn dirty_flag_arm_ignores_non_build_files_but_still_flags_sources() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1773,6 +1778,7 @@ mod tests {
     /// result to Stale — survives unchanged.
     #[test]
     fn combined_staleness_dirty_flag_arm_flags_modified_tree_when_build_was_clean() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1834,6 +1840,7 @@ mod tests {
     /// `ancestry_range_affects_build` narrows that arm.
     #[test]
     fn docs_only_range_is_fresh() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1886,6 +1893,7 @@ mod tests {
     /// still read `Stale` (Phase 16 false-evidence protection preserved).
     #[test]
     fn mixed_range_docs_and_source_is_stale() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1949,6 +1957,7 @@ mod tests {
     /// failure in the ancestry arm must never read as a false `Fresh`.
     #[test]
     fn git_error_range_fails_toward_stale() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2034,6 +2043,7 @@ mod tests {
     /// must never hard-block, even for a self-dogfood workspace.
     #[test]
     fn combined_staleness_dirty_flag_arm_is_indeterminate_when_build_was_already_dirty() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2104,6 +2114,7 @@ mod tests {
     /// returned.
     #[test]
     fn enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (_base, side) = init_repo_with_diverged_commit(root);
@@ -2184,6 +2195,7 @@ mod tests {
     /// never hard-blocks, even for a self-dogfood workspace.
     #[test]
     fn enforce_build_staleness_never_blocks_on_indeterminate() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2242,6 +2254,7 @@ mod tests {
     /// above it already does.
     #[test]
     fn divergent_lineage_docs_only_range_is_fresh() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2329,6 +2342,7 @@ mod tests {
     /// divergent build.
     #[test]
     fn divergent_lineage_with_source_change_is_stale() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2407,6 +2421,7 @@ mod tests {
     /// not merely a source-level assertion one layer removed from it.
     #[test]
     fn enforce_build_staleness_does_not_block_self_dogfood_on_divergent_docs_only_lineage() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2515,6 +2530,7 @@ mod tests {
     /// 16 false-evidence class, T-45-09).
     #[test]
     fn spikes_only_dirty_tree_does_not_block_self_dogfood() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -2628,6 +2644,7 @@ mod tests {
     /// reads.
     #[test]
     fn non_dogfood_project_keeps_the_broad_build_input_rule() {
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
