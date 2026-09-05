@@ -346,9 +346,12 @@ enum Command {
         /// Phase to stop.
         #[arg(long)]
         phase: PhaseId,
-        /// Project root. Defaults to the current directory.
+        /// Project root. Overrides the positional argument when supplied.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
     },
     /// Report DevFlow's own structural record of whether a phase shipped
     /// (23-06) — a read-only oracle sourced from the append-only event log,
@@ -697,10 +700,11 @@ fn run() -> Result<(), CliError> {
             force,
             project,
         } => ship_override(&project_root(project)?, phase, force),
-        Command::Stop { phase, root } => stop(
-            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
+        Command::Stop {
             phase,
-        ),
+            root,
+            project,
+        } => stop(&project_root(root.unwrap_or(project))?, phase),
         Command::Evidence {
             phase,
             json,
