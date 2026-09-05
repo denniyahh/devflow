@@ -77,6 +77,52 @@ if [ -n "$current_branch" ] && [[ "$current_branch" != workspace/* && "$current_
     fi
 fi
 
+# Plan `<automated>` verify commands must not rely on bash-only syntax.
+#
+# GSD executor subagents run their Bash tool under **zsh**, not bash. `zsh`
+# has no `PIPESTATUS` array (it spells it `$pipestatus`, and indexes from 1),
+# so `${PIPESTATUS[0]}` expands to the EMPTY STRING there. A verify block
+# written as
+#
+#     cargo test ... | tee /tmp/x.log; echo "cargo_exit=${PIPESTATUS[0]}"
+#
+# therefore prints `cargo_exit=` and every downstream assertion about that
+# exit code passes vacuously — a green check over a command whose result was
+# never read. Phase 46 hit this in all three of its plans; each executor
+# rediscovered it independently and worked around it by re-running the blocks
+# through `bash -c`.
+#
+# The fix at authoring time is to write the command as `bash -c '...'`, which
+# is what this refuses to let you skip. Same-case conversion (`${v,,}`,
+# `${v^^}`) and `declare -A` are included: both are bash-only and both fail
+# quietly rather than loudly under zsh.
+#
+# Scope note: this is line-based, so it covers the single-line `<automated>`
+# form (542 of 546 blocks in this repo). A multi-line block whose `bash -c`
+# sits on a different line than the bashism would false-positive; wrap the
+# offending line or split it.
+staged_plans="$(git diff --cached --name-only --diff-filter=ACM | grep -E '(^|/)[^/]*PLAN\.md$' || true)"
+if [ -n "$staged_plans" ]; then
+    bashism_hits="$(
+        printf '%s\n' "$staged_plans" \
+        | while IFS= read -r plan; do
+              [ -n "$plan" ] || continue
+              [ -f "$plan" ] || continue
+              grep -HnE '<automated>[^<]*(\$\{PIPESTATUS|\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)\}|declare -A)' "$plan" || true
+          done \
+        | grep -v 'bash -c' || true
+    )"
+    if [ -n "$bashism_hits" ]; then
+        echo "pre-commit: refusing to commit a plan whose <automated> verify command uses" >&2
+        echo "  bash-only syntax that expands to NOTHING under the executor's zsh shell:" >&2
+        echo "$bashism_hits" | cut -c1-200 | sed 's/^/    /' >&2
+        echo "  These assertions would pass without ever reading the value they claim to check." >&2
+        echo "  Wrap the command so it runs under bash, e.g.:" >&2
+        echo "      <automated>bash -c 'cargo test ... ; echo \"exit=\${PIPESTATUS[0]}\"'</automated>" >&2
+        exit 1
+    fi
+fi
+
 global_hooks=$(git config --global --get core.hooksPath || true)
 if [ -n "$global_hooks" ]; then
   # Expand a leading ~ ourselves; git stores the literal string.
