@@ -97,6 +97,17 @@ jobs:
     container:
       image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
     timeout-minutes: 45
+    # REQUIRED, not stylistic. A `run:` step in a CONTAINER job defaults to
+    # `sh -e {0}`, not `bash -e {0}` as it would on a bare runner — and this
+    # image's /bin/sh is dash, which has no `set -o pipefail`. Without this,
+    # the two `set -euo pipefail` steps below die on their FIRST line with
+    # `set: Illegal option -o pipefail` (exit 2) and `scripts/check.sh` never
+    # runs at all, while the job still reports as a real failing check rather
+    # than as a misconfiguration. Observed on PR #208, the job's first live
+    # run: 42s to red, having executed none of the suite.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       # Must precede the parity step below; see the Test job above for why.

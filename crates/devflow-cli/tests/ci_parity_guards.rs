@@ -528,3 +528,78 @@ fn sequential_job_name_is_not_a_required_status_check() {
         path.display()
     );
 }
+
+/// A `run:` step in a **container** job defaults to `sh -e {0}`, not
+/// `bash -e {0}` — GitHub only uses bash on a bare runner. This repo's images
+/// are Debian-based, so `/bin/sh` is dash, which has no `set -o pipefail`.
+///
+/// This is not hypothetical. PR #208 shipped the `Sequential 2-CPU check` job
+/// with two `set -euo pipefail` steps and no shell declaration. Both died on
+/// their FIRST line — `set: Illegal option -o pipefail`, exit 2, 42 seconds —
+/// so `scripts/check.sh` never executed, and the job reported as a red check
+/// rather than as the misconfiguration it was. A reviewer reading only the
+/// check name would conclude the suite failed under the pin. It had not run.
+///
+/// The failure mode this guards is therefore *not* "the job is red" — red was
+/// at least visible. It is the inverse case: a bashism whose failure happens
+/// to be benign under dash (`[[`, `${x,,}`, arrays) would let the step exit 0
+/// having silently done the wrong thing, which is the same false-green class
+/// as `${PIPESTATUS[0]}` expanding to nothing under the executor's zsh
+/// (CLAUDE.md, verification habits).
+///
+/// Job-scoped rather than file-scoped on purpose: a bare `workflow.contains
+/// ("shell: bash")` would pass while the declaration sat on some *other* job
+/// than the one using the bashism.
+#[test]
+fn container_jobs_using_bash_syntax_declare_a_bash_shell() {
+    let path = repo_root().join(".github/workflows/ci.yml");
+    let workflow = read(&path);
+
+    // Bash-only constructs that dash either rejects outright or mishandles.
+    const BASHISMS: &[&str] = &["pipefail", "[[", "PIPESTATUS", "declare -A"];
+
+    // Split into job blocks: a job key is exactly two spaces of indent under
+    // `jobs:`. Anything more deeply indented belongs to the job above it.
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    for line in workflow.lines() {
+        let is_job_header = line.len() > 2
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_job_header {
+            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if let Some(last) = jobs.last_mut() {
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+    }
+    assert!(
+        jobs.len() >= 4,
+        "expected to parse at least the 4 known jobs out of {}, got {:?} — the \
+         block splitter is broken, and a broken splitter would pass this test \
+         vacuously by finding no bashisms anywhere",
+        path.display(),
+        jobs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+
+    for (name, body) in &jobs {
+        let used: Vec<&str> = BASHISMS
+            .iter()
+            .copied()
+            .filter(|b| body.contains(b))
+            .collect();
+        if used.is_empty() {
+            continue;
+        }
+        assert!(
+            body.contains("shell: bash"),
+            "job `{name}` in {} uses bash-only syntax {used:?} but does not declare \
+             `shell: bash`. Container jobs get `sh -e {{0}}` (dash), where \
+             `set -o pipefail` is an ERROR and other bashisms fail quietly. Add:\n    \
+             defaults:\n      run:\n        shell: bash\n  \
+             to that job. See PR #208, where this cost the job its entire first run.",
+            path.display()
+        );
+    }
+}
