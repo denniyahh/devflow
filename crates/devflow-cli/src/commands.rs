@@ -144,28 +144,76 @@ pub(crate) fn phase_artifact_on_base(
 /// `phase_reachability_on_base`'s `Undeterminable` arm. Applying this check
 /// unconditionally would convert that fall-open into a hard refusal and
 /// regress every existing project.
+///
+/// **Two ORDERED calls (46-02, D-07/D-08).** `rev-parse --verify` is a
+/// revision PARSER, and using one as a ref existence check is the root of
+/// VALID-01: revision SUFFIX syntax survives the `refs/heads/` prefix, so
+/// `workspace/example~1`, `develop@{0}` and `develop^{}` all satisfied it.
+/// `show-ref --verify` is a ref LOOKUP and refuses all three. It runs FIRST
+/// and alone decides accept-versus-reject. `check-ref-format` then runs only
+/// on an ALREADY-DECIDED refusal, purely to label it — it cannot decide
+/// existence (it accepts `nonexistent-xyz`), so reversing the order would
+/// accept and reject nothing correctly. Ref-name validity is delegated wholly
+/// to that plumbing rather than to a hand-rolled denylist, which would drift
+/// from git's own rules (`..`, trailing `.lock`, a bare `@`, control
+/// characters) while the plumbing cannot.
+///
+/// **What this does NOT close (R-01, `46-REVIEWS.md`).** This function
+/// qualifies `refs/heads/{base}`, but `crates/devflow-core/src/worktree.rs:64-83`
+/// forwards the RAW `{base}` to `git worktree add`. A value that is both a
+/// legal literal ref name and a revision expression (`@` is the demonstrated
+/// case) passes here and then forks from something else. That asymmetry is
+/// pre-existing, is not narrowed by the switch to `show-ref`, and is tracked
+/// as R-01 — closing it needs validator and consumer to agree on one spelling.
 pub(crate) fn ensure_base_is_a_local_branch(
     project_root: &Path,
     base: &str,
 ) -> Result<(), CliError> {
-    let ok = git_command(project_root)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{base}"),
-        ])
+    // Bound ONCE and shared by both calls, so the two can never diverge. The
+    // raw `base` is passed to neither: it is option-shaped for a value
+    // beginning with `-` (`check-ref-format -x` exits 129, parsed as a flag),
+    // and it also misclassifies plain one-level branch names as malformed
+    // unless `--allow-onelevel` is added. The qualified form needs no flags.
+    let qualified = format!("refs/heads/{base}");
+
+    // D-07: existence.
+    let exists = git_command(project_root)
+        .args(["show-ref", "--verify", "--quiet", qualified.as_str()])
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
-    if ok {
+    if exists {
         return Ok(());
     }
+
+    // D-08: classify the refusal that has already been decided above.
+    //
+    // The two `unwrap_or` defaults deliberately differ. Existence fails CLOSED
+    // (`false`): an unspawnable git refuses the base, exactly as before this
+    // change. Classification fails OPEN toward the EXISTING message (`true`):
+    // an unspawnable git must not emit a new "malformed" claim it has no
+    // evidence for. `check-ref-format` needs no repository — it is a pure text
+    // check — so it cannot be perturbed by repository state.
+    let well_formed = git_command(project_root)
+        .args(["check-ref-format", qualified.as_str()])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(true);
+
+    if well_formed {
+        return Err(CliError::Message(format!(
+            "configured base branch `{base}` is not a local branch in this repository. \
+             DevFlow forks phase worktrees from it and merges phase work back into it, so it \
+             must be a branch — not a remote-tracking name, a `refs/heads/` path, `HEAD`, or a \
+             commit SHA. Create it locally (e.g. `git branch {base} origin/{base}`) and re-run."
+        )));
+    }
+
     Err(CliError::Message(format!(
-        "configured base branch `{base}` is not a local branch in this repository. \
-         DevFlow forks phase worktrees from it and merges phase work back into it, so it \
-         must be a branch — not a remote-tracking name, a `refs/heads/` path, `HEAD`, or a \
-         commit SHA. Create it locally (e.g. `git branch {base} origin/{base}`) and re-run."
+        "configured base branch `{base}` is not a well-formed branch name — git rejects \
+         `{qualified}` as a ref. DevFlow forks phase worktrees from the base and merges phase \
+         work back into it, so it must name a branch, not a revision expression such as \
+         `~1`, `@{{0}}` or `^{{}}`. Set the base to the branch itself and re-run."
     )))
 }
 
@@ -325,10 +373,12 @@ pub(crate) fn start(
     let resolved_base = config::base_branch(project_root).map_err(CliError::Message)?;
     let base = resolved_base.value.as_str();
     if resolved_base.source != config::BaseBranchSource::Default {
-        // A commit-ish that is not a local branch passes `rev-parse --verify`
-        // and is forwarded raw to `git worktree add` — scoped to an
-        // explicitly configured base so the default path's existing
-        // fall-open for a clone with no local `develop` is untouched.
+        // A commit-ish that is not a local branch is forwarded raw to
+        // `git worktree add`, so the base is checked with `show-ref --verify`
+        // — a ref lookup, not the revision parser that let suffix syntax
+        // through (46-02, D-07). Still scoped to an explicitly configured
+        // base so the default path's existing fall-open for a clone with no
+        // local `develop` is untouched.
         ensure_base_is_a_local_branch(project_root, base)?;
     }
     // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
