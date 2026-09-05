@@ -45,6 +45,17 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Trimmed, non-blank, non-comment lines. Guards that count occurrences must
+/// use this: a bare search over the raw source counts prose, so documentation
+/// mentioning a forbidden value would fail a guard about code.
+fn code_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
 /// Every `cargo clippy` invocation must lint the whole workspace *including
 /// test targets*, or the gate silently stops covering `#[cfg(test)]` code —
 /// which is the majority of this repo's `unsafe` blocks. See WR-08.
@@ -318,7 +329,7 @@ fn ci_workflow_runs_the_sequential_check_under_a_cpu_pin() {
     let workflow = read(&path);
 
     assert!(
-        workflow.contains("name: Sequential 2-CPU check"),
+        workflow.contains(&format!("name: {SEQUENTIAL_JOB_NAME}")),
         "{} must define a job named exactly `Sequential 2-CPU check` — it is \
          the only place CI runs the local gate's sequential-under-CPU-pressure \
          load shape (46-CONTEXT.md D-01/D-02). Without it CI runs three \
@@ -380,14 +391,6 @@ fn ci_workflow_runs_the_sequential_check_under_a_cpu_pin() {
 #[test]
 fn cpu_pin_has_exactly_one_definition_site() {
     let root = repo_root();
-
-    fn code_lines(source: &str) -> Vec<&str> {
-        source
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
-    }
 
     // (a) The fragment defines the value exactly once.
     let fragment_path = root.join("scripts/lib/ci-cpus.sh");
@@ -452,5 +455,76 @@ fn cpu_pin_has_exactly_one_definition_site() {
          `taskset -c \"$CPUS\"` would expand to an empty list and change what \
          the job measures.",
         ci_path.display()
+    );
+}
+
+/// The four status contexts BOTH `develop` and `main` require, declared in the
+/// `develop-merge-or-squash` and `main-squash-only` rulesets. Three come from
+/// `.github/workflows/ci.yml`; the fourth lives in `devcontainer.yml`.
+const REQUIRED_STATUS_CONTEXTS: [&str; 4] =
+    ["Test", "Clippy", "Format", "Build + test in devcontainer"];
+
+/// The advisory sequential job added in 46-01. Deliberately absent from
+/// `REQUIRED_STATUS_CONTEXTS`.
+const SEQUENTIAL_JOB_NAME: &str = "Sequential 2-CPU check";
+
+/// `Sequential 2-CPU check` is ADVISORY, and it is advisory for exactly one
+/// reason: its name is not in the required-check set the branch rulesets
+/// declare. Nothing in the workflow marks it advisory — there is no such key —
+/// so a rename in EITHER direction changes its merge-blocking status silently,
+/// and only this guard makes that loud. See 46-CONTEXT.md D-05.
+///
+/// Renaming it INTO the required set would not add a check; it would HIJACK an
+/// existing required context, so the real `Test` (or whichever) would stop
+/// reporting and every merge to that branch would wedge. That has happened
+/// here before, on 2026-07-26, when deleting `devcontainer.yml` orphaned a
+/// required context.
+///
+/// The `continue-on-error` assertion encodes the other half of D-05. That key
+/// was considered and explicitly REJECTED: it makes a job report SUCCESS on a
+/// real suite failure, which would poison every `gh pr checks` reading this
+/// repository's own rules require as the acceptance evidence — a false-green
+/// generator aimed squarely at the one signal used to accept the job.
+#[test]
+fn sequential_job_name_is_not_a_required_status_check() {
+    let path = repo_root().join(".github/workflows/ci.yml");
+    let workflow = read(&path);
+
+    let job_name_line = format!("name: {SEQUENTIAL_JOB_NAME}");
+    assert!(
+        workflow.lines().map(str::trim).any(|l| l == job_name_line),
+        "{} must define a job named exactly `{SEQUENTIAL_JOB_NAME}`. If it was \
+         renamed, check whether the new name collides with a REQUIRED status \
+         context before shipping — classic branch protection under-reports \
+         them, so check the rulesets:\n  \
+         gh api repos/denniyahh/devflow/rules/branches/develop\n  \
+         gh api repos/denniyahh/devflow/rules/branches/main",
+        path.display()
+    );
+
+    assert!(
+        !REQUIRED_STATUS_CONTEXTS.contains(&SEQUENTIAL_JOB_NAME),
+        "`{SEQUENTIAL_JOB_NAME}` must NOT be one of the required status \
+         contexts {REQUIRED_STATUS_CONTEXTS:?} (46-CONTEXT.md D-05). Sharing a \
+         name hijacks that required context rather than adding an advisory \
+         one, so the real job stops reporting and merges wedge. Promotion is \
+         deferred past this milestone and is a ruleset change, not a rename. \
+         Verify the current set with:\n  \
+         gh api repos/denniyahh/devflow/rules/branches/develop\n  \
+         gh api repos/denniyahh/devflow/rules/branches/main"
+    );
+
+    let masking: Vec<&str> = code_lines(&workflow)
+        .into_iter()
+        .filter(|l| l.contains("continue-on-error"))
+        .collect();
+    assert!(
+        masking.is_empty(),
+        "{} must not set `continue-on-error` on any job — it reports SUCCESS \
+         on a real suite failure, which is worse than no job at all because \
+         `gh pr checks` then shows green for a red suite (46-CONTEXT.md D-05 \
+         rejected it explicitly). Advisory-ness comes from being outside the \
+         required-check set, not from masking the exit code. Found: {masking:?}",
+        path.display()
     );
 }
