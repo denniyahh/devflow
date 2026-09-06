@@ -845,3 +845,162 @@ fn job_splitter_finds_exactly_the_live_ci_jobs() {
         "the splitter must return exactly the four real jobs. Got: {keys:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 46-04 / 46-REVIEWS.md C-03: the pinned-vs-unpinned comparison is a DECISION,
+// and the decision is testable because the decider does not measure.
+//
+// `scripts/assert-cpu-pin.sh <cpu_list> <unpinned_nproc> <pinned_nproc>` takes
+// the three values as arguments; the CI step does the real `nproc`/pin
+// measuring and hands them over. That split is the whole point: a decider
+// embedded in `ci.yml` can only ever be observed on a runner that happens to
+// disagree with itself, so its failing direction would never run. Here every
+// branch runs on every developer's machine.
+// ---------------------------------------------------------------------------
+
+/// Run the decider and return `(exit code, stdout, stderr)`. Invoked directly
+/// rather than through `bash <path>`, so a lost exec bit fails here instead of
+/// in CI.
+fn run_assert_cpu_pin(args: &[&str]) -> (Option<i32>, String, String) {
+    let root = repo_root();
+    let path = root.join("scripts/assert-cpu-pin.sh");
+    assert!(
+        path.is_file(),
+        "{} must exist — it is the decider the `Sequential 2-CPU check` job's \
+         load-shape step calls instead of echoing (46-REVIEWS.md C-03).",
+        path.display()
+    );
+    let out = std::process::Command::new(&path)
+        .args(args)
+        .current_dir(&root)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "run {} {args:?}: {e} (is the exec bit set?)",
+                path.display()
+            )
+        });
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The ordinary CI case: 4 visible CPUs unpinned, 2 under the pin.
+#[test]
+fn assert_cpu_pin_passes_when_the_pin_narrowed_the_core_count() {
+    let (code, stdout, stderr) = run_assert_cpu_pin(&["0,1", "4", "2"]);
+    assert_eq!(code, Some(0), "stdout: {stdout:?}\nstderr: {stderr:?}");
+    assert!(
+        stdout.contains("PASSED"),
+        "a silent pass is indistinguishable from a silent skip in a job log. \
+         stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains('4') && stdout.contains('2'),
+        "the pass message must name both counts. stdout: {stdout:?}"
+    );
+}
+
+/// **The C-03 failing direction.** The entire finding is that before this
+/// script existed there was no command in the repository that could produce
+/// this outcome: the step echoed the two counts and exited 0 whether or not
+/// they differed.
+#[test]
+fn assert_cpu_pin_fails_when_the_pin_did_not_narrow_the_core_count() {
+    let (code, stdout, stderr) = run_assert_cpu_pin(&["0,1", "4", "4"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "the pin visibly failed to narrow anything and the decider still \
+         exited 0 — that is C-03 unfixed. stdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("did not narrow"),
+        "the failure must say what went wrong on stderr. stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains('4'),
+        "the failure must name the counts it compared. stderr: {stderr:?}"
+    );
+}
+
+/// Without this skip the C-03 fix would contradict C-06: under
+/// `DEVFLOW_CI_CPUS=all` there is no pin, so there is nothing to narrow.
+#[test]
+fn assert_cpu_pin_skips_and_says_why_for_the_all_override() {
+    let (code, stdout, stderr) = run_assert_cpu_pin(&["all", "4", "4"]);
+    assert_eq!(code, Some(0), "stdout: {stdout:?}\nstderr: {stderr:?}");
+    assert!(
+        stdout.contains("SKIPPED") && stdout.contains("all"),
+        "a SILENT skip reads as a pass to anyone scanning the job log, which is \
+         the C-03 defect wearing a different hat. stdout: {stdout:?}"
+    );
+}
+
+/// A 2-CPU pin cannot narrow a 2-CPU machine, so a failure here would be an
+/// artefact of the host rather than a fact about the pin.
+#[test]
+fn assert_cpu_pin_skips_and_says_why_on_a_two_cpu_host() {
+    let (code, stdout, stderr) = run_assert_cpu_pin(&["0,1", "2", "2"]);
+    assert_eq!(code, Some(0), "stdout: {stdout:?}\nstderr: {stderr:?}");
+    assert!(
+        stdout.contains("SKIPPED") && stdout.contains('2'),
+        "the skip must name the 2-CPU host as its reason. stdout: {stdout:?}"
+    );
+}
+
+/// A decider invoked wrongly must say so rather than silently deciding.
+#[test]
+fn assert_cpu_pin_rejects_a_wrong_argument_count() {
+    let (code, stdout, stderr) = run_assert_cpu_pin(&["0,1", "4"]);
+    assert_ne!(code, Some(0), "stdout: {stdout:?}\nstderr: {stderr:?}");
+    assert!(
+        stderr.contains("usage") || stderr.contains("Usage"),
+        "a wrong argument count must print usage. stderr: {stderr:?}"
+    );
+}
+
+/// Guarded explicitly so bad input reads as bad input. Left to `[ ... -lt ... ]`
+/// it would die under `set -e` with "integer expression expected", which reads
+/// as a broken script rather than as a bad argument.
+#[test]
+fn assert_cpu_pin_rejects_a_non_numeric_count() {
+    let (code, stdout, stderr) = run_assert_cpu_pin(&["0,1", "four", "2"]);
+    assert_ne!(code, Some(0), "stdout: {stdout:?}\nstderr: {stderr:?}");
+    assert!(
+        stderr.contains("four"),
+        "the error must quote the offending argument. stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("integer expression expected"),
+        "bad input must be rejected explicitly, not by letting `[` error out — \
+         that message reads as a broken script. stderr: {stderr:?}"
+    );
+}
+
+/// The decider is only worth anything if CI calls it. Without this, the script
+/// could be perfect and the workflow could still be echoing.
+#[test]
+fn ci_workflow_calls_the_cpu_pin_decider_instead_of_echoing() {
+    let path = repo_root().join(".github/workflows/ci.yml");
+    let workflow = read(&path);
+    let (_, body) = split_jobs(&workflow)
+        .into_iter()
+        .find(|(k, _)| k == "sequential")
+        .expect("the `sequential` job must exist");
+
+    let calls: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("scripts/assert-cpu-pin.sh"))
+        .collect();
+    assert!(
+        !calls.is_empty(),
+        "the `sequential` job must invoke scripts/assert-cpu-pin.sh in its own \
+         body. Echoing the two counts under a comment calling one the negative \
+         control for the other is what 46-REVIEWS.md C-03 found: three bare \
+         `echo`s that always exit 0. Documenting a gate is not implementing one."
+    );
+}
