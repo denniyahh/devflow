@@ -627,17 +627,44 @@ fn ci_parity_fixture(name: &str) -> String {
     read(&path)
 }
 
-/// RED STUB (46-04 Task 2). Reproduces the pre-46-04 splitter verbatim: it
-/// anchors to nothing, so any two-space key in the file — including `push:`
-/// and `pull_request:` under the top-level `on:` block — parses as a job.
+/// Split a workflow's top-level `jobs:` mapping into `(job_key, body)` pairs.
+///
+/// **Anchored to `jobs:` (46-04, 46-REVIEWS.md C-02).** The previous version
+/// anchored to nothing and treated any two-space key as a job header, so
+/// `push:` and `pull_request:` under the top-level `on:` block parsed as jobs.
+/// Measured on the live file at the time: six headers for four real jobs,
+/// which is what let `assert!(jobs.len() >= 4)` be satisfied by two non-jobs.
+///
+/// Operates on RAW lines on purpose. Indentation is the ONLY signal that
+/// separates a top-level key from a nested one, and `code_lines` maps
+/// `str::trim` over everything — it has destroyed that signal before this
+/// function could use it. `code_lines` stays correct for the
+/// occurrence-COUNTING guards that use it; it is simply the wrong tool here.
 fn split_jobs(workflow: &str) -> Vec<(String, String)> {
     let mut jobs: Vec<(String, String)> = Vec::new();
+    let mut inside_jobs_mapping = false;
+
     for line in workflow.lines() {
-        let is_job_header = line.len() > 2
-            && line.starts_with("  ")
-            && !line.starts_with("   ")
+        let blank = line.trim().is_empty();
+        let indent = line.len() - line.trim_start().len();
+
+        if !inside_jobs_mapping {
+            if indent == 0 && line.trim_end() == "jobs:" {
+                inside_jobs_mapping = true;
+            }
+            continue;
+        }
+
+        // A non-blank line back at column 0 ends the `jobs:` mapping.
+        if !blank && indent == 0 {
+            break;
+        }
+
+        let is_job_header = !blank
+            && indent == 2
             && line.trim_end().ends_with(':')
             && !line.trim_start().starts_with('#');
+
         if is_job_header {
             jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
         } else if let Some(last) = jobs.last_mut() {
@@ -645,13 +672,74 @@ fn split_jobs(workflow: &str) -> Vec<(String, String)> {
             last.1.push('\n');
         }
     }
+
     jobs
 }
 
-/// RED STUB (46-04 Task 2). Accepts everything — the vacuous implementation
-/// the fixture cases exist to reject.
-fn recognise_pinned_sequential_job(_workflow: &str) -> Result<String, String> {
-    Ok("sequential".to_string())
+/// Decide whether a workflow really runs the pinned sequential suite, scoped
+/// to the `Sequential 2-CPU check` job's OWN body.
+///
+/// Returns the job's key on success. Every failure names what the job itself
+/// is missing, not what the file is missing — that distinction is the whole of
+/// 46-REVIEWS.md C-02, which demonstrated two bypasses against the previous
+/// whole-file `contains` checks.
+///
+/// Within that body, after dropping whole comment lines, it requires:
+///   (a) a line mentioning `scripts/lib/ci-cpus.sh` — the single definition
+///       site for the CPU list AND for the `all` special-case (D-03, C-06);
+///   (b) a line whose TRIMMED content STARTS WITH [`PIN_TOKEN`] and also
+///       contains `scripts/check.sh all`.
+///
+/// **The starts-with rule in (b) is the entire echoed-command defence**, and
+/// `tests/fixtures/ci-parity/echoed-command.yml` is the case that proves it:
+/// `- run: echo '"${CPU_PIN[@]}" scripts/check.sh all'` trims to a line
+/// starting with `- run: echo`, so it is rejected. A `contains` check would
+/// accept it — mentioning the pinned command is not running it.
+///
+/// Comment stripping is WHOLE-LINE only (drop lines whose first non-space
+/// character is `#`), and is applied only AFTER the splitter has used
+/// indentation. A mid-line `#` is not reliably a comment in YAML, so a
+/// stripper that assumed it was would corrupt the very lines being recognised
+/// — `- run: echo "a#b"` is one value, not a command plus a comment.
+fn recognise_pinned_sequential_job(workflow: &str) -> Result<String, String> {
+    let name_line = format!("name: {SEQUENTIAL_JOB_NAME}");
+
+    let (key, body) = split_jobs(workflow)
+        .into_iter()
+        .find(|(_, body)| body.lines().map(str::trim).any(|l| l == name_line))
+        .ok_or_else(|| {
+            format!(
+                "no job body contains `{name_line}` — the job is missing, \
+                 renamed, or the line sits outside any job block"
+            )
+        })?;
+
+    let code: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+
+    if !code.iter().any(|l| l.contains("scripts/lib/ci-cpus.sh")) {
+        return Err(format!(
+            "job `{key}` does not source `scripts/lib/ci-cpus.sh` in its own \
+             body — the CPU list and the `all` override both live there, and a \
+             mention elsewhere in the file (another job, or a comment) does not \
+             put the pin on this job"
+        ));
+    }
+
+    if !code.iter().any(|l| {
+        let trimmed = l.trim();
+        trimmed.starts_with(PIN_TOKEN) && trimmed.contains("scripts/check.sh all")
+    }) {
+        return Err(format!(
+            "job `{key}` has no line whose trimmed content STARTS WITH \
+             `{PIN_TOKEN}` and runs `scripts/check.sh all` — the pinned \
+             invocation is missing, commented out, or merely echoed"
+        ));
+    }
+
+    Ok(key)
 }
 
 /// POSITIVE CONTROL. Without it a recogniser that rejected every input would
