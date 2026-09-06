@@ -82,14 +82,19 @@ fn assert_blocked(name: &str, expected_text: &str) {
         !out.status.success(),
         "{name} must be REFUSED by the scanner, but it exited 0.\n--- output ---\n{text}"
     );
+    // Assert on a SINGLE line carrying both the file name and the offending
+    // text, not on the whole output. The scanner's guidance boilerplate itself
+    // mentions `${PIPESTATUS[0]}`, so a whole-output `contains` would be
+    // satisfied by the boilerplate for four of these fixtures without the
+    // scanner having reported anything about the file at all.
+    let hit = text
+        .lines()
+        .find(|line| line.contains(name) && line.contains(expected_text));
     assert!(
-        text.contains(name),
-        "the refusal for {name} must name the file.\n--- output ---\n{text}"
-    );
-    assert!(
-        text.contains(expected_text),
-        "the refusal for {name} must quote the offending text {expected_text:?}.\n\
-         --- output ---\n{text}"
+        hit.is_some(),
+        "the refusal for {name} must print one line naming BOTH the file and the \
+         offending text {expected_text:?}; a hit reported only in the generic \
+         guidance text is not a report about this file.\n--- output ---\n{text}"
     );
 }
 
@@ -155,7 +160,7 @@ fn bash_rematch_is_blocked() {
 /// malformed, not skipped.
 #[test]
 fn unterminated_block_is_reported_as_malformed() {
-    assert_blocked("unterminated-PLAN.md", "unterminated");
+    assert_blocked("unterminated-PLAN.md", "unterminated <automated> block");
 }
 
 /// The load-bearing negative control. The bashism is inside the region that
