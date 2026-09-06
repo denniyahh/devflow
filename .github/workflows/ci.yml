@@ -126,13 +126,31 @@ jobs:
       # D-04. Echoing the CPU list alone proves nothing: a partially-invalid
       # list narrows SILENTLY and still exits 0. The unpinned count is the
       # negative control for the pinned one -- they must differ.
+      #
+      # The pin prefix comes from cpu_pin_prefix() in scripts/lib/ci-cpus.sh,
+      # which is the ONE place the `all` override is handled. A shell function
+      # cannot cross a step boundary, so the fragment is sourced again here --
+      # that is the single definition site being read, not a second one.
       - name: Record the load shape this job actually got
         run: |
           set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          cpu_pin_prefix
           echo "unpinned_nproc=$(nproc)"
           echo "cpu_list=$CPUS"
-          echo "pinned_nproc=$(taskset -c "$CPUS" nproc)"
+          echo "pinned_nproc=$("${CPU_PIN[@]}" nproc)"
       # CPU affinity is inherited across fork/exec, so rustc and the test
       # harness threads all land under this mask. `--test-threads=N` is not a
       # substitute: it throttles the harness only, leaving compilation free.
-      - run: taskset -c "$CPUS" scripts/check.sh all
+      #
+      # Same re-source, same reason. With DEVFLOW_CI_CPUS=all the prefix is an
+      # empty array and this runs plain `scripts/check.sh all`; the previous
+      # literal `taskset -c "$CPUS"` died on that override
+      # (46-REVIEWS.md C-06). The array expansion needs the job's
+      # `defaults: run: shell: bash` above -- do not remove it.
+      - name: Run the full check suite under the CPU pin
+        run: |
+          set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          cpu_pin_prefix
+          "${CPU_PIN[@]}" scripts/check.sh all

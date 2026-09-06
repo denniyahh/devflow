@@ -75,12 +75,15 @@ docker volume create "$REGISTRY_VOLUME" >/dev/null
 # `set -euo pipefail` makes a missing fragment fail loudly rather than run
 # the suite unpinned. Override with DEVFLOW_CI_CPUS=all to use every core
 # (faster, less faithful).
+# cpu_pin_prefix() lives in that fragment too, and is the ONLY place the
+# `all` case is decided. This gate used to carry its own copy of the
+# conditional while CI carried none, so DEVFLOW_CI_CPUS=all worked here and
+# killed CI with `taskset: failed to parse CPU list: all` (46-REVIEWS.md
+# C-06). The helper sets an argv PREFIX rather than running the command,
+# because the value is needed inside the `docker run` below where a host-shell
+# function does not exist.
 . scripts/lib/ci-cpus.sh
-if [ "$CPUS" = "all" ]; then
-    PIN=()
-else
-    PIN=(taskset -c "$CPUS")
-fi
+cpu_pin_prefix
 
 # HYG-02 (41-02, re-derived from real container runs 2026-08-20): a git
 # WORKTREE's `.git` is a FILE — `gitdir: <main>/.git/worktrees/<N>` — pointing
@@ -128,4 +131,4 @@ exec docker run --rm -t \
     -e CARGO_TARGET_DIR=/ctarget \
     -e CARGO_TERM_COLOR=always \
     "$IMAGE" \
-    "${PIN[@]}" scripts/check.sh "$TARGET"
+    "${CPU_PIN[@]}" scripts/check.sh "$TARGET"
