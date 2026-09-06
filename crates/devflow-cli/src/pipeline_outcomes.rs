@@ -2363,24 +2363,49 @@ mod tests {
     /// a real, non-zero value throughout, so a green result here cannot be
     /// explained by the branch changing underneath the test.
     ///
-    /// **`NoGitPath` for cycle 1, `NeutralPath` for cycle 2.** Cycle 1 needs
-    /// `git` to be UNRESOLVABLE — only a spawn that fails makes `.output()`
-    /// return `Err`, which is the sole could-not-measure condition (F-1); a
-    /// shim that ran and exited non-zero would be a real observation and would
-    /// exercise the already-correct `Some(0)` path (NC-4). Cycle 2 needs a
-    /// real `git` but still no resolvable agent CLI, which is exactly what
-    /// `NeutralPath`'s git-only `PATH` provides.
+    /// **A child for cycle 1, `NeutralPath` in the parent for cycle 2.**
+    /// Cycle 1 needs `git` to be UNRESOLVABLE — only a spawn that fails makes
+    /// `.output()` return `Err`, which is the sole could-not-measure condition
+    /// (F-1); a shim that ran and exited non-zero would be a real observation
+    /// and would exercise the already-correct `Some(0)` path (NC-4). The
+    /// child owns that empty `PATH`, so no sibling test can observe it. Cycle
+    /// 2 needs a real `git` but still no resolvable agent CLI, which is exactly
+    /// what `NeutralPath`'s git-only `PATH` provides in the parent.
     ///
-    /// **What this does NOT establish.** The run boundary. `State::new` zeroes
-    /// both `consecutive_failures` and the baseline on every `devflow start
-    /// --force`, and nothing here shows the streak surviving a restart.
+    /// **What this does NOT establish.** A forced-run boundary. `State::new`
+    /// zeroes both `consecutive_failures` and the baseline on every `devflow
+    /// start --force`; the save/load control below covers the child boundary,
+    /// not an entirely new run.
     #[test]
     fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            validate_failure_with_unmeasurable_count_accumulates_the_streak";
+        let phase = PhaseId::new(89);
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD: run exactly the first cycle under an empty PATH, then
+            // persist its state for the parent to exercise the real cycle.
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            let _ = handle_validate_outcome(&root, &mut state, ValidateOutcome::Failed);
+
+            assert_eq!(
+                state.last_validate_failure_commit_count,
+                Some(1),
+                "a cycle whose commit count could NOT be measured must leave the baseline \
+                 byte-identical to the last real observation — overwriting it with a forged \
+                 zero is 999.77 itself"
+            );
+            assert_eq!(
+                state.consecutive_failures, 2,
+                "an unmeasurable count is not evidence of forward progress, so the streak \
+                 must continue rather than restart"
+            );
+            workflow::save_state(&state).unwrap();
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = PhaseId::new(89);
         init_repo(root);
         // One real commit on the feature branch, and no further commits for
         // the rest of this test: the REAL count is a stable, non-zero 1.
@@ -2412,12 +2437,14 @@ mod tests {
         };
         seed_gate_response();
 
-        // CYCLE 1 — the measurement fails. The guard wraps exactly this call
-        // and nothing else.
-        {
-            let _no_git = NoGitPath::install();
-            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-        }
+        // CYCLE 1 — the measurement fails in a child whose PATH cannot affect
+        // this test or any sibling. The child persists the resulting state.
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
+
+        // The re-assertion is the round-trip control: the child passing is not
+        // enough if either field is dropped or defaulted while it is saved.
+        let mut state = workflow::load_state(root, phase).unwrap();
 
         assert_eq!(
             state.last_validate_failure_commit_count,
