@@ -318,49 +318,44 @@ fn devflow_test_clippy_matches_ci_scope() {
 /// re-typed literal is exactly the drift this forbids), and D-04 (the job
 /// prints the shape it actually got).
 ///
-/// Deleting the job, dropping the `taskset` wrapper, or re-typing the CPU
-/// list into the workflow all fail here rather than silently reverting CI to
-/// the three-parallel-jobs shape that has rejected 0 of the pushes the local
-/// gate rejected 2 of 2.
+/// Deleting the job, dropping the pin, or re-typing the CPU list into the
+/// workflow all fail here rather than silently reverting CI to the
+/// three-parallel-jobs shape that has rejected 0 of the pushes the local gate
+/// rejected 2 of 2.
+///
+/// **The pin is invoked through `cpu_pin_prefix` (46-04), not through a
+/// literal `taskset` line.** Do not go looking for `taskset -c` in `ci.yml` —
+/// the suite step expands `"${CPU_PIN[@]}"`, which the fragment sets to
+/// `(taskset -c "$CPUS")` or, under `DEVFLOW_CI_CPUS=all`, to an empty array.
+///
+/// **Job-scoped since 46-04 (46-REVIEWS.md C-02).** The three assertions used
+/// to search the whole file independently, so a comment or a decoy job could
+/// supply all three tokens while `sequential` itself carried none. Both
+/// bypasses were demonstrated. The logic now lives in
+/// `recognise_pinned_sequential_job`, a function over `&str` whose negative
+/// cases are exercised against fixtures in `tests/fixtures/ci-parity/` —
+/// without those, the guard can only ever be observed passing on the live
+/// file, which cannot be made to fail on demand.
 #[test]
 fn ci_workflow_runs_the_sequential_check_under_a_cpu_pin() {
     let root = repo_root();
     let path = root.join(".github/workflows/ci.yml");
     let workflow = read(&path);
 
-    assert!(
-        workflow.contains(&format!("name: {SEQUENTIAL_JOB_NAME}")),
-        "{} must define a job named exactly `Sequential 2-CPU check` — it is \
-         the only place CI runs the local gate's sequential-under-CPU-pressure \
-         load shape (46-CONTEXT.md D-01/D-02). Without it CI runs three \
-         parallel jobs on an unpinned runner and cannot see the interleaving \
-         the local gate sees.",
-        path.display()
-    );
-
-    let pinned: Vec<&str> = workflow
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.contains("taskset -c") && l.contains("scripts/check.sh all"))
-        .collect();
-    assert!(
-        !pinned.is_empty(),
-        "{} must run `scripts/check.sh all` wrapped in `taskset -c` — CPU \
-         affinity is inherited across fork/exec, so the pin is what puts \
-         rustc and the test harness threads under the same mask \
-         (46-CONTEXT.md D-02). `--test-threads=N` is not a substitute: it \
-         throttles the harness only, leaving compilation unpinned. \
-         Found: {pinned:?}",
-        path.display()
-    );
-
-    assert!(
-        workflow.contains("scripts/lib/ci-cpus.sh"),
-        "{} must read the CPU list from `scripts/lib/ci-cpus.sh` rather than \
-         re-typing it — the local gate reads the same file, and a second \
-         definition site is the drift 46-CONTEXT.md D-03 exists to prevent.",
-        path.display()
-    );
+    if let Err(why) = recognise_pinned_sequential_job(&workflow) {
+        panic!(
+            "{}: {why}\n\n\
+             The `{SEQUENTIAL_JOB_NAME}` job is the only place CI runs the local \
+             gate's sequential-under-CPU-pressure load shape (46-CONTEXT.md \
+             D-01/D-02). CPU affinity is inherited across fork/exec, so the pin \
+             is what puts rustc AND the test harness threads under the same \
+             mask; `--test-threads=N` is not a substitute, because it throttles \
+             the harness only and leaves compilation unpinned. The CPU list \
+             itself must come from scripts/lib/ci-cpus.sh rather than being \
+             re-typed (46-CONTEXT.md D-03).",
+            path.display()
+        );
+    }
 
     let fragment = root.join("scripts/lib/ci-cpus.sh");
     assert!(
@@ -558,30 +553,33 @@ fn container_jobs_using_bash_syntax_declare_a_bash_shell() {
     // Bash-only constructs that dash either rejects outright or mishandles.
     const BASHISMS: &[&str] = &["pipefail", "[[", "PIPESTATUS", "declare -A"];
 
-    // Split into job blocks: a job key is exactly two spaces of indent under
-    // `jobs:`. Anything more deeply indented belongs to the job above it.
-    let mut jobs: Vec<(String, String)> = Vec::new();
-    for line in workflow.lines() {
-        let is_job_header = line.len() > 2
-            && line.starts_with("  ")
-            && !line.starts_with("   ")
-            && line.trim_end().ends_with(':')
-            && !line.trim_start().starts_with('#');
-        if is_job_header {
-            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
-        } else if let Some(last) = jobs.last_mut() {
-            last.1.push_str(line);
-            last.1.push('\n');
-        }
+    let jobs = split_jobs(&workflow);
+    let keys: Vec<&str> = jobs.iter().map(|(k, _)| k.as_str()).collect();
+
+    // ANTI-VACUITY, replacing the `jobs.len() >= 4` this used to carry
+    // (46-REVIEWS.md C-02). That count was satisfiable by two NON-jobs: the
+    // old splitter anchored to nothing, so `push:` and `pull_request:` under
+    // the top-level `on:` block parsed as job headers and it reported 6
+    // headers for 4 real jobs. Asserting the exact key list is what makes a
+    // broken splitter loud — a broken splitter would otherwise pass this test
+    // vacuously by finding no bashisms anywhere.
+    for expected in LIVE_CI_JOB_KEYS {
+        assert!(
+            keys.contains(&expected),
+            "expected to parse job `{expected}` out of {}, got {keys:?} — the \
+             block splitter is broken",
+            path.display()
+        );
     }
-    assert!(
-        jobs.len() >= 4,
-        "expected to parse at least the 4 known jobs out of {}, got {:?} — the \
-         block splitter is broken, and a broken splitter would pass this test \
-         vacuously by finding no bashisms anywhere",
-        path.display(),
-        jobs.iter().map(|(n, _)| n).collect::<Vec<_>>()
-    );
+    for not_a_job in ["push", "pull_request"] {
+        assert!(
+            !keys.contains(&not_a_job),
+            "`{not_a_job}` is a key under the top-level `on:` block, not a job, \
+             but the splitter returned it in {keys:?}. That is the exact \
+             miscount 46-REVIEWS.md C-02 found: it let `jobs.len() >= 4` pass \
+             on two non-jobs."
+        );
+    }
 
     for (name, body) in &jobs {
         let used: Vec<&str> = BASHISMS
@@ -602,4 +600,160 @@ fn container_jobs_using_bash_syntax_declare_a_bash_shell() {
             path.display()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 46-04 / 46-REVIEWS.md C-02: a job-scoped, fixture-driven parity recogniser.
+// ---------------------------------------------------------------------------
+
+/// The four real jobs in `.github/workflows/ci.yml`. `push` and
+/// `pull_request` are deliberately absent — they are keys under the top-level
+/// `on:` block, and the pre-46-04 splitter counted them as jobs.
+const LIVE_CI_JOB_KEYS: [&str; 4] = ["test", "clippy", "fmt", "sequential"];
+
+/// The argv prefix the pinned suite step expands. `cpu_pin_prefix` in
+/// `scripts/lib/ci-cpus.sh` sets `CPU_PIN` to `(taskset -c "$CPUS")`, or to an
+/// empty array under `DEVFLOW_CI_CPUS=all`.
+const PIN_TOKEN: &str = "\"${CPU_PIN[@]}\"";
+
+/// Read one of the recogniser's fixtures. These exist so the negative cases
+/// actually run: a guard that only ever inspects the live workflow cannot be
+/// made to fail on demand, and one that has only been observed passing is not
+/// evidence of anything.
+fn ci_parity_fixture(name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ci-parity")
+        .join(name);
+    read(&path)
+}
+
+/// RED STUB (46-04 Task 2). Reproduces the pre-46-04 splitter verbatim: it
+/// anchors to nothing, so any two-space key in the file — including `push:`
+/// and `pull_request:` under the top-level `on:` block — parses as a job.
+fn split_jobs(workflow: &str) -> Vec<(String, String)> {
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    for line in workflow.lines() {
+        let is_job_header = line.len() > 2
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_job_header {
+            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if let Some(last) = jobs.last_mut() {
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+    }
+    jobs
+}
+
+/// RED STUB (46-04 Task 2). Accepts everything — the vacuous implementation
+/// the fixture cases exist to reject.
+fn recognise_pinned_sequential_job(_workflow: &str) -> Result<String, String> {
+    Ok("sequential".to_string())
+}
+
+/// POSITIVE CONTROL. Without it a recogniser that rejected every input would
+/// satisfy all four negative fixtures and still report green.
+#[test]
+fn recogniser_accepts_a_valid_pinned_sequential_job() {
+    let workflow = ci_parity_fixture("valid.yml");
+    assert_eq!(
+        recognise_pinned_sequential_job(&workflow),
+        Ok("sequential".to_string()),
+        "valid.yml carries the job name, the ci-cpus.sh source line and a \
+         command line starting with the pin token — the recogniser must accept \
+         it, or every negative case below passes for the wrong reason."
+    );
+}
+
+/// agy's demonstrated bypass (46-REVIEWS.md C-02). Measured against the
+/// pre-46-04 guard: commenting the suite step out left it reporting
+/// `1 passed`.
+#[test]
+fn recogniser_rejects_a_commented_out_pinned_suite_step() {
+    let workflow = ci_parity_fixture("commented-out.yml");
+    let err = recognise_pinned_sequential_job(&workflow)
+        .expect_err("a commented-out pinned suite step must not satisfy the guard");
+    assert!(
+        err.contains("pinned"),
+        "the error must name the missing pinned invocation. Found: {err:?}"
+    );
+}
+
+/// codex's demonstrated bypass (46-REVIEWS.md C-02): the tokens are all
+/// present in the file, just not in the job that has to carry them.
+#[test]
+fn recogniser_rejects_a_decoy_job_carrying_the_pin() {
+    let workflow = ci_parity_fixture("decoy-job.yml");
+    let err = recognise_pinned_sequential_job(&workflow)
+        .expect_err("tokens in a DIFFERENT job must not satisfy the guard");
+    assert!(
+        err.contains("ci-cpus.sh") || err.contains("pinned"),
+        "the error must name what the sequential job itself is missing. \
+         Found: {err:?}"
+    );
+}
+
+/// Mentioning the pinned command is not running it. This is the whole of the
+/// starts-with rule's justification.
+#[test]
+fn recogniser_rejects_an_echoed_pin_command() {
+    let workflow = ci_parity_fixture("echoed-command.yml");
+    let err = recognise_pinned_sequential_job(&workflow)
+        .expect_err("an echoed pin command must not satisfy the guard");
+    assert!(
+        err.contains("pinned"),
+        "the error must name the missing pinned invocation. Found: {err:?}"
+    );
+}
+
+/// Without the pin the job is just a fourth unpinned runner, which is the
+/// exact shape 46-01 added it to escape.
+#[test]
+fn recogniser_rejects_an_unpinned_suite_step() {
+    let workflow = ci_parity_fixture("no-pin.yml");
+    let err = recognise_pinned_sequential_job(&workflow)
+        .expect_err("an unpinned `scripts/check.sh all` must not satisfy the guard");
+    assert!(
+        err.contains("pinned"),
+        "the error must name the missing pinned invocation. Found: {err:?}"
+    );
+}
+
+/// The splitter must anchor to the top-level `jobs:` key. `push:` and
+/// `pull_request:` sit at the same two-space indent under `on:`, which is why
+/// indentation alone is not enough — and why these lines must NOT be routed
+/// through `code_lines`, whose `str::trim` destroys the only signal that
+/// distinguishes a top-level key from a nested one.
+#[test]
+fn job_splitter_excludes_on_block_keys() {
+    let workflow = ci_parity_fixture("valid.yml");
+    let keys: Vec<String> = split_jobs(&workflow).into_iter().map(|(k, _)| k).collect();
+    assert_eq!(
+        keys,
+        vec!["test".to_string(), "sequential".to_string()],
+        "valid.yml has exactly two jobs; `push` and `pull_request` are `on:` \
+         keys. Got: {keys:?}"
+    );
+}
+
+/// The same assertion against the live workflow, pinned to the exact key list
+/// rather than to a count. Measured before 46-04: the old splitter returned
+/// six keys — `push`, `pull_request`, `test`, `clippy`, `fmt`, `sequential` —
+/// for four real jobs, so `assert!(jobs.len() >= 4)` was satisfiable by two
+/// non-jobs.
+#[test]
+fn job_splitter_finds_exactly_the_live_ci_jobs() {
+    let workflow = read(&repo_root().join(".github/workflows/ci.yml"));
+    let keys: Vec<String> = split_jobs(&workflow).into_iter().map(|(k, _)| k).collect();
+    assert_eq!(
+        keys,
+        LIVE_CI_JOB_KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>(),
+        "the splitter must return exactly the four real jobs. Got: {keys:?}"
+    );
 }
