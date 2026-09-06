@@ -1168,7 +1168,6 @@ mod tests {
 
     #[test]
     fn terminal_hook_failure_stops_before_branch_cleanup() {
-        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1209,7 +1208,6 @@ mod tests {
     /// the "unreleased" literal.
     #[test]
     fn run_checkout_hooks_keeps_changelog_in_sync_with_tag_when_no_version_file() {
-        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo_no_version_file(root);
@@ -5106,7 +5104,6 @@ mod tests {
     /// (`gate_fired` → `notify_fired` → `gate_resolved`), not a bypass.
     #[test]
     fn handle_ship_outcome_with_yes_ship_auto_approves_exactly_once_with_attribution() {
-        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
