@@ -359,80 +359,6 @@ impl Drop for NeutralPath {
     }
 }
 
-/// RAII guard that REPLACES `PATH` with a deliberately EMPTY directory, so
-/// `git` — and every other binary — cannot be resolved at all for the scope
-/// it is bound in (35-01, criteria 1 and 6).
-///
-/// **Why empty rather than a failing shim (F-1).** The two consumers of
-/// [`devflow_core::agent_result::phase_commit_count`] must distinguish "the
-/// git child could not be executed" from "git ran and reported zero". Only
-/// the first is a measurement failure, and only an UNRESOLVABLE binary
-/// produces it: `Command::output()` returns `Err(NotFound)` when the program
-/// cannot be spawned, whereas a shim that runs and exits non-zero returns
-/// `Ok(status)` — a real observation. A test built on a failing shim would
-/// exercise the already-correct `Some(0)` path while appearing to cover the
-/// `None` one, which is precisely the proxy measurement this phase exists to
-/// remove.
-///
-/// Structurally a sibling of [`NeutralPath`]: same field shape, same
-/// `install()`-not-`new()` naming, same `Drop`-restores-on-every-exit-path
-/// reasoning (WR-05), and the same `TempDir`-outlives-the-`PATH`-that-names-it
-/// ordering. It differs in exactly one respect — the directory it points
-/// `PATH` at is empty, where [`NeutralPath`]'s still holds a real `git`.
-///
-/// **SUPERSEDED by [`run_test_without_git`] (46-06, review finding C-01).**
-/// The hazard this type's warning below describes is not hypothetical: it is
-/// what made `d525f9a` add `env_lock()` to 47 sibling tests, and that sweep
-/// still missed every test reaching `git` only through a helper. The
-/// replacement runs the same experiment in a CHILD process, where the emptied
-/// `PATH` is invisible to the rest of the suite, so there is nothing to
-/// serialise. This type survives only until 46-07 migrates its five remaining
-/// call sites in `pipeline_outcomes.rs`, at which point it is deleted. Do not
-/// add a new caller.
-///
-/// **The caller must already hold [`ENV_MUTEX`]** (via [`env_lock`]).
-/// `set_var` is process-wide and `cargo test` runs in parallel; this guard
-/// makes the restore unconditional, it does not make the mutation safe on its
-/// own. Hold it over exactly the one call under test and nothing more: this
-/// is the first guard in the workspace that makes `git` unresolvable
-/// process-wide, so any sibling test shelling out to `git` inside the guarded
-/// window fails spuriously.
-pub(crate) struct NoGitPath {
-    _dir: tempfile::TempDir,
-    original: Option<std::ffi::OsString>,
-}
-
-impl NoGitPath {
-    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
-    /// process-global state at the moment of the call.
-    pub(crate) fn install() -> Self {
-        // Deliberately empty — see the type's doc comment. Nothing is written
-        // into this directory, by design.
-        let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var_os("PATH");
-        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
-        // no other test thread is reading or writing PATH concurrently.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        Self {
-            _dir: dir,
-            original,
-        }
-    }
-}
-
-impl Drop for NoGitPath {
-    fn drop(&mut self) {
-        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
-        // for at least as long as this guard's own scope.
-        unsafe {
-            match &self.original {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-}
-
 /// Name of the environment variable that puts a re-executed test binary into
 /// CHILD mode: present means this process was spawned by
 /// [`run_test_without_git`], and its value is the fixture root the parent
@@ -461,13 +387,11 @@ pub(crate) fn child_no_git_root() -> Option<PathBuf> {
 /// the duration of that one test, **inside a child process where the emptied
 /// `PATH` is invisible to every sibling test in the parent**.
 ///
-/// This supersedes [`NoGitPath`] (46-06, review finding C-01). `NoGitPath`
-/// runs the same experiment through `std::env::set_var`, which is
-/// process-global: every other test thread in the same binary sees the
-/// emptied `PATH`, which is why `d525f9a` had to add `env_lock()` to 47
-/// siblings and still missed the tests that reach `git` only through a
-/// helper. Moving the window into a child removes the hazard instead of
-/// serialising around it.
+/// This replaces the former process-global empty-`PATH` experiment (46-06,
+/// review finding C-01). Every test thread in the same binary used to see the
+/// emptied `PATH`, which is why `d525f9a` added `env_lock()` to 47 siblings
+/// and still missed tests that reach `git` only through a helper. Moving the
+/// window into a child removes the hazard instead of serialising around it.
 ///
 /// Three details are load-bearing:
 ///
@@ -794,10 +718,9 @@ mod tests {
     /// unfixed defect, which is why it must pass before any result that
     /// depends on unrunnable `git` is believed.
     ///
-    /// **Named for the property, not the mechanism.** 46-06 renamed it off
-    /// the [`NoGitPath`] guard type, which will not exist once 46-07 lands;
-    /// the old name is in git history and deliberately not repeated here, so
-    /// a grep for it stays a true zero.
+    /// **Named for the property, not the former mechanism.** The deleted
+    /// guard's name remains only in git history, so the source-tree scan for
+    /// it stays a true zero.
     ///
     /// **The proof is in BOTH directions, and one direction alone is not a
     /// measurement.** The child asserts `git` does NOT resolve; the parent
