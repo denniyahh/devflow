@@ -94,34 +94,35 @@ fi
 #
 # The fix at authoring time is to write the command as `bash -c '...'`, which
 # is what this refuses to let you skip. Same-case conversion (`${v,,}`,
-# `${v^^}`) and `declare -A` are included: both are bash-only and both fail
-# quietly rather than loudly under zsh.
+# `${v^^}`), `declare -A`, any `${name[N]}` index and `${BASH_REMATCH[N]}` are
+# included: all are bash-only and all fail quietly rather than loudly under zsh.
 #
-# Scope note: this is line-based, so it covers the single-line `<automated>`
-# form (542 of 546 blocks in this repo). A multi-line block whose `bash -c`
-# sits on a different line than the bashism would false-positive; wrap the
-# offending line or split it.
-staged_plans="$(git diff --cached --name-only --diff-filter=ACM | grep -E '(^|/)[^/]*PLAN\.md$' || true)"
-if [ -n "$staged_plans" ]; then
-    bashism_hits="$(
-        printf '%s\n' "$staged_plans" \
-        | while IFS= read -r plan; do
-              [ -n "$plan" ] || continue
-              [ -f "$plan" ] || continue
-              grep -HnE '<automated>[^<]*(\$\{PIPESTATUS|\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)\}|declare -A)' "$plan" || true
-          done \
-        | grep -v 'bash -c' || true
-    )"
-    if [ -n "$bashism_hits" ]; then
-        echo "pre-commit: refusing to commit a plan whose <automated> verify command uses" >&2
-        echo "  bash-only syntax that expands to NOTHING under the executor's zsh shell:" >&2
-        echo "$bashism_hits" | cut -c1-200 | sed 's/^/    /' >&2
-        echo "  These assertions would pass without ever reading the value they claim to check." >&2
-        echo "  Wrap the command so it runs under bash, e.g.:" >&2
-        echo "      <automated>bash -c 'cargo test ... ; echo \"exit=\${PIPESTATUS[0]}\"'</automated>" >&2
-        exit 1
-    fi
+# The scan itself lives in `scripts/lint-plan-bashisms.sh`, which parses whole
+# `<automated>` BLOCKS and allows a bashism only when it is CONTAINED in a
+# single-quoted region that a `bash -c '` opened — not merely preceded by the
+# string `bash -c` somewhere on the line. See
+# `crates/devflow-cli/tests/plan_bashism_scanner.rs` for the cases, including
+# the two bypasses that were committed through this hook before the rule
+# changed. This hook is early feedback; that suite is the enforcement.
+bashism_scanner="scripts/lint-plan-bashisms.sh"
+if [ ! -x "$bashism_scanner" ]; then
+    # `core.hooksPath` normally points INTO the working tree (`scripts/hooks`),
+    # and a hook's cwd is the top of that tree, so the relative path above is
+    # what resolves in the shipped configuration. A hooksPath BORROWED from
+    # another checkout — which is how this hook is exercised end-to-end in a
+    # scratch repository — leaves cwd somewhere else entirely, so fall back to
+    # the scanner sitting beside this hook. Neither lookup degrades to a pass.
+    bashism_scanner="$(dirname "$0")/../lint-plan-bashisms.sh"
 fi
+if [ ! -x "$bashism_scanner" ]; then
+    echo "pre-commit: missing or non-executable '$bashism_scanner'." >&2
+    echo "  The hook and the scanner ship in the same tree and the same commit," >&2
+    echo "  so an absent scanner means something is wrong. Refusing rather than" >&2
+    echo "  degrading to a silent pass — a guard that skips is the failure class" >&2
+    echo "  it exists to prevent." >&2
+    exit 1
+fi
+"$bashism_scanner" --staged
 
 global_hooks=$(git config --global --get core.hooksPath || true)
 if [ -n "$global_hooks" ]; then
