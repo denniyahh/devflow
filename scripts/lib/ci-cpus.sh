@@ -42,6 +42,7 @@ CPUS="${DEVFLOW_CI_CPUS:-0,1}"
 # A shell function cannot cross a GitHub Actions step boundary, so each CI step
 # that needs it sources this file again. That re-source is this single
 # definition site being READ twice, not a second definition.
+# shellcheck disable=SC2034  # CPU_PIN is consumed by this file's callers
 cpu_pin_prefix() {
     if [ "$CPUS" = "all" ]; then
         CPU_PIN=()

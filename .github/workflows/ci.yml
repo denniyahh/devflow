@@ -123,22 +123,46 @@ jobs:
           set -euo pipefail
           . scripts/lib/ci-cpus.sh
           echo "CPUS=$CPUS" >> "$GITHUB_ENV"
-      # D-04. Echoing the CPU list alone proves nothing: a partially-invalid
-      # list narrows SILENTLY and still exits 0. The unpinned count is the
-      # negative control for the pinned one -- they must differ.
+      # D-04, corrected by 46-REVIEWS.md C-03. Echoing the CPU list alone
+      # proves nothing: a partially-invalid list narrows SILENTLY and still
+      # exits 0. This step used to say the unpinned count was the negative
+      # control for the pinned one and then never compare them -- three bare
+      # `echo`s that always exited 0. Documenting a gate is not implementing
+      # one. The comparison is now ASSERTED by scripts/assert-cpu-pin.sh, a
+      # decider that takes the measurements as ARGUMENTS so its failing
+      # direction is exercised by cargo test rather than only ever on a runner
+      # that happens to disagree with itself.
+      #
+      # The assertion is deliberately CONDITIONAL, and both skip paths print
+      # the reason they skipped (a silent skip reads as a pass in a job log,
+      # which is the same defect in another shape). It fires only when the pin
+      # is not the `all` override -- there is then no pin to narrow anything,
+      # see C-06 -- and when the host reports more than 2 CPUs, because a
+      # 2-CPU pin cannot narrow a 2-CPU machine and a failure there would be an
+      # artefact of the runner.
+      #
+      # WHAT THIS DOES NOT ESTABLISH: that rustc or the test-harness threads
+      # were actually confined, or that the runner was allocated 2 cores. It
+      # shows only that the pin narrowed the core count VISIBLE to one child
+      # process. The mechanism being relied on is that CPU affinity is
+      # inherited across fork/exec, and `nproc` does not measure inheritance.
+      # `nproc` here stays diagnostic, not the sole oracle.
       #
       # The pin prefix comes from cpu_pin_prefix() in scripts/lib/ci-cpus.sh,
       # which is the ONE place the `all` override is handled. A shell function
       # cannot cross a step boundary, so the fragment is sourced again here --
       # that is the single definition site being read, not a second one.
-      - name: Record the load shape this job actually got
+      - name: Record and assert the load shape this job actually got
         run: |
           set -euo pipefail
           . scripts/lib/ci-cpus.sh
           cpu_pin_prefix
-          echo "unpinned_nproc=$(nproc)"
+          unpinned="$(nproc)"
+          pinned="$("${CPU_PIN[@]}" nproc)"
           echo "cpu_list=$CPUS"
-          echo "pinned_nproc=$("${CPU_PIN[@]}" nproc)"
+          echo "unpinned_nproc=$unpinned"
+          echo "pinned_nproc=$pinned"
+          scripts/assert-cpu-pin.sh "$CPUS" "$unpinned" "$pinned"
       # CPU affinity is inherited across fork/exec, so rustc and the test
       # harness threads all land under this mask. `--test-threads=N` is not a
       # substitute: it throttles the harness only, leaving compilation free.
