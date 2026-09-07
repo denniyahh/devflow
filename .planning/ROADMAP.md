@@ -565,6 +565,117 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.124: GSD `phase complete` Leaves the Planning Docs Half-Updated on Every Phase Close (BACKLOG)
+
+**Found:** 2026-09-07, phase 46 post-merge finalization. `gsd-tools phase complete 46` was run
+twice (once in the `.worktrees/phase-46` worktree, once on `workspace/denniyahh`); both runs
+produced the identical set of misses below, so this is deterministic tool behaviour, not a
+one-off. The same class is already partially recorded across CLAUDE.md's "Verification habits"
+bullets, `project-gsd-execute-devflow-quirks` (memory), and the `999.72`/`999.72a` milestone-window
+history — this entry consolidates it as one resolvable unit.
+
+**Framing.** GSD's write path for a phase close derives and writes a small number of
+machine-readable fields, assumes a single canonical document layout, and assumes the
+`execute-phase` orchestrator is driving. This repo violates all three deliberately: it keeps a
+cross-milestone `## Progress` table and hand-maintained tracking tables in STATE.md, and it runs
+the GSD lifecycle by hand (worktree-per-phase, `phase complete` invoked directly) because the
+orchestrated path is structurally unavailable on Claude Code (#48, gsd-core#4254). Nearly every
+GSD drift-guard is scoped "worktree / orchestrator mode only" and no-ops on the hand-driven path,
+so nothing catches the misses below — `phase complete` reports `"roadmap_updated": true` /
+`"state_updated": true` and exits 0 over each one.
+
+---
+
+#### A. GSD-core tool defects (candidates for the `gsd-core` tracker)
+
+**A1 — `phase complete` silently no-ops on a `## Progress` table outside the active milestone
+window.** ROADMAP.md carries a global `## Progress` table (`| Phase | Plans Complete | Status |
+Completed |`) spanning every phase across all milestones. `phase complete`'s row writer
+(`mutateMilestonePhase` → `editProgressHeadingSlice` → `updateTableCell`, in
+`bin/lib/phase.cjs`) is scoped to `currentMilestoneRawRanges` — the active milestone's
+heading-to-next-heading window. The global table sits *below* that window, so its row is never
+offered to `updateTableCell`. Observed: after `phase complete 46`, the milestone-section status
+table flipped Phase 46 to `Complete`, but the `## Progress` row stayed `| 46 | 9/9 | In Progress
+|  |` while the command reported `roadmap_updated: true`. Fixed by hand this session
+(`Complete   | 2026-09-07`). **Candidate fix:** run the progress-row write against the whole
+document (or a second, un-windowed pass) when a `## Progress` heading exists outside the milestone
+window; at minimum, emit a warning when a phase-numbered row matching the completed phase is found
+outside the window and left untouched. **Trap:** the milestone-window scoping was itself added to
+fix `#1956`/`#2012` (a row in an *earlier* `| Phase | Requirements | Count |` table binding
+first) — a naive "just write globally" reopens that. **Not established:** whether the
+milestone-section status table (line ~28) write is itself window-scoped or global — it worked, so
+it was not traced.
+
+**A2 — `phase complete` advances STATE.md frontmatter and ~2 prose spots, leaves the rest
+stale.** STATE.md states "where are we" in five places: the YAML frontmatter (`current_phase`,
+`status`, `progress.percent`), `## Active Phase`, the body of `## Current Position`, and **two**
+`## Operator Next Steps` blocks. `phase complete 46` updated the frontmatter, the `## Current
+Position` `Phase:`/`Current Plan:`/`Last activity:` lines, and the `## Session` `Stopped at:`
+line. It left stale: `## Active Phase` ("Phase 46 is next, unplanned" / "Nothing has been planned
+or executed"), the `## Current Position` body (`Plans: 8 of 9 executed`, `Completed Plans: 46-01
+through 46-08`, `Status: Ready to execute 46-09…`, `Progress: [░░░░░░░░░░] 0% (0 of 6)`), and
+both `## Operator Next Steps` lists (still `/gsd-plan-phase 46`, still the stale worktree-base
+instruction). All corrected by hand this session. `scripts/hooks/post-commit` exists precisely
+because "nobody owns the STATE.md prose update" on non-orchestrator paths — but it only *warns*,
+by design. **Candidate fix:** `phase complete` should either (a) regenerate the full `## Active
+Phase` / `## Current Position` / `## Operator Next Steps` blocks from the roadmap + state it
+already computed, or (b) fail loudly listing the prose spans it cannot own, rather than passing
+silently. **Not established:** whether an existing `gsd-core#NNNN` already tracks this.
+
+**A3 — `phase complete` rewrites an unrelated `**Status:**` cell in a hand-maintained STATE.md
+table.** Both runs rewrote the STATE.md row `| deferred_item | v2.4.0-phases/34-…/deferred-items.md
+#1 — widening STREAM_JSON_STAGES… |` — changing its ``**Status:** v2.8.0 milestone complete`` cell
+to ``**Status:** Ready to plan``. That row is a hand-maintained deferred-item tracker, not a field
+GSD owns; a generic status-deriver appears to be matching `**Status:**` anywhere in the file and
+substituting the current workflow state. Reverted by hand this session. **Candidate fix:** scope
+any `**Status:**` rewrite to the specific frontmatter/section GSD authored; never touch
+`**Status:**` tokens inside a Markdown table body. **Not established:** the exact write site was
+not located; this row was also already malformed in the source (unterminated backtick, missing
+trailing columns), which may be interacting.
+
+**A4 — drift-guards are scoped to a mode this repo cannot use.** `state.validate`,
+`dispatch-isolation`, and the `gsd-executor` branch/cwd assertions are all gated "worktree mode
+only" or "orchestrator only" and no-op on the hand-driven lifecycle this repo is forced onto.
+There is no equivalent check for the manual path. **Candidate fix:** a `gsd-tools` verb that,
+given a phase number and a roadmap+state, reports every place the two disagree about that phase's
+status — runnable standalone after a hand `phase complete`.
+
+---
+
+#### B. Repo-local process / hygiene (fixable here, no upstream dependency)
+
+**B1 — STATE.md is never compacted.** ~890 lines, append-only; historical prose blocks for
+Phases 12–45 are retained inline under `### Historical — superseded phase notes` and never
+pruned, so "stale" is the default state of most of the file and the canonical current-position
+section is buried among superseded ones. No GSD verb compacts it and no process step does.
+**Candidate fix:** at milestone close (or every N phases), move `### Historical` content to a
+dated `.planning/archive/STATE-history-<milestone>.md` and leave STATE.md as frontmatter +
+`## Active Phase` + `## Current Position` + `## Operator Next Steps` + a pointer. Decide whether
+this is a manual checklist step or worth a small script.
+
+**B2 — `graphify-out/` generated files are neither tracked nor ignored.**
+`graphify-out/GRAPH_REPORT.md`, `graph.html`, `.graphify_labels.json`, and
+`.graphify_labels.json.sig` are regenerated by every `graphify update` and show as untracked
+(`git check-ignore` exits 1 for all four). Only `graph.json`, `manifest.json`,
+`.graphify_analysis.json` are tracked (per CLAUDE.md's snapshot rule). **Candidate fix:** add the
+four generated names to `.gitignore` so `git status` stays clean after a graph refresh. Confirm
+first that `scripts/cut-pr-branch.sh`'s `graphify-out/` handling does not rely on their being
+untracked-and-visible.
+
+**B3 — no established landing path for a worktree-per-phase phase's `.planning/` artifacts onto
+`workspace/denniyahh`.** Phase 46 was the first phase to use the mandated `.worktrees/phase-N`
+pattern; `feature/phase-46` and `workspace/denniyahh` diverged (66 vs 4 commits), and there was
+no precedent for reconciling them (Phase 45 did its GSD work directly on `workspace/denniyahh`).
+This session used `git checkout feature/phase-46 -- .planning/` + a single squash commit +
+`phase complete` re-run, which works but loses per-plan commit granularity and is undocumented.
+**Candidate fix:** write the chosen procedure into CLAUDE.md's worktree section (it currently
+only covers *creating* the worktree, not closing it), or add a `scripts/land-phase-planning.sh`
+counterpart to `cut-pr-branch.sh`.
+
+**Priority:** none of these block phase work — every one has a known hand-correction. A1/A2 are
+the highest-value fixes because they recur on *every* phase close and the hand-correction is
+easy to forget. Sequence after the active milestone.
+
 ### Phase 999.123: Every Commit Triggers FOUR CI Runs, and the Contention Manufactures Flakes (BACKLOG)
 
 **Found:** 2026-09-06, phase 46 PR #208 on head `538ca1e`.
