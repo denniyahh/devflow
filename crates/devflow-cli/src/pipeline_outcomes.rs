@@ -2361,24 +2361,49 @@ mod tests {
     /// a real, non-zero value throughout, so a green result here cannot be
     /// explained by the branch changing underneath the test.
     ///
-    /// **`NoGitPath` for cycle 1, `NeutralPath` for cycle 2.** Cycle 1 needs
-    /// `git` to be UNRESOLVABLE — only a spawn that fails makes `.output()`
-    /// return `Err`, which is the sole could-not-measure condition (F-1); a
-    /// shim that ran and exited non-zero would be a real observation and would
-    /// exercise the already-correct `Some(0)` path (NC-4). Cycle 2 needs a
-    /// real `git` but still no resolvable agent CLI, which is exactly what
-    /// `NeutralPath`'s git-only `PATH` provides.
+    /// **A child for cycle 1, `NeutralPath` in the parent for cycle 2.**
+    /// Cycle 1 needs `git` to be UNRESOLVABLE — only a spawn that fails makes
+    /// `.output()` return `Err`, which is the sole could-not-measure condition
+    /// (F-1); a shim that ran and exited non-zero would be a real observation
+    /// and would exercise the already-correct `Some(0)` path (NC-4). The
+    /// child owns that empty `PATH`, so no sibling test can observe it. Cycle
+    /// 2 needs a real `git` but still no resolvable agent CLI, which is exactly
+    /// what `NeutralPath`'s git-only `PATH` provides in the parent.
     ///
-    /// **What this does NOT establish.** The run boundary. `State::new` zeroes
-    /// both `consecutive_failures` and the baseline on every `devflow start
-    /// --force`, and nothing here shows the streak surviving a restart.
+    /// **What this does NOT establish.** A forced-run boundary. `State::new`
+    /// zeroes both `consecutive_failures` and the baseline on every `devflow
+    /// start --force`; the save/load control below covers the child boundary,
+    /// not an entirely new run.
     #[test]
     fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            validate_failure_with_unmeasurable_count_accumulates_the_streak";
+        let phase = PhaseId::new(89);
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD: run exactly the first cycle under an empty PATH, then
+            // persist its state for the parent to exercise the real cycle.
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            let _ = handle_validate_outcome(&root, &mut state, ValidateOutcome::Failed);
+
+            assert_eq!(
+                state.last_validate_failure_commit_count,
+                Some(1),
+                "a cycle whose commit count could NOT be measured must leave the baseline \
+                 byte-identical to the last real observation — overwriting it with a forged \
+                 zero is 999.77 itself"
+            );
+            assert_eq!(
+                state.consecutive_failures, 2,
+                "an unmeasurable count is not evidence of forward progress, so the streak \
+                 must continue rather than restart"
+            );
+            workflow::save_state(&state).unwrap();
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = PhaseId::new(89);
         init_repo(root);
         // One real commit on the feature branch, and no further commits for
         // the rest of this test: the REAL count is a stable, non-zero 1.
@@ -2410,12 +2435,14 @@ mod tests {
         };
         seed_gate_response();
 
-        // CYCLE 1 — the measurement fails. The guard wraps exactly this call
-        // and nothing else.
-        {
-            let _no_git = NoGitPath::install();
-            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-        }
+        // CYCLE 1 — the measurement fails in a child whose PATH cannot affect
+        // this test or any sibling. The child persists the resulting state.
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
+
+        // The re-assertion is the round-trip control: the child passing is not
+        // enough if either field is dropped or defaulted while it is saved.
+        let mut state = workflow::load_state(root, phase).unwrap();
 
         assert_eq!(
             state.last_validate_failure_commit_count,
@@ -3184,28 +3211,59 @@ mod tests {
     ///
     /// # Why this test lives in `devflow-cli` rather than beside its subject
     ///
-    /// **`NoGitPath` is unavoidable here**, unlike the Layer 3 tests which use
-    /// an unspawnable working directory: `evaluate_layer2` reads its exit file
-    /// from `project_root`, so a non-existent root would make the exit read
-    /// fail and return `Ok(None)` for the WRONG reason — an unreadable exit
-    /// file rather than an unmeasurable count — and the test would pass
-    /// against the unfixed code. The root must EXIST and `git` must still be
-    /// unresolvable, and only a `PATH` guard delivers that combination.
+    /// **An unresolvable `git` is unavoidable here**, unlike the Layer 3 tests
+    /// which use an unspawnable working directory: `evaluate_layer2` reads its
+    /// exit file from `project_root`, so a non-existent root would make the
+    /// exit read fail and return `Ok(None)` for the WRONG reason — an
+    /// unreadable exit file rather than an unmeasurable count — and the test
+    /// would pass against the unfixed code. The root must EXIST and `git` must
+    /// still be unresolvable, and only an emptied `PATH` delivers that
+    /// combination.
     ///
-    /// A process-global `PATH` guard is not viable in `devflow-core`'s test
-    /// binary. That crate shells out to `git` from eight modules running in
-    /// parallel, and its tests call production code that spawns `git`
-    /// directly, so no fixture-helper lock can cover them — measured at 1-5
-    /// unrelated failures per run, and still 1 in 8 runs after that module's
-    /// own `git()` helper took a lock. `devflow-cli`'s binary routes every
-    /// `PATH` mutation through the single [`env_lock`] its `git`-touching
-    /// tests already hold, which is why the guard is safe here.
+    /// That emptied `PATH` lives in a CHILD process
+    /// ([`run_test_without_git`], 46-06/46-07, review finding C-01), not in
+    /// this one. A process-global emptied `PATH` made every sibling test that
+    /// shelled out to `git` inside the window fail spuriously; a child's
+    /// `PATH` is invisible to the parent, so there is nothing left to
+    /// serialise and this test holds no [`env_lock`]. The fixture is built in
+    /// the parent — it needs no `git`, but a parent-side failure is far easier
+    /// to attribute than one buried in captured child output.
     ///
     /// `evaluate_layer2` is `pub`, so this drives exactly the same function
     /// with exactly the same inputs; only the binary it runs in differs.
     #[test]
     fn evaluate_layer2_unrunnable_git_falls_through_to_layer3() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_layer2_unrunnable_git_falls_through_to_layer3";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so `git` cannot be
+            // SPAWNED at all — the sole could-not-measure condition — and the
+            // fixture is the one the parent built, reached through the shared
+            // root rather than recreated here.
+            let result = agent_result::evaluate_layer2(
+                &root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap();
+
+            assert!(
+                result.is_none(),
+                "an unmeasurable commit count must fall through to Layer 3, got: {result:?}"
+            );
+            // Asserted separately and explicitly, so a future change that
+            // returns some other non-`Failed` classification from this layer
+            // still has to confront this test rather than slipping past an
+            // `is_none()` check.
+            assert_ne!(
+                result.as_ref().map(|r| r.status),
+                Some(devflow_core::agent_result::AgentStatus::Failed),
+                "Layer 2 must never classify an unmeasurable count as absent work"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3218,29 +3276,8 @@ mod tests {
             "the exit file must be readable, or Layer 2 returns Ok(None) for the wrong reason"
         );
 
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(
-                root,
-                PhaseId::new(4),
-                &GitFlowConfig::default(),
-                Stage::Code,
-            )
-            .unwrap()
-        };
-
-        assert!(
-            result.is_none(),
-            "an unmeasurable commit count must fall through to Layer 3, got: {result:?}"
-        );
-        // Asserted separately and explicitly, so a future change that returns
-        // some other non-`Failed` classification from this layer still has to
-        // confront this test rather than slipping past an `is_none()` check.
-        assert_ne!(
-            result.as_ref().map(|r| r.status),
-            Some(devflow_core::agent_result::AgentStatus::Failed),
-            "Layer 2 must never classify an unmeasurable count as absent work"
-        );
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// **CR-01 (35-REVIEW), the direction whose absence let the defect ship.**
@@ -3257,8 +3294,8 @@ mod tests {
     /// # This test and its predecessor are one measurement, not two
     ///
     /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3` directly above
-    /// is this test's NC-4 negative control and vice versa. They install the
-    /// **same** `NoGitPath` guard against the **same** fixture shape and
+    /// is this test's NC-4 negative control and vice versa. They cross the
+    /// **same** child-process boundary against the **same** fixture shape and
     /// differ in exactly one byte of input — the exit code written to
     /// `phase-NN-exit`. One must return `None`; the other must return
     /// `ResourceKilled`. A suite asserting only the fall-through cannot tell
@@ -3274,7 +3311,42 @@ mod tests {
     /// becomes unreachable.
     #[test]
     fn evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so the commit count is
+            // unmeasurable while the exit file the parent wrote is still
+            // readable.
+            let result = agent_result::evaluate_layer2(
+                &root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap();
+
+            let result = result.expect(
+                "exit 137 is classified from the exit code alone — an unmeasurable commit \
+                 count must not discard the verdict and fall to a layer that cannot produce it",
+            );
+            assert_eq!(
+                result.status,
+                AgentStatus::ResourceKilled,
+                "Layer 2 is the only classifier for 137; losing it here loses it everywhere"
+            );
+            assert_eq!(result.exit_code, Some(137));
+            assert_eq!(
+                result.commits, None,
+                "'could not tell' must not be recorded as a measured zero"
+            );
+            assert_eq!(
+                devflow_core::outcome_policy::decide_action(Stage::Code, result.status),
+                devflow_core::outcome_policy::Action::GateInfra,
+                "an OOM-killed agent must route to the infra gate, NOT into the Validate loop"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3283,37 +3355,13 @@ mod tests {
         // unrunnable is the only difference from a healthy run.
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "137").unwrap();
+        assert!(
+            agent_result::exit_code_path(root, PhaseId::new(4)).exists(),
+            "the exit file must be readable, or the 137 verdict has no input to come from"
+        );
 
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(
-                root,
-                PhaseId::new(4),
-                &GitFlowConfig::default(),
-                Stage::Code,
-            )
-            .unwrap()
-        };
-
-        let result = result.expect(
-            "exit 137 is classified from the exit code alone — an unmeasurable commit \
-             count must not discard the verdict and fall to a layer that cannot produce it",
-        );
-        assert_eq!(
-            result.status,
-            AgentStatus::ResourceKilled,
-            "Layer 2 is the only classifier for 137; losing it here loses it everywhere"
-        );
-        assert_eq!(result.exit_code, Some(137));
-        assert_eq!(
-            result.commits, None,
-            "'could not tell' must not be recorded as a measured zero"
-        );
-        assert_eq!(
-            devflow_core::outcome_policy::decide_action(Stage::Code, result.status),
-            devflow_core::outcome_policy::Action::GateInfra,
-            "an OOM-killed agent must route to the infra gate, NOT into the Validate loop"
-        );
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// CR-01's second, independent harm, in the same shape: a NON-commit-gated
@@ -3323,41 +3371,52 @@ mod tests {
     /// dispatches a cleanly-exited Validate agent as `ValidateOutcome::Failed`.
     ///
     /// The negative control is
-    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3`: same guard,
+    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3`: same
+    /// child-process boundary,
     /// same exit code 0, and the ONLY difference is the stage — `Code` (commit
     /// gated, must fall through) versus `Validate` (not gated, must succeed).
     /// If both stages produced the same answer, the stage scoping would be
     /// doing nothing and neither test would mean anything.
     #[test]
     fn evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so the count is
+            // unmeasurable — which a stage that never consults it must ignore.
+            let result = agent_result::evaluate_layer2(
+                &root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Validate,
+            )
+            .unwrap();
+
+            let result = result.expect(
+                "a stage that is not commit-gated never read the count, so an unmeasurable \
+                 count cannot change its answer",
+            );
+            assert_eq!(result.status, AgentStatus::Success);
+            assert_eq!(result.commits, None);
+            assert_eq!(
+                devflow_core::outcome_policy::decide_action(Stage::Validate, result.status),
+                devflow_core::outcome_policy::Action::Advance
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "0").unwrap();
-
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(
-                root,
-                PhaseId::new(4),
-                &GitFlowConfig::default(),
-                Stage::Validate,
-            )
-            .unwrap()
-        };
-
-        let result = result.expect(
-            "a stage that is not commit-gated never read the count, so an unmeasurable \
-             count cannot change its answer",
+        assert!(
+            agent_result::exit_code_path(root, PhaseId::new(4)).exists(),
+            "the exit file must be readable, or the Success verdict has no input to come from"
         );
-        assert_eq!(result.status, AgentStatus::Success);
-        assert_eq!(result.commits, None);
-        assert_eq!(
-            devflow_core::outcome_policy::decide_action(Stage::Validate, result.status),
-            devflow_core::outcome_policy::Action::Advance
-        );
+
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// **HARDEN-07 / criterion 6 as an OUTCOME rather than a property of one
@@ -3386,54 +3445,68 @@ mod tests {
     /// operator-facing reason — not what the run does next.
     #[test]
     fn evaluate_agent_result_with_unrunnable_git_does_not_report_failed() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_agent_result_with_unrunnable_git_does_not_report_failed";
+        let phase = PhaseId::new(96);
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so the cascade runs
+            // against a real repo it cannot measure. `State` is pure in-memory
+            // construction, so it is rebuilt here rather than carried across
+            // the boundary.
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Code;
+
+            let result =
+                agent_result::evaluate_agent_result(&root, &state, &GitFlowConfig::default())
+                    .unwrap();
+
+            assert_ne!(
+                result.status,
+                devflow_core::agent_result::AgentStatus::Failed,
+                "END TO END: exit 0 + Stage::Code + an unrunnable git must not report Failed. \
+                 This is the criterion-6 outcome, and a passing evaluate_layer2 unit test does \
+                 not establish it"
+            );
+            assert_eq!(
+                result.status,
+                devflow_core::agent_result::AgentStatus::Unknown,
+                "asserted positively too, so a future non-Failed value still confronts this test"
+            );
+            assert_eq!(
+                result.decided_by_layer,
+                Some(3),
+                "the cascade must genuinely traverse Layer 2's fall-through into Layer 3 — \
+                 any other layer means this passed for the wrong reason"
+            );
+            assert_eq!(
+                result.commits, None,
+                "'could not tell' must not be recorded as a measured zero"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = PhaseId::new(96);
-        // A real repo with the feature branch present. Built BEFORE the guard
-        // goes on, because building it shells out to git.
+        // A real repo with the feature branch present. Built in the PARENT,
+        // because building it shells out to git — the ordering constraint the
+        // old in-process guard expressed as "before the guard goes on" is now
+        // the process boundary itself.
         init_repo(root);
         commit_on_feature_branch(root, phase, "seed");
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, phase), "0").unwrap();
         // No stdout capture, so Layer 1 declines and the cascade reaches
-        // Layer 2 at all.
+        // Layer 2 at all. Read in the parent: it needs no `git`, and a
+        // parent-side failure is easier to attribute than one buried in
+        // captured child output.
         assert!(
             !agent_result::stdout_path(root, phase).exists(),
             "Layer 1 must decline, or this test never reaches the cascade under study"
         );
 
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
-        };
-
-        assert_ne!(
-            result.status,
-            devflow_core::agent_result::AgentStatus::Failed,
-            "END TO END: exit 0 + Stage::Code + an unrunnable git must not report Failed. \
-             This is the criterion-6 outcome, and a passing evaluate_layer2 unit test does \
-             not establish it"
-        );
-        assert_eq!(
-            result.status,
-            devflow_core::agent_result::AgentStatus::Unknown,
-            "asserted positively too, so a future non-Failed value still confronts this test"
-        );
-        assert_eq!(
-            result.decided_by_layer,
-            Some(3),
-            "the cascade must genuinely traverse Layer 2's fall-through into Layer 3 — \
-             any other layer means this passed for the wrong reason"
-        );
-        assert_eq!(
-            result.commits, None,
-            "'could not tell' must not be recorded as a measured zero"
-        );
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// The companion opposite-result case for

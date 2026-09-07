@@ -139,13 +139,14 @@ pub use crate::git::{
     ALSO_REDIRECTING_GIT_VARS, REPO_LOCAL_GIT_VARS, git_command, hermetic_command,
 };
 
-// ## Why there is no absent-`git` (`NoGitPath`) harness in THIS crate
+// ## Why there is no in-process absent-`git` harness in THIS crate
 //
-// 35-01 planned one `NoGitPath` guard per crate, so that criterion 6's tests
+// 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
 // could force `git` to be unresolvable and drive `phase_commit_count`'s
-// could-not-measure branch from inside `devflow-core`. **That guard was built
-// here, measured, and removed.** It is recorded rather than silently omitted,
-// because the next author to need a failing `git` will otherwise rebuild it.
+// could-not-measure branch from inside `devflow-core`. **That process-global
+// guard was built here, measured, and removed.** It is recorded rather than
+// silently omitted, because the next author to need a failing `git` will
+// otherwise rebuild it.
 //
 // A `PATH`-replacing guard mutates process-global state, and `cargo test` runs
 // this crate's whole suite as threads in ONE process. `devflow-core` shells out
@@ -179,10 +180,12 @@ pub use crate::git::{
 //
 // **When that is not enough**, because the code under test must also READ a
 // file from `project_root` (`evaluate_layer2` reads its exit file there, so a
-// non-existent root would fail for the wrong reason), the test belongs in
-// `devflow-cli`'s binary, where every `PATH` mutation goes through one
-// `ENV_MUTEX` that its `git`-touching tests already hold. Criterion 6's
-// layer-level and cascade-level tests live in
+// non-existent root would fail for the wrong reason), use the child-process
+// pattern in `devflow-cli`: the parent builds the fixture, one re-executed
+// child gets an empty `PATH`, and the parent verifies the child ran. The empty
+// `PATH` is then process-local rather than something an `ENV_MUTEX` merely
+// serializes. A future core-crate test needing this shape should copy that
+// approach. Criterion 6's layer-level and cascade-level tests live in
 // `devflow-cli/src/pipeline_outcomes.rs` for exactly this reason; they call the
 // same `pub` functions, so only the binary differs.
 
