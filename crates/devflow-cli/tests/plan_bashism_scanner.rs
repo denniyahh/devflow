@@ -397,7 +397,7 @@ fn staged_renamed_bad_plan_is_blocked() {
         fields
             .first()
             .is_some_and(|status| status.starts_with(b"R"))
-            && fields.iter().any(|field| *field == new_path.as_bytes()),
+            && fields.contains(&new_path.as_bytes()),
         "fixture precondition: cached NUL-delimited name status must identify a rename to {new_path:?}; got {:?}",
         fields
     );
