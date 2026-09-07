@@ -84,6 +84,17 @@ case "${1-}" in
 esac
 
 files=()
+staged_inputs=()
+
+# shellcheck disable=SC2329 # Invoked by the EXIT trap immediately below.
+cleanup_staged_inputs() {
+    local input
+    for input in "${staged_inputs[@]}"; do
+        rm -f -- "$input"
+    done
+}
+
+trap cleanup_staged_inputs EXIT
 
 if [ "$staged" -eq 1 ]; then
     if [ "$#" -gt 0 ]; then
@@ -95,14 +106,15 @@ if [ "$staged" -eq 1 ]; then
     # tab, and a `[ -f "$path" ]` on the quoted form then fails and skips the
     # file SILENTLY — the same false-green class this scanner exists to close.
     #
-    # `--diff-filter=ACM` is equally load-bearing in the other direction: a
-    # DELETED plan has no working-tree content to scan, and listing it would
-    # reintroduce the silent skip from the far end.
+    # `--diff-filter=ACMR` selects added, copied, modified, and renamed plan
+    # destinations. DELETED plans remain deliberately excluded: they have no
+    # index blob to scan, and listing them would turn an intentional zero-file
+    # scan into a read failure.
     while IFS= read -r -d '' path; do
         case "${path##*/}" in
             *PLAN.md) files+=("$path") ;;
         esac
-    done < <(git diff --cached --name-only -z --diff-filter=ACM)
+    done < <(git diff --cached --name-only -z --diff-filter=ACMR)
 else
     while [ "$#" -gt 0 ]; do
         files+=("$1")
@@ -119,21 +131,40 @@ if [ "$count" -eq 0 ]; then
     exit 0
 fi
 
-# A named path that is missing or unreadable is an ERROR, not a skip.
-for path in "${files[@]}"; do
-    if [ ! -f "$path" ] || [ ! -r "$path" ]; then
-        echo "$SELF: cannot read '$path' (missing or unreadable)" >&2
-        echo "  A named path that cannot be inspected is an error, not a skip:" >&2
-        echo "  a check that reports success having inspected nothing is exactly" >&2
-        echo "  the failure this scanner exists to prevent." >&2
-        exit 2
-    fi
-done
+# Named paths read from the filesystem. Staged paths must never use this branch:
+# the index is what Git will commit, and it can deliberately differ from the
+# working tree after partial staging or a subsequent local edit.
+if [ "$staged" -eq 0 ]; then
+    for path in "${files[@]}"; do
+        if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+            echo "$SELF: cannot read '$path' (missing or unreadable)" >&2
+            echo "  A named path that cannot be inspected is an error, not a skip:" >&2
+            echo "  a check that reports success having inspected nothing is exactly" >&2
+            echo "  the failure this scanner exists to prevent." >&2
+            exit 2
+        fi
+    done
+fi
 
 hits=""
 status=0
 
 for path in "${files[@]}"; do
+    input=$path
+    if [ "$staged" -eq 1 ]; then
+        if ! input="$(mktemp)"; then
+            echo "$SELF: cannot create a temporary input for staged '$path'" >&2
+            exit 2
+        fi
+        staged_inputs+=("$input")
+        # `:$path` is Git's index-path syntax. Pass it as one quoted argument
+        # and keep the original path in `fname` below for author diagnostics.
+        # Do not use command substitution here: it strips terminal newlines.
+        if ! git show ":$path" >"$input"; then
+            echo "$SELF: cannot read staged index blob '$path'" >&2
+            exit 2
+        fi
+    fi
     out=""
     if ! out="$(awk -v fname="$path" '
 function line_of(off,   pre, n) {
@@ -235,7 +266,7 @@ END {
     }
     exit (violations > 0 ? 1 : 0)
 }
-' "$path")"; then
+' "$input")"; then
         status=1
     fi
     if [ -n "$out" ]; then
