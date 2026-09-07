@@ -25,6 +25,7 @@
 //! Without them a scanner that rejected every input would satisfy every other test
 //! in this file.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -62,12 +63,120 @@ fn run(args: &[&Path]) -> Output {
         })
 }
 
+/// Run the production scanner against the actual index of an owned disposable
+/// repository. Staged-mode regressions must not use the worktree that owns this
+/// test binary: their entire point is that the index can intentionally differ
+/// from the filesystem.
+fn run_staged(repo: &Path) -> Output {
+    let script = scanner();
+    Command::new(&script)
+        .arg("--staged")
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to spawn {} from {}: {err}",
+                script.display(),
+                repo.display()
+            )
+        })
+}
+
 fn combined(out: &Output) -> String {
     format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// Every Git subprocess in a disposable repository must use the project helper.
+/// Its per-command environment scrubbing prevents a test launched from a linked
+/// worktree from accidentally following an inherited `GIT_DIR` back to the
+/// developer checkout.
+fn git_ok(repo: &Path, args: &[&str]) -> Output {
+    let output = devflow_core::test_support::git_command(repo)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to spawn git {args:?} in {}: {err}", repo.display()));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {} with status {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        repo.display(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+fn disposable_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("create disposable repository");
+    let root = repo.path();
+    git_ok(root, &["init", "-q"]);
+    git_ok(root, &["config", "user.name", "DevFlow scanner test"]);
+    git_ok(
+        root,
+        &["config", "user.email", "scanner-test@example.invalid"],
+    );
+    // Fixtures need baseline commits for rename/deletion classification. Disable
+    // any developer-level signing policy inside the disposable repository so a
+    // test never asks for an interactive key passphrase.
+    git_ok(root, &["config", "commit.gpgSign", "false"]);
+    repo
+}
+
+fn fixture_text(name: &str) -> String {
+    fs::read_to_string(fixture(name)).unwrap_or_else(|err| panic!("read fixture {name}: {err}"))
+}
+
+fn write_plan(repo: &Path, path: &str, contents: &str) {
+    let destination = repo.join(path);
+    fs::create_dir_all(destination.parent().expect("plan has a parent directory"))
+        .unwrap_or_else(|err| panic!("create plan directory for {path}: {err}"));
+    fs::write(&destination, contents)
+        .unwrap_or_else(|err| panic!("write disposable plan {}: {err}", destination.display()));
+}
+
+fn index_blob(repo: &Path, path: &str) -> Vec<u8> {
+    let spec = format!(":{path}");
+    git_ok(repo, &["show", &spec]).stdout
+}
+
+fn commit_plan(repo: &Path, path: &str, contents: &str) {
+    write_plan(repo, path, contents);
+    git_ok(repo, &["add", path]);
+    git_ok(repo, &["commit", "-q", "-m", "seed plan"]);
+}
+
+fn assert_staged_refusal(out: &Output, path: &str) {
+    let text = combined(out);
+    assert!(
+        !out.status.success(),
+        "the staged scanner must refuse {path}, but it exited 0.\n--- output ---\n{text}"
+    );
+    assert!(
+        text.contains("scanned 1 file(s)"),
+        "the refusal must report that it inspected the selected staged plan.\n--- output ---\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains(path) && line.contains("${PIPESTATUS[0]}")),
+        "the refusal must name both {path} and the staged violating expression on one line.\n--- output ---\n{text}"
+    );
+}
+
+fn assert_staged_zero_scan(out: &Output) {
+    let text = combined(out);
+    assert!(
+        out.status.success(),
+        "the staged scanner must accept an intentionally empty selection, but exited {:?}.\n--- output ---\n{text}",
+        out.status.code()
+    );
+    assert!(
+        text.contains("scanned 0 file(s)"),
+        "the empty staged selection must be visible.\n--- output ---\n{text}"
+    );
 }
 
 /// The scanner must reject `name`, and its message must name both the file and the
@@ -212,4 +321,116 @@ fn zero_arguments_exits_zero_and_prints_a_zero_count() {
         "an empty scan must print its scanned-file count so the emptiness is \
          visible.\n--- output ---\n{text}"
     );
+}
+
+/// C-08: `--staged` must inspect the exact blob Git will commit. The filesystem
+/// deliberately contains the clean fixture after the bad bytes were staged.
+#[test]
+fn staged_bad_working_tree_clean_is_blocked() {
+    let repo = disposable_repo();
+    let root = repo.path();
+    let path = "docs/staged-bad-PLAN.md";
+    let bad = fixture_text("comment-bypass-PLAN.md");
+    let clean = fixture_text("legit-PLAN.md");
+
+    write_plan(root, path, &bad);
+    git_ok(root, &["add", path]);
+    assert!(
+        String::from_utf8(index_blob(root, path)).expect("index plan is UTF-8") == bad,
+        "fixture precondition: the index must contain the violating plan"
+    );
+    write_plan(root, path, &clean);
+    assert!(
+        fs::read_to_string(root.join(path)).expect("read clean working-tree plan") == clean,
+        "fixture precondition: the working tree must contain only the clean plan"
+    );
+
+    let out = run_staged(root);
+    assert_staged_refusal(&out, path);
+}
+
+/// The opposite C-08 direction is a negative control. A dirty worktree is not
+/// selected when its committed index blob is clean, so `--staged` must visibly
+/// scan zero files instead of reading the unstaged violating text.
+#[test]
+fn staged_clean_working_tree_bad_is_accepted() {
+    let repo = disposable_repo();
+    let root = repo.path();
+    let path = "docs/committed-clean-PLAN.md";
+    let clean = fixture_text("legit-PLAN.md");
+    let bad = fixture_text("comment-bypass-PLAN.md");
+
+    commit_plan(root, path, &clean);
+    assert!(
+        String::from_utf8(index_blob(root, path)).expect("index plan is UTF-8") == clean,
+        "fixture precondition: the committed index must contain the clean plan"
+    );
+    write_plan(root, path, &bad);
+    assert!(
+        fs::read_to_string(root.join(path)).expect("read violating working-tree plan") == bad,
+        "fixture precondition: the working tree must contain the violating plan"
+    );
+
+    let out = run_staged(root);
+    assert_staged_zero_scan(&out);
+}
+
+/// C-09: a staged rename has a destination blob that Git will commit. Its tab
+/// exercises the NUL-delimited discovery branch: line-oriented Git output would
+/// quote or split this name and prove the wrong path.
+#[test]
+fn staged_renamed_bad_plan_is_blocked() {
+    let repo = disposable_repo();
+    let root = repo.path();
+    let old_path = "docs/old-PLAN.md";
+    let new_path = "docs/new\tbad-PLAN.md";
+    let bad = fixture_text("comment-bypass-PLAN.md");
+
+    commit_plan(root, old_path, &bad);
+    git_ok(root, &["mv", old_path, new_path]);
+    let name_status = git_ok(root, &["diff", "--cached", "--name-status", "-z"]);
+    let fields = name_status
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .collect::<Vec<_>>();
+    assert!(
+        fields
+            .first()
+            .is_some_and(|status| status.starts_with(b"R"))
+            && fields.iter().any(|field| *field == new_path.as_bytes()),
+        "fixture precondition: cached NUL-delimited name status must identify a rename to {new_path:?}; got {:?}",
+        fields
+    );
+    assert!(
+        String::from_utf8(index_blob(root, new_path)).expect("renamed index plan is UTF-8") == bad,
+        "fixture precondition: the renamed destination index blob must be violating"
+    );
+
+    let out = run_staged(root);
+    assert_staged_refusal(&out, new_path);
+}
+
+/// Deletions are intentionally excluded: after `git rm` there is no index blob
+/// to inspect, and the empty selection must remain a successful visible result.
+#[test]
+fn staged_deleted_plan_is_skipped() {
+    let repo = disposable_repo();
+    let root = repo.path();
+    let path = "docs/deleted-PLAN.md";
+
+    commit_plan(root, path, &fixture_text("legit-PLAN.md"));
+    git_ok(root, &["rm", path]);
+    assert!(
+        !root.join(path).exists(),
+        "fixture precondition: git rm must remove the working-tree path"
+    );
+    let name_status = git_ok(root, &["diff", "--cached", "--name-status", "-z"]);
+    assert!(
+        name_status.stdout.starts_with(b"D\0"),
+        "fixture precondition: cached NUL-delimited name status must identify a deletion; got {:?}",
+        name_status.stdout
+    );
+
+    let out = run_staged(root);
+    assert_staged_zero_scan(&out);
 }
