@@ -292,6 +292,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
     schema whose default is `300000`.
   - When porting `effort`, carry `routing_tier_defaults` across with it. Creating an `effort` block
     without them silently kills the tier defaults.
+  - `05e264d` (2026-09-01) hit this exact trap the other direction: it copied `skip_discuss`,
+    `research_before_questions` and `use_worktrees` **out of** `~/.gsd/defaults.json` into this
+    project's `.planning/config.json`, believing they were "already in effect as defaults" — but
+    the global file does not layer here, so the effective values had been GSD's built-ins
+    (`skip_discuss: false`, `research_before_questions: false`). `use_worktrees` was reverted to
+    `false` in `dc66867`; `skip_discuss` was reset to `false` (discuss runs) on 2026-09-07, and
+    the global default corrected to match. This project deliberately **runs** the discuss phase.
 - [ ] **[GLOBAL]** MCP servers registered via `claude mcp list` (Google Drive/Gmail/Calendar,
   GitHub, plus two currently broken — `gsd-workflow`, `gsd-browser` — worth fixing or dropping if
   replicating cleanly rather than copying the breakage). A Linear server may still be registered;
