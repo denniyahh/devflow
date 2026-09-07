@@ -1,0 +1,30 @@
+# NEGATIVE CONTROL for the starts-with rule: MENTIONING the pinned command is
+# not RUNNING it.
+#
+# The first echo is the exact string 46-04's plan names as a required case (the
+# pre-46-04 spelling). The second echoes the CURRENT pin token, and is the one
+# that actually exercises the rule: without "trimmed line STARTS WITH the pin
+# token", a `contains` test would accept it.
+name: Fixture CI
+
+on:
+  push:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  sequential:
+    name: Sequential 2-CPU check
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the CPU pin from its single definition site
+        run: |
+          set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          echo "CPUS=$CPUS" >> "$GITHUB_ENV"
+      - run: echo 'taskset -c "$CPUS" scripts/check.sh all'
+      - run: echo '"${CPU_PIN[@]}" scripts/check.sh all'

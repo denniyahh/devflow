@@ -82,16 +82,28 @@ REGISTRY_VOLUME="devflow-ci-registry-${CACHE_SUFFIX}"
 "${DOCKER[@]}" volume create "$TARGET_VOLUME" >/dev/null
 "${DOCKER[@]}" volume create "$REGISTRY_VOLUME" >/dev/null
 
-# CPU pinning: match CI's core count so test-thread interleaving is
-# comparable. GitHub's standard hosted runners are 2-core; a 4-core host
-# hides races that CI sees. Override with DEVFLOW_CI_CPUS=all to use every
-# core (faster, less faithful).
-CPUS="${DEVFLOW_CI_CPUS:-0,1}"
-if [ "$CPUS" = "all" ]; then
-    PIN=()
-else
-    PIN=(taskset -c "$CPUS")
-fi
+# CPU pinning: match the pin CI applies so test-thread interleaving is
+# comparable. This is NOT the runner's core count — denniyahh/devflow is
+# public, and public-repo ubuntu-24.04 runners are 4 vCPU, not the 2 this
+# comment used to claim. The value is still right; the reason is that
+# ci.yml's `Sequential 2-CPU check` job pins the suite to the same list, so
+# a 4-core host here would hide races that the pinned CI job sees.
+#
+# The value itself lives in scripts/lib/ci-cpus.sh — one definition site,
+# read by this gate and by that CI job. Re-typing it here re-opens the drift
+# that file exists to close. Sourced relative to REPO_ROOT (cd'd to above);
+# `set -euo pipefail` makes a missing fragment fail loudly rather than run
+# the suite unpinned. Override with DEVFLOW_CI_CPUS=all to use every core
+# (faster, less faithful).
+# cpu_pin_prefix() lives in that fragment too, and is the ONLY place the
+# `all` case is decided. This gate used to carry its own copy of the
+# conditional while CI carried none, so DEVFLOW_CI_CPUS=all worked here and
+# killed CI with `taskset: failed to parse CPU list: all` (46-REVIEWS.md
+# C-06). The helper sets an argv PREFIX rather than running the command,
+# because the value is needed inside the `docker run` below where a host-shell
+# function does not exist.
+. scripts/lib/ci-cpus.sh
+cpu_pin_prefix
 
 # HYG-02 (41-02, re-derived from real container runs 2026-08-20): a git
 # WORKTREE's `.git` is a FILE — `gitdir: <main>/.git/worktrees/<N>` — pointing
@@ -139,4 +151,4 @@ exec "${DOCKER[@]}" run --rm -t \
     -e CARGO_TARGET_DIR=/ctarget \
     -e CARGO_TERM_COLOR=always \
     "$IMAGE" \
-    "${PIN[@]}" scripts/check.sh "$TARGET"
+    "${CPU_PIN[@]}" scripts/check.sh "$TARGET"

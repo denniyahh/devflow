@@ -7864,16 +7864,17 @@ mod tests {
     /// observation, so it would exercise the case above while appearing to
     /// cover this one (F-1).
     ///
-    /// **Why an unspawnable working directory rather than `NoGitPath` here —
-    /// F-1b's recorded fallback, taken on measured evidence.** `NoGitPath`
-    /// makes `git` unresolvable *process-wide*, and `devflow-core`'s tests
-    /// shell out to `git` from eight modules that all compile into ONE
-    /// parallel test binary. Installing it here failed 1-5 unrelated sibling
-    /// tests per run, nondeterministically, depending on which of them
-    /// happened to invoke `git` inside the guarded window. Serializing them
-    /// would mean every present and future `git`-touching test in the crate
-    /// opting into the same mutex — discipline, not structure, and silently
-    /// reopened by the next test that forgets.
+    /// **Why an unspawnable working directory rather than an in-process
+    /// empty-`PATH` experiment here — F-1b's recorded fallback, taken on
+    /// measured evidence.** An in-process empty `PATH` makes `git`
+    /// unresolvable *process-wide*, and `devflow-core`'s tests shell out to
+    /// `git` from eight modules that all compile into ONE parallel test
+    /// binary. Installing it here failed 1-5 unrelated sibling tests per run,
+    /// nondeterministically, depending on which of them happened to invoke
+    /// `git` inside the guarded window. Serializing them would mean every
+    /// present and future `git`-touching test in the crate opting into the
+    /// same mutex — discipline, not structure, and silently reopened by the
+    /// next test that forgets.
     ///
     /// `hermetic_command` sets `cmd.current_dir(dir)`, so a directory that
     /// does not exist makes the spawn itself fail and `.output()` return
@@ -7881,10 +7882,10 @@ mod tests {
     /// and therefore no effect on any other test. `phase_commit_count` cannot
     /// tell the two causes apart: it sees only `Err`.
     ///
-    /// This route is also independent of the PATH-resolution property C5
-    /// flags as a latent fragility of `NoGitPath` (a future refactor to an
-    /// absolute `git` path would disarm that guard silently; it would not
-    /// disarm this).
+    /// The process-global fragility was resolved elsewhere by moving the
+    /// empty-`PATH` window into a child process. This route remains the right
+    /// alternative here: it is independent of PATH resolution, so a future
+    /// refactor to an absolute `git` path would not disarm it.
     #[test]
     fn phase_commit_count_reports_none_when_git_cannot_run() {
         let dir = tempfile::tempdir().unwrap();

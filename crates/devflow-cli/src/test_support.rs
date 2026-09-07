@@ -359,68 +359,133 @@ impl Drop for NeutralPath {
     }
 }
 
-/// RAII guard that REPLACES `PATH` with a deliberately EMPTY directory, so
-/// `git` — and every other binary — cannot be resolved at all for the scope
-/// it is bound in (35-01, criteria 1 and 6).
+/// Name of the environment variable that puts a re-executed test binary into
+/// CHILD mode: present means this process was spawned by
+/// [`run_test_without_git`], and its value is the fixture root the parent
+/// built before emptying the child's `PATH`.
 ///
-/// **Why empty rather than a failing shim (F-1).** The two consumers of
-/// [`devflow_core::agent_result::phase_commit_count`] must distinguish "the
-/// git child could not be executed" from "git ran and reported zero". Only
-/// the first is a measurement failure, and only an UNRESOLVABLE binary
-/// produces it: `Command::output()` returns `Err(NotFound)` when the program
-/// cannot be spawned, whereas a shim that runs and exits non-zero returns
-/// `Ok(status)` — a real observation. A test built on a failing shim would
-/// exercise the already-correct `Some(0)` path while appearing to cover the
-/// `None` one, which is precisely the proxy measurement this phase exists to
-/// remove.
+/// One shared name rather than one constant per test: each child runs exactly
+/// one test (`--exact`), so there is nothing to disambiguate. A hand-exported
+/// value puts a test into child mode with no parent and no emptied `PATH` —
+/// documented rather than defended against, since a test that takes the inner
+/// branch without the hostile `PATH` fails loudly rather than passing
+/// vacuously.
+pub(crate) const CHILD_NO_GIT_ROOT: &str = "DEVFLOW_CHILD_NO_GIT_ROOT";
+
+/// `Some(root)` when this process is the CHILD half of a
+/// [`run_test_without_git`] pair, `None` when it is the parent.
 ///
-/// Structurally a sibling of [`NeutralPath`]: same field shape, same
-/// `install()`-not-`new()` naming, same `Drop`-restores-on-every-exit-path
-/// reasoning (WR-05), and the same `TempDir`-outlives-the-`PATH`-that-names-it
-/// ordering. It differs in exactly one respect — the directory it points
-/// `PATH` at is empty, where [`NeutralPath`]'s still holds a real `git`.
-///
-/// **The caller must already hold [`ENV_MUTEX`]** (via [`env_lock`]).
-/// `set_var` is process-wide and `cargo test` runs in parallel; this guard
-/// makes the restore unconditional, it does not make the mutation safe on its
-/// own. Hold it over exactly the one call under test and nothing more: this
-/// is the first guard in the workspace that makes `git` unresolvable
-/// process-wide, so any sibling test shelling out to `git` inside the guarded
-/// window fails spuriously.
-pub(crate) struct NoGitPath {
-    _dir: tempfile::TempDir,
-    original: Option<std::ffi::OsString>,
+/// Reading this BEFORE any re-exec is what makes recursion impossible: the
+/// child takes its inner branch and returns long before it could reach the
+/// spawn in the outer branch.
+pub(crate) fn child_no_git_root() -> Option<PathBuf> {
+    std::env::var_os(CHILD_NO_GIT_ROOT).map(PathBuf::from)
 }
 
-impl NoGitPath {
-    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
-    /// process-global state at the moment of the call.
-    pub(crate) fn install() -> Self {
-        // Deliberately empty — see the type's doc comment. Nothing is written
-        // into this directory, by design.
-        let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var_os("PATH");
-        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
-        // no other test thread is reading or writing PATH concurrently.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        Self {
-            _dir: dir,
-            original,
-        }
-    }
+/// Re-executes THIS test binary for exactly one test, with `PATH` pointing at
+/// an empty directory — so `git`, and every other binary, is unresolvable for
+/// the duration of that one test, **inside a child process where the emptied
+/// `PATH` is invisible to every sibling test in the parent**.
+///
+/// This replaces the former process-global empty-`PATH` experiment (46-06,
+/// review finding C-01). Every test thread in the same binary used to see the
+/// emptied `PATH`, which is why `d525f9a` added `env_lock()` to 47 siblings
+/// and still missed tests that reach `git` only through a helper. Moving the
+/// window into a child removes the hazard instead of serialising around it.
+///
+/// Three details are load-bearing:
+///
+/// - `PATH` and the child-mode variable are set **on the `Command` only**.
+///   `std::env::set_var` is unsound under a threaded test runner (`unsafe`
+///   since Rust 2024) and is precisely what this helper exists to stop doing.
+/// - `PATH` is set to an EMPTY DIRECTORY, not removed. Some resolvers fall
+///   back to a built-in default path when `PATH` is absent, which would leave
+///   `git` resolvable and quietly change the experiment.
+/// - the `TempDir` is held in a local binding across the whole `.output()`
+///   call. Dropping it earlier would delete the directory `PATH` names while
+///   the child is still running.
+///
+/// No `--nocapture`: the child's libtest summary line is what
+/// [`assert_child_ran_exactly_one_passing_test`] parses, and `--nocapture`
+/// interleaves the test's own output with it.
+pub(crate) fn run_test_without_git(test_name: &str, root: &Path) -> std::process::Output {
+    // Deliberately empty. Nothing is written into it, by design.
+    let empty = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().expect("current_exe for child test re-invocation");
+    let output = std::process::Command::new(&exe)
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .env("PATH", empty.path())
+        .env(CHILD_NO_GIT_ROOT, root)
+        .output()
+        .expect("spawn child test process with an empty PATH");
+    // Explicit, not incidental: the empty directory must outlive the child.
+    drop(empty);
+    output
 }
 
-impl Drop for NoGitPath {
-    fn drop(&mut self) {
-        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
-        // for at least as long as this guard's own scope.
-        unsafe {
-            match &self.original {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
+/// Asserts that a [`run_test_without_git`] child actually RAN the one test it
+/// was asked to run, and that the test passed.
+///
+/// Four assertions, because each catches a vacuity the others do not:
+///
+/// - `status.success()` alone is satisfied by a run that executed nothing at
+///   all — a libtest filter matching no test exits 0. This repo has already
+///   paid for that: `cargo test --exact <name>` is a false green on a
+///   misspelled name.
+/// - `test {name} ... ok` proves this specific test ran and passed, rather
+///   than some other test the filter happened to match.
+/// - `1 passed` proves exactly one did. A misspelled filter yields
+///   `0 passed`, which the line above would not catch on its own if the name
+///   were also absent from the summary.
+/// - a NON-ZERO `filtered out` count proves the binary contained other tests
+///   that the filter excluded. A count of zero is consistent with a binary
+///   holding only this one test, in which case the filter proved nothing.
+///
+/// The child's full stdout and stderr are printed in every failure message:
+/// libtest captured the child's output, so a child failure is otherwise
+/// invisible from the parent.
+pub(crate) fn assert_child_ran_exactly_one_passing_test(
+    out: &std::process::Output,
+    test_name: &str,
+) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let context = format!(
+        "\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}\
+         \n--- end child output ---"
+    );
+
+    assert!(
+        out.status.success(),
+        "child test process must exit 0; status {status:?}{context}",
+        status = out.status
+    );
+    assert!(
+        stdout.contains(&format!("test {test_name} ... ok")),
+        "child stdout must carry `test {test_name} ... ok` — without it the \
+         child may have run some other test, or none{context}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "child must report exactly `1 passed`{context}"
+    );
+
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    let filtered_out: u64 = words
+        .windows(3)
+        .find(|w| w[1] == "filtered" && w[2].starts_with("out"))
+        .and_then(|w| w[0].parse().ok())
+        .unwrap_or_else(|| {
+            panic!("child stdout must carry a parseable `N filtered out` count{context}")
+        });
+    assert!(
+        filtered_out > 0,
+        "child must report a NON-ZERO `filtered out` count — zero is \
+         consistent with a binary containing only this test, in which case \
+         the filter proved nothing; got {filtered_out}{context}"
+    );
 }
 
 /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
@@ -642,66 +707,94 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::process::Command;
 
-    /// NC-1 (35-VALIDATION.md), and the reason it is load-bearing rather than
-    /// ceremony: criteria 1 and 6 both assert on behaviour that occurs ONLY
-    /// when `git` cannot be executed. If [`NoGitPath`] silently failed to take
-    /// effect — wrong `PATH` ordering, a guard dropped early, an absolute-path
-    /// `git` invocation — every downstream assertion would still run and every
-    /// one of them would pass for the wrong reason. This test is the only
-    /// thing standing between that and a green suite over an unfixed defect,
-    /// which is why it must pass before any criterion-1 or criterion-6 result
-    /// is believed.
+    /// NC-1 (35-VALIDATION.md), relocated into a CHILD PROCESS by 46-06
+    /// (review finding C-01), and the reason it is load-bearing rather than
+    /// ceremony: several tests assert on behaviour that occurs ONLY when
+    /// `git` cannot be executed. If the mechanism that hides `git` silently
+    /// failed to take effect — wrong `PATH` ordering, a child that never ran,
+    /// an absolute-path `git` invocation — every downstream assertion would
+    /// still run and every one of them would pass for the wrong reason. This
+    /// test is the only thing standing between that and a green suite over an
+    /// unfixed defect, which is why it must pass before any result that
+    /// depends on unrunnable `git` is believed.
     ///
-    /// The control is inside the test: the pre-guard call must succeed and the
-    /// post-drop call must succeed, so a guard that did nothing at all cannot
-    /// produce a green result here — all three observations would agree, and
-    /// the middle assertion would fail.
+    /// **Named for the property, not the former mechanism.** The deleted
+    /// guard's name remains only in git history, so the source-tree scan for
+    /// it stays a true zero.
+    ///
+    /// **The proof is in BOTH directions, and one direction alone is not a
+    /// measurement.** The child asserts `git` does NOT resolve; the parent
+    /// asserts it DOES, both before the child is spawned and after it
+    /// returns. A child that failed to spawn `git` for some unrelated reason,
+    /// or a helper that ran nothing at all, would look identical from the
+    /// failing side — and a parent whose own `PATH` had been mutated would
+    /// look identical from the passing side.
+    ///
+    /// **`ErrorKind::NotFound` specifically, not merely `is_err()`.**
+    /// `Command::output()` returns `Err(NotFound)` when the program cannot be
+    /// SPAWNED, whereas a `git` that runs and exits non-zero returns
+    /// `Ok(status)`. Accepting any error kind would accept a guard that
+    /// blocked `git` for the wrong reason.
     ///
     /// `git` is invoked through `devflow_core::test_support::git_command`, the
     /// same PATH-resolved constructor production code uses (`git.rs`'s
     /// `git_command` -> `hermetic_command` -> `Command::new("git")`), so this
     /// measures the harness against the real spawn path rather than an
     /// approximation of it.
+    ///
+    /// No `env_lock()`: nothing in this test mutates process-global state any
+    /// more. Keeping the guard would preserve the false impression that a
+    /// hazard remains here.
     #[test]
-    fn no_git_path_makes_git_unresolvable_and_restores_it() {
-        let _guard = env_lock();
+    fn an_empty_path_child_cannot_resolve_git_while_the_parent_still_can() {
+        const NAME: &str = "test_support::tests::\
+                            an_empty_path_child_cannot_resolve_git_while_the_parent_still_can";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, set by the parent on
+            // this process's `Command` only.
+            let err = devflow_core::test_support::git_command(&root)
+                .arg("--version")
+                .output()
+                .expect_err("the child's empty PATH must make `git` unresolvable");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::NotFound,
+                "the spawn must fail because the binary cannot be FOUND — any \
+                 other kind means `git` was blocked for the wrong reason"
+            );
+            return;
+        }
+
+        // PARENT half.
         let dir = tempfile::tempdir().unwrap();
         let path_before = std::env::var_os("PATH");
 
-        let before = devflow_core::test_support::git_command(dir.path())
-            .arg("--version")
-            .output();
         assert!(
-            before.is_ok(),
-            "control: `git` must be resolvable BEFORE the guard is installed, \
-             otherwise the middle assertion below proves nothing"
-        );
-
-        let during = {
-            let _no_git = NoGitPath::install();
             devflow_core::test_support::git_command(dir.path())
                 .arg("--version")
                 .output()
-        };
-        let err = during.expect_err("NoGitPath must make `git` unresolvable");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::NotFound,
-            "the spawn must fail because the binary cannot be found — any other \
-             error kind means the guard blocked git for the wrong reason"
+                .is_ok(),
+            "control: `git` must be resolvable in the parent BEFORE the child \
+             is spawned, otherwise the child's failure proves nothing"
         );
 
-        let after = devflow_core::test_support::git_command(dir.path())
-            .arg("--version")
-            .output();
+        let out = run_test_without_git(NAME, dir.path());
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
+
         assert!(
-            after.is_ok(),
-            "control: `git` must be resolvable again once the guard has dropped"
+            devflow_core::test_support::git_command(dir.path())
+                .arg("--version")
+                .output()
+                .is_ok(),
+            "control: `git` must still be resolvable in the parent AFTER the \
+             child returns — the whole point of the child is that the parent's \
+             own PATH is never touched"
         );
         assert_eq!(
             std::env::var_os("PATH"),
             path_before,
-            "PATH must be byte-identical to its pre-guard value after the guard drops"
+            "the parent's PATH must be byte-identical across the child run"
         );
     }
 

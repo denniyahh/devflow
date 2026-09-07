@@ -2444,13 +2444,39 @@ mod tests {
     /// `check_dead_monitor`, which both skip any phase already marked
     /// `stopped`. `resume` must re-mark the phase `stopped` (with a reason)
     /// on this failure path, not leave it looking falsely active.
+    ///
+    /// The unrunnable-agent window runs in a CHILD process
+    /// ([`run_test_without_git`], 46-06 / review finding C-01) so the emptied
+    /// `PATH` is invisible to every sibling test; the fixture stays in the
+    /// parent because building it shells out to `git`.
     #[test]
     fn resume_re_marks_stopped_when_launch_stage_fails_outright() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_launch::tests::\
+                            resume_re_marks_stopped_when_launch_stage_fails_outright";
+        let phase = PhaseId::new(82);
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so no `claude` binary
+            // is resolvable anywhere on it and `ensure_agent_binary` inside
+            // `launch_stage` fails deterministically regardless of what is
+            // installed on the host running this test.
+            let err = resume(&root, phase, None, false).unwrap_err();
+            assert!(err.to_string().contains("not found"), "{err}");
+            let reloaded = workflow::load_state(&root, phase).unwrap();
+            assert!(
+                reloaded.stopped,
+                "a failed resume must leave the phase marked stopped, not a false-active zombie"
+            );
+            assert!(reloaded.stop_reason.is_some_and(|r| r.contains("claude")));
+            assert!(reloaded.monitor_pid.is_none());
+            return;
+        }
+
+        // PARENT half: `init_repo` and `save_state` both need a working
+        // `git`, so the fixture cannot move across the process boundary.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let phase = PhaseId::new(82);
         let mut state = State::new(
             phase,
             AgentKind::Claude,
@@ -2462,31 +2488,8 @@ mod tests {
         state.stop_reason = Some("rate limited".to_string());
         workflow::save_state(&state).unwrap();
 
-        // An empty directory on PATH: no `claude` binary anywhere on it, so
-        // `ensure_agent_binary` inside `launch_stage` fails deterministically
-        // regardless of what's installed on the host running this test.
-        let empty_path_dir = tempfile::tempdir().unwrap();
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", empty_path_dir.path());
-        }
-        let result = resume(root, phase, None, false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("not found"), "{err}");
-        let reloaded = workflow::load_state(root, phase).unwrap();
-        assert!(
-            reloaded.stopped,
-            "a failed resume must leave the phase marked stopped, not a false-active zombie"
-        );
-        assert!(reloaded.stop_reason.is_some_and(|r| r.contains("claude")));
-        assert!(reloaded.monitor_pid.is_none());
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
