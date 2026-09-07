@@ -36,7 +36,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Input Validation (VALID)
 
-- [ ] **VALID-01**: A configured `base_branch` naming a computed revision rather than a branch is
+- [x] **VALID-01**: A configured `base_branch` naming a computed revision rather than a branch is
       refused.
       *Traces to #204.* Reproduced with a negative control on 2026-09-03: `refs/heads/develop~1`,
       `develop@{0}` and `develop^{}` all pass `rev-parse --verify` (exit 0) while
@@ -47,7 +47,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       (`commands.rs:5459`) — it already carries its own negative control — rather than writing a
       new test.
 
-- [ ] **VALID-02**: `devflow stop` accepts the project root the same way `start`, `resume` and
+- [x] **VALID-02**: `devflow stop` accepts the project root the same way `start`, `resume` and
       `status` do.
       *Traces to #206.* Verified: `stop` takes `--root <ROOT>`; the others take a positional
       `[PROJECT]`. `devflow stop --phase 7 .` dies with a usage error naming no offending argument.
@@ -113,13 +113,20 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Test Infrastructure (INFRA)
 
-- [ ] **INFRA-01**: CI runs a job that reproduces the sequential `fmt → clippy → test` load shape
-      on a 2-core runner.
-      *Traces to #174.* Verified unchanged: `.github/workflows/ci.yml` runs three parallel jobs
-      (`test:31`, `clippy:55`, `fmt:67`), each invoking one `scripts/check.sh` part; no `all` job
-      exists. Every reproduction of the 999.47 `/proc` fork-inheritance race required the
-      sequential ordering, so CI is structurally incapable of catching that class today — it
-      rejected 0 of the pushes the local pre-push gate rejected 2 of 2.
+- [x] **INFRA-01**: CI runs a job that reproduces the sequential `fmt → clippy → test` load shape
+      **pinned to two CPUs**.
+      *Traces to #174.* **Corrected 2026-09-04 — the note below was wrong about `all`.**
+      `.github/workflows/ci.yml` runs three parallel jobs (`test:31`, `clippy:55`, `fmt:67`), each
+      invoking one `scripts/check.sh` part, and it has no `all` job — but that survey read only
+      `ci.yml`. `.github/workflows/devcontainer.yml:52` **already runs `scripts/check.sh all`
+      sequentially**, and its job `Build + test in devcontainer` is **already a required status
+      check on both `develop` and `main`** (verified against the repository rulesets: 4 required
+      contexts each — `Test`, `Clippy`, `Format`, `Build + test in devcontainer`). What is missing
+      is therefore **not the sequential ordering — it is the 2-CPU pin**: `devcontainer.yml`
+      contains no `taskset` and no `DEVFLOW_CI_CPUS`, so its sequential run gets the whole runner.
+      Every reproduction of the 999.47 `/proc` fork-inheritance race required the sequential
+      ordering *under CPU pressure*, and CI has rejected 0 of the pushes the local pre-push gate
+      rejected 2 of 2.
       **Land first:** it is a workflow-file addition with no source change, and it should be
       running underneath the rest of this milestone rather than alongside it.
 
@@ -153,9 +160,9 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 
 | Requirement | Phase | Wave | Status |
 |-------------|-------|------|--------|
-| INFRA-01 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Pending |
-| VALID-01 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Pending |
-| VALID-02 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Pending |
+| INFRA-01 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Complete |
+| VALID-01 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Complete |
+| VALID-02 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Complete |
 | DECN-02 | Phase 47 — Unattended Decision Policy Consistency | 1 | Pending |
 | DECN-03 | Phase 47 — Unattended Decision Policy Consistency (behavioural arm resolves against Phase 49) | 1 | Pending |
 | SURV-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery (field arm observed, not settled, in Phase 49) | 2 | Pending |
@@ -165,6 +172,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**
+
 - v3.0.0 requirements: 10 total
 - Mapped to phases: 10
 - Unmapped: 0 ✓

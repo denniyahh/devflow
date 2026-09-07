@@ -25,7 +25,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 
 | Phase | Name | Requirements | Wave | Status |
 |---|---|---|---|---|
-| 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Not started |
+| 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Not started |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02 | 2 | Not started |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
@@ -45,11 +45,15 @@ phase's pushes rather than alongside them.
 **Success Criteria** (what must be TRUE):
 
   1. A CI job runs the `scripts/check.sh` parts sequentially in one job (`fmt` → `clippy` → `test`)
-     on a 2-core runner and reports against a PR's current `HEAD_SHA` in `gh pr checks` — while the
-     three existing parallel jobs (`test`, `clippy`, `fmt`) still run and still pass, so the new
-     job is an addition rather than a re-shape. **Not claimed:** that this job catches the 999.47
-     `/proc` fork-inheritance race. CI has rejected 0 of the pushes the local gate rejected 2 of 2;
-     the criterion is that the load shape now exists in CI, not that it has caught anything.
+     **pinned to two CPUs** — `taskset -c 0,1`, the same constraint the local pre-push gate applies
+     — and reports against a PR's current `HEAD_SHA` in `gh pr checks`, while the three existing
+     parallel jobs (`test`, `clippy`, `fmt`) still run and still pass, so the new job is an addition
+     rather than a re-shape. **Not claimed:** that the runner is allocated 2 cores. The shape is
+     pinned by CPU *affinity*, not by runner size, which makes the runner's actual core count
+     irrelevant to correctness — verified in the pinned image, where `nproc` reports 4 and
+     `taskset -c 0,1 nproc` reports 2. **Not claimed:** that this job catches the 999.47 `/proc`
+     fork-inheritance race. CI has rejected 0 of the pushes the local gate rejected 2 of 2; the
+     criterion is that the load shape now exists in CI, not that it has caught anything.
   2. A configured `base_branch` of `refs/heads/develop~1`, `develop@{0}` or `develop^{}` is refused
      with a message naming the offending value — and the negative control still holds in the same
      assertion loop: a plain local branch name is still accepted, and `refs/heads/nonexistent-xyz`
@@ -62,7 +66,30 @@ phase's pushes rather than alongside them.
      offending argument rather than a bare usage error — the failure mode that made #200 read as
      "stop did not work" instead of "stop rejected my input".
 
-**Plans**: TBD
+**Plans**: 9/9 plans executed (3 executed, 6 gap-closure plans from the code-stage and final-scanner reviews)
+
+- [x] 46-01-PLAN.md — CPU-pin definition site, the advisory sequential CI job, and its parity guards
+- [x] 46-02-PLAN.md — `base_branch` refuses a computed revision (VALID-01)
+- [x] 46-03-PLAN.md — `devflow stop` takes a `[PROJECT]` positional (VALID-02)
+- [x] 46-04-PLAN.md — gap closure C-02/C-03/C-06: job-scope the parity guards, assert the pinned
+      vs unpinned comparison, and give `DEVFLOW_CI_CPUS=all` one home
+- [x] 46-05-PLAN.md — gap closure C-04: block-parsing plan-bashism scanner with both proven
+      bypasses as regression fixtures
+- [x] 46-06-PLAN.md — gap closure C-01 (1/3): child-process helper, proven in both directions, plus
+      2 of the 7 PATH-emptying sites
+- [x] 46-07-PLAN.md — gap closure C-01 (2/3): the 5 remaining sites, and `NoGitPath` deleted under
+      compiler enforcement
+- [x] 46-08-PLAN.md — gap closure C-01 (3/3): revert `d525f9a`'s 47 `env_lock` lines, contended
+      re-run, and correct the false class-fix claim
+- [x] 46-09-PLAN.md — final scanner-review gap closure C-08/C-09/C-10: read staged index blobs,
+      include renamed plans while excluding deletions, and prove the behavior in disposable Git repos
+
+**Deliberately not planned** (operator dispositions, `46-REVIEWS.md`): C-05 and C-07 are deferred
+under GitHub #207 — codex established there is no safe middle, since `commands.rs:185-187` returns
+`Ok` the moment the ref exists, so a new refusal arm never runs for the dangerous case while the raw
+value still reaches `git worktree add`. `cargo nextest` is backlog, not adopted: measured as a wash
+(76s vs 78s, identical test sets, 0 doctests), and `devflow::phase7_cli suite_reap_audit` is
+structurally incompatible with per-test process isolation.
 
 ### Phase 47: Unattended Decision Policy Consistency
 
@@ -364,7 +391,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 43 | 2/2 | Complete | 2026-08-24 |
 | 44 | 5/5 | Complete | 2026-08-27 |
 | 45 | 3/3 | Complete | 2026-09-02 |
-| 46 | — | Not started | — |
+| 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | — | Not started | — |
 | 48 | — | Not started | — |
 | 49 | — | Not started | — |
@@ -538,6 +565,117 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.123: Every Commit Triggers FOUR CI Runs, and the Contention Manufactures Flakes (BACKLOG)
+
+**Found:** 2026-09-06, phase 46 PR #208 on head `538ca1e`.
+
+**Problem.** `ci.yml` and `devcontainer.yml` both declare:
+
+```yaml
+on:
+  push:                              # NO branch filter
+  pull_request:
+    branches: [main, develop]
+```
+
+`push:` is unfiltered, so pushing a feature branch that already has an open PR fires it AND the
+`pull_request` event. Two workflows x two events = **four workflow runs per commit**. Observed on
+`538ca1e`: runs `34073787179` / `34073787212` (`push`) and `34073788513` / `34073788521`
+(`pull_request`). Every check name consequently appears **twice** in `gh pr checks` — which is the
+listing D-06 obliges a reader to parse carefully.
+
+**The concurrency guard cannot collapse this, and is not misconfigured.** Both use
+`group: ${{ github.workflow }}-${{ github.ref }}` with `cancel-in-progress: true`. On a push
+`github.ref` is `refs/heads/<branch>`; on a pull_request it is `refs/pull/<n>/merge`. Different
+refs, different groups, no cancellation. The guard's real job — superseding an older push on the
+same branch — still works.
+
+**Why this is not merely 2x cost.** The four runs contend for runner capacity, and that contention
+produces failures. On `538ca1e`, `Build + test in devcontainer` **failed in one run (2m50s) and
+passed in its duplicate (3m9s) on the identical commit**. Cause:
+`reference_and_cleanup_worktree_cli_flow` timed out in `wait_for` — a 5-second budget
+(200 x 25ms) — waiting for a gate file. That is the pre-existing 999.23 flake, and the duplication
+is manufacturing the load it loses under. A re-run of the single failed job passed (2m58s).
+
+So the duplication actively trains the reader to re-run red CI instead of investigating it, which
+is the failure mode 999.23's own entry warns about.
+
+**Candidate fix**, conventional:
+
+```yaml
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+```
+
+Feature branches then get one run per workflow via the PR; trunk pushes keep direct coverage.
+
+**The trap that makes this NOT a one-line change.** `develop`'s required contexts are exactly
+`["Test","Clippy","Format","Build + test in devcontainer"]` (read from
+`gh api repos/denniyahh/devflow/rules/branches/develop`). All four would still be produced by the
+`pull_request` runs, so the change *should* be safe — but this repo has already orphaned a required
+context once by editing workflows (deleting `devcontainer.yml`, 2026-07-26), and a PR that silently
+stops reporting a required context wedges the merge with no error. **Verify on a throwaway PR
+against the live rulesets before trusting it**; do not reason about it.
+
+**Not established:** whether any tooling or automation depends on the `push`-event runs existing for
+feature branches, and whether reducing to one run per workflow is on its own enough to stop 999.23
+(the 5-second budget may be too tight regardless — that is 999.23's scope, not this entry's).
+
+### Phase 999.122: Adopt `cargo nextest` for Per-Test Process Isolation (BACKLOG)
+
+**Found:** 2026-09-05, phase 46 external adversarial code review (`46-REVIEWS.md`, finding C-01
+and its operator disposition).
+
+**Problem.** `NoGitPath` and one ad-hoc `empty_path_dir` replace `PATH` process-wide so `git`
+becomes unresolvable. Every other test in the same binary that spawns `git` can lose the race.
+The repo's answer to date is `ENV_MUTEX`: 135 tests now hold it, and the population that *should*
+hold it is not reliably enumerable — a source scan for direct spawns missed 31 tests reaching git
+through helpers, and reviewers named further routes (production code paths, cross-crate
+`devflow-core` spawns, tests that re-exec `current_exe()`). Phase 46 closes the hazard by
+child-processing the seven PATH-emptying sites (46-06..46-08), which removes the race without
+serialising fixtures — but it fixes the *shape*, not the *class*: a future PATH-emptying guard
+reintroduces it and nothing enforces the pattern.
+
+**Why nextest.** It runs every test in its own process, so a process-global `PATH` mutation cannot
+reach any other test. That deletes the class outright and makes the enumeration problem moot.
+
+**Measured before deferring (2026-09-05, this workspace, `cargo-nextest 0.9.143` already installed):**
+
+| | `cargo test --workspace` | `cargo nextest run --workspace` |
+|---|---|---|
+| wall clock | 78s | 76s |
+| outcome | 1244 results, 0 failed | 1242 tests, 1 failed |
+
+- **Test sets are identical.** Name-diffed both directions: 0 tests that `cargo test` runs are
+  missing from nextest. The single apparent extra is
+  `agents::codex::tests::codex_writable_roots_refuses_non_utf8_paths`, a `#[should_panic]` test
+  that `cargo test` prints as `... - should panic ... ok` — a formatting difference, not a skip.
+- **No speedup.** 76s vs 78s is a wash. Do not justify this work on performance.
+- **Doctests cost nothing here.** nextest does not run them; `cargo test --workspace --doc` runs
+  **0** tests in this workspace.
+
+**The two blockers, both measured, both real work:**
+
+1. `devflow::phase7_cli suite_reap_audit` (`crates/devflow-cli/tests/phase7_cli.rs:1741`) is
+   *structurally* incompatible. It is a cross-test invariant auditor: it must observe its siblings
+   in one shared process and assert no monitors leaked. Under per-test isolation it runs alone,
+   sees `alive=[], in_flight=0, registered=0`, and reports a false leak. It needs redesigning, and
+   simply excluding it would delete a real leak check the repo relies on.
+2. **6 tests are flagged "leaky"** by nextest (processes outliving the test). Untraced. Each is
+   either a latent defect nextest surfaces and `cargo test` hides, or noise — nobody has looked.
+
+**Also in scope:** adopting it changes the gate itself (`scripts/check.sh:19,48` and the four
+`.github/workflows/ci.yml` jobs), so it needs a flag-parity audit (`--no-fail-fast` semantics, CI
+reporting, `--workspace` behaviour) before the gate can be trusted. That is why it was not folded
+into phase 46 — phase 46 is the phase that *added* the gate's newest job, and changing the
+measuring instrument in the same change is the sequencing error the milestone design warns about.
+
+**Not established:** whether nextest's process-per-test overhead scales differently on a 2-CPU
+pinned runner than on this 4-core host; the 76s figure is one unpinned run on an idle machine.
+
 ### Phase 999.121: OpenCode Has No CLI-Level `marker-less run never advances` Regression Test (BACKLOG)
 
 **Found:** 2026-09-03, v2.8.0 milestone audit (`/gsd-audit-milestone`, integration checker
@@ -611,7 +749,6 @@ already-converted sites.
 computed against the configured base — with a negative control that the default-base case is
 unchanged. `rg -n 'git_flow_for_project' crates/devflow-cli/src/pipeline_outcomes.rs` returns only
 non-production (test) sites afterward.
-
 
 ### Phase 999.119: Live `devflow start --mode auto` End-to-End Verification of the Configured-Base Fork/Preflight/Merge Chain (BACKLOG)
 

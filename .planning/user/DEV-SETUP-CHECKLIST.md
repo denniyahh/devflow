@@ -76,6 +76,48 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   (secret scanners, etc.). `pre-commit` additionally **refuses to commit directly on
   `develop`/`main`** (both PR-protected, so the commit would be rejected at push time), with no
   override — the fix is `git switch -c <branch>` first.
+- [ ] **[PROJECT]** `scripts/hooks/pre-commit` also **refuses a staged `*PLAN.md` whose
+  `<automated>` verify command uses bash-only syntax** (`${PIPESTATUS[...]}`, any `${name[N]}`
+  index, `${BASH_REMATCH[N]}`, `${v,,}`/`${v^^}`, `declare -A`) without wrapping it in `bash -c`.
+  GSD executor subagents run their Bash tool under **zsh**, where `PIPESTATUS` does not exist —
+  `${PIPESTATUS[0]}` expands to the empty string, so `echo "exit=${PIPESTATUS[0]}"` prints `exit=`
+  and every assertion about that exit code passes without ever reading it. That is a green check
+  over an unread result, the same class as the `rg -c` dead gate in CLAUDE.md. All three phase-46
+  plans shipped with it and each executor rediscovered it independently on the clock.
+- [ ] **[PATTERN]** **The scan is a standalone, tested script the hook DELEGATES to** —
+  `scripts/lint-plan-bashisms.sh`, exercised by `crates/devflow-cli/tests/plan_bashism_scanner.rs`
+  (11 cases, run by `cargo test` and therefore by every CI job through `scripts/check.sh`). A hook
+  is early feedback; the test suite is the enforcement. The first version of this guard was inline
+  in the hook and **untested**, and an external review (46-REVIEWS.md C-04) bypassed it twice by
+  *actually committing through it*.
+- [ ] **[PATTERN]** **The allow rule is CONTAINMENT, not ordering, and that distinction is the
+  whole guard.** A bashism is permitted only when it lies inside the single-quoted region that a
+  `bash -c '` opened; single quotes do not nest in POSIX shell, so the region boundary is
+  unambiguous. Four cases, all now regression fixtures — measured against the old hook, which
+  **committed all four**:
+  - `bash -c 'echo "${PIPESTATUS[0]}"'` — accepted; genuinely runs under bash.
+  - `echo "${PIPESTATUS[0]}" # bash -c` — refused; a trailing comment opens no region. The old
+    hook's `grep -v 'bash -c'` dropped any line *containing* the substring anywhere.
+  - `bash -c ':'; echo "${PIPESTATUS[0]}"` — refused; the region closed before the bashism, which
+    runs in the outer shell. An ordering rule ("`bash -c` appears first") accepts this.
+  - `bash -c "echo ${PIPESTATUS[0]}"` — refused; double quotes open no single-quoted region and
+    the outer shell expands before bash starts. Ordering accepts this too.
+- [ ] **[PATTERN]** **Parse BLOCKS, not lines, and treat an unterminated opening tag as an error.**
+  A line-based scan cannot see inside a multi-line `<automated>` block, which was the first proven
+  bypass; and a parser that matches only *complete* blocks is bypassed by construction — open a
+  tag, never close it, and there is nothing to check. Both are fixtures.
+- [ ] **[PATTERN]** **List staged files with `--cached --name-only -z --diff-filter=ACM` and
+  consume with `read -r -d ''`.** Without `-z`, git QUOTES a path containing non-ASCII or a tab and
+  the subsequent `[ -f "$path" ]` fails, skipping the file *silently*. Keep `--diff-filter=ACM` in
+  the same breath: a deleted plan has no content to scan and reintroduces the silent skip from the
+  other end. A named path that cannot be read is an **error**, never a skip — a check reporting
+  success having inspected nothing is the failure class the guard exists to prevent.
+- [ ] **[PATTERN]** **When probing a hook end-to-end in a scratch repo, attribute the refusal.**
+  `git commit` failing proves only that *some* hook objected. The first run of this repo's own
+  probe read `legit=WRONGLY_REFUSED` and the cause was the **commit-msg** Conventional Commit
+  validator rejecting the message `t3` — nothing to do with the guard under test. Use a conforming
+  commit message, choose a branch and paths that trip neither the protected-branch nor the
+  personal-artifact arm, and grep the captured output for the specific guard's own text.
 - [ ] **[PROJECT]** `scripts/hooks/commit-msg`: Conventional Commit validator — enforces
   `<type>(<scope>)!: <description>` against the allowed type list, refuses a subject ending in a
   period, warns (does not refuse) past 72 chars, and exempts merge/fixup/squash subjects.
@@ -123,9 +165,67 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 
 ## 4. GitHub Actions CI
 
-- [ ] **[PROJECT]** `.github/workflows/ci.yml` — three required jobs (`Test`, `Clippy`, `Format`),
-  each running **inside the exact same pinned container image** the devcontainer and the
-  pre-push hook use (§5) — the whole point being zero host/CI drift.
+- [ ] **[PROJECT]** `.github/workflows/ci.yml` — **four** jobs, each running **inside the exact
+  same pinned container image** the devcontainer and the pre-push hook use (§5) — the whole point
+  being zero host/CI drift. Three (`Test`, `Clippy`, `Format`) are **required** status contexts;
+  the fourth (`Sequential 2-CPU check`) is deliberately **advisory**. The **fourth required
+  context is `Build + test in devcontainer`, which lives in `devcontainer.yml`, not here** — so
+  the required set spans two workflow files, and reading only this one under-counts it.
+- [ ] **[PATTERN]** **Any container job whose `run:` steps use bash syntax must declare
+  `shell: bash`.** GitHub defaults a `run:` step to `bash -e {0}` only on a *bare runner*; inside
+  a `container:` job it is `sh -e {0}`, and these Debian images ship dash as `/bin/sh`. So
+  `set -euo pipefail` is a hard error there (`set: Illegal option -o pipefail`, exit 2) and other
+  bashisms (`[[`, `${v,,}`, arrays) fail *quietly*. `Sequential 2-CPU check` shipped without it
+  and died on line 1 of its first two live runs on PR #208 — 42s to red, having executed none of
+  the suite, while presenting as an ordinary failing check rather than a misconfiguration.
+  Enforced job-scoped (not file-scoped) by `container_jobs_using_bash_syntax_declare_a_bash_shell`
+  in `crates/devflow-cli/tests/ci_parity_guards.rs`; a file-scoped check would pass with the
+  declaration sitting on the wrong job. Same false-green family as the zsh `${PIPESTATUS[0]}`
+  hazard in CLAUDE.md.
+- [ ] **[PATTERN]** **A workflow guard must be a FUNCTION over text, driven by fixtures — not a
+  `contains` search over the live file.** A guard that can only ever run against the real workflow
+  cannot be made to fail on demand, so it is only ever observed passing, which is not evidence.
+  Measured here: with the pinned suite step commented out, the whole-file version still reported
+  `1 passed`; a decoy job supplying the tokens passed it too. The replacement
+  (`split_jobs` + `recognise_pinned_sequential_job`, same file) scopes to the target job's own body
+  and is exercised by five fixtures in `crates/devflow-cli/tests/fixtures/ci-parity/` — one
+  positive control plus four negative. Two details that are load-bearing rather than stylistic: the
+  splitter anchors to the top-level `jobs:` key (otherwise `push:`/`pull_request:` under `on:` parse
+  as jobs — six headers for four real jobs, which made an `>= 4` anti-vacuity assert satisfiable by
+  two non-jobs), and it reads RAW lines because indentation is the only thing separating a top-level
+  key from a nested one, so a trim-everything helper destroys the signal before use.
+- [ ] **[PATTERN]** The CI CPU pin has exactly **one definition site**, `scripts/lib/ci-cpus.sh`.
+  Both consumers source it — `scripts/check-in-container.sh` (the pre-push gate) and the
+  `Sequential 2-CPU check` job — rather than re-typing the value, because a second copy lets the
+  local gate and CI measure different load shapes while both report green. Same class as the
+  image-tag duplication above, and enforced the same way: a test
+  (`cpu_pin_has_exactly_one_definition_site`) rather than a "keep in sync" comment.
+- [ ] **[PATTERN]** The `DEVFLOW_CI_CPUS=all` escape hatch is decided in **one function**,
+  `cpu_pin_prefix()` in that same fragment, which sets an argv-prefix array `CPU_PIN` — empty for
+  `all`, `(taskset -c "$CPUS")` otherwise. All three consumers call it: the pre-push gate and
+  **both** pin sites in the `Sequential 2-CPU check` job. It builds an array rather than running
+  the command because the gate needs the value as a prefix inside `docker run`, where a host-shell
+  function does not exist. A shell function cannot cross a GitHub Actions step boundary, so each CI
+  step sources the fragment again — that is the one definition site being read twice, not a second
+  copy. The value of doing it this way is measured, not stylistic: while the conditional existed
+  only in the local gate, `DEVFLOW_CI_CPUS=all` passed locally and killed CI with
+  `taskset: failed to parse CPU list: all` (exit 1) — a parity break inside the pair of files whose
+  only purpose is parity.
+- [ ] **[PATTERN]** **A negative control must ASSERT, and the decider must not be the measurer.**
+  The `Sequential 2-CPU check` job compares `nproc` unpinned against `nproc` under the pin, and
+  the comparison lives in `scripts/assert-cpu-pin.sh <cpu_list> <unpinned> <pinned>` — a script
+  that takes all three values as ARGUMENTS and measures nothing. That split is what makes the
+  failing direction runnable: a decider inlined in the workflow can only ever be observed on a
+  runner that happens to disagree with itself, so its interesting branch never executes. It
+  shipped originally as three bare `echo`s under a comment calling one count the negative control
+  for the other, which is the shape to watch for — documenting a gate is not implementing one.
+  The assertion is conditional (skipped when the list is `all`, and on a <= 2-CPU host where a
+  2-CPU pin cannot narrow anything) and **both skips print their reason**, because a silent skip
+  and a pass look identical in a job log. Four decision cases are unit-tested in
+  `crates/devflow-cli/tests/ci_parity_guards.rs`. What a pass does NOT establish: that rustc or
+  the harness threads were confined, or that the runner had 2 cores — only that the pin narrowed
+  the count visible to one child process. Affinity inheritance across fork/exec is the mechanism
+  relied on, and `nproc` does not measure it.
 - [ ] **[PATTERN]** A dedicated `scripts/assert-image-parity.sh` step fails the build if the
   image tag in CI drifts from `.devcontainer/devcontainer.json` — because GitHub Actions can't
   interpolate `env` into `jobs.*.container.image`, so the tag is duplicated by hand and needs an
@@ -258,6 +358,28 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   2026-09-03); gsd-core issue numbers are in the thousands and turn up inside warning strings
   emitted by the installed package (e.g. the `#3532` shadowed-global-defaults diagnostic). A
   four-digit number in GSD output is never one of yours.
+- [ ] **[PROJECT]** `.planning/config.json` sets **`workflow.use_worktrees: false`**, deliberately
+  (2026-09-05). This is not a preference — on Claude Code, GSD executor worktrees are forked from
+  `origin/HEAD` and the harness ignores the project's `worktree.baseRef` (#48, upstream
+  claude-code#44965). A phase branch is by definition ahead of `origin/HEAD` for its whole life,
+  so `worktree.base-check` auto-degrades to sequential on **every** phase — parallel executor
+  worktrees are structurally unavailable here, not merely unavailable today.
+
+  Declaring the degrade in config rather than discovering it per-dispatch is what makes it
+  survivable. The isolation sentinel that records a shell-computed degrade carries a **10-minute
+  TTL** (`hooks/lib/isolation-sentinel.js`), and `execute-phase.md` writes it once at `initialize`
+  and never refreshes it — so any executor running longer than 10 minutes stales it and the *next*
+  plan's dispatch is denied (filed upstream as gsd-core#4317). `workflow.use_worktrees: false` is
+  the one degrade the guard re-derives from config on a stale or absent sentinel, so it is immune
+  to both that TTL and the re-query clobber of gsd-core#4222. Verified: with the sentinel deleted,
+  `gsd-tools query dispatch-isolation --raw` returned `harness-worktree` before the change and
+  `none` after.
+
+  Consequence to know about: sequential dispatch has no hard-pin to the orchestrator's worktree
+  root (gsd-core#4254), so an executor subagent can spawn with cwd on the *primary checkout* and
+  commit to the wrong branch silently. Until that lands upstream, every executor dispatch must
+  carry the orchestrator's absolute worktree path and a branch assertion in its prompt — see
+  CLAUDE.md.
 - [ ] **[PROJECT]** Issue tracking is **GitHub Issues only** (`denniyahh/devflow`). ROADMAP.md
   `999.x` backlog entries are the primary record; mirror one to a GitHub issue when it needs to be
   visible outside the repo. **Linear is no longer used** (retired 2026-09-02). Historical

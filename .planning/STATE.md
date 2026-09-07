@@ -1,16 +1,22 @@
 ---
 gsd_state_version: 1.0
 milestone: v3.0.0
-milestone_name: Unattended Run Survivability
+milestone_name: milestone (ACTIVE — Unattended Run Survivability)
+current_phase: 47
+current_phase_name: Unattended Decision Policy Consistency
+current_plan: Not started
 status: planning
-last_updated: "2026-09-03T19:09:48.508Z"
-last_activity: 2026-09-03
+stopped_at: Phase 46 complete, ready to plan Phase 47
+last_updated: "2026-09-07T09:35:46.247Z"
+last_activity: 2026-09-07
+last_activity_desc: Phase 46 complete, transitioned to Phase 47
+state_head: dc66867acf26fe5c9d2e311cf3345ed77c270389
 progress:
   total_phases: 6
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 9
+  completed_plans: 9
+  percent: 17
 ---
 
 # DevFlow — Project State
@@ -46,9 +52,10 @@ pipe-tables to bullet lists in the same edit — `audit-open`'s deferred-items s
 
 ## Active Phase
 
-**None yet — Phase 46 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
+**None — Phase 47 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
 declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
-requirements mapped. Nothing has been planned or executed.
+requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208);
+Phases 47-51 are unplanned.
 
 **The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
 survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
@@ -71,13 +78,14 @@ See: `.planning/PROJECT.md` (updated 2026-09-03)
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
 **Current focus:** v3.0.0 Unattended Run Survivability — Phase 46 (CI Load Shape and Operator
-Input Validation), not yet planned.
+Input Validation) complete and merged (PR #208); Phase 47 (Unattended Decision Policy
+Consistency) next and unplanned.
 
 ## Operator Next Steps
 
-- `/gsd-plan-phase 46` to plan the first phase (INFRA-01 + VALID-01 + VALID-02).
-- Before starting Phase 46's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
-  then `git worktree add -b feature/phase-46 .worktrees/phase-46 develop` — per CLAUDE.md.
+- `/gsd-plan-phase 47` to plan Phase 47 (DECN-02 + DECN-03). It depends on nothing.
+- Before starting Phase 47's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
+  then `git worktree add -b feature/phase-47 .worktrees/phase-47 workspace/denniyahh` — per CLAUDE.md.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
   `base_branch` must be configured before the live `--mode auto` run is possible.
 - `workspace/denniyahh` is ahead of `origin/develop` and unpushed — push when ready.
@@ -89,7 +97,7 @@ Input Validation), not yet planned.
 
 The entries below describe earlier phases and are retained for context. They are
 **not** the active phase; the `## Active Phase` and `## Current Position` sections above
-(milestone v3.0.0, Phase 46 next and unplanned) are authoritative.
+(milestone v3.0.0, Phase 47 next and unplanned) are authoritative.
 
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
 Claude** — **scoped 2026-07-25.** The goal was the
@@ -154,13 +162,18 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 46 of 6 (CI Load Shape and Operator Input Validation) — first phase of v3.0.0
-Plan: — (no plans yet)
-Status: Ready to plan
-Last activity: 2026-09-03 — v3.0.0 roadmap created: 6 phases (46-51), 5 waves, 10/10 requirements
-mapped, 0 orphans
+Phase: 47 — Unattended Decision Policy Consistency (DECN-02, DECN-03) — NOT STARTED
+Plans: none yet — phase not planned
+Current Plan: Not started
+Total Plans in Phase: —
+Completed Plans: —
+Status: Phase 46 complete (9/9 plans, verification passed, PR #208 merged to develop as 0acc828).
+Phase 47 depends on nothing — ready to plan. Phase 46's own deferrals remain tracked: C-05/C-07
+against GitHub #207, `cargo nextest` on the backlog, deferred-items.md #46-05-#2 (seven tracked
+plans fail the bashism scanner) grandfathered by the scanner's staged-only scope.
+Last activity: 2026-09-07 — Phase 46 complete, transitioned to Phase 47
 
-Progress: [░░░░░░░░░░] 0% (0 of 6 phases complete)
+Progress: [█░░░░░░░░░] 17% (1 of 6 phases complete)
 
 ## Recently Shipped
 
@@ -632,7 +645,7 @@ item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 
 ## Blockers
 
-None currently open.
+currently open.
 
 <!-- This section is a LIVE SET, not a log. GSD's smart-entry scan promotes EVERY hyphen-bullet
      here to an open blocker and returns situation:"blocked" — including one whose text begins
@@ -663,11 +676,14 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
     Define-to-Ship unattended — is now owned by **Phase 31's acceptance criterion** (the live
     Phase 29 wave-2 re-run), i.e. tracked as phase scope rather than as a blocker. Removing the
     entry does not drop the concern.
+- D-46-01-A: scripts/check-in-container.sh all exits 101 under the 2-CPU pin (wr01_clean_tree_strict_ancestor... PATH/ENV_MUTEX race, pre-existing, fix identified in phase 34 but never applied). Blocks git push from the phase-46 worktree via pre-push hook.
 
 ## Decisions
 
 | Date | Decision |
 |---|---|
+| 2026-09-05 | **46-03: `devflow stop` now takes its project root as a positional, and the empty-root premise the plan was built on turned out to be wrong.** `Command::Stop` gained `project: PathBuf` with `#[arg(default_value = ".")]`, and the dispatch arm resolves `root.unwrap_or(project)` — no `conflicts_with` (it would make the both-supplied case an ERROR, which D-12 forbids) and no `overrides_with` (it relates a repeated flag to itself, not a flag to a positional); either would also change `--help`. The arm's old `unwrap_or_else(|| PathBuf::from("."))` was DELETED so the positional's own default is the single source, which is what makes the shape identical to `Resume`/`Status` rather than merely similar. `project_root` was NOT touched: D-13 is a routing fix, and changing that function would alter every root-resolving subcommand. **EDGE measured, and it OVERTURNED the plan's prediction:** the plan expected both empty spellings to reach `project_root` and render `project path does not exist: ` with an invisible value, and filed that illegibility as an UNRESOLVED gap. Measured, clap refuses an empty value at the PARSER for both — exit 2, `a value is required for '[PROJECT]'` / `'--root <ROOT>'` — so `project_root` is never reached and the refusal already names the offending argument, which is what D-13 asks for. The gap as *described* is vacuous for empty arguments; the underlying `project_root` weakness is untouched and no claim is made that D-13 covers it. Post-fix behaviour was measured by proxy against `status` (identical field shape) BEFORE the fix existed, then re-measured directly on `stop` after. Precedence proven in BOTH orderings — one direction alone is equally consistent with the positional silently winning. D-12 control holds: all nine pre-existing `stop --root` call sites pass unedited (the whole-plan diff of `stop_e2e.rs` removes exactly two lines, both doc-comment lines of the widened help test; `reap_strays_e2e.rs` untouched). Purely additive — nothing migrated, no breaking change. `evidence` and `gate sweep` deliberately NOT converged, per Deferred Ideas. |
+| 2026-09-05 | **46-02: `base_branch` validation now asks git for a REF, not for a revision.** `ensure_base_is_a_local_branch` used `git rev-parse --verify` — a revision *parser* — as a ref existence check, so revision suffix syntax surviving the `refs/heads/` prefix was accepted: `workspace/example~1`, `develop@{0}` and `develop^{}` all exited 0 (re-measured this session under git 2.55.0, with negative controls). Replaced by two ORDERED calls on one shared `refs/heads/{base}` binding: `show-ref --verify --quiet` alone decides accept-versus-reject, then `check-ref-format` runs only on an already-decided refusal to choose which of two messages to emit (D-07/D-08). Order is load-bearing — `check-ref-format` exits 0 for a well-formed name that does not exist, so reversing them would decide nothing. The `unwrap_or` defaults deliberately differ: existence fails CLOSED (`false`, unchanged behaviour for an unspawnable git), the classifier fails OPEN toward the pre-existing message (`true`) so a git that cannot run never emits a malformed claim it has no evidence for. The raw `base` reaches neither call — it is option-shaped for a value starting with `-`. Ref-name validity is delegated wholly to git's plumbing; a hand-rolled denylist was prohibited because it drifts from git's own rules. **EDGE measured, not predicted:** an empty base yields `refs/heads/`, on which both probes exit 1, so it lands in the malformed arm — matching the plan's prediction. **R-01 remains OPEN and is explicitly not closed:** the validator qualifies `refs/heads/{base}` while `devflow-core`'s `worktree::add` forwards the RAW value to `git worktree add`, so a value that is both a legal ref name and a revision expression (`@`) still validates here and forks from elsewhere. Test extended in place per D-10 rather than duplicated; each RED arm was observed failing individually rather than inferred, and one broken probe (an escaping error that produced non-compiling Rust and therefore silent empty output) was caught and re-run rather than read as a pass. |
 | 2026-07-23 | **Phase 20 executed on `feat/phase-20-release-correctness-operator-control` via parallel worktrees, not the #683 sequential degrade.** HEAD was 11 planning-only commits ahead of `origin/develop`, tripping the auto-degrade; operator chose to set `worktree.baseRef:"head"` and branch properly rather than commit straight onto `develop` (per the standing git-flow preference). Wave 1 (20-01+20-02, disjoint files) ran genuinely parallel; waves 2-4 were single-plan by DAG construction (20-03→20-04→20-05 share `main.rs`). Code review found 2 blockers (CR-01 version-read/comment asymmetry, CR-02 a genuine cross-plan regression where `cleanup` never learned 20c's `state.stopped`) + 3 warnings — operator chose to fix all 5 inline (11 new regression tests) rather than ship-then-backlog, since the branch wasn't merged yet. PR #20 opened `feat/... → develop`, CI green (8/8 checks, both named ex-flaky fixtures pass). Phase marked complete via `/gsd-verify-work 20` after live-verifying the ssh-signing UAT item against the real operator ssh-agent (4 states) and confirming CI-on-branch sign-off from PR #20's logs. `/gsd-secure-phase 20` ran State B (18 threats built from all 5 plans' `<threat_model>` blocks, 0 open, L1 short-circuit) since `workflow.security_enforcement=true` gated completion. **Milestone-boundary bug caught and corrected:** `phase.complete`'s next-phase detection picked up backlog heading `999.1` (Hermes Support) as if it were the next sequential phase — STATE.md's `current_phase`/`status` were corrected back to reflect that the v2.0.0 milestone (Phase 11-20) is 100% complete (`progress.percent: 100`, 9/9 phases) and awaiting an explicit `/gsd-complete-milestone` decision, not auto-continuation into a backlog item. PROJECT.md was also 3 phases stale (still described Phase 18 as "Hermes Support," which was rescoped away 2026-07-20) — evolved through Phases 18/19/20 in the same pass. INF-01 (signing-key inline-classification, Info-severity) deferred to backlog `999.27`/Linear DEN-52 rather than blocking the fix pass. |
 | 2026-07-20 | **18-01: `cargo test -p devflow --lib` does not work on this crate — corrected in verification, not source.** 18-01-PLAN.md's own `<verify>`/`<acceptance_criteria>` blocks (and 18-RESEARCH.md's Validation Architecture table) specify `cargo test -p devflow --lib <name>`, but `devflow` (the `devflow-cli` package) is binary-only (no `[lib]` target), so `--lib` hard-errors (`no library targets found`, exit 101) rather than filtering tests. Used the working equivalent, `cargo test -p devflow <name>` (no `--lib`), for all verification in this plan and going forward. Flag this in future 18-0N plans' verify blocks so the same false-error isn't hit again. |
 | 2026-07-20 | **18-01: two-task pure-core/wiring split requires staged `#[allow(dead_code)]` on a binary-only crate.** `crates/devflow-cli` has no `[lib]` target, so `cargo clippy --workspace --all-targets -- -D warnings` compiles the plain `bin` target *without* `#[cfg(test)]` — unit-test-only usage of a not-yet-wired item does not satisfy that build's dead-code check. Task 1 (pure `reconcile_phase` core) added `#[allow(dead_code)]` to its new items with a comment naming the exact commit that removes them; Task 2 removed every one once `doctor()` became the real caller. Verified clean independently after each commit (not just at the end). Pattern to reuse for any future plan that splits a pure-core commit from its wiring commit in this crate. |
@@ -760,6 +776,23 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase ?]: Human declined to substitute CI-shape for local push-gate observation in 25e evidence — CI's Test job lacks the taskset pin and fmt->clippy->test ordering that produced the 2/2 reproduction; conditional pre-authorised approval of truth 7 applied instead
 - [Phase ?]: Truth 7 (999.47/DEN-72) recorded as human-verified against 25-CI-TRIALS.md's 11-observation evidence, residuals stated — not upgraded to a closure claim; 25-VALIDATION.md rows 1-3 (25f) human-approved
 - [Phase 45]: Accepted workspace_scoped staleness classification: narrow only DevFlow self-dogfood workspaces and preserve broad downstream detection.
+- [Phase 46]: 46-01: CI gains an advisory Sequential 2-CPU check job; the pin is ADD-ALONGSIDE, devcontainer.yml's required job untouched (D-01)
+- [Phase 46]: 46-01: the CPU pin has one definition site (scripts/lib/ci-cpus.sh), SOURCED by both the local gate and CI — never sed-extracted, which exits 0 on no match (D-03)
+- [Phase 46]: 46-01: the 2-CPU pin makes the known PATH/ENV_MUTEX staleness race DETERMINISTIC (2/2) where phase 34 recorded it as a flake — deferred as D-46-01-A, blocks git push
+- [Phase 46]: 46-04: a CI guard is a function over text driven by fixtures, not a `contains` search over the live file — a guard that can only run against the real workflow is only ever observed passing. — Two bypasses were demonstrated against the whole-file form (commented-out suite step; decoy job), and the commented-out case was replicated this session: the old guard reported `1 passed`, the new one reports `FAILED`.
+- [Phase 46]: 46-04: a CI assertion's decision logic lives in a script that takes the measurements as arguments (scripts/assert-cpu-pin.sh), so its failing branch runs under cargo test rather than only on a runner that happens to disagree with itself. — C-03's finding was that no command in the repository could produce the failing outcome. `scripts/assert-cpu-pin.sh 0,1 4 4` now exits 1.
+- [Phase 46]: 46-04: every conditional CI assertion prints the reason it skipped — a silent skip and a pass are indistinguishable in a job log. — The two skips (CPUS=all, and a host reporting 2 or fewer CPUs) are operator dispositions; making them silent would reintroduce C-03 in another shape.
+- [Phase 46]: The bashism guard allow rule is CONTAINMENT, not ordering: a bashism is permitted only when it lies inside the single-quoted region a `bash -c '` opened. — Single quotes do not nest in POSIX shell, so the region boundary is unambiguous. Ordering accepts two bypasses the operator named: `bash -c ':'; echo "${PIPESTATUS[0]}"` (region already closed) and `bash -c "echo ${PIPESTATUS[0]}"` (double quotes open no region, outer shell expands first). Both are now fixtures and both fail.
+- [Phase 46]: No CI corpus scan of tracked PLAN.md files was added; enforcement is the fixture suite cargo test already runs. — MEASURED: origin/develop tracks ZERO PLAN.md files (223 on this branch). A CI step scanning tracked plans would inspect nothing and report green on every develop PR - the same false-green class C-04 is about.
+- [Phase 46]: Remove a process-global test hazard by relocating the window into a child process, not by serialising every possible victim around it (C-01). — d525f9a closed 47 of at least 78 exposures because it scanned only for DIRECT git spawns. A child process makes the emptied PATH invisible to siblings, so the hazard stops existing rather than needing a complete victim inventory.
+- [Phase 46]: A child-process test assertion needs a four-part anti-vacuity check on the libtest summary; status.success() alone is a false green because a filter matching nothing exits 0. — Observed directly in negative control NC-B during 46-06 (child printed "test result: ok. 0 passed" and exited 0), not assumed from the CLAUDE.md note.
+- [Phase 46]: 46-07: Empty PATH test windows run in child processes; no parent env_lock serialisation.
+- [Phase 46]: 46-07: Reassert persisted baseline and streak after child save/load before Validate cycle 2.
+- [Phase 46]: 46-07: Delete NoGitPath only after clippy dead-code failure proves no callers.
+- [Phase 46]: Removed d525f9a direct-spawner locks only after child-process isolation eliminated all seven empty-PATH windows; preserved 81 pre-existing environment-mutation locks.
+- [Phase 46]: Recorded three contended green runs as corroboration only: process isolation is the load-bearing C-01 argument, not a reliability-rate claim.
+- [Phase 46]: Staged plan scanning reads the Git index blob only; there is no working-tree fallback.
+- [Phase 46]: Cached staged-plan discovery uses ACMR destinations with NUL delimiters; deletions remain intentional zero-file scans.
 
 ## Roadmap Evolution
 
@@ -840,17 +873,23 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
 | Phase 34 P05 | 110m | 6 tasks | 19 files |
 | Phase 45 P02 | 32min | 2 tasks | 1 files |
+| Phase 46 P01 | 26min | 3 tasks | 5 files |
+| Phase 46 P04 | 15 min | 3 tasks | 11 files |
+| Phase 46 P05 | 20 min | 3 tasks | 13 files |
+| Phase 46 P06 | 25 min | 2 tasks | 2 files |
+| Phase 46 P07 | 13 min | 3 tasks | 4 files |
+| Phase 46 P08 | 20 min minimum | 2 tasks | 7 files |
+| Phase 46 P09 | 4 min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-09-03
-**Stopped at:** v3.0.0 roadmap created (ROADMAP.md phases 46-51, REQUIREMENTS.md traceability
-populated). Nothing planned or executed.
+**Last session:** 2026-09-07T00:59:39.016Z
+**Stopped at:** Phase 46 complete, ready to plan Phase 47
 **Resume file:** None
 
 ## Operator Next Steps
 
-- `/gsd-plan-phase 46` — see the fuller list under the first `## Operator Next Steps` above.
+- `/gsd-plan-phase 47` — see the fuller list under the first `## Operator Next Steps` above.
 
 ## Accumulated Context
 
