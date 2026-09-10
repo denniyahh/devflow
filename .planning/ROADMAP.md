@@ -120,7 +120,14 @@ undelivered.
      as an explicit observation item for Phase 49's live run — naming in advance what would count
      as evidence either way — rather than marking DECN-03 settled on a source read.
 
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+- [ ] 47-01-PLAN.md — Snapshot drift guard: `insta` wiring, hardened `run_test`, three-case control (wave 1)
+- [ ] 47-02-PLAN.md — DECN-02: the `fix_prompt` gap, shared arm helper, six-adapter coverage (wave 2)
+- [ ] 47-03-PLAN.md — DECN-03: one gate rule, `resume_launch_shape`, two-turn delivery test (wave 3)
+- [ ] 47-04-PLAN.md — D-15 snapshot suite against the final text (wave 4)
+- [ ] 47-05-PLAN.md — The record: docs correction, ROADMAP/REQUIREMENTS amendments, backlog filings (wave 4)
 
 ### Phase 48: Survivable State Writes and Honest Gate Recovery
 
