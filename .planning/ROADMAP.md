@@ -3691,7 +3691,7 @@ functions predate the diff), but real:
 **Size:** S–M — #1 is a parser-ordering fix with a new `turn.failed` negative test; #2 is a
 serialization hardening with a hostile-path fixture.
 
-### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT and PLAN a Default Phase Gate (BACKLOG)
+### Phase 999.105: Make Adversarial Cross-Model Review of CONTEXT, PLAN and the Executed Diff a Default Phase Gate (BACKLOG)
 
 **Found:** 2026-08-15, dogfooding Phase 36. A hand-run adversarial review (claude/opus,
 codex/gpt-5.6-sol, antigravity/Gemini 3.1 Pro) against the phase's SPEC/CONTEXT and then its PLAN
@@ -3703,12 +3703,64 @@ have shipped or wasted a wave without it.
 
 **The item:** make that review a default part of the phase lifecycle, not an ad-hoc operator step:
 
-- a cross-model adversarial pass over the CONTEXT (post-discuss) and the PLAN (post-plan), before execute;
-- the pass is the `adversarial-review` skill (selectable `cli:model:effort` reviewers) or a
-  GSD-native equivalent, defaulting to a diverse 2-3 reviewer set;
+- a cross-model adversarial pass at **all three agent-stage boundaries** — over the CONTEXT
+  (post-discuss), the PLAN (post-plan), and **the executed diff (post-execute)**;
+- the pass is the `adversarial-review` / `external-review` skill (selectable `cli:model:effort`
+  reviewers) or a GSD-native equivalent, defaulting to a diverse 2-3 reviewer set;
 
-- findings feed back into planning the way `gsd-plan-phase --reviews` consumes REVIEWS.md, with the
-  orchestrator gating execute until blocking findings are dispositioned.
+- findings feed back the way `gsd-plan-phase --reviews` consumes REVIEWS.md, with the orchestrator
+  gating the *next* stage until blocking findings are dispositioned.
+
+**Amended 2026-09-10 — the post-execute boundary was missing and is the one with teeth.** The entry
+as filed covered only CONTEXT and PLAN. `Stage::Code` is the third `is_agent_stage()` member
+(`crates/devflow-core/src/stage.rs:47-49`) and the only one that produces a diff, yet nothing
+adversarial gates it: `Stage::is_gate()` is `Validate | Ship` only (`stage.rs:42-44`), and there is
+no `Review` variant in the enum. The repo's own history argues this boundary matters most —
+999.101's post-mortem records a phase where "every defect was found by reading code, never by a red
+test", and concluded a future attempt "should treat adversarial review as the primary gate and the
+suite as necessary-but-far-from-sufficient".
+
+**The wiring points are verified to exist, so this is integration work, not new machinery:**
+
+- Hook points, confirmed from the `gsd:loop-host` declarations in `~/.claude/gsd-core/workflows/`:
+  `discuss:pre|post`, `plan:pre|post`, `execute:pre|wave:pre|wave:post|post`, `verify:pre|post`,
+  `ship:pre|post`. The three this item needs — `discuss:post`, `plan:post`, `execute:post` — all
+  already exist. The capability hook shape is also already proven: `plan:pre` alone resolves 13
+  active hooks across `step`, `contribution` and `gate` kinds, and the `live-dom-uat` capability
+  already demonstrates an agent-spawning hook at `execute:wave:post`.
+- The post-execute reviewer already exists as a skill: `/gsd-code-review` (agents
+  `gsd-code-reviewer` / `gsd-code-fixer`, producing a severity-classified `REVIEW.md`). It is
+  currently an operator-invoked command, not a gate.
+- **Two review skills are installed and both are live** — `~/.agents/skills/adversarial-review/`
+  and `~/.claude/skills/external-review/`. Whichever becomes the default, the other should be
+  reconciled or retired rather than left as a second roster to drift.
+
+**Second confirming instance, 2026-09-09/10 (Phase 47) — stronger than the Phase 36 one.** A
+two-lane adversarial pass (codex `gpt-5.6-terra` high effort; agy `gemini-3.8-flash-high` high
+effort; 34 and 30 `file:line` citations respectively) over Phase 47's CONTEXT.md revised **10 of its
+16 decisions** before any code was written:
+
+- The phase's own self-flagged unverified assumption was **false**. Both lanes independently
+  falsified it; codex found the deciding mechanism (`preflight.rs:1368-1376`, an operator-approved
+  gate calling `launch_stage_inner` and skipping the check it just adjudicated).
+- An **irreversible** operator-accepted tradeoff was reversed — the carve-out had been widened to
+  package-verification checkpoints on a premise that source disproves (`verify.rs:131-137`), which
+  would have let an unattended run self-approve a package publish that cannot be unpublished.
+- A requirement that **no implementation could satisfy** was removed: four live per-adapter runs,
+  against a resume route hard-gated to `AgentKind::Claude` (`pipeline_launch.rs:1569`).
+- Two proposed tests were **proxies that would have gone green over unverified claims** — one
+  concatenating two strings that production never concatenates, one asserting on an audit event
+  emitted *before* the work it was taken as evidence of (`pipeline_launch.rs:1102-1108`).
+
+This is the CONTEXT-boundary pass paying for itself a second time, and it is direct evidence for
+the "blocking findings gate the next stage" half of the item: every one of those four would have
+reached execute unchallenged.
+
+**Design note the implementation should not skip.** A lane that returns "no concerns" is a claim
+about the reviewer, not the artifact. The gate must record a per-lane *typed* outcome (findings /
+clean-with-N-citations / dropped-with-reason) and must never fold a dropped or low-citation lane
+into a pass — the `external-review` skill already specifies this discipline and a gate that
+discards it would manufacture false green.
 
 **Why this is more than the existing `gsd-review`:** `gsd-review` is plan-only, CLI-level (flags
 select CLIs, not models/effort), and carries no CWD/context discipline — the Phase 36 run's own
@@ -3716,10 +3768,13 @@ failure mode (reviewers launched from the wrong checkout, reading a stale SPEC) 
 feature's procedure must pin. The `adversarial-review` skill already encodes the review-root/CWD and
 citation-verification discipline; this item promotes it into the default flow.
 
-**Priority:** High — it paid for itself in a single phase by catching findings that would otherwise
-have shipped. **Size:** M — the skill exists; the work is wiring it into the phase gates
-(discuss:post / plan:post hooks, or a devflow stage), the feedback loop, and the "blocking
-findings" gate.
+**Priority:** High — it has now paid for itself in two separate phases (36, 47), the second time by
+catching an irreversible tradeoff taken on a false premise. **Size:** M-L — revised upward from M
+on the post-execute addition. The skills exist and the hook points exist; the work is wiring three
+gates (`discuss:post`, `plan:post`, `execute:post`), the findings feedback loop, the typed per-lane
+outcome record, and the blocking-findings disposition gate. Adding `Stage::Review` variants to
+DevFlow's own pipeline instead of using GSD hooks would be a larger, separate decision — the enum
+has no Review member today and `Stage::next()` is a fixed linear chain (`stage.rs:30-39`).
 
 **Depends on:** nothing structurally. The `adversarial-review` skill (`~/.agents/skills/`) is the
 reusable core.
