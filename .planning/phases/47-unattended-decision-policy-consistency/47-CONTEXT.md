@@ -2,7 +2,7 @@
 
 **Gathered:** 2026-09-09
 **Revised:** 2026-09-09 — after adversarial external review (codex + agy). See `47-REVIEWS.md`.
-**Status:** Ready for planning — with two decisions flagged for operator re-confirmation (D-02, D-12)
+**Status:** Ready for planning — D-02 and D-12 re-confirmed by the operator 2026-09-10 (see below)
 
 > **Revision notice.** The first draft of this document rested on an assumption it flagged as
 > unverified (old D-13). External review verified it and it is **false**. Correcting it changed
@@ -62,7 +62,7 @@ and DECN-03 (the co-residence contradiction) is narrower, claude-only, and human
   inert and halt every headless run at a gate) and keeping both texts but preventing co-residence
   (leaves two contradictory rules in source for the next injection site to rediscover).
 
-- **D-02 [REVISED — REVERSES AN EARLIER OPERATOR-ACCEPTED TRADEOFF; NEEDS RE-CONFIRMATION]:**
+- **D-02 [REVISED — REVERSAL RE-CONFIRMED BY THE OPERATOR 2026-09-10]:**
   The carve-out covers **`blocking-human` gates ONLY**. Package-verification checkpoints keep the
   **unconditional** prohibition.
 
@@ -84,10 +84,11 @@ and DECN-03 (the co-residence contradiction) is narrower, claude-only, and human
   one: an unattended run self-approving a package verification cannot unpublish the package. That
   irreversibility was accepted **on a premise that has since been disproven**, so it is not carried
   forward.
-  — ⚠️ **The operator explicitly accepted the widened version during discussion.** This revision
-  reverses that acceptance in the *conservative* direction, on new evidence. It is recorded as
-  **open** rather than settled: `gsd-planner` must raise a `checkpoint:decision` before any task
-  implementing the carve-out wording, presenting narrow-vs-wide with this evidence.
+  — **Decision history.** The operator explicitly accepted the *widened* version during the
+  original discussion. Presented with the disproven premise on 2026-09-10, the operator chose
+  **narrow — `blocking-human` only**. This is now **settled**, not open; no `checkpoint:decision`
+  is required for it. The narrow form is two-way reversible, so it earns no one-way-door gate
+  either. Do not re-widen without a new decision.
 
 - **D-03 [REVISED]:** The contradiction test is **layered** — a constant-level unit test
   (unconditional prohibition string gone, conditional form present) **plus a two-turn delivery
@@ -208,7 +209,7 @@ and DECN-03 (the co-residence contradiction) is narrower, claude-only, and human
   — **[NEW] Follow-on candidate for the backlog:** adapter-independent checkpoint detection and
   per-driver resume. That is a feature, not a test, and it is not this phase's work.
 
-- **D-12 [RESCINDED — NEEDS OPERATOR RE-CONFIRMATION]:** The first draft amended Phase 49's ROADMAP
+- **D-12 [RESCINDED — RE-CONFIRMED BY THE OPERATOR 2026-09-10]:** The first draft amended Phase 49's ROADMAP
   criteria to require **four** live `--mode auto` runs, one per claude-style adapter. Per D-11 that
   is unachievable: two of the four are refused at preflight and three of the four cannot reach the
   resume injection. Leaving it in place would hand `gsd-planner` acceptance criteria for Phase 49
@@ -216,8 +217,11 @@ and DECN-03 (the co-residence contradiction) is narrower, claude-only, and human
 
   **Phase 49 stays as written — a single live run, on claude.** No ROADMAP amendment to Phase 49 is
   made by this phase, other than D-09's one-line pointer.
-  — ⚠️ Recorded as **open**: rescinding is the correction of a factual error, but it does shrink a
-  scope the operator agreed to, so it is surfaced rather than assumed.
+  — **Decision history.** Rescinding shrinks a scope the operator had agreed to, so it was put back
+  to them rather than assumed. On 2026-09-10 the operator confirmed **rescind — Phase 49 stays one
+  claude run**, and declined the variant that would also file the adapter-independent-resume
+  follow-on as a numbered 999.x entry now. That follow-on therefore stays a **deferred note only**
+  (see § Deferred Ideas); do not open a backlog entry for it in this phase.
 
 ### Policy text ownership
 
@@ -477,7 +481,8 @@ the doc change altogether (D-13 still changes the doc, at a different line).
   999.124 backlog cluster.
 - **[NEW] Adapter-independent checkpoint detection and per-driver resume.** D-11's model-specificity
   concern is real but untestable while the resume route is claude-only
-  (`pipeline_launch.rs:1569`, `claude.rs:122`). A feature, not a test; backlog candidate.
+  (`pipeline_launch.rs:1569`, `claude.rs:122`). A feature, not a test. **Operator decided 2026-09-10
+  to leave this as a note and NOT file it as a numbered backlog entry in this phase.**
 - **[NEW] The two latent defects from D-13** — the preflight/resume predicate mismatch
   (`verify.rs:131-137` vs `:207-220`) and the TOCTOU window on agent-writable plans
   (`preflight.rs:971-973`, `verify.rs:118-119`). Both let an unattended run reach a self-decision on
