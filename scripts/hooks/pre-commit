@@ -77,6 +77,36 @@ if [ -n "$current_branch" ] && [[ "$current_branch" != workspace/* && "$current_
     fi
 fi
 
+# Phase source belongs in the phase's worktree.
+#
+# CLAUDE.md requires a dedicated worktree per phase, and the reason is a real
+# failure this repo has had more than once: `cd` does not persist across an
+# agent's separate tool calls, and an unrelated `git checkout` earlier in a long
+# sequence silently changes what a much-later `git commit` lands on. Nothing
+# fails at the time -- the commit succeeds on whatever branch happened to be
+# checked out, and it stays invisible until someone tries to separate the
+# phase's work again.
+#
+# The rule is asymmetric on purpose: `crates/**` is refused outright, while
+# phase docs only warn. Early spec commits before the worktree is populated are
+# legitimate and routine; misplaced source is the expensive one to unpick.
+# Escape hatch is DEVFLOW_ALLOW_OFF_WORKTREE=1, never `--no-verify`.
+#
+# Both directions are exercised by scripts/test-phase-worktree-guard.sh.
+worktree_guard="scripts/lint-phase-worktree.sh"
+if [ ! -x "$worktree_guard" ]; then
+    # Same borrowed-hooksPath fallback the bashism scanner documents below.
+    worktree_guard="$(dirname "$0")/../lint-phase-worktree.sh"
+fi
+if [ ! -x "$worktree_guard" ]; then
+    echo "pre-commit: missing or non-executable '$worktree_guard'." >&2
+    echo "  The hook and the guard ship in the same tree and the same commit," >&2
+    echo "  so an absent guard means something is wrong. Refusing rather than" >&2
+    echo "  degrading to a silent pass." >&2
+    exit 1
+fi
+"$worktree_guard" --staged
+
 # Plan `<automated>` verify commands must not rely on bash-only syntax.
 #
 # GSD executor subagents run their Bash tool under **zsh**, not bash. `zsh`

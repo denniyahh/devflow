@@ -84,6 +84,29 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   and every assertion about that exit code passes without ever reading it. That is a green check
   over an unread result, the same class as the `rg -c` dead gate in CLAUDE.md. All three phase-46
   plans shipped with it and each executor rediscovered it independently on the clock.
+- [ ] **[PROJECT]** `scripts/hooks/pre-commit` also **refuses phase source committed outside the
+  phase's own worktree**. When `.planning/STATE.md`'s `current_phase` is N and a worktree exists on
+  `feature/phase-N`, a commit made from any other branch is refused if it stages `crates/**`, and
+  warned (not blocked) if it stages `.planning/phases/N-*/**`. The asymmetry is deliberate: early
+  spec commits before the worktree is populated are legitimate and routine, whereas misplaced
+  source is the expensive thing to unpick later. The escape hatch is `DEVFLOW_ALLOW_OFF_WORKTREE=1`
+  and **not** `--no-verify` — agents reach for `--no-verify` reflexively and it disables every other
+  guard in the hook at the same time, whereas a named variable is deliberate and greppable.
+  Existence is asked of `git worktree list --porcelain`, not of the `.worktrees/phase-N` path, so
+  the answer stays correct when the hook runs from inside a worktree (where that relative path does
+  not resolve at all). Guard: `scripts/lint-phase-worktree.sh`; both directions exercised by
+  `scripts/test-phase-worktree-guard.sh` (7 cases, including two negative controls that must PASS —
+  a guard only ever observed refusing has not been shown to discriminate).
+- [ ] **[PROJECT]** **`scripts/phase-worktree.sh <N>` is the one command that creates a phase
+  worktree correctly**, replacing a four-step manual sequence every step of which was skippable.
+  It validates the phase against a real `### Phase N:` heading in ROADMAP.md (phases get
+  renumbered — 36 became 35.3), syncs `workspace/denniyahh`, creates the worktree **based on
+  `workspace/denniyahh` and never on `develop`**, and asserts the base actually tracks `.planning/`
+  before proceeding. That last assertion is not paranoia: `.gitignore` on `develop` ignores
+  `.planning/` wholesale, so a develop-based worktree cannot commit CONTEXT.md/PLAN.md/STATE.md at
+  all, and CLAUDE.md itself specified the wrong base until 2026-09-04. Re-running is idempotent —
+  an existing worktree is fast-forwarded, and a non-fast-forward refuses rather than rewriting
+  phase history.
 - [ ] **[PATTERN]** **The scan is a standalone, tested script the hook DELEGATES to** —
   `scripts/lint-plan-bashisms.sh`, exercised by `crates/devflow-cli/tests/plan_bashism_scanner.rs`
   (11 cases, run by `cargo test` and therefore by every CI job through `scripts/check.sh`). A hook
