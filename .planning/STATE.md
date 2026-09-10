@@ -6,11 +6,11 @@ current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: Not started
 status: planning
-stopped_at: Phase 46 complete, ready to plan Phase 47
-last_updated: "2026-09-07T09:35:46.247Z"
-last_activity: 2026-09-07
-last_activity_desc: Phase 46 complete, transitioned to Phase 47
-state_head: dc66867acf26fe5c9d2e311cf3345ed77c270389
+stopped_at: Phase 47 context gathered
+last_updated: "2026-09-10T01:44:03.846Z"
+last_activity: 2026-09-09
+last_activity_desc: "Phase 47 context gathered: 16 decisions across 4 areas. Scout found the DECN-02 gap is 4 of 6 adapters (claude/opencode/hermes/antigravity via render_claude_style), not the 2 the ROADMAP names, and that docs/guides/unattended-mode.md contradicts the chosen blocking-human carve-out. Phase is larger than its 'prompt rendering only' framing: 2 ROADMAP amendments, a docs rewrite, and an insta dev-dependency with required CI."
+state_head: 6761f73b98d784a4ba6462633f2451dadf32a547
 progress:
   total_phases: 6
   completed_phases: 1
@@ -162,16 +162,22 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 47 — Unattended Decision Policy Consistency (DECN-02, DECN-03) — NOT STARTED
+Phase: 47 — Unattended Decision Policy Consistency (DECN-02, DECN-03) — CONTEXT GATHERED, UNPLANNED
 Plans: none yet — phase not planned
 Current Plan: Not started
 Total Plans in Phase: —
 Completed Plans: —
-Status: Phase 46 complete (9/9 plans, verification passed, PR #208 merged to develop as 0acc828).
-Phase 47 depends on nothing — ready to plan. Phase 46's own deferrals remain tracked: C-05/C-07
-against GitHub #207, `cargo nextest` on the backlog, deferred-items.md #46-05-#2 (seven tracked
-plans fail the bashism scanner) grandfathered by the scanner's staged-only scope.
-Last activity: 2026-09-07 — Phase 46 complete, transitioned to Phase 47
+Status: 47-CONTEXT.md written (16 decisions, D-01..D-16) and committed. Ready to plan.
+Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
+the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
+they meet, D-13 and possibly D-02 must be revisited, not left standing. (2) The phase is larger
+than the ROADMAP's "prompt rendering only" framing — it now carries two ROADMAP amendments (D-06
+adapter naming, D-12 widening Phase 49 to four runs), a `docs/guides/unattended-mode.md` rewrite,
+and an `insta` dev-dependency wired as a required CI check.
+Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
+backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
+by the scanner's staged-only scope.
+Last activity: 2026-09-09 — Phase 47 context gathered
 
 Progress: [█░░░░░░░░░] 17% (1 of 6 phases complete)
 
@@ -883,9 +889,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-07T00:59:39.016Z
-**Stopped at:** Phase 46 complete, ready to plan Phase 47
-**Resume file:** None
+**Last session:** 2026-09-10T01:44:03.689Z
+**Stopped at:** Phase 47 context gathered
+**Resume file:** .planning/phases/47-unattended-decision-policy-consistency/47-CONTEXT.md
 
 ## Operator Next Steps
 
