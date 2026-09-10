@@ -15,10 +15,25 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_PREFIX 
 GUARD="$(cd "$(dirname "$0")" && pwd)/lint-phase-worktree.sh"
 [ -x "$GUARD" ] || { echo "missing guard: $GUARD" >&2; exit 1; }
 
+pass=0; fail=0
+
+# The guard is useless if git does not record it executable. `core.fileMode` is
+# false in this repo, so an on-disk `chmod +x` is INVISIBLE to git and a new
+# script commits as 100644 -- while still working locally, because the on-disk
+# bit is real. A fresh clone then gets a non-executable guard, pre-commit takes
+# its "missing or non-executable" branch, and EVERY commit is refused. That
+# shipped once; this asserts against the index, not against the filesystem.
+for f in lint-phase-worktree.sh phase-worktree.sh test-phase-worktree-guard.sh; do
+    mode="$(git -C "$(dirname "$GUARD")/.." ls-files --stage -- "scripts/$f" 2>/dev/null | awk '{print $1}')"
+    if [ "$mode" = "100755" ]; then
+        printf '  ok   %-58s (mode %s)\n' "0. scripts/$f recorded executable" "$mode"; pass=$((pass+1))
+    else
+        printf '  FAIL %-58s (mode %s, want 100755)\n' "0. scripts/$f recorded executable" "${mode:-missing}"; fail=$((fail+1))
+    fi
+done
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-
-pass=0; fail=0
 check() { # check <name> <expected: refuse|allow> <actual_exit>
     local name="$1" expected="$2" rc="$3"
     local actual; if [ "$rc" -eq 0 ]; then actual=allow; else actual=refuse; fi
