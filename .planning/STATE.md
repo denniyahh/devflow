@@ -6,11 +6,11 @@ current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: 5
 status: ready_for_verification
-stopped_at: Completed 47-05-PLAN.md
-last_updated: "2026-09-11T21:03:45.493Z"
+stopped_at: "Session resumed: 47 verification gaps_found 19/23 (CR-01); running the 3 behavior-unverified check.sh checks before choosing the CR-01 fix"
+last_updated: "2026-09-11T23:54:59.303Z"
 last_activity: 2026-09-11
 last_activity_desc: Completed 47-05-PLAN.md (written-record corrections and D-13 backlog filings)
-state_head: b30adf2c35bd99d1c29061ea11059bd5689174c5
+state_head: e6ab7674124d057e4df2ba4f080d7830ca6364b7
 progress:
   total_phases: 6
   completed_phases: 1
@@ -903,8 +903,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-11T21:03:45.346Z
-**Stopped at:** Completed 47-05-PLAN.md
+**Last session:** 2026-09-11T23:54:59.073Z
+**Stopped at:** Session resumed: 47 verification gaps_found 19/23 (CR-01); running the 3 behavior-unverified check.sh checks before choosing the CR-01 fix
 **Resume file:** None
 
 ## Operator Next Steps
