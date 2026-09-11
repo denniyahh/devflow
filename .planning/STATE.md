@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
-current_plan: 4
+current_plan: 5
 status: executing
-stopped_at: Completed 47-03-PLAN.md
-last_updated: "2026-09-11T19:20:22.344Z"
+stopped_at: Completed 47-04-PLAN.md
+last_updated: "2026-09-11T19:41:17.939Z"
 last_activity: 2026-09-11
-last_activity_desc: Completed 47-03-PLAN.md (one gate rule for the Code policy and the resume prompt)
-state_head: 3b836b1e6c6b47b585e3b8bb4178530179713cf1
+last_activity_desc: Completed 47-04-PLAN.md (D-15 snapshot suite against the final text)
+state_head: d8fb3022f060bff5766562affee0f712f6e7779b
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
   percent: 17
 ---
 
@@ -163,9 +163,9 @@ change earns 2.0.
 
 Phase: 47 (Unattended Decision Policy Consistency) — EXECUTING
 Plans: 5 (47-01..47-05) across 4 waves
-Current Plan: 4
+Current Plan: 5
 Total Plans in Phase: 5
-Completed Plans: 3 (47-01, 47-02, 47-03)
+Completed Plans: 4 (47-01, 47-02, 47-03, 47-04)
 Status: Ready to execute
 Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
 the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
@@ -176,7 +176,7 @@ and an `insta` dev-dependency wired as a required CI check.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-11 — Completed 47-03 (one gate rule for the Code policy and the resume prompt)
+Last activity: 2026-09-11 — Completed 47-04 (D-15 snapshot suite against the final text)
 
 Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
@@ -806,6 +806,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase 47]: 47-02: D-05 extraction held byte-identically (scratch render dump 11 sections, 0 removed lines); fallback not taken, no existing test edited — workflow_code_prompt output unchanged for all four Code arms; only claude-style FullExecute and fix_prompt FullExecute gained the policy
 - [Phase 47]: 47-03: resume_launch_shape(phase, session_id) builds the resume instruction itself; relaunch_checkpoint_session keeps its own copy for the pre-spawn checkpoint_auto_decided event, pinned to argv[1] by a debug_assert — Returning the instruction as a third tuple element would put the call before the emit and fail the plan source-order criterion; passing it in would stop the delivery test exercising the real builder
 - [Phase 47]: 47-03: GATE_RESOLUTION_RULE is defined once as a macro_rules literal spliced into CODE_STAGE_POLICY by concat!; the package-verification prohibition and carve-out section is pinned verbatim by a test-owned literal — concat! rejects a const name; a pin built from the constants under test would widen along with them
+- [Phase 47]: 47-04: the six core D-15 baselines come from one test that walks every AgentKind through an exhaustive match chain and snapshots driver_for(kind).render_prompt, so a new AgentKind variant is a compile error until it is given a baseline — Same enumeration the D-07 test uses; an array literal is a manual list a new variant silently falls outside of. The four byte-identical claude-style baselines are deliberate: an adapter switching render style becomes a diff on its own file.
+- [Phase 47]: 47-04: the turn_one_code_prompt / turn_two_resume_prompt snapshots live inside the_gate_rule_holds_in_both_delivered_turns, as two named files and never a joined string — Inside the test they snapshot the exact turn1/turn2 values the gate-rule and distinctness assertions already checked, so no second capture can drift from the first; a joined snapshot would reintroduce the composition D-03 rejects.
+- [Phase 47]: 47-04: codex and pi baselines are rendered through their drivers rather than render_workflow_style with a fixed root; workflow_root() returns the literal string "$HOME/..." and never expands it, so the baselines are host-independent — Going through the drivers also catches a change to the workflow root of a driver; reading agents/mod.rs and agents/pi.rs shows no expansion, and the committed baselines carry the unexpanded $HOME token.
 
 ## Roadmap Evolution
 
@@ -896,11 +899,12 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 47 P01 | 26min | 3 tasks | 11 files |
 | Phase 47 P02 | 12min | 3 tasks | 2 files |
 | Phase 47 P03 | 28min | 3 tasks | 4 files |
+| Phase 47 P04 | 9min | 2 tasks | 10 files |
 
 ## Session
 
-**Last session:** 2026-09-11T19:20:22.186Z
-**Stopped at:** Completed 47-03-PLAN.md
+**Last session:** 2026-09-11T19:40:44.905Z
+**Stopped at:** Completed 47-04-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
