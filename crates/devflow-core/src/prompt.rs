@@ -451,25 +451,48 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str) -> String {
     )
 }
 
-fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
+/// Whether a Code-stage arm carries `CODE_STAGE_POLICY` (D-05, 47-CONTEXT.md).
+///
+/// The single definition of the rule both renderers consult. It is extracted
+/// from `workflow_code_prompt`'s arm split, where the rule already lived and
+/// was correct, not re-derived. Stating the rule separately in each renderer is
+/// what let `fix_prompt` drift from it (DECN-02). The first Code pass (`None`)
+/// and the full-execute loop-back carry the policy; `GapsOnly` and `AuditFix`
+/// do not. The `match` is exhaustive on purpose: a new `FixType` variant must
+/// be classified here rather than falling into either answer by default.
+fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     match fix {
+        Some(FixType::FullExecute) | None => true,
+        Some(FixType::GapsOnly) | Some(FixType::AuditFix) => false,
+    }
+}
+
+fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
+    let instruction = match fix {
         Some(FixType::AuditFix) => format!(
             "Read and follow the GSD workflow file at {workflow_root}/audit-fix.md for \
-            phase {phase}.\n\n{COMPLETION_PROTOCOL}"
+            phase {phase}."
         ),
         Some(FixType::GapsOnly) => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
-            of the workflow invocation and must be preserved verbatim.\n\n{COMPLETION_PROTOCOL}"
+            of the workflow invocation and must be preserved verbatim."
         ),
         Some(FixType::FullExecute) | None => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
-            must be preserved verbatim.\n\n\
+            must be preserved verbatim."
+        ),
+    };
+    if code_policy_applies_to_fix_arm(fix) {
+        format!(
+            "{instruction}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
             {COMPLETION_PROTOCOL}"
-        ),
+        )
+    } else {
+        format!("{instruction}\n\n{COMPLETION_PROTOCOL}")
     }
 }
 
@@ -564,6 +587,19 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// Flag ORDER within the command string does not matter — GSD extracts
 /// `--`-prefixed tokens position-independently
 /// (`references/phase-argument-parsing.md`).
+///
+/// **The unattended decision policy (DECN-02; D-05 and D-06, 47-CONTEXT.md).**
+/// The `FullExecute` arm carries `CODE_STAGE_POLICY`, laid out as
+/// `code_stage_prompt` lays it out: command, policy, then the completion
+/// protocol last. Before Phase 47 it did not. Because `render_claude_style` is
+/// shared, every adapter routed through it (Claude, OpenCode, Hermes and
+/// Antigravity) lost the policy on every Validate loop-back, while Codex and Pi
+/// kept it through `workflow_code_prompt`. Whether an arm carries the policy is
+/// now decided by `code_policy_applies_to_fix_arm`, the same helper
+/// `workflow_code_prompt` consults, so the two renderers cannot state different
+/// rules. `GapsOnly` and `AuditFix` are excluded deliberately, not overlooked:
+/// they are `workflow_code_prompt`'s existing exclusions, carried over
+/// unchanged.
 pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
     let command = match fix_type {
         FixType::AuditFix => format!("/gsd-audit-fix {phase}"),
@@ -574,9 +610,23 @@ pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
             format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
         }
     };
-    format!(
-        "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
-    )
+    // Signature bridge: the helper takes `Option<FixType>`, where `None` means
+    // the first Code pass, and a loop-back always has a fix type, so the bridge
+    // is always `Some(fix_type)`. This is the seam where an edit could silently
+    // widen the policy to every fix arm (e.g. by passing `None`); the
+    // claude-style omission control in `mod tests` is what catches that.
+    if code_policy_applies_to_fix_arm(Some(fix_type)) {
+        format!(
+            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n\
+            {CODE_STAGE_POLICY}\n\
+            \n\
+            {COMPLETION_PROTOCOL}"
+        )
+    } else {
+        format!(
+            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
+        )
+    }
 }
 
 #[cfg(test)]
