@@ -4084,6 +4084,14 @@ mod tests {
             contradictions.is_empty(),
             "the delivered turns disagree on the gate rule: {contradictions:#?}"
         );
+
+        // D-15 (47-04): each delivered turn is also a reviewed `insta` baseline,
+        // taken from the same captures asserted above. Two separately named
+        // snapshots, NEVER one joined string: a joined snapshot would
+        // reintroduce the composition D-03 rejects, which production never
+        // performs (47-RESEARCH.md B-3).
+        insta::assert_snapshot!("turn_one_code_prompt", turn1);
+        insta::assert_snapshot!("turn_two_resume_prompt", turn2);
     }
 
     /// Phase 39 Stage 1 regression: Pi always resolves to `MonitorLaunch::Legacy`.
