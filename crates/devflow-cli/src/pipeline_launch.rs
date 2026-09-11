@@ -4070,6 +4070,11 @@ mod tests {
         if turn1.contains("gate or a package-verification checkpoint") {
             contradictions.push("turn 1 forbids a blocking-human gate unconditionally");
         }
+        // Strengthened once the shared constant existed (47-03 Task 3): turn 1
+        // must carry the one definition, not merely lack the old sentence.
+        if !turn1.contains(prompt::GATE_RESOLUTION_RULE) {
+            contradictions.push("turn 1 does not carry the shared GATE_RESOLUTION_RULE");
+        }
         if !turn2.contains("blocking-human") {
             contradictions.push(
                 "turn 2 does not name the blocking-human gate it resumes the agent to resolve",

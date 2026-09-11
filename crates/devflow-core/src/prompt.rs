@@ -54,12 +54,48 @@ DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n
 DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
 
+/// The single definition of who may resolve a `blocking-human` gate
+/// (47-CONTEXT.md D-04). It is a macro and not only a `const` because
+/// `CODE_STAGE_POLICY` is assembled with `concat!`, which accepts literals and
+/// macro expansions but rejects a `const` name (`error: expected a literal`).
+/// `GATE_RESOLUTION_RULE` and `CODE_STAGE_POLICY` both expand this one literal.
+///
+/// A line continuation drops the newline AND the next line's leading
+/// whitespace, so the space between two words sits before each `\`.
+macro_rules! gate_resolution_rule {
+    () => {
+        "A blocking-human gate is human-only, with one exception: if DevFlow \
+        resumed you specifically to resolve that gate, resolve it yourself and \
+        record your reasoning in your final message; otherwise report it instead."
+    };
+}
+
+/// Who may resolve a `blocking-human` gate: a prohibition with one named
+/// condition (47-CONTEXT.md D-01, D-02, D-04). `CODE_STAGE_POLICY` includes this
+/// sentence verbatim through `gate_resolution_rule!()`, and
+/// [`checkpoint_auto_decide_prompt`] states the SAME condition in the
+/// affirmative — it is only ever sent when DevFlow has resumed the agent to
+/// resolve such a gate. The two texts differ in grammatical mood, never in the
+/// condition.
+///
+/// `pub` deliberately: the cross-crate delivery test in `devflow-cli`
+/// (`pipeline_launch.rs`) asserts against this definition, not a re-typed copy.
+/// The carve-out covers `blocking-human` gates ONLY. Package-verification
+/// checkpoints keep an unconditional prohibition in `CODE_STAGE_POLICY` (D-02,
+/// settled by the operator 2026-09-10; the section text is pinned by
+/// `package_verification_prohibition_is_unconditional`, operator decision
+/// 2026-09-11). Do not widen it without a new decision.
+pub const GATE_RESOLUTION_RULE: &str = gate_resolution_rule!();
+
 /// Shared policy for full-execute Code prompts. This advises the agent during
 /// one-shot Code execution, while [`checkpoint_auto_decide_prompt`] is injected
 /// into a resumed session after DevFlow's own human-blocking gate finds no
 /// operator. They are complementary, not duplicates; neither should replace or
-/// be deleted as the other.
-const CODE_STAGE_POLICY: &str = "\
+/// be deleted as the other. Both state the gate rule through
+/// [`GATE_RESOLUTION_RULE`], so a resumed session that has seen both is never
+/// handed two different conditions (47-CONTEXT.md D-04).
+const CODE_STAGE_POLICY: &str = concat!(
+    "\
 ## Advisory incremental self-review\n\
 \n\
 After each plan or wave lands, perform a quick, shallow self-check \
@@ -83,10 +119,11 @@ produced the choice: which options you considered and why the chosen one won, \
 not merely a sentence asserting the choice. The final message is the only record \
 of the decision.\n\
 \n\
-This authority does not extend to a `blocking-human` gate or a \
-package-verification checkpoint. Those remain human-only: do not self-resolve \
-or approve them; report them instead. This policy must not pause execution or \
-request human input.";
+This authority never extends to a package-verification checkpoint: do not \
+self-resolve or approve one under any circumstances, and report it instead. ",
+    gate_resolution_rule!(),
+    " This policy must not pause execution or request human input."
+);
 
 /// The data a stage wants rendered, with NO agent-specific syntax.
 ///
@@ -546,10 +583,18 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 }
 
 /// The synthesized instruction sent into a resumed Claude session when a
-/// confirmed human-blocking checkpoint has nobody available to answer it
+/// confirmed `blocking-human` gate has nobody available to answer it
 /// (D-03, 28-CONTEXT.md): DevFlow's default, unconditional policy — no flag,
 /// no config toggle — is for the agent to resolve the checkpoint itself,
 /// using its own judgment, and record why.
+///
+/// 47-03 (47-CONTEXT.md D-02, D-04): the text names `blocking-human` because
+/// the only trigger for this resume, `verify::phase_has_blocking_human_checkpoint`,
+/// matches `gate="blocking-human"` and nothing else. It states the SAME
+/// condition as [`GATE_RESOLUTION_RULE`], in the affirmative: DevFlow resumed
+/// you specifically to resolve that gate, so resolve it and record your
+/// reasoning in your final message. It grants nothing beyond that gate —
+/// package-verification checkpoints are never routed through this injection.
 ///
 /// Deliberately deterministic: no timestamp, no random content, no varying
 /// state. Two calls for the same `phase` produce byte-identical strings, so
@@ -560,12 +605,12 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
     format!(
         "This is phase {phase} of a headless DevFlow run. You previously \
-        stopped at a human-blocking checkpoint, but no human operator is \
+        stopped at a blocking-human gate, but no human operator is \
         available to answer it — this run is unattended, and none is \
-        coming. DevFlow's policy is for you to resolve the checkpoint \
-        yourself, using your own best judgment, and continue the work. You \
-        MUST record your reasoning for the decision you made in your final \
-        message, so the decision is auditable after the fact.\n\
+        coming. DevFlow resumed you specifically to resolve that gate: \
+        resolve it yourself, using your own best judgment, and continue the \
+        work. You MUST record your reasoning for the decision you made in \
+        your final message, so the decision is auditable after the fact.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -1249,9 +1294,43 @@ mod tests {
                  class it resumes the agent to resolve",
             );
         }
+        // Strengthened once the shared constant existed (47-03 Task 3): the
+        // policy must carry the one definition, not merely lack the old sentence.
+        if !CODE_STAGE_POLICY.contains(GATE_RESOLUTION_RULE) {
+            contradictions.push("CODE_STAGE_POLICY does not carry GATE_RESOLUTION_RULE");
+        }
         assert!(
             contradictions.is_empty(),
             "the two gate-rule texts disagree: {contradictions:#?}"
+        );
+    }
+
+    /// D-02 enforcement (47-03, operator decision 2026-09-11): the gate-rule
+    /// section of `CODE_STAGE_POLICY` is PINNED character for character. Word
+    /// lists failed review three times; an exact pin cannot be paraphrased
+    /// around, so ANY change to this section fails here — a synonym, a
+    /// restructure, a waiver added inside it, or a space lost before a line
+    /// continuation.
+    ///
+    /// The expected text is this test's own literal and is never assembled from
+    /// `GATE_RESOLUTION_RULE` or `CODE_STAGE_POLICY`: building it from the
+    /// constants under test would widen the expectation along with them.
+    ///
+    /// NOT covered: an authorization added elsewhere in the policy, outside this
+    /// section. That is caught only by reading the snapshot diff when the
+    /// baseline is re-blessed, and in phase review.
+    #[test]
+    fn package_verification_prohibition_is_unconditional() {
+        const PINNED_SECTION: &str = "This authority never extends to a package-verification checkpoint: do not self-resolve or approve one under any circumstances, and report it instead. A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
+        const PINNED_GATE_RULE: &str = "A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
+
+        assert!(
+            CODE_STAGE_POLICY.contains(PINNED_SECTION),
+            "CODE_STAGE_POLICY no longer carries the pinned gate-rule section verbatim"
+        );
+        assert_eq!(
+            GATE_RESOLUTION_RULE, PINNED_GATE_RULE,
+            "GATE_RESOLUTION_RULE must equal the pinned section's second sentence exactly"
         );
     }
 
