@@ -135,6 +135,64 @@ fn check_script_clippy_lints_test_targets() {
     assert_clippy_lines_are_workspace_wide(&script, &path);
 }
 
+/// D-16 (47-CONTEXT.md), at the one place CI's required Test job and the
+/// pre-push gate both run cargo test. `run_test` must invoke it as
+/// `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test …`, and both halves are
+/// load-bearing: an exported `INSTA_UPDATE=always` silently rewrites a drifted
+/// `.snap` baseline and exits 0, and `INSTA_FORCE_UPDATE=1` OVERRIDES
+/// `INSTA_UPDATE=no` and does the same (47-RESEARCH.md § A-2, § A-3). 47-01
+/// observed the second on this repository: with the plain invocation,
+/// `INSTA_FORCE_UPDATE=1 scripts/check.sh test` exited 0 and re-blessed a
+/// drifted baseline; with this wiring the same run exited 101 and left it intact.
+///
+/// Source-asserting rather than script-executing (contrast
+/// `plan_bashism_scanner.rs`, whose header says when each idiom is right): the
+/// behaviour here is running `scripts/check.sh test`, and doing that from inside
+/// a test would recurse the entire workspace suite.
+///
+/// The filter is deliberately tighter than
+/// `check_script_fails_fast_before_any_cargo_invocation`'s comment strip. The
+/// same command string also sits in `run_test`'s rationale comment and in its
+/// `echo "==> …"` banner, and the usage block carries `test    cargo test
+/// --workspace`, which is neither a comment nor an `echo`. Keeping only lines
+/// whose first word is `env` or `cargo` leaves invocations alone. The assertion
+/// is on the COUNT, not on `.find()`: with `.find()`, a stale banner or a second
+/// invocation could satisfy it while the line that actually runs had lost
+/// `env -u`.
+#[test]
+fn check_script_pins_snapshots_against_env_override() {
+    let path = repo_root().join("scripts/check.sh");
+    let script = read(&path);
+
+    let invocations: Vec<&str> = code_lines(&script)
+        .into_iter()
+        .filter(|l| matches!(l.split_whitespace().next(), Some("env" | "cargo")))
+        .filter(|l| l.contains("cargo test"))
+        .collect();
+
+    assert_eq!(
+        invocations.len(),
+        1,
+        "{} must contain exactly ONE `cargo test` invocation line (comments, \
+         `echo` banners and the usage block excluded). Zero means the first-word \
+         anchor no longer matches — e.g. the invocation moved onto a continuation \
+         line; two means a second, possibly unpinned, test run was added. \
+         Found: {invocations:?}",
+        path.display()
+    );
+    let line = invocations[0];
+    assert!(
+        line.contains("env -u INSTA_FORCE_UPDATE") && line.contains("INSTA_UPDATE=no"),
+        "the `cargo test` invocation in {} must carry both `env -u \
+         INSTA_FORCE_UPDATE` and `INSTA_UPDATE=no` (47-CONTEXT.md D-16, \
+         47-RESEARCH.md § A-3). Without `INSTA_UPDATE=no` an exported \
+         `INSTA_UPDATE=always` rewrites a drifted snapshot baseline and exits 0; \
+         without `env -u INSTA_FORCE_UPDATE`, `INSTA_FORCE_UPDATE=1` overrides \
+         `INSTA_UPDATE=no` and does the same. Found: {line:?}",
+        path.display()
+    );
+}
+
 /// The scope guard above only means something if CI actually runs that
 /// script. Without this, someone could reinline a narrow `cargo clippy` into
 /// the workflow and both guards would still pass while CI linted nothing.

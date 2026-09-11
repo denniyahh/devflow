@@ -68,3 +68,52 @@ fn gitignore_covers_devflow_runtime_state_paths() {
         unignored.join("\n  ")
     );
 }
+
+/// D-14 (47-CONTEXT.md): insta's `.snap.new` scratch must be ignored, and the
+/// committed `.snap` baseline must NOT be — the baseline is the reviewable
+/// artifact, so a prompt wording change has to show up in the PR diff. One path
+/// per invocation, as above.
+///
+/// The `.snap` half is the negative control. Without it, a `.gitignore` that
+/// ignored every snapshot file — or everything — would pass the `.snap.new`
+/// half alone.
+///
+/// Two details keep that control from passing vacuously:
+/// * `--no-index`. `git check-ignore` never reports a TRACKED path as ignored,
+///   and the baseline is tracked, so without it a `*.snap` rule would still read
+///   as "not ignored" for the real baseline.
+/// * Exact exit codes. `check-ignore -q` exits 0 for ignored, 1 for not ignored
+///   and 128 on a git error; asserting `!success()` for the negative half would
+///   read a failed git invocation as "not ignored".
+#[test]
+fn gitignore_ignores_snapshot_scratch_but_not_the_baseline() {
+    const BASELINE: &str = "crates/devflow-core/src/snapshots/\
+         devflow_core__prompt__tests__claude_style_full_execute_fix_prompt_snapshot.snap";
+    let scratch = format!("{BASELINE}.new");
+
+    let root = repo_root();
+    let check_ignore_exit = |path: &str| {
+        devflow_core::test_support::git_command(&root)
+            .args(["check-ignore", "-q", "--no-index", path])
+            .output()
+            .expect("run git check-ignore")
+            .status
+            .code()
+    };
+
+    assert_eq!(
+        check_ignore_exit(&scratch),
+        Some(0),
+        ".gitignore must ignore insta's `.snap.new` scratch file ({scratch}) — it \
+         is written beside a missing or mismatched baseline and must never be \
+         committed (47-CONTEXT.md D-14). Exit 1 = not ignored, 128 = git error."
+    );
+    assert_eq!(
+        check_ignore_exit(BASELINE),
+        Some(1),
+        ".gitignore must NOT ignore the committed `.snap` baseline ({BASELINE}) — \
+         the baseline is the reviewable artifact, and ignoring it hides every \
+         prompt wording change from the PR diff (47-CONTEXT.md D-14). Exit 0 = \
+         ignored, 128 = git error."
+    );
+}
