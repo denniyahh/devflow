@@ -1,0 +1,19 @@
+---
+source: crates/devflow-core/src/prompt.rs
+expression: prompt
+---
+Validation reported issues. Run the fix command for this loop:
+
+    /gsd-execute-phase 47 --auto
+
+## Completion Protocol (REQUIRED)
+
+When all work is done, your FINAL message must be exactly:
+
+DEVFLOW_RESULT: {"status": "success"}
+
+If something prevents completion:
+
+DEVFLOW_RESULT: {"status": "failed", "reason": "specific explanation"}
+
+DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.
