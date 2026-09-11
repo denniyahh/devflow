@@ -216,6 +216,26 @@ fn resolve_launch_shape(
     }
 }
 
+/// Resolve a checkpoint resume into `(program, argv)`.
+///
+/// Extracted from [`relaunch_checkpoint_session`] unchanged (47-03), for the
+/// same reason 31-04 extracted [`resolve_launch_shape`]: so the instruction a
+/// resume actually DELIVERS is assertable without spawning a process. The
+/// instruction rides positionally in `argv[1]` (`ClaudeDriver::exec_resume_command`);
+/// this path has no stdin turn.
+///
+/// It builds the instruction itself rather than taking it as a parameter, so a
+/// test driving this function exercises the same prompt builder a real resume
+/// delivers. The caller still builds its own copy for the
+/// `checkpoint_auto_decided` event, which must be emitted BEFORE this call so a
+/// spawn failure still leaves the attempt on record (47-CONTEXT.md D-10).
+/// `checkpoint_auto_decide_prompt` is byte-deterministic, and the caller
+/// asserts in debug builds that the two copies agree.
+fn resume_launch_shape(phase: PhaseId, session_id: &str) -> (&'static str, Vec<String>) {
+    let instruction = prompt::checkpoint_auto_decide_prompt(phase);
+    agents::ClaudeDriver::exec_resume_command(session_id, &instruction)
+}
+
 /// Where a forced legacy launch's authorization came from, for the provenance
 /// record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,7 +1136,14 @@ pub(crate) fn relaunch_checkpoint_session(
         }),
     );
 
-    let (program, args) = agents::ClaudeDriver::exec_resume_command(session_id, &instruction);
+    // 47-03: built by `resume_launch_shape` so the delivered instruction is
+    // assertable without a spawn. The event above quotes this function's own
+    // `instruction`; the debug assertion pins that quote to what is delivered.
+    let (program, args) = resume_launch_shape(state.phase, session_id);
+    debug_assert_eq!(
+        args[1], instruction,
+        "the checkpoint_auto_decided event must quote the instruction the resume delivers"
+    );
 
     // `Legacy`, deliberately: `exec_resume_command` builds the pre-31
     // single-document shape (positional instruction, `--output-format json`),
