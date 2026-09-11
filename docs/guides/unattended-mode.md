@@ -27,7 +27,9 @@ is deliberately *not*:
   `_auto_chain_active` key is ever written, and only that one key.
 
 Checkpoints marked `blocking-human`, and `checkpoint:human-action` tasks, are
-never auto-approved by any mode. A phase whose plans declare one is refused
+never auto-approved by any mode. The exception is an agent DevFlow resumed
+specifically to resolve a `blocking-human` gate after a human has approved the
+parked preflight gate. A phase whose plans declare one is otherwise refused
 before it starts — see the next section.
 
 ## Before you start: what the preflight checks
@@ -82,22 +84,24 @@ are expected — their absence is `[COULD NOT BE DETERMINED]`, and that refuses.
 A refusal here means replanning the phase without the human-only marker, or
 running in supervise mode and answering it yourself.
 
-### A refusal is final
+### A parked refusal can be approved
 
-There is no `--force-unattended` flag and no environment variable that turns a
-refusal into a warning. Your options are to fix the condition or to run in
-supervise mode.
+A refusal for a human-only checkpoint parks the run at a gate. If an operator
+approves that gate, `GateAction::Advance` calls `launch_stage_inner` directly
+and skips the just-adjudicated check. The run stays in its existing mode, so it
+continues unattended afterwards and can reach the resume injection.
 
-**Both external review lanes objected to that, on record, and the decision
-stands.** The objection is real and worth stating so you know it was heard: a
-preflight that false-positives makes unattended runs impossible with no
-in-product recovery, and one reviewer characterised that as a
-denial-of-service. The counter-argument that carried is DevFlow's standing
-principle — advance as far as the rules permit and stop at the first hard gate,
-never route around one — plus the asymmetry that adding an override later is
-easy while removing one after operators have built habits around it is not. If
-the preflight's own reliability turns out to be a problem in practice, that is
-grounds to reopen the decision, not to work around it.
+The cost is deliberate: approving the parked gate accepts continuing without
+re-running the condition that refused the launch. Use that recovery only when
+you, as the operator, accept that responsibility.
+
+**Both external review lanes raised the tradeoff, and their concern remains on
+record.** They warned that a false-positive preflight can block an unattended
+run. The accurate counterpoint is narrower than the old claim: DevFlow has a
+human-approved recovery through the parked gate, rather than an unattended
+opt-out. That preserves the standing principle — advance as far as the rules
+permit and stop at the first hard gate — while making the operator's explicit
+approval, and its cost, visible.
 
 ### If your planning artifacts do not live on `develop`
 
