@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
-current_plan: 1
+current_plan: 2
 status: executing
-stopped_at: Phase 47 execution started
-last_updated: "2026-09-11T16:59:41.430Z"
+stopped_at: Completed 47-01-PLAN.md
+last_updated: "2026-09-11T17:36:51.799Z"
 last_activity: 2026-09-11
-last_activity_desc: Phase 47 execution started
-state_head: ada299d48f2a3a2a75d6e548395862e75c1f141e
+last_activity_desc: Completed 47-01-PLAN.md (snapshot drift guard)
+state_head: 950cca348ddb941b85c1223b69e27213946e1f7f
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 9
+  completed_plans: 10
   percent: 17
 ---
 
@@ -163,10 +163,10 @@ change earns 2.0.
 
 Phase: 47 (Unattended Decision Policy Consistency) — EXECUTING
 Plans: 5 (47-01..47-05) across 4 waves
-Current Plan: 1
+Current Plan: 2
 Total Plans in Phase: 5
-Completed Plans: —
-Status: Executing Phase 47
+Completed Plans: 1 (47-01)
+Status: Ready to execute
 Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
 the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
 they meet, D-13 and possibly D-02 must be revisited, not left standing. (2) The phase is larger
@@ -176,7 +176,7 @@ and an `insta` dev-dependency wired as a required CI check.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-11 — Phase 47 execution started
+Last activity: 2026-09-11 — Completed 47-01 (snapshot drift guard)
 
 Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
@@ -798,6 +798,10 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase 46]: Recorded three contended green runs as corroboration only: process isolation is the load-bearing C-01 argument, not a reliability-rate claim.
 - [Phase 46]: Staged plan scanning reads the Git index blob only; there is no working-tree fallback.
 - [Phase 46]: Cached staged-plan discovery uses ACMR destinations with NUL delimiters; deletions remain intentional zero-file scans.
+- [Phase 47]: 47-01 Task 1 TDD split: all wiring (insta dep, hardened run_test, .gitignore, checklist, failing snapshot test) in the RED commit so dependency, CI change and checklist share one commit; the reviewed baseline alone is GREEN
+- [Phase 47]: 47-01 gitignore guard uses git check-ignore --no-index with exact exit codes 0/1: without --no-index a TRACKED baseline reads not-ignored even under a *.snap rule (measured exit 1 without, 0 with)
+- [Phase 47]: 47-01 run_test guard asserts exactly one env/cargo-first-word cargo test invocation line: a stale-banner mutation showed a presence check would pass while the running line lost env -u
+- [Phase 47]: 47-01 gsd-core check tdd-red-evidence parses node TAP only and exits 0 even on INVALID_RED; cargo RED evidence was classified via a mechanical TAP transcription with a wrong-target control
 
 ## Roadmap Evolution
 
@@ -885,12 +889,13 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 46 P07 | 13 min | 3 tasks | 4 files |
 | Phase 46 P08 | 20 min minimum | 2 tasks | 7 files |
 | Phase 46 P09 | 4 min | 2 tasks | 2 files |
+| Phase 47 P01 | 26min | 3 tasks | 11 files |
 
 ## Session
 
-**Last session:** 2026-09-10T01:44:03.689Z
-**Stopped at:** Phase 47 context gathered
-**Resume file:** .planning/phases/47-unattended-decision-policy-consistency/47-CONTEXT.md
+**Last session:** 2026-09-11T17:36:51.601Z
+**Stopped at:** Completed 47-01-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 
