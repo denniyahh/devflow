@@ -1355,4 +1355,72 @@ mod tests {
         });
         insta::assert_snapshot!(prompt);
     }
+
+    /// D-15 (47-CONTEXT.md): one named, reviewed `insta` baseline per adapter
+    /// for the policy-carrying `FullExecute` fix prompt, captured exactly as
+    /// each adapter delivers it through `driver_for(kind).render_prompt`.
+    ///
+    /// The four claude-style baselines (claude, opencode, hermes, antigravity)
+    /// are byte-identical to each other and to the
+    /// `claude_style_full_execute_fix_prompt_snapshot` baseline. That redundancy
+    /// is DELIBERATE, not an oversight: it is what turns an adapter silently
+    /// switching render style into a visible diff on that adapter's own `.snap`
+    /// file. Do not "clean it up" into one shared baseline. The two
+    /// workflow-style baselines (codex, pi) differ only in each driver's
+    /// workflow root.
+    ///
+    /// Scope is D-15's and no wider. The `GapsOnly`/`AuditFix` arms carry no
+    /// policy and are already discriminated by
+    /// `claude_style_fix_prompts_that_must_not_carry_the_policy_still_omit_it`.
+    ///
+    /// Kinds are walked through an exhaustive `match`, as in
+    /// `code_policy_reaches_the_full_execute_fix_arm_on_every_adapter`, so a new
+    /// `AgentKind` variant is a compile error here until it is given a baseline.
+    #[test]
+    fn policy_carrying_full_execute_fix_prompt_snapshots() {
+        use crate::agents::driver_for;
+        use crate::state::AgentKind;
+
+        fn snapshot_name_and_next(kind: AgentKind) -> (&'static str, Option<AgentKind>) {
+            match kind {
+                AgentKind::Claude => ("full_execute_fix_prompt_claude", Some(AgentKind::OpenCode)),
+                AgentKind::OpenCode => {
+                    ("full_execute_fix_prompt_opencode", Some(AgentKind::Hermes))
+                }
+                AgentKind::Hermes => (
+                    "full_execute_fix_prompt_hermes",
+                    Some(AgentKind::Antigravity),
+                ),
+                AgentKind::Antigravity => (
+                    "full_execute_fix_prompt_antigravity",
+                    Some(AgentKind::Codex),
+                ),
+                AgentKind::Codex => ("full_execute_fix_prompt_codex", Some(AgentKind::Pi)),
+                AgentKind::Pi => ("full_execute_fix_prompt_pi", None),
+            }
+        }
+
+        let intent = StageIntent::Code {
+            phase: PhaseId::new(47),
+            fix: Some(FixType::FullExecute),
+        };
+        let mut visited: Vec<AgentKind> = Vec::new();
+        let mut next = Some(AgentKind::Claude);
+        while let Some(kind) = next {
+            assert!(
+                !visited.contains(&kind),
+                "the kind chain cycles at {kind:?}"
+            );
+            let (name, successor) = snapshot_name_and_next(kind);
+            let prompt = driver_for(kind).render_prompt(&intent);
+            insta::assert_snapshot!(name, prompt);
+            visited.push(kind);
+            next = successor;
+        }
+        assert_eq!(
+            visited.len(),
+            6,
+            "every adapter must be snapshotted exactly once"
+        );
+    }
 }
