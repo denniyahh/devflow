@@ -10,6 +10,9 @@
   unification, so `cargo clippy --workspace --all-targets -- -D warnings` (the CLAUDE.md / CI form) exits 0.
   **Found during:** 47-02 Task 1, 2026-09-11. Out of scope for 47-02: neither file was touched, and the
   errors do not involve the `#[cfg(test)]` code the plan changed.
-  **Not established:** whether it predates Phase 47. No negative control was run on the fork-point tree.
+  **Predates Phase 47** (orchestrator, 2026-09-11): on the fork-point tree `034f5b6`, whose `crates/`,
+  `Cargo.toml` and `Cargo.lock` are identical to the phase base, the same command exits 101 with the same
+  `E0433: cannot find test_support in devflow_core` errors, while `cargo clippy --workspace --all-targets`
+  on that tree exits 0. Only the first two error sites were compared, not the full list of affected files.
   **Impact:** a package-scoped `--all-targets` check, which a contributor might reasonably run, fails
   for reasons unrelated to their change.
