@@ -94,10 +94,11 @@ structurally incompatible with per-test process isolation.
 ### Phase 47: Unattended Decision Policy Consistency
 
 **Goal**: An unattended agent receives the same merit-based decision instruction everywhere it is
-asked to make a Code-stage decision — including the Claude/OpenCode Validate loop-back, the primary
-agent's common path — and is never handed two contradictory instructions about who may resolve a
-`blocking-human` gate inside one resumed session. Closes the half of DECN-01 that v2.8.0 shipped
-undelivered.
+asked to make a Code-stage decision — including the claude, opencode, hermes, and antigravity
+Validate loop-back, the four adapters routed through `render_claude_style`; codex and pi use
+`render_workflow_style` and are already correct — and is never handed two contradictory instructions
+about who may resolve a `blocking-human` gate inside one resumed session. Closes the half of DECN-01
+that v2.8.0 shipped undelivered.
 **Depends on**: Nothing — prompt rendering only, independent of Phase 46.
 **Sequencing note**: Wave 1 by milestone design — this must be true before Phase 49 measures a run.
 **Requirements**: DECN-02, DECN-03
@@ -573,6 +574,37 @@ needs to be visible outside the repo, using the existing
 add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
+
+### Phase 999.126: A Checkpoint Added After Code Preflight Is Never Re-Scanned (BACKLOG)
+
+**Found:** 2026-09-11, Phase 47 D-13 source review. Preflight checks plans only at Define and
+Code (`crates/devflow-cli/src/preflight.rs:971-973`), while agents may write plan files during Code
+(`crates/devflow-core/src/verify.rs:118-119`). A human-only gate added after Code's preflight has
+already run is never checked before the run can reach the resume route.
+
+**Fix shape:** make the gate decision consume a fresh, authoritative plan scan at the point where
+the run would otherwise continue unattended, or prevent the plan from changing after the checked
+snapshot is established.
+
+**Acceptance:** a plan that gains a human-only gate after Code's initial preflight cannot continue
+unattended into the resume decision path; a plan that does not gain one remains unaffected.
+
+### Phase 999.125: Preflight and Resume Disagree on Where a `blocking-human` Gate Exists (BACKLOG)
+
+**Found:** 2026-09-11, Phase 47 D-13 source review. Preflight's
+`phase_has_human_only_checkpoint` is line-anchored to a task-opening line
+(`crates/devflow-core/src/verify.rs:207-220`), while the resume route's
+`phase_has_blocking_human_checkpoint` is a whole-file substring match
+(`crates/devflow-core/src/verify.rs:131-137`). The comment at
+`crates/devflow-core/src/verify.rs:191-196` says the pair deliberately fails in opposite
+directions. A `gate="blocking-human"` marker outside a task-opening line can therefore pass
+preflight while still arming the resume route.
+
+**Fix shape:** replace the divergent scans with one parsed checkpoint predicate shared by preflight
+and resume, with one explicit definition of the task locations and gate classes that count.
+
+**Acceptance:** a marker outside a task-opening line neither blocks preflight nor arms resume; a
+proper task-level `blocking-human` gate produces the same human-only result in both paths.
 
 ### Phase 999.124: GSD `phase complete` Leaves the Planning Docs Half-Updated on Every Phase Close (BACKLOG)
 

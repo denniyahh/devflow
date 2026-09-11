@@ -15,8 +15,10 @@ change shape once a live run exists.
 
 The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.8.0. These close it.
 
-- [ ] **DECN-02**: The unattended decision policy reaches the Claude/OpenCode Code prompt on the
-      Validate loop-back path, not only on the first Code pass.
+- [ ] **DECN-02**: The unattended decision policy reaches the claude, opencode, hermes, and
+      antigravity Code prompts on the Validate loop-back path, not only on the first Code pass.
+      These four adapters route through `render_claude_style`; codex and pi use
+      `render_workflow_style` and are already correct.
       *Traces to 999.115.* Verified: `CODE_STAGE_POLICY` occurs at `prompt.rs:62/379/469` and in
       tests, never inside `fix_prompt` (`:567-580`); negative control — `COMPLETION_PROTOCOL` at
       `:578` proves the search range is non-empty.
@@ -33,6 +35,10 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       **Not established:** which instruction an agent actually follows. That is a question about
       model instruction-priority and is not answerable by reading source — this requirement is
       deliberately scheduled to resolve against VERIFY-01's live run.
+      **Closure limit:** DECN-03 closes for claude alone: `pipeline_launch.rs:1569` gates the
+      resume route on `AgentKind::Claude`, `exec_resume_command` exists only on `ClaudeDriver`,
+      and auto-mode preflight admits only claude and antigravity. The other claude-style adapters
+      cannot all reach the co-resident prompt, so this closure does not generalize to them.
 
 ### Input Validation (VALID)
 
