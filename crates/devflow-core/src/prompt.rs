@@ -1211,6 +1211,50 @@ mod tests {
         assert!(checkpoint_auto_decide_prompt(PhaseId::new(42)).contains("phase 42"));
     }
 
+    /// D-03/D-04 (47-03), constant level. A resumed Claude session sees
+    /// `CODE_STAGE_POLICY` in its first turn and `checkpoint_auto_decide_prompt`
+    /// in a later one, so the two texts must state one rule about who may
+    /// resolve a `blocking-human` gate: the policy may not forbid it outright
+    /// while the resume instruction, which names a different class, says to
+    /// resolve it.
+    ///
+    /// Controls: the policy must still name `package-verification` (D-02 keeps
+    /// that prohibition unconditional, so a fix that deletes the sentence instead
+    /// of splitting it fails here), and the resume prompt must end with the
+    /// completion protocol, so an absent `blocking-human` means the prose lacks
+    /// it rather than that the prompt is empty. The rule checks are collected so
+    /// a red run reports every half that is wrong, not only the first.
+    #[test]
+    fn the_gate_rule_has_one_definition_site() {
+        let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
+        assert!(
+            CODE_STAGE_POLICY.contains("package-verification"),
+            "D-02: the package-verification prohibition must survive the split, not be deleted"
+        );
+        assert!(
+            resume.ends_with(COMPLETION_PROTOCOL),
+            "precondition: the resume instruction must be a real rendered prompt"
+        );
+
+        let mut contradictions = Vec::new();
+        if CODE_STAGE_POLICY.contains("gate or a package-verification checkpoint") {
+            contradictions.push(
+                "CODE_STAGE_POLICY still forbids a blocking-human gate unconditionally, \
+                 in the same sentence as package verification",
+            );
+        }
+        if !resume.contains("blocking-human") {
+            contradictions.push(
+                "checkpoint_auto_decide_prompt does not name the blocking-human gate \
+                 class it resumes the agent to resolve",
+            );
+        }
+        assert!(
+            contradictions.is_empty(),
+            "the two gate-rule texts disagree: {contradictions:#?}"
+        );
+    }
+
     /// D-14/D-15 (47-CONTEXT.md): the Claude/OpenCode loop-back Code prompt is
     /// pinned as a reviewed `insta` snapshot, so a wording change to it surfaces
     /// as a `.snap` diff in review instead of drifting unnoticed — the failure
