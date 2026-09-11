@@ -1,20 +1,20 @@
 ---
-gsd_state_version: 1.0
+gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
-current_plan: Not started
-status: planning
-stopped_at: Phase 47 context gathered
-last_updated: "2026-09-10T01:44:03.846Z"
-last_activity: 2026-09-09
-last_activity_desc: "Phase 47 context gathered: 16 decisions across 4 areas. Scout found the DECN-02 gap is 4 of 6 adapters (claude/opencode/hermes/antigravity via render_claude_style), not the 2 the ROADMAP names, and that docs/guides/unattended-mode.md contradicts the chosen blocking-human carve-out. Phase is larger than its 'prompt rendering only' framing: 2 ROADMAP amendments, a docs rewrite, and an insta dev-dependency with required CI."
-state_head: 6761f73b98d784a4ba6462633f2451dadf32a547
+current_plan: 1
+status: executing
+stopped_at: Phase 47 execution started
+last_updated: "2026-09-11T16:59:41.430Z"
+last_activity: 2026-09-11
+last_activity_desc: Phase 47 execution started
+state_head: ada299d48f2a3a2a75d6e548395862e75c1f141e
 progress:
   total_phases: 6
   completed_phases: 1
-  total_plans: 9
+  total_plans: 14
   completed_plans: 9
   percent: 17
 ---
@@ -77,9 +77,8 @@ See: `.planning/PROJECT.md` (updated 2026-09-03)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 46 (CI Load Shape and Operator
-Input Validation) complete and merged (PR #208); Phase 47 (Unattended Decision Policy
-Consistency) next and unplanned.
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 47 (Unattended Decision Policy
+Consistency) executing: 5 plans across 4 waves. Phase 46 complete and merged (PR #208).
 
 ## Operator Next Steps
 
@@ -162,12 +161,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 47 — Unattended Decision Policy Consistency (DECN-02, DECN-03) — CONTEXT GATHERED, UNPLANNED
-Plans: none yet — phase not planned
-Current Plan: Not started
-Total Plans in Phase: —
+Phase: 47 (Unattended Decision Policy Consistency) — EXECUTING
+Plans: 5 (47-01..47-05) across 4 waves
+Current Plan: 1
+Total Plans in Phase: 5
 Completed Plans: —
-Status: 47-CONTEXT.md written (16 decisions, D-01..D-16) and committed. Ready to plan.
+Status: Executing Phase 47
 Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
 the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
 they meet, D-13 and possibly D-02 must be revisited, not left standing. (2) The phase is larger
@@ -177,9 +176,9 @@ and an `insta` dev-dependency wired as a required CI check.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-09 — Phase 47 context gathered
+Last activity: 2026-09-11 — Phase 47 execution started
 
-Progress: [█░░░░░░░░░] 17% (1 of 6 phases complete)
+Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
 ## Recently Shipped
 
