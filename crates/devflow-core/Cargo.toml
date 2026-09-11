@@ -32,3 +32,5 @@ tempfile = "3"
 # such as `cargo clippy -p devflow-core --all-targets` does not unify features
 # with devflow-cli's dev-dependency, so enable the feature for them here.
 devflow-core = { path = ".", features = ["test-support"] }
+# `insta::assert_snapshot!` for the prompt-text drift guard (47-CONTEXT.md D-14/D-15).
+insta = { workspace = true }

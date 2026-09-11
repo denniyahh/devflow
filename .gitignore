@@ -81,3 +81,11 @@ skills-lock.json
 
 # Bytecode cache
 __pycache__/
+
+# insta snapshot scratch (47-CONTEXT.md D-14). `*.snap.new` is what insta writes
+# beside a baseline when a snapshot is missing or mismatches under its local
+# default mode — transient, never reviewed, never committed. `*.snap` itself
+# stays TRACKED on purpose: the committed baseline IS the reviewable artifact,
+# so every prompt wording change must appear in the PR diff. Never widen this
+# rule to cover the baselines.
+*.snap.new

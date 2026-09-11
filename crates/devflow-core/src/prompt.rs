@@ -1026,4 +1026,26 @@ mod tests {
     fn checkpoint_auto_decide_prompt_substitutes_phase_for_legibility() {
         assert!(checkpoint_auto_decide_prompt(PhaseId::new(42)).contains("phase 42"));
     }
+
+    /// D-14/D-15 (47-CONTEXT.md): the Claude/OpenCode loop-back Code prompt is
+    /// pinned as a reviewed `insta` snapshot, so a wording change to it surfaces
+    /// as a `.snap` diff in review instead of drifting unnoticed — the failure
+    /// that produced Phase 47.
+    ///
+    /// The committed baseline is DELIBERATELY the pre-fix capture: it carries the
+    /// `/gsd-execute-phase` fix command and no unattended decision-policy
+    /// section. That absence is the DECN-02 defect recorded as a reviewed
+    /// artifact; DECN-02's fix must drift this snapshot and re-bless it with the
+    /// content change asserted. Do not re-bless it to make a failure go away —
+    /// read the diff. `scripts/check.sh test` unsets `INSTA_FORCE_UPDATE` and
+    /// pins `INSTA_UPDATE=no`, so a mismatch fails there rather than rewriting
+    /// the baseline.
+    #[test]
+    fn claude_style_full_execute_fix_prompt_snapshot() {
+        let prompt = render_claude_style(&StageIntent::Code {
+            phase: PhaseId::new(47),
+            fix: Some(FixType::FullExecute),
+        });
+        insta::assert_snapshot!(prompt);
+    }
 }
