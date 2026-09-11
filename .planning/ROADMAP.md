@@ -187,6 +187,7 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
      agent follows when `CODE_STAGE_POLICY` and `checkpoint_auto_decide_prompt` are both present —
      or the run records explicitly that it never exercised that path. Either is a result; silence
      is not.
+     See `47-PHASE49-OBSERVATION.md` for the evidence standard derived by Phase 47.
   5. SURV-01's field question is recorded the same way: whether the run produced any concurrent
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
