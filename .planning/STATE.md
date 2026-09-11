@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
-current_plan: 2
+current_plan: 3
 status: executing
-stopped_at: Completed 47-01-PLAN.md
-last_updated: "2026-09-11T17:36:51.799Z"
+stopped_at: Completed 47-02-PLAN.md
+last_updated: "2026-09-11T18:40:19.854Z"
 last_activity: 2026-09-11
-last_activity_desc: Completed 47-01-PLAN.md (snapshot drift guard)
-state_head: 950cca348ddb941b85c1223b69e27213946e1f7f
+last_activity_desc: Completed 47-02-PLAN.md (FullExecute fix-arm decision policy)
+state_head: 17748ff470a01360035fdb79e692c64545329504
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 10
+  completed_plans: 11
   percent: 17
 ---
 
@@ -163,9 +163,9 @@ change earns 2.0.
 
 Phase: 47 (Unattended Decision Policy Consistency) — EXECUTING
 Plans: 5 (47-01..47-05) across 4 waves
-Current Plan: 2
+Current Plan: 3
 Total Plans in Phase: 5
-Completed Plans: 1 (47-01)
+Completed Plans: 2 (47-01, 47-02)
 Status: Ready to execute
 Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
 the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
@@ -176,7 +176,7 @@ and an `insta` dev-dependency wired as a required CI check.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-11 — Completed 47-01 (snapshot drift guard)
+Last activity: 2026-09-11 — Completed 47-02 (FullExecute fix-arm decision policy)
 
 Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
@@ -802,6 +802,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase 47]: 47-01 gitignore guard uses git check-ignore --no-index with exact exit codes 0/1: without --no-index a TRACKED baseline reads not-ignored even under a *.snap rule (measured exit 1 without, 0 with)
 - [Phase 47]: 47-01 run_test guard asserts exactly one env/cargo-first-word cargo test invocation line: a stale-banner mutation showed a presence check would pass while the running line lost env -u
 - [Phase 47]: 47-01 gsd-core check tdd-red-evidence parses node TAP only and exits 0 even on INVALID_RED; cargo RED evidence was classified via a mechanical TAP transcription with a wrong-target control
+- [Phase 47]: 47-02: fix_prompt consults code_policy_applies_to_fix_arm on every arm (not only FullExecute), so one helper decides policy delivery for both renderers and a widening of it is observable — Hard-coding the policy into the FullExecute match arm would pass the gate but make the D-08 widening demonstration vacuous
+- [Phase 47]: 47-02: D-05 extraction held byte-identically (scratch render dump 11 sections, 0 removed lines); fallback not taken, no existing test edited — workflow_code_prompt output unchanged for all four Code arms; only claude-style FullExecute and fix_prompt FullExecute gained the policy
 
 ## Roadmap Evolution
 
@@ -890,11 +892,12 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 46 P08 | 20 min minimum | 2 tasks | 7 files |
 | Phase 46 P09 | 4 min | 2 tasks | 2 files |
 | Phase 47 P01 | 26min | 3 tasks | 11 files |
+| Phase 47 P02 | 12min | 3 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-09-11T17:36:51.601Z
-**Stopped at:** Completed 47-01-PLAN.md
+**Last session:** 2026-09-11T18:40:00.212Z
+**Stopped at:** Completed 47-02-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
