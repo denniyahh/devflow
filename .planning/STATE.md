@@ -5,17 +5,17 @@ milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: 5
-status: executing
-stopped_at: Completed 47-04-PLAN.md
-last_updated: "2026-09-11T19:41:17.939Z"
+status: ready_for_verification
+stopped_at: Completed 47-05-PLAN.md
+last_updated: "2026-09-11T21:03:45.493Z"
 last_activity: 2026-09-11
-last_activity_desc: Completed 47-04-PLAN.md (D-15 snapshot suite against the final text)
-state_head: d8fb3022f060bff5766562affee0f712f6e7779b
+last_activity_desc: Completed 47-05-PLAN.md (written-record corrections and D-13 backlog filings)
+state_head: b30adf2c35bd99d1c29061ea11059bd5689174c5
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 13
+  completed_plans: 14
   percent: 17
 ---
 
@@ -161,22 +161,19 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 47 (Unattended Decision Policy Consistency) — EXECUTING
+Phase: 47 (Unattended Decision Policy Consistency) — READY FOR VERIFICATION
 Plans: 5 (47-01..47-05) across 4 waves
 Current Plan: 5
 Total Plans in Phase: 5
-Completed Plans: 4 (47-01, 47-02, 47-03, 47-04)
-Status: Ready to execute
-Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
-the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
-they meet, D-13 and possibly D-02 must be revisited, not left standing. (2) The phase is larger
-than the ROADMAP's "prompt rendering only" framing — it now carries two ROADMAP amendments (D-06
-adapter naming, D-12 widening Phase 49 to four runs), a `docs/guides/unattended-mode.md` rewrite,
-and an `insta` dev-dependency wired as a required CI check.
+Completed Plans: 5 (47-01, 47-02, 47-03, 47-04, 47-05)
+Status: Phase complete — ready for verification
+The D-13 assumption was verified false and its two latent defects are now backlog entries 999.125
+and 999.126. DECN-03's unresolved behavioural arm has an explicit claude-only evidence standard
+for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-11 — Completed 47-04 (D-15 snapshot suite against the final text)
+Last activity: 2026-09-11 — Completed 47-05 (written-record corrections and D-13 backlog filings)
 
 Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
@@ -809,6 +806,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase 47]: 47-04: the six core D-15 baselines come from one test that walks every AgentKind through an exhaustive match chain and snapshots driver_for(kind).render_prompt, so a new AgentKind variant is a compile error until it is given a baseline — Same enumeration the D-07 test uses; an array literal is a manual list a new variant silently falls outside of. The four byte-identical claude-style baselines are deliberate: an adapter switching render style becomes a diff on its own file.
 - [Phase 47]: 47-04: the turn_one_code_prompt / turn_two_resume_prompt snapshots live inside the_gate_rule_holds_in_both_delivered_turns, as two named files and never a joined string — Inside the test they snapshot the exact turn1/turn2 values the gate-rule and distinctness assertions already checked, so no second capture can drift from the first; a joined snapshot would reintroduce the composition D-03 rejects.
 - [Phase 47]: 47-04: codex and pi baselines are rendered through their drivers rather than render_workflow_style with a fixed root; workflow_root() returns the literal string "$HOME/..." and never expands it, so the baselines are host-independent — Going through the drivers also catches a change to the workflow root of a driver; reading agents/mod.rs and agents/pi.rs shows no expansion, and the committed baselines carry the unexpanded $HOME token.
+- [Phase 47]: 47-05: Kept Phase 49 at five criteria and delegated DECN-03's evidence standard to 47-PHASE49-OBSERVATION.md.
+- [Phase 47]: 47-05: Recorded the four/two renderer split and filed 999.125/999.126; the declined adapter-independent-resume follow-on was not filed.
 
 ## Roadmap Evolution
 
@@ -900,16 +899,17 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 47 P02 | 12min | 3 tasks | 2 files |
 | Phase 47 P03 | 28min | 3 tasks | 4 files |
 | Phase 47 P04 | 9min | 2 tasks | 10 files |
+| Phase 47 P05 | 7min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-09-11T19:40:44.905Z
-**Stopped at:** Completed 47-04-PLAN.md
+**Last session:** 2026-09-11T21:03:45.346Z
+**Stopped at:** Completed 47-05-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
 
-- `/gsd-plan-phase 47` — see the fuller list under the first `## Operator Next Steps` above.
+- `/gsd-verify-work 47` — verify the completed phase before advancing to Phase 48.
 
 ## Accumulated Context
 
