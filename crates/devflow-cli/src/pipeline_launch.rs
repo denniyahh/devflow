@@ -3998,6 +3998,89 @@ mod tests {
         );
     }
 
+    /// D-03 (47-03): a resumed Claude session receives the gate rule in two
+    /// separately delivered turns — the Code loop-back prompt as the stdin user
+    /// turn (turn 1) and the checkpoint resume instruction positionally in argv
+    /// (turn 2). Co-residence is a property of the session transcript, not of
+    /// any string DevFlow builds, so this test NEVER joins the two: each is
+    /// captured from the production constructor that delivers it and asserted on
+    /// its own.
+    ///
+    /// Controls: the stream-launch precondition (without it turn 1 resolves to
+    /// `Legacy`, there is no stdin turn, and the rule checks would be vacuous
+    /// rather than false); `assert_ne!` plus mutual non-containment (otherwise
+    /// two captures collapsed onto one source would still pass); and turn 1
+    /// still naming `package-verification` (D-02 keeps that prohibition, so a
+    /// fix that deletes the sentence instead of splitting it fails here).
+    #[test]
+    fn the_gate_rule_holds_in_both_delivered_turns() {
+        let phase = PhaseId::new(47);
+        let agent = AgentKind::Claude;
+        let driver = agents::driver_for(agent);
+        let stream_launch = stream_launch_enabled(agent, Stage::Code, false);
+        assert!(
+            stream_launch,
+            "Stage::Code must be stream-launch-enabled for Claude for this test to mean anything"
+        );
+
+        // Turn 1: `loop_back_to_code`'s own render (pipeline_gate.rs), then the
+        // launch shape `launch_stage_inner` resolves it to.
+        let loop_back_prompt = driver.render_prompt(&prompt::StageIntent::Code {
+            phase,
+            fix: Some(prompt::FixType::FullExecute),
+        });
+        let (_program, _args, launch) = resolve_launch_shape(
+            agent,
+            driver.as_ref(),
+            phase,
+            loop_back_prompt,
+            &[],
+            stream_launch,
+        );
+        let turn1 = match launch {
+            monitor::MonitorLaunch::PipeOwning { prompt: stdin_turn } => stdin_turn,
+            monitor::MonitorLaunch::Legacy => {
+                panic!("the Code loop-back must deliver a stdin user turn, not a Legacy launch")
+            }
+        };
+
+        // Turn 2: the real resume builder. Index rather than `.get()`, so an
+        // absent element panics instead of reading quietly as `None`.
+        let (_program, argv) = resume_launch_shape(phase, "session-under-test");
+        assert_eq!(
+            argv[0], "-p",
+            "resume argv shape changed; the instruction is not argv[1]"
+        );
+        let turn2 = argv[1].clone();
+
+        assert_ne!(
+            turn1, turn2,
+            "the two turns must be distinct delivered artifacts"
+        );
+        assert!(
+            !turn1.contains(&turn2) && !turn2.contains(&turn1),
+            "neither turn may contain the other, or the pair is one source twice"
+        );
+        assert!(
+            turn1.contains("package-verification"),
+            "D-02: turn 1 must keep the unconditional package-verification prohibition"
+        );
+
+        let mut contradictions = Vec::new();
+        if turn1.contains("gate or a package-verification checkpoint") {
+            contradictions.push("turn 1 forbids a blocking-human gate unconditionally");
+        }
+        if !turn2.contains("blocking-human") {
+            contradictions.push(
+                "turn 2 does not name the blocking-human gate it resumes the agent to resolve",
+            );
+        }
+        assert!(
+            contradictions.is_empty(),
+            "the delivered turns disagree on the gate rule: {contradictions:#?}"
+        );
+    }
+
     /// Phase 39 Stage 1 regression: Pi always resolves to `MonitorLaunch::Legacy`.
     /// Pi is never Claude, so `stream_launch` is false and the `else` branch
     /// applies; `PipeOwning` deadlocks Pi (Pi consumes stdin until EOF while
