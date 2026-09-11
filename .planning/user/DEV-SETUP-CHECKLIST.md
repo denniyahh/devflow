@@ -420,8 +420,21 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 
 ## 8. Language/build tooling — [PROJECT], Rust-specific
 
-- [ ] Cargo workspace: `devflow-core` (lib) + `devflow-cli` (bin), zero network-dependency
-  policy (serde, clap, thiserror, tracing only).
+- [ ] Cargo workspace: `devflow-core` (lib) + `devflow-cli` (bin). Zero network-dependency
+  policy for the **runtime** graph only — no network crate among `[dependencies]` (serde,
+  serde_json, toml, clap, thiserror, tracing, tracing-subscriber, semver, git-conventional,
+  libc). It does **not** cover `[dev-dependencies]`: `tempfile` and, since Phase 47, `insta`
+  (the prompt-text snapshot drift guard, 47-CONTEXT.md D-14/D-15) are test-only. `cargo deny`
+  with this `deny.toml` does not traverse dev-dependencies, and `cargo machete` 0.9.2 does not
+  analyze them, so neither tool polices that half.
+- [ ] **Snapshot baselines (`insta`).** `cargo-insta` is NOT installed, and `scripts/check.sh test`
+  runs cargo test under `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no`, so a missing or mismatched
+  `.snap` fails there and nothing in the dev loop writes one. The only way to create (or
+  deliberately re-bless) a baseline is this recipe, run once, on purpose:
+  `INSTA_UPDATE=always cargo test -p <crate> <testname>` — then READ the generated
+  `src/snapshots/*.snap` before committing it. `*.snap` is tracked (it is the reviewable
+  artifact); `*.snap.new` is gitignored. Never export `INSTA_UPDATE` or `INSTA_FORCE_UPDATE` from
+  a shell profile or CI image: `check.sh` neutralises both, but a bare `cargo test` does not.
 - [ ] `~/.cargo/credentials.toml` exists (crates.io publish auth) — contents not inspected here;
   needed to reproduce the publish step, not the dev-loop itself.
 - [ ] Publish order matters and is enforced by convention, not tooling: `devflow-core` before

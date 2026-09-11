@@ -44,8 +44,18 @@ run_test() {
     # devflow-cli. Chasing CI one masked failure at a time cost several
     # round trips on 2026-07-26; one run should report everything that is
     # broken, not the alphabetically-first thing.
-    echo "==> cargo test --workspace --no-fail-fast"
-    cargo test --workspace --no-fail-fast
+    #
+    # env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test: both halves are
+    # load-bearing for the insta snapshot guard (47-CONTEXT.md D-14..D-16).
+    # INSTA_UPDATE=no keeps a snapshot mismatch failing even when a developer
+    # (or a stale shell, or a CI image) exports INSTA_UPDATE=always, which
+    # otherwise SILENTLY rewrites the baseline and exits 0. `env -u
+    # INSTA_FORCE_UPDATE` is equally load-bearing: INSTA_FORCE_UPDATE=1
+    # OVERRIDES INSTA_UPDATE=no and re-blesses a drifted baseline green. Both
+    # were verified by experiment (47-RESEARCH.md § A-2, § A-3). Dropping
+    # either reopens a green-over-unread guard.
+    echo "==> env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast"
+    env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast
 }
 
 run_build() {

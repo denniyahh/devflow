@@ -31,3 +31,5 @@ git-conventional = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# `insta::assert_snapshot!` for the prompt-text drift guard (47-CONTEXT.md D-14/D-15).
+insta = { workspace = true }
