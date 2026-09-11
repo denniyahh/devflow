@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
-current_plan: 3
+current_plan: 4
 status: executing
-stopped_at: Completed 47-02-PLAN.md
-last_updated: "2026-09-11T18:40:19.854Z"
+stopped_at: Completed 47-03-PLAN.md
+last_updated: "2026-09-11T19:20:22.344Z"
 last_activity: 2026-09-11
-last_activity_desc: Completed 47-02-PLAN.md (FullExecute fix-arm decision policy)
-state_head: 17748ff470a01360035fdb79e692c64545329504
+last_activity_desc: Completed 47-03-PLAN.md (one gate rule for the Code policy and the resume prompt)
+state_head: 3b836b1e6c6b47b585e3b8bb4178530179713cf1
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 14
-  completed_plans: 11
+  completed_plans: 12
   percent: 17
 ---
 
@@ -163,9 +163,9 @@ change earns 2.0.
 
 Phase: 47 (Unattended Decision Policy Consistency) — EXECUTING
 Plans: 5 (47-01..47-05) across 4 waves
-Current Plan: 3
+Current Plan: 4
 Total Plans in Phase: 5
-Completed Plans: 2 (47-01, 47-02)
+Completed Plans: 3 (47-01, 47-02, 47-03)
 Status: Ready to execute
 Two items planning must carry: (1) **D-13 rests on an assumption discussion did not verify** — that
 the preflight `*-PLAN.md` gate scan and the resume path are disjoint. Research must confirm it; if
@@ -176,7 +176,7 @@ and an `insta` dev-dependency wired as a required CI check.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-11 — Completed 47-02 (FullExecute fix-arm decision policy)
+Last activity: 2026-09-11 — Completed 47-03 (one gate rule for the Code policy and the resume prompt)
 
 Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
@@ -804,6 +804,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase 47]: 47-01 gsd-core check tdd-red-evidence parses node TAP only and exits 0 even on INVALID_RED; cargo RED evidence was classified via a mechanical TAP transcription with a wrong-target control
 - [Phase 47]: 47-02: fix_prompt consults code_policy_applies_to_fix_arm on every arm (not only FullExecute), so one helper decides policy delivery for both renderers and a widening of it is observable — Hard-coding the policy into the FullExecute match arm would pass the gate but make the D-08 widening demonstration vacuous
 - [Phase 47]: 47-02: D-05 extraction held byte-identically (scratch render dump 11 sections, 0 removed lines); fallback not taken, no existing test edited — workflow_code_prompt output unchanged for all four Code arms; only claude-style FullExecute and fix_prompt FullExecute gained the policy
+- [Phase 47]: 47-03: resume_launch_shape(phase, session_id) builds the resume instruction itself; relaunch_checkpoint_session keeps its own copy for the pre-spawn checkpoint_auto_decided event, pinned to argv[1] by a debug_assert — Returning the instruction as a third tuple element would put the call before the emit and fail the plan source-order criterion; passing it in would stop the delivery test exercising the real builder
+- [Phase 47]: 47-03: GATE_RESOLUTION_RULE is defined once as a macro_rules literal spliced into CODE_STAGE_POLICY by concat!; the package-verification prohibition and carve-out section is pinned verbatim by a test-owned literal — concat! rejects a const name; a pin built from the constants under test would widen along with them
 
 ## Roadmap Evolution
 
@@ -893,11 +895,12 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 46 P09 | 4 min | 2 tasks | 2 files |
 | Phase 47 P01 | 26min | 3 tasks | 11 files |
 | Phase 47 P02 | 12min | 3 tasks | 2 files |
+| Phase 47 P03 | 28min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-09-11T18:40:00.212Z
-**Stopped at:** Completed 47-02-PLAN.md
+**Last session:** 2026-09-11T19:20:22.186Z
+**Stopped at:** Completed 47-03-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
