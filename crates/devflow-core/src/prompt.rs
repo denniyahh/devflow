@@ -821,6 +821,140 @@ mod tests {
         }
     }
 
+    /// D-08 (47-CONTEXT.md): the claude-style twin of the omission control
+    /// directly above, which drives `render_workflow_style` only. DECN-02
+    /// changes the claude-style fix path, so an over-broad edit that gave every
+    /// claude-style fix arm the policy would leave that workflow-style control
+    /// green. This one goes red.
+    #[test]
+    fn claude_style_fix_prompts_that_must_not_carry_the_policy_still_omit_it() {
+        let phase = PhaseId::new(45);
+        let gaps_only = render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::GapsOnly),
+        });
+        let audit_fix = render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::AuditFix),
+        });
+
+        for prompt in [
+            stage_prompt(Stage::Validate, phase),
+            stage_prompt(Stage::Ship, phase),
+            gaps_only,
+            audit_fix,
+        ] {
+            assert!(
+                !prompt.contains(CODE_STAGE_POLICY),
+                "only full-execute Code prompts may carry the shared policy"
+            );
+        }
+    }
+
+    /// D-07 / DECN-02 (47-CONTEXT.md): a Validate loop-back that dispatches
+    /// `Code { fix: Some(FullExecute) }` must deliver the unattended decision
+    /// policy on every adapter, not only on the first Code pass.
+    ///
+    /// Kinds are enumerated by an exhaustive `match` over `AgentKind`, NOT an
+    /// array literal. This workspace has no `AgentKind::ALL`, and an array loop
+    /// is a manual list that a seventh variant would silently fall outside of.
+    /// Here a new variant is a compile error until it is given a render style
+    /// and linked into the chain. Residual gap, stated rather than hidden: an
+    /// arm added with a successor that no other arm points at would compile and
+    /// go unvisited.
+    ///
+    /// Asserts on the heading string literal rather than on `CODE_STAGE_POLICY`
+    /// so the pre-fix tree compiles and prints a real `test result: FAILED`
+    /// (RESEARCH Pitfall 4: a compile error is not a red test).
+    #[test]
+    fn code_policy_reaches_the_full_execute_fix_arm_on_every_adapter() {
+        use crate::agents::driver_for;
+        use crate::state::AgentKind;
+
+        const POLICY_HEADING: &str = "## Unattended decision checkpoints";
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Render {
+            /// Routed through `render_claude_style` — the DECN-02 gap.
+            ClaudeStyle,
+            /// Routed through `render_workflow_style`, already correct — a
+            /// passing control (D-07).
+            WorkflowStyleControl,
+        }
+
+        fn render_and_next(kind: AgentKind) -> (Render, Option<AgentKind>) {
+            match kind {
+                AgentKind::Claude => (Render::ClaudeStyle, Some(AgentKind::Codex)),
+                AgentKind::Codex => (Render::WorkflowStyleControl, Some(AgentKind::OpenCode)),
+                AgentKind::OpenCode => (Render::ClaudeStyle, Some(AgentKind::Pi)),
+                AgentKind::Pi => (Render::WorkflowStyleControl, Some(AgentKind::Antigravity)),
+                AgentKind::Antigravity => (Render::ClaudeStyle, Some(AgentKind::Hermes)),
+                AgentKind::Hermes => (Render::ClaudeStyle, None),
+            }
+        }
+
+        let intent = StageIntent::Code {
+            phase: PhaseId::new(47),
+            fix: Some(FixType::FullExecute),
+        };
+        let mut visited: Vec<AgentKind> = Vec::new();
+        let mut controls_seen = 0;
+        let mut controls_missing = Vec::new();
+        let mut claude_style_missing = Vec::new();
+        let mut next = Some(AgentKind::Claude);
+        while let Some(kind) = next {
+            assert!(
+                !visited.contains(&kind),
+                "the kind chain cycles at {kind:?}"
+            );
+            let (render, successor) = render_and_next(kind);
+            let prompt = driver_for(kind).render_prompt(&intent);
+
+            // Precondition: every render carries the completion protocol, so the
+            // search range is non-empty and a missing heading below is absence of
+            // the policy, not an empty or wrong render.
+            assert!(
+                prompt.contains(COMPLETION_PROTOCOL),
+                "{kind:?} rendered no completion protocol, so a missing heading would prove nothing"
+            );
+
+            let carries_policy = prompt.contains(POLICY_HEADING);
+            match render {
+                Render::WorkflowStyleControl => {
+                    controls_seen += 1;
+                    if !carries_policy {
+                        controls_missing.push(kind);
+                    }
+                }
+                Render::ClaudeStyle if !carries_policy => claude_style_missing.push(kind),
+                Render::ClaudeStyle => {}
+            }
+            visited.push(kind);
+            next = successor;
+        }
+
+        // Precondition: without the codex/pi controls, a red result could not
+        // distinguish "the claude-style fix arm omits the policy" from "the
+        // heading literal matches no real policy text on any adapter". The
+        // controls carrying the heading is what makes the claude-style
+        // assertion below a real discrimination.
+        assert!(
+            controls_seen >= 1,
+            "no workflow-style control was visited, so this test cannot discriminate"
+        );
+        assert!(
+            controls_missing.is_empty(),
+            "workflow-style controls {controls_missing:?} lost the policy heading on the \
+             FullExecute arm: this test is no longer measuring the claude-style gap"
+        );
+        assert!(
+            claude_style_missing.is_empty(),
+            "the FullExecute fix arm omits the unattended decision policy on \
+             {claude_style_missing:?} (render_claude_style): a Validate loop-back never \
+             delivers it to those adapters"
+        );
+    }
+
     #[test]
     fn both_code_prompts_still_end_with_the_completion_protocol() {
         let phase = PhaseId::new(45);
