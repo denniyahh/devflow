@@ -6,11 +6,11 @@ current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: 7
 status: awaiting_uat
-stopped_at: "Pre-UAT complete: review fixes committed 67cab06..9a2c7fe; commit-claim BLOCKER confirmed as gsd-core defect open-gsd/gsd-core#4670 and waived by the operator; next /gsd-verify-work 47"
-last_updated: "2026-09-12T22:16:40.000Z"
+stopped_at: "Pre-UAT complete: final codex/agy review findings fixed (ac3ee42..49bb324, 4 findings); commit-claim BLOCKER waived under open-gsd/gsd-core#4670; next /gsd-verify-work 47"
+last_updated: "2026-09-12T23:22:31.000Z"
 last_activity: 2026-09-12
-last_activity_desc: Confirmed the verify-work commit-claim BLOCKER as a gsd-core defect, filed open-gsd/gsd-core#4670 and recorded the operator's waiver; operator UAT remains
-state_head: 53850223722f600cd4590243f804fd1197ee6ce5
+last_activity_desc: Fixed and verified the four findings from the final codex/agy code review; full check.sh test green on 49bb324; operator UAT remains
+state_head: 49bb324301cc5920ad8601439191906084842ba8
 progress:
   total_phases: 6
   completed_phases: 1
@@ -905,8 +905,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-12T22:16:40.000Z
-**Stopped at:** Pre-UAT complete: review fixes committed 67cab06..9a2c7fe; commit-claim BLOCKER confirmed as gsd-core defect open-gsd/gsd-core#4670 and waived by the operator; next /gsd-verify-work 47
+**Last session:** 2026-09-12T23:22:31.000Z
+**Stopped at:** Pre-UAT complete: final codex/agy review findings fixed (ac3ee42..49bb324, 4 findings); commit-claim BLOCKER waived under open-gsd/gsd-core#4670; next /gsd-verify-work 47
 **Resume file:** .planning/phases/47-unattended-decision-policy-consistency/.continue-here.md
 
 ## Operator Next Steps

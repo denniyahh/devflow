@@ -216,3 +216,55 @@ No `cargo` was run against the repository by any lane or by this review. Nothing
 gap plans compile or that the specified Rust tests behave as written; the executor's first run is
 the first real evidence. The DeepSeek lane contributed nothing, so this round is two external lanes,
 not three.
+
+## Final code review — phase 47 code, pre-UAT
+
+**Run:** 2026-09-12
+**Artifact reviewed:** the phase-47 code diff `034f5b6..c4d7231` (23 files, +1250/-77), with emphasis on
+the fix round `7a7770a..c4d7231`, which no external lane had seen.
+**Outcome:** 4 findings. All 4 were verified here and all 4 are fixed (`ac3ee42`, `c66cba2`, `2790678`,
+`49bb324`).
+
+### Lane roster
+
+| Lane | Model | Result | Depth |
+|---|---|---|---|
+| agy (antigravity) | `gemini-3.8-flash-high`, effort high | **completed**, about 10 min | 14 `file:line` citations; 3 confirmed, 1 suspected |
+| codex | `gpt-5.6-terra`, reasoning effort high, sandboxed to its scratch directory | **completed**, about 17 min | 13 `file:line` citations; 1 confirmed |
+
+Neither lane wrote into the worktree. A fingerprint of HEAD, status, diff, untracked content, refs,
+stash, worktrees and `.snap.new` files was identical before and after, and no worktree file was
+modified during the run. The DeepSeek lane was not run; the operator named codex and agy.
+
+### Findings — verification status
+
+| # | Finding | Lanes | Verified here | Resolution |
+|---|---|---|---|---|
+| 1 | The worktree-guard harness exits 128 with no output in CI's container. `67cab06` nulled global git config before the harness's one query against the real checkout, which CI accepts only through a global `safe.directory`. | agy | In the pinned CI image, as root on a runner-owned copy: the committed harness exited 128 with no output; the pre-`67cab06` harness passed 13/0; the committed harness with matching ownership passed 13/0. | `c66cba2`. Global config is nulled only after that query, and a failed query is a visible FAIL. Under the same mismatch the fixed harness passes 13/0 while the committed one still exits 128. Both escapes `67cab06` closed stay closed: global excludes hiding `.planning/` gives 13/0 (pre-`67cab06` harness aborts), and an exported `GIT_OBJECT_DIRECTORY` gives 13/0 with 0 stray objects (pre-`67cab06`: 17). Parity guard `worktree_guard_harness_queries_the_checkout_before_nulling_global_config` failed before the fix. |
+| 2 | The line-anchored detector missed `- **Gate:**`, `1. **Gate:**` and `> **Gate:**` lines. | agy (codex saw it and judged it acceptable) | Probe: those renderings return false after `bd7bd7c` and true before it; both controls behaved. | `ac3ee42`. Leading list, ordinal and blockquote markup is stripped, never words. `blocking_human_checkpoint_reported_sees_through_list_and_quote_markup` failed before the fix on the `- ` prefix. |
+| 3 | A literal `\n` in agent-authored text, such as a code sample, read as a declaration and could spend a capped, audited auto-resume. | agy, codex | Probe: true both before and after `bd7bd7c`, so it predates the line anchoring. codex's proposed fix (stop splitting) failed 4 existing tests in an earlier mutation run. | `49bb324`. A raw-capture reader decodes the string values of JSON lines; the matcher scans physical lines only; the envelope fallback is unchanged. `literal_backslash_n_in_agent_text_is_not_a_line_break` failed before the fix on plain text. Mutation probe: disabling the stream branch fails the same 9 tests as HEAD, disabling the JSON decoding fails 5 including the new test, and restoring the old split fails only the new test. |
+| 4 | `check.sh test` skipped the harness whenever `cargo test` failed. | agy (codex observed the behaviour and judged it correct) | A real failed run earlier the same day printed no harness output. | `2790678`. Both exit statuses are kept, the harness always runs, and cargo's status is returned first. `check_script_run_test.rs` failed before the fix on the cargo-failure case and asserts exit 101 and exit 1. |
+
+### Convergence
+
+- **Both lanes:** finding 3. codex rated it medium, tracing it to the resume path at
+  `pipeline_launch.rs:1594`; agy rated it low.
+- **agy alone:** findings 1, 2 and 4. codex missed 1 because it did not run the CI container (its own
+  limits section says so), and recorded the behaviour behind 2 and 4 as acceptable.
+- **Both lanes, independently of each other and of this session's probe:** disabling the Claude stream
+  branch fails the same 9 stream-scoping tests (codex `190 passed; 9 failed`, with one test of its own
+  added; agy `189 passed; 9 failed`).
+- **agy's quoted evidence for finding 1 was partly wrong.** It quoted `fatal: detected dubious ownership`,
+  which the real run never printed, because the harness discarded git's stderr. The finding held; the
+  quoted output did not.
+
+### Not established
+
+- The fixed harness inside a full `scripts/check.sh test` on GitHub's runner. The container runs here
+  exercised the harness alone, so the PR's first CI run is the first real observation.
+- Whether anything relays checkpoints as list items, which is finding 2's practical reach. GSD's
+  executor template does not.
+- Live model compliance with prompt wording, which Phase 49 observes.
+
+Raw lane output is in the session scratchpad (`review47/review-agy.md`, `review47/review-codex.md`);
+codex's final review reached stdout this time as well as stderr.
