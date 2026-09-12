@@ -6,11 +6,11 @@ current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: 7
 status: awaiting_uat
-stopped_at: "Pre-UAT review fixes committed 67cab06..9a2c7fe (WR-01, WR-02, IN-01..IN-04; IN-05 deferred to #210); next /gsd-verify-work 47, which needs the operator's commit-claim waiver"
-last_updated: "2026-09-12T21:32:09.000Z"
+stopped_at: "Pre-UAT complete: review fixes committed 67cab06..9a2c7fe; commit-claim BLOCKER confirmed as gsd-core defect open-gsd/gsd-core#4670 and waived by the operator; next /gsd-verify-work 47"
+last_updated: "2026-09-12T22:16:40.000Z"
 last_activity: 2026-09-12
-last_activity_desc: Committed fixes for the gap-closure review after restoring the stream-scoping regression tests the detector narrowing had blinded; operator UAT remains
-state_head: 9a2c7fe3962c5bea0c91605948c0106a387c5b93
+last_activity_desc: Confirmed the verify-work commit-claim BLOCKER as a gsd-core defect, filed open-gsd/gsd-core#4670 and recorded the operator's waiver; operator UAT remains
+state_head: 53850223722f600cd4590243f804fd1197ee6ce5
 progress:
   total_phases: 6
   completed_phases: 1
@@ -905,8 +905,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-12T21:32:09.000Z
-**Stopped at:** Pre-UAT review fixes committed 67cab06..9a2c7fe (WR-01, WR-02, IN-01..IN-04; IN-05 deferred to #210); next /gsd-verify-work 47, which needs the operator's commit-claim waiver
+**Last session:** 2026-09-12T22:16:40.000Z
+**Stopped at:** Pre-UAT complete: review fixes committed 67cab06..9a2c7fe; commit-claim BLOCKER confirmed as gsd-core defect open-gsd/gsd-core#4670 and waived by the operator; next /gsd-verify-work 47
 **Resume file:** .planning/phases/47-unattended-decision-policy-consistency/.continue-here.md
 
 ## Operator Next Steps
