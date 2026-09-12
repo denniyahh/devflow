@@ -3699,11 +3699,11 @@ mod tests {
         // This control makes the positive assertions discriminate rather than
         // merely proving that the fixture itself contains a success marker.
         let after = format!("{success_line}\n{decision_record}");
-        assert_ne!(status_for(&after), Some(AgentStatus::Success));
+        assert_eq!(status_for(&after), None);
         let escaped_after = serde_json::to_string(&after).unwrap();
         let escaped_after = &escaped_after[1..escaped_after.len() - 1];
         let after_stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped_after);
-        assert_ne!(status_for(&after_stream), Some(AgentStatus::Success));
+        assert_eq!(status_for(&after_stream), None);
 
         // The parser permits short trailing text within TAIL_BUDGET_CHARS;
         // only the long control above measures the prompt contract's tail.
