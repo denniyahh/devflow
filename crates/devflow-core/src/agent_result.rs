@@ -672,11 +672,11 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 }
 
 /// Core matcher shared by both search targets (raw stdout and the unescaped
-/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans for
-/// a case-insensitive `gate` label, tolerating surrounding markdown emphasis
-/// (`*`), code-span backticks (`` ` ``), and whitespace up to the following
-/// `:`, then compares the VALUE token immediately after the colon exactly
-/// against [`HUMAN_GATE_VALUE`].
+/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans only
+/// for a line starting with a case-insensitive `gate` label, tolerating
+/// surrounding markdown emphasis (`*`), code-span backticks (`` ` ``), and
+/// whitespace up to the following `:`, then compares the VALUE token
+/// immediately after the colon exactly against [`HUMAN_GATE_VALUE`].
 ///
 /// The backtick tolerance is not speculative — it is the single reason this
 /// matcher failed against the first real checkpoint ever observed. The live
@@ -691,14 +691,18 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
 fn text_reports_human_gate(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let mut search_from = 0;
-    while let Some(rel_idx) = lower[search_from..].find("gate") {
-        let idx = search_from + rel_idx;
-        let after_label = &lower[idx + "gate".len()..];
+    // Some non-Claude adapters retain agent text JSON-escaped in their raw
+    // capture. Treat those escaped newlines as the same logical boundary as a
+    // physical newline without admitting a `gate:` phrase mid-line.
+    text.lines().flat_map(|line| line.split("\\n")).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let line = lower.trim_start_matches(['*', ' ', '\t', '`']);
+        let Some(after_label) = line.strip_prefix("gate") else {
+            return false;
+        };
         let after_label = after_label.trim_start_matches(['*', ' ', '`']);
         if let Some(rest) = after_label.strip_prefix(':') {
-            let value_region = rest.trim_start_matches(['*', ' ', '`']);
+            let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
             let value_token: String = value_region
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -707,9 +711,8 @@ fn text_reports_human_gate(text: &str) -> bool {
                 return true;
             }
         }
-        search_from = idx + "gate".len();
-    }
-    false
+        false
+    })
 }
 
 /// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
@@ -3740,6 +3743,16 @@ mod tests {
         );
         assert!(!text_reports_human_gate(&resume));
         assert!(!blocking_human_checkpoint_reported(&envelope(&resume)));
+
+        let prose = "Resolved gate: blocking-human using the recorded evidence.";
+        assert!(
+            !text_reports_human_gate(prose),
+            "only a Gate-labeled line may report a checkpoint"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&envelope(prose)),
+            "free-form reasoning about a resolved gate must not request another resume"
+        );
     }
 
     #[test]
@@ -4037,7 +4050,9 @@ mod tests {
     // Each negative asserts a NEGATIVE CONTROL first: `text_reports_human_gate`
     // must still match the raw capture. Without it a negative would also pass
     // against a fixture that simply contains no gate text, and would keep
-    // passing if someone deleted the gate line from the fixture.
+    // passing if someone deleted the gate line from the fixture. Presence is
+    // not the same claim: the matcher is line-anchored, so gate text it cannot
+    // match would let every negative pass with the stream branch removed.
 
     /// **REGRESSION — review constraint 3, the prompt-echo false positive.**
     ///
@@ -4294,7 +4309,10 @@ mod tests {
     /// suppressing real gates.
     #[test]
     fn non_stream_captures_still_use_the_raw_scan_after_widening() {
-        let plain = format!("Some narration.\n{}\n", gate_declaration_text());
+        let plain = format!(
+            "Some narration.\n{}\n",
+            gate_declaration_text().replace("\\n", "\n")
+        );
         assert!(
             blocking_human_checkpoint_reported(&plain),
             "plain text must still be raw-scanned"
@@ -4503,7 +4521,7 @@ mod tests {
     /// shipped in `06675da`.
     #[test]
     fn one_stray_json_line_does_not_suppress_a_plain_text_gate() {
-        let gate = gate_declaration_text();
+        let gate = gate_declaration_text().replace("\\n", "\n");
 
         assert!(
             blocking_human_checkpoint_reported(&gate),
@@ -5621,14 +5639,19 @@ mod tests {
 
     /// Text that merely DOCUMENTS a gate rendering — the shape a plan file, a
     /// GSD reference document, or an agent narrating its next task carries.
-    /// Same code-span rendering as a real declaration, which is precisely why a
-    /// substring scan cannot tell the two apart and the EVENT must decide.
+    /// Same line-leading code-span rendering as a real declaration, which is
+    /// precisely why a text scan cannot tell the two apart and the EVENT must
+    /// decide.
     ///
-    /// Single line, no double quotes, so it drops into a JSON string field
-    /// without further escaping.
+    /// The label must start its own line. `text_reports_human_gate` matches
+    /// only a line-leading label, so a mid-line rendering matches nothing, and
+    /// every negative built on it would pass with the stream branch removed.
+    ///
+    /// The line break is a JSON-escaped `\n` and there are no double quotes, so
+    /// it drops into a JSON string field without further escaping.
     fn gate_documenting_text() -> String {
         format!(
-            "The next task is declared **Gate:** `{HUMAN_GATE_VALUE}` in the plan, so the executor must stop rather than auto-select."
+            "The next task is declared in the plan, so the executor must stop rather than auto-select:\\n**Gate:** `{HUMAN_GATE_VALUE}`"
         )
     }
 
