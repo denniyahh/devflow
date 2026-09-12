@@ -2,11 +2,11 @@
 source: crates/devflow-cli/src/pipeline_launch.rs
 expression: turn2
 ---
-This is phase 47 of a headless DevFlow run. You previously stopped at a blocking-human gate, but no human operator is available to answer it — this run is unattended, and none is coming. DevFlow resumed you specifically to resolve that gate: resolve it yourself, using your own best judgment, and continue the work. You MUST record your reasoning for the decision you made in your final message, so the decision is auditable after the fact.
+This is phase 47 of a headless DevFlow run. You previously stopped at a blocking-human gate, but no human operator is available to answer it — this run is unattended, and none is coming. DevFlow resumed you specifically to resolve that gate: resolve it yourself, using your own best judgment, and continue the work. You MUST record your reasoning for the decision you made in your final message, so the decision is auditable after the fact. In that reasoning, refer to the gate you resolved in plain prose and do not copy the gate-declaration line from the checkpoint, because DevFlow can mistake a copied declaration line for a new checkpoint.
 
 ## Completion Protocol (REQUIRED)
 
-When all work is done, your FINAL message must be exactly:
+When all work is done, the LAST line of your FINAL message must be exactly:
 
 DEVFLOW_RESULT: {"status": "success"}
 
@@ -14,4 +14,4 @@ If something prevents completion:
 
 DEVFLOW_RESULT: {"status": "failed", "reason": "specific explanation"}
 
-DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.
+Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.

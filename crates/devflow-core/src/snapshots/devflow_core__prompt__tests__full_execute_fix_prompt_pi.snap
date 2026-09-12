@@ -18,7 +18,7 @@ This authority never extends to a package-verification checkpoint: do not self-r
 
 ## Completion Protocol (REQUIRED)
 
-When all work is done, your FINAL message must be exactly:
+When all work is done, the LAST line of your FINAL message must be exactly:
 
 DEVFLOW_RESULT: {"status": "success"}
 
@@ -26,4 +26,4 @@ If something prevents completion:
 
 DEVFLOW_RESULT: {"status": "failed", "reason": "specific explanation"}
 
-DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.
+Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.
