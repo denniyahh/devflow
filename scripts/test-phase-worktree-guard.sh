@@ -9,10 +9,12 @@
 # than a discriminator.
 set -euo pipefail
 
-# Hermetic: the host checkout's git env must not leak into the fixture.
-# GIT_CONFIG_PARAMETERS and GIT_CONFIG_COUNT carry command-line and environment
-# git config, which outranks the fixture's repository settings.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_PREFIX GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT 2>/dev/null || true
+# Hermetic: neither the host checkout's Git environment nor its config may
+# leak into the fixture. Git owns the complete local-environment inventory;
+# listing it here avoids silently missing a new carrier such as object storage.
+mapfile -t git_local_env_vars < <(git rev-parse --local-env-vars)
+unset "${git_local_env_vars[@]}"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 GUARD="$(cd "$(dirname "$0")" && pwd)/lint-phase-worktree.sh"
 [ -x "$GUARD" ] || { echo "missing guard: $GUARD" >&2; exit 1; }
