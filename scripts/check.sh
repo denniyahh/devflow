@@ -54,10 +54,21 @@ run_test() {
     # OVERRIDES INSTA_UPDATE=no and re-blesses a drifted baseline green. Both
     # were verified by experiment (47-RESEARCH.md § A-2, § A-3). Dropping
     # either reopens a green-over-unread guard.
+    #
+    # The worktree-guard harness runs even when cargo test fails, for the same
+    # one-run-reports-everything reason: under `set -e` a failing cargo run used
+    # to end the script before the harness reported anything. Both exit statuses
+    # are kept; either failing fails the target, with cargo's status first.
+    local cargo_status=0 harness_status=0
     echo "==> env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast"
-    env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast
+    env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast || cargo_status=$?
     echo "==> bash scripts/test-phase-worktree-guard.sh"
-    bash scripts/test-phase-worktree-guard.sh
+    bash scripts/test-phase-worktree-guard.sh || harness_status=$?
+    if [ "$cargo_status" -ne 0 ] || [ "$harness_status" -ne 0 ]; then
+        echo "error: cargo test exited $cargo_status; worktree-guard harness exited $harness_status" >&2
+        [ "$cargo_status" -ne 0 ] && return "$cargo_status"
+        return "$harness_status"
+    fi
 }
 
 run_build() {

@@ -97,7 +97,8 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   not resolve at all). Guard: `scripts/lint-phase-worktree.sh`; both directions exercised by
   `scripts/test-phase-worktree-guard.sh` (13 checks, including two negative controls that must PASS —
   a guard only ever observed refusing has not been shown to discriminate). `scripts/check.sh test`
-  runs it after `cargo test`, so every CI job that calls that target gates on it.
+  runs it after `cargo test`, even when `cargo test` fails, so every CI job that calls that target
+  gates on it.
   The harness unsets every repository-local git environment variable (`git rev-parse
   --local-env-vars`), queries the real checkout's recorded modes with the inherited config (CI
   accepts its runner-owned checkout only through a global `safe.directory`), and only then disables
