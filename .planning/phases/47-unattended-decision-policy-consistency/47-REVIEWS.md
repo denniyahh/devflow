@@ -142,3 +142,77 @@ spliced into the plan unchanged, and byte-compared after writing:
 **Not established by any of this:** no `cargo` was run against the repository, so nothing here shows
 the plans compile or that the specified Rust tests behave as written at runtime; that is the
 executor's first real evidence.
+
+## Gap-plan review — 47-06, 47-07
+
+**Run:** 2026-09-11
+**Artifacts reviewed:** `47-06-PLAN.md` (CR-01 wording fix) and `47-07-PLAN.md` (WR-01 fixture
+isolation), at `e69fe3d`
+**Inputs given to every lane:** both plans, `47-VERIFICATION.md`, `47-REVIEW.md`, and the operator
+decisions (CR-01 wording-only; WR-01 in scope; the three `check.sh` truths already exercised).
+
+### Lane roster
+
+| Lane | Model / mode | Result | Depth |
+|---|---|---|---|
+| gsd-plan-checker (internal) | — | completed: 0 blockers, 0 warnings, 10 info | — |
+| agy | `gemini-3.8-flash-high`, effort high, `--print-timeout 30m`, cwd in scratch | completed (7m36s) | 28 `file:line` citations |
+| codex | `gpt-5.6-terra`, reasoning high, `-s workspace-write -C <scratch>` | completed (5m14s, 174,862 tokens). The first probe hit the **usage limit**; the lane waited for the stated reset and re-probed (`PROBE_OK`) before running | 40 `file:line` citations |
+| DeepSeek v4 Pro | `pi --provider deepseek --tools read,grep,find,ls` (read-only tools) | **DROPPED — timeout.** Killed by the 60-minute cap (`exit=124`) with 0 bytes on stdout and stderr. Recorded as a drop, not a pass. Not re-run: two external lanes completed | — |
+
+Every lane was probed before running (`agy --version` → 1.2.1 with `gemini-3.8-flash-high` listed;
+`pi` → `PROBE_OK`; `codex` → usage limit, then `PROBE_OK` after the reset). Worktree HEAD, `git status`
+and the main checkout's status were snapshotted before the run and compared after every lane:
+unchanged each time, and no `scripts/.mutant-guard-test.sh` was left behind. The DeepSeek balance
+moved $3.00 → $2.99 over the run; that is not attributable to the dropped lane alone, because the
+operator's `hermes gateway` daemon (running) also bills DeepSeek.
+
+### Findings — verification status
+
+Every finding below was checked against source in this repository before being recorded. Findings 1
+and 2 were confirmed by execution against synthetic fixtures, each case set including one that must
+flip.
+
+| # | Finding | Raised by | Verified | Severity (lane → assessed) |
+|---|---|---|---|---|
+| 1 | **47-06's `prompt.rs` region gate is blind to pure insertions after lines 55 and 56.** The awk uses the *old* hunk count; a zero count computes the end as start−1. | codex | **Executed** with the gate's exact sed/awk: `@@ -56,0` and `@@ -55,0` → `outside=0`; controls `@@ -57,1`, `@@ -41,0`, `@@ -60` → `outside=1`; in-range `@@ -45,2` → `0`. An edit *to* the pinned text at ≥57 is still caught. | HIGH → LOW |
+| 2 | **47-06 Task 2's snapshot gate passes a wrong two-line edit.** It requires both new lines and absence of the old opening line, but never absence of the old closing line. | codex | **Executed** on copies of the real Claude snapshot: intended edit PASS; heading replaced by new line 2 with the old closing line kept → PASS (`old2_still_present=1`); edit missing new line 2 → FAIL (control). | MEDIUM → MEDIUM |
+| 3 | **Intermediate red commit.** `feat(47-06)` leaves three snapshot tests failing until Task 2's `test(47-06)`. An interrupted executor, or a push in that window, reads as a broken tree; `git bisect` sees a regression. | agy, codex, checker | Task 1 commits `test(47-06)` then `feat(47-06)` (47-06:213, :235); re-bless is Task 2 (:272-307); the three tests are two core snapshot tests plus `the_gate_rule_holds_in_both_delivered_turns` (`pipeline_launch.rs:4016`); pre-push runs the full check (`scripts/hooks/pre-push:217-220`). | agy MEDIUM, codex HIGH, checker info → MEDIUM |
+| 4 | **Gate-detector interaction.** Reasoning that restates a `gate: blocking-human` label can make a *failed* Claude stage read as a confirmed checkpoint and resume up to `MAX_CHECKPOINT_RESUMES` = 3. The plan's decision-record fixture deliberately avoids the label, so its test does not exercise this. | planner (T-47-14), agy, codex, checker | Matcher `agent_result.rs:693-713`; every top-level result event scanned `:1474-1480`; sole caller `pipeline_launch.rs:1594-1603` inside `Action::GateReview`; only `Failed`/`Unknown`/`IdleTimeout` map to GateReview (`outcome_policy.rs:59-71`, re-read here). A Success result never triggers it. Exposure pre-exists, from 47-03's final-message reasoning demand. | codex HIGH, agy LOW → MEDIUM (bounded) |
+| 5 | **The "reasoning after the result line" control only holds past the 4000-character tail budget.** A short trailing sentence still parses as success, so the test cannot substantiate "must be last". | codex, checker | `parse_marker_lines` scans bottom-up within the budget (`agent_result.rs:2016-2044`); the fixture record is >5000 chars (47-06:191-193). | MEDIUM → MEDIUM |
+| 6 | **The parser-boundary test covers plain text and Claude single-document/stream only**; Codex, OpenCode and Antigravity event shapes are not exercised with long reasoning. | agy, codex | 47-06:200-206. Already listed under "What this plan does not establish" (47-06:391-394). | codex MEDIUM, agy LOW → LOW (acknowledged) |
+| 7 | **47-07's checklist count.** The plan changes "7 cases" to "8 cases"; counted as the existing text counts, 7a/7b/7c make 10. | codex | Today's 7 = the six named `check` calls 1–6 (`scripts/test-phase-worktree-guard.sh:60-94`) plus the separately printed 3b (`:78`). The plan keeps those (47-07:180) and adds 7a/7b/7c (:194-202); the summary becomes `passed=13` = 3 mode checks + 10. | HIGH → LOW |
+| 8 | **`hostile_commit <dir>` never specifies `git -C "$dir"`.** A literal implementation runs in `$REPO`, whose fixture-local isolation disarms 7a/7b. | codex (suspected) | 47-07:189-191. Fails loudly: 7a/7b would report allow and the `passed=13` gate fails, so not a false green. | MEDIUM → LOW |
+| 9 | **47-07's mutant is created in `scripts/`**; a hard kill can leave an untracked executable. | codex (suspected) | Gate at 47-07:214. It must sit beside the guard to resolve it; the trap removes it on normal exit. | LOW → LOW |
+| 10 | **Environment-injected git config** (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) outranks the fixture's repo-local isolation and is not unset. | agy (suspected) | `scripts/test-phase-worktree-guard.sh:13` unsets `GIT_DIR … GIT_CONFIG GIT_PREFIX` only. agy's `/etc/gitconfig` example is wrong: repo-local config outranks system config. | LOW → LOW |
+
+**Checker advisories not duplicated above:** T-47-14 should record the Success short-circuit and the
+3-resume cap; name the numstat gate, not the insta diff read, as what enforces D-15;
+`requirements: [WR-01]` names a review finding rather than a REQUIREMENTS.md ID; `47-VALIDATION.md`
+maps none of the four new tasks; `47-RESEARCH.md:702` Open Questions lack RESOLVED markers;
+REQUIREMENTS.md marks DECN-03 complete while VERIFICATION lists it BLOCKED.
+
+### Convergence
+
+- **Found by more than one lane:** the red intermediate commit (3), the gate-detector interaction (4),
+  the tail-budget control scope (5), and the parser coverage limit (6).
+- **codex alone:** the region-gate insertion blind spot (1), the snapshot-gate weakness (2), the
+  checklist count (7), `hostile_commit` (8) and the mutant location (9). Findings 1 and 2 are the two
+  that change what a gate can prove, and both reproduced.
+- **agy alone:** environment-injected git config (10).
+- **Checked by the lanes, no finding:** the new wording removes the contradiction at every policy
+  delivery site, and the four stage prompts with their own "must be exactly" line
+  (`prompt.rs:271-279, 350-360, 478-487, 563-573`) ask for no other content (agy, codex, checker);
+  47-07's isolation does not bypass the guard under test, with six direct `"$GUARD" --staged` calls
+  retained (agy, codex, checker); D-02/D-04 pinned text lies outside every intended edit (agy, codex,
+  checker).
+- **agy reported executing 47-07's gates outside the repository** (unmodified script → `gate_rc=1`;
+  with isolation → `gate_rc=0`, `passed=10`; mutant → `FAIL 7c`). Not reproduced here; recorded as
+  the lane's claim.
+
+### Not established
+
+No `cargo` was run against the repository by any lane or by this review. Nothing here shows the
+gap plans compile or that the specified Rust tests behave as written; the executor's first run is
+the first real evidence. The DeepSeek lane contributed nothing, so this round is two external lanes,
+not three.
