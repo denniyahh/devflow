@@ -673,7 +673,8 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 
 /// Core matcher shared by both search targets (raw stdout and the unescaped
 /// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans only
-/// for a line starting with a case-insensitive `gate` label, tolerating
+/// for a line whose first word, after any list, ordinal or blockquote markup
+/// ([`strip_leading_markup`]), is a case-insensitive `gate` label, tolerating
 /// surrounding markdown emphasis (`*`), code-span backticks (`` ` ``), and
 /// whitespace up to the following `:`, then compares the VALUE token
 /// immediately after the colon exactly against [`HUMAN_GATE_VALUE`].
@@ -696,7 +697,7 @@ fn text_reports_human_gate(text: &str) -> bool {
     // physical newline without admitting a `gate:` phrase mid-line.
     text.lines().flat_map(|line| line.split("\\n")).any(|line| {
         let lower = line.to_ascii_lowercase();
-        let line = lower.trim_start_matches(['*', ' ', '\t', '`']);
+        let line = strip_leading_markup(&lower);
         let Some(after_label) = line.strip_prefix("gate") else {
             return false;
         };
@@ -713,6 +714,27 @@ fn text_reports_human_gate(text: &str) -> bool {
         }
         false
     })
+}
+
+/// Strip the markdown a relayed declaration line can carry before its label:
+/// indentation, blockquote markers (`>`), a list bullet (`-`, `+`, `*`) or an
+/// ordinal (`1.`, `2)`), emphasis (`*`) and code-span backticks.
+///
+/// An external review (2026-09-12) found that the line-anchored matcher
+/// otherwise missed `- **Gate:** ...` and `> **Gate:** ...`, both of which the
+/// earlier substring scan matched. Only markup is stripped, never words, so
+/// prose such as `- Resolved gate: blocking-human` still does not start with
+/// the label.
+fn strip_leading_markup(line: &str) -> &str {
+    let is_markup = |c: char| c.is_whitespace() || matches!(c, '>' | '-' | '+' | '*' | '`');
+    let rest = line.trim_start_matches(is_markup);
+    let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    match after_digits.strip_prefix(['.', ')']) {
+        Some(after_ordinal) if after_digits.len() < rest.len() => {
+            after_ordinal.trim_start_matches(is_markup)
+        }
+        _ => rest,
+    }
 }
 
 /// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
@@ -3962,6 +3984,31 @@ mod tests {
     fn blocking_human_checkpoint_reported_tolerates_whitespace_and_emphasis() {
         let stdout = format!("  **Gate:**   {HUMAN_GATE_VALUE}   \n");
         assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    /// A relayed checkpoint can carry list or blockquote markup before its label
+    /// (external review, 2026-09-12). The line-anchored matcher must see through
+    /// that markup, while prose that merely mentions a gate inside a list item or
+    /// a quote must still not match.
+    #[test]
+    fn blocking_human_checkpoint_reported_sees_through_list_and_quote_markup() {
+        for prefix in ["- ", "+ ", "* ", "1. ", "12) ", "> ", "> - ", "  - "] {
+            let stdout = format!("{prefix}**Gate:** `{HUMAN_GATE_VALUE}`\n");
+            assert!(
+                blocking_human_checkpoint_reported(&stdout),
+                "a declaration behind {prefix:?} must be recognised"
+            );
+        }
+        for prose in [
+            "- Resolved gate: blocking-human using the recorded evidence.",
+            "> Note: the gate: blocking-human was answered.",
+            "1. The gate: blocking-human is already resolved.",
+        ] {
+            assert!(
+                !blocking_human_checkpoint_reported(prose),
+                "list or quote markup must not turn prose into a declaration: {prose:?}"
+            );
+        }
     }
 
     /// REGRESSION — the rendering a real headless run actually produces.
