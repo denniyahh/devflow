@@ -39,11 +39,11 @@ const SHIP_REVIEW_ANGLES: &[&str] = &[
 /// so a reader of any one of them can find this explanation.
 const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
 
-/// The completion contract every agent must honor as its final message.
+/// The completion contract every agent must honor as the last line of its final message.
 pub const COMPLETION_PROTOCOL: &str = "\
 ## Completion Protocol (REQUIRED)\n\
 \n\
-When all work is done, your FINAL message must be exactly:\n\
+When all work is done, the LAST line of your FINAL message must be exactly:\n\
 \n\
 DEVFLOW_RESULT: {\"status\": \"success\"}\n\
 \n\
@@ -51,8 +51,8 @@ If something prevents completion:\n\
 \n\
 DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n\
 \n\
-DevFlow reads this line to decide whether the stage succeeded. \
-Output nothing after it.";
+Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. \
+DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
 
 /// The single definition of who may resolve a `blocking-human` gate
 /// (47-CONTEXT.md D-04). It is a macro and not only a `const` because

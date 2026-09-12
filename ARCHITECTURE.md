@@ -111,8 +111,8 @@ Agent backends are isolated behind a trait
   not a single shared instruction template. Every prompt hands the agent its
   GSD slash command (`Stage::gsd_command()`) plus the `DEVFLOW_RESULT`
   completion contract (`DEVFLOW_RESULT: {"status": "success"}` /
-  `{"status": "failed", "reason": "..."}`, required as the agent's exact
-  final message). Three stages get dedicated prompts:
+  `{"status": "failed", "reason": "..."}`, required as the last line of the
+  agent's final message, with any decision reasoning above it). Three stages get dedicated prompts:
   - **Define / Plan** — idempotent: if the stage's deliverable
     (`CONTEXT.md` / `PLAN.md`) already exists, the agent reports success
     without re-running the GSD command (headless Codex cannot answer GSD's
