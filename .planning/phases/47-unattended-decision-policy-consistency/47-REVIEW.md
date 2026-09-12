@@ -1,6 +1,7 @@
 ---
 phase: 47-unattended-decision-policy-consistency
 reviewed: 2026-09-12T17:15:45Z
+resolved: 2026-09-12T21:32:09Z
 depth: deep
 diff_range: ead8443..7a7770a
 files_reviewed: 13
@@ -23,7 +24,7 @@ findings:
   warning: 2
   info: 5
   total: 7
-status: issues_found
+status: resolved
 ---
 
 # Phase 47: Code Review Report (gap-closure re-review, plans 47-06 / 47-07)
@@ -271,6 +272,38 @@ this worktree was touched.
 
 ---
 
-_Reviewed: 2026-09-12T17:15:45Z_
+## Finding Resolutions — 2026-09-12
+
+Operator decision (2026-09-12): fix every finding except IN-05, which is backlogged. Codex applied
+the fixes. One of them left the stream-scoping regression tests unable to fail, and that was
+corrected before commit (IN-02 below). Commits `67cab06`..`9a2c7fe`.
+
+- **WR-01 closed by `67cab06`.** The harness unsets every name `git rev-parse --local-env-vars`
+  lists (15 here; the old list covered 8) and runs with global and system git config disabled. The
+  repository-local hook and signing pins remain. The E1/E2 escape probes were run by codex and not
+  re-run independently.
+- **WR-02 closed by `bbf696d`.** `scripts/check.sh test` runs the harness after `cargo test`
+  (`passed=13 failed=0` on the host). Not yet observed in GitHub CI.
+- **IN-01 closed by `ae9970a`.** ARCHITECTURE.md scopes the last-line contract to prompts that use
+  `COMPLETION_PROTOCOL`. `VALIDATE_VERDICT_CONTRACT` is unchanged.
+- **IN-02 closed by `bd7bd7c`, with the detector narrowed.** `text_reports_human_gate` matches only a
+  line that starts with the Gate label, with JSON-escaped newlines counted as line breaks. Prose
+  such as "Resolved gate: blocking-human" no longer matches, and the new assertion fails against
+  the previous matcher. Narrowing blinded the stream-scoping negatives, whose fixture put the label
+  mid-line: with the Claude stream branch disabled, all of them passed. The fixture now starts a
+  line with the label, and the negatives' controls again require a match. Disabling the branch now
+  fails the same 9 tests it failed before the change. A copied line-leading declaration still
+  matches, and the narrowing was not re-run against a live checkpoint.
+- **IN-03 closed by `c3de608`.** Both long-trailing-text controls assert no result at all.
+- **IN-04 closed by `bd7bd7c`.** The two unresolved links in the resume prompt's doc comment are now
+  code spans.
+- **IN-05 deferred** to [#210](https://github.com/denniyahh/devflow/issues/210).
+
+The review above remains the record of findings. These resolutions establish code, test and harness
+behaviour, not live agent compliance, which Phase 49 observes.
+
+---
+
+_Reviewed: 2026-09-12T17:15:45Z; resolved: 2026-09-12T21:32:09Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_

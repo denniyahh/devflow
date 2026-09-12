@@ -6,11 +6,11 @@ current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: 7
 status: awaiting_uat
-stopped_at: "Pre-UAT step 2 of 3 done: independent deep review of ead8443..7a7770a committed as aba3cee (0 critical, 2 warning, 5 info; each finding checked against source); next decide fixes, then /gsd-verify-work 47"
-last_updated: "2026-09-12T17:24:42.574Z"
+stopped_at: "Pre-UAT review fixes committed 67cab06..9a2c7fe (WR-01, WR-02, IN-01..IN-04; IN-05 deferred to #210); next /gsd-verify-work 47, which needs the operator's commit-claim waiver"
+last_updated: "2026-09-12T21:32:09.000Z"
 last_activity: 2026-09-12
-last_activity_desc: Re-verified Phase 47 after closing CR-01 and WR-01; source and harness checks passed, operator UAT remains
-state_head: aba3ceecbd531fd4588eb223ddf3112e5d3a5cfb
+last_activity_desc: Committed fixes for the gap-closure review after restoring the stream-scoping regression tests the detector narrowing had blinded; operator UAT remains
+state_head: 9a2c7fe3962c5bea0c91605948c0106a387c5b93
 progress:
   total_phases: 6
   completed_phases: 1
@@ -905,8 +905,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-12T17:24:42.344Z
-**Stopped at:** Pre-UAT step 2 of 3 done: independent deep review of ead8443..7a7770a committed as aba3cee (0 critical, 2 warning, 5 info; each finding checked against source); next decide fixes, then /gsd-verify-work 47
+**Last session:** 2026-09-12T21:32:09.000Z
+**Stopped at:** Pre-UAT review fixes committed 67cab06..9a2c7fe (WR-01, WR-02, IN-01..IN-04; IN-05 deferred to #210); next /gsd-verify-work 47, which needs the operator's commit-claim waiver
 **Resume file:** .planning/phases/47-unattended-decision-policy-consistency/.continue-here.md
 
 ## Operator Next Steps
