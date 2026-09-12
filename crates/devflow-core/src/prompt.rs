@@ -598,10 +598,11 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 ///
 /// The resume wording tells the agent to name the resolved gate in prose rather
 /// than copy the checkpoint's declaration line. A failed resume capture is
-/// re-read by [`crate::agent_result::text_reports_human_gate`], so a copied
-/// declaration line could read as a new checkpoint. The sentence must never
-/// carry that detector's match shape; [`crate::agent_result::tests::resume_prompt_does_not_read_as_a_blocking_human_checkpoint`]
-/// pins that boundary.
+/// re-read by `agent_result::text_reports_human_gate`, so a copied declaration
+/// line could read as a new checkpoint. The detector accepts only a
+/// `**Gate:**`-labeled line; the
+/// `resume_prompt_does_not_read_as_a_blocking_human_checkpoint` test pins that
+/// boundary and rejects prose such as `Resolved gate: blocking-human`.
 ///
 /// Deliberately deterministic: no timestamp, no random content, no varying
 /// state. Two calls for the same `phase` produce byte-identical strings, so
