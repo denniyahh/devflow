@@ -127,8 +127,8 @@ Plans:
 **Wave 1**
 
 - [x] 47-01-PLAN.md — Snapshot drift guard: `insta` wiring, hardened `run_test`, three-case control (wave 1)
-- [ ] 47-06-PLAN.md — Gap closure CR-01: completion protocol puts reasoning above a last-line `DEVFLOW_RESULT`; prompt-to-parser contract test; nine baselines re-blessed (gap wave 1)
-- [ ] 47-07-PLAN.md — Gap closure WR-01: worktree-guard test fixture isolated from inherited hooks and commit signing (gap wave 1)
+- [ ] 47-06-PLAN.md — Gap closure CR-01: completion protocol puts reasoning above a last-line `DEVFLOW_RESULT`; prompt-to-parser contract test; resume prompt names the resolved gate in prose, pinned against the gate detector; nine baselines re-blessed (gap wave 1)
+- [ ] 47-07-PLAN.md — Gap closure WR-01: worktree-guard test fixture isolated from inherited hooks, commit signing and environment-injected git config (gap wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
