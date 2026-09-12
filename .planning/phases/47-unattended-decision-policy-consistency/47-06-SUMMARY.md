@@ -42,8 +42,8 @@ status: complete
 ## Accomplishments
 
 - `COMPLETION_PROTOCOL` now requires `DEVFLOW_RESULT` as the last line while allowing decision reasoning above it; ARCHITECTURE describes the same contract.
-- Added a production-boundary test covering plain text, a single Claude envelope, and a three-turn Claude stream. It includes an over-5000-character record, a long-trailing-text negative control, and a short-trailing-text tail-budget boundary.
-- Added a detector control proving a real declaration is detected while the rendered resume prompt itself is not; the prompt tells the agent to describe the resolved gate in prose.
+- Added a production-boundary test covering plain text, a single Claude envelope, and a three-turn Claude stream. It includes an over-5000-character record, a long-trailing-text negative control, and a short-trailing-text control.
+- Added a detector control proving a real declaration is detected while the rendered resume prompt and free-form resolved-gate prose are not; the prompt tells the agent to describe the resolved gate in prose.
 - Re-blessed exactly nine reviewed snapshots: eight have 2 added/2 deleted lines and the resume snapshot has 3/3.
 
 ## Task Commits
@@ -73,4 +73,3 @@ None.
 - Five task commits exist in the required red-test-before-fix order.
 - No `.snap.new` file remains.
 - Full hardened test suite passed locally; this is not a CI or live-agent guarantee.
-
