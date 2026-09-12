@@ -596,6 +596,13 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 /// reasoning in your final message. It grants nothing beyond that gate —
 /// package-verification checkpoints are never routed through this injection.
 ///
+/// The resume wording tells the agent to name the resolved gate in prose rather
+/// than copy the checkpoint's declaration line. A failed resume capture is
+/// re-read by [`crate::agent_result::text_reports_human_gate`], so a copied
+/// declaration line could read as a new checkpoint. The sentence must never
+/// carry that detector's match shape; [`crate::agent_result::tests::resume_prompt_does_not_read_as_a_blocking_human_checkpoint`]
+/// pins that boundary.
+///
 /// Deliberately deterministic: no timestamp, no random content, no varying
 /// state. Two calls for the same `phase` produce byte-identical strings, so
 /// the `checkpoint_auto_decided` audit event (D-07, plan 28-03) can quote
@@ -610,7 +617,8 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
         coming. DevFlow resumed you specifically to resolve that gate: \
         resolve it yourself, using your own best judgment, and continue the \
         work. You MUST record your reasoning for the decision you made in \
-        your final message, so the decision is auditable after the fact.\n\
+        your final message, so the decision is auditable after the fact. \
+        In that reasoning, refer to the gate you resolved in plain prose and do not copy the gate-declaration line from the checkpoint, because DevFlow can mistake a copied declaration line for a new checkpoint.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
