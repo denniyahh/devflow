@@ -46,21 +46,26 @@ check() { # check <name> <expected: refuse|allow> <actual_exit>
     fi
 }
 
+init_fixture_repo() { # init_fixture_repo <dir>
+    local dir="$1"
+    mkdir -p "$dir" "$TMP/no-hooks"
+    git -C "$dir" init -q -b workspace/tester .
+    # Inherited hooks and inherited SSH commit signing both come from global git
+    # config. Signing with no ssh-agent was observed to abort with exit 128; these
+    # settings are local to the fixture repository, so the guard's environment is untouched.
+    git -C "$dir" config core.hooksPath "$TMP/no-hooks"
+    git -C "$dir" config commit.gpgsign false
+    git -C "$dir" config user.email t@example.com; git -C "$dir" config user.name Tester
+    mkdir -p "$dir/.planning" "$dir/crates/devflow-core/src" "$dir/.planning/phases/47-demo"
+    printf -- '---\ncurrent_phase: 47\n---\n' > "$dir/.planning/STATE.md"
+    echo "fn main() {}" > "$dir/crates/devflow-core/src/lib.rs"
+    echo "spec" > "$dir/.planning/phases/47-demo/47-CONTEXT.md"
+    git -C "$dir" add -A >/dev/null; git -C "$dir" commit -qm init
+}
+
 REPO="$TMP/repo"
-mkdir -p "$REPO"; cd "$REPO"
-git init -q -b workspace/tester .
-# Inherited hooks and inherited SSH commit signing both come from global git
-# config. Signing with no ssh-agent was observed to abort with exit 128; these
-# settings are local to the fixture repository, so the guard's environment is untouched.
-mkdir -p "$TMP/no-hooks"
-git config core.hooksPath "$TMP/no-hooks"
-git config commit.gpgsign false
-git config user.email t@example.com; git config user.name Tester
-mkdir -p .planning crates/devflow-core/src ".planning/phases/47-demo"
-printf -- '---\ncurrent_phase: 47\n---\n' > .planning/STATE.md
-echo "fn main() {}" > crates/devflow-core/src/lib.rs
-echo "spec" > ".planning/phases/47-demo/47-CONTEXT.md"
-git add -A >/dev/null; git commit -qm init
+init_fixture_repo "$REPO"
+cd "$REPO"
 
 echo "== before any worktree exists =="
 echo "// edit" >> crates/devflow-core/src/lib.rs; git add crates >/dev/null
@@ -101,6 +106,43 @@ echo "// edit" >> crates/devflow-core/src/lib.rs; git add crates >/dev/null
 set +e; "$GUARD" --staged >/dev/null 2>&1; rc=$?; set -e
 check "6. no STATE.md -> no-op (control)" allow "$rc"
 mv .planning/STATE.md.bak .planning/STATE.md; git reset -q
+
+echo "== fixture isolation from inherited git config =="
+mkdir -p "$TMP/hostile/hooks" "$TMP/empty-hooks"
+for hook in pre-commit post-checkout; do
+    printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$TMP/hostile/fired" > "$TMP/hostile/hooks/$hook"
+    chmod +x "$TMP/hostile/hooks/$hook"
+done
+printf '[core]\n\thooksPath = %s/hostile/hooks\n[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = %s/hostile/no-such-key.pub\n\tname = Hostile\n\temail = h@example.com\n' "$TMP" "$TMP" > "$TMP/hostile/gitconfig"
+
+hostile_commit() { # hostile_commit <dir> <git -c args...>
+    local dir="$1"
+    shift
+    (
+        set -e
+        export GIT_CONFIG_GLOBAL="$TMP/hostile/gitconfig" GIT_CONFIG_NOSYSTEM=1
+        mkdir -p "$dir"
+        git -C "$dir" init -q .
+        echo hostile > "$dir/f"
+        git -C "$dir" add f
+        git -C "$dir" "$@" commit -qm hostile
+    )
+}
+
+rm -f "$TMP/hostile/fired"
+set +e; hostile_commit "$TMP/h7a" -c commit.gpgsign=false >/dev/null 2>&1; rc=$?; set -e
+[ -f "$TMP/hostile/fired" ] || rc=0
+check "7a. inherited hook armed: unisolated commit -> refuse (control)" refuse "$rc"
+
+rm -f "$TMP/hostile/fired"
+set +e; hostile_commit "$TMP/h7b" -c core.hooksPath="$TMP/empty-hooks" >/dev/null 2>&1; rc=$?; set -e
+[ -f "$TMP/hostile/fired" ] && rc=0
+check "7b. inherited signing armed: unisolated commit -> refuse (control)" refuse "$rc"
+
+rm -f "$TMP/hostile/fired"
+set +e; (set -e; export GIT_CONFIG_GLOBAL="$TMP/hostile/gitconfig" GIT_CONFIG_NOSYSTEM=1; init_fixture_repo "$TMP/iso") >/dev/null 2>&1; rc=$?; set -e
+[ -f "$TMP/hostile/fired" ] && rc=1
+check "7c. fixture bootstrap under hostile config -> allow" allow "$rc"
 
 echo
 echo "passed=$pass failed=$fail"

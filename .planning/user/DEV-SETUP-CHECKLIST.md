@@ -95,8 +95,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   Existence is asked of `git worktree list --porcelain`, not of the `.worktrees/phase-N` path, so
   the answer stays correct when the hook runs from inside a worktree (where that relative path does
   not resolve at all). Guard: `scripts/lint-phase-worktree.sh`; both directions exercised by
-  `scripts/test-phase-worktree-guard.sh` (7 cases, including two negative controls that must PASS —
+  `scripts/test-phase-worktree-guard.sh` (10 cases, including two negative controls that must PASS —
   a guard only ever observed refusing has not been shown to discriminate).
+  Its scratch repository is isolated from inherited hooks and commit signing, including git config
+  injected through the environment; case 7 proves the repository-local isolation under a hostile
+  global git config.
 - [ ] **[PROJECT]** **`scripts/phase-worktree.sh <N>` is the one command that creates a phase
   worktree correctly**, replacing a four-step manual sequence every step of which was skippable.
   It validates the phase against a real `### Phase N:` heading in ROADMAP.md (phases get
