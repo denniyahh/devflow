@@ -9,6 +9,7 @@ covered_files:
   - .gitignore
   - scripts/check.sh
   - crates/devflow-core/Cargo.toml
+  - crates/devflow-core/src/agent_result.rs
   - crates/devflow-core/src/prompt.rs
   - crates/devflow-core/src/snapshots/devflow_core__prompt__tests__claude_style_full_execute_fix_prompt_snapshot.snap
   - crates/devflow-core/src/snapshots/devflow_core__prompt__tests__full_execute_fix_prompt_antigravity.snap
@@ -23,7 +24,9 @@ covered_files:
   - crates/devflow-cli/src/snapshots/devflow__pipeline_launch__tests__turn_two_resume_prompt.snap
   - crates/devflow-cli/tests/ci_parity_guards.rs
   - crates/devflow-cli/tests/gitignore_coverage.rs
+  - ARCHITECTURE.md
   - docs/guides/unattended-mode.md
+  - scripts/test-phase-worktree-guard.sh
   - .planning/user/DEV-SETUP-CHECKLIST.md
   - .planning/REQUIREMENTS.md
   - .planning/ROADMAP.md
@@ -37,11 +40,15 @@ covered_files:
   - .planning/phases/47-unattended-decision-policy-consistency/47-04-SUMMARY.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-05-PLAN.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-05-SUMMARY.md
+  - .planning/phases/47-unattended-decision-policy-consistency/47-06-PLAN.md
+  - .planning/phases/47-unattended-decision-policy-consistency/47-06-SUMMARY.md
+  - .planning/phases/47-unattended-decision-policy-consistency/47-07-PLAN.md
+  - .planning/phases/47-unattended-decision-policy-consistency/47-07-SUMMARY.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-CONTEXT.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-RESEARCH.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-REVIEW.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-PHASE49-OBSERVATION.md
-covered_digest: "v1:sha256:02b123887d69fb90f1c44efabae0f916d4b9d2cb4365383a067a72a0335f9901"
+covered_digest: "v1:sha256:d40445fc156f5df15350523b4f12aac932c3e6ca949004b913ee7d36738a356c"
 behavior_unverified: 1
 overrides_applied: 0
 gaps_closed_after_verification:
