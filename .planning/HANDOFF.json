@@ -1,0 +1,57 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-12T16:06:20.148Z",
+  "phase": "47",
+  "phase_name": "Unattended Decision Policy Consistency",
+  "phase_dir": ".planning/phases/47-unattended-decision-policy-consistency",
+  "plan": 7,
+  "task": 1,
+  "total_tasks": 3,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "Gap-closure plans 47-06/47-07 replanned from the gap-plan review round and committed", "status": "done", "commit": "bf49a77"},
+    {"id": 2, "name": "47-06 executed by codex (CR-01 wording fix, parser-boundary and detector tests, nine snapshots re-blessed)", "status": "done", "commit": "1691b12"},
+    {"id": 3, "name": "47-07 executed by codex (guard fixture isolated from hooks, signing, env-injected git config)", "status": "done", "commit": "b331719"},
+    {"id": 4, "name": "Re-verification recorded passed 23/23 by codex (self-verified, no independent verifier)", "status": "done", "commit": "7a7770a"},
+    {"id": 5, "name": "Independent re-run at 7a7770a by Claude: all 6 plan gates gate_rc=0, scripts/check.sh test first attempt, cargo fmt --check, clippy 0 warnings, tree unchanged", "status": "done", "commit": null},
+    {"id": 6, "name": "External adversarial review of ead8443..7a7770a via agy (gemini-3.8-flash-high): 0 BLOCKER/HIGH, 1 MEDIUM, 4 LOW, 27 citations; findings NOT yet verified against source", "status": "done", "commit": null}
+  ],
+  "remaining_tasks": [
+    {"id": 1, "name": "Verify the five agy findings against source", "status": "not_started"},
+    {"id": 2, "name": "Run /gsd-code-review 47 on ead8443..7a7770a (independent review of codex's diff)", "status": "not_started"},
+    {"id": 3, "name": "Decide fixes, then /gsd-verify-work 47 (UAT) with a waiver for the false commit_claim_mismatch", "status": "not_started"}
+  ],
+  "blockers": [
+    {
+      "description": "UAT commit-claim check counts plan_head_before..HEAD (gsd-core verify-work.md:181) and accepts only claimed or claimed+1, so 47-05/06/07 (claimed 3/5/2) measure 20/10/5 and read as BLOCKER",
+      "type": "external",
+      "workaround": "Counts match when measured to each plan's own last commit (47-06 bf49a77..1691b12 = 5; 47-07 1691b12..b331719 = 2). Needs an operator waiver at UAT; worth filing against @opengsd/gsd-core"
+    }
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Decide which agy / code-review findings to fix before UAT", "context": "agy MEDIUM: prompt.rs doc comment intra-doc-links a #[cfg(test)] item (no cargo doc in check.sh or CI). agy LOW: 47-06 SUMMARY overstates the tail-budget boundary test; ARCHITECTURE.md wording broader than four stage prompts; guard control 7b accepts any hostile_commit failure; VERIFICATION marks the detector risk VERIFIED though the detector is unchanged by design", "blocking": true},
+    {"action": "Approve waiving the false commit_claim_mismatch at UAT", "context": "see blockers", "blocking": true},
+    {"action": "Decide prevention for agents doing phase work from the main checkout", "context": "Mirror the worktree rule into AGENTS.md (codex never reads CLAUDE.md); make the pre-commit guard block phase docs once that phase's worktree exists", "blocking": false}
+  ],
+  "decisions": [
+    {"decision": "CR-01 fixed by wording only: decision reasoning above a last-line DEVFLOW_RESULT; no parser change", "rationale": "parse_marker_lines already scans bottom-up; operator 2026-09-11", "phase": "47"},
+    {"decision": "WR-01 in scope", "rationale": "operator 2026-09-11", "phase": "47"},
+    {"decision": "Finding 4: one sentence in checkpoint_auto_decide_prompt only, carrying no detector match shape", "rationale": "a resume moves the prior capture aside (agent_result.rs:3168,3180), so a copied label is the only trigger on a failed resume; operator 2026-09-12", "phase": "47"},
+    {"decision": "Independent code review plus one external lane before UAT", "rationale": "codex implemented and self-verified with no subagents, no plan check, no adversarial review; operator 2026-09-12", "phase": "47"},
+    {"decision": "Stray b102898 dropped from unpushed workspace/denniyahh (reset --keep 034f5b6) and untracked main-checkout 47-PATTERNS.md deleted", "rationale": "superseded codex output produced from the main checkout; merge-tree clean afterwards; operator 2026-09-12", "phase": "47"}
+  ],
+  "uncommitted_files": [
+    " M graphify-out/graph.json",
+    " M graphify-out/manifest.json",
+    "?? .planning/user/errors/",
+    "?? graphify-out/.graphify_labels.json",
+    "?? graphify-out/.graphify_labels.json.sig",
+    "?? graphify-out/2026-09-11/",
+    "?? graphify-out/2026-09-12/",
+    "?? graphify-out/GRAPH_REPORT.md",
+    "?? graphify-out/graph.html"
+  ],
+  "next_action": "In .worktrees/phase-47: read the agy review (/tmp/claude-1000/-var-home-denniyahh-Github-devflow/51c107f3-4031-4088-a4d4-f63e748cfbe1/scratchpad/codex-review/review-agy.md, if the scratchpad still exists; otherwise re-run one external lane on ead8443..7a7770a), verify each finding against source, then run /gsd-code-review 47 on ead8443..7a7770a",
+  "context_notes": "Phase 47 plans 47-01..47-07 are executed; STATE.md says awaiting_uat. The implementation was independently re-run green at 7a7770a, but no independent code review of codex's diff exists yet: REVIEW.md was only annotated resolved. graphify-out changes are local-only per CLAUDE.md and must not be committed from this worktree."
+}
