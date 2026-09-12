@@ -56,6 +56,8 @@ run_test() {
     # either reopens a green-over-unread guard.
     echo "==> env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast"
     env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast
+    echo "==> bash scripts/test-phase-worktree-guard.sh"
+    bash scripts/test-phase-worktree-guard.sh
 }
 
 run_build() {
