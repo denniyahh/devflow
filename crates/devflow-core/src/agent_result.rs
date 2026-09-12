@@ -628,12 +628,13 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// unconditionally recorded by the `checkpoint_auto_decided` audit event
 /// (plan 28-03) — it can never silently authorize anything.
 ///
-/// Searches BOTH the raw stdout text and — when the stdout is a Claude JSON
-/// result envelope — the unescaped inner `result` text obtained via
-/// [`extract_json_result_text`], because the `Gate:` line typically crosses
-/// into the capture escaped inside that envelope (RESEARCH § "Common
-/// Pitfalls / Pitfall 2": two indirections, subagent emission → orchestrator
-/// relay → DevFlow's captured top-level stdout). Matching is
+/// Searches BOTH the raw capture, through [`capture_reports_human_gate`], and —
+/// when the stdout is one Claude JSON result envelope, even pretty-printed — the
+/// unescaped inner `result` text obtained via [`extract_json_result_text`],
+/// because the `Gate:` line typically crosses into the capture escaped inside
+/// that envelope (RESEARCH § "Common Pitfalls / Pitfall 2": two indirections,
+/// subagent emission → orchestrator relay → DevFlow's captured top-level
+/// stdout). Matching is
 /// case-insensitive on the `Gate` LABEL and tolerates surrounding markdown
 /// emphasis (`*`) and whitespace, but the VALUE comparison is exact — this
 /// deliberately does NOT widen into a general "does this look like a
@@ -663,7 +664,7 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
     if classify(&capture) == CaptureKind::ClaudeStream {
         return claude_stream_reports_human_gate(&capture.events);
     }
-    if text_reports_human_gate(stdout) {
+    if capture_reports_human_gate(stdout) {
         return true;
     }
     extract_json_result_text(stdout)
@@ -671,8 +672,43 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
         .is_some_and(text_reports_human_gate)
 }
 
-/// Core matcher shared by both search targets (raw stdout and the unescaped
-/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans only
+/// The raw-capture reader behind [`blocking_human_checkpoint_reported`]'s
+/// non-stream path. A physical line that parses as a JSON object or array has
+/// its string values decoded and matched, so agent text escaped inside an
+/// envelope or a JSON-lines event is read with its real line breaks. Every
+/// other line is matched as it is.
+///
+/// This replaces splitting the whole capture on the two characters `\n`, which
+/// turned a literal backslash-n in agent-authored text (a code sample, a diff
+/// hunk) into a line break and read `let s = "\n**Gate:** ...";` as a
+/// declaration (final external review, 2026-09-12). Escaped text is decoded
+/// only where it really is a JSON string, and only once, so a JSON string that
+/// itself quotes an escaped sample stays a sample.
+fn capture_reports_human_gate(stdout: &str) -> bool {
+    stdout.lines().any(
+        |line| match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(value) if value.is_object() || value.is_array() => {
+                json_strings_report_human_gate(&value)
+            }
+            _ => text_reports_human_gate(line),
+        },
+    )
+}
+
+/// Match every string value inside a decoded JSON document.
+fn json_strings_report_human_gate(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text_reports_human_gate(text),
+        serde_json::Value::Array(items) => items.iter().any(json_strings_report_human_gate),
+        serde_json::Value::Object(fields) => fields.values().any(json_strings_report_human_gate),
+        _ => false,
+    }
+}
+
+/// Core matcher over text already in its final form: a physical line of a
+/// non-JSON capture, a decoded JSON string ([`capture_reports_human_gate`]), or
+/// an envelope's unescaped `result` ([`blocking_human_checkpoint_reported`]).
+/// It never decodes escapes itself. Scans only
 /// for a line whose first word, after any list, ordinal or blockquote markup
 /// ([`strip_leading_markup`]), is a case-insensitive `gate` label, tolerating
 /// surrounding markdown emphasis (`*`), code-span backticks (`` ` ``), and
@@ -692,10 +728,7 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
 fn text_reports_human_gate(text: &str) -> bool {
-    // Some non-Claude adapters retain agent text JSON-escaped in their raw
-    // capture. Treat those escaped newlines as the same logical boundary as a
-    // physical newline without admitting a `gate:` phrase mid-line.
-    text.lines().flat_map(|line| line.split("\\n")).any(|line| {
+    text.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
         let line = strip_leading_markup(&lower);
         let Some(after_label) = line.strip_prefix("gate") else {
@@ -4011,6 +4044,59 @@ mod tests {
         }
     }
 
+    /// A literal backslash-n inside agent-authored text, such as a code sample or
+    /// a diff hunk, is not a line break (final external review, 2026-09-12). The
+    /// raw scan used to split every capture on the two characters `\n`, so a code
+    /// sample like `let s = "\n**Gate:** ...";` read as a declaration. Escaped
+    /// text may be decoded only where it really is a JSON string. Each case pairs
+    /// the false positive with a control carrying a real line break, which must
+    /// still match.
+    #[test]
+    fn literal_backslash_n_in_agent_text_is_not_a_line_break() {
+        let gate = format!("**Gate:** `{HUMAN_GATE_VALUE}`");
+        let code_sample = format!(r#"let s = "\n{gate}";"#);
+        let real_break = format!("let s = \"\n{gate}\";");
+
+        assert!(
+            !blocking_human_checkpoint_reported(&code_sample),
+            "plain text: {code_sample:?}"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&real_break),
+            "plain-text control"
+        );
+
+        let envelope =
+            |text: &str| serde_json::json!({"type": "result", "result": text}).to_string();
+        assert!(
+            !blocking_human_checkpoint_reported(&envelope(&code_sample)),
+            "single-document envelope"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&envelope(&real_break)),
+            "single-document envelope control"
+        );
+
+        let json_lines = |text: &str| {
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type": "thread.started", "thread_id": "t1"}),
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": text}
+                })
+            )
+        };
+        assert!(
+            !blocking_human_checkpoint_reported(&json_lines(&code_sample)),
+            "JSON-lines capture"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&json_lines(&real_break)),
+            "JSON-lines capture control"
+        );
+    }
+
     /// REGRESSION — the rendering a real headless run actually produces.
     ///
     /// Transcribed verbatim from `.devflow/phase-91-stdout` of the live A1
@@ -4094,12 +4180,13 @@ mod tests {
     // they record which capture line each envelope came from and that every
     // gate payload is synthetic.
     //
-    // Each negative asserts a NEGATIVE CONTROL first: `text_reports_human_gate`
-    // must still match the raw capture. Without it a negative would also pass
-    // against a fixture that simply contains no gate text, and would keep
-    // passing if someone deleted the gate line from the fixture. Presence is
-    // not the same claim: the matcher is line-anchored, so gate text it cannot
-    // match would let every negative pass with the stream branch removed.
+    // Each negative asserts a NEGATIVE CONTROL first: `capture_reports_human_gate`,
+    // the raw-capture reader the stream branch replaces, must still report the
+    // capture. Without it a negative would also pass against a fixture that
+    // simply contains no gate text, and would keep passing if someone deleted the
+    // gate line from the fixture. Presence is not the same claim: the reader is
+    // line-anchored, so gate text it cannot match would let every negative pass
+    // with the stream branch removed.
 
     /// **REGRESSION — review constraint 3, the prompt-echo false positive.**
     ///
@@ -4120,7 +4207,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -4148,7 +4235,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -4179,7 +4266,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -5690,9 +5777,10 @@ mod tests {
     /// precisely why a text scan cannot tell the two apart and the EVENT must
     /// decide.
     ///
-    /// The label must start its own line. `text_reports_human_gate` matches
-    /// only a line-leading label, so a mid-line rendering matches nothing, and
-    /// every negative built on it would pass with the stream branch removed.
+    /// The label must start its own line. `capture_reports_human_gate` decodes
+    /// the event's JSON strings and matches only a line-leading label, so a
+    /// mid-line rendering matches nothing, and every negative built on it would
+    /// pass with the stream branch removed.
     ///
     /// The line break is a JSON-escaped `\n` and there are no double quotes, so
     /// it drops into a JSON string field without further escaping.
