@@ -6,11 +6,11 @@ current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
 current_plan: 7
 status: awaiting_uat
-stopped_at: Re-verification passed after 47-06 and 47-07; awaiting operator UAT before phase completion
-last_updated: "2026-09-12T14:27:36.000Z"
+stopped_at: "Pre-UAT step 1 of 3 done: agy findings on ead8443..7a7770a verified against source (5 of 5 confirmed, none a production-path defect); next /gsd-code-review 47"
+last_updated: "2026-09-12T16:42:30.973Z"
 last_activity: 2026-09-12
 last_activity_desc: Re-verified Phase 47 after closing CR-01 and WR-01; source and harness checks passed, operator UAT remains
-state_head: b33171960d2a72ba0ae5b3542719c0f87f7db13c
+state_head: a2141e23d3383b9c6641bd198b9c238a66d11fa2
 progress:
   total_phases: 6
   completed_phases: 1
@@ -905,9 +905,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-12T01:37:41.417Z
-**Stopped at:** Planned gap closure 47-06 (CR-01 wording fix) and 47-07 (WR-01); plan-checker 0 blockers/0 warnings/10 info; next /gsd-execute-phase 47 --gaps-only
-**Resume file:** None
+**Last session:** 2026-09-12T16:42:30.778Z
+**Stopped at:** Pre-UAT step 1 of 3 done: agy findings on ead8443..7a7770a verified against source (5 of 5 confirmed, none a production-path defect); next /gsd-code-review 47
+**Resume file:** .planning/phases/47-unattended-decision-policy-consistency/.continue-here.md
 
 ## Operator Next Steps
 
