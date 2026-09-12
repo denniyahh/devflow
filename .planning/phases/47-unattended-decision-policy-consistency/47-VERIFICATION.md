@@ -1,8 +1,8 @@
 ---
 phase: 47-unattended-decision-policy-consistency
-verified: 2026-09-11T21:27:32Z
-status: gaps_found
-score: 19/23 must-haves verified
+verified: 2026-09-12T14:20:38Z
+status: passed
+score: 23/23 must-haves verified
 covered_files:
   - Cargo.toml
   - Cargo.lock
@@ -42,39 +42,30 @@ covered_files:
   - .planning/phases/47-unattended-decision-policy-consistency/47-REVIEW.md
   - .planning/phases/47-unattended-decision-policy-consistency/47-PHASE49-OBSERVATION.md
 covered_digest: "v1:sha256:02b123887d69fb90f1c44efabae0f916d4b9d2cb4365383a067a72a0335f9901"
-behavior_unverified: 3
+behavior_unverified: 1
 overrides_applied: 0
-gaps:
+gaps_closed_after_verification:
   - truth: "A resumed Claude session receives one consistent, usable instruction that both permits the narrow blocking-human resolution and records the required decision reasoning."
-    status: failed
-    reason: "The delivered policy and resume instruction require substantive reasoning in the final message, but COMPLETION_PROTOCOL requires that final message to be exactly one DEVFLOW_RESULT line with nothing after it. The required audit record and the completion parser contract cannot both be satisfied."
+    status: CLOSED 2026-09-12 by 47-06
+    reason: "COMPLETION_PROTOCOL now places decision reasoning above the terminal DEVFLOW_RESULT line, with prompt-to-parser controls at the production boundary."
     artifacts:
       - path: "crates/devflow-core/src/prompt.rs"
-        issue: "COMPLETION_PROTOCOL at lines 46-55 conflicts with CODE_STAGE_POLICY at 117-120 and GATE_RESOLUTION_RULE/checkpoint_auto_decide_prompt at 67-69 and 605-615."
+        issue: "Resolved by the last-line completion contract and the resume-prompt detector mitigation."
     missing:
-      - "Define a parser-compatible decision-audit envelope (for example a DEVFLOW_DECISION record before an unchanged terminal DEVFLOW_RESULT) and update both prompt instructions."
-      - "Add a test at the result-parser boundary proving the decision record and terminal result coexist."
+      - "Phase 49 must still observe whether a live Claude agent follows the wording."
 behavior_unverified_items:
-  - truth: "A wording change to a policy-carrying prompt fails scripts/check.sh test."
-    test: "Deliberately drift a committed snapshot, run scripts/check.sh test, then restore the exact baseline."
-    expected: "The command exits non-zero without rewriting the baseline."
-    why_human: "The current source guard proves the invocation contains the right environment controls, but this verification did not mutate a tracked baseline; the supplied workspace cargo-test run did not exercise this transition."
-  - truth: "INSTA_FORCE_UPDATE=1 cannot re-bless a drifted snapshot green."
-    test: "Deliberately drift a committed snapshot, run INSTA_FORCE_UPDATE=1 scripts/check.sh test, then restore it."
-    expected: "The command exits non-zero and the drift remains; no baseline is re-blessed."
-    why_human: "This is the load-bearing environment/side-effect transition. The named source guard passes, but it does not run insta against a drifted artifact."
-  - truth: "A clean tree passes scripts/check.sh test under its hardened environment."
-    test: "Run scripts/check.sh test on the clean worktree."
-    expected: "Exit 0 with no .snap.new files."
-    why_human: "The supplied bounded cargo-test regression was green, but it did not execute scripts/check.sh's env -u / INSTA_UPDATE wrapper; it is not proof of this script-level path."
+  - truth: "A live Claude agent follows the compatible decision-reasoning wording in an unattended run."
+    test: "Run Phase 49's planned live Claude observation and classify Followed, Not followed, or Void."
+    expected: "The live record distinguishes the model behavior without treating a pre-spawn event as decision evidence."
+    why_human: "Source and parser tests cannot establish live model instruction following."
 ---
 
 # Phase 47: Unattended Decision Policy Consistency Verification Report
 
 **Phase Goal:** An unattended agent receives the same merit-based decision instruction everywhere it is asked to make a Code-stage decision, and is never handed contradictory instructions about resolving a `blocking-human` gate.
 
-**Verified:** 2026-09-11T21:27:32Z  
-**Status:** gaps_found  
+**Initial verification:** 2026-09-11T21:27:32Z
+**Initial status:** gaps_found (superseded by the 2026-09-12 re-verification below)
 **Re-verification:** No — initial verification
 
 ## Goal Achievement
@@ -182,3 +173,29 @@ Phase 47 materially delivers DECN-02 and most of DECN-03's source-level wiring, 
 
 _Verified: 2026-09-11T21:27:32Z_  
 _Verifier: the agent (gsd-verifier)_
+
+## Re-verification — 2026-09-12
+
+This amendment supersedes the initial `gaps_found` verdict above. Plans 47-06 and 47-07
+closed CR-01 and WR-01 respectively; their summaries and the commit history were checked in this
+worktree before this re-verification.
+
+| Initial open truth | Current evidence | Re-verification result |
+|---|---|---|
+| Reasoning and terminal result were incompatible | `decision_reasoning_above_the_result_line_parses_to_that_result` passed at `evaluate_layer1` for plain text, a Claude envelope, and a three-turn Claude stream; its long-after-result control did not parse to Success. | ✓ VERIFIED |
+| A copied gate declaration could make a failed resume look like a checkpoint | `resume_prompt_does_not_read_as_a_blocking_human_checkpoint` passed: a real declaration control matched, while the rendered resume prompt did not. | ✓ VERIFIED |
+| The snapshot wrapper path had not been observed | A clean `scripts/check.sh test` exited 0. With one committed baseline deliberately drifted, the wrapper exited 101 both normally and with caller-supplied `INSTA_FORCE_UPDATE=1`; its printed invocation was `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no`. The baseline was restored to its prior hash and no `.snap.new` file remained. | ✓ VERIFIED |
+| The worktree-guard fixture inherited global hooks/signing | The post-commit 47-07 gate passed under hostile global config, no SSH agent, and both injected-config carriers. Its two-line isolation mutant printed `FAIL 7c.` and `passed=12 failed=1`. | ✓ VERIFIED |
+
+The original 19 truths that were already verified retain their prior evidence. A new detached,
+initially clean worktree passed the hardened workspace suite on its second full attempt. Attempt
+one failed only `pi_marker_less_run_does_not_advance` while verifying a test-spawned monitor was
+dead; that named test passed immediately alone, and the one allowed full rerun passed. This is
+evidence that the clean wrapper path works, not a reliability guarantee for the monitor test.
+`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` passed
+after the gap fixes.
+
+**Re-verified score:** 23/23 must-haves verified. DECN-02 and DECN-03 are satisfied at the
+prompt, parser, and harness boundaries. The sole remaining behavioral limit is intentional:
+Phase 49's live Claude run must establish whether a model follows the wording. That is not a
+Phase 47 blocker and this report does not claim it has been observed.

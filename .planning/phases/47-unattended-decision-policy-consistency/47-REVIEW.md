@@ -1,6 +1,7 @@
 ---
 phase: 47-unattended-decision-policy-consistency
 reviewed: 2026-09-11T21:13:27Z
+resolved: 2026-09-12T14:20:38Z
 depth: deep
 files_reviewed: 24
 files_reviewed_list:
@@ -33,7 +34,7 @@ findings:
   warning: 1
   info: 0
   total: 2
-status: issues_found
+status: resolved
 ---
 
 # Phase 47: Code Review Report
@@ -77,6 +78,19 @@ The review traced the prompt renderers through `pipeline_launch` into the Claude
 
 ---
 
-_Reviewed: 2026-09-11T21:13:27Z_
+## Finding Resolutions — 2026-09-12
+
+- **CR-01 closed by 47-06.** The completion protocol now requires the result as the last line,
+  permits decision reasoning above it, and has a production parser test with a long-trailing-text
+  negative control. The resumed prompt is separately pinned against the gate detector.
+- **WR-01 closed by 47-07.** The fixture clears both injected-config carriers and applies
+  repository-local hooks/signing isolation. Its post-commit gate passed under every hostile state;
+  removing only the two isolation lines fails the permanent 7c control.
+
+The initial review remains above as the historical record of findings. These resolutions establish
+the scoped code and harness behavior, not a live agent's instruction following; Phase 49 retains
+that behavioral observation.
+
+_Reviewed: 2026-09-11T21:13:27Z; resolved: 2026-09-12T14:20:38Z_
 _Reviewer: the agent (gsd-code-reviewer)_
 _Depth: deep_
