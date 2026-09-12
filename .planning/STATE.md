@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 47
 current_phase_name: Unattended Decision Policy Consistency
-current_plan: 5
-status: executing
-stopped_at: Planned gap closure 47-06 (CR-01 wording fix) and 47-07 (WR-01); plan-checker 0 blockers/0 warnings/10 info; next /gsd-execute-phase 47 --gaps-only
-last_updated: "2026-09-12T01:37:41.611Z"
-last_activity: 2026-09-11
-last_activity_desc: Completed 47-05-PLAN.md (written-record corrections and D-13 backlog filings)
-state_head: b3b47ea162cfb290a795944148d8cbcdfe1ba788
+current_plan: 7
+status: ready_for_verification
+stopped_at: Completed gap closures 47-06 (CR-01) and 47-07 (WR-01); all 7/7 plans executed; next re-run phase verification and review
+last_updated: "2026-09-12T14:12:31.000Z"
+last_activity: 2026-09-12
+last_activity_desc: Completed 47-06 (completion contract and resume-detector gaps) and 47-07 (worktree-guard fixture isolation)
+state_head: b33171960d2a72ba0ae5b3542719c0f87f7db13c
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 16
-  completed_plans: 14
+  completed_plans: 16
   percent: 17
 ---
 
@@ -78,7 +78,8 @@ See: `.planning/PROJECT.md` (updated 2026-09-03)
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
 **Current focus:** v3.0.0 Unattended Run Survivability — Phase 47 (Unattended Decision Policy
-Consistency) executing: 5 plans across 4 waves. Phase 46 complete and merged (PR #208).
+Consistency) has executed all 7 plans and is ready for re-verification. Phase 46 is complete and
+merged (PR #208).
 
 ## Operator Next Steps
 
@@ -161,19 +162,19 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 47 (Unattended Decision Policy Consistency) — READY TO EXECUTE
-Plans: 7 — 47-01..47-05 across 4 waves (executed); gap closure 47-06, 47-07 in gap wave 1
-Current Plan: 5
+Phase: 47 (Unattended Decision Policy Consistency) — READY FOR VERIFICATION
+Plans: 7 — 47-01..47-05 across 4 waves plus gap closures 47-06 and 47-07 (executed)
+Current Plan: 7
 Total Plans in Phase: 7
-Completed Plans: 5 (47-01, 47-02, 47-03, 47-04, 47-05)
-Status: Ready to execute
+Completed Plans: 7 (47-01, 47-02, 47-03, 47-04, 47-05, 47-06, 47-07)
+Status: Ready for verification
 The D-13 assumption was verified false and its two latent defects are now backlog entries 999.125
 and 999.126. DECN-03's unresolved behavioural arm has an explicit claude-only evidence standard
 for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-11 — Completed 47-05 (written-record corrections and D-13 backlog filings)
+Last activity: 2026-09-12 — Completed 47-06 (completion-contract and resume-detector gaps) and 47-07 (worktree-guard fixture isolation)
 
 Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
 
