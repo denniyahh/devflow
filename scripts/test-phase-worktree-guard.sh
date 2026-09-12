@@ -9,12 +9,11 @@
 # than a discriminator.
 set -euo pipefail
 
-# Hermetic: neither the host checkout's Git environment nor its config may
-# leak into the fixture. Git owns the complete local-environment inventory;
-# listing it here avoids silently missing a new carrier such as object storage.
+# Hermetic: the host checkout's Git environment may not leak into the fixture.
+# Git owns the complete local-environment inventory; listing it here avoids
+# silently missing a new carrier such as object storage.
 mapfile -t git_local_env_vars < <(git rev-parse --local-env-vars)
 unset "${git_local_env_vars[@]}"
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 GUARD="$(cd "$(dirname "$0")" && pwd)/lint-phase-worktree.sh"
 [ -x "$GUARD" ] || { echo "missing guard: $GUARD" >&2; exit 1; }
@@ -27,14 +26,27 @@ pass=0; fail=0
 # bit is real. A fresh clone then gets a non-executable guard, pre-commit takes
 # its "missing or non-executable" branch, and EVERY commit is refused. That
 # shipped once; this asserts against the index, not against the filesystem.
+#
+# This is the harness's only query against the real checkout, so it runs with
+# the inherited git config: CI runs as root on a runner-owned checkout that git
+# accepts only through a global safe.directory entry. A failed query is reported
+# as a FAIL with git's own error above it, never as a silent exit.
 for f in lint-phase-worktree.sh phase-worktree.sh test-phase-worktree-guard.sh; do
-    mode="$(git -C "$(dirname "$GUARD")/.." ls-files --stage -- "scripts/$f" 2>/dev/null | awk '{print $1}')"
+    if ! listing="$(git -C "$(dirname "$GUARD")/.." ls-files --stage -- "scripts/$f")"; then
+        printf '  FAIL %-58s (git ls-files failed; its error is above)\n' "0. scripts/$f recorded executable"; fail=$((fail+1))
+        continue
+    fi
+    mode="$(printf '%s\n' "$listing" | awk '{print $1}')"
     if [ "$mode" = "100755" ]; then
         printf '  ok   %-58s (mode %s)\n' "0. scripts/$f recorded executable" "$mode"; pass=$((pass+1))
     else
         printf '  FAIL %-58s (mode %s, want 100755)\n' "0. scripts/$f recorded executable" "${mode:-missing}"; fail=$((fail+1))
     fi
 done
+
+# Hermetic, continued: from here on only scratch fixtures are touched, and they
+# may not inherit global or system config either (hooks, signing, excludes).
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

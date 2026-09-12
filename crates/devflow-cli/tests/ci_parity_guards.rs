@@ -193,6 +193,42 @@ fn check_script_pins_snapshots_against_env_override() {
     );
 }
 
+/// External review, 2026-09-12 (finding C1). CI's Test job runs as root inside the
+/// pinned image, on a checkout owned by the runner, and git accepts that checkout
+/// only through the GLOBAL `safe.directory` entry the workflow adds. The
+/// worktree-guard harness nulls global git config so its scratch fixtures cannot
+/// inherit hooks, signing or excludes. Doing that before its one query against the
+/// real checkout (the recorded-executable-mode check) made that query fail git's
+/// ownership check, and the harness exited 128 with no output. That was reproduced
+/// in the pinned image; the harness from before the change, and the changed
+/// harness with matching ownership, both passed 13/0.
+///
+/// Source-asserting, like the rest of this file: the failure needs a root process
+/// against a checkout owned by another user, which a test cannot arrange.
+#[test]
+fn worktree_guard_harness_queries_the_checkout_before_nulling_global_config() {
+    let path = repo_root().join("scripts/test-phase-worktree-guard.sh");
+    let script = read(&path);
+    let lines = code_lines(&script);
+
+    let checkout_query = lines
+        .iter()
+        .position(|l| l.contains("ls-files --stage"))
+        .expect("the harness must still check recorded executable modes against the checkout");
+    let null_global_config = lines
+        .iter()
+        .position(|l| l.contains("GIT_CONFIG_GLOBAL=/dev/null"))
+        .expect("the harness must still null global git config for its fixtures");
+
+    assert!(
+        checkout_query < null_global_config,
+        "{} nulls global git config (code line {null_global_config}) before querying the \
+         real checkout (code line {checkout_query}); as root on a runner-owned checkout \
+         that query then fails git's safe.directory ownership check",
+        path.display()
+    );
+}
+
 /// The scope guard above only means something if CI actually runs that
 /// script. Without this, someone could reinline a narrow `cargo clippy` into
 /// the workflow and both guards would still pass while CI linted nothing.

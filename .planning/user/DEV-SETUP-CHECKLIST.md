@@ -98,10 +98,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   `scripts/test-phase-worktree-guard.sh` (13 checks, including two negative controls that must PASS —
   a guard only ever observed refusing has not been shown to discriminate). `scripts/check.sh test`
   runs it after `cargo test`, so every CI job that calls that target gates on it.
-  The harness runs with global and system git config disabled and every repository-local git
-  environment variable (`git rev-parse --local-env-vars`) unset; its scratch repository also pins
-  hooks and signing locally, and case 7 proves that local isolation under a hostile global git
-  config.
+  The harness unsets every repository-local git environment variable (`git rev-parse
+  --local-env-vars`), queries the real checkout's recorded modes with the inherited config (CI
+  accepts its runner-owned checkout only through a global `safe.directory`), and only then disables
+  global and system git config for its fixtures. Its scratch repository also pins hooks and signing
+  locally, and case 7 proves that local isolation under a hostile global git config.
 - [ ] **[PROJECT]** **`scripts/phase-worktree.sh <N>` is the one command that creates a phase
   worktree correctly**, replacing a four-step manual sequence every step of which was skippable.
   It validates the phase against a real `### Phase N:` heading in ROADMAP.md (phases get
