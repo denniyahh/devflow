@@ -10,7 +10,9 @@
 set -euo pipefail
 
 # Hermetic: the host checkout's git env must not leak into the fixture.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_PREFIX 2>/dev/null || true
+# GIT_CONFIG_PARAMETERS and GIT_CONFIG_COUNT carry command-line and environment
+# git config, which outranks the fixture's repository settings.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_PREFIX GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT 2>/dev/null || true
 
 GUARD="$(cd "$(dirname "$0")" && pwd)/lint-phase-worktree.sh"
 [ -x "$GUARD" ] || { echo "missing guard: $GUARD" >&2; exit 1; }
@@ -47,6 +49,12 @@ check() { # check <name> <expected: refuse|allow> <actual_exit>
 REPO="$TMP/repo"
 mkdir -p "$REPO"; cd "$REPO"
 git init -q -b workspace/tester .
+# Inherited hooks and inherited SSH commit signing both come from global git
+# config. Signing with no ssh-agent was observed to abort with exit 128; these
+# settings are local to the fixture repository, so the guard's environment is untouched.
+mkdir -p "$TMP/no-hooks"
+git config core.hooksPath "$TMP/no-hooks"
+git config commit.gpgsign false
 git config user.email t@example.com; git config user.name Tester
 mkdir -p .planning crates/devflow-core/src ".planning/phases/47-demo"
 printf -- '---\ncurrent_phase: 47\n---\n' > .planning/STATE.md
