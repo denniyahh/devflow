@@ -121,13 +121,25 @@ that v2.8.0 shipped undelivered.
      as an explicit observation item for Phase 49's live run — naming in advance what would count
      as evidence either way — rather than marking DECN-03 settled on a source read.
 
-**Plans**: 5/5 plans executed
+**Plans**: 5/7 plans executed
 
 Plans:
+**Wave 1**
 
 - [x] 47-01-PLAN.md — Snapshot drift guard: `insta` wiring, hardened `run_test`, three-case control (wave 1)
+- [ ] 47-06-PLAN.md — Gap closure CR-01: completion protocol puts reasoning above a last-line `DEVFLOW_RESULT`; prompt-to-parser contract test; nine baselines re-blessed (gap wave 1)
+- [ ] 47-07-PLAN.md — Gap closure WR-01: worktree-guard test fixture isolated from inherited hooks and commit signing (gap wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [x] 47-02-PLAN.md — DECN-02: the `fix_prompt` gap, shared arm helper, six-adapter coverage (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [x] 47-03-PLAN.md — DECN-03: one gate rule, `resume_launch_shape`, two-turn delivery test (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [x] 47-04-PLAN.md — D-15 snapshot suite against the final text (wave 4)
 - [x] 47-05-PLAN.md — The record: docs correction, ROADMAP/REQUIREMENTS amendments, backlog filings (wave 4)
 
