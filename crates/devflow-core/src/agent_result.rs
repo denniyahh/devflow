@@ -3443,6 +3443,7 @@ mod tests {
     use crate::agents::AgentDriver;
     use crate::config::GitFlowConfig;
     use crate::mode::Mode;
+    use crate::prompt::{FixType, StageIntent};
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
 
@@ -3615,6 +3616,99 @@ mod tests {
     fn parse_json_envelope_without_marker_returns_none() {
         let stdout = r#"{"result":"did some work but forgot the marker","session_id":"x"}"#;
         assert!(parse_devflow_result(stdout).is_none());
+    }
+
+    #[test]
+    fn decision_reasoning_above_the_result_line_parses_to_that_result() {
+        let phase = PhaseId::new(47);
+        let resume_prompt = crate::prompt::checkpoint_auto_decide_prompt(phase);
+        let fix_prompt = crate::prompt::render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::FullExecute),
+        });
+        for prompt in [&resume_prompt, &fix_prompt] {
+            assert!(prompt.ends_with(crate::prompt::COMPLETION_PROTOCOL));
+            let prompt = prompt.to_ascii_lowercase();
+            assert!(prompt.contains("record"));
+            assert!(prompt.contains("reasoning"));
+        }
+
+        let protocol = crate::prompt::COMPLETION_PROTOCOL;
+        assert!(
+            protocol.contains("the LAST line of your FINAL message must be exactly:"),
+            "COMPLETION_PROTOCOL must describe the DEVFLOW_RESULT as the LAST line"
+        );
+        assert!(protocol.contains("goes above the DEVFLOW_RESULT line"));
+        assert!(protocol.contains("Output nothing after it."));
+        assert!(!protocol.contains("When all work is done, your FINAL message must be exactly:"));
+
+        let success_lines = protocol
+            .lines()
+            .filter(|line| line.starts_with("DEVFLOW_RESULT:") && line.contains("success"))
+            .collect::<Vec<_>>();
+        assert_eq!(success_lines.len(), 1);
+        let success_line = success_lines[0];
+
+        let mut decision_record = String::from(
+            "Decision record\n\nOptions considered: continue, retry, or stop for a human decision.\n",
+        );
+        for choice in 1..=60 {
+            decision_record.push_str(&format!(
+                "Option {choice}: I considered the evidence available at this stage, the reversible \
+                 next action, the impact on the unattended run, and the reason this choice does or \
+                 does not preserve the operator's intent without silently widening authorization.\n"
+            ));
+        }
+        decision_record.push_str(
+            "Chosen option: continue, because the recorded evidence supports it and the decision remains auditable.\n",
+        );
+        assert!(decision_record.lines().count() >= 60);
+        assert!(decision_record.len() > 5_000);
+        assert!(!decision_record.contains("**Gate:**"));
+
+        let status_for = |capture: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(stdout_path(dir.path(), phase), capture).unwrap();
+            evaluate_layer1(dir.path(), phase).map(|result| result.status)
+        };
+
+        let above = format!("{decision_record}\n{success_line}");
+        assert_eq!(status_for(&above), Some(AgentStatus::Success));
+
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "num_turns": 1,
+            "result": above,
+            "session_id": "decision-record",
+        })
+        .to_string();
+        assert_eq!(status_for(&envelope), Some(AgentStatus::Success));
+
+        let escaped = serde_json::to_string(&above).unwrap();
+        let escaped = &escaped[1..escaped.len() - 1];
+        let stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped);
+        assert_eq!(status_for(&stream), Some(AgentStatus::Success));
+        let last_event: serde_json::Value =
+            serde_json::from_str(stream.lines().rev().find(|line| !line.is_empty()).unwrap())
+                .unwrap();
+        assert!(event_is_top_level_result_marker(&last_event));
+
+        // This control makes the positive assertions discriminate rather than
+        // merely proving that the fixture itself contains a success marker.
+        let after = format!("{success_line}\n{decision_record}");
+        assert_ne!(status_for(&after), Some(AgentStatus::Success));
+        let escaped_after = serde_json::to_string(&after).unwrap();
+        let escaped_after = &escaped_after[1..escaped_after.len() - 1];
+        let after_stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped_after);
+        assert_ne!(status_for(&after_stream), Some(AgentStatus::Success));
+
+        // The parser permits short trailing text within TAIL_BUDGET_CHARS;
+        // only the long control above measures the prompt contract's tail.
+        let short_after = format!("{decision_record}\n{success_line}\nDone.");
+        assert_eq!(status_for(&short_after), Some(AgentStatus::Success));
     }
 
     #[test]
