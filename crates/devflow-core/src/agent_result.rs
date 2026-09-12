@@ -3712,6 +3712,37 @@ mod tests {
     }
 
     #[test]
+    fn resume_prompt_does_not_read_as_a_blocking_human_checkpoint() {
+        let resume = crate::prompt::checkpoint_auto_decide_prompt(PhaseId::new(47));
+        assert!(resume.ends_with(crate::prompt::COMPLETION_PROTOCOL));
+
+        let envelope = |text: &str| {
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "num_turns": 1,
+                "result": text,
+                "session_id": "resumed-session",
+            })
+            .to_string()
+        };
+        let declaration = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** decision\n**Gate:** `{HUMAN_GATE_VALUE}`\n**Plan:** 30-05\n"
+        );
+        let labelled = format!("{resume}\n{declaration}");
+        assert!(text_reports_human_gate(&labelled));
+        assert!(blocking_human_checkpoint_reported(&envelope(&labelled)));
+
+        assert!(
+            resume.contains("gate-declaration line"),
+            "the resume prompt must tell the agent not to copy the gate-declaration line"
+        );
+        assert!(!text_reports_human_gate(&resume));
+        assert!(!blocking_human_checkpoint_reported(&envelope(&resume)));
+    }
+
+    #[test]
     fn detect_claude_json_rate_limit_by_subtype() {
         let stdout = r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z","result":"rate limited"}"#;
         assert_eq!(
