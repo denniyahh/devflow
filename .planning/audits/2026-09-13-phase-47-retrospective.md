@@ -1,7 +1,7 @@
 # Phase 47 Retrospective — and the Integration Session That Followed
 
 **Written:** 2026-09-13, at the operator's request, so it can be reviewed in a later session with a clean context.
-**Status:** OPEN. Decisions D1 and D2 have not been made. D3 is due before Phase 49 planning.
+**Status:** CLOSED (2026-09-13). Decisions D1 (Option A, minimal-divergence workspace), D2 (P1–P5 adoption schedule), and D3 (999.125, 999.126, 999.38 promoted now) resolved with operator.
 **Scope:**
 - Phase 47 (Unattended Decision Policy Consistency), from context capture on 2026-09-09 to completion on 2026-09-13.
 - The integration session on 2026-09-13: merging to `develop` via PR #213, the `deny.toml` dependency-checks PR #214, and housekeeping.
@@ -30,35 +30,35 @@
 
 ---
 
-## 2. Open decisions (take them in this order)
+## 2. Decisions made (resolved 2026-09-13 with operator)
 
-### D1 — Workspace branch structure (framed as: decide before Phase 48 work)
+### D1 — Workspace branch structure: OPTION A ADOPTED (Minimal-divergence workspace)
+- **Decision:** Adopt **Option A**. `workspace/denniyahh` tracks only `develop` code + `.planning/` + `graphify-out/`.
+- **Triage of 27 divergent files:**
+  1. *Shared Conflict Surface (10 files):* Upstream `Cargo.toml`, `crates/devflow-core/Cargo.toml`, `crates/devflow-cli/Cargo.toml` lints/deps (`insta`) to `develop`. Upstream `scripts/hooks/` (`commit-msg`, `post-commit`, `pre-commit`) and `CONTRIBUTING.md`, `scripts/check-in-container.sh`, `.devcontainer/devcontainer-lock.json` to `develop`. `.gitignore` remains the sole intentional code difference (ignoring `.planning/` and `graphify-out/` on `develop` while tracking on `workspace/denniyahh`).
+  2. *Personal Workflow Scripts & Tests (6 files):* Keep `scripts/cut-pr-branch.sh`, `scripts/sync-workspace.sh`, `scripts/phase-worktree.sh`, `scripts/lint-phase-worktree.sh`, `scripts/test-phase-worktree-guard.sh` on workspace. Decouple `crates/devflow-cli/tests/worktree_guard_harness.rs` so shared check scripts never depend on it.
+  3. *Agent & Tool Configs (11 files):*
+     - `CLAUDE.md`: Minimized to ~40-line project build/test architecture on `develop` (zero private paths). Generic rules moved to `~/.config/agents/AGENTS.md` and `~/.claude/CLAUDE.md`.
+     - `AGENTS.md` & 5 Graphify rules (`.agents/rules/graphify.md`, `.agents/workflows/graphify.md`, `.cursor/rules/graphify.mdc`, `.opencode/opencode.json`, `.opencode/plugins/graphify.js`): Deleted from repo tree; rely on global `~/.config/agents/AGENTS.md`.
+     - `.claude/settings.json` & `.codex/hooks.json`: Moved to global configs; deleted from repo.
+     - `.claude/settings.local.json`: Added to `.gitignore`.
+     - `skills-lock.json`: Curated (strip `docx`, `pptx`, `xlsx`, `pdf`) and upstreamed to `develop`.
 
-| Option | What changes | Cost / unknowns |
-|---|---|---|
-| **A. Minimal-divergence workspace** (recommended) | `workspace/denniyahh` becomes `develop` + `.planning/` + the graphify snapshot only. Each of the 27 divergent non-planning files (§6.1) is upstreamed to `develop`, moved out of the repo tree, or dropped. A guard fails whenever a shared file diverges again. | One-time: upstream PRs and a per-file keep/upstream/drop call. `.gitignore` must still differ at least for `.planning/`, because `develop` ignores it wholesale. **Not established:** whether GSD's commit helper can work with force-tracked ignored paths, which would let `.gitignore` match `develop` exactly. |
-| B. Put `.planning/` on `develop` | All split mechanics disappear: no cut script, no exclusions, no sync conflicts from planning. | The repository is **public**, so this publishes 1,054 planning files: operator decisions, review transcripts, and 674 lines containing the home path across 97 files. It reverses the 2026-08-22 split (`2a2ce97`, `fad1ef5`). |
-| C. Planning in a separate private repo | Code gets a single line. | **Not established:** GSD commits planning files through the project repository (`gsd-tools query commit`), so a nested or separate repo needs a spike first. |
-| Keep as is | — | Everything in §6.2 recurs at every integration. |
+### D2 — Process improvements: ROLLOUT APPROVED
+- **Adopt now (before Phase 48):**
+  - **P1:** Check commands as `.sh` files, dry-run before review, and trap linter.
+  - **P2:** Tested bash probe helpers and run probes under bash.
+- **Trial during Phase 48:**
+  - **P3:** Contract inventory at plan time.
+  - **P4:** One automated fix round per review, then operator decides.
+- **After P1 lands:**
+  - **P5:** Prune standing context once rules are mechanically enforced.
 
-### D2 — Which process improvements to adopt, and when
-
-Details and evidence are in §7. Recommended now: **P1** and **P2**. Trial **P3** and **P4** during Phase 48. Do **P5** after P1 lands.
-
-| # | Improvement | Targets |
-|---|---|---|
-| P1 | Check commands as files, dry-run before review, plus a trap linter | §4.1, the largest class |
-| P2 | Tested probe helpers, and run probes under bash | §4.6, and the zsh traps in §5 |
-| P3 | Contract inventory at plan time | §4.2, the CR-01 class |
-| P4 | One automated fix round per review, then the operator decides | §4.1 (fix rounds that introduced defects) |
-| P5 | Prune standing context once rules are enforced | §5 (about 52 KB loaded every session) |
-
-(In the chat these were items 2, 3, 4, 5 and 7. Item 1 is D1, and item 6 moved into D3.)
-
-### D3 — Backlog promotions (due before Phase 49 planning; also recorded in STATE.md)
-
-- **999.125** (preflight and resume disagree on where a `blocking-human` gate exists) and **999.126** (a checkpoint added after Code preflight is never re-scanned). Both concern whether an unattended run can reach the resume route past a human gate, which is the path Phase 49's live run observes.
-- **999.38**, the test-suite PATH race (GitHub #181). It is a recurring source of red runs and review findings (§4.3).
+### D3 — Backlog promotions: PROMOTED NOW (Pre-Phase 49 Prerequisite)
+- **Decision:** Promoted immediately to active roadmap prior to Phase 49 live runs.
+- **Promoted Items:**
+  - **999.125** (preflight and resume disagree on where a `blocking-human` gate exists) & **999.126** (checkpoint added after Code preflight is never re-scanned). Scheduled into Wave 2 alongside Phase 48.
+  - **999.38** (test-suite PATH race / GitHub #181). Scheduled for test-suite isolation.
 
 ---
 

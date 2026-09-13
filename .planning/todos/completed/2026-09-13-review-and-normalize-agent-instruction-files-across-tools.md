@@ -46,14 +46,12 @@ Each agent tool reads a different instruction file, and the files say different 
 - **`.opencode/`** has 2,515 files on disk but 2 tracked; the other 2,510 are `node_modules`.
 - **Workspace-only divergence.** All the project files above exist only on `workspace/denniyahh`, not on `develop`. See the retrospective's workspace assessment.
 
-## Solution
+## Solution (Resolved 2026-09-13)
 
-TBD. Starting points:
-
-- **One source per scope.** Pick one canonical file each for global and project rules, and generate or symlink every tool's file from it.
-- **Close the gaps.** Give codex, gemini and opencode the project rules they currently miss, starting with the worktree rules.
-- **Deduplicate** the graphify instruction blocks.
-- **Delete enforced prose.** Once a rule is enforced by a lint or hook, replace its prose with a one-line pointer. This is retrospective proposal 7, which is **not yet decided**.
-- **Prune** stale or phase-specific memory entries.
-- **Remove unused tooling** (skills, plugins, connectors) after operator confirmation. Coordinate with the todo "Evaluate skills, plugins, MCP and ACP servers to add".
-- **Decide D1 first.** The retrospective's open decision D1 (workspace branch structure) may move or upstream several of these files: `.planning/audits/2026-09-13-phase-47-retrospective.md`.
+Implemented per Phase 47 Retrospective D1 & D2 decisions:
+- **One source per scope:** Global agent rules consolidated into `~/.config/agents/AGENTS.md`. Minimal, public-safe repository rules (28 lines) retained in `CLAUDE.md`.
+- **Deduplication:** Deleted redundant repo-level graphify files (`AGENTS.md`, `.agents/`, `.cursor/`, `.opencode/`). Graphify hooks moved globally to `~/.claude/settings.json` and `~/.codex/hooks.json`.
+- **Enforced prose:** Added P1 mechanical trap linters (`--exact`, `rg -c`, `-p devflow --lib`) to `scripts/lint-plan-bashisms.sh`.
+- **Claude Code subagent rules:** Added to `~/.claude/rules/claude-subagent-worktrees.md`.
+- **Local IDE state:** Added `**/.claude/settings.local.json` to `.gitignore`.
+- **Skills curation:** `skills-lock.json` pruned of stray Office tools (`docx`, `pptx`, `xlsx`, `pdf`) and curated to 9 development skills.

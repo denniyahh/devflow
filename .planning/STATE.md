@@ -81,10 +81,9 @@ interleaving has ever been observed in the wild) is recorded — not settled —
 
 **Carried forward from the v2.8.0 close, NOT in this milestone:** **999.120** (residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back) and **999.121** (OpenCode has no
-`devflow start`-level marker-less regression test). Filed by Phase 47, also NOT in this milestone:
+`devflow start`-level marker-less regression test). Filed by Phase 47 and **promoted on 2026-09-13**:
 **999.125** (preflight and resume disagree on where a `blocking-human` gate exists) and **999.126**
-(a checkpoint added after Code preflight is never re-scanned). Promote with `/gsd-review-backlog`
-when ready.
+(a checkpoint added after Code preflight is never re-scanned), along with **999.38** (test-suite PATH race).
 
 ## Project Reference
 
@@ -110,18 +109,12 @@ verification reads `stale` (see `## Active Phase`).
   `8c41c46` deleted that file deliberately: `develop`'s `scripts/check.sh` cannot call the
   workspace-only worktree-guard harness, so `crates/devflow-cli/tests/worktree_guard_harness.rs` now
   runs the harness inside `cargo test`. Record an override; do not restore the file.
-- **Review first, with the operator:** `.planning/audits/2026-09-13-phase-47-retrospective.md`. Open
-  decisions: D1 (workspace branch structure) and D2 (process improvements), both framed as
-  decisions to make before Phase 48 work; D3 (backlog promotions) before Phase 49 planning. Its §12
-  is the review agenda.
+- **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
+- **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
 - `/gsd-discuss-phase 48`, run from `.worktrees/phase-48` (`feature/phase-48`). No CONTEXT.md exists
   yet. Phase 48 depends on Phases 46 and 47.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
   `base_branch` must be configured before the live `--mode auto` run is possible.
-- Backlog items NOT promoted into v3.0.0: 999.120, 999.121, 999.125, 999.126. **Open decision, not
-  yet made:** whether to promote 999.125 and 999.126 before Phase 49 is planned. Both concern whether
-  an unattended run can reach the resume route past a `blocking-human` gate, which is the path Phase
-  49's live run observes.
 
 ---
 

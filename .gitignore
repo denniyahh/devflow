@@ -28,6 +28,7 @@ Thumbs.db
 **/.claude/agent-memory-local
 **/.claude/first-run
 **/.claude/assistant-daemon-state.json
+**/.claude/settings.local.json
 
 # GSD run-scoped runtime state (session id, PID, timestamps — dead on any
 # other checkout the moment it's written; regenerated at the next command).

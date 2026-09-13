@@ -27,7 +27,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 |---|---|---|---|---|
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
-| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02 | 2 | Not started |
+| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, GATE-01 (999.125), GATE-02 (999.126), 999.38 | 2 | Not started |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
@@ -145,13 +145,14 @@ Plans:
 
 ### Phase 48: Survivable State Writes and Honest Gate Recovery
 
-**Goal**: A second writer cannot silently erase another's state update, and a gate whose consumer is
+**Goal**: A second writer cannot silently erase another's state update, a gate whose consumer is
 gone tells the operator the repair that actually works instead of asserting a waiter that does not
-exist.
+exist, preflight and resume agree on where blocking-human gates exist, checkpoints added after preflight
+are re-scanned, and the test-suite PATH race is isolated.
 **Depends on**: Phases 46, 47
-**Sequencing note**: Wave order — correctness lands before survivability. There is no code-level
-coupling; this is the milestone's stated design.
-**Requirements**: SURV-01, SURV-02
+**Sequencing note**: Wave order — correctness lands before survivability, and gate consistency lands
+before Phase 49's live unattended run measures the chain.
+**Requirements**: SURV-01, SURV-02, GATE-01 (999.125), GATE-02 (999.126), 999.38
 **Success Criteria** (what must be TRUE):
 
   1. A test drives two writers for the same phase and **fails against the current implementation** —
@@ -171,6 +172,13 @@ coupling; this is the milestone's stated design.
      requires the foreground `start` to be **interrupted**, and a run left alone self-resolves in
      ~40s. The self-resolving arm is the negative control — if both arms wedge, the reproduction is
      measuring something else.
+  5. **GATE-01 (999.125):** Preflight's `phase_has_human_only_checkpoint` and resume's
+     `phase_has_blocking_human_checkpoint` use one parsed checkpoint predicate shared across paths;
+     a marker outside a task-opening line neither blocks preflight nor arms resume.
+  6. **GATE-02 (999.126):** Checkpoints added or modified after Code's initial preflight are
+     re-scanned from a fresh plan snapshot before the run can continue into the resume decision path.
+  7. **999.38:** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
+     invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
 **Plans**: TBD
 
@@ -587,7 +595,7 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
-### Phase 999.126: A Checkpoint Added After Code Preflight Is Never Re-Scanned (BACKLOG)
+### Phase 999.126: A Checkpoint Added After Code Preflight Is Never Re-Scanned (PROMOTED — Phase 48, 2026-09-13)
 
 **Found:** 2026-09-11, Phase 47 D-13 source review. Preflight checks plans only at Define and
 Code (`crates/devflow-cli/src/preflight.rs:971-973`), while agents may write plan files during Code
@@ -601,7 +609,7 @@ snapshot is established.
 **Acceptance:** a plan that gains a human-only gate after Code's initial preflight cannot continue
 unattended into the resume decision path; a plan that does not gain one remains unaffected.
 
-### Phase 999.125: Preflight and Resume Disagree on Where a `blocking-human` Gate Exists (BACKLOG)
+### Phase 999.125: Preflight and Resume Disagree on Where a `blocking-human` Gate Exists (PROMOTED — Phase 48, 2026-09-13)
 
 **Found:** 2026-09-11, Phase 47 D-13 source review. Preflight's
 `phase_has_human_only_checkpoint` is line-anchored to a task-opening line
@@ -3062,7 +3070,7 @@ Plans:
 
 - [x] Delivered in this release (hook scrub, per-command containment, hermeticity guard, `pre-commit` chaining shim)
 
-### Phase 999.38: Test-Suite PATH Race Between ENV_MUTEX Mutators and Concurrent Git Callers (BACKLOG)
+### Phase 999.38: Test-Suite PATH Race Between ENV_MUTEX Mutators and Concurrent Git Callers (PROMOTED — Phase 48 test-suite isolation, 2026-09-13)
 
 **GitHub:** [#181](https://github.com/denniyahh/devflow/issues/181) (migrated from Linear DEN-65)
 
