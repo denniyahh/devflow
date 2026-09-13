@@ -3074,6 +3074,8 @@ Plans:
 
 **Note:** Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because this pattern is unsound in a threaded test binary — the fix direction is per-`Command` `env`/`env_remove` (as 999.37's `test_support` now does for git) rather than process-global mutation. Fixing this would let `ENV_MUTEX` shrink or disappear, which is worth more than the flake itself. Related: 999.15 (hermetic tests for shell entry points).
 
+**Third site family, devflow-core (found 2026-09-11, Phase 47 deferred items).** The `agents/pi.rs` and `agents/opencode.rs` tests replace process-global `PATH` through a local `PathGuard` (`pi.rs:287-305` with eight `PathGuard::set` call sites; `opencode.rs:423-441`), serialized only by a module-local `ENV_MUTEX` (`pi.rs:194`, `opencode.rs:355`). The guard's SAFETY comment says no other thread reads or writes `PATH`, which is false: the `git.rs`, `hooks.rs`, `version.rs` and `worktree.rs` test modules spawn `git` or `sh` at 38, 6, 14 and 5 sites and take no lock. Observed in 47-03's second `scripts/check.sh test` run: the `devflow_core` lib reported 668 passed and 101 failed, every panic a spawn `NotFound`, and three immediate re-runs passed. The per-`Command` fix direction above covers these sites too. A devflow-cli *reader* of `PATH` raced the same devflow-cli mutators (`test_support.rs`, `an_empty_path_child_cannot_resolve_git_while_the_parent_still_can`); it now holds `env_lock()` on branch `fix/test-support-and-dependency-checks` (`82f081f`), a mitigation for that one test rather than this entry's fix.
+
 **Priority:** Medium | **Size:** M
 
 Plans:

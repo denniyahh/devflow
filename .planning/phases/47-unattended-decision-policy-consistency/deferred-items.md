@@ -3,7 +3,7 @@
 ## Deferred Items
 
 - `cargo clippy -p devflow-core --all-targets` does not compile two devflow-core integration tests
-  status: open
+  status: resolved
   **What:** `tests/monitor_e2e.rs:30` and `tests/devflow_dir_gitignore.rs:231,286,303` call
   `devflow_core::test_support::git_command`, and rustc reports the module as "configured out" when only
   `-p devflow-core` is selected. The feature that enables it is only active under workspace feature
@@ -16,9 +16,13 @@
   on that tree exits 0. Only the first two error sites were compared, not the full list of affected files.
   **Impact:** a package-scoped `--all-targets` check, which a contributor might reasonably run, fails
   for reasons unrelated to their change.
+  **Resolution (2026-09-13):** devflow-core now dev-depends on itself with `test-support` — `fc40bd9` on
+  branch `fix/test-support-and-dependency-checks`, not yet merged. On that branch the command went from
+  exit 101 to exit 0, both integration tests pass, workspace clippy stays green, and the `devflow`
+  binary's normal dependency graph still builds devflow-core with no features.
 
 - `an_empty_path_child_cannot_resolve_git_while_the_parent_still_can` races PATH-mutating sibling tests
-  status: open
+  status: resolved
   **What:** `crates/devflow-cli/src/test_support.rs:749-799` reads process-global `PATH` before and after
   a child-process run and asserts it is byte-identical, deliberately without `env_lock()` (its doc
   comment: "nothing in this test mutates process-global state any more"). Sibling tests in the same
@@ -34,6 +38,10 @@
   pre-47-03 tree, or a failure rate.
   **Impact:** an intermittent red in `scripts/check.sh test` (the required CI Test job) unrelated to
   the change under test.
+  **Resolution (2026-09-13):** the test's parent half holds `env_lock()` — `82f081f` on branch
+  `fix/test-support-and-dependency-checks`, not yet merged. Every devflow-cli file that mutates `PATH`
+  takes the same lock. The race was never reproduced on demand, so this rests on construction plus a
+  passing run, not on an observed before and after.
 
 - devflow-core `PathGuard` (`agents/pi.rs`, `agents/opencode.rs`) hides `git`/`sh` from concurrent tests
   status: open
@@ -53,3 +61,5 @@
   examined `devflow-core` was not checked.
   **Impact:** a burst of about 100 spurious failures in the required Test job, which reads as a
   broken build.
+  **Tracked (2026-09-13):** added to ROADMAP 999.38 as its third site family and commented on
+  devflow#181. Still open: its fix is 999.38's per-`Command` refactor, not a lock.

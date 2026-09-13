@@ -79,7 +79,7 @@ were also re-derived from each plan's final register, because several no longer 
 | 47-06-01 | 06 | 1 (gaps) | DECN-02, DECN-03 | 47-06/T-47-10, 47-06/T-47-11 | Decision reasoning above the last-line `DEVFLOW_RESULT` parses to that result; long trailing text still hides it | unit | `agent_result::tests::decision_reasoning_above_the_result_line_parses_to_that_result` | ✅ `agent_result.rs` | ✅ green |
 | 47-06-02 | 06 | 1 (gaps) | DECN-03 | 47-06/T-47-14, 47-06/T-47-19 | A real gate declaration is detected; the rendered resume prompt and resolved-gate prose are not | unit | `agent_result::tests::resume_prompt_does_not_read_as_a_blocking_human_checkpoint`; review-fix tests `agent_result::tests::blocking_human_checkpoint_reported_sees_through_list_and_quote_markup`, `agent_result::tests::literal_backslash_n_in_agent_text_is_not_a_line_break` | ✅ `agent_result.rs` | ✅ green |
 | 47-06-03 | 06 | 1 (gaps) | DECN-02, DECN-03 | 47-06/T-47-12, 47-06/T-47-13 | Nine re-blessed baselines match rendered output; package-verification prohibition unchanged | unit | the three snapshot tests above; `prompt::tests::package_verification_prohibition_is_unconditional` | ✅ 9 tracked `.snap` | ✅ green |
-| 47-07-01 | 07 | 1 (gaps) | WR-01 | 47-07/T-47-15, 47-07/T-47-17, 47-07/T-47-18 | Fixture bootstrap isolated from inherited hooks, signing and injected git config | integration | `scripts/test-phase-worktree-guard.sh` (`passed=13 failed=0`); `tests/ci_parity_guards.rs::worktree_guard_harness_queries_the_checkout_before_nulling_global_config` | ✅ `scripts/test-phase-worktree-guard.sh` | ✅ green |
+| 47-07-01 | 07 | 1 (gaps) | WR-01 | 47-07/T-47-15, 47-07/T-47-17, 47-07/T-47-18 | Fixture bootstrap isolated from inherited hooks, signing and injected git config | integration | `scripts/test-phase-worktree-guard.sh` (`passed=19 failed=0` since `7400042`); `tests/ci_parity_guards.rs::worktree_guard_harness_queries_the_checkout_before_nulling_global_config` | ✅ `scripts/test-phase-worktree-guard.sh` | ✅ green |
 | 47-07-02 | 07 | 1 (gaps) | WR-01 | 47-07/T-47-15, 47-07/T-47-16 | Host-independent regression case 7c, with armed controls 7a/7b | integration | `scripts/test-phase-worktree-guard.sh` rows 7a, 7b, 7c; `tests/check_script_run_test.rs` (harness runs even when cargo fails) | ✅ `scripts/test-phase-worktree-guard.sh` | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
@@ -151,14 +151,19 @@ Audited at HEAD `0afbff5`. No code, script or dependency manifest has changed si
 - **Snapshot drift (47-01/T-47-01):** `claude_style_full_execute_fix_prompt_snapshot.snap` was drifted by one line. The hardened invocation, with the caller exporting `INSTA_FORCE_UPDATE=1`, exited 101 and left the file untouched.
   - Control: the same run without `env -u INSTA_FORCE_UPDATE` exited 0 and rewrote the file.
   - The baseline was restored to its HEAD blob afterwards.
-- **`cargo deny check`:** advisories, bans, licenses and sources all ok. There was no control for this one.
+- **`cargo deny check`:** advisories, bans, licenses and sources all ok.
 - **`cargo machete`:** no unused dependencies.
   - Control: machete flagged `serde` in a throwaway crate that declares it without using it.
 
-**Not established here:**
+**Remediation 2026-09-13** (closing gaps this audit first listed):
 
-- **The full workspace suite was not re-run.** The previous session recorded `scripts/check.sh test` green on `49bb324`, and no code has changed since.
+- **`cargo deny` control:** an empty license allowlist fails (exit 4, `licenses FAILED`); the real `deny.toml` passes.
+- **Discrimination demos repeated at `dd873a6`:** the 47-02 helper widening, the 47-03 prohibition widening and the 47-07 two-line isolation mutant each turned their guarding test red (the mutant gave `passed=12 failed=1`); the restored tree is green and matches HEAD.
+- **Full suite:** `scripts/check.sh all` passed at `dd873a6` in 147 s. One run, not a flake-rate measurement.
+- **Regression guard for 47-01-03:** a `scripts/check.sh deps` target and an advisory `Dependency checks` CI job, on branch `fix/test-support-and-dependency-checks` (not merged into this phase).
+- **Worktree guard:** `7400042` fixes a quoted-filename bypass found while measuring 47-07/T-47-16; the harness now runs 19 checks.
+
+**Still not established:**
+
 - **The drift check ran the pinned invocation on one test, not the whole `check.sh test` wrapper.** `tests/check_script_run_test.rs` covers the wrapper's exit propagation, using a stub cargo.
-- **The discrimination demonstrations recorded during execution were not repeated:** the 47-02 helper widening, the 47-03 prohibition widening, and the 47-07 two-line isolation mutant.
-- **47-01-03 holds today but has no regression guard.** Nothing in CI or the git hooks runs `cargo deny` or `cargo machete`.
 - **Model behaviour** is not tested here: whether a live agent writes its reasoning above the result line, or avoids copying the gate line, is Phase 49's to observe.
