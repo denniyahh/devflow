@@ -109,10 +109,12 @@ Agent backends are isolated behind a trait
 - Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`
   (or `stage_prompt_for_project` when the CLI applies project config),
   not a single shared instruction template. Every prompt hands the agent its
-  GSD slash command (`Stage::gsd_command()`) plus the `DEVFLOW_RESULT`
+  GSD slash command (`Stage::gsd_command()`) plus a `DEVFLOW_RESULT`
   completion contract (`DEVFLOW_RESULT: {"status": "success"}` /
-  `{"status": "failed", "reason": "..."}`, required as the agent's exact
-  final message). Three stages get dedicated prompts:
+  `{"status": "failed", "reason": "..."}`). Prompts using
+  `COMPLETION_PROTOCOL` require that result as the last line of the agent's
+  final message, with any decision reasoning above it. Three stages get
+  dedicated prompts:
   - **Define / Plan** — idempotent: if the stage's deliverable
     (`CONTEXT.md` / `PLAN.md`) already exists, the agent reports success
     without re-running the GSD command (headless Codex cannot answer GSD's

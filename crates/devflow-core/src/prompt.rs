@@ -39,11 +39,11 @@ const SHIP_REVIEW_ANGLES: &[&str] = &[
 /// so a reader of any one of them can find this explanation.
 const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
 
-/// The completion contract every agent must honor as its final message.
+/// The completion contract every agent must honor as the last line of its final message.
 pub const COMPLETION_PROTOCOL: &str = "\
 ## Completion Protocol (REQUIRED)\n\
 \n\
-When all work is done, your FINAL message must be exactly:\n\
+When all work is done, the LAST line of your FINAL message must be exactly:\n\
 \n\
 DEVFLOW_RESULT: {\"status\": \"success\"}\n\
 \n\
@@ -51,15 +51,51 @@ If something prevents completion:\n\
 \n\
 DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n\
 \n\
-DevFlow reads this line to decide whether the stage succeeded. \
-Output nothing after it.";
+Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. \
+DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
+
+/// The single definition of who may resolve a `blocking-human` gate
+/// (47-CONTEXT.md D-04). It is a macro and not only a `const` because
+/// `CODE_STAGE_POLICY` is assembled with `concat!`, which accepts literals and
+/// macro expansions but rejects a `const` name (`error: expected a literal`).
+/// `GATE_RESOLUTION_RULE` and `CODE_STAGE_POLICY` both expand this one literal.
+///
+/// A line continuation drops the newline AND the next line's leading
+/// whitespace, so the space between two words sits before each `\`.
+macro_rules! gate_resolution_rule {
+    () => {
+        "A blocking-human gate is human-only, with one exception: if DevFlow \
+        resumed you specifically to resolve that gate, resolve it yourself and \
+        record your reasoning in your final message; otherwise report it instead."
+    };
+}
+
+/// Who may resolve a `blocking-human` gate: a prohibition with one named
+/// condition (47-CONTEXT.md D-01, D-02, D-04). `CODE_STAGE_POLICY` includes this
+/// sentence verbatim through `gate_resolution_rule!()`, and
+/// [`checkpoint_auto_decide_prompt`] states the SAME condition in the
+/// affirmative — it is only ever sent when DevFlow has resumed the agent to
+/// resolve such a gate. The two texts differ in grammatical mood, never in the
+/// condition.
+///
+/// `pub` deliberately: the cross-crate delivery test in `devflow-cli`
+/// (`pipeline_launch.rs`) asserts against this definition, not a re-typed copy.
+/// The carve-out covers `blocking-human` gates ONLY. Package-verification
+/// checkpoints keep an unconditional prohibition in `CODE_STAGE_POLICY` (D-02,
+/// settled by the operator 2026-09-10; the section text is pinned by
+/// `package_verification_prohibition_is_unconditional`, operator decision
+/// 2026-09-11). Do not widen it without a new decision.
+pub const GATE_RESOLUTION_RULE: &str = gate_resolution_rule!();
 
 /// Shared policy for full-execute Code prompts. This advises the agent during
 /// one-shot Code execution, while [`checkpoint_auto_decide_prompt`] is injected
 /// into a resumed session after DevFlow's own human-blocking gate finds no
 /// operator. They are complementary, not duplicates; neither should replace or
-/// be deleted as the other.
-const CODE_STAGE_POLICY: &str = "\
+/// be deleted as the other. Both state the gate rule through
+/// [`GATE_RESOLUTION_RULE`], so a resumed session that has seen both is never
+/// handed two different conditions (47-CONTEXT.md D-04).
+const CODE_STAGE_POLICY: &str = concat!(
+    "\
 ## Advisory incremental self-review\n\
 \n\
 After each plan or wave lands, perform a quick, shallow self-check \
@@ -83,10 +119,11 @@ produced the choice: which options you considered and why the chosen one won, \
 not merely a sentence asserting the choice. The final message is the only record \
 of the decision.\n\
 \n\
-This authority does not extend to a `blocking-human` gate or a \
-package-verification checkpoint. Those remain human-only: do not self-resolve \
-or approve them; report them instead. This policy must not pause execution or \
-request human input.";
+This authority never extends to a package-verification checkpoint: do not \
+self-resolve or approve one under any circumstances, and report it instead. ",
+    gate_resolution_rule!(),
+    " This policy must not pause execution or request human input."
+);
 
 /// The data a stage wants rendered, with NO agent-specific syntax.
 ///
@@ -451,25 +488,48 @@ fn workflow_plan_prompt(phase: PhaseId, workflow_root: &str) -> String {
     )
 }
 
-fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
+/// Whether a Code-stage arm carries `CODE_STAGE_POLICY` (D-05, 47-CONTEXT.md).
+///
+/// The single definition of the rule both renderers consult. It is extracted
+/// from `workflow_code_prompt`'s arm split, where the rule already lived and
+/// was correct, not re-derived. Stating the rule separately in each renderer is
+/// what let `fix_prompt` drift from it (DECN-02). The first Code pass (`None`)
+/// and the full-execute loop-back carry the policy; `GapsOnly` and `AuditFix`
+/// do not. The `match` is exhaustive on purpose: a new `FixType` variant must
+/// be classified here rather than falling into either answer by default.
+fn code_policy_applies_to_fix_arm(fix: Option<FixType>) -> bool {
     match fix {
+        Some(FixType::FullExecute) | None => true,
+        Some(FixType::GapsOnly) | Some(FixType::AuditFix) => false,
+    }
+}
+
+fn workflow_code_prompt(phase: PhaseId, fix: Option<FixType>, workflow_root: &str) -> String {
+    let instruction = match fix {
         Some(FixType::AuditFix) => format!(
             "Read and follow the GSD workflow file at {workflow_root}/audit-fix.md for \
-            phase {phase}.\n\n{COMPLETION_PROTOCOL}"
+            phase {phase}."
         ),
         Some(FixType::GapsOnly) => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto --gaps-only. The `--auto` and `--gaps-only` flags are part \
-            of the workflow invocation and must be preserved verbatim.\n\n{COMPLETION_PROTOCOL}"
+            of the workflow invocation and must be preserved verbatim."
         ),
         Some(FixType::FullExecute) | None => format!(
             "Read and follow the GSD workflow file at {workflow_root}/execute-phase.md for \
             phase {phase} --auto. The `--auto` flag is part of the workflow invocation and \
-            must be preserved verbatim.\n\n\
+            must be preserved verbatim."
+        ),
+    };
+    if code_policy_applies_to_fix_arm(fix) {
+        format!(
+            "{instruction}\n\n\
             {CODE_STAGE_POLICY}\n\
             \n\
             {COMPLETION_PROTOCOL}"
-        ),
+        )
+    } else {
+        format!("{instruction}\n\n{COMPLETION_PROTOCOL}")
     }
 }
 
@@ -523,10 +583,26 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 }
 
 /// The synthesized instruction sent into a resumed Claude session when a
-/// confirmed human-blocking checkpoint has nobody available to answer it
+/// confirmed `blocking-human` gate has nobody available to answer it
 /// (D-03, 28-CONTEXT.md): DevFlow's default, unconditional policy — no flag,
 /// no config toggle — is for the agent to resolve the checkpoint itself,
 /// using its own judgment, and record why.
+///
+/// 47-03 (47-CONTEXT.md D-02, D-04): the text names `blocking-human` because
+/// the only trigger for this resume, `verify::phase_has_blocking_human_checkpoint`,
+/// matches `gate="blocking-human"` and nothing else. It states the SAME
+/// condition as [`GATE_RESOLUTION_RULE`], in the affirmative: DevFlow resumed
+/// you specifically to resolve that gate, so resolve it and record your
+/// reasoning in your final message. It grants nothing beyond that gate —
+/// package-verification checkpoints are never routed through this injection.
+///
+/// The resume wording tells the agent to name the resolved gate in prose rather
+/// than copy the checkpoint's declaration line. A failed resume capture is
+/// re-read by `agent_result::text_reports_human_gate`, so a copied declaration
+/// line could read as a new checkpoint. The detector accepts only a
+/// `**Gate:**`-labeled line; the
+/// `resume_prompt_does_not_read_as_a_blocking_human_checkpoint` test pins that
+/// boundary and rejects prose such as `Resolved gate: blocking-human`.
 ///
 /// Deliberately deterministic: no timestamp, no random content, no varying
 /// state. Two calls for the same `phase` produce byte-identical strings, so
@@ -537,12 +613,13 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
     format!(
         "This is phase {phase} of a headless DevFlow run. You previously \
-        stopped at a human-blocking checkpoint, but no human operator is \
+        stopped at a blocking-human gate, but no human operator is \
         available to answer it — this run is unattended, and none is \
-        coming. DevFlow's policy is for you to resolve the checkpoint \
-        yourself, using your own best judgment, and continue the work. You \
-        MUST record your reasoning for the decision you made in your final \
-        message, so the decision is auditable after the fact.\n\
+        coming. DevFlow resumed you specifically to resolve that gate: \
+        resolve it yourself, using your own best judgment, and continue the \
+        work. You MUST record your reasoning for the decision you made in \
+        your final message, so the decision is auditable after the fact. \
+        In that reasoning, refer to the gate you resolved in plain prose and do not copy the gate-declaration line from the checkpoint, because DevFlow can mistake a copied declaration line for a new checkpoint.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -564,6 +641,19 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 /// Flag ORDER within the command string does not matter — GSD extracts
 /// `--`-prefixed tokens position-independently
 /// (`references/phase-argument-parsing.md`).
+///
+/// **The unattended decision policy (DECN-02; D-05 and D-06, 47-CONTEXT.md).**
+/// The `FullExecute` arm carries `CODE_STAGE_POLICY`, laid out as
+/// `code_stage_prompt` lays it out: command, policy, then the completion
+/// protocol last. Before Phase 47 it did not. Because `render_claude_style` is
+/// shared, every adapter routed through it (Claude, OpenCode, Hermes and
+/// Antigravity) lost the policy on every Validate loop-back, while Codex and Pi
+/// kept it through `workflow_code_prompt`. Whether an arm carries the policy is
+/// now decided by `code_policy_applies_to_fix_arm`, the same helper
+/// `workflow_code_prompt` consults, so the two renderers cannot state different
+/// rules. `GapsOnly` and `AuditFix` are excluded deliberately, not overlooked:
+/// they are `workflow_code_prompt`'s existing exclusions, carried over
+/// unchanged.
 pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
     let command = match fix_type {
         FixType::AuditFix => format!("/gsd-audit-fix {phase}"),
@@ -574,9 +664,23 @@ pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
             format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
         }
     };
-    format!(
-        "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
-    )
+    // Signature bridge: the helper takes `Option<FixType>`, where `None` means
+    // the first Code pass, and a loop-back always has a fix type, so the bridge
+    // is always `Some(fix_type)`. This is the seam where an edit could silently
+    // widen the policy to every fix arm (e.g. by passing `None`); the
+    // claude-style omission control in `mod tests` is what catches that.
+    if code_policy_applies_to_fix_arm(Some(fix_type)) {
+        format!(
+            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n\
+            {CODE_STAGE_POLICY}\n\
+            \n\
+            {COMPLETION_PROTOCOL}"
+        )
+    } else {
+        format!(
+            "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +925,140 @@ mod tests {
         }
     }
 
+    /// D-08 (47-CONTEXT.md): the claude-style twin of the omission control
+    /// directly above, which drives `render_workflow_style` only. DECN-02
+    /// changes the claude-style fix path, so an over-broad edit that gave every
+    /// claude-style fix arm the policy would leave that workflow-style control
+    /// green. This one goes red.
+    #[test]
+    fn claude_style_fix_prompts_that_must_not_carry_the_policy_still_omit_it() {
+        let phase = PhaseId::new(45);
+        let gaps_only = render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::GapsOnly),
+        });
+        let audit_fix = render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::AuditFix),
+        });
+
+        for prompt in [
+            stage_prompt(Stage::Validate, phase),
+            stage_prompt(Stage::Ship, phase),
+            gaps_only,
+            audit_fix,
+        ] {
+            assert!(
+                !prompt.contains(CODE_STAGE_POLICY),
+                "only full-execute Code prompts may carry the shared policy"
+            );
+        }
+    }
+
+    /// D-07 / DECN-02 (47-CONTEXT.md): a Validate loop-back that dispatches
+    /// `Code { fix: Some(FullExecute) }` must deliver the unattended decision
+    /// policy on every adapter, not only on the first Code pass.
+    ///
+    /// Kinds are enumerated by an exhaustive `match` over `AgentKind`, NOT an
+    /// array literal. This workspace has no `AgentKind::ALL`, and an array loop
+    /// is a manual list that a seventh variant would silently fall outside of.
+    /// Here a new variant is a compile error until it is given a render style
+    /// and linked into the chain. Residual gap, stated rather than hidden: an
+    /// arm added with a successor that no other arm points at would compile and
+    /// go unvisited.
+    ///
+    /// Asserts on the heading string literal rather than on `CODE_STAGE_POLICY`
+    /// so the pre-fix tree compiles and prints a real `test result: FAILED`
+    /// (RESEARCH Pitfall 4: a compile error is not a red test).
+    #[test]
+    fn code_policy_reaches_the_full_execute_fix_arm_on_every_adapter() {
+        use crate::agents::driver_for;
+        use crate::state::AgentKind;
+
+        const POLICY_HEADING: &str = "## Unattended decision checkpoints";
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Render {
+            /// Routed through `render_claude_style` — the DECN-02 gap.
+            ClaudeStyle,
+            /// Routed through `render_workflow_style`, already correct — a
+            /// passing control (D-07).
+            WorkflowStyleControl,
+        }
+
+        fn render_and_next(kind: AgentKind) -> (Render, Option<AgentKind>) {
+            match kind {
+                AgentKind::Claude => (Render::ClaudeStyle, Some(AgentKind::Codex)),
+                AgentKind::Codex => (Render::WorkflowStyleControl, Some(AgentKind::OpenCode)),
+                AgentKind::OpenCode => (Render::ClaudeStyle, Some(AgentKind::Pi)),
+                AgentKind::Pi => (Render::WorkflowStyleControl, Some(AgentKind::Antigravity)),
+                AgentKind::Antigravity => (Render::ClaudeStyle, Some(AgentKind::Hermes)),
+                AgentKind::Hermes => (Render::ClaudeStyle, None),
+            }
+        }
+
+        let intent = StageIntent::Code {
+            phase: PhaseId::new(47),
+            fix: Some(FixType::FullExecute),
+        };
+        let mut visited: Vec<AgentKind> = Vec::new();
+        let mut controls_seen = 0;
+        let mut controls_missing = Vec::new();
+        let mut claude_style_missing = Vec::new();
+        let mut next = Some(AgentKind::Claude);
+        while let Some(kind) = next {
+            assert!(
+                !visited.contains(&kind),
+                "the kind chain cycles at {kind:?}"
+            );
+            let (render, successor) = render_and_next(kind);
+            let prompt = driver_for(kind).render_prompt(&intent);
+
+            // Precondition: every render carries the completion protocol, so the
+            // search range is non-empty and a missing heading below is absence of
+            // the policy, not an empty or wrong render.
+            assert!(
+                prompt.contains(COMPLETION_PROTOCOL),
+                "{kind:?} rendered no completion protocol, so a missing heading would prove nothing"
+            );
+
+            let carries_policy = prompt.contains(POLICY_HEADING);
+            match render {
+                Render::WorkflowStyleControl => {
+                    controls_seen += 1;
+                    if !carries_policy {
+                        controls_missing.push(kind);
+                    }
+                }
+                Render::ClaudeStyle if !carries_policy => claude_style_missing.push(kind),
+                Render::ClaudeStyle => {}
+            }
+            visited.push(kind);
+            next = successor;
+        }
+
+        // Precondition: without the codex/pi controls, a red result could not
+        // distinguish "the claude-style fix arm omits the policy" from "the
+        // heading literal matches no real policy text on any adapter". The
+        // controls carrying the heading is what makes the claude-style
+        // assertion below a real discrimination.
+        assert!(
+            controls_seen >= 1,
+            "no workflow-style control was visited, so this test cannot discriminate"
+        );
+        assert!(
+            controls_missing.is_empty(),
+            "workflow-style controls {controls_missing:?} lost the policy heading on the \
+             FullExecute arm: this test is no longer measuring the claude-style gap"
+        );
+        assert!(
+            claude_style_missing.is_empty(),
+            "the FullExecute fix arm omits the unattended decision policy on \
+             {claude_style_missing:?} (render_claude_style): a Validate loop-back never \
+             delivers it to those adapters"
+        );
+    }
+
     #[test]
     fn both_code_prompts_still_end_with_the_completion_protocol() {
         let phase = PhaseId::new(45);
@@ -1025,5 +1263,173 @@ mod tests {
     #[test]
     fn checkpoint_auto_decide_prompt_substitutes_phase_for_legibility() {
         assert!(checkpoint_auto_decide_prompt(PhaseId::new(42)).contains("phase 42"));
+    }
+
+    /// D-03/D-04 (47-03), constant level. A resumed Claude session sees
+    /// `CODE_STAGE_POLICY` in its first turn and `checkpoint_auto_decide_prompt`
+    /// in a later one, so the two texts must state one rule about who may
+    /// resolve a `blocking-human` gate: the policy may not forbid it outright
+    /// while the resume instruction, which names a different class, says to
+    /// resolve it.
+    ///
+    /// Controls: the policy must still name `package-verification` (D-02 keeps
+    /// that prohibition unconditional, so a fix that deletes the sentence instead
+    /// of splitting it fails here), and the resume prompt must end with the
+    /// completion protocol, so an absent `blocking-human` means the prose lacks
+    /// it rather than that the prompt is empty. The rule checks are collected so
+    /// a red run reports every half that is wrong, not only the first.
+    #[test]
+    fn the_gate_rule_has_one_definition_site() {
+        let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
+        assert!(
+            CODE_STAGE_POLICY.contains("package-verification"),
+            "D-02: the package-verification prohibition must survive the split, not be deleted"
+        );
+        assert!(
+            resume.ends_with(COMPLETION_PROTOCOL),
+            "precondition: the resume instruction must be a real rendered prompt"
+        );
+
+        let mut contradictions = Vec::new();
+        if CODE_STAGE_POLICY.contains("gate or a package-verification checkpoint") {
+            contradictions.push(
+                "CODE_STAGE_POLICY still forbids a blocking-human gate unconditionally, \
+                 in the same sentence as package verification",
+            );
+        }
+        if !resume.contains("blocking-human") {
+            contradictions.push(
+                "checkpoint_auto_decide_prompt does not name the blocking-human gate \
+                 class it resumes the agent to resolve",
+            );
+        }
+        // Strengthened once the shared constant existed (47-03 Task 3): the
+        // policy must carry the one definition, not merely lack the old sentence.
+        if !CODE_STAGE_POLICY.contains(GATE_RESOLUTION_RULE) {
+            contradictions.push("CODE_STAGE_POLICY does not carry GATE_RESOLUTION_RULE");
+        }
+        assert!(
+            contradictions.is_empty(),
+            "the two gate-rule texts disagree: {contradictions:#?}"
+        );
+    }
+
+    /// D-02 enforcement (47-03, operator decision 2026-09-11): the gate-rule
+    /// section of `CODE_STAGE_POLICY` is PINNED character for character. Word
+    /// lists failed review three times; an exact pin cannot be paraphrased
+    /// around, so ANY change to this section fails here — a synonym, a
+    /// restructure, a waiver added inside it, or a space lost before a line
+    /// continuation.
+    ///
+    /// The expected text is this test's own literal and is never assembled from
+    /// `GATE_RESOLUTION_RULE` or `CODE_STAGE_POLICY`: building it from the
+    /// constants under test would widen the expectation along with them.
+    ///
+    /// NOT covered: an authorization added elsewhere in the policy, outside this
+    /// section. That is caught only by reading the snapshot diff when the
+    /// baseline is re-blessed, and in phase review.
+    #[test]
+    fn package_verification_prohibition_is_unconditional() {
+        const PINNED_SECTION: &str = "This authority never extends to a package-verification checkpoint: do not self-resolve or approve one under any circumstances, and report it instead. A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
+        const PINNED_GATE_RULE: &str = "A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead.";
+
+        assert!(
+            CODE_STAGE_POLICY.contains(PINNED_SECTION),
+            "CODE_STAGE_POLICY no longer carries the pinned gate-rule section verbatim"
+        );
+        assert_eq!(
+            GATE_RESOLUTION_RULE, PINNED_GATE_RULE,
+            "GATE_RESOLUTION_RULE must equal the pinned section's second sentence exactly"
+        );
+    }
+
+    /// D-14/D-15 (47-CONTEXT.md): the Claude/OpenCode loop-back Code prompt is
+    /// pinned as a reviewed `insta` snapshot, so a wording change to it surfaces
+    /// as a `.snap` diff in review instead of drifting unnoticed — the failure
+    /// that produced Phase 47.
+    ///
+    /// The committed baseline is DELIBERATELY the pre-fix capture: it carries the
+    /// `/gsd-execute-phase` fix command and no unattended decision-policy
+    /// section. That absence is the DECN-02 defect recorded as a reviewed
+    /// artifact; DECN-02's fix must drift this snapshot and re-bless it with the
+    /// content change asserted. Do not re-bless it to make a failure go away —
+    /// read the diff. `scripts/check.sh test` unsets `INSTA_FORCE_UPDATE` and
+    /// pins `INSTA_UPDATE=no`, so a mismatch fails there rather than rewriting
+    /// the baseline.
+    #[test]
+    fn claude_style_full_execute_fix_prompt_snapshot() {
+        let prompt = render_claude_style(&StageIntent::Code {
+            phase: PhaseId::new(47),
+            fix: Some(FixType::FullExecute),
+        });
+        insta::assert_snapshot!(prompt);
+    }
+
+    /// D-15 (47-CONTEXT.md): one named, reviewed `insta` baseline per adapter
+    /// for the policy-carrying `FullExecute` fix prompt, captured exactly as
+    /// each adapter delivers it through `driver_for(kind).render_prompt`.
+    ///
+    /// The four claude-style baselines (claude, opencode, hermes, antigravity)
+    /// are byte-identical to each other and to the
+    /// `claude_style_full_execute_fix_prompt_snapshot` baseline. That redundancy
+    /// is DELIBERATE, not an oversight: it is what turns an adapter silently
+    /// switching render style into a visible diff on that adapter's own `.snap`
+    /// file. Do not "clean it up" into one shared baseline. The two
+    /// workflow-style baselines (codex, pi) differ only in each driver's
+    /// workflow root.
+    ///
+    /// Scope is D-15's and no wider. The `GapsOnly`/`AuditFix` arms carry no
+    /// policy and are already discriminated by
+    /// `claude_style_fix_prompts_that_must_not_carry_the_policy_still_omit_it`.
+    ///
+    /// Kinds are walked through an exhaustive `match`, as in
+    /// `code_policy_reaches_the_full_execute_fix_arm_on_every_adapter`, so a new
+    /// `AgentKind` variant is a compile error here until it is given a baseline.
+    #[test]
+    fn policy_carrying_full_execute_fix_prompt_snapshots() {
+        use crate::agents::driver_for;
+        use crate::state::AgentKind;
+
+        fn snapshot_name_and_next(kind: AgentKind) -> (&'static str, Option<AgentKind>) {
+            match kind {
+                AgentKind::Claude => ("full_execute_fix_prompt_claude", Some(AgentKind::OpenCode)),
+                AgentKind::OpenCode => {
+                    ("full_execute_fix_prompt_opencode", Some(AgentKind::Hermes))
+                }
+                AgentKind::Hermes => (
+                    "full_execute_fix_prompt_hermes",
+                    Some(AgentKind::Antigravity),
+                ),
+                AgentKind::Antigravity => (
+                    "full_execute_fix_prompt_antigravity",
+                    Some(AgentKind::Codex),
+                ),
+                AgentKind::Codex => ("full_execute_fix_prompt_codex", Some(AgentKind::Pi)),
+                AgentKind::Pi => ("full_execute_fix_prompt_pi", None),
+            }
+        }
+
+        let intent = StageIntent::Code {
+            phase: PhaseId::new(47),
+            fix: Some(FixType::FullExecute),
+        };
+        let mut visited: Vec<AgentKind> = Vec::new();
+        let mut next = Some(AgentKind::Claude);
+        while let Some(kind) = next {
+            assert!(
+                !visited.contains(&kind),
+                "the kind chain cycles at {kind:?}"
+            );
+            let (name, successor) = snapshot_name_and_next(kind);
+            let prompt = driver_for(kind).render_prompt(&intent);
+            insta::assert_snapshot!(name, prompt);
+            visited.push(kind);
+            next = successor;
+        }
+        assert_eq!(
+            visited.len(),
+            6,
+            "every adapter must be snapshotted exactly once"
+        );
     }
 }

@@ -95,8 +95,22 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   Existence is asked of `git worktree list --porcelain`, not of the `.worktrees/phase-N` path, so
   the answer stays correct when the hook runs from inside a worktree (where that relative path does
   not resolve at all). Guard: `scripts/lint-phase-worktree.sh`; both directions exercised by
-  `scripts/test-phase-worktree-guard.sh` (7 cases, including two negative controls that must PASS —
-  a guard only ever observed refusing has not been shown to discriminate).
+  `scripts/test-phase-worktree-guard.sh` (19 checks, including two negative controls that must PASS —
+  a guard only ever observed refusing has not been shown to discriminate). The workspace-only test
+  `crates/devflow-cli/tests/worktree_guard_harness.rs` runs it inside `cargo test --workspace` and
+  requires exit 0 plus a `passed=N failed=0` line with N > 0, so `scripts/check.sh test` and the
+  pre-push container gate fail when it does, without `check.sh` naming a script `develop` lacks.
+  That test file and the harness stay out of every `develop` PR cut. The guard reads staged names
+  with `git diff --cached --name-only -z --no-relative`:
+  the newline form quotes any name with a non-ASCII byte, a quote or a backslash, so a `^crates/`
+  match never saw it, and `diff.relative` hides paths outside the current directory. Case 8 covers
+  both, each case beside a control proving its condition is live.
+  The harness unsets every repository-local git environment variable (`git rev-parse
+  --local-env-vars`), queries the real checkout's recorded modes with the inherited config (CI
+  accepts its runner-owned checkout only through a global `safe.directory`), and only then disables
+  global and system git config for its fixtures; `worktree_guard_harness.rs` asserts that order.
+  Its scratch repository also pins hooks and signing
+  locally, and case 7 proves that local isolation under a hostile global git config.
 - [ ] **[PROJECT]** **`scripts/phase-worktree.sh <N>` is the one command that creates a phase
   worktree correctly**, replacing a four-step manual sequence every step of which was skippable.
   It validates the phase against a real `### Phase N:` heading in ROADMAP.md (phases get
@@ -447,8 +461,21 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 
 ## 8. Language/build tooling — [PROJECT], Rust-specific
 
-- [ ] Cargo workspace: `devflow-core` (lib) + `devflow-cli` (bin), zero network-dependency
-  policy (serde, clap, thiserror, tracing only).
+- [ ] Cargo workspace: `devflow-core` (lib) + `devflow-cli` (bin). Zero network-dependency
+  policy for the **runtime** graph only — no network crate among `[dependencies]` (serde,
+  serde_json, toml, clap, thiserror, tracing, tracing-subscriber, semver, git-conventional,
+  libc). It does **not** cover `[dev-dependencies]`: `tempfile` and, since Phase 47, `insta`
+  (the prompt-text snapshot drift guard, 47-CONTEXT.md D-14/D-15) are test-only. `cargo deny`
+  with this `deny.toml` does not traverse dev-dependencies, and `cargo machete` 0.9.2 does not
+  analyze them, so neither tool polices that half.
+- [ ] **Snapshot baselines (`insta`).** `cargo-insta` is NOT installed, and `scripts/check.sh test`
+  runs cargo test under `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no`, so a missing or mismatched
+  `.snap` fails there and nothing in the dev loop writes one. The only way to create (or
+  deliberately re-bless) a baseline is this recipe, run once, on purpose:
+  `INSTA_UPDATE=always cargo test -p <crate> <testname>` — then READ the generated
+  `src/snapshots/*.snap` before committing it. `*.snap` is tracked (it is the reviewable
+  artifact); `*.snap.new` is gitignored. Never export `INSTA_UPDATE` or `INSTA_FORCE_UPDATE` from
+  a shell profile or CI image: `check.sh` neutralises both, but a bare `cargo test` does not.
 - [ ] `~/.cargo/credentials.toml` exists (crates.io publish auth) — contents not inspected here;
   needed to reproduce the publish step, not the dev-loop itself.
 - [ ] Publish order matters and is enforced by convention, not tooling: `devflow-core` before

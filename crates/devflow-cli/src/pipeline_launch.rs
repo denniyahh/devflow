@@ -216,6 +216,26 @@ fn resolve_launch_shape(
     }
 }
 
+/// Resolve a checkpoint resume into `(program, argv)`.
+///
+/// Extracted from [`relaunch_checkpoint_session`] unchanged (47-03), for the
+/// same reason 31-04 extracted [`resolve_launch_shape`]: so the instruction a
+/// resume actually DELIVERS is assertable without spawning a process. The
+/// instruction rides positionally in `argv[1]` (`ClaudeDriver::exec_resume_command`);
+/// this path has no stdin turn.
+///
+/// It builds the instruction itself rather than taking it as a parameter, so a
+/// test driving this function exercises the same prompt builder a real resume
+/// delivers. The caller still builds its own copy for the
+/// `checkpoint_auto_decided` event, which must be emitted BEFORE this call so a
+/// spawn failure still leaves the attempt on record (47-CONTEXT.md D-10).
+/// `checkpoint_auto_decide_prompt` is byte-deterministic, and the caller
+/// asserts in debug builds that the two copies agree.
+fn resume_launch_shape(phase: PhaseId, session_id: &str) -> (&'static str, Vec<String>) {
+    let instruction = prompt::checkpoint_auto_decide_prompt(phase);
+    agents::ClaudeDriver::exec_resume_command(session_id, &instruction)
+}
+
 /// Where a forced legacy launch's authorization came from, for the provenance
 /// record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,7 +1136,14 @@ pub(crate) fn relaunch_checkpoint_session(
         }),
     );
 
-    let (program, args) = agents::ClaudeDriver::exec_resume_command(session_id, &instruction);
+    // 47-03: built by `resume_launch_shape` so the delivered instruction is
+    // assertable without a spawn. The event above quotes this function's own
+    // `instruction`; the debug assertion pins that quote to what is delivered.
+    let (program, args) = resume_launch_shape(state.phase, session_id);
+    debug_assert_eq!(
+        args[1], instruction,
+        "the checkpoint_auto_decided event must quote the instruction the resume delivers"
+    );
 
     // `Legacy`, deliberately: `exec_resume_command` builds the pre-31
     // single-document shape (positional instruction, `--output-format json`),
@@ -3969,6 +3996,102 @@ mod tests {
             "the forced path must be exec_command_single_document byte-for-byte, \
              not an approximation of it"
         );
+    }
+
+    /// D-03 (47-03): a resumed Claude session receives the gate rule in two
+    /// separately delivered turns — the Code loop-back prompt as the stdin user
+    /// turn (turn 1) and the checkpoint resume instruction positionally in argv
+    /// (turn 2). Co-residence is a property of the session transcript, not of
+    /// any string DevFlow builds, so this test NEVER joins the two: each is
+    /// captured from the production constructor that delivers it and asserted on
+    /// its own.
+    ///
+    /// Controls: the stream-launch precondition (without it turn 1 resolves to
+    /// `Legacy`, there is no stdin turn, and the rule checks would be vacuous
+    /// rather than false); `assert_ne!` plus mutual non-containment (otherwise
+    /// two captures collapsed onto one source would still pass); and turn 1
+    /// still naming `package-verification` (D-02 keeps that prohibition, so a
+    /// fix that deletes the sentence instead of splitting it fails here).
+    #[test]
+    fn the_gate_rule_holds_in_both_delivered_turns() {
+        let phase = PhaseId::new(47);
+        let agent = AgentKind::Claude;
+        let driver = agents::driver_for(agent);
+        let stream_launch = stream_launch_enabled(agent, Stage::Code, false);
+        assert!(
+            stream_launch,
+            "Stage::Code must be stream-launch-enabled for Claude for this test to mean anything"
+        );
+
+        // Turn 1: `loop_back_to_code`'s own render (pipeline_gate.rs), then the
+        // launch shape `launch_stage_inner` resolves it to.
+        let loop_back_prompt = driver.render_prompt(&prompt::StageIntent::Code {
+            phase,
+            fix: Some(prompt::FixType::FullExecute),
+        });
+        let (_program, _args, launch) = resolve_launch_shape(
+            agent,
+            driver.as_ref(),
+            phase,
+            loop_back_prompt,
+            &[],
+            stream_launch,
+        );
+        let turn1 = match launch {
+            monitor::MonitorLaunch::PipeOwning { prompt: stdin_turn } => stdin_turn,
+            monitor::MonitorLaunch::Legacy => {
+                panic!("the Code loop-back must deliver a stdin user turn, not a Legacy launch")
+            }
+        };
+
+        // Turn 2: the real resume builder. Index rather than `.get()`, so an
+        // absent element panics instead of reading quietly as `None`.
+        let (_program, argv) = resume_launch_shape(phase, "session-under-test");
+        assert_eq!(
+            argv[0], "-p",
+            "resume argv shape changed; the instruction is not argv[1]"
+        );
+        let turn2 = argv[1].clone();
+
+        assert_ne!(
+            turn1, turn2,
+            "the two turns must be distinct delivered artifacts"
+        );
+        assert!(
+            !turn1.contains(&turn2) && !turn2.contains(&turn1),
+            "neither turn may contain the other, or the pair is one source twice"
+        );
+        assert!(
+            turn1.contains("package-verification"),
+            "D-02: turn 1 must keep the unconditional package-verification prohibition"
+        );
+
+        let mut contradictions = Vec::new();
+        if turn1.contains("gate or a package-verification checkpoint") {
+            contradictions.push("turn 1 forbids a blocking-human gate unconditionally");
+        }
+        // Strengthened once the shared constant existed (47-03 Task 3): turn 1
+        // must carry the one definition, not merely lack the old sentence.
+        if !turn1.contains(prompt::GATE_RESOLUTION_RULE) {
+            contradictions.push("turn 1 does not carry the shared GATE_RESOLUTION_RULE");
+        }
+        if !turn2.contains("blocking-human") {
+            contradictions.push(
+                "turn 2 does not name the blocking-human gate it resumes the agent to resolve",
+            );
+        }
+        assert!(
+            contradictions.is_empty(),
+            "the delivered turns disagree on the gate rule: {contradictions:#?}"
+        );
+
+        // D-15 (47-04): each delivered turn is also a reviewed `insta` baseline,
+        // taken from the same captures asserted above. Two separately named
+        // snapshots, NEVER one joined string: a joined snapshot would
+        // reintroduce the composition D-03 rejects, which production never
+        // performs (47-RESEARCH.md B-3).
+        insta::assert_snapshot!("turn_one_code_prompt", turn1);
+        insta::assert_snapshot!("turn_two_resume_prompt", turn2);
     }
 
     /// Phase 39 Stage 1 regression: Pi always resolves to `MonitorLaunch::Legacy`.

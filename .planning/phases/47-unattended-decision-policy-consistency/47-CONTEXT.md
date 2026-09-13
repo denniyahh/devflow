@@ -89,6 +89,12 @@ and DECN-03 (the co-residence contradiction) is narrower, claude-only, and human
   **narrow — `blocking-human` only**. This is now **settled**, not open; no `checkpoint:decision`
   is required for it. The narrow form is two-way reversible, so it earns no one-way-door gate
   either. Do not re-widen without a new decision.
+  — **Enforcement, operator decision 2026-09-11.** After the third external review found both
+  word-list enforcement designs broken (evadable 15 ways, then a test correct work could not pass
+  plus a waiver hidden in a neighbouring sentence), the operator chose to **pin the gate-rule
+  section's exact text** in `47-03-PLAN.md` Task 3 and assert it character for character. What
+  that does not cover — an authorization added elsewhere in the policy — stays with snapshot-diff
+  review, and the plan says so.
 
 - **D-03 [REVISED]:** The contradiction test is **layered** — a constant-level unit test
   (unconditional prohibition string gone, conditional form present) **plus a two-turn delivery
@@ -306,7 +312,9 @@ and DECN-03 (the co-residence contradiction) is narrower, claude-only, and human
 
 ### Claude's Discretion
 
-- Exact wording of the carve-out sentence and of the shared constant from D-04.
+- ~~Exact wording of the carve-out sentence and of the shared constant from D-04.~~
+  **Revoked by operator decision 2026-09-11** (see D-02 § Enforcement): the gate-rule section's
+  wording is now fixed in `47-03-PLAN.md` Task 3, not left to the executor.
 - Whether the snapshot framework lands as its own plan or inside the fix plan.
 - Whether the two latent defects named in D-13 are filed as one backlog entry or two.
 

@@ -26,7 +26,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | Phase | Name | Requirements | Wave | Status |
 |---|---|---|---|---|
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
-| 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Not started |
+| 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02 | 2 | Not started |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
@@ -94,10 +94,11 @@ structurally incompatible with per-test process isolation.
 ### Phase 47: Unattended Decision Policy Consistency
 
 **Goal**: An unattended agent receives the same merit-based decision instruction everywhere it is
-asked to make a Code-stage decision — including the Claude/OpenCode Validate loop-back, the primary
-agent's common path — and is never handed two contradictory instructions about who may resolve a
-`blocking-human` gate inside one resumed session. Closes the half of DECN-01 that v2.8.0 shipped
-undelivered.
+asked to make a Code-stage decision — including the claude, opencode, hermes, and antigravity
+Validate loop-back, the four adapters routed through `render_claude_style`; codex and pi use
+`render_workflow_style` and are already correct — and is never handed two contradictory instructions
+about who may resolve a `blocking-human` gate inside one resumed session. Closes the half of DECN-01
+that v2.8.0 shipped undelivered.
 **Depends on**: Nothing — prompt rendering only, independent of Phase 46.
 **Sequencing note**: Wave 1 by milestone design — this must be true before Phase 49 measures a run.
 **Requirements**: DECN-02, DECN-03
@@ -120,7 +121,27 @@ undelivered.
      as an explicit observation item for Phase 49's live run — naming in advance what would count
      as evidence either way — rather than marking DECN-03 settled on a source read.
 
-**Plans**: TBD
+**Plans**: 7/7 plans executed
+
+Plans:
+**Wave 1**
+
+- [x] 47-01-PLAN.md — Snapshot drift guard: `insta` wiring, hardened `run_test`, three-case control (wave 1)
+- [x] 47-06-PLAN.md — Gap closure CR-01: completion protocol puts reasoning above a last-line `DEVFLOW_RESULT`; prompt-to-parser contract test; resume prompt names the resolved gate in prose, pinned against the gate detector; nine baselines re-blessed (gap wave 1)
+- [x] 47-07-PLAN.md — Gap closure WR-01: worktree-guard test fixture isolated from inherited hooks, commit signing and environment-injected git config (gap wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 47-02-PLAN.md — DECN-02: the `fix_prompt` gap, shared arm helper, six-adapter coverage (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 47-03-PLAN.md — DECN-03: one gate rule, `resume_launch_shape`, two-turn delivery test (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 47-04-PLAN.md — D-15 snapshot suite against the final text (wave 4)
+- [x] 47-05-PLAN.md — The record: docs correction, ROADMAP/REQUIREMENTS amendments, backlog filings (wave 4)
 
 ### Phase 48: Survivable State Writes and Honest Gate Recovery
 
@@ -179,6 +200,7 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
      agent follows when `CODE_STAGE_POLICY` and `checkpoint_auto_decide_prompt` are both present —
      or the run records explicitly that it never exercised that path. Either is a result; silence
      is not.
+     See `47-PHASE49-OBSERVATION.md` for the evidence standard derived by Phase 47.
   5. SURV-01's field question is recorded the same way: whether the run produced any concurrent
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
@@ -392,7 +414,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 44 | 5/5 | Complete | 2026-08-27 |
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
-| 47 | — | Not started | — |
+| 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | — | Not started | — |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
@@ -564,6 +586,37 @@ needs to be visible outside the repo, using the existing
 add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
+
+### Phase 999.126: A Checkpoint Added After Code Preflight Is Never Re-Scanned (BACKLOG)
+
+**Found:** 2026-09-11, Phase 47 D-13 source review. Preflight checks plans only at Define and
+Code (`crates/devflow-cli/src/preflight.rs:971-973`), while agents may write plan files during Code
+(`crates/devflow-core/src/verify.rs:118-119`). A human-only gate added after Code's preflight has
+already run is never checked before the run can reach the resume route.
+
+**Fix shape:** make the gate decision consume a fresh, authoritative plan scan at the point where
+the run would otherwise continue unattended, or prevent the plan from changing after the checked
+snapshot is established.
+
+**Acceptance:** a plan that gains a human-only gate after Code's initial preflight cannot continue
+unattended into the resume decision path; a plan that does not gain one remains unaffected.
+
+### Phase 999.125: Preflight and Resume Disagree on Where a `blocking-human` Gate Exists (BACKLOG)
+
+**Found:** 2026-09-11, Phase 47 D-13 source review. Preflight's
+`phase_has_human_only_checkpoint` is line-anchored to a task-opening line
+(`crates/devflow-core/src/verify.rs:207-220`), while the resume route's
+`phase_has_blocking_human_checkpoint` is a whole-file substring match
+(`crates/devflow-core/src/verify.rs:131-137`). The comment at
+`crates/devflow-core/src/verify.rs:191-196` says the pair deliberately fails in opposite
+directions. A `gate="blocking-human"` marker outside a task-opening line can therefore pass
+preflight while still arming the resume route.
+
+**Fix shape:** replace the divergent scans with one parsed checkpoint predicate shared by preflight
+and resume, with one explicit definition of the task locations and gate classes that count.
+
+**Acceptance:** a marker outside a task-opening line neither blocks preflight nor arms resume; a
+proper task-level `blocking-human` gate produces the same human-only result in both paths.
 
 ### Phase 999.124: GSD `phase complete` Leaves the Planning Docs Half-Updated on Every Phase Close (BACKLOG)
 
@@ -3020,6 +3073,8 @@ Plans:
 **Second mechanism, observed 2026-08-05 (Phase 33 review WR-05 + the 33-06 execution run).** The same `ENV_MUTEX`+`PATH` regions have a *second* failure mode this entry did not originally name: the restore is a trailing statement, and Rust abandons remaining statements the instant a panic begins unwinding. So a panic inside a region (a) leaves `PATH` pointed at a `neutral_path_dir` the unwind then drops and **deletes**, handing every concurrent test a `PATH` naming a nonexistent directory, and (b) poisons `ENV_MUTEX`, so every later `ENV_MUTEX.lock().unwrap()` panics with `PoisonError` — one legible failure becomes a cascade. Observed live during 33-06: a single `index.lock` failure in `concurrent_ship_advances_finish_both_phases_independently` cascaded into ~15 unrelated `PoisonError` failures. Phase 33-06 added a `NeutralPath` RAII guard (`crates/devflow-cli/src/test_support.rs:279`, `impl Drop` at `:300`) and applied it to **two** regions only; ten pre-existing regions still use the trailing-statement form (`pipeline_outcomes.rs:1280-1304`, `:1355-1383`, `:1434-1458`, `:1489-1508`, `:1545-1560`, `:1779-1798`, `:1850-1865`, `:1915-1930`; `pipeline_gate.rs:1140-1159`, `:1231-1246`). Two cheap partial mitigations short of this entry's full per-`Command` fix: retrofit `NeutralPath` to the remaining ten, and replace `ENV_MUTEX.lock().unwrap()` with `.unwrap_or_else(PoisonError::into_inner)` — the mutex guards a `()`, so no invariant can be protected by refusing a poisoned lock. See also 999.80, which needs three *more* such regions and must be sequenced against this entry deliberately.
 
 **Note:** Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because this pattern is unsound in a threaded test binary — the fix direction is per-`Command` `env`/`env_remove` (as 999.37's `test_support` now does for git) rather than process-global mutation. Fixing this would let `ENV_MUTEX` shrink or disappear, which is worth more than the flake itself. Related: 999.15 (hermetic tests for shell entry points).
+
+**Third site family, devflow-core (found 2026-09-11, Phase 47 deferred items).** The `agents/pi.rs` and `agents/opencode.rs` tests replace process-global `PATH` through a local `PathGuard` (`pi.rs:287-305` with eight `PathGuard::set` call sites; `opencode.rs:423-441`), serialized only by a module-local `ENV_MUTEX` (`pi.rs:194`, `opencode.rs:355`). The guard's SAFETY comment says no other thread reads or writes `PATH`, which is false: the `git.rs`, `hooks.rs`, `version.rs` and `worktree.rs` test modules spawn `git` or `sh` at 38, 6, 14 and 5 sites and take no lock. Observed in 47-03's second `scripts/check.sh test` run: the `devflow_core` lib reported 668 passed and 101 failed, every panic a spawn `NotFound`, and three immediate re-runs passed. The per-`Command` fix direction above covers these sites too. A devflow-cli *reader* of `PATH` raced the same devflow-cli mutators (`test_support.rs`, `an_empty_path_child_cannot_resolve_git_while_the_parent_still_can`); it now holds `env_lock()` (`82f081f`, merged to `develop` via #212 as `683f6dc`), a mitigation for that one test rather than this entry's fix.
 
 **Priority:** Medium | **Size:** M
 
