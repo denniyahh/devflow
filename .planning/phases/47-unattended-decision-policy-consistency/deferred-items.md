@@ -17,7 +17,8 @@
   **Impact:** a package-scoped `--all-targets` check, which a contributor might reasonably run, fails
   for reasons unrelated to their change.
   **Resolution (2026-09-13):** devflow-core now dev-depends on itself with `test-support` — `fc40bd9` on
-  branch `fix/test-support-and-dependency-checks`, not yet merged. On that branch the command went from
+  branch `fix/test-support-and-dependency-checks`, merged to `develop` via #212 as `f6aad13` (merge
+  `4a2bfcb`; identical patch-id). On that branch the command went from
   exit 101 to exit 0, both integration tests pass, workspace clippy stays green, and the `devflow`
   binary's normal dependency graph still builds devflow-core with no features.
 
@@ -39,7 +40,8 @@
   **Impact:** an intermittent red in `scripts/check.sh test` (the required CI Test job) unrelated to
   the change under test.
   **Resolution (2026-09-13):** the test's parent half holds `env_lock()` — `82f081f` on branch
-  `fix/test-support-and-dependency-checks`, not yet merged. Every devflow-cli file that mutates `PATH`
+  `fix/test-support-and-dependency-checks`, merged to `develop` via #212 as `683f6dc` (merge `4a2bfcb`;
+  identical patch-id). Every devflow-cli file that mutates `PATH`
   takes the same lock. The race was never reproduced on demand, so this rests on construction plus a
   passing run, not on an observed before and after.
 

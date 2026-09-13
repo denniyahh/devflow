@@ -106,10 +106,11 @@ and its verification reads `stale` (see `## Active Phase`).
   `roadmap update-plan-progress` cannot mark a stale phase Complete. Upstream, the mechanism is
   already reported as open-gsd/gsd-core#4623 (`covered_digest` covers shared planning docs); here it
   staled the very phase `phase.complete` was completing.
-- Integrate Phase 47: `feature/phase-47` is 72 commits ahead of `workspace/denniyahh`, with no
-  upstream and no PR. Merge it back into `workspace/denniyahh` before cutting Phase 48's worktree,
-  or Phase 48 forks without it. Per `deferred-items.md`, the two resolved 47 deferred items sit on
-  `fix/test-support-and-dependency-checks`, which is also unmerged and has no PR.
+- Integrate Phase 47: `feature/phase-47` is ahead of `workspace/denniyahh` (73 commits at `c2b8322`),
+  with no upstream and no PR. Merge it back into `workspace/denniyahh` before cutting Phase 48's
+  worktree, or Phase 48 forks without it. The two resolved 47 deferred items reached `develop` via
+  #212 (`4a2bfcb`); only the advisory Dependency checks job (`b8fdcb2`) stays on
+  `fix/test-support-and-dependency-checks`, parked pending a `deny.toml` decision.
 - Before starting Phase 48's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
   then `git worktree add -b feature/phase-48 .worktrees/phase-48 workspace/denniyahh` — per CLAUDE.md.
 - `/gsd-discuss-phase 48` — no CONTEXT.md exists yet. Phase 48 depends on Phases 46 and 47.
