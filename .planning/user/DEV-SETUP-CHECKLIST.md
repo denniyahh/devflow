@@ -96,16 +96,20 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   the answer stays correct when the hook runs from inside a worktree (where that relative path does
   not resolve at all). Guard: `scripts/lint-phase-worktree.sh`; both directions exercised by
   `scripts/test-phase-worktree-guard.sh` (19 checks, including two negative controls that must PASS —
-  a guard only ever observed refusing has not been shown to discriminate). `scripts/check.sh test`
-  runs it after `cargo test`, even when `cargo test` fails, so every CI job that calls that target
-  gates on it. The guard reads staged names with `git diff --cached --name-only -z --no-relative`:
+  a guard only ever observed refusing has not been shown to discriminate). The workspace-only test
+  `crates/devflow-cli/tests/worktree_guard_harness.rs` runs it inside `cargo test --workspace` and
+  requires exit 0 plus a `passed=N failed=0` line with N > 0, so `scripts/check.sh test` and the
+  pre-push container gate fail when it does, without `check.sh` naming a script `develop` lacks.
+  That test file and the harness stay out of every `develop` PR cut. The guard reads staged names
+  with `git diff --cached --name-only -z --no-relative`:
   the newline form quotes any name with a non-ASCII byte, a quote or a backslash, so a `^crates/`
   match never saw it, and `diff.relative` hides paths outside the current directory. Case 8 covers
   both, each case beside a control proving its condition is live.
   The harness unsets every repository-local git environment variable (`git rev-parse
   --local-env-vars`), queries the real checkout's recorded modes with the inherited config (CI
   accepts its runner-owned checkout only through a global `safe.directory`), and only then disables
-  global and system git config for its fixtures. Its scratch repository also pins hooks and signing
+  global and system git config for its fixtures; `worktree_guard_harness.rs` asserts that order.
+  Its scratch repository also pins hooks and signing
   locally, and case 7 proves that local isolation under a hostile global git config.
 - [ ] **[PROJECT]** **`scripts/phase-worktree.sh <N>` is the one command that creates a phase
   worktree correctly**, replacing a four-step manual sequence every step of which was skippable.
