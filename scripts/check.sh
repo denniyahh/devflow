@@ -10,13 +10,15 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/check.sh [all|fmt|clippy|test|build]
+usage: scripts/check.sh [all|fmt|clippy|test|build|deps]
 
   all     fmt + clippy + test   (default)
   build   compile workspace and tests only
   fmt     cargo fmt --check
   clippy  cargo clippy --workspace --all-targets -- -D warnings
   test    cargo test --workspace
+  deps    cargo deny check + cargo machete (not in `all`; install the tools
+          with scripts/install-dep-tools.sh)
 
 Run inside the pinned devcontainer for CI parity:
   scripts/check-in-container.sh [target]
@@ -63,6 +65,24 @@ run_build() {
     cargo build --workspace --tests
 }
 
+run_deps() {
+    # Not part of `all`: neither tool ships in the pinned devcontainer image, so
+    # the pre-push gate would fail on a missing binary rather than on a finding.
+    # A missing tool is a hard error here, never a skip — a skipped check prints
+    # nothing a log reader can tell apart from a passing one.
+    local tool
+    for tool in cargo-deny cargo-machete; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "error: $tool is not installed; run scripts/install-dep-tools.sh" >&2
+            exit 1
+        fi
+    done
+    echo "==> cargo deny check"
+    cargo deny check
+    echo "==> cargo machete"
+    cargo machete
+}
+
 case "$TARGET" in
     all)
         # Cheapest first: fail on formatting before paying for a compile.
@@ -74,6 +94,7 @@ case "$TARGET" in
     clippy) run_clippy ;;
     test) run_test ;;
     build) run_build ;;
+    deps) run_deps ;;
     -h | --help | help) usage ;;
     *)
         echo "error: unknown target '$TARGET'" >&2
