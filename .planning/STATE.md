@@ -110,6 +110,10 @@ verification reads `stale` (see `## Active Phase`).
   `8c41c46` deleted that file deliberately: `develop`'s `scripts/check.sh` cannot call the
   workspace-only worktree-guard harness, so `crates/devflow-cli/tests/worktree_guard_harness.rs` now
   runs the harness inside `cargo test`. Record an override; do not restore the file.
+- **Review first, with the operator:** `.planning/audits/2026-09-13-phase-47-retrospective.md`. Open
+  decisions: D1 (workspace branch structure) and D2 (process improvements), both framed as
+  decisions to make before Phase 48 work; D3 (backlog promotions) before Phase 49 planning. Its §12
+  is the review agenda.
 - `/gsd-discuss-phase 48`, run from `.worktrees/phase-48` (`feature/phase-48`). No CONTEXT.md exists
   yet. Phase 48 depends on Phases 46 and 47.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
@@ -952,11 +956,19 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Operator Next Steps
 
-- See `## Operator Next Steps` near the top of this file: integrate Phase 47, sync
-  `workspace/denniyahh`, create the Phase 48 worktree, then `/gsd-discuss-phase 48`. Phase 47's
-  verification stays `stale` by operator decision until a re-verify near milestone close.
+- See `## Operator Next Steps` near the top of this file. Phase 47 is integrated and the Phase 48
+  worktree exists; the next command is `/gsd-discuss-phase 48`. Phase 47's verification stays
+  `stale` by operator decision until a re-verify near milestone close.
 
 ## Accumulated Context
+
+### Pending Todos
+
+3 pending in `.planning/todos/pending/` (captured 2026-09-13, all `minor`):
+
+- Review and normalize agent instruction files across tools (`tooling`)
+- True up development setup docs against live config (`docs`)
+- Evaluate skills, plugins, MCP and ACP servers to add (`tooling`)
 
 ### Roadmap Evolution
 
