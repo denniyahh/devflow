@@ -210,9 +210,9 @@
     "semantic_hash": "6f3dd7721ad597194da4cb7deb41a9d5"
   },
   "crates/devflow-cli/tests/ci_parity_guards.rs": {
-    "mtime": 1789319729.0209537,
-    "seen": 1789319851.5590596,
-    "ast_hash": "9276e1a261983edb579d89454198db1d",
+    "mtime": 1789321779.767416,
+    "seen": 1789321930.6386132,
+    "ast_hash": "6b8f45ec8eb247d5122b370d6a26ceaa",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/cut_release_guard.rs": {
@@ -312,8 +312,8 @@
     "semantic_hash": "1bbc05e520e5e67914121aa4c7f2cd15"
   },
   "crates/devflow-core/Cargo.toml": {
-    "mtime": 1789319792.1907823,
-    "seen": 1789319851.560225,
+    "mtime": 1789321779.9216573,
+    "seen": 1789321930.6403818,
     "ast_hash": "0bb4584730630c2e6f62dd290e53ae54",
     "semantic_hash": ""
   },
@@ -576,9 +576,9 @@
     "semantic_hash": ""
   },
   "scripts/check.sh": {
-    "mtime": 1789319729.0289536,
-    "seen": 1789319851.5630043,
-    "ast_hash": "d80cc02ec0a36d9da8f285203578e3b9",
+    "mtime": 1789321779.768416,
+    "seen": 1789321930.6434312,
+    "ast_hash": "0fd783d111b77adc997d23e312ab5886",
     "semantic_hash": ""
   },
   "scripts/cut-pr-branch.sh": {
@@ -666,15 +666,15 @@
     "semantic_hash": "39feed5d65bd442dc2e937bfb68f6810"
   },
   ".planning/ROADMAP.md": {
-    "mtime": 1789319728.9919536,
-    "seen": 1789319851.5642257,
-    "ast_hash": "6f983734e00da5ac6510aad69f46fe01",
+    "mtime": 1789321363.407539,
+    "seen": 1789321930.644766,
+    "ast_hash": "bb90671b8f73785dd5dc664bbbaa439a",
     "semantic_hash": ""
   },
   ".planning/STATE.md": {
-    "mtime": 1789319728.9939537,
-    "seen": 1789319851.5642276,
-    "ast_hash": "9da83fdbc10d456fa7701c79dfd58f5c",
+    "mtime": 1789321848.4002306,
+    "seen": 1789321930.6447675,
+    "ast_hash": "33470530a04329153c0e1dd969776088",
     "semantic_hash": ""
   },
   ".planning/WINDOWS.md": {
@@ -1763,12 +1763,6 @@
     "ast_hash": "d4f93b5b8dd33f2291b0ca5524e15617",
     "semantic_hash": ""
   },
-  ".planning/user/errors/state-stale.json": {
-    "mtime": 1788773866.518258,
-    "seen": 1788773909.6467357,
-    "ast_hash": "e024c51f05a3e4b31545e250ec1183c7",
-    "semantic_hash": ""
-  },
   "crates/devflow-cli/tests/plan_bashism_scanner.rs": {
     "mtime": 1788773879.54822,
     "seen": 1788773909.648074,
@@ -1824,9 +1818,9 @@
     "semantic_hash": ""
   },
   ".github/workflows/ci.yml": {
-    "mtime": 1788773879.53722,
-    "seen": 1788773909.651087,
-    "ast_hash": "5f4be1922f9a89a6eaea22235821bc7b",
+    "mtime": 1789321779.767416,
+    "seen": 1789321930.6445403,
+    "ast_hash": "9af1dd0f316aad6fb4470d1621dd004e",
     "semantic_hash": ""
   },
   ".github/workflows/devcontainer.yml": {
@@ -6222,9 +6216,9 @@
     "semantic_hash": ""
   },
   ".planning/user/DEV-SETUP-CHECKLIST.md": {
-    "mtime": 1789319729.0149536,
-    "seen": 1789319851.6452816,
-    "ast_hash": "d918132967790b436ff373a84f12c9da",
+    "mtime": 1789321870.6151707,
+    "seen": 1789321930.7032385,
+    "ast_hash": "0ed24f232ee2936976e2c6069ed032a6",
     "semantic_hash": ""
   },
   "AGENTS.md": {
@@ -6615,6 +6609,12 @@
     "mtime": 1789319729.0139537,
     "seen": 1789319851.6409569,
     "ast_hash": "864c4daa4fc56c7081f48ff27c7fc878",
+    "semantic_hash": ""
+  },
+  "scripts/install-dep-tools.sh": {
+    "mtime": 1789321779.768416,
+    "seen": 1789321930.6437998,
+    "ast_hash": "f3bba19bd96e6f901659f98b4778dad1",
     "semantic_hash": ""
   }
 }
