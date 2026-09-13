@@ -142,6 +142,7 @@ dependencies = [
 name = "devflow-core"
 version = "2.12.0"
 dependencies = [
+ "devflow-core",
  "git-conventional",
  "libc",
  "semver",
