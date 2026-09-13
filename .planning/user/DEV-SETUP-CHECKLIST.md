@@ -490,7 +490,9 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[GLOBAL / PROJECT]** Rust AI harness tooling: `cargo-deny` (`deny.toml`), `cargo-machete`,
   `cargo-semver-checks`, `cargo-mutants`, `cargo-llvm-cov`, `cargo-nextest`, and `miri` (via nightly).
   `cargo-deny` and `cargo-machete` are the two a gate runs: `scripts/check.sh deps`, with the versions
-  pinned in `scripts/install-dep-tools.sh` (§4).
+  pinned in `scripts/install-dep-tools.sh` (§4). `deny.toml` is tracked on `develop` since #214; from
+  `22d9ff3` until then it existed only on `workspace/denniyahh`. Without it `cargo deny check` falls
+  back to an empty license allowlist and fails the licenses check.
 
 
 ## 9. Token/usage tracking (from earlier conversation, for completeness)

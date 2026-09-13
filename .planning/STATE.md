@@ -62,8 +62,8 @@ stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold
 **None — Phase 48 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
 declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
 requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208).
-Phase 47 is complete (7/7 plans) but **not yet integrated** — `feature/phase-47` has no upstream and
-no PR. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
+Phase 47 is complete (7/7 plans) and integrated: merged to `develop` via PR #213 and into
+`workspace/denniyahh`. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
 `stale`: `.planning/ROADMAP.md` is one of its 48 covered files, and `phase.complete`'s own write in
 `4bb9504` changed it (the covered digest recomputed with that file reverted to `3fa9206` matches the
 recorded one). Phases 48-51 are unplanned.
@@ -93,8 +93,8 @@ See: `.planning/PROJECT.md` (updated 2026-09-13)
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
 **Current focus:** v3.0.0 Unattended Run Survivability — Phase 48 (Survivable State Writes and
-Honest Gate Recovery), next and unplanned. Phases 46 and 47 are complete; 47 is not yet integrated
-and its verification reads `stale` (see `## Active Phase`).
+Honest Gate Recovery), next and unplanned. Phases 46 and 47 are complete and integrated; 47's
+verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
 
@@ -106,18 +106,18 @@ and its verification reads `stale` (see `## Active Phase`).
   `roadmap update-plan-progress` cannot mark a stale phase Complete. Upstream, the mechanism is
   already reported as open-gsd/gsd-core#4623 (`covered_digest` covers shared planning docs); here it
   staled the very phase `phase.complete` was completing.
-- Integrate Phase 47: `feature/phase-47` is ahead of `workspace/denniyahh` (73 commits at `c2b8322`),
-  with no upstream and no PR. Merge it back into `workspace/denniyahh` before cutting Phase 48's
-  worktree, or Phase 48 forks without it. The two resolved 47 deferred items reached `develop` via
-  #212 (`4a2bfcb`); only the advisory Dependency checks job (`b8fdcb2`) stays on
-  `fix/test-support-and-dependency-checks`, parked pending a `deny.toml` decision.
-- Before starting Phase 48's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
-  then `git worktree add -b feature/phase-48 .worktrees/phase-48 workspace/denniyahh` — per CLAUDE.md.
-- `/gsd-discuss-phase 48` — no CONTEXT.md exists yet. Phase 48 depends on Phases 46 and 47.
+- When that re-verification runs, expect its `check_script_run_test.rs` evidence to be missing.
+  `8c41c46` deleted that file deliberately: `develop`'s `scripts/check.sh` cannot call the
+  workspace-only worktree-guard harness, so `crates/devflow-cli/tests/worktree_guard_harness.rs` now
+  runs the harness inside `cargo test`. Record an override; do not restore the file.
+- `/gsd-discuss-phase 48`, run from `.worktrees/phase-48` (`feature/phase-48`). No CONTEXT.md exists
+  yet. Phase 48 depends on Phases 46 and 47.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
   `base_branch` must be configured before the live `--mode auto` run is possible.
-- `workspace/denniyahh` is 7 commits ahead of `origin/workspace/denniyahh` (unpushed).
-- Backlog items NOT promoted into v3.0.0: 999.120, 999.121, 999.125, 999.126.
+- Backlog items NOT promoted into v3.0.0: 999.120, 999.121, 999.125, 999.126. **Open decision, not
+  yet made:** whether to promote 999.125 and 999.126 before Phase 49 is planned. Both concern whether
+  an unattended run can reach the resume route past a `blocking-human` gate, which is the path Phase
+  49's live run observes.
 
 ---
 
