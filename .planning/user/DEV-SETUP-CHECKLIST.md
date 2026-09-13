@@ -362,6 +362,18 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   `test(NN-PP):` commit touching a test path, or execution halts. `mvp_mode` is **not** set on
   this project, so today's posture is guidance + advisory review.
 
+- [ ] **[PROJECT, 2026-09-13]** Graphify output is ignored by **allowlist**, not denylist.
+  `.gitignore` ignores `graphify-out/*` and re-includes only `graph.json`, `manifest.json` and
+  `.graphify_analysis.json` — the snapshot CLAUDE.md's graphify rule commits once per phase on
+  `workspace/denniyahh`. The earlier denylist missed each new output as graphify grew:
+  `.graphify_labels.json`, `.graphify_python` (an absolute host path) and 16 MB dated
+  `YYYY-MM-DD/` dumps. Keep the `graphify-out/*` form — a directory-level `graphify-out/` ignore
+  cannot be negated and would silently ignore `graph.json` too. Why the snapshot is tracked at all,
+  measured 2026-09-13 in scratch worktrees: a checkout *with* `graph.json` regenerates in ~40s and
+  keeps its LLM-derived (`_origin: semantic`) nodes; *without* it, `graphify update .` rebuilds
+  code-only and every semantic node is gone until a paid LLM pass. `develop` and `main` neither
+  track nor ignore `graphify-out/` (open as of this entry).
+
 ## 7. GSD planning structure (`.planning/`)
 
 - [ ] **[PROJECT]** `PROJECT.md`, `ROADMAP.md`, `STATE.md`, `REQUIREMENTS.md` (recreated fresh
