@@ -36,15 +36,22 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   - Deliberately **excludes** anything naming a specific person, key file, or home directory —
     `.gitconfig`'s own header comment states this explicitly, since the repo is public.
 - [ ] **[PROJECT, local-only by design]** `user.signingkey` — per-contributor, set locally, never
-  tracked. On this machine: the agent's own key (`~/.ssh/github_ed25519.pub`), so agent commits
-  are attributable to the agent rather than impersonating the maintainer.
+  tracked. On this machine the repo-local `.git/config` sets the agent's own key,
+  `~/.ssh/devflow_signing_ed25519.pub` (comment `devflow-agent-signing`). That overrides the global
+  `~/.gitconfig` value, `~/.ssh/github_ed25519.pub`, which is the maintainer's key and is also this
+  repo's `devflow.releaseSigningKey`. Agent commits are attributable only by key fingerprint:
+  every key in `~/.config/git/allowed_signers` uses the maintainer's email, so GitHub shows them
+  as the maintainer's "Verified" commits.
 - [ ] **[PATTERN, local-only by design]** `devflow.releaseSigningKey` — a **second signing key,
   for release tags and `main` only**, set once locally (`git config --local
   devflow.releaseSigningKey ~/.ssh/<key>.pub`), enforced by the pre-push hook (§3) by comparing
   key *fingerprints* (not the signer string — both keys share `user.email`, so the string alone
   can't distinguish them). Unset = no enforcement, so non-release contributors need nothing.
-- [ ] **[GLOBAL]** `gh auth status` — GitHub CLI authenticated via keyring, scopes include
-  `repo`, `workflow`, `admin:ssh_signing_key`.
+- [ ] **[GLOBAL]** `gh auth status` — GitHub CLI authenticated via keyring as `denniyahh`, with scopes
+  `repo`, `workflow`, `gist` and `read:org` (checked 2026-09-13). `admin:ssh_signing_key` is **not**
+  granted, so `gh api user/ssh_signing_keys` returns 404. Add it with
+  `gh auth refresh -h github.com -s admin:ssh_signing_key` only when listing or uploading signing keys.
+  Agents merge PRs to `develop` through this token, so GitHub records those merges as `denniyahh`.
 
 ## 2. GitHub repository settings (not files — verify via `gh api`, not by reading the repo)
 
