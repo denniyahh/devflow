@@ -2,21 +2,21 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: 47
-current_phase_name: Unattended Decision Policy Consistency
-current_plan: 7
-status: awaiting_uat
-stopped_at: "Pre-UAT complete: final codex/agy review findings fixed (ac3ee42..49bb324, 4 findings); commit-claim BLOCKER waived under open-gsd/gsd-core#4670; next /gsd-verify-work 47"
-last_updated: "2026-09-12T23:22:31.000Z"
-last_activity: 2026-09-12
-last_activity_desc: Fixed and verified the four findings from the final codex/agy code review; full check.sh test green on 49bb324; operator UAT remains
-state_head: 49bb324301cc5920ad8601439191906084842ba8
+current_phase: 48
+current_phase_name: Survivable State Writes and Honest Gate Recovery
+current_plan: Not started
+status: planning
+stopped_at: Phase 47 complete, ready to plan Phase 48
+last_updated: "2026-09-13T07:09:50.087Z"
+last_activity: 2026-09-13
+last_activity_desc: Phase 47 complete, transitioned to Phase 48
+state_head: 3fa9206fab55e59831c29a01f70b28f519b2e7df
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 16
   completed_plans: 16
-  percent: 17
+  percent: 33
 ---
 
 # DevFlow — Project State
@@ -40,7 +40,7 @@ reports all-clear with these suppressed:
 | uat_gap | 40-UAT.md (Phase 40) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
 | uat_gap | 41-UAT.md (Phase 41) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
 | uat_gap | 42-UAT.md (Phase 42) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
-| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | `**Status:** v2.8.0 milestone complete
+| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | `**Status:** Ready to plan
 | deferred_item | v2.4.0-phases/34-…/deferred-items.md #2 — `embedded_commit_is_stale…` flake (pre-existing) | `**Status:** acknowledged` set in-file; pre-existing `PATH`/`ENV_MUTEX` race, fix identified not applied | 2026-09-02 | v2.8.0 |
 | deferred_item | v2.3.0-phases/30-…/deferred-items.md #1 — `30a-evidence/raw_output*.jsonl` carry home path / OS username / session id | `**Status:** acknowledged` set in-file; low-but-real, no credential-shaped match; sanitiser exists | 2026-09-02 | v2.8.0 |
 | verification_override | 45-VERIFICATION.md — AUTO-01 live `devflow start --mode auto` end-to-end run | `PASSED (override)`, accepted by Dennis Kim; tracked as backlog 999.119 | 2026-09-02 | v2.8.0 |
@@ -163,9 +163,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 47 (Unattended Decision Policy Consistency) — AWAITING UAT
+Phase: 48 — Survivable State Writes and Honest Gate Recovery
 Plans: 7 — 47-01..47-05 across 4 waves plus gap closures 47-06 and 47-07 (executed)
-Current Plan: 7
+Current Plan: Not started
 Total Plans in Phase: 7
 Completed Plans: 7 (47-01, 47-02, 47-03, 47-04, 47-05, 47-06, 47-07)
 Status: Awaiting operator UAT
@@ -175,9 +175,9 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-12 — Re-verified Phase 47 after closing CR-01 and WR-01; awaiting operator UAT
+Last activity: 2026-09-13 — Phase 47 complete, transitioned to Phase 48
 
-Progress: [██░░░░░░░░] 17% (1 of 6 phases complete)
+Progress: [███░░░░░░░] 33% (1 of 6 phases complete)
 
 ## Recently Shipped
 
@@ -905,8 +905,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-12T23:22:31.000Z
-**Stopped at:** Pre-UAT complete: final codex/agy review findings fixed (ac3ee42..49bb324, 4 findings); commit-claim BLOCKER waived under open-gsd/gsd-core#4670; next /gsd-verify-work 47
+**Last session:** 2026-09-13T07:09:19.037Z
+**Stopped at:** Phase 47 complete, ready to plan Phase 48
 **Resume file:** .planning/phases/47-unattended-decision-policy-consistency/.continue-here.md
 
 ## Operator Next Steps

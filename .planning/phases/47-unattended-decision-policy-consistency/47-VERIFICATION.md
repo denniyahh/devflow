@@ -1,9 +1,10 @@
 ---
 phase: 47-unattended-decision-policy-consistency
 verified: 2026-09-13T06:58:15Z
-status: human_needed
+status: passed
 score: 39/39 must-haves verified
 covered_files:
+
   - .github/workflows/ci.yml
   - .gitignore
   - .planning/REQUIREMENTS.md
@@ -52,9 +53,16 @@ covered_files:
   - scripts/check.sh
   - scripts/lint-phase-worktree.sh
   - scripts/test-phase-worktree-guard.sh
+
 covered_digest: "v1:sha256:273202e8cf7cd5db6f032ff899a6c36819b0a03e28f763c1b40e97c79b6f0422"
 behavior_unverified: 0
-overrides_applied: 0
+overrides_applied: 1
+overrides:
+
+  - must_have: "MUST NOT allow any text after the DEVFLOW_RESULT line, introduce a second record or marker format, or change the result parser or the gate detector (operator decision A1)."
+    reason: "Review-fix commits bd7bd7c (match only Gate-labelled lines), ac3ee42 (recognise list and blockquote declarations) and 49bb324 (decode escaped captures) changed the gate detector after 47-06 to close code-review findings. Each carries its own regression test, all passing at 6ae0b77, and the result parser is untouched. bd7bd7c was already covered by the recorded 'fix every finding except IN-05' decision; the operator accepted all three on 2026-09-13."
+    accepted_by: "operator"
+    accepted_at: "2026-09-13T07:08:34Z"
 re_verification:
   previous_status: passed
   previous_score: 23/23
@@ -63,10 +71,12 @@ re_verification:
   gaps_remaining: []
   regressions: []
 deferred:
+
   - truth: "Which instruction a live Claude agent actually follows when CODE_STAGE_POLICY and the resume instruction are both present (the DECN-03 behavioural arm)."
     addressed_in: "Phase 49"
     evidence: "ROADMAP Phase 47 criterion 4 ('Deliberately NOT closed here'); Phase 49 criterion 4 carries the pointer to 47-PHASE49-OBSERVATION.md, which defines Followed / Not followed / Void."
 human_verification:
+
   - test: "Decide whether the gate-detector changes made after plan 47-06 (bd7bd7c, ac3ee42, 49bb324) supersede 47-06's test-tier prohibition 'MUST NOT allow any text after the DEVFLOW_RESULT line, introduce a second record or marker format, or change the result parser or the gate detector'."
     expected: "Either accept the later detector changes (and record an overrides: entry for that prohibition), or ask for them to be reverted or re-reviewed."
     why_human: "Plan 06's own commits (b33406c..1691b12) honoured the prohibition: agent_result.rs changed only in tests. At HEAD the detector's non-test code (agent_result.rs 631-770) differs from b3b47ea; the result parser (182, 1736, 2074-2075, 2317) does not. REVIEW.md records an operator decision covering bd7bd7c (IN-02). REVIEWS.md records ac3ee42 and 49bb324 as fixes from the final external review but carries no operator-decision line. Whether a plan-scoped prohibition binds later review fixes is an operator decision, not a code fact."
@@ -85,7 +95,7 @@ human_verification:
 
 **Phase Goal:** An unattended agent receives the same merit-based decision instruction everywhere it is asked to make a Code-stage decision, and is never handed contradictory instructions about who may resolve a `blocking-human` gate inside one resumed session.
 **Verified:** 2026-09-13T06:58:15Z against HEAD `6ae0b77` on `feature/phase-47`
-**Status:** human_needed. No gaps. Four prohibition items need an operator answer; see Human Verification Required.
+**Status:** passed. No gaps. The four prohibition items this report raised were answered by the operator on 2026-09-13. The three post-47-06 gate-detector changes (`bd7bd7c`, `ac3ee42`, `49bb324`) are accepted as an override (frontmatter `overrides`). The operator also confirmed that the 47-06 tests build their inputs from production text; that no 47-06 commit was pushed before its gates passed (`feature/phase-47` has never been on origin); and that 47-07 never touched the real signing key, global git config or global hooks (their modification times all predate 2026-09-12).
 **Re-verification:** Yes. The previous report (`9a2c7fe`, passed 23/23) predates review fixes `ac3ee42`, `c66cba2`, `2790678`, `49bb324`, guard fix `7400042`, and docs `0afbff5`..`6ae0b77`. It also collapsed plans 06 and 07 into four rows and did not assess any `prohibitions`. This report checks all 35 plan truths plus the 4 roadmap criteria and every prohibition, with evidence re-run at HEAD.
 
 ## What changed from the previous verdict
@@ -264,6 +274,7 @@ No orphaned requirements: REQUIREMENTS.md maps only DECN-02 and DECN-03 to Phase
 ### Gaps Summary
 
 No gaps. Phase 47's goal holds at HEAD:
+
 - The FullExecute loop-back carries the policy on all six adapters, with real controls.
 - A resumed Claude session is handed one gate rule in two production-built turns.
 - The last-line completion contract lets required reasoning coexist with the result marker.
