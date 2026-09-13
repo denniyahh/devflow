@@ -31,3 +31,8 @@ git-conventional = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# This crate's own integration tests (`tests/monitor_e2e.rs`,
+# `tests/devflow_dir_gitignore.rs`) use `test_support`. A package-scoped build
+# such as `cargo clippy -p devflow-core --all-targets` does not unify features
+# with devflow-cli's dev-dependency, so enable the feature for them here.
+devflow-core = { path = ".", features = ["test-support"] }
