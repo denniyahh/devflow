@@ -21,7 +21,7 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-08-27
+> Last updated: 2026-09-13
 
 ## Deferred Items
 
@@ -40,9 +40,9 @@ reports all-clear with these suppressed:
 | uat_gap | 40-UAT.md (Phase 40) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
 | uat_gap | 41-UAT.md (Phase 41) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
 | uat_gap | 42-UAT.md (Phase 42) | acknowledged via `audit-open acknowledge` (commit 2057c12) | 2026-09-02 | v2.8.0 |
-| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | `**Status:** Ready to plan
-| deferred_item | v2.4.0-phases/34-…/deferred-items.md #2 — `embedded_commit_is_stale…` flake (pre-existing) | `**Status:** acknowledged` set in-file; pre-existing `PATH`/`ENV_MUTEX` race, fix identified not applied | 2026-09-02 | v2.8.0 |
-| deferred_item | v2.3.0-phases/30-…/deferred-items.md #1 — `30a-evidence/raw_output*.jsonl` carry home path / OS username / session id | `**Status:** acknowledged` set in-file; low-but-real, no credential-shaped match; sanitiser exists | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.4.0-phases/34-…/deferred-items.md #1 — widening `STREAM_JSON_STAGES` breaks 5 integration tests | status line set to `acknowledged` in-file; carried v2.4.0 debt, needs a decision before any plan widens the constant | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.4.0-phases/34-…/deferred-items.md #2 — `embedded_commit_is_stale…` flake (pre-existing) | status line set to `acknowledged` in-file; pre-existing `PATH`/`ENV_MUTEX` race, fix identified not applied | 2026-09-02 | v2.8.0 |
+| deferred_item | v2.3.0-phases/30-…/deferred-items.md #1 — `30a-evidence/raw_output*.jsonl` carry home path / OS username / session id | status line set to `acknowledged` in-file; low-but-real, no credential-shaped match; sanitiser exists | 2026-09-02 | v2.8.0 |
 | verification_override | 45-VERIFICATION.md — AUTO-01 live `devflow start --mode auto` end-to-end run | `PASSED (override)`, accepted by Dennis Kim; tracked as backlog 999.119 | 2026-09-02 | v2.8.0 |
 
 The two evidence tables inside the Phase 34 and Phase 30 entries were reformatted from GFM
@@ -50,47 +50,73 @@ pipe-tables to bullet lists in the same edit — `audit-open`'s deferred-items s
 `|`-prefixed line as a table row and was emitting each evidence row as its own phantom open item
 (8 fragments from 2 real entries). Content is unchanged; only the table syntax.
 
+The three `deferred_item` Status cells above describe the in-file marker in prose instead of quoting
+its bold label. `gsd-tools`' `stateReplaceField` matches the first bold Status label anywhere in this
+body, case-insensitively, before it tries the plain Status line under `## Current Position`, and
+replaces the rest of the matched line. Row #1 was truncated that way twice (to
+`v2.8.0 milestone complete`, then to `Ready to plan` in `4bb9504`) while the real Status line stayed
+stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold label in this table.
+
 ## Active Phase
 
-**None — Phase 47 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
+**None — Phase 48 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
 declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
-requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208);
-Phases 47-51 are unplanned.
+requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208).
+Phase 47 is complete (7/7 plans) but **not yet integrated** — `feature/phase-47` has no upstream and
+no PR. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
+`stale`: `.planning/ROADMAP.md` is one of its 48 covered files, and `phase.complete`'s own write in
+`4bb9504` changed it (the covered digest recomputed with that file reverted to `3fa9206` matches the
+recorded one). Phases 48-51 are unplanned.
 
 **The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
 survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
 supervisor (50) → rate-limit failover on top of it (51). Phase 49 is the measuring instrument;
 landing it earlier would measure the defects rather than the chain.
 
-**Two open questions are deliberately carried, not closed on a source read:** DECN-03 (which of two
-contradictory prompts an agent actually follows) resolves against Phase 49's live run, and SURV-01's
-field arm (no state-write interleaving has ever been observed in the wild) is recorded — not
-settled — by that same run.
+**Two open questions are deliberately carried, not closed on a source read:** DECN-03's behavioural
+arm — Phase 47 removed the prompt-level contradiction, for claude only; which instruction a model
+actually follows is still unobserved — resolves against Phase 49's live run under
+`47-PHASE49-OBSERVATION.md`'s evidence standard, and SURV-01's field arm (no state-write
+interleaving has ever been observed in the wild) is recorded — not settled — by that same run.
 
 **Carried forward from the v2.8.0 close, NOT in this milestone:** **999.120** (residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back) and **999.121** (OpenCode has no
-`devflow start`-level marker-less regression test). Promote with `/gsd-review-backlog` when ready.
+`devflow start`-level marker-less regression test). Filed by Phase 47, also NOT in this milestone:
+**999.125** (preflight and resume disagree on where a `blocking-human` gate exists) and **999.126**
+(a checkpoint added after Code preflight is never re-scanned). Promote with `/gsd-review-backlog`
+when ready.
 
 ## Project Reference
 
-See: `.planning/PROJECT.md` (updated 2026-09-03)
+See: `.planning/PROJECT.md` (updated 2026-09-13)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 47 (Unattended Decision Policy
-Consistency) has executed all 7 plans and passed re-verification. Operator UAT remains before phase
-completion. Phase 46 is complete and
-merged (PR #208).
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 48 (Survivable State Writes and
+Honest Gate Recovery), next and unplanned. Phases 46 and 47 are complete; 47 is not yet integrated
+and its verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
 
-- `/gsd-plan-phase 47` to plan Phase 47 (DECN-02 + DECN-03). It depends on nothing.
-- Before starting Phase 47's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
-  then `git worktree add -b feature/phase-47 .worktrees/phase-47 workspace/denniyahh` — per CLAUDE.md.
+- Phase 47's `stale` verification is **left stale by operator decision (2026-09-13)** — re-verifying
+  now would hold only until the next ROADMAP.md write. Re-run the verifier once near milestone
+  close, when ROADMAP.md stops changing. Until then `roadmap.analyze` counts 47 as `partial` and
+  `verification.status` names `/gsd-verify-work 47` as its next command. ROADMAP.md's `## Progress`
+  row was corrected by hand to `7/7 | Complete`: `phase.complete` left it at `5/5 | In Progress`, and
+  `roadmap update-plan-progress` cannot mark a stale phase Complete. Upstream, the mechanism is
+  already reported as open-gsd/gsd-core#4623 (`covered_digest` covers shared planning docs); here it
+  staled the very phase `phase.complete` was completing.
+- Integrate Phase 47: `feature/phase-47` is 72 commits ahead of `workspace/denniyahh`, with no
+  upstream and no PR. Merge it back into `workspace/denniyahh` before cutting Phase 48's worktree,
+  or Phase 48 forks without it. Per `deferred-items.md`, the two resolved 47 deferred items sit on
+  `fix/test-support-and-dependency-checks`, which is also unmerged and has no PR.
+- Before starting Phase 48's GSD work: sync `workspace/denniyahh` (`scripts/sync-workspace.sh`),
+  then `git worktree add -b feature/phase-48 .worktrees/phase-48 workspace/denniyahh` — per CLAUDE.md.
+- `/gsd-discuss-phase 48` — no CONTEXT.md exists yet. Phase 48 depends on Phases 46 and 47.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
   `base_branch` must be configured before the live `--mode auto` run is possible.
-- `workspace/denniyahh` is ahead of `origin/develop` and unpushed — push when ready.
-- Backlog items NOT promoted into v3.0.0: 999.120, 999.121.
+- `workspace/denniyahh` is 7 commits ahead of `origin/workspace/denniyahh` (unpushed).
+- Backlog items NOT promoted into v3.0.0: 999.120, 999.121, 999.125, 999.126.
 
 ---
 
@@ -164,20 +190,23 @@ change earns 2.0.
 ## Current Position
 
 Phase: 48 — Survivable State Writes and Honest Gate Recovery
-Plans: 7 — 47-01..47-05 across 4 waves plus gap closures 47-06 and 47-07 (executed)
+Plans: not yet planned (no phase directory)
 Current Plan: Not started
-Total Plans in Phase: 7
-Completed Plans: 7 (47-01, 47-02, 47-03, 47-04, 47-05, 47-06, 47-07)
-Status: Awaiting operator UAT
+Total Plans in Phase: —
+Completed Plans: —
+Status: Ready to plan
+Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
+47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
+`4bb9504` (see `## Active Phase`).
 The D-13 assumption was verified false and its two latent defects are now backlog entries 999.125
 and 999.126. DECN-03's unresolved behavioural arm has an explicit claude-only evidence standard
 for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-13 — Phase 47 complete, transitioned to Phase 48
+Last activity: 2026-09-13 — Phase 47 transition post-processing: PROJECT.md evolved, STATE.md reconciled
 
-Progress: [███░░░░░░░] 33% (1 of 6 phases complete)
+Progress: [███░░░░░░░] 33% (2 of 6 phases complete — `roadmap.analyze` counts 1 while 47 reads `stale`)
 
 ## Recently Shipped
 
@@ -680,7 +709,13 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
     Define-to-Ship unattended — is now owned by **Phase 31's acceptance criterion** (the live
     Phase 29 wave-2 re-run), i.e. tracked as phase scope rather than as a blocker. Removing the
     entry does not drop the concern.
-- D-46-01-A: scripts/check-in-container.sh all exits 101 under the 2-CPU pin (wr01_clean_tree_strict_ancestor... PATH/ENV_MUTEX race, pre-existing, fix identified in phase 34 but never applied). Blocks git push from the phase-46 worktree via pre-push hook.
+
+Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
+
+(c) D-46-01-A — `scripts/check-in-container.sh all` exiting 101 under the 2-CPU pin. Phase 46's
+    `deferred-items.md` records it RESOLVED by the child-process migration (46-06, 46-07), and
+    `46-VERIFICATION.md` re-ran the failing test 4/4 green under a real `taskset -c 0,1`. The stale
+    bullet was still making `smart-entry` report `situation: blocked`.
 
 ## Decisions
 
@@ -810,6 +845,11 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - [Phase 47]: 47-04: codex and pi baselines are rendered through their drivers rather than render_workflow_style with a fixed root; workflow_root() returns the literal string "$HOME/..." and never expands it, so the baselines are host-independent — Going through the drivers also catches a change to the workflow root of a driver; reading agents/mod.rs and agents/pi.rs shows no expansion, and the committed baselines carry the unexpanded $HOME token.
 - [Phase 47]: 47-05: Kept Phase 49 at five criteria and delegated DECN-03's evidence standard to 47-PHASE49-OBSERVATION.md.
 - [Phase 47]: 47-05: Recorded the four/two renderer split and filed 999.125/999.126; the declined adapter-independent-resume follow-on was not filed.
+- [Phase 47]: 47-06: the result parser is unchanged — the policy's required decision reasoning goes above a last-line `DEVFLOW_RESULT`, per operator decision A1, and the parser's 4000-character tail boundary stays explicit (closes CR-01)
+- [Phase 47]: 47-06: a resumed agent names the resolved gate in prose and must not copy the checkpoint declaration line; the resume prompt is pinned against the gate detector
+- [Phase 47]: 47-07: worktree-guard fixture isolation is repository-local — the guard under test keeps its normal environment, and both environment carriers that outrank repository config are cleared at the script boundary
+- [Phase 47]: close: the operator accepted three post-47-06 gate-detector review fixes (`bd7bd7c`, `ac3ee42`, `49bb324`) as a verification override; re-verification passed 39/39 before `phase.complete` ran
+- [Phase 47]: transition: `phase.complete`'s own ROADMAP.md write (`4bb9504`) staled 47's verification, since ROADMAP.md is one of its covered files; the operator chose to leave it stale rather than re-verify (not durable across later ROADMAP.md writes), hand-correct the `## Progress` row `phase.complete` left at `5/5 | In Progress`, draft an upstream gsd-core issue, and re-verify once near milestone close
 
 ## Roadmap Evolution
 
@@ -905,13 +945,15 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-09-13T07:09:19.037Z
+**Last session:** 2026-09-13T07:39:55Z
 **Stopped at:** Phase 47 complete, ready to plan Phase 48
-**Resume file:** .planning/phases/47-unattended-decision-policy-consistency/.continue-here.md
+**Resume file:** None
 
 ## Operator Next Steps
 
-- `/gsd-verify-work 47` — verify the completed phase before advancing to Phase 48.
+- See `## Operator Next Steps` near the top of this file: integrate Phase 47, sync
+  `workspace/denniyahh`, create the Phase 48 worktree, then `/gsd-discuss-phase 48`. Phase 47's
+  verification stays `stale` by operator decision until a re-verify near milestone close.
 
 ## Accumulated Context
 

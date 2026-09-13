@@ -370,6 +370,32 @@ version is still derived automatically from conventional-commit classification a
   files, ignoring `.planning/spikes/`. Verified at unit/integration level with a real fork-point
   negative control; the live `devflow start --mode auto` end-to-end run is deferred to backlog
   999.119. Shipped v2.12.0, PR #203 — Phase 45, milestone v2.8.0.
+- ✓ **INFRA-01, VALID-01, VALID-02** — CI gains an advisory `Sequential 2-CPU check` job that runs
+  `scripts/check.sh` `fmt → clippy → test` in one job under `taskset -c 0,1`, with the pin defined
+  once in `scripts/lib/ci-cpus.sh` and sourced by both CI and the local gate; the three parallel
+  jobs still run, and the new job is not a required check. A configured `base_branch` naming a
+  computed revision (`develop~1`, `develop@{0}`, `develop^{}`) is refused by asking git for a ref
+  (`show-ref --verify` on `refs/heads/{base}`) rather than a revision; `devflow stop` accepts the
+  positional `[PROJECT]` root as `start`, `resume` and `status` do. Verified 3/3, no overrides.
+  **Not claimed:** that the advisory job has caught the 999.47 race. **Not delivered:** C-05/C-07
+  are deferred to GitHub #207 — the raw `base_branch` value still reaches `git worktree add`.
+  Merged to `develop` via PR #208 — Phase 46, milestone v3.0.0.
+- ✓ **DECN-02, DECN-03** — the unattended decision policy reaches the Validate loop-back Code prompt
+  on the four adapters routed through `render_claude_style` (claude, opencode, hermes,
+  antigravity): `fix_prompt`'s `FullExecute` arm carries `CODE_STAGE_POLICY`, decided by one helper
+  (`code_policy_applies_to_fix_arm`) that both renderers consult, while `GapsOnly` and `AuditFix`
+  still omit it; codex and pi were already correct. Who may resolve a `blocking-human` gate has one
+  definition, `GATE_RESOLUTION_RULE`, spliced into `CODE_STAGE_POLICY` and restated affirmatively
+  by `checkpoint_auto_decide_prompt`; a delivery test captures each turn from its production
+  constructor and failed on the pre-fix tree. The package-verification prohibition is
+  unconditional and pinned verbatim. The completion protocol puts the required decision reasoning
+  above a last-line `DEVFLOW_RESULT`, with the result parser unchanged. Guarded by `insta`
+  baselines run under `INSTA_UPDATE=no` with `INSTA_FORCE_UPDATE` cleared. Verified 39/39 with one
+  operator-accepted override (three later gate-detector review fixes) — Phase 47, milestone
+  v3.0.0; not yet merged to `develop`. **Closure limits:** DECN-03 closes for claude alone (the
+  resume route is gated on `AgentKind::Claude`), and which instruction a model actually follows is
+  not settled by source — that behavioural arm resolves against Phase 49's live run under
+  `47-PHASE49-OBSERVATION.md`'s evidence standard.
 
 ### Partially delivered
 
@@ -381,19 +407,16 @@ version is still derived automatically from conventional-commit classification a
   `fix_prompt` (the Claude/OpenCode post-Validate-failure loop-back — the primary agent's common
   path), and `checkpoint_auto_decide_prompt` grants blocking-human authority the policy withholds
   in the same resumed conversation. Both holes deferred by operator decision to backlog **999.115**
-  / **999.116** — Phase 45, milestone v2.8.0.
+  / **999.116** — Phase 45, milestone v2.8.0. **Both holes closed in v3.0.0** as DECN-02 and
+  DECN-03 (Phase 47, see Validated); DECN-03's closure covers claude only, and its behavioural arm
+  stays open against Phase 49.
 
 ### Active
 
 **v3.0.0 Unattended Run Survivability** — declared 2026-09-03. Requirement IDs in
-`REQUIREMENTS.md`; the backlog/issue each traces to is named inline.
+`REQUIREMENTS.md`; the backlog/issue each traces to is named inline. Phases 46 and 47 delivered
+five of the ten (#174, #204, #206, 999.115, 999.116); those moved to Validated.
 
-- [ ] Unattended decision policy reaches the Claude/OpenCode loop-back Code prompt (999.115)
-- [ ] `CODE_STAGE_POLICY` and `checkpoint_auto_decide_prompt` stop contradicting each other in a
-      resumed session (999.116)
-- [ ] `base_branch` validation rejects revspec suffixes on a real branch name (#204)
-- [ ] `devflow stop` accepts the positional project root every other verb accepts (#206)
-- [ ] CI runs a job that reproduces the sequential fmt→clippy→test load shape (#174)
 - [ ] `write_state_atomic` cannot lose an update to a concurrent writer (999.118)
 - [ ] A gate with no consumer reports the recovery that exists rather than asserting a waiter
       (#200)
@@ -404,7 +427,10 @@ version is still derived automatically from conventional-commit classification a
 
 Carried-forward follow-ups NOT in this milestone (backlog): **999.120** (one residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back), **999.121** (OpenCode has no
-`devflow start`-level marker-less regression test). Promote with `/gsd-review-backlog` when ready.
+`devflow start`-level marker-less regression test). Filed by Phase 47, also backlog: **999.125**
+(preflight and resume disagree on where a `blocking-human` gate exists) and **999.126** (a
+checkpoint added after Code preflight is never re-scanned). Phase 46's C-05/C-07 are deferred to
+GitHub #207. Promote with `/gsd-review-backlog` when ready.
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
 2026-08-04**,
@@ -511,6 +537,12 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | Pi pinned to `MonitorLaunch::Legacy`, never `PipeOwning` (Phase 39) | `PipeOwning`'s stdin wire protocol deadlocks Pi (phase-38 review); the regression test asserts the `claude_stream_launch_enabled` precondition | ✓ Good |
 | Subagent dispatch via `@bacnh85/pi-subagent` (in-process, synchronous) under `Legacy` (Phase 39) | The 37.1 verdict: a synchronous extension awaits its children, so process-exit supervision suffices — no `CloseRule`/drain gate | ✓ Good |
 | Capability detection matches the vetted `@bacnh85/pi-subagent` name, not `*subagent*` (Phase 39) | Unsafe/deferred packages (`@mystilleef` etc.) must not report "available" | ✓ Good |
+| `base_branch` validation asks git for a ref (`show-ref --verify` on `refs/heads/{base}`), not a revision (Phase 46, 46-02) | `rev-parse --verify` is a revision parser and accepted `develop~1`, `develop@{0}` and `develop^{}`; a hand-rolled denylist would drift from git's own ref-name rules | ✓ Good |
+| Remove a process-global `PATH` test hazard by moving the empty-`PATH` window into a child process, not by locking every possible victim (Phase 46, C-01) | The `env_lock` sweep in `d525f9a` closed 47 of at least 78 exposures because it could only find direct git spawns; a child process makes the emptied `PATH` invisible to sibling tests. `wr01_…` went from 2/2 failing to 4/4 green under a real `taskset -c 0,1` | ✓ Good |
+| One helper, `code_policy_applies_to_fix_arm`, decides which Code arms carry `CODE_STAGE_POLICY` for both renderers (Phase 47, 47-02) | The v2.8.0 defect was two renderers disagreeing for `FullExecute`; hard-coding the policy into that one match arm would pass the presence test while making a widening of the rule unobservable | ✓ Good |
+| `GATE_RESOLUTION_RULE` is defined once as a `macro_rules!` literal spliced into `CODE_STAGE_POLICY`, and pinned by a test-owned literal (Phase 47, 47-03) | `concat!` rejects a const name, and a pin built from the constants under test would widen along with them | ✓ Good |
+| DECN-03 is closed at the prompt level only, for claude alone; its behavioural arm goes to Phase 49 with a Followed / Not followed / Void evidence standard (Phase 47, 47-05) | Which of two instructions a model follows is not answerable from source, and `checkpoint_auto_decided` is emitted before the spawn, so the event alone would label a failed spawn as followed | — Pending (Phase 49) |
+| Result parser left unchanged; the policy's required decision reasoning goes above a last-line `DEVFLOW_RESULT` (Phase 47, 47-06, closing CR-01) | Operator decision A1: no text after the `DEVFLOW_RESULT` line, no second record format, no parser change; the parser's 4000-character tail boundary stays explicit | ✓ Good |
 
 ## Key Files
 
@@ -555,6 +587,14 @@ delivered most of it. Major version chosen because #185 changes the monitor mech
 socket path to `state.json`, breaking state-file compatibility with 2.x on a published crate.
 Research skipped by operator decision — every item is a verified defect in this codebase with a
 known fix direction, and the #185 socket design is already spike-proven.*
+
+---
+*Last updated: 2026-09-13 after Phase 47 (Unattended Decision Policy Consistency) — 7/7 plans;
+verification recorded passed 39/39 with one operator-accepted override. DECN-02 and DECN-03 moved to
+Validated, with DECN-03's claude-only closure limit and its behavioural arm left to Phase 49. The
+same pass caught up Phase 46 (INFRA-01, VALID-01, VALID-02), whose transition had not evolved this
+file, and logged six decisions across both phases. 999.125 and 999.126 filed as backlog, not
+promoted. Five of v3.0.0's ten Active items remain.*
 
 ---
 *Previous: 2026-08-23 after Phase 43 (OpenCode Driver Completion) — the OpenCode stub driver

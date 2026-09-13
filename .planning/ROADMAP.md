@@ -414,7 +414,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 44 | 5/5 | Complete | 2026-08-27 |
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
-| 47 | 5/5 | In Progress|  |
+| 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | — | Not started | — |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
