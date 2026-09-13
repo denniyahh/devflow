@@ -742,9 +742,12 @@ mod tests {
     /// measures the harness against the real spawn path rather than an
     /// approximation of it.
     ///
-    /// No `env_lock()`: nothing in this test mutates process-global state any
-    /// more. Keeping the guard would preserve the false impression that a
-    /// hazard remains here.
+    /// Takes `env_lock()` although it mutates nothing: the PARENT half resolves
+    /// `git` through the process `PATH` twice and asserts that `PATH` is
+    /// byte-identical across the child run, while sibling tests still replace
+    /// `PATH` under `ENV_MUTEX` (999.38). Without the lock a sibling's stub
+    /// directory can land between those reads and fail this test for a reason
+    /// unrelated to the harness, as a full `check.sh test` run did on 2026-09-11.
     #[test]
     fn an_empty_path_child_cannot_resolve_git_while_the_parent_still_can() {
         const NAME: &str = "test_support::tests::\
@@ -767,6 +770,7 @@ mod tests {
         }
 
         // PARENT half.
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path_before = std::env::var_os("PATH");
 
