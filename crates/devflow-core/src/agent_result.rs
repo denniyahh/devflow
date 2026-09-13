@@ -628,12 +628,13 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// unconditionally recorded by the `checkpoint_auto_decided` audit event
 /// (plan 28-03) — it can never silently authorize anything.
 ///
-/// Searches BOTH the raw stdout text and — when the stdout is a Claude JSON
-/// result envelope — the unescaped inner `result` text obtained via
-/// [`extract_json_result_text`], because the `Gate:` line typically crosses
-/// into the capture escaped inside that envelope (RESEARCH § "Common
-/// Pitfalls / Pitfall 2": two indirections, subagent emission → orchestrator
-/// relay → DevFlow's captured top-level stdout). Matching is
+/// Searches BOTH the raw capture, through [`capture_reports_human_gate`], and —
+/// when the stdout is one Claude JSON result envelope, even pretty-printed — the
+/// unescaped inner `result` text obtained via [`extract_json_result_text`],
+/// because the `Gate:` line typically crosses into the capture escaped inside
+/// that envelope (RESEARCH § "Common Pitfalls / Pitfall 2": two indirections,
+/// subagent emission → orchestrator relay → DevFlow's captured top-level
+/// stdout). Matching is
 /// case-insensitive on the `Gate` LABEL and tolerates surrounding markdown
 /// emphasis (`*`) and whitespace, but the VALUE comparison is exact — this
 /// deliberately does NOT widen into a general "does this look like a
@@ -663,7 +664,7 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
     if classify(&capture) == CaptureKind::ClaudeStream {
         return claude_stream_reports_human_gate(&capture.events);
     }
-    if text_reports_human_gate(stdout) {
+    if capture_reports_human_gate(stdout) {
         return true;
     }
     extract_json_result_text(stdout)
@@ -671,12 +672,48 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
         .is_some_and(text_reports_human_gate)
 }
 
-/// Core matcher shared by both search targets (raw stdout and the unescaped
-/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans for
-/// a case-insensitive `gate` label, tolerating surrounding markdown emphasis
-/// (`*`), code-span backticks (`` ` ``), and whitespace up to the following
-/// `:`, then compares the VALUE token immediately after the colon exactly
-/// against [`HUMAN_GATE_VALUE`].
+/// The raw-capture reader behind [`blocking_human_checkpoint_reported`]'s
+/// non-stream path. A physical line that parses as a JSON object or array has
+/// its string values decoded and matched, so agent text escaped inside an
+/// envelope or a JSON-lines event is read with its real line breaks. Every
+/// other line is matched as it is.
+///
+/// This replaces splitting the whole capture on the two characters `\n`, which
+/// turned a literal backslash-n in agent-authored text (a code sample, a diff
+/// hunk) into a line break and read `let s = "\n**Gate:** ...";` as a
+/// declaration (final external review, 2026-09-12). Escaped text is decoded
+/// only where it really is a JSON string, and only once, so a JSON string that
+/// itself quotes an escaped sample stays a sample.
+fn capture_reports_human_gate(stdout: &str) -> bool {
+    stdout.lines().any(
+        |line| match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(value) if value.is_object() || value.is_array() => {
+                json_strings_report_human_gate(&value)
+            }
+            _ => text_reports_human_gate(line),
+        },
+    )
+}
+
+/// Match every string value inside a decoded JSON document.
+fn json_strings_report_human_gate(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text_reports_human_gate(text),
+        serde_json::Value::Array(items) => items.iter().any(json_strings_report_human_gate),
+        serde_json::Value::Object(fields) => fields.values().any(json_strings_report_human_gate),
+        _ => false,
+    }
+}
+
+/// Core matcher over text already in its final form: a physical line of a
+/// non-JSON capture, a decoded JSON string ([`capture_reports_human_gate`]), or
+/// an envelope's unescaped `result` ([`blocking_human_checkpoint_reported`]).
+/// It never decodes escapes itself. Scans only
+/// for a line whose first word, after any list, ordinal or blockquote markup
+/// ([`strip_leading_markup`]), is a case-insensitive `gate` label, tolerating
+/// surrounding markdown emphasis (`*`), code-span backticks (`` ` ``), and
+/// whitespace up to the following `:`, then compares the VALUE token
+/// immediately after the colon exactly against [`HUMAN_GATE_VALUE`].
 ///
 /// The backtick tolerance is not speculative — it is the single reason this
 /// matcher failed against the first real checkpoint ever observed. The live
@@ -691,14 +728,15 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
 fn text_reports_human_gate(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let mut search_from = 0;
-    while let Some(rel_idx) = lower[search_from..].find("gate") {
-        let idx = search_from + rel_idx;
-        let after_label = &lower[idx + "gate".len()..];
+    text.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let line = strip_leading_markup(&lower);
+        let Some(after_label) = line.strip_prefix("gate") else {
+            return false;
+        };
         let after_label = after_label.trim_start_matches(['*', ' ', '`']);
         if let Some(rest) = after_label.strip_prefix(':') {
-            let value_region = rest.trim_start_matches(['*', ' ', '`']);
+            let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
             let value_token: String = value_region
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -707,9 +745,29 @@ fn text_reports_human_gate(text: &str) -> bool {
                 return true;
             }
         }
-        search_from = idx + "gate".len();
+        false
+    })
+}
+
+/// Strip the markdown a relayed declaration line can carry before its label:
+/// indentation, blockquote markers (`>`), a list bullet (`-`, `+`, `*`) or an
+/// ordinal (`1.`, `2)`), emphasis (`*`) and code-span backticks.
+///
+/// An external review (2026-09-12) found that the line-anchored matcher
+/// otherwise missed `- **Gate:** ...` and `> **Gate:** ...`, both of which the
+/// earlier substring scan matched. Only markup is stripped, never words, so
+/// prose such as `- Resolved gate: blocking-human` still does not start with
+/// the label.
+fn strip_leading_markup(line: &str) -> &str {
+    let is_markup = |c: char| c.is_whitespace() || matches!(c, '>' | '-' | '+' | '*' | '`');
+    let rest = line.trim_start_matches(is_markup);
+    let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    match after_digits.strip_prefix(['.', ')']) {
+        Some(after_ordinal) if after_digits.len() < rest.len() => {
+            after_ordinal.trim_start_matches(is_markup)
+        }
+        _ => rest,
     }
-    false
 }
 
 /// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
@@ -3443,6 +3501,7 @@ mod tests {
     use crate::agents::AgentDriver;
     use crate::config::GitFlowConfig;
     use crate::mode::Mode;
+    use crate::prompt::{FixType, StageIntent};
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
 
@@ -3615,6 +3674,140 @@ mod tests {
     fn parse_json_envelope_without_marker_returns_none() {
         let stdout = r#"{"result":"did some work but forgot the marker","session_id":"x"}"#;
         assert!(parse_devflow_result(stdout).is_none());
+    }
+
+    #[test]
+    fn decision_reasoning_above_the_result_line_parses_to_that_result() {
+        let phase = PhaseId::new(47);
+        let resume_prompt = crate::prompt::checkpoint_auto_decide_prompt(phase);
+        let fix_prompt = crate::prompt::render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::FullExecute),
+        });
+        for prompt in [&resume_prompt, &fix_prompt] {
+            assert!(prompt.ends_with(crate::prompt::COMPLETION_PROTOCOL));
+            let prompt = prompt.to_ascii_lowercase();
+            assert!(prompt.contains("record"));
+            assert!(prompt.contains("reasoning"));
+        }
+
+        let protocol = crate::prompt::COMPLETION_PROTOCOL;
+        assert!(
+            protocol.contains("the LAST line of your FINAL message must be exactly:"),
+            "COMPLETION_PROTOCOL must describe the DEVFLOW_RESULT as the LAST line"
+        );
+        assert!(protocol.contains("goes above the DEVFLOW_RESULT line"));
+        assert!(protocol.contains("Output nothing after it."));
+        assert!(!protocol.contains("When all work is done, your FINAL message must be exactly:"));
+
+        let success_lines = protocol
+            .lines()
+            .filter(|line| line.starts_with("DEVFLOW_RESULT:") && line.contains("success"))
+            .collect::<Vec<_>>();
+        assert_eq!(success_lines.len(), 1);
+        let success_line = success_lines[0];
+
+        let mut decision_record = String::from(
+            "Decision record\n\nOptions considered: continue, retry, or stop for a human decision.\n",
+        );
+        for choice in 1..=60 {
+            decision_record.push_str(&format!(
+                "Option {choice}: I considered the evidence available at this stage, the reversible \
+                 next action, the impact on the unattended run, and the reason this choice does or \
+                 does not preserve the operator's intent without silently widening authorization.\n"
+            ));
+        }
+        decision_record.push_str(
+            "Chosen option: continue, because the recorded evidence supports it and the decision remains auditable.\n",
+        );
+        assert!(decision_record.lines().count() >= 60);
+        assert!(decision_record.len() > 5_000);
+        assert!(!decision_record.contains("**Gate:**"));
+
+        let status_for = |capture: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(stdout_path(dir.path(), phase), capture).unwrap();
+            evaluate_layer1(dir.path(), phase).map(|result| result.status)
+        };
+
+        let above = format!("{decision_record}\n{success_line}");
+        assert_eq!(status_for(&above), Some(AgentStatus::Success));
+
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "num_turns": 1,
+            "result": above,
+            "session_id": "decision-record",
+        })
+        .to_string();
+        assert_eq!(status_for(&envelope), Some(AgentStatus::Success));
+
+        let escaped = serde_json::to_string(&above).unwrap();
+        let escaped = &escaped[1..escaped.len() - 1];
+        let stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped);
+        assert_eq!(status_for(&stream), Some(AgentStatus::Success));
+        let last_event: serde_json::Value =
+            serde_json::from_str(stream.lines().rev().find(|line| !line.is_empty()).unwrap())
+                .unwrap();
+        assert!(event_is_top_level_result_marker(&last_event));
+
+        // This control makes the positive assertions discriminate rather than
+        // merely proving that the fixture itself contains a success marker.
+        let after = format!("{success_line}\n{decision_record}");
+        assert_eq!(status_for(&after), None);
+        let escaped_after = serde_json::to_string(&after).unwrap();
+        let escaped_after = &escaped_after[1..escaped_after.len() - 1];
+        let after_stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped_after);
+        assert_eq!(status_for(&after_stream), None);
+
+        // The parser permits short trailing text within TAIL_BUDGET_CHARS;
+        // only the long control above measures the prompt contract's tail.
+        let short_after = format!("{decision_record}\n{success_line}\nDone.");
+        assert_eq!(status_for(&short_after), Some(AgentStatus::Success));
+    }
+
+    #[test]
+    fn resume_prompt_does_not_read_as_a_blocking_human_checkpoint() {
+        let resume = crate::prompt::checkpoint_auto_decide_prompt(PhaseId::new(47));
+        assert!(resume.ends_with(crate::prompt::COMPLETION_PROTOCOL));
+
+        let envelope = |text: &str| {
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "num_turns": 1,
+                "result": text,
+                "session_id": "resumed-session",
+            })
+            .to_string()
+        };
+        let declaration = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** decision\n**Gate:** `{HUMAN_GATE_VALUE}`\n**Plan:** 30-05\n"
+        );
+        let labelled = format!("{resume}\n{declaration}");
+        assert!(text_reports_human_gate(&labelled));
+        assert!(blocking_human_checkpoint_reported(&envelope(&labelled)));
+
+        assert!(
+            resume.contains("gate-declaration line"),
+            "the resume prompt must tell the agent not to copy the gate-declaration line"
+        );
+        assert!(!text_reports_human_gate(&resume));
+        assert!(!blocking_human_checkpoint_reported(&envelope(&resume)));
+
+        let prose = "Resolved gate: blocking-human using the recorded evidence.";
+        assert!(
+            !text_reports_human_gate(prose),
+            "only a Gate-labeled line may report a checkpoint"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&envelope(prose)),
+            "free-form reasoning about a resolved gate must not request another resume"
+        );
     }
 
     #[test]
@@ -3826,6 +4019,84 @@ mod tests {
         assert!(blocking_human_checkpoint_reported(&stdout));
     }
 
+    /// A relayed checkpoint can carry list or blockquote markup before its label
+    /// (external review, 2026-09-12). The line-anchored matcher must see through
+    /// that markup, while prose that merely mentions a gate inside a list item or
+    /// a quote must still not match.
+    #[test]
+    fn blocking_human_checkpoint_reported_sees_through_list_and_quote_markup() {
+        for prefix in ["- ", "+ ", "* ", "1. ", "12) ", "> ", "> - ", "  - "] {
+            let stdout = format!("{prefix}**Gate:** `{HUMAN_GATE_VALUE}`\n");
+            assert!(
+                blocking_human_checkpoint_reported(&stdout),
+                "a declaration behind {prefix:?} must be recognised"
+            );
+        }
+        for prose in [
+            "- Resolved gate: blocking-human using the recorded evidence.",
+            "> Note: the gate: blocking-human was answered.",
+            "1. The gate: blocking-human is already resolved.",
+        ] {
+            assert!(
+                !blocking_human_checkpoint_reported(prose),
+                "list or quote markup must not turn prose into a declaration: {prose:?}"
+            );
+        }
+    }
+
+    /// A literal backslash-n inside agent-authored text, such as a code sample or
+    /// a diff hunk, is not a line break (final external review, 2026-09-12). The
+    /// raw scan used to split every capture on the two characters `\n`, so a code
+    /// sample like `let s = "\n**Gate:** ...";` read as a declaration. Escaped
+    /// text may be decoded only where it really is a JSON string. Each case pairs
+    /// the false positive with a control carrying a real line break, which must
+    /// still match.
+    #[test]
+    fn literal_backslash_n_in_agent_text_is_not_a_line_break() {
+        let gate = format!("**Gate:** `{HUMAN_GATE_VALUE}`");
+        let code_sample = format!(r#"let s = "\n{gate}";"#);
+        let real_break = format!("let s = \"\n{gate}\";");
+
+        assert!(
+            !blocking_human_checkpoint_reported(&code_sample),
+            "plain text: {code_sample:?}"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&real_break),
+            "plain-text control"
+        );
+
+        let envelope =
+            |text: &str| serde_json::json!({"type": "result", "result": text}).to_string();
+        assert!(
+            !blocking_human_checkpoint_reported(&envelope(&code_sample)),
+            "single-document envelope"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&envelope(&real_break)),
+            "single-document envelope control"
+        );
+
+        let json_lines = |text: &str| {
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type": "thread.started", "thread_id": "t1"}),
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": text}
+                })
+            )
+        };
+        assert!(
+            !blocking_human_checkpoint_reported(&json_lines(&code_sample)),
+            "JSON-lines capture"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&json_lines(&real_break)),
+            "JSON-lines capture control"
+        );
+    }
+
     /// REGRESSION — the rendering a real headless run actually produces.
     ///
     /// Transcribed verbatim from `.devflow/phase-91-stdout` of the live A1
@@ -3909,10 +4180,13 @@ mod tests {
     // they record which capture line each envelope came from and that every
     // gate payload is synthetic.
     //
-    // Each negative asserts a NEGATIVE CONTROL first: `text_reports_human_gate`
-    // must still match the raw capture. Without it a negative would also pass
-    // against a fixture that simply contains no gate text, and would keep
-    // passing if someone deleted the gate line from the fixture.
+    // Each negative asserts a NEGATIVE CONTROL first: `capture_reports_human_gate`,
+    // the raw-capture reader the stream branch replaces, must still report the
+    // capture. Without it a negative would also pass against a fixture that
+    // simply contains no gate text, and would keep passing if someone deleted the
+    // gate line from the fixture. Presence is not the same claim: the reader is
+    // line-anchored, so gate text it cannot match would let every negative pass
+    // with the stream branch removed.
 
     /// **REGRESSION — review constraint 3, the prompt-echo false positive.**
     ///
@@ -3933,7 +4207,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -3961,7 +4235,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -3992,7 +4266,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -4169,7 +4443,10 @@ mod tests {
     /// suppressing real gates.
     #[test]
     fn non_stream_captures_still_use_the_raw_scan_after_widening() {
-        let plain = format!("Some narration.\n{}\n", gate_declaration_text());
+        let plain = format!(
+            "Some narration.\n{}\n",
+            gate_declaration_text().replace("\\n", "\n")
+        );
         assert!(
             blocking_human_checkpoint_reported(&plain),
             "plain text must still be raw-scanned"
@@ -4378,7 +4655,7 @@ mod tests {
     /// shipped in `06675da`.
     #[test]
     fn one_stray_json_line_does_not_suppress_a_plain_text_gate() {
-        let gate = gate_declaration_text();
+        let gate = gate_declaration_text().replace("\\n", "\n");
 
         assert!(
             blocking_human_checkpoint_reported(&gate),
@@ -5496,14 +5773,20 @@ mod tests {
 
     /// Text that merely DOCUMENTS a gate rendering — the shape a plan file, a
     /// GSD reference document, or an agent narrating its next task carries.
-    /// Same code-span rendering as a real declaration, which is precisely why a
-    /// substring scan cannot tell the two apart and the EVENT must decide.
+    /// Same line-leading code-span rendering as a real declaration, which is
+    /// precisely why a text scan cannot tell the two apart and the EVENT must
+    /// decide.
     ///
-    /// Single line, no double quotes, so it drops into a JSON string field
-    /// without further escaping.
+    /// The label must start its own line. `capture_reports_human_gate` decodes
+    /// the event's JSON strings and matches only a line-leading label, so a
+    /// mid-line rendering matches nothing, and every negative built on it would
+    /// pass with the stream branch removed.
+    ///
+    /// The line break is a JSON-escaped `\n` and there are no double quotes, so
+    /// it drops into a JSON string field without further escaping.
     fn gate_documenting_text() -> String {
         format!(
-            "The next task is declared **Gate:** `{HUMAN_GATE_VALUE}` in the plan, so the executor must stop rather than auto-select."
+            "The next task is declared in the plan, so the executor must stop rather than auto-select:\\n**Gate:** `{HUMAN_GATE_VALUE}`"
         )
     }
 
