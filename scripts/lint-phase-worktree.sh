@@ -81,11 +81,19 @@ current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
 [ -n "$current_branch" ] || exit 0                 # detached HEAD: not our call
 [ "$current_branch" != "$phase_branch" ] || exit 0 # already in the right place
 
-staged="$(git diff --cached --name-only || true)"
-[ -n "$staged" ] || exit 0
-
-staged_source="$(printf '%s\n' "$staged" | grep -E '^crates/' || true)"
-staged_phase_docs="$(printf '%s\n' "$staged" | grep -E "^\.planning/phases/${phase}-" || true)"
+# NUL-separated, because the newline form quotes any name holding a non-ASCII
+# byte (under the default core.quotePath) or a quote, backslash or control
+# character, and a quoted `"crates/...` line never matched `^crates/`.
+# --no-relative pins repository-root names: diff.relative=true would otherwise
+# drop every staged path outside the directory the guard was started from.
+staged_source=""
+staged_phase_docs=""
+while IFS= read -r -d '' path; do
+    case "$path" in
+        crates/*) staged_source+="${path}"$'\n' ;;
+        ".planning/phases/${phase}-"*) staged_phase_docs+="${path}"$'\n' ;;
+    esac
+done < <(git diff --cached --name-only -z --no-relative || true)
 
 if [ -n "$staged_source" ]; then
     worktree_path="$(git worktree list --porcelain 2>/dev/null \
@@ -94,7 +102,7 @@ if [ -n "$staged_source" ]; then
             $0 == b     { print p; exit }' || true)"
     echo "pre-commit: refusing to commit phase ${phase} source on '${current_branch}'." >&2
     echo "  Phase ${phase} has a worktree and this is not it:" >&2
-    echo "$staged_source" | sed 's/^/      /' >&2
+    printf '%s' "$staged_source" | sed 's/^/      /' >&2
     echo "  Commit source for this phase on '${phase_branch}' instead:" >&2
     if [ -n "$worktree_path" ]; then
         echo "      git -C ${worktree_path} ..." >&2

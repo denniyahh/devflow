@@ -121,6 +121,41 @@ set +e; "$GUARD" --staged >/dev/null 2>&1; rc=$?; set -e
 check "6. no STATE.md -> no-op (control)" allow "$rc"
 mv .planning/STATE.md.bak .planning/STATE.md; git reset -q
 
+echo "== staged names git quotes, and a subdirectory under diff.relative =="
+# `git diff --cached --name-only` quotes a name holding a non-ASCII byte (under
+# the default core.quotePath) or a double quote, backslash or control character
+# (under any config). A guard matching `^crates/` against that output never sees
+# the quoted line. Each control proves its condition is really present in this
+# fixture, so its case cannot pass for want of the thing it tests. Each case
+# stages only its own file: the lib.rs edits left unstaged above would otherwise
+# make the guard refuse for the wrong reason.
+nonascii="crates/devflow-core/src/café.rs"
+echo "// edit" > "$nonascii"; git add -- "$nonascii" >/dev/null
+case "$(git diff --cached --name-only)" in '"'*) rc=1 ;; *) rc=0 ;; esac
+check "8a. control: git quotes a non-ASCII staged name" refuse "$rc"
+set +e; "$GUARD" --staged >/dev/null 2>&1; rc=$?; set -e
+check "8b. non-ASCII source name staged off-worktree -> refuse" refuse "$rc"
+git reset -q; rm -f -- "$nonascii"
+
+dquote='crates/devflow-core/src/a"b.rs'
+echo "// edit" > "$dquote"; git add -- "$dquote" >/dev/null
+case "$(git diff --cached --name-only)" in '"'*) rc=1 ;; *) rc=0 ;; esac
+check "8c. control: git quotes a staged name holding a double quote" refuse "$rc"
+set +e; "$GUARD" --staged >/dev/null 2>&1; rc=$?; set -e
+check "8d. double-quote source name staged off-worktree -> refuse" refuse "$rc"
+git reset -q; rm -f -- "$dquote"
+
+# Hooks run from the repository root, but the guard can be started by hand from
+# anywhere, and diff.relative limits name-only output to the current directory.
+# Injected per command: this harness nulls global config.
+git add -- crates/devflow-core/src/lib.rs >/dev/null
+relative="$(cd .planning && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.relative GIT_CONFIG_VALUE_0=true git diff --cached --name-only)"
+if [ -z "$relative" ]; then rc=1; else rc=0; fi
+check "8e. control: diff.relative hides root staging from a subdirectory" refuse "$rc"
+set +e; (cd .planning && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.relative GIT_CONFIG_VALUE_0=true "$GUARD" --staged) >/dev/null 2>&1; rc=$?; set -e
+check "8f. run from a subdirectory under diff.relative -> refuse" refuse "$rc"
+git reset -q
+
 echo "== fixture isolation from inherited git config =="
 mkdir -p "$TMP/hostile/hooks" "$TMP/empty-hooks"
 for hook in pre-commit post-checkout; do

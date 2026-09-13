@@ -95,10 +95,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   Existence is asked of `git worktree list --porcelain`, not of the `.worktrees/phase-N` path, so
   the answer stays correct when the hook runs from inside a worktree (where that relative path does
   not resolve at all). Guard: `scripts/lint-phase-worktree.sh`; both directions exercised by
-  `scripts/test-phase-worktree-guard.sh` (13 checks, including two negative controls that must PASS —
+  `scripts/test-phase-worktree-guard.sh` (19 checks, including two negative controls that must PASS —
   a guard only ever observed refusing has not been shown to discriminate). `scripts/check.sh test`
   runs it after `cargo test`, even when `cargo test` fails, so every CI job that calls that target
-  gates on it.
+  gates on it. The guard reads staged names with `git diff --cached --name-only -z --no-relative`:
+  the newline form quotes any name with a non-ASCII byte, a quote or a backslash, so a `^crates/`
+  match never saw it, and `diff.relative` hides paths outside the current directory. Case 8 covers
+  both, each case beside a control proving its condition is live.
   The harness unsets every repository-local git environment variable (`git rev-parse
   --local-env-vars`), queries the real checkout's recorded modes with the inherited config (CI
   accepts its runner-owned checkout only through a global `safe.directory`), and only then disables
