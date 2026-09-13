@@ -147,6 +147,7 @@ fn ci_workflow_delegates_to_the_shared_check_script() {
         "scripts/check.sh test",
         "scripts/check.sh clippy",
         "scripts/check.sh fmt",
+        "scripts/check.sh deps",
     ] {
         assert!(
             workflow.contains(target),
@@ -606,10 +607,10 @@ fn container_jobs_using_bash_syntax_declare_a_bash_shell() {
 // 46-04 / 46-REVIEWS.md C-02: a job-scoped, fixture-driven parity recogniser.
 // ---------------------------------------------------------------------------
 
-/// The four real jobs in `.github/workflows/ci.yml`. `push` and
+/// The five real jobs in `.github/workflows/ci.yml`. `push` and
 /// `pull_request` are deliberately absent — they are keys under the top-level
 /// `on:` block, and the pre-46-04 splitter counted them as jobs.
-const LIVE_CI_JOB_KEYS: [&str; 4] = ["test", "clippy", "fmt", "sequential"];
+const LIVE_CI_JOB_KEYS: [&str; 5] = ["test", "clippy", "fmt", "sequential", "deps"];
 
 /// The argv prefix the pinned suite step expands. `cpu_pin_prefix` in
 /// `scripts/lib/ci-cpus.sh` sets `CPU_PIN` to `(taskset -c "$CPUS")`, or to an
@@ -842,7 +843,7 @@ fn job_splitter_finds_exactly_the_live_ci_jobs() {
             .iter()
             .map(|k| k.to_string())
             .collect::<Vec<_>>(),
-        "the splitter must return exactly the four real jobs. Got: {keys:?}"
+        "the splitter must return exactly the five real jobs. Got: {keys:?}"
     );
 }
 

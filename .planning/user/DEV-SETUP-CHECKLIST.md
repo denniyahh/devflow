@@ -188,12 +188,19 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 
 ## 4. GitHub Actions CI
 
-- [ ] **[PROJECT]** `.github/workflows/ci.yml` — **four** jobs, each running **inside the exact
+- [ ] **[PROJECT]** `.github/workflows/ci.yml` — **five** jobs, each running **inside the exact
   same pinned container image** the devcontainer and the pre-push hook use (§5) — the whole point
   being zero host/CI drift. Three (`Test`, `Clippy`, `Format`) are **required** status contexts;
-  the fourth (`Sequential 2-CPU check`) is deliberately **advisory**. The **fourth required
+  `Sequential 2-CPU check` and `Dependency checks` are deliberately **advisory**. The **fourth required
   context is `Build + test in devcontainer`, which lives in `devcontainer.yml`, not here** — so
   the required set spans two workflow files, and reading only this one under-counts it.
+- [ ] **[PROJECT]** `Dependency checks` runs `scripts/check.sh deps`: `cargo deny check` plus
+  `cargo machete`. Neither tool ships in the pinned image, so the job first runs
+  `scripts/install-dep-tools.sh`, the one place their versions are pinned, and `deps` is
+  deliberately **not** in `check.sh all` — the pre-push gate would fail on a missing binary
+  rather than on a finding. `check.sh deps` refuses loudly when a tool is missing instead of
+  skipping. Advisory because `cargo deny` reads the live RustSec advisory database, so a newly
+  published advisory can turn it red on a PR that changed nothing.
 - [ ] **[PATTERN]** **Any container job whose `run:` steps use bash syntax must declare
   `shell: bash`.** GitHub defaults a `run:` step to `bash -e {0}` only on a *bare runner*; inside
   a `container:` job it is `sh -e {0}`, and these Debian images ship dash as `/bin/sh`. So
@@ -428,6 +435,8 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   `devflow`.
 - [ ] **[GLOBAL / PROJECT]** Rust AI harness tooling: `cargo-deny` (`deny.toml`), `cargo-machete`,
   `cargo-semver-checks`, `cargo-mutants`, `cargo-llvm-cov`, `cargo-nextest`, and `miri` (via nightly).
+  `cargo-deny` and `cargo-machete` are the two a gate runs: `scripts/check.sh deps`, with the versions
+  pinned in `scripts/install-dep-tools.sh` (§4).
 
 
 ## 9. Token/usage tracking (from earlier conversation, for completeness)
