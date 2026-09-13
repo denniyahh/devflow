@@ -29,22 +29,20 @@ The agent tooling has never been reviewed systematically, either for gaps worth 
 - **ACP clients and agents on PATH:** `zed`, `goose`, `opencode`, `pi`, `hermes`, `agy`. No Claude Code or codex ACP adapter is on PATH.
 - **Documentation lookup** uses the `npx ctx7` CLI (`~/.claude/rules/context7.md`), not an MCP server.
 
-## Solution
+## Solution (Resolved 2026-09-13)
 
-TBD. Criteria to apply to every candidate:
-
-- actively maintained, from a reputable source;
-- least-privilege scopes;
-- local or offline where possible;
-- measured context/token cost (the phase 47 retrospective found about 52 KB of standing context per session already);
-- Rust or Zig implementations preferred when otherwise comparable (operator preference);
-- installable without `dnf`, since the host is immutable Fedora: brew, cargo, npx or flatpak;
-- a supply-chain review before install.
-
-Areas to look at:
-
-- ACP adapters so Zed and other ACP clients can drive Claude Code or codex.
-- Rust development and testing aids beyond `rust-analyzer-lsp`.
-- Anything that turns the retrospective's recurring verification traps into mechanical checks.
-
-Removals belong with the todo "Review and normalize agent instruction files across tools".
+1. **Standing Context Pruning (Option A adopted):**
+   - Removed 11 unused skills from `~/.claude/skills/` to lower standing prompt token overhead:
+     - 7 Azure/Microsoft skills: `azure-deploy`, `azure-hosted-copilot-sdk`, `azure-prepare`, `azure-resource-lookup`, `azure-validate`, `entra-app-registration`, `microsoft-foundry`.
+     - 4 Office skills: `docx`, `pdf`, `pptx`, `xlsx`.
+   - Remaining skills inventory: 84 skills (72 `gsd-*` + 12 core development skills).
+2. **Plugins & Connectors:**
+   - Confirmed `vercel-plugin` is disabled (`false`) in `~/.claude/settings.json`.
+   - Linear connector confirmed retired.
+3. **Rust Development & Verification Tooling:**
+   - Verified `rust-analyzer-lsp` is active in Claude Code (`settings.json`) and Codex (`config.toml`).
+   - Verified host Rust verification toolchain (`cargo-deny`, `cargo-machete`, `cargo-nextest`, `cargo-mutants`, `cargo-llvm-cov`, `cargo-semver-checks`, `miri`) is available on PATH.
+   - P1 verification trap linters implemented in `scripts/lint-plan-bashisms.sh` and enforced via `pre-commit`.
+4. **Documentation & ACP Ecosystem:**
+   - Documentation lookup retained on `npx ctx7` CLI (zero background daemon / token overhead).
+   - ACP clients noted on PATH (`zed`, `goose`, `opencode`, `pi`, `hermes`, `agy`); no additional adapter needed for current devflow workflows.

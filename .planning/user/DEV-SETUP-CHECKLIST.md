@@ -1,6 +1,6 @@
 # Replicating DevFlow's Dev Setup & Workflow — Checklist
 
-Verified live against this repo and this machine on 2026-08-04 (not reconstructed from memory).
+Verified live against this repo and this machine on 2026-08-04; trued up against live repository rulesets and global configs on 2026-09-13 (not reconstructed from memory).
 Each item is tagged:
 
 - **[GLOBAL]** — lives on this machine outside any repo; reusable as-is on any project, but
@@ -58,19 +58,30 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PROJECT]** Default branch: `main`.
 - [ ] **[PROJECT]** Merge button config: squash ✓, merge-commit ✓, rebase ✗.
   `squash_merge_commit_title: PR_TITLE`. `delete_branch_on_merge: true`.
-- [ ] **[PROJECT]** Branch protection on `main`: required status checks `Test`, `Clippy`,
-  `Format` (app-scoped, `strict: false`), `required_approving_review_count: 0`,
-  `enforce_admins: true`, force-push and deletion both disabled.
-- [ ] **[PROJECT]** Branch protection on `develop`: force-push/deletion disabled,
-  `enforce_admins: true`, **no required status checks or review count set** (lighter than `main`).
-- [ ] Dump/apply commands, for portability:
+- [ ] **[PROJECT]** GitHub Repository Rulesets govern branch protection (verified 2026-09-13; replaces classic branch protection):
+  - **`develop-merge-or-squash`** (id `19616771`):
+    - Target: `develop` (`refs/heads/develop`)
+    - Enforcement: `active`
+    - Allowed merge methods: squash, merge-commit
+    - Pull request required, `required_approving_review_count: 0`
+    - Required status checks (4 contexts): `Test`, `Clippy`, `Format`, and `Build + test in devcontainer` (spans `ci.yml` and `devcontainer.yml`)
+    - Strict up-to-date policy: `strict: true` (head branch must be up to date before merge)
+    - Deletions and force pushes disabled; no bypass actors (`enforce_admins: true` equivalent).
+  - **`main-squash-only`** (id `19616766`):
+    - Target: `main` (`refs/heads/main`)
+    - Enforcement: `active`
+    - Allowed merge methods: squash only (`squash_merge_commit_title: PR_TITLE`)
+    - Pull request required, `required_approving_review_count: 0`
+    - Required status checks: `Test`, `Clippy`, `Format`
+    - Deletions and force pushes disabled; no bypass actors.
+- [ ] Dump / inspect commands, for portability:
   ```bash
-  gh api repos/OWNER/REPO/branches/main/protection
+  gh api repos/OWNER/REPO/rulesets
+  gh api repos/OWNER/REPO/rulesets/19616771
+  gh api repos/OWNER/REPO/rulesets/19616766
   gh api repos/OWNER/REPO --jq '{default_branch,allow_squash_merge,allow_merge_commit,allow_rebase_merge,delete_branch_on_merge,squash_merge_commit_title}'
   ```
-  **No official `gh` subcommand applies these from a file** — this is the concrete gap from the
-  "portable setup" conversation. A small script wrapping `gh api -X PUT .../protection` with a
-  JSON payload is the realistic fix if you want this replicated automatically, not just documented.
+  **Rulesets must be configured via the Rulesets API or web UI** — classic `.../branches/<branch>/protection` calls do not apply or inspect these repository rulesets.
 
 ## 3. Local git hooks — `core.hooksPath`, two layers
 
@@ -313,10 +324,12 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[GLOBAL]** `~/.claude/CLAUDE.md` is a **symlink** to `~/.config/agents/AGENTS.md` — your
   actual global instructions file (RULE ZERO, reporting style, coding methodology, etc.).
 - [ ] **[GLOBAL]** `~/.claude/rules/*.md` — `git-workflow.md`, `code-style.md`, `context7.md`,
-  `effort-routing.md`. Loaded into every session automatically.
-- [ ] **[PROJECT]** `CLAUDE.md` at repo root — repo-specific constraints only (this repo's own
-  says explicitly: "Global rules live in `~/.config/agents/AGENTS.md`; this file holds only
-  constraints specific to how *this* repository is worked on").
+  `effort-routing.md`, and `claude-subagent-worktrees.md`. Loaded into every session automatically.
+- [ ] **[PROJECT]** `CLAUDE.md` at repo root — deliberately minimal (24 lines) public-safe repository
+  instructions (crate topology, canonical test/check commands, worktree conventions). All generic
+  agent rules and verification habits live in `~/.config/agents/AGENTS.md`.
+- [ ] **[PROJECT]** `skills-lock.json` — curated to 9 engineering skills (office tools like docx,
+  pptx, xlsx, pdf pruned per Retrospective D1).
 - [ ] **[GLOBAL]** GSD-core installed as a global npm package (`@opengsd/gsd-pi`, currently
   `1.12.0`), not vendored per-repo — one install serves every project.
 - [ ] **[PROJECT]** `.planning/config.json` — per-project GSD config (branching strategy, phase
@@ -405,17 +418,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   the allowlist's `!` re-includes (appending it conflicted in simulation). `main` gets it with
   the next release.
 
-- [ ] **[PROJECT, operator decision 2026-09-13]** `GRAPHIFY_NO_BACKUP=1` is set in the project
-  `.claude/settings.json` `env` block. graphify's `backup_if_protected` copies the graph into a
-  dated `graphify-out/YYYY-MM-DD/` folder (~15 MB) before any overwrite it judges "curated", and it
-  judges every label that is not literally `Community N` as curated — so this repo's hub-derived
-  labels (`git.rs`, `PhaseId`) trigger a backup on every update-day, one folder per day, never
-  pruned (31 MB accumulated in one worktree in two days). What it protects, `graph.json`, is already
-  tracked in git wherever updates run. Scoped to this repo on purpose, and it covers Claude Code
-  sessions only — codex/antigravity sessions still write backups. Same decision: archived phases
-  stay in the graph. Excluding `.planning/milestones/` measured 59% smaller (14.7 -> 6.1 MB) but
-  drops 222 of 314 LLM-derived nodes, and no speedup was established (identical baseline runs took
-  41s and 93s).
+- [ ] **[GLOBAL / PROJECT, operator decision 2026-09-13]** Graphify hooks and environment are
+  configured globally (`~/.claude/settings.json` and `~/.codex/hooks.json`), not in tracked repo files
+  (per Phase 47 Retrospective D1, eliminating project `.claude/` and `.codex/` configs).
+  `GRAPHIFY_NO_BACKUP=1` is set in the global `.claude/settings.json` `env` block to prevent
+  `backup_if_protected` from creating dated `graphify-out/YYYY-MM-DD/` folders (~15 MB each), since
+  `graph.json` is already tracked in git. Archived phases stay in the graph (`.planning/milestones/`
+  retained) to preserve semantic LLM nodes.
 
 ## 7. GSD planning structure (`.planning/`)
 

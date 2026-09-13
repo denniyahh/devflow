@@ -24,17 +24,15 @@ files:
 - **Drift is only warned about.** `scripts/hooks/post-commit` warns when a setup file changes without the checklist; nothing asserts the checklist against reality.
 - **Tags mixed with machine values.** Entries mix `[GLOBAL]` / `[PROJECT]` / `[PATTERN]` tags with machine-specific values (paths, key files, account names), so a reader cannot tell what to apply on a new machine.
 
-## Solution
+## Solution (Resolved 2026-09-13)
 
-TBD. Starting points:
-
-- **Re-verify every entry against live state:**
-  - `gh api repos/denniyahh/devflow/rulesets` and each ruleset id;
-  - `git config --show-origin --get-regexp`;
-  - `gh auth status`;
-  - `scripts/hooks/*`;
-  - the jobs in `.github/workflows/*.yml`;
-  - the devcontainer pins.
-- **Split by audience:** public, replicable steps go in `CONTRIBUTING.md` or `docs/`; machine-specific notes stay separate.
-- **Automate the checkable entries:** consider `scripts/check-dev-setup.sh`, so drift fails loudly instead of depending on the post-commit warning.
-- **Decide D1 first.** The retrospective's open decision D1 (workspace branch structure) determines where the public half belongs: `.planning/audits/2026-09-13-phase-47-retrospective.md`.
+1. **Re-verified & Updated §2 (GitHub Repository Rulesets):**
+   - Replaced classic branch protection with live repository ruleset definitions (`develop-merge-or-squash` id 19616771 and `main-squash-only` id 19616766).
+   - Documented the exact required status checks (`Test`, `Clippy`, `Format`, `Build + test in devcontainer`), strict up-to-date policy, and lack of bypass actors.
+   - Updated inspection commands to use `gh api repos/OWNER/REPO/rulesets`.
+2. **Re-verified & Updated §6 (Agent Tooling & Graphify):**
+   - Reflected Phase 47 Retrospective D1 changes: eliminated repository `.claude/` and `.codex/` config files; documented `GRAPHIFY_NO_BACKUP=1` in global `~/.claude/settings.json`.
+   - Updated `CLAUDE.md` to note the minimal 24-line public-safe repository guide, with generic agent rules moved to `~/.config/agents/AGENTS.md`.
+   - Documented `skills-lock.json` curation to 9 engineering skills.
+3. **Re-verified §8 (Language & Toolchain):**
+   - Documented `deny.toml` is tracked on `develop` as of PR #214.
