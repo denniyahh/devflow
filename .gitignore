@@ -1,6 +1,10 @@
 # Build artifacts
 /target
 site/
+# graphify knowledge-graph output: regenerable, never committed to develop/main.
+# `graphify-out/*` rather than `graphify-out/` so a branch that tracks a snapshot
+# can still re-include files with `!` (a directory-level ignore cannot be negated).
+graphify-out/*
 
 # IDE
 .idea/
