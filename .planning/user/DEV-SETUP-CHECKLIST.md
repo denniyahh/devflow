@@ -374,6 +374,18 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   code-only and every semantic node is gone until a paid LLM pass. `develop` and `main` neither
   track nor ignore `graphify-out/` (open as of this entry).
 
+- [ ] **[PROJECT, operator decision 2026-09-13]** `GRAPHIFY_NO_BACKUP=1` is set in the project
+  `.claude/settings.json` `env` block. graphify's `backup_if_protected` copies the graph into a
+  dated `graphify-out/YYYY-MM-DD/` folder (~15 MB) before any overwrite it judges "curated", and it
+  judges every label that is not literally `Community N` as curated — so this repo's hub-derived
+  labels (`git.rs`, `PhaseId`) trigger a backup on every update-day, one folder per day, never
+  pruned (31 MB accumulated in one worktree in two days). What it protects, `graph.json`, is already
+  tracked in git wherever updates run. Scoped to this repo on purpose, and it covers Claude Code
+  sessions only — codex/antigravity sessions still write backups. Same decision: archived phases
+  stay in the graph. Excluding `.planning/milestones/` measured 59% smaller (14.7 -> 6.1 MB) but
+  drops 222 of 314 LLM-derived nodes, and no speedup was established (identical baseline runs took
+  41s and 93s).
+
 ## 7. GSD planning structure (`.planning/`)
 
 - [ ] **[PROJECT]** `PROJECT.md`, `ROADMAP.md`, `STATE.md`, `REQUIREMENTS.md` (recreated fresh

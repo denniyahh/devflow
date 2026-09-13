@@ -20,5 +20,8 @@
         ]
       }
     ]
+  },
+  "env": {
+    "GRAPHIFY_NO_BACKUP": "1"
   }
 }
