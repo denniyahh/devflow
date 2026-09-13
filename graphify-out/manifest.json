@@ -18,9 +18,9 @@
     "semantic_hash": "9ec7ef7d69395727dfb705d93414ad79"
   },
   ".planning/config.json": {
-    "mtime": 1788691269.2442267,
-    "seen": 1788773909.6467109,
-    "ast_hash": "fd8cc477dc290a0406b83e548929ee3b",
+    "mtime": 1789159913.5646205,
+    "seen": 1789319851.5565534,
+    "ast_hash": "4f07ce2572ddf67521184c22c358a9d7",
     "semantic_hash": ""
   },
   ".planning/estimation-calibration.json": {
@@ -120,10 +120,10 @@
     "semantic_hash": "52668ee9b10bac7557e4d96e04f2f625"
   },
   "crates/devflow-cli/Cargo.toml": {
-    "mtime": 1788386283.823369,
-    "seen": 1788773909.6467369,
-    "ast_hash": "f9c7a5f1639455b343d90fd115e6ac86",
-    "semantic_hash": "f9c7a5f1639455b343d90fd115e6ac86"
+    "mtime": 1789319729.0169537,
+    "seen": 1789319851.5583863,
+    "ast_hash": "f965e92fb88a457bc66727ad14d3d624",
+    "semantic_hash": ""
   },
   "crates/devflow-cli/build.rs": {
     "mtime": 1787397780.0870833,
@@ -162,9 +162,9 @@
     "semantic_hash": "fcce644ab9f48dc2090f4ae1b34aa556"
   },
   "crates/devflow-cli/src/pipeline_launch.rs": {
-    "mtime": 1788773879.5422199,
-    "seen": 1788773909.6470094,
-    "ast_hash": "219276a61af2899be4112836f219ddd4",
+    "mtime": 1789319729.0189536,
+    "seen": 1789319851.558716,
+    "ast_hash": "57a81078059880316c553325fa269525",
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/pipeline_outcomes.rs": {
@@ -186,9 +186,9 @@
     "semantic_hash": ""
   },
   "crates/devflow-cli/src/test_support.rs": {
-    "mtime": 1788773879.54522,
-    "seen": 1788773909.64702,
-    "ast_hash": "40f5f6c854836276883524be5d80f8ba",
+    "mtime": 1789319759.8438702,
+    "seen": 1789319851.5588937,
+    "ast_hash": "8f7b385e867464d34ea81475e692226c",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/auto_chain_flag_e2e.rs": {
@@ -210,9 +210,9 @@
     "semantic_hash": "6f3dd7721ad597194da4cb7deb41a9d5"
   },
   "crates/devflow-cli/tests/ci_parity_guards.rs": {
-    "mtime": 1788773879.5462198,
-    "seen": 1788773909.6473253,
-    "ast_hash": "e57121aaa29db05099d72bc478dbfd2a",
+    "mtime": 1789319729.0209537,
+    "seen": 1789319851.5590596,
+    "ast_hash": "9276e1a261983edb579d89454198db1d",
     "semantic_hash": ""
   },
   "crates/devflow-cli/tests/cut_release_guard.rs": {
@@ -240,10 +240,10 @@
     "semantic_hash": "a597e7335737b26fd8f6734745b54a14"
   },
   "crates/devflow-cli/tests/gitignore_coverage.rs": {
-    "mtime": 1787397780.0991933,
-    "seen": 1788294958.7153652,
-    "ast_hash": "96ffc8046e0bba5aab4607509ee19619",
-    "semantic_hash": "96ffc8046e0bba5aab4607509ee19619"
+    "mtime": 1789319729.0219536,
+    "seen": 1789319851.559304,
+    "ast_hash": "403450163967379b967d12a47a5813e8",
+    "semantic_hash": ""
   },
   "crates/devflow-cli/tests/help_snapshot.rs": {
     "mtime": 1787397780.0991933,
@@ -312,10 +312,10 @@
     "semantic_hash": "1bbc05e520e5e67914121aa4c7f2cd15"
   },
   "crates/devflow-core/Cargo.toml": {
-    "mtime": 1788386283.827369,
-    "seen": 1788773909.6485937,
-    "ast_hash": "9161079d7eaf929b366d7e95134275ed",
-    "semantic_hash": "9161079d7eaf929b366d7e95134275ed"
+    "mtime": 1789319792.1907823,
+    "seen": 1789319851.560225,
+    "ast_hash": "0bb4584730630c2e6f62dd290e53ae54",
+    "semantic_hash": ""
   },
   "crates/devflow-core/src/agent.rs": {
     "mtime": 1787397780.1040301,
@@ -324,9 +324,9 @@
     "semantic_hash": "5c33a615e69a0eca48594176debb5758"
   },
   "crates/devflow-core/src/agent_result.rs": {
-    "mtime": 1788773879.55122,
-    "seen": 1788773909.6486971,
-    "ast_hash": "b91f32ec9e13e711dfe6c15b45dc66ce",
+    "mtime": 1789319729.0259535,
+    "seen": 1789319851.5602825,
+    "ast_hash": "6571c1b85ce27ad876ee62918f657da3",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/agents/antigravity.rs": {
@@ -462,9 +462,9 @@
     "semantic_hash": "69f9c8f4b355e51c29fff794d1973dde"
   },
   "crates/devflow-core/src/prompt.rs": {
-    "mtime": 1788429861.072703,
-    "seen": 1788773909.6501236,
-    "ast_hash": "518f915bc24ac9b04fd5c40e368ee3f9",
+    "mtime": 1789319729.0269535,
+    "seen": 1789319851.5620136,
+    "ast_hash": "f2a9188a5d3095f19bf140ae736e3505",
     "semantic_hash": ""
   },
   "crates/devflow-core/src/recover.rs": {
@@ -492,8 +492,8 @@
     "semantic_hash": ""
   },
   "crates/devflow-core/src/stage.rs": {
-    "mtime": 1787397780.1221933,
-    "seen": 1788294958.7154043,
+    "mtime": 1789049074.6212096,
+    "seen": 1789319851.562235,
     "ast_hash": "6597ea2b99b80c21be0f55d8735afe5c",
     "semantic_hash": "6597ea2b99b80c21be0f55d8735afe5c"
   },
@@ -576,10 +576,10 @@
     "semantic_hash": ""
   },
   "scripts/check.sh": {
-    "mtime": 1787397780.129031,
-    "seen": 1788294958.7154183,
-    "ast_hash": "28d2578dc6a609fcf4893ea3b789338b",
-    "semantic_hash": "28d2578dc6a609fcf4893ea3b789338b"
+    "mtime": 1789319729.0289536,
+    "seen": 1789319851.5630043,
+    "ast_hash": "d80cc02ec0a36d9da8f285203578e3b9",
+    "semantic_hash": ""
   },
   "scripts/cut-pr-branch.sh": {
     "mtime": 1788386283.836369,
@@ -618,9 +618,9 @@
     "semantic_hash": ""
   },
   "scripts/hooks/pre-commit": {
-    "mtime": 1788773879.5532198,
-    "seen": 1788773909.650931,
-    "ast_hash": "3149408548906096b012e8285f849e23",
+    "mtime": 1789048968.6574218,
+    "seen": 1789319851.563289,
+    "ast_hash": "6a0e4dc2a40e05015875f40eb27814b3",
     "semantic_hash": ""
   },
   "scripts/hooks/pre-push": {
@@ -666,15 +666,15 @@
     "semantic_hash": "39feed5d65bd442dc2e937bfb68f6810"
   },
   ".planning/ROADMAP.md": {
-    "mtime": 1788773783.430502,
-    "seen": 1788773909.6510937,
-    "ast_hash": "b7f1a974a6eda7e03a78537f6eefc4ac",
+    "mtime": 1789319728.9919536,
+    "seen": 1789319851.5642257,
+    "ast_hash": "6f983734e00da5ac6510aad69f46fe01",
     "semantic_hash": ""
   },
   ".planning/STATE.md": {
-    "mtime": 1788773829.9103656,
-    "seen": 1788773909.6510947,
-    "ast_hash": "a196995674e6698b294c1100a9b1037c",
+    "mtime": 1789319728.9939537,
+    "seen": 1789319851.5642276,
+    "ast_hash": "9da83fdbc10d456fa7701c79dfd58f5c",
     "semantic_hash": ""
   },
   ".planning/WINDOWS.md": {
@@ -1704,10 +1704,10 @@
     "semantic_hash": "a66179f2c0d668798d30274f0382e6c7"
   },
   "ARCHITECTURE.md": {
-    "mtime": 1787397780.0811932,
-    "seen": 1788294958.7155988,
-    "ast_hash": "8bf5ecb36f1ece4cbc6cdaf9ab6f0095",
-    "semantic_hash": "8bf5ecb36f1ece4cbc6cdaf9ab6f0095"
+    "mtime": 1789319729.0159535,
+    "seen": 1789319851.6453264,
+    "ast_hash": "d6a90329dd1a8abc2d6ad0bf670a6603",
+    "semantic_hash": ""
   },
   "docs/guides/configuration.md": {
     "mtime": 1787438875.9695864,
@@ -1728,15 +1728,15 @@
     "semantic_hash": "f3351ef676ebe5298513896ac5acefb6"
   },
   "docs/guides/unattended-mode.md": {
-    "mtime": 1788429861.0747027,
-    "seen": 1788773909.652697,
-    "ast_hash": "0e5bd2b710873f1228cad43b6d4100c6",
+    "mtime": 1789319729.0289536,
+    "seen": 1789319851.647588,
+    "ast_hash": "26eb754376013ce92b840a1fe4625994",
     "semantic_hash": ""
   },
   ".claude/settings.json": {
-    "mtime": 1788386283.6319873,
-    "seen": 1788773909.6466942,
-    "ast_hash": "bb865ad73d2761614644f941158852b9",
+    "mtime": 1789301291.9670258,
+    "seen": 1789319851.555856,
+    "ast_hash": "dabb4f36ed9c7f9e2b771731f46aee19",
     "semantic_hash": ""
   },
   ".codex/hooks.json": {
@@ -1842,15 +1842,15 @@
     "semantic_hash": ""
   },
   ".planning/PROJECT.md": {
-    "mtime": 1788461885.4296694,
-    "seen": 1788773909.6510904,
-    "ast_hash": "1b24bf7be5d607fca0e11199541e4c9a",
+    "mtime": 1789319728.9869537,
+    "seen": 1789319851.5641763,
+    "ast_hash": "11c376c8275be89cb48c44e873d1f24b",
     "semantic_hash": ""
   },
   ".planning/REQUIREMENTS.md": {
-    "mtime": 1788773739.2546315,
-    "seen": 1788773909.6510913,
-    "ast_hash": "4e8df1905d92dfeb3c7fcccac2561035",
+    "mtime": 1789319728.9889536,
+    "seen": 1789319851.564178,
+    "ast_hash": "62a294220031b604e2ca53835fe31ce5",
     "semantic_hash": ""
   },
   ".planning/RETROSPECTIVE.md": {
@@ -1962,8 +1962,8 @@
     "semantic_hash": ""
   },
   ".planning/intel/API-SURFACE.md": {
-    "mtime": 1788386283.6911252,
-    "seen": 1788773909.6511145,
+    "mtime": 1789163601.3528206,
+    "seen": 1789319851.5652554,
     "ast_hash": "672f4459763250973c97c8d7d2ede2f2",
     "semantic_hash": ""
   },
@@ -6222,9 +6222,9 @@
     "semantic_hash": ""
   },
   ".planning/user/DEV-SETUP-CHECKLIST.md": {
-    "mtime": 1788773739.2656314,
-    "seen": 1788773909.652252,
-    "ast_hash": "6cfceb2ec3337c0bbb21a16d69f1a437",
+    "mtime": 1789319729.0149536,
+    "seen": 1789319851.6452816,
+    "ast_hash": "d918132967790b436ff373a84f12c9da",
     "semantic_hash": ""
   },
   "AGENTS.md": {
@@ -6435,6 +6435,186 @@
     "mtime": 1787438875.9715865,
     "seen": 1788773909.6527026,
     "ast_hash": "a2c6f5854c4a1590a590d0be57a0c033",
+    "semantic_hash": ""
+  },
+  "crates/devflow-cli/tests/worktree_guard_harness.rs": {
+    "mtime": 1789319729.0229535,
+    "seen": 1789319851.5601673,
+    "ast_hash": "229474305432f6cc03b8bc20a1586621",
+    "semantic_hash": ""
+  },
+  "scripts/lint-phase-worktree.sh": {
+    "mtime": 1789319729.0299535,
+    "seen": 1789319851.5634713,
+    "ast_hash": "dcc0f03a166e3a85912f2d634bb599d9",
+    "semantic_hash": ""
+  },
+  "scripts/phase-worktree.sh": {
+    "mtime": 1789048996.363924,
+    "seen": 1789319851.5635207,
+    "ast_hash": "9661c1915a3f8cc6e782697ade15e5e1",
+    "semantic_hash": ""
+  },
+  "scripts/test-phase-worktree-guard.sh": {
+    "mtime": 1789319729.0309536,
+    "seen": 1789319851.5636632,
+    "ast_hash": "544f7bb3a8b55552930642f49387d88d",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-01-PLAN.md": {
+    "mtime": 1789319728.9949536,
+    "seen": 1789319851.640922,
+    "ast_hash": "832f052c87ceebb85f705d1ded2fce4e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-01-SUMMARY.md": {
+    "mtime": 1789319728.9959536,
+    "seen": 1789319851.6409237,
+    "ast_hash": "e616ae74607945eeb17daf06b1d93f4a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-02-PLAN.md": {
+    "mtime": 1789319728.9969537,
+    "seen": 1789319851.6409256,
+    "ast_hash": "3bef12362974cbabfae3d25ec4a30327",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-02-SUMMARY.md": {
+    "mtime": 1789319728.9969537,
+    "seen": 1789319851.6409273,
+    "ast_hash": "a08840bedd80177658eb6afdddab5624",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-03-PLAN.md": {
+    "mtime": 1789319728.9979537,
+    "seen": 1789319851.6409287,
+    "ast_hash": "d149b6640e33cd9689bd71117ece2567",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-03-SUMMARY.md": {
+    "mtime": 1789319728.9999537,
+    "seen": 1789319851.64093,
+    "ast_hash": "65468469cea0c4c80349b7ec67bbe18a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-04-PLAN.md": {
+    "mtime": 1789319728.9999537,
+    "seen": 1789319851.6409314,
+    "ast_hash": "1d8dd0dd0d91983c625cc6172cd4a5ef",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-04-SUMMARY.md": {
+    "mtime": 1789319729.0009537,
+    "seen": 1789319851.6409328,
+    "ast_hash": "65535ef4ff1320ad2d4e94d3db8ec1f0",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-05-PLAN.md": {
+    "mtime": 1789319729.0019536,
+    "seen": 1789319851.6409345,
+    "ast_hash": "83c3aa9bcdc94a57f31070aafb4e819f",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-05-SUMMARY.md": {
+    "mtime": 1789319729.0019536,
+    "seen": 1789319851.640936,
+    "ast_hash": "9e9e624ca51c1fe8013730e8b6455bc7",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-06-PLAN.md": {
+    "mtime": 1789319729.0039537,
+    "seen": 1789319851.6409378,
+    "ast_hash": "000758fdd438fee9e46691eff3e8f69e",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-06-SUMMARY.md": {
+    "mtime": 1789319729.0059536,
+    "seen": 1789319851.640939,
+    "ast_hash": "9df4ef95e3a616ce7e1f62d816d3d29c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-07-PLAN.md": {
+    "mtime": 1789319729.0059536,
+    "seen": 1789319851.64094,
+    "ast_hash": "7276e6f552a271f96db5e16b7a90b779",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-07-SUMMARY.md": {
+    "mtime": 1789319729.0069537,
+    "seen": 1789319851.6409411,
+    "ast_hash": "d3c2f6da132532ee82e7ea7a31a75485",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-CONTEXT.md": {
+    "mtime": 1789319729.0079536,
+    "seen": 1789319851.6409426,
+    "ast_hash": "2cc62b370d9ddd7509200065d6292163",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-DISCUSSION-LOG.md": {
+    "mtime": 1789004620.9670856,
+    "seen": 1789319851.6409438,
+    "ast_hash": "c09cae34597be701a626923f0f3ceaad",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-PATTERNS.md": {
+    "mtime": 1789319729.0089536,
+    "seen": 1789319851.6409452,
+    "ast_hash": "a82ee877f8241a53afd185a4f8d20787",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-PHASE49-OBSERVATION.md": {
+    "mtime": 1789319729.0089536,
+    "seen": 1789319851.6409461,
+    "ast_hash": "4abd79001f3e9459f2f2c728d09f8a68",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-RESEARCH.md": {
+    "mtime": 1789037398.5232043,
+    "seen": 1789319851.640948,
+    "ast_hash": "ab84966ef3c0bebfa9707f2d4a5b3b53",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-REVIEW.md": {
+    "mtime": 1789319729.0089536,
+    "seen": 1789319851.6409492,
+    "ast_hash": "1b9d04607fc5636031d19d1be6bea1cc",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-REVIEWS.md": {
+    "mtime": 1789319729.0099535,
+    "seen": 1789319851.6409504,
+    "ast_hash": "7db91aa27c694d97ea3a006a9b5ca54a",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-SECURITY.md": {
+    "mtime": 1789319729.0109537,
+    "seen": 1789319851.6409519,
+    "ast_hash": "bab63f039d726f700b21d55b6d9efe00",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-UAT.md": {
+    "mtime": 1789319729.0119536,
+    "seen": 1789319851.6409533,
+    "ast_hash": "45487ab97d52c630c8f6525993f51117",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-VALIDATION.md": {
+    "mtime": 1789319729.0119536,
+    "seen": 1789319851.6409543,
+    "ast_hash": "2eafa70df1b8170392f6b5c572197d43",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/47-VERIFICATION.md": {
+    "mtime": 1789319729.0129535,
+    "seen": 1789319851.640956,
+    "ast_hash": "8b528eda01a3d8df2d554a6b1084942c",
+    "semantic_hash": ""
+  },
+  ".planning/phases/47-unattended-decision-policy-consistency/deferred-items.md": {
+    "mtime": 1789319729.0139537,
+    "seen": 1789319851.6409569,
+    "ast_hash": "864c4daa4fc56c7081f48ff27c7fc878",
     "semantic_hash": ""
   }
 }
