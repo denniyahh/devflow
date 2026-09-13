@@ -371,8 +371,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   cannot be negated and would silently ignore `graph.json` too. Why the snapshot is tracked at all,
   measured 2026-09-13 in scratch worktrees: a checkout *with* `graph.json` regenerates in ~40s and
   keeps its LLM-derived (`_origin: semantic`) nodes; *without* it, `graphify update .` rebuilds
-  code-only and every semantic node is gone until a paid LLM pass. `develop` and `main` neither
-  track nor ignore `graphify-out/` (open as of this entry).
+  code-only and every semantic node is gone until a paid LLM pass. `develop` and `main` had neither
+  tracked nor ignored `graphify-out/`; PR #211 adds `graphify-out/*` to `develop`, placed under
+  "Build artifacts" so syncing `develop` into this branch merges cleanly and still lands before
+  the allowlist's `!` re-includes (appending it conflicted in simulation). `main` gets it with
+  the next release.
 
 - [ ] **[PROJECT, operator decision 2026-09-13]** `GRAPHIFY_NO_BACKUP=1` is set in the project
   `.claude/settings.json` `env` block. graphify's `backup_if_protected` copies the graph into a
