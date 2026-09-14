@@ -287,6 +287,61 @@ From `.planning/audits/2026-09-13-phase-47-retrospective.md`:
 
 </decisions>
 
+<review_findings>
+## Adversarial Review Findings — Binding Amendments
+
+**Reviewed:** 2026-09-14 against commit `f063b42` (read-only `git archive` snapshot). **These amendments
+override the decision text above wherever they conflict.** Applied by operator decision ("Apply all").
+
+**Lane roster:**
+- codex (`gpt-5.6-terra`, high effort) — completed; 4 findings, 20 distinct `file:line` citations.
+- DeepSeek via `pi` (`deepseek-v4-pro`) — completed; 7 findings, 36 distinct citations.
+- agy (`gemini-3.8-flash-high`) — **DROPPED**: print timeout after 30m with the turn in progress, 0 bytes of
+  output. Not a pass.
+
+Every finding below was re-verified against source by Claude. Failure paths are reasoned from code, not
+reproduced.
+
+- **R-1 (HIGH, D-05) — never strand a live waiter.** Delete a phase's gate request/response/ack files only
+  when no live process holds the per-phase lock. `recover --clean --phase` (`commands.rs:2286` →
+  `recover.rs:130-145`) takes no lock and checks only the agent pid; `Gates::cleanup` removes all three files
+  unconditionally (`gates.rs:294-305`); a waiter polls only the response path (`gates.rs:255-272`) and
+  `respond` refuses once the request is gone (`gates.rs:192-194`). Cleanup under a live waiter would leave it
+  unanswerable until its gate timeout. A fresh `start` cleans up only after taking its lock (D-02).
+- **R-2 (HIGH, D-02) — bind a waiting `advance` to its stage.** The monitor passes the stage it launched
+  (Legacy `advance_tail`, `monitor.rs:473-479`; PipeOwning `run_monitor`, `pipeline_launch.rs:977`). After
+  acquiring the lock, `advance` refuses — logging `advance_failed` — when `state.stage` no longer matches.
+  Today `advance` receives only the phase and evaluates whatever `state.stage` holds (`pipeline_launch.rs:1452`,
+  `:1496-1510`); the comment at `:1491-1495` relies on duplicates being excluded, which a bounded wait breaks.
+- **R-3 (HIGH, D-06) — unclosed fences fail closed.** Ignore only content inside properly closed fences. From
+  an unclosed fence to end of file, apply the line-anchored match, so a declaration there still counts.
+  Negative test: an unterminated fence before a real `blocking-human` task still refuses unattended preflight.
+  Today's scan is not fence-aware and cannot fail this way (`verify.rs:207-220`); the corpus has 0 odd-fence
+  plans (both lanes reproduced this), so this guards agent-written plans rather than current ones.
+- **R-4 (MEDIUM, D-04) — exclusive publish for responses only.** Apply fail-if-exists publishing only in
+  `Gates::respond`. `write_gate` and `ack` keep rename-overwrite: `resume` re-fires the preflight gate over a
+  leftover request with no cleanup in between (`preflight.rs:1367` → `pipeline_gate.rs:369-371`).
+- **R-5 (MEDIUM, D-02) — `stop` locks before it loads.** Order: acquire the lock → load state (re-check that it
+  exists) → mutate → save → release. `persist_stopped_state` loads before saving today
+  (`commands.rs:1930-1945`); any other order leaves D-01 hazard (b) open.
+- **R-6 (MEDIUM, D-05) — every answer writer follows D-05.** The no-waiter rule also covers `stop_via_gate` →
+  `Gates::reap` (`commands.rs:1806-1840`) and `gate sweep`, whose only write path is `Gates::reap`
+  (`gates.rs:207-211`) and which checks gate age but not for a waiter (`commands.rs:1442`), in addition to
+  `gate_respond`.
+- **R-7 (LOW, D-04 and D-02) — collectable temp files.** Unique temp names follow a recognizable pattern, and
+  gate cleanup and state cleanup remove orphans left by a crash between publish and unlink.
+- **R-8 (LOW, D-07) — approval records the set.** Approving the re-scan gate persists the then-current
+  checkpoint set, so a run upgraded past Code gates once rather than at every resume decision.
+
+**Planner notes (not amendments):**
+- Hard links are unsupported on some filesystems (FAT/exFAT, some network mounts). Record a fallback or a clear
+  error for R-4.
+- Not adopted: the concern that D-07's whole-task comparison over-triggers on task-body edits. No GSD workflow
+  instructs the executor to edit PLAN.md task bodies (filtered search — weak evidence), so pin the comparison
+  rule with a real-plan fixture.
+
+</review_findings>
+
 <canonical_refs>
 ## Canonical References
 
