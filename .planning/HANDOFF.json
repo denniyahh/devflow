@@ -1,0 +1,43 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-15T15:00:09.637Z",
+  "phase": "48",
+  "phase_name": "survivable-state-writes-and-honest-gate-recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": null,
+  "task": null,
+  "total_tasks": 34,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "Research (48-RESEARCH.md)", "status": "done", "commit": "71b3eb3"},
+    {"id": 2, "name": "Validation strategy (48-VALIDATION.md)", "status": "done", "commit": "2be3907"},
+    {"id": 3, "name": "Pattern map (48-PATTERNS.md)", "status": "done", "commit": "c0fb193"},
+    {"id": 4, "name": "Phase plans: 14 plans in 9 waves; checker passed after 2 revision rounds plus an operator-approved narrow fix to 48-07", "status": "done", "commit": "9915c56"},
+    {"id": 5, "name": "Fix the pre-commit plan linter crash and its bare-name false positive", "status": "done", "commit": "b9ee940"},
+    {"id": 6, "name": "Regression tests for the plan linter fixes", "status": "done", "commit": "56f3466"},
+    {"id": 7, "name": "Cross-AI adversarial review of the plan set (48-REVIEWS.md)", "status": "done", "commit": "e62eca9"}
+  ],
+  "remaining_tasks": [
+    {"id": 8, "name": "Get the operator's decision on what recover --clean may delete while a process holds or could take the per-phase lock", "status": "not_started"},
+    {"id": 9, "name": "Replan incorporating 48-REVIEWS.md: $gsd-plan-phase 48 --reviews", "status": "not_started"},
+    {"id": 10, "name": "Second external adversarial review of the revised plan set (operator standing rule)", "status": "not_started"},
+    {"id": 11, "name": "Execute phase 48: $gsd-execute-phase 48", "status": "not_started"}
+  ],
+  "blockers": [
+    {"description": "48-REVIEWS.md confirmed safety gaps in the committed plans: CX-1 (recover --clean can delete a live gate a new start just wrote) and CX-3 (a fenced </task> line lets a changed checkpoint pass the CHKPT-02 re-scan without a human). The plans must not be executed before the --reviews replan. STATE.md still says Ready to execute; the review findings override it.", "type": "technical", "workaround": "none; replan first"}
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Decide what devflow recover --clean may delete while a process holds or could take the per-phase lock: gate files, state, both, or neither", "context": "48-REVIEWS.md CX-1 (gate cleanup races a new start) and PI-S2 (state is cleared under a live holder) hit the same function; amendment R-1 (48-CONTEXT.md:305-310) covers gate files only", "blocking": true}
+  ],
+  "decisions": [
+    {"decision": "Plan frontmatter uses the D-11 requirement IDs SURV-01, SURV-02, CHKPT-01, CHKPT-02 and TEST-01; never GATE-01 or GATE-02", "rationale": "REQUIREMENTS.md already uses GATE-01 and GATE-02 for #184 and #170. The ROADMAP still says GATE-01 (999.125), GATE-02 (999.126) and 999.38 until plan 48-01 executes, so pass that alias mapping to the planner and checker.", "phase": "48"},
+    {"decision": "An upgraded run whose state has no recorded checkpoint set gates at a loop-back Code evaluation (fail closed)", "rationale": "Derived from the text of D-07; not a new decision", "phase": "48"},
+    {"decision": "ROADMAP criterion 4 drops the ~40s figure; plan 48-01 applies the rewording", "rationale": "Operator decision on 2026-09-14: ~40s measured the poll backoff, not the wedge", "phase": "48"},
+    {"decision": "48-07's D-09 signature gate targets preflight_unattended_launch_check", "rationale": "The final checker blocker named the wrong function; the operator approved a narrow fix, verified mechanically", "phase": "48"},
+    {"decision": "Stop the ChatGPT desktop app's Claude Code import sync by setting external-agent-import-sync-enabled = false in ~/.codex/config.toml", "rationale": "The sync kept writing a stray CLAUDE.md-mirror AGENTS.md into repo roots; the phase 47 retrospective had removed AGENTS.md from the repo", "phase": "48"}
+  ],
+  "uncommitted_files": ["?? .planning/research/.cache/"],
+  "next_action": "In Codex, from /var/home/denniyahh/Github/devflow/.worktrees/phase-48 on branch feature/phase-48: read .planning/phases/48-survivable-state-writes-and-honest-gate-recovery/.continue-here.md, get the operator's recover --clean decision, then run $gsd-plan-phase 48 --reviews",
+  "context_notes": "Gaps cluster in three places: (1) destructive recovery that does not hold the per-phase lock (48-14: CX-1, PI-S2); (2) checkpoint parsing that is not fence-aware in every place it extracts text (48-02: CX-2, CX-3); (3) doctor's read-only guarantee broken by lock::holder deleting empty lock files (48-13/48-14: PI-1). Fix directions are in 48-REVIEWS.md and are suggestions, not decisions."
+}
