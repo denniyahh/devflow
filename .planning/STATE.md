@@ -6,15 +6,15 @@ current_phase: 48
 current_phase_name: Survivable State Writes and Honest Gate Recovery
 current_plan: Not started
 status: executing
-stopped_at: Phase 48 planned — 14 plans in 9 waves, ready to execute
-last_updated: "2026-09-15T13:20:25.037Z"
-last_activity: 2026-09-13
-last_activity_desc: Phase 47 complete, transitioned to Phase 48
-state_head: c0fb193e155b87c73bba6b4c7e07ea94dced94e9
+stopped_at: Phase 48 review replan complete — 17 plans in 11 waves, ready to execute
+last_updated: "2026-09-15T20:28:08.346Z"
+last_activity: 2026-09-15
+last_activity_desc: Phase 48 review replan passed independent plan review; ready to execute
+state_head: 5578a208f37bdc82cd82f0fdb8cf7a95b4449101
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 30
+  total_plans: 33
   completed_plans: 16
   percent: 33
 ---
@@ -59,14 +59,15 @@ stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold
 
 ## Active Phase
 
-**None — Phase 48 is next, unplanned.** Milestone **v3.0.0 — Unattended Run Survivability** was
+**Phase 48 — Survivable State Writes and Honest Gate Recovery is planned and ready to execute.** Its
+17 plans span 11 dependency waves and passed independent static plan review. Milestone **v3.0.0 — Unattended Run Survivability** was
 declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
 requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208).
 Phase 47 is complete (7/7 plans) and integrated: merged to `develop` via PR #213 and into
 `workspace/denniyahh`. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
 `stale`: `.planning/ROADMAP.md` is one of its 48 covered files, and `phase.complete`'s own write in
 `4bb9504` changed it (the covered digest recomputed with that file reverted to `3fa9206` matches the
-recorded one). Phases 48-51 are unplanned.
+recorded one). Phases 49-51 remain unplanned.
 
 **The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
 survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
@@ -92,7 +93,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-13)
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
 **Current focus:** v3.0.0 Unattended Run Survivability — Phase 48 (Survivable State Writes and
-Honest Gate Recovery), next and unplanned. Phases 46 and 47 are complete and integrated; 47's
+Honest Gate Recovery), planned in 17 plans across 11 waves and ready to execute. Phases 46 and 47 are complete and integrated; 47's
 verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
@@ -111,8 +112,8 @@ verification reads `stale` (see `## Active Phase`).
   runs the harness inside `cargo test`. Record an override; do not restore the file.
 - **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
 - **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- `/gsd-discuss-phase 48`, run from `.worktrees/phase-48` (`feature/phase-48`). No CONTEXT.md exists
-  yet. Phase 48 depends on Phases 46 and 47.
+- `$gsd-execute-phase 48`, run from `.worktrees/phase-48` (`feature/phase-48`). Phase 48's 17 plans
+  in 11 waves incorporate the completed review replan and depend on Phases 46 and 47.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
   `base_branch` must be configured before the live `--mode auto` run is possible.
 
@@ -188,9 +189,9 @@ change earns 2.0.
 ## Current Position
 
 Phase: 48 (Survivable State Writes and Honest Gate Recovery) — READY TO EXECUTE
-Plans: not yet planned (no phase directory)
+Plans: 17 plans in 11 waves (48-01..48-17)
 Current Plan: Not started
-Total Plans in Phase: 14
+Total Plans in Phase: 17
 Completed Plans: —
 Status: Ready to execute
 Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
@@ -202,7 +203,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-13 — Phase 47 transition post-processing: PROJECT.md evolved, STATE.md reconciled
+Last activity: 2026-09-15 — Phase 48 review replan passed independent plan review
 
 Progress: [███░░░░░░░] 33% (2 of 6 phases complete — `roadmap.analyze` counts 1 while 47 reads `stale`)
 
