@@ -243,14 +243,14 @@ function check_block(body, base,   rest, off, o, txt) {
         violations++
     }
 
-    # Trap: rg -c piped to rg '^0$'
+    # Trap: rg -c piped to rg ^0$ (no apostrophes: this comment is inside the single-quoted awk program)
     if (match(body, /rg[ \t]+-[a-zA-Z0-9]*c[^\n|]*\|[ \t]*rg[ \t]+[\047\042]?\^0\$/)) {
         printf "%s:%d: rg -c ... | rg %s^0$%s trap (rg -c prints nothing on zero matches and exits 1)\n", fname, line_of(base + RSTART - 1), SQ, SQ
         violations++
     }
 
     # Trap: cargo test --exact with bare identifier (must be module-qualified)
-    if (match(body, /cargo test[^\n]*--exact[ \t]+[\047\042]?[A-Za-z0-9_-]+[\047\042]?([ \t\n]|$)/)) {
+    if (match(body, /cargo test[^\n]*--exact[ \t]+[\047\042]?[A-Za-z0-9_][A-Za-z0-9_-]*[\047\042]?([ \t\n]|$)/)) {
         printf "%s:%d: cargo test --exact bare-name trap (bare name matches nothing; use module-qualified path e.g. tests::name)\n", fname, line_of(base + RSTART - 1)
         violations++
     }
