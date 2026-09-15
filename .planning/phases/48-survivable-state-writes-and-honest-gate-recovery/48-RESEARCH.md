@@ -860,17 +860,20 @@ Test names are proposals; the module path must be kept exact.
 | A6 | A killed foreground `start` is the only realistic #200 wedge shape | Pattern 7 | Other no-waiter gates are covered by the unit tests, not by the e2e |
 | A7 | Test locations marked "search hit" / "not located" in the Contract Inventory are accurate | Contract Inventory | Plan-checker verifies each |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Upgraded run with no recorded checkpoint set at a loop-back Code evaluation (Pattern 5).**
    - What we know: `None` must gate at the resume decision; D-07 says a later launch never widens the set silently.
    - What's unclear: whether a first-ever recording at a *loop-back* evaluation counts as a silent widening.
-   - Recommendation: gate it (fail closed), or record it as an accepted gap; the planner states which. **Decision needed.**
+   - Recommendation: gate it (fail closed), or record it as an accepted gap; the planner states which.
+   - **RESOLVED (48-07):** gated, fail closed. `Unrecorded` is the serde default for an older state file and is never recorded by a Code evaluation; only `Pending` (state created by this binary) is recorded, so an upgraded run parks at the re-scan gate until a human approves. Pinned by `preflight::tests::code_preflight_does_not_record_an_unrecorded_set`.
 2. **F-1 retry window after signalling.**
    - What we know: SIGTERM ends `advance` without unwinding; `acquire` reclaims dead-pid locks.
    - What's unclear: how long a SIGTERM'd devflow takes to disappear from `kill(pid, 0)` (zombie reaping by its parent shell counts; `agent_running` treats zombies as dead, agent.rs:36-46).
    - Recommendation: reuse `agent::TERMINATE_VERIFY_WAIT` (3 s, agent.rs:86) as the window; pin with a test.
+   - **RESOLVED (48-12):** the window is `agent::TERMINATE_VERIFY_WAIT` (3 s), applied only after a successful signal. Pinned by `stop_marks_stopped_after_the_signalled_lock_holder_exits` and `stop_writes_no_state_while_the_lock_holder_survives_the_signal`.
 3. **Ship finalization-retry gate recovery** remains unverified (CONTEXT Deferred); D-05 names `ship` and lets its ack guard refuse.
+   - **RESOLVED (out of scope, 48-CONTEXT.md Deferred Ideas):** not fixed in Phase 48. 48-13's `no_waiter_repair` names `devflow ship --phase N` at the Ship gate and relies on `ship_override`'s ack guard to refuse.
 
 ## Sources
 

@@ -180,7 +180,48 @@ before Phase 49's live unattended run measures the chain.
   7. **999.38:** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: TBD
+**Plans**: 14 plans in 9 waves
+
+**Wave 1**
+
+- [ ] 48-01-PLAN.md
+- [ ] 48-02-PLAN.md
+- [ ] 48-03-PLAN.md
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 48-04-PLAN.md
+- [ ] 48-05-PLAN.md
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 48-06-PLAN.md
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 48-07-PLAN.md
+- [ ] 48-08-PLAN.md
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 48-09-PLAN.md
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 48-10-PLAN.md
+- [ ] 48-11-PLAN.md
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 48-12-PLAN.md
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [ ] 48-13-PLAN.md
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [ ] 48-14-PLAN.md
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
@@ -423,7 +464,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
-| 48 | — | Not started | — |
+| 48 | 0/14 | Planned    |  |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
