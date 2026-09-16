@@ -1663,6 +1663,20 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
 
+    macro_rules! enter_agent_free_child {
+        ($name:expr, $program:literal) => {
+            if !devflow_core::test_support::in_child_test($name) {
+                let path_dir = agent_free_dir_with_agent_stub($program);
+                let output =
+                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, $name,
+                );
+                return;
+            }
+        };
+    }
+
     /// D-04/D-05/F-1: the chain flag is engaged for `Stage::Code` under
     /// `Mode::Auto` and for nothing else.
     ///
@@ -1811,6 +1825,13 @@ mod tests {
     /// `canary_gate_only_applies_to_the_stream_launch_path` does.
     #[test]
     fn launch_stage_persists_monitor_pid_for_reload() {
+        const NAME: &str = "pipeline_launch::tests::launch_stage_persists_monitor_pid_for_reload";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -1837,14 +1858,6 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = launch_stage(&mut state, None, None);
 
         // WR-03 / 999.46: this launch_stage call spawns a real detached
@@ -1859,13 +1872,6 @@ mod tests {
         // `Err` but the pid would nonetheless be live (G-25-2, 25-17).
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         result.unwrap();
 
         assert!(
@@ -1896,6 +1902,14 @@ mod tests {
     /// ORs the persisted value, so it survives the reload.
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_clears_stop_marker_and_advances_past_stop_point";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -1913,23 +1927,7 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = resume(root, phase, None, false);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         // `resume()` loads its own `State` from the state file and never writes the
         // spawned pid back into this test's local `state`, so binding the guard from
@@ -1988,6 +1986,13 @@ mod tests {
     /// sibling test above: `resume()` reloads its own `State`.
     #[test]
     fn resume_preserves_unfired_until_cap() {
+        const NAME: &str = "pipeline_launch::tests::resume_preserves_unfired_until_cap";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2017,23 +2022,7 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = resume(root, phase, None, false);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         // Same reap-before-unwrap ordering as the sibling test above: read
         // the pid back from disk, since `resume()` loads its own `State`
@@ -2074,6 +2063,13 @@ mod tests {
     /// takes. Persisted rather than set locally, as in the two siblings above.
     #[test]
     fn resume_without_a_cap_is_unchanged() {
+        const NAME: &str = "pipeline_launch::tests::resume_without_a_cap_is_unchanged";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2098,23 +2094,7 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = resume(root, phase, None, false);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
@@ -2138,6 +2118,13 @@ mod tests {
 
     #[test]
     fn resume_with_agent_hands_off_and_relaunches_under_the_new_driver() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_agent_hands_off_and_relaunches_under_the_new_driver";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2158,18 +2145,7 @@ mod tests {
         );
         devflow_core::ship::write_cron_instructions(root, &record).unwrap();
 
-        let stub_dir = stub_agent_binary("codex");
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
         let result = resume(root, phase, Some(AgentKind::Codex), false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -2194,6 +2170,14 @@ mod tests {
 
     #[test]
     fn resume_without_agent_leaves_the_saved_agent_untouched() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_without_agent_leaves_the_saved_agent_untouched";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2208,18 +2192,7 @@ mod tests {
         state.stage = Stage::Code;
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
         let result = resume(root, phase, None, false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -2295,6 +2268,14 @@ mod tests {
 
     #[test]
     fn resume_with_same_agent_is_an_ordinary_idempotent_resume() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_same_agent_is_an_ordinary_idempotent_resume";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2309,18 +2290,7 @@ mod tests {
         state.stage = Stage::Code;
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
         let result = resume(root, phase, Some(AgentKind::Claude), false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -2339,6 +2309,13 @@ mod tests {
     /// Pitfall 1: Plan is deliberately not gated by the Define-only artifact check.
     #[test]
     fn resume_with_agent_allows_plan_stage() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_agent_allows_plan_stage";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2347,18 +2324,7 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
-        let stub_dir = stub_agent_binary("codex");
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
         let result = resume(root, phase, Some(AgentKind::Codex), false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -2373,6 +2339,13 @@ mod tests {
     /// Whole-state comparison keeps this handoff check current when State gains fields.
     #[test]
     fn resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid() {
+        const NAME: &str = "pipeline_launch::tests::resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2389,18 +2362,7 @@ mod tests {
         state.infra_failures = 2;
         workflow::save_state(&state).unwrap();
         let mut before = serde_json::to_value(&state).unwrap();
-        let stub_dir = stub_agent_binary("codex");
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
         let result = resume(root, phase, Some(AgentKind::Codex), false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -2416,6 +2378,14 @@ mod tests {
 
     #[test]
     fn resume_with_agent_from_a_rate_limited_state_relaunches() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_agent_from_a_rate_limited_state_relaunches";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("codex");
+            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2437,18 +2407,7 @@ mod tests {
             "2026-06-18T15:45:30Z",
         );
         devflow_core::ship::write_cron_instructions(root, &record).unwrap();
-        let stub_dir = stub_agent_binary("codex");
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
         let result = resume(root, phase, Some(AgentKind::Codex), false);
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -2527,6 +2486,12 @@ mod tests {
     /// prove the dispatch never took the success/Advance arm.
     #[test]
     fn code_unknown_does_not_transition_to_validate() {
+        const NAME: &str = "pipeline_launch::tests::code_unknown_does_not_transition_to_validate";
+        enter_agent_free_child!(NAME, "claude");
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -2599,6 +2564,9 @@ mod tests {
     /// real agent CLI and without racing other PATH-mutating tests.
     #[test]
     fn launch_stage_inner_clears_monitor_pid_on_early_failure() {
+        const NAME: &str =
+            "pipeline_launch::tests::launch_stage_inner_clears_monitor_pid_on_early_failure";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2611,22 +2579,7 @@ mod tests {
         state.monitor_pid = Some(999_999);
         workflow::save_state(&state).unwrap();
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let result = launch_stage_inner(&mut state, None, None);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(
             result.is_err(),
@@ -2652,6 +2605,9 @@ mod tests {
     /// so this test is the negative control for the successful resume tests.
     #[test]
     fn failed_relaunch_preserves_the_phase_cron_instructions_record() {
+        const NAME: &str =
+            "pipeline_launch::tests::failed_relaunch_preserves_the_phase_cron_instructions_record";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2685,13 +2641,6 @@ mod tests {
             "the failure fixture must be absent"
         );
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", prepend_path(&stub_dir, &original_path));
-        }
-
         let result = spawn_agent_and_record(
             &mut state,
             "claude",
@@ -2700,14 +2649,6 @@ mod tests {
             None,
             monitor::MonitorLaunch::Legacy,
         );
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(
             result.is_err(),
@@ -2728,6 +2669,12 @@ mod tests {
     /// field.
     #[test]
     fn advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed() {
+        const NAME: &str = "pipeline_launch::tests::advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed";
+        enter_agent_free_child!(NAME, "claude");
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(78);
@@ -2779,6 +2726,9 @@ mod tests {
     /// checkpoint decision.
     #[test]
     fn relaunch_checkpoint_session_emits_exactly_one_audit_event() {
+        const NAME: &str =
+            "pipeline_launch::tests::relaunch_checkpoint_session_emits_exactly_one_audit_event";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2790,23 +2740,7 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = relaunch_checkpoint_session(&mut state, "sess-abc-123");
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         result.unwrap();
@@ -2828,6 +2762,9 @@ mod tests {
     /// invocations.
     #[test]
     fn relaunch_checkpoint_session_increments_and_persists_counter() {
+        const NAME: &str =
+            "pipeline_launch::tests::relaunch_checkpoint_session_increments_and_persists_counter";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2840,23 +2777,7 @@ mod tests {
         state.checkpoint_resumes = 1;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = relaunch_checkpoint_session(&mut state, "sess-xyz");
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         result.unwrap();
@@ -2874,6 +2795,9 @@ mod tests {
     /// the current stage's agent run, not a new stage entry.
     #[test]
     fn relaunch_checkpoint_session_does_not_change_stage() {
+        const NAME: &str =
+            "pipeline_launch::tests::relaunch_checkpoint_session_does_not_change_stage";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2885,23 +2809,7 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = relaunch_checkpoint_session(&mut state, "sess-stage");
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         result.unwrap();
@@ -2920,6 +2828,9 @@ mod tests {
     /// lifetime.
     #[test]
     fn launch_stage_inner_resets_checkpoint_resumes_counter() {
+        const NAME: &str =
+            "pipeline_launch::tests::launch_stage_inner_resets_checkpoint_resumes_counter";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2939,23 +2850,7 @@ mod tests {
         state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = launch_stage_inner(&mut state, None, None);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         result.unwrap();
@@ -3437,6 +3332,8 @@ mod tests {
     /// agent invocation, and no claim about the real CLI's behaviour.
     #[test]
     fn launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm() {
+        const NAME: &str = "pipeline_launch::tests::launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -3446,23 +3343,7 @@ mod tests {
         let phase = PhaseId::new(126);
         let mut state = canary_state(root, phase);
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = launch_stage_inner(&mut state, None, None);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         // The refusal is meant to spawn nothing, but bind the guard anyway —
         // this test is worthless if it silently starts leaking monitors.
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
@@ -3580,6 +3461,10 @@ mod tests {
     /// `advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed`'s
     /// fixture pattern.
     fn write_abort_gate_response(root: &Path, phase: PhaseId, stage: Stage) {
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "write_abort_gate_response must run inside a child test with an agent-free PATH (999.80)"
+        );
         let response_path = Gates::response_path(root, phase, stage);
         std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -3594,38 +3479,42 @@ mod tests {
     /// `gate_fired` for this stage.
     #[test]
     fn advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_launch::tests::advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_TEST_ROOT";
 
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+
+            let phase = PhaseId::new(88);
+            write_declared_checkpoint_plan(root, phase);
+            write_confirmed_checkpoint_capture(root, phase);
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Code;
+            state.session_id = Some("sess-checkpoint-1".to_string());
+            workflow::save_state(&state).unwrap();
+
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
 
         let phase = PhaseId::new(88);
-        write_declared_checkpoint_plan(root, phase);
-        write_confirmed_checkpoint_capture(root, phase);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        state.session_id = Some("sess-checkpoint-1".to_string());
-        workflow::save_state(&state).unwrap();
-
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
 
         let result = advance(root, Some(phase));
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -3680,6 +3569,8 @@ mod tests {
     /// execution root.
     #[test]
     fn advance_with_worktree_declared_checkpoint_reads_the_execution_root() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_worktree_declared_checkpoint_reads_the_execution_root";
+        enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -3729,23 +3620,7 @@ mod tests {
         state.worktree_path = Some(worktree.clone());
         workflow::save_state(&state).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let result = advance(root, Some(phase));
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -3777,6 +3652,8 @@ mod tests {
     /// least one gate_fired.
     #[test]
     fn advance_without_declared_checkpoint_falls_through_to_generic_gate() {
+        const NAME: &str = "pipeline_launch::tests::advance_without_declared_checkpoint_falls_through_to_generic_gate";
+        enter_agent_free_child!(NAME, "claude");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3808,6 +3685,8 @@ mod tests {
     /// in a phase that happens to declare a checkpoint elsewhere.
     #[test]
     fn advance_with_declared_checkpoint_but_unreported_gate_falls_through() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_declared_checkpoint_but_unreported_gate_falls_through";
+        enter_agent_free_child!(NAME, "claude");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3832,6 +3711,8 @@ mod tests {
     /// and the never-silent gate's context names the missing precondition.
     #[test]
     fn advance_with_confirmed_checkpoint_and_no_session_id_falls_through() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_confirmed_checkpoint_and_no_session_id_falls_through";
+        enter_agent_free_child!(NAME, "claude");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3865,6 +3746,8 @@ mod tests {
     /// exhaustion.
     #[test]
     fn advance_at_checkpoint_resume_ceiling_falls_through_to_generic_gate() {
+        const NAME: &str = "pipeline_launch::tests::advance_at_checkpoint_resume_ceiling_falls_through_to_generic_gate";
+        enter_agent_free_child!(NAME, "claude");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3899,6 +3782,8 @@ mod tests {
     /// preconditions.
     #[test]
     fn advance_with_non_claude_agent_never_resumes() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_non_claude_agent_never_resumes";
+        enter_agent_free_child!(NAME, "codex");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);

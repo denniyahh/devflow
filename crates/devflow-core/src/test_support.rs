@@ -196,9 +196,13 @@ pub fn assert_child_ran_exactly_one_passing_test(output: &std::process::Output, 
         stdout.contains("1 passed"),
         "child must report exactly `1 passed`{context}"
     );
+    let test_prefix = format!("test {test_name} ...");
+    let result_summary = "test result: ok. 1 passed;";
+    let test_completed = stdout.contains(&format!("{test_prefix} ok"))
+        || stdout.contains(&format!("\nok\n\n{result_summary}"));
     assert!(
-        stdout.contains(&format!("test {test_name} ... ok")),
-        "child stdout must carry `test {test_name} ... ok` — without it the child may have run some other test, or none{context}"
+        stdout.contains(&test_prefix) && test_completed && stdout.contains(result_summary),
+        "child stdout must show the requested test and its successful one-test result — test output may appear between `{test_prefix}` and libtest's `ok`, but the child may not run another test or none{context}"
     );
 
     let words: Vec<&str> = stdout.split_whitespace().collect();
@@ -286,6 +290,21 @@ mod tests {
             .arg("--version")
             .output()
             .expect("the parent PATH must resolve git for this control");
+        let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
+        let output = run_test_in_child(NAME, empty_dir.path(), &[]);
+        assert_child_ran_exactly_one_passing_test(&output, NAME);
+    }
+
+    #[test]
+    fn child_guard_accepts_output_emitted_by_the_passing_child() {
+        const NAME: &str =
+            "test_support::tests::child_guard_accepts_output_emitted_by_the_passing_child";
+
+        if in_child_test(NAME) {
+            println!("child emits output before libtest writes the final status");
+            return;
+        }
+
         let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
         let output = run_test_in_child(NAME, empty_dir.path(), &[]);
         assert_child_ran_exactly_one_passing_test(&output, NAME);
