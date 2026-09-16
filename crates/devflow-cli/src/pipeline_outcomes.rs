@@ -1429,6 +1429,17 @@ mod tests {
         consecutive_failures: u32,
         verdict_json: Option<&str>,
     ) -> String {
+        // 999.80 / T-48-08-01, FIRST statement: this helper writes an abort
+        // fixture, and a magic substring in a JSON note is the only thing
+        // keeping the gate it drives off `launch_stage`. Reword that note or
+        // change the response parser and the gate resolves as LoopBack
+        // instead, which spawns whatever `claude` the developer has on PATH.
+        // Refusing outside a child makes the protection structural rather
+        // than a property of the fixture's text.
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "drive_validate_advance_and_read_gate_context must run inside a child test with an agent-free PATH (999.80)"
+        );
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = consecutive_failures;
@@ -1488,6 +1499,17 @@ mod tests {
     /// `handle_validate_outcome`'s failure path (gate/loop), never Ship.
     #[test]
     fn validate_gaps_does_not_advance_to_ship() {
+        // Converted with the helper it calls:
+        // `drive_validate_advance_and_read_gate_context` now refuses to run
+        // outside a child (999.80).
+        const NAME: &str = "pipeline_outcomes::tests::validate_gaps_does_not_advance_to_ship";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
@@ -1508,6 +1530,17 @@ mod tests {
     /// closes the marker-less/verdict-less Validate → Ship false-advance.
     #[test]
     fn validate_missing_verdict_does_not_advance() {
+        // Converted with the helper it calls:
+        // `drive_validate_advance_and_read_gate_context` now refuses to run
+        // outside a child (999.80).
+        const NAME: &str = "pipeline_outcomes::tests::validate_missing_verdict_does_not_advance";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
@@ -1530,6 +1563,17 @@ mod tests {
     /// `transition`/`launch_stage` spawn.
     #[test]
     fn validate_pass_advances() {
+        // Converted with the helper it calls:
+        // `drive_validate_advance_and_read_gate_context` now refuses to run
+        // outside a child (999.80).
+        const NAME: &str = "pipeline_outcomes::tests::validate_pass_advances";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
@@ -1592,6 +1636,24 @@ mod tests {
         );
     }
 
+    /// The negative control for every `CHILD_TEST_ENV` assertion added by this
+    /// plan (D-10).
+    ///
+    /// Counting guarded functions proves only that the keyword is present; it
+    /// cannot show the guard FIRES. This calls a guarded helper directly in
+    /// the parent — where the developer's real `PATH` is live — and requires
+    /// the panic. `expected` is a substring of the helper's own assertion
+    /// message, so it cannot be satisfied by an unrelated panic on the way.
+    #[test]
+    #[should_panic(expected = "must run inside a child test")]
+    fn abort_fixture_helper_refuses_to_run_outside_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately called from the PARENT, with no child marker set. The
+        // arguments are irrelevant: the assertion is this helper's first
+        // statement, so it panics before touching any of them.
+        let _ = drive_validate_advance_and_read_gate_context(dir.path(), PhaseId::new(1), 0, None);
+    }
+
     /// D-18e's disagreement arm: the probe passes but the agent reports
     /// `verdict: gaps`. Must classify `Ambiguous` and gate IMMEDIATELY on
     /// the FIRST cycle — never touching `consecutive_failures` — which is
@@ -1601,6 +1663,15 @@ mod tests {
     /// ever launched.
     #[test]
     fn external_verify_disagreement_gates_immediately() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::external_verify_disagreement_gates_immediately";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(91);
@@ -1645,6 +1716,14 @@ mod tests {
     /// — `consecutive_failures` must stay 0.
     #[test]
     fn external_verify_no_verdict_gates_immediately() {
+        const NAME: &str = "pipeline_outcomes::tests::external_verify_no_verdict_gates_immediately";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(92);
@@ -1932,6 +2011,15 @@ mod tests {
     /// an otherwise pure test for no additional coverage.
     #[test]
     fn grafted_failure_shape_gates_instead_of_shipping() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::grafted_failure_shape_gates_instead_of_shipping";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         // The POST-graft-fix shape.
         let post_fix =
             classify_validate_outcome(&classifier_fixture(true, AgentStatus::Success, None));
@@ -2000,6 +2088,14 @@ mod tests {
     /// the never-silent gate resolves immediately without a spawn thread.
     #[test]
     fn resource_killed_on_code_bumps_infra_failures_not_consecutive_failures() {
+        const NAME: &str = "pipeline_outcomes::tests::resource_killed_on_code_bumps_infra_failures_not_consecutive_failures";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(73);
@@ -2039,6 +2135,14 @@ mod tests {
     /// on-disk state file and gate artifacts).
     #[test]
     fn resource_killed_on_validate_bumps_infra_not_consecutive_failures() {
+        const NAME: &str = "pipeline_outcomes::tests::resource_killed_on_validate_bumps_infra_not_consecutive_failures";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(74);
@@ -4545,6 +4649,13 @@ mod tests {
     /// future refactor from quietly routing ambiguity back through the
     /// counter-based auto-loop.
     fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: PhaseId) {
+        // 999.80 / T-48-08-01, FIRST statement — see
+        // `drive_validate_advance_and_read_gate_context` for why this is
+        // structural rather than a property of the fixture text.
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "arm_a_ambiguous_outcome_gates_on_cycle_one must run inside a child test with an agent-free PATH (999.80)"
+        );
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -4584,6 +4695,13 @@ mod tests {
     /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
     /// own `launch_stage` risk spawning a real agent CLI.
     fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: PhaseId) {
+        // 999.80 / T-48-08-01, FIRST statement — see
+        // `drive_validate_advance_and_read_gate_context` for why this is
+        // structural rather than a property of the fixture text.
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "arm_b_genuine_failures_reach_the_ceiling must run inside a child test with an agent-free PATH (999.80)"
+        );
         let _guard = env_lock();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -4623,6 +4741,14 @@ mod tests {
     /// `run_gate`'s poll doesn't wait out the timeout.
     #[test]
     fn consecutive_failures_increment_saturates() {
+        const NAME: &str = "pipeline_outcomes::tests::consecutive_failures_increment_saturates";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(82);
@@ -4732,6 +4858,14 @@ mod tests {
     /// (WR-11/D-15), and must never invent a schedule.
     #[test]
     fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
+        const NAME: &str = "pipeline_outcomes::tests::rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(81);
@@ -4859,6 +4993,14 @@ mod tests {
     /// (Abort resolves via `abort()`, which never calls `launch_stage`).
     #[test]
     fn ship_agent_failed_fires_gate() {
+        const NAME: &str = "pipeline_outcomes::tests::ship_agent_failed_fires_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -5073,6 +5215,14 @@ mod tests {
     /// human exactly as before this flag existed.
     #[test]
     fn handle_ship_outcome_without_yes_ship_writes_gate_but_no_response() {
+        const NAME: &str = "pipeline_outcomes::tests::handle_ship_outcome_without_yes_ship_writes_gate_but_no_response";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -5126,7 +5276,60 @@ mod tests {
     /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
     #[test]
     fn non_validate_failure_fires_gate_and_hook() {
+        const NAME: &str = "pipeline_outcomes::tests::non_validate_failure_fires_gate_and_hook";
+        // Read through a const, never as a literal inside the `var_os` call:
+        // `doc_check::source_read_env_vars` flags a `DEVFLOW_*` name only when
+        // it appears as a literal there, and would then demand this test
+        // fixture appear in the operator docs (see the 48-04 fix in c7d5971).
+        const TOUCH_ENV: &str = "DEVFLOW_TEST_TOUCH_BIN";
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            // This test needs TWO things the git-only PATH does not carry,
+            // and they are needed for different reasons.
+            //
+            // `sh`, on the child's PATH: `gates::run_notify_command` executes
+            // the operator's hook as `Command::new("sh").arg("-c")`, so with
+            // no resolvable `sh` the spawn fails fail-soft (a `warn!`) and the
+            // sentinel silently never appears — the hook would look "not
+            // fired" for a reason that has nothing to do with the behaviour
+            // under test.
+            //
+            // `touch`, as an ABSOLUTE path handed to the child: the hook's own
+            // command string is looked up against the child's PATH, so passing
+            // the resolved binary avoids widening that PATH a second time.
+            //
+            // Neither weakens the 999.80 guarantee. What must stay
+            // unreachable is `claude`/`codex`/`opencode`; a shell and
+            // coreutils cannot be mistaken for an agent by `launch_stage`.
+            let resolve = |program: &str| {
+                std::env::var_os("PATH")
+                    .and_then(|paths| {
+                        std::env::split_paths(&paths).find_map(|dir| {
+                            let candidate = dir.join(program);
+                            candidate.is_file().then_some(candidate)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{program} must be resolvable on PATH to run this test")
+                    })
+            };
+            std::os::unix::fs::symlink(resolve("sh"), path_dir.path().join("sh")).unwrap();
+            let touch = resolve("touch");
+            let out = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(TOUCH_ENV, touch.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let _guard = env_lock();
+
+        let touch = std::path::PathBuf::from(
+            std::env::var_os(TOUCH_ENV).expect("child test must receive an absolute touch path"),
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -5146,7 +5349,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "DEVFLOW_GATE_NOTIFY_CMD",
-                format!("touch {}", sentinel.display()),
+                format!("{} {}", touch.display(), sentinel.display()),
             );
         }
 
@@ -5197,6 +5400,14 @@ mod tests {
     /// those up before the retry launches.
     #[test]
     fn stage_failure_retry_cleans_stale_response() {
+        const NAME: &str = "pipeline_outcomes::tests::stage_failure_retry_cleans_stale_response";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
