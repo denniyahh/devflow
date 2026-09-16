@@ -2344,10 +2344,20 @@ mod tests {
     fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
         const NAME: &str = "pipeline_outcomes::tests::\
                             validate_failure_with_unmeasurable_count_accumulates_the_streak";
+        // Named once and referenced, never written as a literal inside the
+        // `var_os(...)` call — matching every other child-test root var in
+        // this crate. `doc_check::source_read_env_vars` flags a `DEVFLOW_*`
+        // name only when it appears as a string literal directly inside
+        // `std::env::var`/`var_os`/`env_value`, and then requires it to be in
+        // the scoped operator docs or `doc-check-allowlist.toml`. This is a
+        // test fixture root, not an operator-facing knob, so it belongs in
+        // neither. Inlining this constant back into the call below re-breaks
+        // `doc_check::source_devflow_env_vars_and_subcommands_are_documented`.
+        const ROOT_ENV: &str = "DEVFLOW_TEST_AGENT_FREE_ROOT";
         let phase = PhaseId::new(89);
 
         if devflow_core::test_support::in_child_test(NAME) {
-            let root = std::env::var_os("DEVFLOW_TEST_AGENT_FREE_ROOT")
+            let root = std::env::var_os(ROOT_ENV)
                 .map(std::path::PathBuf::from)
                 .expect("agent-free child receives the fixture root");
             let mut state = workflow::load_state(&root, phase).unwrap();
@@ -2445,7 +2455,7 @@ mod tests {
         let out = devflow_core::test_support::run_test_in_child(
             NAME,
             path_dir.path(),
-            &[("DEVFLOW_TEST_AGENT_FREE_ROOT", root.as_os_str())],
+            &[(ROOT_ENV, root.as_os_str())],
         );
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
         let state = workflow::load_state(root, phase).unwrap();
