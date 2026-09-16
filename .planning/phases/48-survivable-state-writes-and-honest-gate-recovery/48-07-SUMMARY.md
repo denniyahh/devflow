@@ -261,6 +261,20 @@ With this plan's work: `devflow-core` 791 passed / 1 failed (+2 tests),
 `devflow` 370 passed / 1 failed (+7 tests) — the same single pre-existing
 failure in each. `cargo clippy --workspace --all-targets -- -D warnings` exits 0.
 
+**Update (same session, after operator decision).** The `doc_check` failure was
+fixed on this branch — see the `fix(48-04)` commit; the env var is now read
+through a `const`, which is the convention every other child-test root var in
+that crate already follows. Both suites then go green: `devflow-core` 792/0
+(twice) and `devflow` 371/0, clippy 0.
+
+The stray-process failure was NOT fixed and is not claimed to be. It is flaky,
+not constant: it failed three consecutive full-suite runs and then passed one.
+A sibling in `devflow-core`,
+`agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape`,
+failed once the same way (`exec visibility timed out`) and passes 3/3 in
+isolation. Both are the known `/proc`-visibility and PATH races; a green suite
+run is not evidence either is resolved.
+
 ## Next Phase Readiness
 
 48-15 can proceed: it needs `CheckpointApproval`, the normalized element text,
