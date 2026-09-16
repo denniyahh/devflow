@@ -851,7 +851,10 @@ mod tests {
         );
         write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
 
-        assert!(phase_has_human_only_checkpoint(dir.path(), PhaseId::new(93)));
+        assert!(phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
         assert!(phase_has_blocking_human_checkpoint(
             dir.path(),
             PhaseId::new(93)
@@ -1001,30 +1004,22 @@ mod tests {
         // F-3 declarations: 19-05:83, 19-11:160, 44-04:168, and 15-05:73.
         let declarations = [
             (
-                format!(
-                    "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n"
-                ),
+                format!("<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n"),
                 true,
                 false,
             ),
             (
-                format!(
-                    "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n"
-                ),
+                format!("<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n"),
                 true,
                 false,
             ),
             (
-                format!(
-                    "<task type=\"checkpoint:decision\" gate=\"{HUMAN_GATE_VALUE}\">\n"
-                ),
+                format!("<task type=\"checkpoint:decision\" gate=\"{HUMAN_GATE_VALUE}\">\n"),
                 true,
                 false,
             ),
             (
-                format!(
-                    "<task type=\"{HUMAN_ACTION_TYPE_VALUE}\" gate=\"{PLAIN_GATE_VALUE}\">\n"
-                ),
+                format!("<task type=\"{HUMAN_ACTION_TYPE_VALUE}\" gate=\"{PLAIN_GATE_VALUE}\">\n"),
                 false,
                 true,
             ),
