@@ -17,8 +17,11 @@ use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The gate request DevFlow writes when it pauses for a human decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,7 +199,12 @@ impl Gates {
         if path.exists() {
             return Err(GateError::AlreadyResponded { phase, stage });
         }
-        write_atomic(&path, &serde_json::to_string_pretty(response)?)?;
+        publish_response_exclusive(
+            &path,
+            &serde_json::to_string_pretty(response)?,
+            phase,
+            stage,
+        )?;
         info!(
             "gate response written for phase {phase} {stage}: approved={}",
             response.approved
@@ -292,13 +300,35 @@ impl Gates {
 
     /// Remove the gate, response, and ack files for a stage. Idempotent.
     pub fn cleanup(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<(), GateError> {
-        for path in [
+        let paths = [
             Self::gate_path(project_root, phase, stage),
             Self::response_path(project_root, phase, stage),
             Self::ack_path(project_root, phase, stage),
-        ] {
+        ];
+        for path in &paths {
             if path.exists() {
                 std::fs::remove_file(path)?;
+            }
+        }
+        let dir = Self::dir(project_root);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(());
+        };
+        let prefixes = paths
+            .iter()
+            .map(|path| {
+                format!(
+                    ".{}.",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )
+            })
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") && prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                std::fs::remove_file(entry.path())?;
             }
         }
         Ok(())
@@ -351,15 +381,58 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
     }
 }
 
+/// Publish a fully-written response exactly once. Filesystems that cannot
+/// create hard links fail loudly through [`GateError::Io`] rather than falling
+/// back to a rename that could overwrite the first response.
+fn publish_response_exclusive(
+    path: &Path,
+    contents: &str,
+    phase: PhaseId,
+    stage: Stage,
+) -> Result<(), GateError> {
+    if let Some(parent) = path.parent() {
+        crate::workflow::ensure_devflow_dir(parent)?;
+    }
+    let (tmp, mut file) = crate::workflow::create_unique_temp(path, std::process::id(), &TEMP_SEQ)?;
+    if let Err(error) = std::io::Write::write_all(&mut file, contents.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    drop(file);
+
+    let publish = std::fs::hard_link(&tmp, path);
+    let cleanup = std::fs::remove_file(&tmp);
+    match publish {
+        Ok(()) => cleanup.map_err(GateError::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = cleanup;
+            Err(GateError::AlreadyResponded { phase, stage })
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error.into())
+        }
+    }
+}
+
 /// Write `contents` to `path` atomically: write a temp file in the same
 /// directory, then rename over the target so readers never see a partial write.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), GateError> {
     if let Some(parent) = path.parent() {
         crate::workflow::ensure_devflow_dir(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
+    let (tmp, mut file) = crate::workflow::create_unique_temp(path, std::process::id(), &TEMP_SEQ)?;
+    if let Err(error) = std::io::Write::write_all(&mut file, contents.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -477,6 +550,39 @@ mod tests {
         Gates::cleanup(dir.path(), PhaseId::new(11), Stage::Validate).unwrap();
     }
 
+    #[test]
+    fn cleanup_removes_orphan_temps_for_its_gate_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        let stage = Stage::Code;
+        let paths = [
+            Gates::gate_path(dir.path(), phase, stage),
+            Gates::response_path(dir.path(), phase, stage),
+            Gates::ack_path(dir.path(), phase, stage),
+        ];
+        std::fs::create_dir_all(paths[0].parent().unwrap()).unwrap();
+        let code_orphans = paths.map(|path| {
+            let orphan = path.with_file_name(format!(
+                ".{}.1.0.tmp",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&orphan, "orphan").unwrap();
+            orphan
+        });
+        let validate = Gates::gate_path(dir.path(), phase, Stage::Validate);
+        let validate_orphan = validate.with_file_name(format!(
+            ".{}.1.0.tmp",
+            validate.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&validate_orphan, "orphan").unwrap();
+
+        Gates::cleanup(dir.path(), phase, stage).unwrap();
+
+        assert!(code_orphans.iter().all(|path| !path.exists()));
+        assert!(validate_orphan.exists());
+        Gates::cleanup(dir.path(), phase, stage).unwrap();
+    }
+
     /// 15a: `devflow gate list` — a gate is open until its response lands;
     /// response/ack protocol files must never be mistaken for requests.
     #[test]
@@ -512,6 +618,101 @@ mod tests {
     fn list_open_is_empty_without_gates_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Gates::list_open(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn list_open_ignores_a_planted_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        Gates::write_gate(dir.path(), phase, Stage::Code, "real gate").unwrap();
+        let gate = Gates::gate_path(dir.path(), phase, Stage::Code);
+        let orphan = gate.with_file_name(format!(
+            ".{}.1.0.tmp",
+            gate.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&orphan, "orphan").unwrap();
+
+        let open = Gates::list_open(dir.path());
+
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].phase, phase);
+        assert_eq!(open[0].stage, Stage::Code);
+        assert!(orphan.exists());
+    }
+
+    #[test]
+    fn write_gate_still_overwrites_a_leftover_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        Gates::write_gate(dir.path(), phase, Stage::Code, "old request").unwrap();
+
+        Gates::write_gate(dir.path(), phase, Stage::Code, "replacement request").unwrap();
+
+        let gate: GateFile = serde_json::from_str(
+            &std::fs::read_to_string(Gates::gate_path(dir.path(), phase, Stage::Code)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate.context, "replacement request");
+    }
+
+    #[test]
+    fn second_publisher_past_the_existence_check_gets_already_responded() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        let stage = Stage::Code;
+        let path = Gates::response_path(dir.path(), phase, stage);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let rejected = serde_json::to_string(&GateResponse {
+            approved: false,
+            note: Some("first answer".into()),
+            responded_by: None,
+        })
+        .unwrap();
+        let approved = serde_json::to_string(&GateResponse {
+            approved: true,
+            note: Some("second answer".into()),
+            responded_by: None,
+        })
+        .unwrap();
+
+        publish_response_exclusive(&path, &rejected, phase, stage).unwrap();
+        let error = publish_response_exclusive(&path, &approved, phase, stage).unwrap_err();
+
+        assert!(
+            matches!(error, GateError::AlreadyResponded { phase: actual, stage: actual_stage } if actual == phase && actual_stage == stage)
+        );
+        let response: GateResponse =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!response.approved);
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|entry| !entry.starts_with(&format!(".{name}."))),
+            "exclusive publication cleans up its temp on both outcomes"
+        );
+    }
+
+    #[test]
+    fn single_responder_still_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: None,
+        };
+        Gates::write_gate(dir.path(), phase, Stage::Code, "ctx").unwrap();
+
+        Gates::respond(dir.path(), phase, Stage::Code, &response).unwrap();
+
+        let actual: GateResponse = serde_json::from_str(
+            &std::fs::read_to_string(Gates::response_path(dir.path(), phase, Stage::Code)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, response);
     }
 
     /// 15a: `respond` is the programmatic answer path — it must round-trip
