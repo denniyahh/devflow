@@ -1403,6 +1403,20 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
+    macro_rules! enter_path_isolated_child {
+        ($name:expr, $path_dir:expr) => {
+            if !devflow_core::test_support::in_child_test($name) {
+                let path_dir = $path_dir;
+                let output =
+                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, $name,
+                );
+                return;
+            }
+        };
+    }
+
     /// 14-CR-05: a missing agent binary must fail fast with the actionable
     /// "is it installed?" message, not a post-worktree exit-127 mystery.
     #[test]
@@ -1817,21 +1831,21 @@ mod tests {
     /// reaches_spawn_monitor`): a breaking-commit range at Stage::Ship drives
     /// `run_preflight` into the never-silent gate rather than continuing
     /// toward `hooks_after_ship`, and never reaches `monitor::spawn_monitor`.
-    /// PATH is replaced (never prepended) with a `git`-only directory so
-    /// `gh` never resolves — this test's outcome must not depend on whether
-    /// the host running the suite happens to have `gh` installed and
-    /// authenticated, which would otherwise make `preflight_gh_auth_check`
-    /// (composed earlier in the same chain) the check that actually fails
-    /// instead of this one.
+    /// The child runs with a `git`-only PATH so `gh` never resolves — this
+    /// test's outcome must not depend on whether the host running the suite
+    /// happens to have `gh` installed and authenticated, which would
+    /// otherwise make `preflight_gh_auth_check` (composed earlier in the same
+    /// chain) the check that actually fails instead of this one.
     #[test]
     fn run_preflight_major_bump_gates_and_never_ships_unattended() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_major_bump_gates_and_never_ships_unattended";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let _guard = env_lock();
-        let git_only_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", git_only_dir.path());
-        }
 
         let dir = major_bump_fixture();
         let root = dir.path();
@@ -1853,14 +1867,6 @@ mod tests {
 
         let adapter = agents::driver_for(AgentKind::Claude);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(
             !should_continue,
@@ -1889,14 +1895,14 @@ mod tests {
     /// `run_preflight_advance_skips_recheck_on_idempotently_failing_check`).
     #[test]
     fn run_preflight_major_bump_gate_not_auto_approved_by_yes_ship() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_major_bump_gate_not_auto_approved_by_yes_ship";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
         let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
-        let git_only_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
         // SAFETY: serialized under ENV_MUTEX.
         unsafe {
             std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "1");
-            std::env::set_var("PATH", git_only_dir.path());
         }
 
         let dir = major_bump_fixture();
@@ -1914,10 +1920,6 @@ mod tests {
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
             match &original_gate_timeout {
                 Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
                 None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
@@ -1957,13 +1959,9 @@ mod tests {
     /// compose in production.
     #[test]
     fn generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first() {
+        const NAME: &str = "preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first";
+        enter_path_isolated_child!(NAME, git_only_path_dir_with_failing_gh());
         let _guard = env_lock();
-        let git_only_dir = git_only_path_dir_with_failing_gh();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", git_only_dir.path());
-        }
 
         let (outer, worktree_path) = major_bump_worktree_fixture();
         let project_root = outer.path().join("project");
@@ -1977,14 +1975,6 @@ mod tests {
         state.worktree_path = Some(worktree_path);
 
         let err = generic_preflight_checks(&project_root, &state).unwrap_err();
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(err.contains("MAJOR"), "{err}");
         assert!(err.contains("drop legacy api"), "{err}");
@@ -2006,6 +1996,13 @@ mod tests {
     /// `run_gate`'s poll resolves immediately.
     #[test]
     fn run_preflight_failing_check_gates_and_never_reaches_spawn_monitor() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_failing_check_gates_and_never_reaches_spawn_monitor";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -2044,6 +2041,12 @@ mod tests {
     /// through the same gate+abort path as a generic-check failure.
     #[test]
     fn run_preflight_adapter_hook_override_fires() {
+        const NAME: &str = "preflight::tests::run_preflight_adapter_hook_override_fires";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -2088,6 +2091,9 @@ mod tests {
     /// `run_preflight` says to.
     #[test]
     fn run_preflight_advance_gate_launches_agent_exactly_once() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_advance_gate_launches_agent_exactly_once";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2116,14 +2122,6 @@ mod tests {
         std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let adapter = FailOnceAdapter::new();
         let preflight = run_preflight(root, &mut state, &adapter);
         let continuation = match &preflight {
@@ -2143,18 +2141,6 @@ mod tests {
         // unlinks the project root out from under it.
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        // Unwrapping moves below the PATH restore above — deliberate, not an
-        // accidental reorder: on the error path, PATH is now restored before
-        // the panic instead of after it, narrowing the window in which a
-        // failing test leaves a mutated PATH behind for whatever runs next.
         let should_continue = preflight.unwrap();
         continuation.unwrap();
 
@@ -2185,6 +2171,9 @@ mod tests {
     /// path as Advance.
     #[test]
     fn run_preflight_loopback_gate_launches_agent_exactly_once() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_loopback_gate_launches_agent_exactly_once";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2210,14 +2199,6 @@ mod tests {
         )
         .unwrap();
 
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
         let adapter = FailOnceAdapter::new();
         let preflight = run_preflight(root, &mut state, &adapter);
         let continuation = match &preflight {
@@ -2239,18 +2220,6 @@ mod tests {
         // before `dir` unlinks the project root out from under it.
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        // Unwrapping moves below the PATH restore above — deliberate, not an
-        // accidental reorder: on the error path, PATH is now restored before
-        // the panic instead of after it, narrowing the window in which a
-        // failing test leaves a mutated PATH behind for whatever runs next.
         let should_continue = preflight.unwrap();
         continuation.unwrap();
 
@@ -2308,6 +2277,9 @@ mod tests {
     /// of hanging the suite for 7 days.
     #[test]
     fn run_preflight_advance_skips_recheck_on_idempotently_failing_check() {
+        const NAME: &str =
+            "preflight::tests::run_preflight_advance_skips_recheck_on_idempotently_failing_check";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX.
@@ -2332,13 +2304,6 @@ mod tests {
         std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
 
-        let agent_dir = agent_free_dir_with_agent_stub("codex");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", agent_dir.path());
-        }
-
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
         // WR-05 / 999.44 (residual finding, 25-18 verification step 6): the
@@ -2357,10 +2322,6 @@ mod tests {
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
             match &original_gate_timeout {
                 Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
                 None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
@@ -2402,6 +2363,8 @@ mod tests {
     /// background writer.
     #[test]
     fn run_preflight_loopback_bounds_recursion() {
+        const NAME: &str = "preflight::tests::run_preflight_loopback_bounds_recursion";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
         let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX.
@@ -2427,21 +2390,10 @@ mod tests {
         )
         .unwrap();
 
-        let agent_dir = agent_free_dir_with_agent_stub("codex");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", agent_dir.path());
-        }
-
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
             match &original_gate_timeout {
                 Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
                 None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
