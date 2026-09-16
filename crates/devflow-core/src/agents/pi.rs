@@ -337,20 +337,31 @@ mod tests {
     /// from `settings.json` (`litellm`), not hardcoded.
     #[test]
     fn preflight_invokes_pi_auth_check_and_accepts_ready() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::pi::tests::preflight_invokes_pi_auth_check_and_accepts_ready";
+        if crate::test_support::in_child_test(NAME) {
+            let stub_dir = std::path::PathBuf::from(
+                std::env::var_os("PI_CODING_AGENT_DIR")
+                    .expect("child must receive PI_CODING_AGENT_DIR from its parent"),
+            );
+            PiDriver
+                .health(&test_state())
+                .expect("a `ready` stub should pass preflight");
+
+            let argv = std::fs::read_to_string(stub_dir.join("args.txt")).unwrap();
+            assert_eq!(
+                argv,
+                "auth\ncheck\n--json\n--provider\nlitellm\n--no-refresh\n"
+            );
+            return;
+        }
+
         let stub_dir = stub_pi_with_provider(r#"{"status":"ready"}"#, 0, "litellm");
-        let _path = PathGuard::set(stub_dir.path());
-        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
-
-        PiDriver
-            .health(&test_state())
-            .expect("a `ready` stub should pass preflight");
-
-        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(
-            argv,
-            "auth\ncheck\n--json\n--provider\nlitellm\n--no-refresh\n"
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
         );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// The negative control AC #1 requires: a `pi` binary that reports
