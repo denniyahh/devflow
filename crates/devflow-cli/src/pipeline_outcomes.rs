@@ -1131,6 +1131,11 @@ mod tests {
     /// affects a concurrent test if it is actually contended, which none are
     /// (no other test holds the project lock).
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -5275,6 +5280,11 @@ mod tests {
     /// response/ack once the gate resolves. This test sets
     /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_NOTIFY_CMD` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn non_validate_failure_fires_gate_and_hook() {
         const NAME: &str = "pipeline_outcomes::tests::non_validate_failure_fires_gate_and_hook";
         // Read through a const, never as a literal inside the `var_os` call:

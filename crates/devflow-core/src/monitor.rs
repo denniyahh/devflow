@@ -3397,6 +3397,11 @@ sleep 120
     }
 
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS`, `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn idle_timeout_setting_for_is_agent_specific() {
         use std::sync::Mutex;
         static ENV_MUTEX: Mutex<()> = Mutex::new(());

@@ -1143,6 +1143,11 @@ mod tests {
     /// disk awaiting a human. The common case (no collision) still asserts
     /// both phases finish independently, exactly as before.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn concurrent_ship_advances_finish_both_phases_independently() {
         let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
@@ -1480,6 +1485,11 @@ mod tests {
     /// which is left untouched, proving the two timeouts are genuinely
     /// independent knobs.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
         let _guard = env_lock();
         let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
