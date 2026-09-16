@@ -1,0 +1,9 @@
+{
+  "command": "cargo test -p devflow-core --lib state::tests::checkpoint_approval_defaults_to_unrecorded_for_old_state_files -- --exact",
+  "exitCode": 101,
+  "output": "test state::tests::checkpoint_approval_defaults_to_unrecorded_for_old_state_files ... FAILED\nthread 'state::tests::checkpoint_approval_defaults_to_unrecorded_for_old_state_files' panicked at crates/devflow-core/src/state.rs:581:9:\nnew state must persist its checkpoint-approval provenance\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 790 filtered out; finished in 0.00s",
+  "targetTest": "state::tests::checkpoint_approval_defaults_to_unrecorded_for_old_state_files",
+  "targetFile": "crates/devflow-core/src/state.rs",
+  "expected": "A new State persists checkpoint approval provenance while an older state file defaults conservatively.",
+  "actual": "The persisted JSON had no checkpoint_approval field."
+}

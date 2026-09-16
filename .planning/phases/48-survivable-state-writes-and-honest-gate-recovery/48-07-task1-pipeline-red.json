@@ -1,0 +1,9 @@
+{
+  "command": "cargo test -p devflow --bin devflow pipeline_launch::tests::checkpoint_added_after_code_preflight_parks_at_the_rescan_gate -- --exact",
+  "exitCode": 101,
+  "output": "test pipeline_launch::tests::checkpoint_added_after_code_preflight_parks_at_the_rescan_gate ... FAILED\nthread 'pipeline_launch::tests::checkpoint_added_after_code_preflight_parks_at_the_rescan_gate' panicked at crates/devflow-cli/src/pipeline_launch.rs:3588:9:\na checkpoint added after Code preflight must not auto-decide\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 364 filtered out; finished in 0.08s",
+  "targetTest": "pipeline_launch::tests::checkpoint_added_after_code_preflight_parks_at_the_rescan_gate",
+  "targetFile": "crates/devflow-cli/src/pipeline_launch.rs",
+  "expected": "A checkpoint added after Code preflight emits a Code gate and never emits checkpoint_auto_decided.",
+  "actual": "The existing route emitted checkpoint_auto_decided."
+}
