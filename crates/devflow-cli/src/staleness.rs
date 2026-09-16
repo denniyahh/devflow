@@ -1066,12 +1066,53 @@ mod tests {
     /// `reason` field stays a bare, path-free label even though the
     /// returned `CliError` (terminal-only) still names the worktree path.
     ///
-    /// Guarded under `ENV_MUTEX` (999.38-class flake): drives
-    /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses AND
-    /// mutates `PATH` for the stubbed `claude` binary.
+    /// The launch half runs in a child process with a directory-only PATH.
+    /// The parent builds and proves the staleness fixture first, then passes
+    /// its root to that child so no test mutates process-global PATH.
     #[test]
     fn mid_run_stage_transition_does_not_readjudicate_staleness() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "staleness::tests::mid_run_stage_transition_does_not_readjudicate_staleness";
+        const ROOT_ENV: &str = "DEVFLOW_STALENESS_TEST_ROOT";
+
+        if devflow_core::test_support::in_child_test(NAME) {
+            let project_root = PathBuf::from(
+                std::env::var_os(ROOT_ENV)
+                    .expect("child test must receive its parent-built fixture root"),
+            );
+            let project_root = project_root.as_path();
+            let phase = PhaseId::new(94);
+            let mut state = workflow::load_state(project_root, phase)
+                .expect("parent-built state must be available to the child");
+
+            let result = launch_stage_inner(&mut state, None, None);
+
+            // WR-03 / 999.46: the launch above spawned a detached monitor.
+            // Bind its reaper before assertions, while the child still owns
+            // the parent-built fixture root.
+            let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+            result.expect(
+                "a mid-run stage transition must not re-invoke the staleness adjudication — this \
+                 same fixture just refused via the direct start-shaped call above",
+            );
+
+            let all_events =
+                std::fs::read_to_string(devflow_core::events::events_path(project_root)).unwrap();
+            let blocked_count = all_events
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|e| {
+                    phase.matches_json(e.get("phase")) && e["event"] == "self_dogfood_stale_blocked"
+                })
+                .count();
+            assert_eq!(
+                blocked_count, 1,
+                "exactly one self_dogfood_stale_blocked event must exist — the direct \
+                 start-shaped call's, not a second one from the mid-run stage transition"
+            );
+            return;
+        }
 
         let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
@@ -1141,62 +1182,20 @@ mod tests {
             "persisted reason must never carry an absolute filesystem path (WR-02): {reason_str}"
         );
 
-        // 2. The SAME fixture, driven through a mid-run stage transition.
-        // `launch_stage_inner` is the exact function 25b's Task 1 deleted
-        // the `enforce_build_staleness` call from — if the check were
-        // re-invoked anywhere in this path, this call would fail with the
-        // identical "self-dogfood stale build blocked" error produced
-        // above; instead it must complete.
+        // 2. The SAME fixture, driven through a mid-run stage transition in
+        // a child whose PATH contains only the required `git`, `sh`, and a
+        // stubbed `claude`. `launch_stage_inner` is the exact function 25b's
+        // Task 1 deleted `enforce_build_staleness` from — if the check were
+        // re-invoked anywhere in this path, the child would fail with the
+        // identical "self-dogfood stale build blocked" error produced above.
         workflow::save_state(&state).unwrap();
-        let stub_dir = stub_agent_binary("claude");
-        let original_path = std::env::var_os("PATH");
-        let stubbed_path = prepend_path(&stub_dir, &original_path);
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", &stubbed_path);
-        }
-
-        let result = launch_stage_inner(&mut state, None, None);
-
-        // WR-03 / 999.46: the launch_stage_inner call above spawned a real
-        // detached monitor wrapper. Bound here — this test's LAST `&mut
-        // state` use — the guard reaps it, verified, before `outer` drops
-        // below and unlinks the project root out from under it (999.44's
-        // reproduction shape), and it outranks both panicking checkpoints
-        // that follow: `result.expect(...)` and the `assert_eq!` on
-        // `blocked_count` (G-25-2, 25-17).
-        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        result.expect(
-            "a mid-run stage transition must not re-invoke the staleness adjudication — this \
-             same fixture just refused via the direct start-shaped call above",
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        let output = devflow_core::test_support::run_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[(ROOT_ENV, project_root.as_os_str())],
         );
-
-        // Exactly one self_dogfood_stale_blocked event must exist for this
-        // phase — the direct start-shaped call's, not a second one fired by
-        // launch_stage_inner.
-        let all_events =
-            std::fs::read_to_string(devflow_core::events::events_path(&project_root)).unwrap();
-        let blocked_count = all_events
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|e| {
-                phase.matches_json(e.get("phase")) && e["event"] == "self_dogfood_stale_blocked"
-            })
-            .count();
-        assert_eq!(
-            blocked_count, 1,
-            "exactly one self_dogfood_stale_blocked event must exist — the direct \
-             start-shaped call's, not a second one from the mid-run stage transition"
-        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
