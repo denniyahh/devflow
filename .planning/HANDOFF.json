@@ -1,0 +1,46 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-16T20:31:57.619Z",
+  "phase": "48",
+  "phase_name": "survivable-state-writes-and-honest-gate-recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": "48-07",
+  "task": 1,
+  "total_tasks": 38,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "48-01 planning contract correction (2/2 tasks)", "status": "done", "commit": "7789c67"},
+    {"id": 2, "name": "48-02 shared fence-aware checkpoint parser (3/3 tasks)", "status": "done", "commit": "ca6792f"},
+    {"id": 3, "name": "48-03 core child-process helper and Pi/OpenCode fixtures (2/2 tasks)", "status": "done", "commit": "d24a34b"},
+    {"id": 4, "name": "48-04 pipeline-outcomes PATH isolation (2/2 tasks)", "status": "done", "commit": "47425fa"},
+    {"id": 5, "name": "48-05 pipeline-launch PATH isolation and child-output parser repair (2/2 tasks)", "status": "done", "commit": "246ed28"},
+    {"id": 6, "name": "48-06 remaining PATH fixture isolation (3/3 tasks)", "status": "done", "commit": "c1c4765"},
+    {"id": 15, "name": "48-07 Task 1 RED tests for checkpoint persistence and post-preflight re-scan", "status": "in_progress", "progress": "User accepted the reproduced Cargo RED evidence; no implementation has started."}
+  ],
+  "remaining_tasks": [
+    {"id": 16, "name": "48-07 Task 1 implementation: checkpoint approval persistence and re-scan gate", "status": "not_started"},
+    {"id": 17, "name": "48-07 Task 2 complete checkpoint comparison and verification", "status": "not_started"},
+    {"id": 18, "name": "Execute plans 48-08 through 48-17 in dependency order", "status": "not_started"}
+  ],
+  "blockers": [
+    {"description": "GSD tdd-red-evidence parses Node TAP only and rejects truthful Cargo red output as INVALID_RED/zero_tests_discovered.", "type": "technical", "workaround": "User explicitly accepted the manually reproduced Cargo RED evidence for 48-07; do not fabricate TAP output and do not block implementation on this checker."}
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {"decision": "Accept the 48-07 Cargo RED evidence manually", "rationale": "The state exact test exited 101 with one intended assertion failure and 790 filtered; the child-wrapped pipeline exact test exited 101 on the intended no-auto-decide assertion, with the wrapper producing two failure summaries rather than zero tests.", "phase": "48"},
+    {"decision": "Use orchestrator-managed normal-hook commits for remaining sequential Phase 48 scopes", "rationale": "Upstream GSD #4799 incorrectly applies an agent-worktree branch guard to this deliberate sequential feature worktree.", "phase": "48"},
+    {"decision": "Keep TEST-01 Pending", "rationale": "Plans 48-08 and 48-09 still own remaining PATH-isolation and lint obligations.", "phase": "48"}
+  ],
+  "uncommitted_files": [
+    " M .planning/STATE.md",
+    " M crates/devflow-cli/src/pipeline_launch.rs",
+    " M crates/devflow-core/src/state.rs",
+    "?? .planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-07-task1-pipeline-red.json",
+    "?? .planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-07-task1-state-red.json",
+    "?? .planning/research/.cache/",
+    "?? .planning/user/errors/"
+  ],
+  "next_action": "Claude should read the Plan 48-07 RED tests, their two JSON evidence files, and the user-accepted override in this handoff; then implement Task 1 without rerunning or fabricating the incompatible TAP-only TDD checker.",
+  "context_notes": "Phase 48 executes sequentially because workflow.use_worktrees=false. GSD upstream bug #4799 makes executor commits reject feature/phase-48 despite that mode; the user approved orchestrator-managed normal-hook commits after independent verification. GSD tracking writers repeatedly drift current-plan/status/requirements fields; inspect and incident-log each repair."
+}
