@@ -347,12 +347,8 @@ mod tests {
     use crate::mode::Mode;
     use crate::state::{AgentKind, State};
     use std::os::unix::process::ExitStatusExt;
-    use std::sync::Mutex;
 
-    /// Serializes tests that mutate the process-global `PATH` (`set_var` is
-    /// process-wide; `cargo test` runs tests in parallel). Copied verbatim
-    /// from `pi.rs`'s test harness.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    const OPENCODE_STUB_DIR_ENV: &str = "DEVFLOW_TEST_OPENCODE_STUB_DIR";
 
     /// A `State` value for `health`, which ignores it (`_state`) —
     /// constructed only to satisfy the trait signature.
@@ -414,32 +410,17 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
         }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
+            .expect("link the required sleep utility into the isolated PATH");
         dir
     }
 
-    /// RAII guard that replaces `PATH` with `path` and restores the previous
-    /// value on `Drop` — including the panic path, so a failing test never
-    /// hands the next test a mutated `PATH`. Copied verbatim from `pi.rs`.
-    struct PathGuard {
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl PathGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let original = std::env::var_os("PATH");
-            // SAFETY: held under ENV_MUTEX; no other thread reads/writes PATH.
-            unsafe { std::env::set_var("PATH", path) };
-            Self { original }
-        }
-    }
-
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(prev) => unsafe { std::env::set_var("PATH", prev) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-        }
+    fn child_opencode_stub_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var_os(OPENCODE_STUB_DIR_ENV)
+                .expect("child must receive the OpenCode stub directory from its parent"),
+        )
     }
 
     /// The real, live-verified `opencode providers list` output captured
@@ -537,13 +518,20 @@ mod tests {
 
     #[test]
     fn preflight_accepts_configured_credentials() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::opencode::tests::preflight_accepts_configured_credentials";
+        if crate::test_support::in_child_test(NAME) {
+            OpenCodeDriver
+                .health(&test_state())
+                .expect("configured credentials must pass preflight");
+            return;
+        }
         let stub_dir = stub_opencode_on_path(LIVE_PROVIDER_LIST_OUTPUT, 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        OpenCodeDriver
-            .health(&test_state())
-            .expect("configured credentials must pass preflight");
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// SYNTHETIC (A1, P-05) — negative control proving exit code 0 alone
@@ -552,16 +540,24 @@ mod tests {
     /// credentials, so `health` must still refuse.
     #[test]
     fn preflight_rejects_constructed_zero_credential_output() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str =
+            "agents::opencode::tests::preflight_rejects_constructed_zero_credential_output";
+        if crate::test_support::in_child_test(NAME) {
+            let err = OpenCodeDriver
+                .health(&test_state())
+                .expect_err("zero configured credentials must refuse preflight even with exit 0");
+            assert!(err.contains("no OpenCode provider credential configured"));
+            return;
+        }
         let zero_body =
             "┌  Credentials\n└  0 credentials\n\n┌  Environment\n└  0 environment variables\n";
         let stub_dir = stub_opencode_on_path(zero_body, 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        let err = OpenCodeDriver
-            .health(&test_state())
-            .expect_err("zero configured credentials must refuse preflight even with exit 0");
-        assert!(err.contains("no OpenCode provider credential configured"));
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// WR-01 regression: a non-zero exit must refuse preflight even when the
@@ -570,26 +566,40 @@ mod tests {
     /// addition to the parsed count, not ignored entirely.
     #[test]
     fn preflight_rejects_nonzero_exit_with_credential_bearing_stdout() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::opencode::tests::preflight_rejects_nonzero_exit_with_credential_bearing_stdout";
+        if crate::test_support::in_child_test(NAME) {
+            let err = OpenCodeDriver.health(&test_state()).expect_err(
+                "a non-zero exit must fail closed even when stdout would otherwise report credentials",
+            );
+            assert!(err.contains("no OpenCode provider credential configured"));
+            return;
+        }
         let stub_dir = stub_opencode_on_path(LIVE_PROVIDER_LIST_OUTPUT, 1);
-        let _path = PathGuard::set(stub_dir.path());
-
-        let err = OpenCodeDriver.health(&test_state()).expect_err(
-            "a non-zero exit must fail closed even when stdout would otherwise report credentials",
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
         );
-        assert!(err.contains("no OpenCode provider credential configured"));
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     #[test]
     fn preflight_rejects_when_probe_cannot_run() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::opencode::tests::preflight_rejects_when_probe_cannot_run";
+        if crate::test_support::in_child_test(NAME) {
+            let err = OpenCodeDriver
+                .health(&test_state())
+                .expect_err("missing opencode binary must fail closed, not panic");
+            assert!(!err.is_empty());
+            return;
+        }
         let empty_dir = tempfile::tempdir().expect("create empty dir");
-        let _path = PathGuard::set(empty_dir.path());
-
-        let err = OpenCodeDriver
-            .health(&test_state())
-            .expect_err("missing opencode binary must fail closed, not panic");
-        assert!(!err.is_empty());
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            empty_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, empty_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// 43-REVIEW.md WR-02: a hung probe subprocess must be killed within its
@@ -600,11 +610,6 @@ mod tests {
     /// duration here.
     #[test]
     fn spawn_with_timeout_kills_a_hung_child() {
-        // The stub script's own `sleep` invocation is PATH-resolved even
-        // though this test spawns the stub itself by absolute path — a
-        // concurrent test's PathGuard nulling PATH races with it otherwise
-        // (found by running this test: `sleep: command not found`).
-        let _guard = ENV_MUTEX.lock().unwrap();
         let stub_dir = stub_hanging_opencode_on_path(10);
         let mut cmd = std::process::Command::new(stub_dir.path().join("opencode"));
         let start = std::time::Instant::now();
@@ -625,47 +630,68 @@ mod tests {
     /// runtime is bounded by `PROBE_TIMEOUT`, not instantaneous.
     #[test]
     fn health_fails_closed_on_a_hung_probe() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::opencode::tests::health_fails_closed_on_a_hung_probe";
+        if crate::test_support::in_child_test(NAME) {
+            let err = OpenCodeDriver
+                .health(&test_state())
+                .expect_err("a hung `opencode providers list` must fail closed, not hang forever");
+            assert!(!err.is_empty());
+            return;
+        }
         let stub_dir = stub_hanging_opencode_on_path(60);
-        let _path = PathGuard::set(stub_dir.path());
-
-        let err = OpenCodeDriver
-            .health(&test_state())
-            .expect_err("a hung `opencode providers list` must fail closed, not hang forever");
-        assert!(!err.is_empty());
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     #[test]
     fn health_error_leaks_no_provider_detail() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::opencode::tests::health_error_leaks_no_provider_detail";
+        if crate::test_support::in_child_test(NAME) {
+            let err = OpenCodeDriver
+                .health(&test_state())
+                .expect_err("zero total credentials must refuse preflight");
+
+            for leaked in ["auth.json", "GOOGLE_API_KEY", "Google", "expired"] {
+                assert!(
+                    !err.contains(leaked),
+                    "health error must not leak `{leaked}`, got: {err}"
+                );
+            }
+            return;
+        }
         let body = "┌  Credentials ~/.local/share/opencode/auth.json\n└  0 credentials\n\n┌  Environment\n│\n●  Google GOOGLE_API_KEY (expired)\n│\n└  0 environment variables\n";
         let stub_dir = stub_opencode_on_path(body, 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        let err = OpenCodeDriver
-            .health(&test_state())
-            .expect_err("zero total credentials must refuse preflight");
-
-        for leaked in ["auth.json", "GOOGLE_API_KEY", "Google", "expired"] {
-            assert!(
-                !err.contains(leaked),
-                "health error must not leak `{leaked}`, got: {err}"
-            );
-        }
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     #[test]
     fn health_probe_argv_is_providers_list() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::opencode::tests::health_probe_argv_is_providers_list";
+        if crate::test_support::in_child_test(NAME) {
+            OpenCodeDriver
+                .health(&test_state())
+                .expect("configured credentials must pass health");
+
+            let argv = std::fs::read_to_string(child_opencode_stub_dir().join("args.txt")).unwrap();
+            assert_eq!(argv, "providers\nlist\n");
+            return;
+        }
         let stub_dir = stub_opencode_on_path(LIVE_PROVIDER_LIST_OUTPUT, 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        OpenCodeDriver
-            .health(&test_state())
-            .expect("configured credentials must pass health");
-
-        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(argv, "providers\nlist\n");
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     // --- Task 2: subagent-dispatch capability probe (spawn-free, mockable
