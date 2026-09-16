@@ -30,7 +30,7 @@ use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
 use devflow_core::{agents, events, verify, version, workflow};
 use std::path::{Path, PathBuf};
 
@@ -1386,6 +1386,40 @@ pub(crate) fn run_preflight(
         return Ok(false);
     }
 
+    // D-07 (CHKPT-02): a Code evaluation that PASSED is the moment DevFlow
+    // last looked at this phase's plan files before handing them to an agent
+    // that may rewrite them. Record what it saw, so the resume decision can
+    // tell an addition from what was always there.
+    //
+    // Recorded only from `Pending` — state this binary created. An
+    // `Unrecorded` approval (a state file from a binary predating the field)
+    // is deliberately never upgraded here: a run whose FIRST Code evaluation
+    // happened under the old binary has an unobserved set, and letting a
+    // later loop-back or relaunched evaluation record it would bless
+    // whatever the agent had already written by then.
+    if stage == Stage::Code && state.checkpoint_approval == CheckpointApproval::Pending {
+        // The EXECUTION root, not `project_root` — `.planning/` is tracked
+        // content, so an in-flight phase's plans live on the feature branch
+        // inside the worktree and are absent from the main checkout (999.76).
+        // This must be the same root the resume decision re-scans, or every
+        // worktree run would compare a recorded empty set against a populated
+        // one and gate on every resume.
+        let execution_root = state
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| state.project_root.clone());
+        let recorded = verify::phase_checkpoint_declarations(&execution_root, state.phase)
+            .into_iter()
+            .filter(|declaration| declaration.blocking_human || declaration.human_action)
+            .map(|declaration| ApprovedCheckpoint {
+                plan_file: declaration.plan_file,
+                element: declaration.element,
+            })
+            .collect();
+        state.checkpoint_approval = CheckpointApproval::Recorded(recorded);
+        workflow::save_state(state)?;
+    }
+
     // Preflight passed: reset the retry counter, persisted (the wedge this
     // counter bounds spans separate `devflow` invocations, so an in-memory
     // reset alone would not survive a monitor restart). Guarded so a
@@ -2414,6 +2448,204 @@ mod tests {
             last["event"] == "preflight_retry_ceiling_reached"
                 || last["event"] == "workflow_aborted",
             "expected a ceiling or abort event, got {last:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 48-07 / CHKPT-02 (D-07): a passing Code evaluation records the
+    // human-only checkpoint set it saw, from the EXECUTION root.
+    // -----------------------------------------------------------------
+
+    /// 28-01's precedent: assembled from a const so this file never contains
+    /// the bare literal the checkpoint scanner matches.
+    const HUMAN_GATE_VALUE_FOR_RECORDING_TEST: &str = "blocking-human";
+    const PLAIN_GATE_VALUE_FOR_RECORDING_TEST: &str = "blocking";
+
+    /// Write a plan declaring a human-only checkpoint under `root`, matching
+    /// `verify::phase_plan_files`'s discovery pattern.
+    fn write_human_only_plan(root: &Path, phase: PhaseId) {
+        let dir = root.join(".planning/phases").join(format!(
+            "{padded}-recording-fixture",
+            padded = phase.padded()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{padded}-01-PLAN.md", padded = phase.padded())),
+            format!(
+                "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:human-verify\" \
+                 gate=\"{HUMAN_GATE_VALUE_FOR_RECORDING_TEST}\">\n</task>\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The decoy: same discovery shape, plain `blocking` gate, so it declares
+    /// nothing human-only. Written under the PROJECT root so that recording
+    /// from the wrong root produces an empty set rather than merely missing a
+    /// directory.
+    fn write_decoy_plan(root: &Path, phase: PhaseId) {
+        let dir = root.join(".planning/phases").join(format!(
+            "{padded}-recording-fixture",
+            padded = phase.padded()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{padded}-01-PLAN.md", padded = phase.padded())),
+            format!(
+                "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:decision\" \
+                 gate=\"{PLAIN_GATE_VALUE_FOR_RECORDING_TEST}\">\n</task>\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// D-07: a Code evaluation that passes must turn `Pending` into
+    /// `Recorded` of what it actually saw, read from the EXECUTION root.
+    ///
+    /// This test fails in BOTH wrong directions, which is the point:
+    ///
+    /// - recording absent -> approval is still `Pending`;
+    /// - recording scans `project_root` -> approval is `Recorded(vec![])`,
+    ///   because the project root holds only the decoy.
+    ///
+    /// A `Recorded(vec![])` is not a harmless near-miss. It is the value that
+    /// would silently approve nothing while LOOKING recorded, so every
+    /// worktree run would then gate on its first resume — and the obvious
+    /// "fix" for that noise is to loosen the compare, which is the hole
+    /// CHKPT-02 exists to close.
+    ///
+    /// SUPERVISE mode, deliberately. In Auto, `preflight_unattended_launch_check`
+    /// refuses a Code launch that declares a human-only checkpoint, so the
+    /// pass path could only ever record an EMPTY set and this test could not
+    /// tell a correct root from a wrong one. Supervise evaluates the same
+    /// conditions, reports them, and proceeds (D-08) — which is what makes a
+    /// non-empty recorded set reachable on the pass path at all. The
+    /// non-empty case a refusal DOES produce is recorded by the refusal-gate
+    /// approval that plan 48-15 owns.
+    #[test]
+    fn code_preflight_records_a_pending_set_from_the_execution_root() {
+        const NAME: &str =
+            "preflight::tests::code_preflight_records_a_pending_set_from_the_execution_root";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(624);
+        let worktree = root.join("phase-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        write_human_only_plan(&worktree, phase);
+        write_decoy_plan(root, phase);
+
+        // Mechanical control, asserted BEFORE the call: the two roots must
+        // DISAGREE, or this test measures "a plan exists somewhere" rather
+        // than which root was read.
+        assert_eq!(
+            verify::phase_checkpoint_declarations(&worktree, phase)
+                .iter()
+                .filter(|declaration| declaration.blocking_human || declaration.human_action)
+                .count(),
+            1,
+            "the execution root must hold exactly one human-only declaration"
+        );
+        assert_eq!(
+            verify::phase_checkpoint_declarations(root, phase)
+                .iter()
+                .filter(|declaration| declaration.blocking_human || declaration.human_action)
+                .count(),
+            0,
+            "opposite-result case: the project root holds only the decoy"
+        );
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.worktree_path = Some(worktree.clone());
+        assert_eq!(
+            state.checkpoint_approval,
+            CheckpointApproval::Pending,
+            "the fixture must start from Pending or this test proves nothing"
+        );
+        workflow::save_state(&state).unwrap();
+
+        let adapter = agents::driver_for(AgentKind::Claude);
+        let result = run_preflight(root, &mut state, adapter.as_ref());
+        assert!(
+            matches!(result, Ok(true)),
+            "this fixture must PASS preflight to reach the recording path, got {result:?}"
+        );
+
+        let expected = CheckpointApproval::Recorded(vec![ApprovedCheckpoint {
+            plan_file: format!("{padded}-01-PLAN.md", padded = phase.padded()),
+            element: verify::phase_checkpoint_declarations(&worktree, phase)
+                .into_iter()
+                .find(|declaration| declaration.blocking_human || declaration.human_action)
+                .expect("the control above proved this declaration exists")
+                .element,
+        }]);
+        assert_eq!(
+            state.checkpoint_approval, expected,
+            "a passing Code evaluation must record the execution root's human-only set"
+        );
+
+        // Across the process boundary: the resume decision that reads this
+        // runs in a separate `devflow advance`, so an in-memory-only record
+        // would protect nothing.
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.checkpoint_approval, expected,
+            "the recorded set must be persisted, not just held in memory"
+        );
+    }
+
+    /// D-07's other half: an `Unrecorded` approval is NEVER upgraded by a
+    /// Code evaluation. A run whose first Code evaluation predates this
+    /// binary has an unobserved set, and recording it at a later loop-back
+    /// would bless whatever the agent had already written by then.
+    #[test]
+    fn code_preflight_never_records_from_an_unrecorded_approval() {
+        const NAME: &str =
+            "preflight::tests::code_preflight_never_records_from_an_unrecorded_approval";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(625);
+        let worktree = root.join("phase-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        write_human_only_plan(&worktree, phase);
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.worktree_path = Some(worktree.clone());
+        // The state an older binary leaves behind.
+        state.checkpoint_approval = CheckpointApproval::Unrecorded;
+        workflow::save_state(&state).unwrap();
+
+        let adapter = agents::driver_for(AgentKind::Claude);
+        let result = run_preflight(root, &mut state, adapter.as_ref());
+        assert!(
+            matches!(result, Ok(true)),
+            "this fixture must PASS preflight, got {result:?}"
+        );
+        assert_eq!(
+            state.checkpoint_approval,
+            CheckpointApproval::Unrecorded,
+            "an Unrecorded approval must survive a Code evaluation untouched"
         );
     }
 
