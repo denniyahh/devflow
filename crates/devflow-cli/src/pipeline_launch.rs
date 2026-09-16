@@ -22,8 +22,8 @@
 
 use crate::CliError;
 use crate::config_parse::gate_timeout_secs;
-use crate::pipeline_gate::run_gate_with_timeout;
 use crate::pipeline_gate::transition;
+use crate::pipeline_gate::{abort, run_gate_with_timeout};
 use crate::pipeline_outcomes::{
     ValidateOutcome, classify_validate_outcome, handle_infra_outcome, handle_rate_limited_outcome,
     handle_ship_failure, handle_ship_outcome, handle_stage_failure, handle_validate_outcome,
@@ -34,12 +34,13 @@ use crate::preflight::{
     worktree_writable_roots,
 };
 use devflow_core::config::capture_retention;
+use devflow_core::gates::{GateAction, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
     agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
@@ -1120,6 +1121,37 @@ fn rescan_gate_context(unapproved: &[&CheckpointDeclaration]) -> String {
     )
 }
 
+/// The distinct plan files among `unapproved`, sorted — the actionable part of
+/// both the gate context and the fall-through reason.
+fn unapproved_plan_files(unapproved: &[&CheckpointDeclaration]) -> Vec<String> {
+    let mut files: Vec<String> = unapproved
+        .iter()
+        .map(|declaration| declaration.plan_file.clone())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+/// The `CheckpointApproval` that records `current`'s human-only declarations.
+///
+/// Shared by the re-scan gate's approval arm and `preflight`'s recording sites
+/// so an approval and a preflight can never disagree about what "the set"
+/// means — a divergence there would gate forever or approve too much, and
+/// neither is visible from a passing test of either site alone.
+pub(crate) fn recorded_approval(current: &[CheckpointDeclaration]) -> CheckpointApproval {
+    CheckpointApproval::Recorded(
+        current
+            .iter()
+            .filter(|declaration| declaration.blocking_human || declaration.human_action)
+            .map(|declaration| ApprovedCheckpoint {
+                plan_file: declaration.plan_file.clone(),
+                element: declaration.element.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// Resume the exited Claude session that raised a confirmed human-blocking
 /// checkpoint (D-03/D-04), continuing the SAME stage rather than launching a
 /// fresh one.
@@ -1644,17 +1676,17 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
                         let unapproved = state.checkpoint_approval.unapproved(&current);
                         if !unapproved.is_empty() {
                             let context = rescan_gate_context(&unapproved);
-                            // Plan 48-07 parks only. Plan 48-15 owns what an
-                            // answer MEANS (approve records the fresh set and
-                            // relaunches; reject records nothing). Until then
-                            // the gate is the protection: no relaunch, no
-                            // auto-decide, no stage transition.
-                            //
+                            // The unapproved plan files, captured BEFORE the
+                            // gate: `unapproved` borrows `current`, and the
+                            // LoopBack arm needs these names after `&mut state`
+                            // has been handed to the gate.
+                            let unapproved_files = unapproved_plan_files(&unapproved);
+
                             // `None` for the auto-response is load-bearing and
                             // not a placeholder: this gate exists precisely
                             // because a human has not seen these declarations,
                             // so nothing may pre-authorize it.
-                            run_gate_with_timeout(
+                            let action = run_gate_with_timeout(
                                 project_root,
                                 &mut state,
                                 stage,
@@ -1662,9 +1694,57 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
                                 gate_timeout_secs(),
                                 None,
                             )?;
-                            return Ok(());
+                            match action {
+                                // R-8 / T-48-15-01: approval must become
+                                // DURABLE, or the gate reopens on every resume
+                                // and an operator learns to answer it without
+                                // reading. Record the set that was just SCANNED
+                                // — not the stale one the gate was opened about
+                                // — and persist it before relaunching, because
+                                // the next resume runs in a separate process.
+                                GateAction::Advance => {
+                                    // CR-01: drop the gate/response/ack now, so
+                                    // a later Code gate in this run cannot
+                                    // silently consume this approval as its own
+                                    // answer.
+                                    let _ = Gates::cleanup(project_root, phase, stage);
+                                    state.gate_pending = false;
+                                    state.checkpoint_approval = recorded_approval(&current);
+                                    workflow::save_state(&state)?;
+                                    return relaunch_checkpoint_session(&mut state, &session_id);
+                                }
+                                // T-48-15-03: a rejection records NOTHING.
+                                // Widening the set here would mean the next
+                                // resume proceeded as though the human had said
+                                // yes. Fall through to the unchanged
+                                // non-auto-decide dispatch below, naming the
+                                // files they objected to in the reason it
+                                // renders.
+                                //
+                                // The response is deliberately NOT cleaned up:
+                                // the fall-through gate asks the same question
+                                // about the same stage, so it consumes the same
+                                // answer rather than re-asking a human who has
+                                // already replied.
+                                GateAction::LoopBack(_) => {
+                                    reason = Some(augment_unresolved_checkpoint_reason(
+                                        reason,
+                                        &format!(
+                                            "checkpoint added or changed after Code preflight in {}",
+                                            unapproved_files.join(", ")
+                                        ),
+                                    ));
+                                }
+                                // The same abort every other gate uses, so
+                                // cleanup, state clearing and deregistration
+                                // all happen exactly once and identically.
+                                GateAction::Abort(note) => {
+                                    return abort(project_root, &state, &note);
+                                }
+                            }
+                        } else {
+                            return relaunch_checkpoint_session(&mut state, &session_id);
                         }
-                        return relaunch_checkpoint_session(&mut state, &session_id);
                     }
                     (Some(_), false) => {
                         // T-28-16: a confirmed checkpoint that could not be
@@ -3814,12 +3894,13 @@ mod tests {
         phase: PhaseId,
         plan_body: &str,
         approval: devflow_core::state::CheckpointApproval,
+        mode: Mode,
     ) {
         init_repo(root);
         write_rescan_plan(root, phase, plan_body);
         write_confirmed_checkpoint_capture(root, phase);
 
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
         state.stage = Stage::Code;
         // A session id AND an unexhausted ceiling, so every one of these
         // tests lands in the `(Some(session_id), true)` arm where the
@@ -3827,6 +3908,13 @@ mod tests {
         // that gates for an entirely different reason.
         state.session_id = Some(RESCAN_SESSION_ID.to_string());
         state.checkpoint_approval = approval;
+        // A run that has already launched Code once has recorded its delivery
+        // canary. Without this, any path that reaches `launch_stage` — the
+        // rejection path does, via `handle_stage_failure`'s LoopBack arm —
+        // refuses because the stub agent cannot return a notification token,
+        // and the test fails on the canary instead of on the behaviour under
+        // test. Same fixture shape other launch tests in this module use.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
     }
 
@@ -3871,6 +3959,327 @@ mod tests {
         );
     }
 
+    /// Write an arbitrary gate response so a gate's poll returns immediately.
+    ///
+    /// `GateAction::from_response` maps these three shapes: approved ->
+    /// `Advance`; not approved with a note containing "abort" -> `Abort`;
+    /// anything else not approved -> `LoopBack`.
+    fn write_gate_response(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        approved: bool,
+        note: Option<&str>,
+    ) {
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "write_gate_response must run inside a child test with an agent-free PATH (999.80)"
+        );
+        let response_path = Gates::response_path(root, phase, stage);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        let body = match note {
+            Some(note) => serde_json::json!({
+                "approved": approved, "note": note, "responded_by": "test"
+            }),
+            None => serde_json::json!({ "approved": approved, "responded_by": "test" }),
+        };
+        std::fs::write(&response_path, serde_json::to_vec(&body).unwrap()).unwrap();
+    }
+
+    /// 48-15 Task 1 / R-8: approving the re-scan gate must make the approval
+    /// DURABLE — record the set the human just saw, then relaunch — so the
+    /// very next resume of an unchanged plan auto-decides without asking
+    /// again. A gate that reopens on every resume is one an operator learns
+    /// to answer without reading.
+    #[test]
+    fn approving_the_rescan_gate_records_the_set_and_relaunches() {
+        const NAME: &str =
+            "pipeline_launch::tests::approving_the_rescan_gate_records_the_set_and_relaunches";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_RESCAN_APPROVE_ROOT";
+        let phase = PhaseId::new(101);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            // Approved: the ORIGINAL body. On disk: the REWRITTEN one, so the
+            // compare finds one unapproved declaration and opens the gate.
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Auto,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+
+        write_gate_response(root, phase, Stage::Code, true, None);
+
+        let first = advance(root, Some(phase));
+        let reloaded_first = workflow::load_state(root, phase).ok();
+        let _reap_first = reloaded_first.as_ref().map(ReapMonitorOnDrop::after_launch);
+        first.unwrap();
+
+        // The approval is recorded as the set now ON DISK, not as the stale
+        // recorded set the gate was opened about.
+        let after_approval = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            after_approval.checkpoint_approval,
+            recorded_from_body(phase, &rescan_plan_body_rewritten()),
+            "approving must record the freshly scanned set, persisted for the next process"
+        );
+        assert_eq!(
+            events_of_kind(root, "checkpoint_auto_decided").len(),
+            1,
+            "approving must reach the relaunch path"
+        );
+        let gates_after_first = events_of_kind(root, "gate_fired")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .count();
+        assert_eq!(
+            gates_after_first, 1,
+            "exactly one re-scan gate should have fired"
+        );
+
+        // DURABILITY, asserted as the predicate the next resume evaluates
+        // rather than by driving a second `advance()`.
+        //
+        // A second real advance cannot measure this in this fixture: the
+        // relaunch above spawns the stub agent, whose own stdout REPLACES the
+        // confirmed-checkpoint capture, so the next advance classifies a
+        // different result entirely and never reaches the re-scan route. That
+        // is a fixture artifact, not behaviour — measured, not assumed (it
+        // produced a never-silent gate on an unrelated path).
+        //
+        // The composition is still covered end to end:
+        // `unchanged_recorded_checkpoint_still_auto_decides` (48-07) drives a
+        // REAL advance with a matching recorded set and asserts auto-decide
+        // with no gate. This test supplies the other half — that an approval
+        // produces exactly such a matching set, on disk, for the separate
+        // process that reads it next.
+        let current_on_disk = verify::phase_checkpoint_declarations(root, phase);
+        assert!(
+            after_approval
+                .checkpoint_approval
+                .unapproved(&current_on_disk)
+                .is_empty(),
+            "after approval the next resume's compare must find nothing to gate"
+        );
+        // Negative control: the same predicate against the pre-approval set
+        // MUST still find the declaration, or the assertion above would pass
+        // for a set that approves everything.
+        assert_eq!(
+            recorded_from_body(phase, &rescan_plan_body())
+                .unapproved(&current_on_disk)
+                .len(),
+            1,
+            "the pre-approval set must still leave one declaration unapproved"
+        );
+    }
+
+    /// 48-15 Task 1 / T-48-15-03: a non-abort rejection must record NOTHING.
+    /// Widening the approved set on a rejection is the repudiation path — the
+    /// human said no and the next resume would proceed as though they had
+    /// said yes. It also must not relaunch, and the plan file it objected to
+    /// has to appear in what the fall-through gate shows the operator.
+    #[test]
+    fn rejecting_the_rescan_gate_records_nothing_and_falls_through() {
+        const NAME: &str =
+            "pipeline_launch::tests::rejecting_the_rescan_gate_records_nothing_and_falls_through";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_RESCAN_REJECT_ROOT";
+        let phase = PhaseId::new(102);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            // SUPERVISE, and the reason is load-bearing. The rejection path
+            // ends in `handle_stage_failure`'s LoopBack arm, which calls
+            // `launch_stage` -> `run_preflight`. In AUTO,
+            // `preflight_unattended_launch_check` refuses that launch
+            // precisely BECAUSE the plan declares a human-only checkpoint, so
+            // a third gate opens with no response left and the test blocks on
+            // the three-day poll instead of failing. Measured, not assumed:
+            // the Auto run printed `[DOES NOT HOLD] no plan declares a
+            // human-only checkpoint` and spawned zero monitors.
+            //
+            // The route under test has no mode check (D-07), and nothing in
+            // the rejection path reads `mode`, so Supervise exercises the
+            // same code with the downstream refusal out of the way.
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Supervise,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+
+        let before = workflow::load_state(root, phase)
+            .unwrap()
+            .checkpoint_approval;
+
+        // Not approved, and the note deliberately does NOT say "abort" —
+        // `GateAction::from_response` maps that to LoopBack, the "I will fix
+        // the plan" answer. The fall-through gate below consumes this same
+        // response, which is correct: it is the same question.
+        write_gate_response(
+            root,
+            phase,
+            Stage::Code,
+            false,
+            Some("the rewritten task needs review first"),
+        );
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let after = workflow::load_state(root, phase)
+            .unwrap()
+            .checkpoint_approval;
+        assert_eq!(
+            after, before,
+            "a rejection must leave the approved set exactly as it was"
+        );
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "a rejection must never reach the relaunch path"
+        );
+
+        // A rejection must REACH the existing non-auto-decide dispatch, not
+        // stop at the re-scan gate. `handle_stage_failure` is the only thing
+        // that emits a `[never-silent]` context, and the augmented reason it
+        // renders must name the plan file the human objected to — that gate
+        // is where they will actually read it.
+        //
+        // Asserting on the never-silent context specifically, NOT merely on
+        // "some gate mentions the plan file": the re-scan gate's own context
+        // already names it, so the weaker assertion passes without any of
+        // this plan's changes and would measure nothing.
+        let plan_file = rescan_plan_file_name(phase);
+        let gate_contexts: Vec<String> = events_of_kind(root, "gate_fired")
+            .iter()
+            .filter_map(|event| event["context"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            gate_contexts.iter().any(|context| {
+                context.contains("[never-silent]")
+                    && context.contains("could not auto-resolve")
+                    && context.contains(&plan_file)
+            }),
+            "the fall-through gate must name `{plan_file}` in an augmented \
+             unresolved-checkpoint reason; contexts were {gate_contexts:?}"
+        );
+        // At least two: the re-scan gate AND the never-silent fall-through.
+        // Deliberately not an EXACT count — the LoopBack arm relaunches the
+        // stage, and that monitor's own background `devflow advance` can fire
+        // further gates on its own schedule. Pinning the count would make this
+        // test fail on a race rather than on the behaviour it asserts; the
+        // never-silent context check above is what discriminates.
+        let code_gates = events_of_kind(root, "gate_fired")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .count();
+        assert!(
+            code_gates >= 2,
+            "a rejection fires the re-scan gate AND then the never-silent \
+             fall-through gate; {code_gates} gate(s) means the dispatch was \
+             not reached"
+        );
+    }
+
+    /// 48-15 Task 1: an abort note must terminate through the SAME
+    /// `pipeline_gate::abort` every other gate uses — not a bespoke exit
+    /// path that skips gate cleanup, state clearing or deregistration.
+    #[test]
+    fn rejecting_the_rescan_gate_with_abort_aborts() {
+        const NAME: &str = "pipeline_launch::tests::rejecting_the_rescan_gate_with_abort_aborts";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_RESCAN_ABORT_ROOT";
+        let phase = PhaseId::new(103);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Auto,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+
+        write_gate_response(
+            root,
+            phase,
+            Stage::Code,
+            false,
+            Some("abort: the agent rewrote its own gate"),
+        );
+
+        let result = advance(root, Some(phase));
+        let reloaded = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "an abort must never relaunch the session"
+        );
+        assert_eq!(
+            events_of_kind(root, "workflow_aborted").len(),
+            1,
+            "an abort note must terminate through pipeline_gate::abort"
+        );
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "abort clears state; a surviving state file means a bespoke exit path was taken"
+        );
+    }
+
     /// A rewritten body of an ALREADY-APPROVED checkpoint is new relative to
     /// the recorded set. The recorded set holds the original element; the
     /// plan on disk holds an edited one.
@@ -3889,6 +4298,7 @@ mod tests {
                 phase,
                 &rescan_plan_body_rewritten(),
                 recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
             let output = devflow_core::test_support::run_test_in_child(
@@ -3925,6 +4335,7 @@ mod tests {
                 phase,
                 &rescan_plan_body(),
                 devflow_core::state::CheckpointApproval::Unrecorded,
+                Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
             let output = devflow_core::test_support::run_test_in_child(
@@ -3962,6 +4373,7 @@ mod tests {
                 &rescan_plan_body(),
                 // Left exactly where `State::new` puts it.
                 devflow_core::state::CheckpointApproval::Pending,
+                Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
             let output = devflow_core::test_support::run_test_in_child(
@@ -4006,6 +4418,7 @@ mod tests {
                 phase,
                 &rescan_plan_body_whitespace_only_edit(),
                 recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
             let output = devflow_core::test_support::run_test_in_child(

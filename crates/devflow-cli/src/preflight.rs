@@ -30,7 +30,7 @@ use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
+use devflow_core::state::{AgentKind, CheckpointApproval, State};
 use devflow_core::{agents, events, verify, version, workflow};
 use std::path::{Path, PathBuf};
 
@@ -1289,6 +1289,38 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
     }
 }
 
+/// Record the human-only checkpoint set for a Code evaluation, read from the
+/// EXECUTION root.
+///
+/// The root is `state.worktree_path` when set, else `state.project_root` —
+/// NOT `project_root` — because `.planning/` is tracked content: an in-flight
+/// phase's plans live on the feature branch inside the worktree and are absent
+/// from the main checkout for the phase's whole duration (999.76). It must be
+/// the SAME root the resume decision re-scans, or a worktree run would compare
+/// a recorded empty set against a populated one and gate on every resume
+/// (T-48-15-02).
+///
+/// [`CheckpointApproval::Unrecorded`] is left untouched at every Code
+/// evaluation (T-48-07-02): a run whose first Code evaluation predates this
+/// field has an unobserved set, and recording it later would bless whatever
+/// the agent had already written by then. Every other approval state is
+/// replaced with the freshly scanned set.
+///
+/// Callers own their own `save_state` so this can sit inside an arm that
+/// already saves once.
+fn record_checkpoint_set_for_code_evaluation(state: &mut State) -> Result<(), CliError> {
+    if state.checkpoint_approval == CheckpointApproval::Unrecorded {
+        return Ok(());
+    }
+    let execution_root = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| state.project_root.clone());
+    let current = verify::phase_checkpoint_declarations(&execution_root, state.phase);
+    state.checkpoint_approval = crate::pipeline_launch::recorded_approval(&current);
+    Ok(())
+}
+
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
 /// checks (D-14) plus the adapter-specific hook, called from `launch_stage`
 /// BEFORE `monitor::spawn_monitor` so a readiness failure is caught before
@@ -1372,6 +1404,17 @@ pub(crate) fn run_preflight(
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 state.gate_pending = false;
                 state.preflight_retries = 0;
+                // 48-15 / R-8, T-48-15-01: in Auto mode a Code launch whose
+                // plans declare a human-only checkpoint is REFUSED, so the
+                // pass path below can only ever record an EMPTY set. THIS is
+                // where a non-empty set becomes legitimate: a human read the
+                // refusal — which names the declaring plans — and approved.
+                //
+                // Only a human answer widens the set. The LoopBack arm below
+                // deliberately records nothing: "I will fix it and retry" is
+                // not approval, and treating it as approval is the
+                // repudiation path T-48-15-03 names.
+                record_checkpoint_set_for_code_evaluation(state)?;
                 workflow::save_state(state)?;
                 launch_stage_inner(state, None, None)?;
             }
@@ -1398,25 +1441,7 @@ pub(crate) fn run_preflight(
     // later loop-back or relaunched evaluation record it would bless
     // whatever the agent had already written by then.
     if stage == Stage::Code && state.checkpoint_approval == CheckpointApproval::Pending {
-        // The EXECUTION root, not `project_root` — `.planning/` is tracked
-        // content, so an in-flight phase's plans live on the feature branch
-        // inside the worktree and are absent from the main checkout (999.76).
-        // This must be the same root the resume decision re-scans, or every
-        // worktree run would compare a recorded empty set against a populated
-        // one and gate on every resume.
-        let execution_root = state
-            .worktree_path
-            .clone()
-            .unwrap_or_else(|| state.project_root.clone());
-        let recorded = verify::phase_checkpoint_declarations(&execution_root, state.phase)
-            .into_iter()
-            .filter(|declaration| declaration.blocking_human || declaration.human_action)
-            .map(|declaration| ApprovedCheckpoint {
-                plan_file: declaration.plan_file,
-                element: declaration.element,
-            })
-            .collect();
-        state.checkpoint_approval = CheckpointApproval::Recorded(recorded);
+        record_checkpoint_set_for_code_evaluation(state)?;
         workflow::save_state(state)?;
     }
 
@@ -1436,6 +1461,9 @@ pub(crate) fn run_preflight(
 mod tests {
     use super::*;
     use crate::test_support::*;
+    // Named only by the recording assertions below; importing it at module
+    // scope would be an unused import in a non-test build.
+    use devflow_core::state::ApprovedCheckpoint;
 
     macro_rules! enter_path_isolated_child {
         ($name:expr, $path_dir:expr) => {
@@ -2499,6 +2527,14 @@ mod tests {
         .unwrap();
     }
 
+    /// How many human-only checkpoint declarations `root` holds for `phase`.
+    fn human_only_count(root: &Path, phase: PhaseId) -> usize {
+        verify::phase_checkpoint_declarations(root, phase)
+            .iter()
+            .filter(|declaration| declaration.blocking_human || declaration.human_action)
+            .count()
+    }
+
     /// D-07: a Code evaluation that passes must turn `Pending` into
     /// `Recorded` of what it actually saw, read from the EXECUTION root.
     ///
@@ -2604,14 +2640,185 @@ mod tests {
         );
     }
 
+    /// 48-15 Task 2 / T-48-15-01 + T-48-15-02: the OTHER way a set legitimately
+    /// gets recorded.
+    ///
+    /// In Auto mode a Code launch whose plans declare a human-only checkpoint
+    /// is REFUSED by `preflight_unattended_launch_check` — so the pass-path
+    /// recording 48-07 added can only ever record an EMPTY set there. The
+    /// non-empty case arrives through this gate: a human reads the refusal,
+    /// approves, and that approval is what makes the set legitimate.
+    ///
+    /// Two halves, one fixture shape:
+    /// - `Advance` records the current EXECUTION-root set (T-48-15-02: from
+    ///   the worktree, not the project root, or recording and comparison
+    ///   would disagree and every worktree run would gate forever).
+    /// - `LoopBack` records NOTHING — "I will fix it and retry" is not
+    ///   approval, and treating it as approval is the repudiation path.
+    #[test]
+    fn approving_the_preflight_refusal_gate_records_the_set() {
+        const NAME: &str = "preflight::tests::approving_the_preflight_refusal_gate_records_the_set";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX. Bounded so a regression that
+        // stops answering this gate fails fast instead of polling for days.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
+        // ---- Half 1: Advance records the execution-root set ----
+        let approve_dir = tempfile::tempdir().unwrap();
+        let approve_root = approve_dir.path();
+        init_repo(approve_root);
+        let approve_phase = PhaseId::new(626);
+        let approve_worktree = approve_root.join("phase-worktree");
+        std::fs::create_dir_all(&approve_worktree).unwrap();
+        write_human_only_plan(&approve_worktree, approve_phase);
+        // The decoy under the PROJECT root, so recording from the wrong root
+        // yields an empty set rather than a missing directory (T-48-15-02).
+        write_decoy_plan(approve_root, approve_phase);
+
+        // Mechanical control, before the call: the roots must DISAGREE.
+        assert_eq!(
+            human_only_count(&approve_worktree, approve_phase),
+            1,
+            "the execution root must hold exactly one human-only declaration"
+        );
+        assert_eq!(
+            human_only_count(approve_root, approve_phase),
+            0,
+            "opposite-result case: the project root holds only the decoy"
+        );
+
+        let mut approve_state = State::new(
+            approve_phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            approve_root.to_path_buf(),
+        );
+        approve_state.stage = Stage::Code;
+        approve_state.worktree_path = Some(approve_worktree.clone());
+        approve_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        workflow::save_state(&approve_state).unwrap();
+
+        let response_path = Gates::response_path(approve_root, approve_phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let approve_result = run_preflight(
+            approve_root,
+            &mut approve_state,
+            agents::driver_for(AgentKind::Claude).as_ref(),
+        );
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&approve_state);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            matches!(approve_result, Ok(false)),
+            "an approved refusal gate returns Ok(false) after relaunching, got {approve_result:?}"
+        );
+        let expected = CheckpointApproval::Recorded(vec![ApprovedCheckpoint {
+            plan_file: format!("{padded}-01-PLAN.md", padded = approve_phase.padded()),
+            element: verify::phase_checkpoint_declarations(&approve_worktree, approve_phase)
+                .into_iter()
+                .find(|declaration| declaration.blocking_human || declaration.human_action)
+                .expect("the control above proved this declaration exists")
+                .element,
+        }]);
+        assert_eq!(
+            approve_state.checkpoint_approval, expected,
+            "approving the refusal gate must record the EXECUTION-root set"
+        );
+
+        // ---- Half 2: LoopBack records nothing ----
+        //
+        // Same fixture shape, same `Pending` start, same refusal — only the
+        // human's answer differs. That is what makes this the opposite-result
+        // case for Half 1 rather than a different scenario: if recording were
+        // keyed on "a gate was answered" instead of on "the answer was
+        // approval", both halves would record and this assertion would fail.
+        let loopback_dir = tempfile::tempdir().unwrap();
+        let loopback_root = loopback_dir.path();
+        init_repo(loopback_root);
+        let loopback_phase = PhaseId::new(627);
+        let loopback_worktree = loopback_root.join("phase-worktree");
+        std::fs::create_dir_all(&loopback_worktree).unwrap();
+        write_human_only_plan(&loopback_worktree, loopback_phase);
+        assert_eq!(
+            human_only_count(&loopback_worktree, loopback_phase),
+            1,
+            "the LoopBack fixture must also declare a human-only checkpoint, \
+             or its preflight would not be refused and nothing would be tested"
+        );
+
+        let mut loopback_state = State::new(
+            loopback_phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            loopback_root.to_path_buf(),
+        );
+        loopback_state.stage = Stage::Code;
+        loopback_state.worktree_path = Some(loopback_worktree.clone());
+        loopback_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        workflow::save_state(&loopback_state).unwrap();
+
+        let loopback_response = Gates::response_path(loopback_root, loopback_phase, Stage::Code);
+        std::fs::create_dir_all(loopback_response.parent().unwrap()).unwrap();
+        // Not approved, and the note does NOT say "abort" — LoopBack.
+        std::fs::write(
+            &loopback_response,
+            r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        // SAFETY: serialized under ENV_MUTEX (the guard is still held).
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+        let loopback_result = run_preflight(
+            loopback_root,
+            &mut loopback_state,
+            agents::driver_for(AgentKind::Claude).as_ref(),
+        );
+        let _loopback_reap = ReapMonitorOnDrop::after_launch(&loopback_state);
+        // SAFETY: still serialized under ENV_MUTEX.
+        unsafe {
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        // The terminus is deliberately NOT asserted as Ok. LoopBack re-enters
+        // `run_preflight`, which refuses again; its own `Gates::cleanup` has
+        // removed the one seeded response, so the next cycle's gate reaches
+        // the bounded 2s timeout and that Err propagates. Which terminus the
+        // recursion reaches is `run_preflight_loopback_bounds_recursion`'s
+        // subject, not this test's. What matters here is that NO arm along
+        // that path recorded a set.
+        let _ = loopback_result;
+        assert_eq!(
+            loopback_state.checkpoint_approval,
+            CheckpointApproval::Pending,
+            "a LoopBack answer is not approval and must record nothing"
+        );
+    }
+
     /// D-07's other half: an `Unrecorded` approval is NEVER upgraded by a
     /// Code evaluation. A run whose first Code evaluation predates this
     /// binary has an unobserved set, and recording it at a later loop-back
     /// would bless whatever the agent had already written by then.
     #[test]
-    fn code_preflight_never_records_from_an_unrecorded_approval() {
-        const NAME: &str =
-            "preflight::tests::code_preflight_never_records_from_an_unrecorded_approval";
+    fn code_preflight_does_not_record_an_unrecorded_set() {
+        const NAME: &str = "preflight::tests::code_preflight_does_not_record_an_unrecorded_set";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
         let _guard = env_lock();
 
@@ -2645,7 +2852,83 @@ mod tests {
         assert_eq!(
             state.checkpoint_approval,
             CheckpointApproval::Unrecorded,
-            "an Unrecorded approval must survive a Code evaluation untouched"
+            "an Unrecorded approval must survive a PASSING Code evaluation untouched"
+        );
+
+        // ---- The REFUSAL-gate path, which the half above cannot reach ----
+        //
+        // This half exists because a negative control proved the half above
+        // was not measuring the guard: the pass path is wrapped in its own
+        // `== Pending` test, so deleting the `Unrecorded` check inside the
+        // recorder left that assertion passing. The refusal gate's Advance arm
+        // has NO outer `Pending` condition — the recorder's own guard is the
+        // only thing standing between an older run and a blessed set — so this
+        // is where T-48-07-02 is actually pinned.
+        let refusal_dir = tempfile::tempdir().unwrap();
+        let refusal_root = refusal_dir.path();
+        init_repo(refusal_root);
+        let refusal_phase = PhaseId::new(628);
+        let refusal_worktree = refusal_root.join("phase-worktree");
+        std::fs::create_dir_all(&refusal_worktree).unwrap();
+        write_human_only_plan(&refusal_worktree, refusal_phase);
+
+        let mut refusal_state = State::new(
+            refusal_phase,
+            AgentKind::Claude,
+            // AUTO, so the declared human-only checkpoint REFUSES the launch
+            // and the gate actually opens. In Supervise it would pass and this
+            // half would silently re-test the path above.
+            Mode::Auto,
+            refusal_root.to_path_buf(),
+        );
+        refusal_state.stage = Stage::Code;
+        refusal_state.worktree_path = Some(refusal_worktree.clone());
+        refusal_state.checkpoint_approval = CheckpointApproval::Unrecorded;
+        refusal_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
+        workflow::save_state(&refusal_state).unwrap();
+
+        let refusal_response = Gates::response_path(refusal_root, refusal_phase, Stage::Code);
+        std::fs::create_dir_all(refusal_response.parent().unwrap()).unwrap();
+        // APPROVED — the strongest answer a human can give. Even this must not
+        // upgrade an Unrecorded set: nobody ever observed what this run's Code
+        // stage started from, so there is no set to approve.
+        std::fs::write(
+            &refusal_response,
+            r#"{"approved":true,"responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        // No second `env_lock()` here: this test already holds it from its
+        // first line, and the mutex is not reentrant — re-acquiring it
+        // deadlocks the test rather than failing it.
+        let saved_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX via the guard held since the top
+        // of this test.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+        let refusal_result = run_preflight(
+            refusal_root,
+            &mut refusal_state,
+            agents::driver_for(AgentKind::Claude).as_ref(),
+        );
+        let _refusal_reap = ReapMonitorOnDrop::after_launch(&refusal_state);
+        // SAFETY: still serialized under the same ENV_MUTEX guard.
+        unsafe {
+            match &saved_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            matches!(refusal_result, Ok(false)),
+            "the refusal gate must be approved and relaunch, got {refusal_result:?}"
+        );
+        assert_eq!(
+            refusal_state.checkpoint_approval,
+            CheckpointApproval::Unrecorded,
+            "not even an APPROVED refusal gate may upgrade an Unrecorded set"
         );
     }
 
