@@ -79,6 +79,29 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       What survives: `gate reject` and `stop` both print that a waiting process will pick up the
       response without ever checking whether one exists, and neither names the repair.
 
+### Checkpoint Consistency (CHKPT)
+
+- [ ] **CHKPT-01**: Preflight and the resume route use one parsed checkpoint predicate; a marker
+      outside a task-opening line neither blocks preflight nor arms resume, and a proper task-level
+      `blocking-human` gate is human-only on both paths.
+      *Traces to 999.125.* Provenance: Phase 47 D-13 found the whole-file substring match on the
+      resume route versus the line-anchored preflight match (`verify.rs:131-137` and `:207-220`, at
+      time of filing).
+
+- [ ] **CHKPT-02**: A human-only checkpoint that is new or changed relative to the set DevFlow
+      recorded at Code's preflight parks at a human gate before the resume decision can auto-decide
+      it; a state file with no recorded set gates.
+      *Traces to 999.126.*
+
+### Test Isolation (TEST)
+
+- [ ] **TEST-01**: Tests that replace process-global `PATH` run in a child process with `PATH` set
+      on the child `Command` only; tests kept from spawning a real agent only by an abort fixture
+      note (999.80) run the same way; a clippy `disallowed-methods` lint rejects new process-global
+      environment mutation.
+      *Traces to 999.38 with 999.80 folded in (D-10).* **Not established:** the full-suite run
+      pinned to two CPUs is a sanity check and does not prove the flakes cannot recur.
+
 ### Live Verification (VERIFY)
 
 - [ ] **VERIFY-01**: A real `devflow start --mode auto` run is recorded end to end against a
@@ -173,14 +196,17 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | DECN-03 | Phase 47 — Unattended Decision Policy Consistency (behavioural arm resolves against Phase 49) | 1 | Complete |
 | SURV-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery (field arm observed, not settled, in Phase 49) | 2 | Pending |
 | SURV-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| CHKPT-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Pending |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Pending |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**
 
-- v3.0.0 requirements: 10 total
-- Mapped to phases: 10
+- v3.0.0 requirements: 13 total
+- Mapped to phases: 13
 - Unmapped: 0 ✓
 - Duplicates (a requirement owned by more than one phase): 0 ✓
 

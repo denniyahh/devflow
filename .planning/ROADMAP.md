@@ -27,7 +27,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 |---|---|---|---|---|
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
-| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, GATE-01 (999.125), GATE-02 (999.126), 999.38 | 2 | Not started |
+| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Not started |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
@@ -152,76 +152,86 @@ are re-scanned, and the test-suite PATH race is isolated.
 **Depends on**: Phases 46, 47
 **Sequencing note**: Wave order — correctness lands before survivability, and gate consistency lands
 before Phase 49's live unattended run measures the chain.
-**Requirements**: SURV-01, SURV-02, GATE-01 (999.125), GATE-02 (999.126), 999.38
+**Requirements**: SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01
 **Success Criteria** (what must be TRUE):
 
-  1. A test drives two writers for the same phase and **fails against the current implementation** —
-     `workflow.rs:185-193` derives `path.with_extension("tmp")`, a pure function of the state path,
-     so every writer for a phase writes the same temp file. A single-writer control exercising the
-     same path must still round-trip cleanly, so a red result discriminates concurrency from a
-     broken harness. **Not established, and not claimed:** no interleaving has been observed in the
-     wild — the evidence for SURV-01 is the failing-then-passing test, not a field sighting.
-  2. After the fix, both writers' updates are observable in the final state file — neither is
-     silently dropped — and the single-writer control still round-trips.
-  3. `devflow gate reject` and `devflow stop` check whether a consumer exists before claiming one
-     will pick up the response. With no consumer, they name the repair that works —
-     `devflow resume --phase N`, which `doctor`'s `check_gate_pending_without_gate` already
-     prescribes — and specifically do not prescribe `rm -f`, which the live reproduction showed is
-     not required.
+  1. A test drives a second writer for the same phase and **fails against the current implementation**
+     because the second writer silently overwrites. A single-writer control exercising the same path
+     must still round-trip cleanly, so a red result discriminates concurrency from a broken harness.
+     **Not established, and not claimed:** no interleaving has been observed in the wild — the
+     evidence for SURV-01 is the failing-then-passing test, not a field sighting.
+  2. After the fix, a second writer for the same phase is excluded or refused loudly and never silently
+     overwrites; the single-writer control exercising the same path still round-trips.
+  3. `devflow gate approve`, `devflow gate reject`, `devflow stop` and `devflow gate sweep` check for
+     a live waiter (the identity-confirmed per-phase lock holder) before writing an answer. With no live waiter,
+     they say nothing is waiting, write no answer file at a non-Ship gate, and name the
+     repair that works: `devflow ship --phase N` at a Ship gate; `devflow resume --phase N` or
+     `devflow recover --clean --phase N` at any other gate. They do not prescribe `rm -f`. `resume`
+     relaunches the saved stage and never reads a pending answer.
   4. The #200 wedge is reproducible on demand and its shape is pinned in both directions: the wedge
-     requires the foreground `start` to be **interrupted**, and a run left alone self-resolves in
-     ~40s. The self-resolving arm is the negative control — if both arms wedge, the reproduction is
-     measuring something else.
-  5. **GATE-01 (999.125):** Preflight's `phase_has_human_only_checkpoint` and resume's
+     requires the foreground `start` to be **interrupted**, and a run left alone self-resolves. The
+     self-resolving arm's observed answer-to-pickup interval is what the 48-13 reproduction records.
+     The self-resolving arm is the negative control — if both arms wedge, the reproduction is measuring
+     something else.
+  5. **CHKPT-01 (999.125):** Preflight's `phase_has_human_only_checkpoint` and resume's
      `phase_has_blocking_human_checkpoint` use one parsed checkpoint predicate shared across paths;
      a marker outside a task-opening line neither blocks preflight nor arms resume.
-  6. **GATE-02 (999.126):** Checkpoints added or modified after Code's initial preflight are
+  6. **CHKPT-02 (999.126):** Checkpoints added or modified after Code's initial preflight are
      re-scanned from a fresh plan snapshot before the run can continue into the resume decision path.
-  7. **999.38:** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
+  7. **TEST-01 (999.38 + 999.80):** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: 14 plans in 9 waves
+**Plans**: 17 plans in 11 waves
 
 **Wave 1**
 
-- [ ] 48-01-PLAN.md
-- [ ] 48-02-PLAN.md
-- [ ] 48-03-PLAN.md
+- [ ] 48-01-PLAN.md *(no plan dependencies)*
+- [ ] 48-02-PLAN.md *(no plan dependencies)*
+- [ ] 48-03-PLAN.md *(no plan dependencies)*
 
-**Wave 2** *(blocked on Wave 1 completion)*
+**Wave 2**
 
-- [ ] 48-04-PLAN.md
-- [ ] 48-05-PLAN.md
+- [ ] 48-04-PLAN.md *(depends on 48-03)*
+- [ ] 48-05-PLAN.md *(depends on 48-03)*
 
-**Wave 3** *(blocked on Wave 2 completion)*
+**Wave 3**
 
-- [ ] 48-06-PLAN.md
+- [ ] 48-06-PLAN.md *(depends on 48-03, 48-05)*
 
-**Wave 4** *(blocked on Wave 3 completion)*
+**Wave 4**
 
-- [ ] 48-07-PLAN.md
-- [ ] 48-08-PLAN.md
+- [ ] 48-07-PLAN.md *(depends on 48-02, 48-05, 48-06)*
+- [ ] 48-08-PLAN.md *(depends on 48-04, 48-06)*
 
-**Wave 5** *(blocked on Wave 4 completion)*
+**Wave 5**
 
-- [ ] 48-09-PLAN.md
+- [ ] 48-15-PLAN.md *(depends on 48-07)*
 
-**Wave 6** *(blocked on Wave 5 completion)*
+**Wave 6**
 
-- [ ] 48-10-PLAN.md
-- [ ] 48-11-PLAN.md
+- [ ] 48-09-PLAN.md *(depends on 48-04, 48-05, 48-06, 48-08, 48-15)*
 
-**Wave 7** *(blocked on Wave 6 completion)*
+**Wave 7**
 
-- [ ] 48-12-PLAN.md
+- [ ] 48-10-PLAN.md *(depends on 48-09)*
+- [ ] 48-11-PLAN.md *(depends on 48-09)*
+- [ ] 48-17-PLAN.md *(depends on 48-09)*
 
-**Wave 8** *(blocked on Wave 7 completion)*
+**Wave 8**
 
-- [ ] 48-13-PLAN.md
+- [ ] 48-12-PLAN.md *(depends on 48-10, 48-11)*
 
-**Wave 9** *(blocked on Wave 8 completion)*
+**Wave 9**
 
-- [ ] 48-14-PLAN.md
+- [ ] 48-13-PLAN.md *(depends on 48-12)*
+
+**Wave 10**
+
+- [ ] 48-16-PLAN.md *(depends on 48-13)*
+
+**Wave 11**
+
+- [ ] 48-14-PLAN.md *(depends on 48-16)*
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
@@ -2004,6 +2014,8 @@ landmine for any future Validate→Ship pairing.
 
 ### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (BACKLOG)
 
+**Phase 48 (2026-09-14):** worked together with 999.38 as TEST-01
+
 **GitHub:** [#168](https://github.com/denniyahh/devflow/issues/168) (migrated from Linear DEN-102)
 **Found:** 2026-08-05, Phase 33 code review (WR-06); **corrected the same day** by the Phase 33
 security audit, which mapped it to the registered trust boundary "cargo test process → spawned
@@ -3112,6 +3124,8 @@ Plans:
 - [x] Delivered in this release (hook scrub, per-command containment, hermeticity guard, `pre-commit` chaining shim)
 
 ### Phase 999.38: Test-Suite PATH Race Between ENV_MUTEX Mutators and Concurrent Git Callers (PROMOTED — Phase 48 test-suite isolation, 2026-09-13)
+
+**Phase 48 (2026-09-14):** worked together with 999.80 as TEST-01
 
 **GitHub:** [#181](https://github.com/denniyahh/devflow/issues/181) (migrated from Linear DEN-65)
 
