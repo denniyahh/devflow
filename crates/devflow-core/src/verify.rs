@@ -129,11 +129,9 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
 /// caller that does this correctly is `pipeline_launch.rs`'s
 /// `Action::GateReview` arm, which resolves `state.worktree_path` first.
 pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
-    const HUMAN_BLOCKING_GATE: &str = r#"gate="blocking-human""#;
-    phase_plan_files(project_root, phase)
+    phase_checkpoint_declarations(project_root, phase)
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .any(|contents| contents.contains(HUMAN_BLOCKING_GATE))
+        .any(|declaration| declaration.blocking_human)
 }
 
 /// The two checkpoint markers GSD will not auto-approve in ANY mode, each
@@ -160,6 +158,70 @@ const HUMAN_ONLY_CHECKPOINT_MARKERS: [&str; 2] = [
 /// The opening bytes of a task element, the anchor every marker match must
 /// also satisfy.
 const TASK_ELEMENT_OPENING: &str = "<task";
+
+/// A human-only checkpoint declared by one plan task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointDeclaration {
+    /// The plan file name only, so declarations compare identically from a
+    /// worktree or the project root.
+    pub plan_file: String,
+    /// The task element text. This initially holds its opening line; the
+    /// parser extends it to the full element below.
+    pub element: String,
+    /// Whether the task has a gate that prevents every auto-approval mode.
+    pub blocking_human: bool,
+    /// Whether the task needs direct human action, such as authentication.
+    pub human_action: bool,
+}
+
+/// Parse human-only checkpoint declarations from one plan file.
+pub fn parse_checkpoint_declarations(
+    plan_file: &str,
+    contents: &str,
+) -> Vec<CheckpointDeclaration> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            task_opening_line(line).then(|| {
+                let blocking_human = line.contains(HUMAN_ONLY_CHECKPOINT_MARKERS[0]);
+                let human_action = line.contains(HUMAN_ONLY_CHECKPOINT_MARKERS[1]);
+                (blocking_human || human_action).then(|| CheckpointDeclaration {
+                    plan_file: plan_file.to_owned(),
+                    element: line.to_owned(),
+                    blocking_human,
+                    human_action,
+                })
+            })?
+        })
+        .collect()
+}
+
+/// Read all human-only checkpoint declarations in a phase's plan files.
+pub fn phase_checkpoint_declarations(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Vec<CheckpointDeclaration> {
+    phase_plan_files(project_root, phase)
+        .into_iter()
+        .filter_map(|path| {
+            let plan_file = path.file_name()?.to_string_lossy().into_owned();
+            let contents = std::fs::read_to_string(path).ok()?;
+            Some(parse_checkpoint_declarations(&plan_file, &contents))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Whether a line's first non-whitespace bytes open a task element.
+fn task_opening_line(line: &str) -> bool {
+    let Some(after_opening) = line.trim_start().strip_prefix(TASK_ELEMENT_OPENING) else {
+        return false;
+    };
+    matches!(
+        after_opening.as_bytes().first(),
+        Some(byte) if *byte == b'>' || byte.is_ascii_whitespace()
+    )
+}
 
 /// Return `true` if any plan declared for `phase` DECLARES a checkpoint task
 /// that GSD will not auto-approve in any mode.
@@ -205,18 +267,9 @@ const TASK_ELEMENT_OPENING: &str = "<task";
 /// live on the feature branch inside the worktree and are absent from the main
 /// checkout (999.76).
 pub fn phase_has_human_only_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
-    phase_plan_files(project_root, phase)
+    phase_checkpoint_declarations(project_root, phase)
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .any(|contents| contents.lines().any(line_declares_human_only_checkpoint))
-}
-
-/// Whether one line both opens a task element and carries a human-only marker.
-fn line_declares_human_only_checkpoint(line: &str) -> bool {
-    line.contains(TASK_ELEMENT_OPENING)
-        && HUMAN_ONLY_CHECKPOINT_MARKERS
-            .iter()
-            .any(|marker| line.contains(marker))
+        .any(|declaration| declaration.blocking_human || declaration.human_action)
 }
 
 /// Run one explicitly operator-approved external verification command.
