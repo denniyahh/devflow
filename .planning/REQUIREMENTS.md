@@ -95,7 +95,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Test Isolation (TEST)
 
-- [x] **TEST-01**: Tests that replace process-global `PATH` run in a child process with `PATH` set
+- [ ] **TEST-01**: Tests that replace process-global `PATH` run in a child process with `PATH` set
       on the child `Command` only; tests kept from spawning a real agent only by an abort fixture
       note (999.80) run the same way; a clippy `disallowed-methods` lint rejects new process-global
       environment mutation.
@@ -198,7 +198,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | SURV-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
 | CHKPT-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
-| TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
+| TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Pending |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Pending |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |

@@ -193,7 +193,7 @@ Plans: 17 plans in 11 waves (48-01..48-17)
 Current Plan: 3
 Total Plans in Phase: 17
 Completed Plans: —
-Status: Ready to execute
+Status: Executing Phase 48
 Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
