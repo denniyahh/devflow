@@ -486,31 +486,6 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
     dir
 }
 
-pub(crate) fn stub_agent_binary(name: &str) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(name);
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    dir
-}
-
-/// Prefix `PATH` with `stub_dir`, keeping the rest of `original` intact
-/// so `sh`/`git` still resolve normally — only the stubbed binary name
-/// is shadowed (it is found first).
-pub(crate) fn prepend_path(
-    stub_dir: &tempfile::TempDir,
-    original: &Option<std::ffi::OsString>,
-) -> std::ffi::OsString {
-    let mut dirs = vec![stub_dir.path().to_path_buf()];
-    if let Some(original) = original {
-        dirs.extend(std::env::split_paths(original));
-    }
-    std::env::join_paths(dirs).unwrap()
-}
-
 /// Count `stage_launched` events recorded for `phase` across the WHOLE
 /// event log — `last_event_for_phase` only sees the most recent line and
 /// cannot distinguish one launch from two.
