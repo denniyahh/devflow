@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-16T12:39:21.158Z",
+  "phase": "48",
+  "phase_name": "survivable-state-writes-and-honest-gate-recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": "48-05",
+  "task": 1,
+  "total_tasks": 38,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "48-01 planning contract correction (2/2 tasks)", "status": "done", "commit": "7789c67"},
+    {"id": 2, "name": "48-02 shared fence-aware checkpoint parser (3/3 tasks)", "status": "done", "commit": "ca6792f"},
+    {"id": 3, "name": "48-03 core child-process test helper and Pi/OpenCode migrations (2/2 tasks)", "status": "done", "commit": "d24a34b"},
+    {"id": 4, "name": "48-04 pipeline-outcomes PATH isolation (2/2 tasks)", "status": "done", "commit": "47425fa"}
+  ],
+  "remaining_tasks": [
+    {"id": 10, "name": "48-05 Task 1 pipeline-launch fixture migration", "status": "in_progress", "progress": "crates/devflow-cli/src/pipeline_launch.rs has an uncommitted whitespace-clean partial migration"},
+    {"id": 11, "name": "48-05 Task 2 complete pipeline-launch migration and verification", "status": "not_started"},
+    {"id": 12, "name": "Execute plans 48-06 through 48-17 in dependency order", "status": "not_started"}
+  ],
+  "blockers": [
+    {"description": "The 48-05 executor ended with provider class quota-exceeded before writing a commit or SUMMARY; it reported reset at 12:37 PM with no timezone.", "type": "external", "workaround": "Do not retry until the provider accepts a new request; resume the existing partial diff rather than restarting the plan."}
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Wait for provider quota reset, then resume Plan 48-05 from the existing diff", "context": "The execution workflow forbids retry-now after quota-exceeded; the partial pipeline_launch.rs migration would otherwise be overwritten.", "blocking": true}
+  ],
+  "decisions": [
+    {"decision": "Keep TEST-01 Pending after 48-03", "rationale": "Plans 48-04 through 48-09 still implement remaining PATH-isolation and lint obligations.", "phase": "48"},
+    {"decision": "Correct Wave 2 key-link descriptors before execution", "rationale": "The guard requires source and target file paths, with helper symbols in via; both links now pass.", "phase": "48"}
+  ],
+  "uncommitted_files": [
+    " M crates/devflow-cli/src/pipeline_launch.rs",
+    "?? .planning/research/.cache/",
+    "?? .planning/user/errors/"
+  ],
+  "next_action": "After provider quota reset is confirmed, read 48-05-PLAN.md and the current pipeline_launch.rs diff, then resume 48-05 without discarding the partial migration.",
+  "context_notes": "Phase 48 uses sequential executors because workflow.use_worktrees=false. Executors can sometimes commit, but 48-01 and 48-04 hit an index-lock sandbox failure; validate and commit their exact scope from the orchestrator if it recurs. GSD state/roadmap writers have repeatedly drifted and every manual repair is logged in ~/.config/agents/gsd-manual-fix-incidents.md."
+}
