@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 48
 current_phase_name: Survivable State Writes and Honest Gate Recovery
-current_plan: 1
+current_plan: 2
 status: executing
-stopped_at: Phase 48 review replan complete — 17 plans in 11 waves, ready to execute
-last_updated: "2026-09-16T00:27:56.953Z"
+stopped_at: Completed 48-02-PLAN.md
+last_updated: "2026-09-16T00:45:50.294Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 48 execution started
-state_head: 7789c67236522c5352bf367d7300fa3ff2190fdd
+state_head: ca6792f44e6d6676154917c995a9599f179a68f6
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 33
-  completed_plans: 17
+  completed_plans: 18
   percent: 33
 ---
 
@@ -190,7 +190,7 @@ change earns 2.0.
 
 Phase: 48 (Survivable State Writes and Honest Gate Recovery) — EXECUTING
 Plans: 17 plans in 11 waves (48-01..48-17)
-Current Plan: 1
+Current Plan: 2
 Total Plans in Phase: 17
 Completed Plans: —
 Status: Executing Phase 48
@@ -849,6 +849,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 47]: 47-07: worktree-guard fixture isolation is repository-local — the guard under test keeps its normal environment, and both environment carriers that outrank repository config are cleared at the script boundary
 - [Phase 47]: close: the operator accepted three post-47-06 gate-detector review fixes (`bd7bd7c`, `ac3ee42`, `49bb324`) as a verification override; re-verification passed 39/39 before `phase.complete` ran
 - [Phase 47]: transition: `phase.complete`'s own ROADMAP.md write (`4bb9504`) staled 47's verification, since ROADMAP.md is one of its covered files; the operator chose to leave it stale rather than re-verify (not durable across later ROADMAP.md writes), hand-correct the `## Progress` row `phase.complete` left at `5/5 | In Progress`, draft an upstream gsd-core issue, and re-verify once near milestone close
+- [Phase 48]: CHKPT-01 predicates filter one fence-aware checkpoint declaration parser; human-action remains preflight-only.
+- [Phase 48]: Closed fences are ignored; unclosed fence tails rescan unfenced so malformed plans cannot hide declarations.
 
 ## Roadmap Evolution
 
@@ -941,12 +943,13 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 47 P03 | 28min | 3 tasks | 4 files |
 | Phase 47 P04 | 9min | 2 tasks | 10 files |
 | Phase 47 P05 | 7min | 3 tasks | 4 files |
+| Phase 48 P02 | 10min | 3 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-09-14T17:58:43.044Z
-**Stopped at:** Phase 48 context gathered
-**Resume file:** .planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-CONTEXT.md
+**Last session:** 2026-09-16T00:45:50.018Z
+**Stopped at:** Completed 48-02-PLAN.md
+**Resume file:** None
 
 ## Operator Next Steps
 

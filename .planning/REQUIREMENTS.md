@@ -81,7 +81,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Checkpoint Consistency (CHKPT)
 
-- [ ] **CHKPT-01**: Preflight and the resume route use one parsed checkpoint predicate; a marker
+- [x] **CHKPT-01**: Preflight and the resume route use one parsed checkpoint predicate; a marker
       outside a task-opening line neither blocks preflight nor arms resume, and a proper task-level
       `blocking-human` gate is human-only on both paths.
       *Traces to 999.125.* Provenance: Phase 47 D-13 found the whole-file substring match on the
@@ -196,7 +196,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | DECN-03 | Phase 47 — Unattended Decision Policy Consistency (behavioural arm resolves against Phase 49) | 1 | Complete |
 | SURV-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery (field arm observed, not settled, in Phase 49) | 2 | Pending |
 | SURV-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
-| CHKPT-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| CHKPT-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
 | TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Pending |
