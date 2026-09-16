@@ -4726,6 +4726,11 @@ mod tests {
     struct LegacyEnvOverride(Option<std::ffi::OsString>);
 
     impl LegacyEnvOverride {
+        // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
+        // Deferred deliberately, not overlooked: THIS process reads the value, so
+        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+        // race and the value is restored on every exit path, unwinding included.
+        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
         fn set(value: &str) -> Self {
             let prior = std::env::var_os("DEVFLOW_CLAUDE_LEGACY_LAUNCH");
             // SAFETY: serialized by ENV_MUTEX; restored on drop.
@@ -4735,6 +4740,11 @@ mod tests {
     }
 
     impl Drop for LegacyEnvOverride {
+        // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
+        // Deferred deliberately, not overlooked: THIS process reads the value, so
+        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+        // race and the value is restored on every exit path, unwinding included.
+        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
         fn drop(&mut self) {
             // SAFETY: same serialization as `set`.
             unsafe {
@@ -4932,6 +4942,11 @@ mod tests {
     /// transport. An escape hatch that engaged on its own would be the silent
     /// downgrade D-11 rejects.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn legacy_launch_is_off_by_default() {
         let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
@@ -4968,6 +4983,11 @@ mod tests {
     /// null) and the run's event ledger. Stdout is not asserted here; see the
     /// summary's "what this does not establish".
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn legacy_launch_use_is_recorded_in_provenance() {
         let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
@@ -5076,6 +5096,11 @@ mod tests {
     /// 31-04-SUMMARY.md as a known un-migrated route, not something this test
     /// covers.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn parse_failure_does_not_trigger_a_fallback() {
         let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
@@ -5171,6 +5196,11 @@ mod tests {
     /// same silent-drop class as `stop_until`'s unconditional clear (999.60),
     /// which was fixed by gating it.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_CLAUDE_LEGACY_LAUNCH` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn resume_does_not_clear_a_persisted_legacy_launch() {
         let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.

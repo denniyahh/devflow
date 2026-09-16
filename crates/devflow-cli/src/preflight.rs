@@ -1563,6 +1563,11 @@ mod tests {
     /// configured base, and refused a perfectly valid run as unrunnable with
     /// no way forward.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_BASE_BRANCH` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn preflight_interactivity_check_probes_the_runs_persisted_base() {
         let _guard = env_lock();
         // The defect only reproduces when the environment does NOT carry the
@@ -1956,6 +1961,11 @@ mod tests {
     /// suite for 7 days (mirrors
     /// `run_preflight_advance_skips_recheck_on_idempotently_failing_check`).
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn run_preflight_major_bump_gate_not_auto_approved_by_yes_ship() {
         const NAME: &str =
             "preflight::tests::run_preflight_major_bump_gate_not_auto_approved_by_yes_ship";
@@ -2338,6 +2348,11 @@ mod tests {
     /// is bounded under `ENV_MUTEX` so a regression here fails fast instead
     /// of hanging the suite for 7 days.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn run_preflight_advance_skips_recheck_on_idempotently_failing_check() {
         const NAME: &str =
             "preflight::tests::run_preflight_advance_skips_recheck_on_idempotently_failing_check";
@@ -2424,6 +2439,11 @@ mod tests {
     /// "one retry short of the ceiling" → "ceiling reached" without a racy
     /// background writer.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn run_preflight_loopback_bounds_recursion() {
         const NAME: &str = "preflight::tests::run_preflight_loopback_bounds_recursion";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("codex"));
@@ -2656,6 +2676,11 @@ mod tests {
     /// - `LoopBack` records NOTHING — "I will fix it and retry" is not
     ///   approval, and treating it as approval is the repudiation path.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn approving_the_preflight_refusal_gate_records_the_set() {
         const NAME: &str = "preflight::tests::approving_the_preflight_refusal_gate_records_the_set";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
@@ -2817,6 +2842,11 @@ mod tests {
     /// binary has an unobserved set, and recording it at a later loop-back
     /// would bless whatever the agent had already written by then.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn code_preflight_does_not_record_an_unrecorded_set() {
         const NAME: &str = "preflight::tests::code_preflight_does_not_record_an_unrecorded_set";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));

@@ -645,6 +645,11 @@ mod tests {
     /// This test mutates process-global env, so it acquires `ENV_MUTEX` to
     /// avoid racing any other env-touching test in this module.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_NOTIFY_CMD` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn notify_hook_unset_is_noop() {
         let _guard = ENV_MUTEX.lock().unwrap();
         // SAFETY: serialized under ENV_MUTEX — no other thread in this
