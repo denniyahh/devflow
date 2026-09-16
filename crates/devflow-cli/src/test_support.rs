@@ -325,40 +325,6 @@ pub(crate) fn agent_free_git_only_path_dir() -> tempfile::TempDir {
 /// **The caller must already hold [`ENV_MUTEX`].** `set_var` is process-wide
 /// and `cargo test` runs in parallel; this guard makes the restore
 /// unconditional, it does not make the mutation safe on its own.
-pub(crate) struct NeutralPath {
-    _dir: tempfile::TempDir,
-    original: Option<std::ffi::OsString>,
-}
-
-impl NeutralPath {
-    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
-    /// process-global state at the moment of the call.
-    pub(crate) fn install() -> Self {
-        let dir = agent_free_git_only_path_dir();
-        let original = std::env::var_os("PATH");
-        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
-        // no other test thread is reading or writing PATH concurrently.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        Self {
-            _dir: dir,
-            original,
-        }
-    }
-}
-
-impl Drop for NeutralPath {
-    fn drop(&mut self) {
-        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
-        // for at least as long as this guard's own scope.
-        unsafe {
-            match &self.original {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-}
-
 /// Name of the environment variable that puts a re-executed test binary into
 /// CHILD mode: present means this process was spawned by
 /// [`run_test_without_git`], and its value is the fixture root the parent
