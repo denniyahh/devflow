@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 48
 current_phase_name: Survivable State Writes and Honest Gate Recovery
-current_plan: 2
+current_plan: 3
 status: executing
-stopped_at: Completed 48-02-PLAN.md
-last_updated: "2026-09-16T00:45:50.294Z"
+stopped_at: Completed 48-03-PLAN.md
+last_updated: "2026-09-16T11:51:10.860Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 48 execution started
-state_head: ca6792f44e6d6676154917c995a9599f179a68f6
+state_head: 8b534d9bc2a76f2a190d57e5c81785303b44dc92
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 33
-  completed_plans: 18
+  completed_plans: 19
   percent: 33
 ---
 
@@ -190,10 +190,10 @@ change earns 2.0.
 
 Phase: 48 (Survivable State Writes and Honest Gate Recovery) — EXECUTING
 Plans: 17 plans in 11 waves (48-01..48-17)
-Current Plan: 2
+Current Plan: 3
 Total Plans in Phase: 17
 Completed Plans: —
-Status: Executing Phase 48
+Status: Ready to execute
 Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -851,6 +851,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 47]: transition: `phase.complete`'s own ROADMAP.md write (`4bb9504`) staled 47's verification, since ROADMAP.md is one of its covered files; the operator chose to leave it stale rather than re-verify (not durable across later ROADMAP.md writes), hand-correct the `## Progress` row `phase.complete` left at `5/5 | In Progress`, draft an upstream gsd-core issue, and re-verify once near milestone close
 - [Phase 48]: CHKPT-01 predicates filter one fence-aware checkpoint declaration parser; human-action remains preflight-only.
 - [Phase 48]: Closed fences are ignored; unclosed fence tails rescan unfenced so malformed plans cannot hide declarations.
+- [Phase 48]: Child marker value is the exact module-qualified test name, and the guard requires a non-vacuous exact-test result.
+- [Phase 48]: Driver fixtures supply PATH and configuration only through the spawned child Command.
 
 ## Roadmap Evolution
 
@@ -944,11 +946,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 47 P04 | 9min | 2 tasks | 10 files |
 | Phase 47 P05 | 7min | 3 tasks | 4 files |
 | Phase 48 P02 | 10min | 3 tasks | 1 files |
+| Phase 48 P03 | 12m | 2 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-09-16T00:45:50.018Z
-**Stopped at:** Completed 48-02-PLAN.md
+**Last session:** 2026-09-16T11:51:10.688Z
+**Stopped at:** Completed 48-03-PLAN.md
 **Resume file:** None
 
 ## Operator Next Steps
