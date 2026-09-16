@@ -181,7 +181,7 @@ before Phase 49's live unattended run measures the chain.
   7. **TEST-01 (999.38 + 999.80):** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: 8/17 plans executed in 11 waves
+**Plans**: 9/17 plans executed in 11 waves
 
 **Wave 1**
 
@@ -201,7 +201,7 @@ before Phase 49's live unattended run measures the chain.
 **Wave 4**
 
 - [x] 48-07-PLAN.md *(depends on 48-02, 48-05, 48-06)*
-- [ ] 48-08-PLAN.md *(depends on 48-04, 48-06)*
+- [x] 48-08-PLAN.md *(depends on 48-04, 48-06)*
 
 **Wave 5**
 
@@ -474,7 +474,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
-| 48 | 8/17 | In Progress|  |
+| 48 | 9/17 | In Progress|  |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
