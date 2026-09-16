@@ -1,0 +1,29 @@
+[
+  {
+    "command": "cargo test -p devflow --bin devflow pipeline_launch::tests::approving_the_rescan_gate_records_the_set_and_relaunches -- --exact",
+    "exitCode": 101,
+    "output": "thread 'pipeline_launch::tests::approving_the_rescan_gate_records_the_set_and_relaunches' (1387184) panicked at crates/devflow-cli/src/pipeline_launch.rs:3950:9:\nassertion `left == right` failed: approving must record the freshly scanned set, persisted for the next process\n  left: Recorded([ApprovedCheckpoint { plan_file: \"101-01-PLAN.md\", element: \"<task type=\\\"checkpoint:human-verify\\\" gate=\\\"blocking-human\\\">\\n  <name>Task 1: Dogfood the acceptance contract against a non-compliant diff</name>\\n\\n  <action>\\n    Prepare the scratch diffs described in `<what-built>` in the working tree \u2014\\n    Diff A (non-compliant: assert-constant-against-itself), Diff C\\n    (non-compliant: reproduces the production algorithm inside the test), and\\n    Diff B (a compliant control) \u2014 then run the review against each in turn.\\n  </action>\\n</task>\" }])\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 373 filtered out; finished in 0.01s",
+    "targetTest": "pipeline_launch::tests::approving_the_rescan_gate_records_the_set_and_relaunches",
+    "targetFile": "crates/devflow-cli/src/pipeline_launch.rs",
+    "expected": "An approved re-scan gate records the freshly scanned set, relaunches once, and the next unchanged advance auto-decides without a second gate.",
+    "actual": "The approval was never recorded: the state still held the stale recorded set, and 48-07's park-and-return never reached relaunch_checkpoint_session."
+  },
+  {
+    "command": "cargo test -p devflow --bin devflow pipeline_launch::tests::rejecting_the_rescan_gate_records_nothing_and_falls_through -- --exact",
+    "exitCode": 101,
+    "output": "thread 'pipeline_launch::tests::rejecting_the_rescan_gate_records_nothing_and_falls_through' (1389614) panicked at crates/devflow-cli/src/pipeline_launch.rs:4079:9:\nthe fall-through gate must name `102-01-PLAN.md` in an augmented unresolved-checkpoint reason; contexts were [\"[checkpoint re-scan] 1 human-only checkpoint(s) in 102-01-PLAN.md were added or changed after this phase's Code preflight \u2014 a human must review them before the agent is resumed to decide them itself (approve, loop-to-code, or abort)\"]\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 373 filtered out; finished in 0.00s",
+    "targetTest": "pipeline_launch::tests::rejecting_the_rescan_gate_records_nothing_and_falls_through",
+    "targetFile": "crates/devflow-cli/src/pipeline_launch.rs",
+    "expected": "A non-abort rejection records nothing, does not relaunch, and reaches the never-silent dispatch whose augmented reason names the unapproved plan file.",
+    "actual": "Only the re-scan gate fired. The fall-through dispatch was never reached, so no [never-silent] context existed and the augmented unresolved-checkpoint reason was never rendered."
+  },
+  {
+    "command": "cargo test -p devflow --bin devflow pipeline_launch::tests::rejecting_the_rescan_gate_with_abort_aborts -- --exact",
+    "exitCode": 101,
+    "output": "thread 'pipeline_launch::tests::rejecting_the_rescan_gate_with_abort_aborts' (1388100) panicked at crates/devflow-cli/src/pipeline_launch.rs:4128:9:\nassertion `left == right` failed: an abort note must terminate through pipeline_gate::abort\n  left: 0\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 373 filtered out; finished in 0.03s",
+    "targetTest": "pipeline_launch::tests::rejecting_the_rescan_gate_with_abort_aborts",
+    "targetFile": "crates/devflow-cli/src/pipeline_launch.rs",
+    "expected": "An abort note terminates through pipeline_gate::abort, emitting workflow_aborted and clearing state.",
+    "actual": "48-07 parked and returned Ok(()); no workflow_aborted event was emitted and the state file survived."
+  }
+]
