@@ -187,11 +187,6 @@ mod tests {
     use super::*;
     use crate::mode::Mode;
     use crate::state::{AgentKind, State};
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate the process-global `PATH` (`set_var` is
-    /// process-wide; `cargo test` runs tests in parallel).
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn exec_command_shape() {
@@ -281,54 +276,11 @@ mod tests {
         dir
     }
 
-    /// RAII guard that replaces `PATH` with `path` and restores the previous
-    /// value on `Drop` — including the panic path, so a failing test never
-    /// hands the next test a mutated `PATH`.
-    struct PathGuard {
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl PathGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let original = std::env::var_os("PATH");
-            // SAFETY: held under ENV_MUTEX; no other thread reads/writes PATH.
-            unsafe { std::env::set_var("PATH", path) };
-            Self { original }
-        }
-    }
-
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(prev) => unsafe { std::env::set_var("PATH", prev) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-        }
-    }
-
-    /// RAII guard that sets an environment variable to `value` and restores it
-    /// on `Drop` — the same panic-safe pattern as [`PathGuard`].
-    struct EnvGuard {
-        name: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(name: &'static str, value: &std::path::Path) -> Self {
-            let original = std::env::var_os(name);
-            // SAFETY: held under ENV_MUTEX; no other thread reads/writes this var.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(prev) => unsafe { std::env::set_var(self.name, prev) },
-                None => unsafe { std::env::remove_var(self.name) },
-            }
-        }
+    fn child_pi_stub_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .expect("child must receive PI_CODING_AGENT_DIR from its parent"),
+        )
     }
 
     /// The shell-out must actually spawn `pi auth check --json --provider
@@ -339,10 +291,7 @@ mod tests {
     fn preflight_invokes_pi_auth_check_and_accepts_ready() {
         const NAME: &str = "agents::pi::tests::preflight_invokes_pi_auth_check_and_accepts_ready";
         if crate::test_support::in_child_test(NAME) {
-            let stub_dir = std::path::PathBuf::from(
-                std::env::var_os("PI_CODING_AGENT_DIR")
-                    .expect("child must receive PI_CODING_AGENT_DIR from its parent"),
-            );
+            let stub_dir = child_pi_stub_dir();
             PiDriver
                 .health(&test_state())
                 .expect("a `ready` stub should pass preflight");
@@ -369,37 +318,50 @@ mod tests {
     /// tests credential readiness, not env-var presence.
     #[test]
     fn preflight_reports_credentialless_when_auth_check_says_not_ready() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str =
+            "agents::pi::tests::preflight_reports_credentialless_when_auth_check_says_not_ready";
+        if crate::test_support::in_child_test(NAME) {
+            let err = PiDriver
+                .health(&test_state())
+                .expect_err("a `not_ready` stub should fail preflight");
+            assert!(
+                err.contains("no provider credential resolves"),
+                "unexpected error: {err}"
+            );
+            return;
+        }
         let stub_dir = stub_pi_with_provider(
             r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
             0,
             "litellm",
         );
-        let _path = PathGuard::set(stub_dir.path());
-        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
-
-        let err = PiDriver
-            .health(&test_state())
-            .expect_err("a `not_ready` stub should fail preflight");
-        assert!(
-            err.contains("no provider credential resolves"),
-            "unexpected error: {err}"
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
         );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// The exit code must be honored through the shell-out path, not just the
     /// pure classifier: a `ready` body with a failed exit is still a failure.
     #[test]
     fn preflight_rejects_ready_body_with_failed_exit() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::pi::tests::preflight_rejects_ready_body_with_failed_exit";
+        if crate::test_support::in_child_test(NAME) {
+            assert!(
+                PiDriver.health(&test_state()).is_err(),
+                "a failed exit must not be read as ready even when the body says ready"
+            );
+            return;
+        }
         let stub_dir = stub_pi_with_provider(r#"{"status":"ready"}"#, 1, "litellm");
-        let _path = PathGuard::set(stub_dir.path());
-        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
-
-        assert!(
-            PiDriver.health(&test_state()).is_err(),
-            "a failed exit must not be read as ready even when the body says ready"
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
         );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// No `settings.json` (a standard install: built-in provider from env vars
@@ -408,20 +370,28 @@ mod tests {
     /// `pi auth check` report readiness (phase-39 code review, finding 1a).
     #[test]
     fn preflight_falls_back_to_google_when_no_default_provider() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str =
+            "agents::pi::tests::preflight_falls_back_to_google_when_no_default_provider";
+        if crate::test_support::in_child_test(NAME) {
+            let stub_dir = child_pi_stub_dir();
+            PiDriver
+                .health(&test_state())
+                .expect("a default-provider stub must pass preflight via the google fallback");
+
+            let argv = std::fs::read_to_string(stub_dir.join("args.txt")).unwrap();
+            assert_eq!(
+                argv,
+                "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n"
+            );
+            return;
+        }
         let stub_dir = stub_pi_on_path(r#"{"status":"ready"}"#, 0);
-        let _path = PathGuard::set(stub_dir.path());
-        let _cfgdir = EnvGuard::set("PI_CODING_AGENT_DIR", stub_dir.path());
-
-        PiDriver
-            .health(&test_state())
-            .expect("a default-provider stub must pass preflight via the google fallback");
-
-        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(
-            argv,
-            "auth\ncheck\n--json\n--provider\ngoogle\n--no-refresh\n"
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
         );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// The capability probe shells out to `pi list --no-approve` and matches on
@@ -430,14 +400,20 @@ mod tests {
     /// argv proves the probe is exactly `pi list --no-approve`.
     #[test]
     fn pi_capabilities_detect_subagent_dispatch() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::pi::tests::pi_capabilities_detect_subagent_dispatch";
+        if crate::test_support::in_child_test(NAME) {
+            assert!(PiDriver.capabilities().subagent_dispatch);
+            let argv = std::fs::read_to_string(child_pi_stub_dir().join("args.txt")).unwrap();
+            assert_eq!(argv, "list\n--no-approve\n");
+            return;
+        }
         let stub_dir = stub_pi_on_path("npm:@bacnh85/pi-subagent@0.15.1 (user)", 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        assert!(PiDriver.capabilities().subagent_dispatch);
-
-        let argv = std::fs::read_to_string(stub_dir.path().join("args.txt")).unwrap();
-        assert_eq!(argv, "list\n--no-approve\n");
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// A `subagent`-named package that is NOT the vetted `@bacnh85/pi-subagent`
@@ -446,30 +422,51 @@ mod tests {
     /// code review, finding 2).
     #[test]
     fn pi_capabilities_exclude_unvetted_subagent_packages() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::pi::tests::pi_capabilities_exclude_unvetted_subagent_packages";
+        if crate::test_support::in_child_test(NAME) {
+            assert!(!PiDriver.capabilities().subagent_dispatch);
+            return;
+        }
         let stub_dir = stub_pi_on_path("npm:@mystilleef/pi-subagent@2.0.0 (user)", 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        assert!(!PiDriver.capabilities().subagent_dispatch);
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// No subagent package in `pi list` → capability stays off (baseline path).
     #[test]
     fn pi_capabilities_fail_closed_when_no_subagent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::pi::tests::pi_capabilities_fail_closed_when_no_subagent";
+        if crate::test_support::in_child_test(NAME) {
+            assert!(!PiDriver.capabilities().subagent_dispatch);
+            return;
+        }
         let stub_dir = stub_pi_on_path("No packages installed.", 0);
-        let _path = PathGuard::set(stub_dir.path());
-
-        assert!(!PiDriver.capabilities().subagent_dispatch);
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// A failing probe (non-zero exit) fails closed to baseline, never refuses.
     #[test]
     fn pi_capabilities_fail_closed_when_probe_fails() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAME: &str = "agents::pi::tests::pi_capabilities_fail_closed_when_probe_fails";
+        if crate::test_support::in_child_test(NAME) {
+            assert!(!PiDriver.capabilities().subagent_dispatch);
+            return;
+        }
         let stub_dir = stub_pi_on_path("", 1);
-        let _path = PathGuard::set(stub_dir.path());
-
-        assert!(!PiDriver.capabilities().subagent_dispatch);
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[("PI_CODING_AGENT_DIR", stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 }
