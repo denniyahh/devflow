@@ -591,6 +591,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blocking_human_checkpoint_ignores_a_marker_mentioned_only_in_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\n\
+             A phase whose PLAN declares `gate=\"{HUMAN_GATE_VALUE}\"` has no mechanism \
+             for receiving an operator's answer, and the same goes for \
+             `type=\"{HUMAN_ACTION_TYPE_VALUE}\"`.\n\n\
+             ```text\n\
+             gate=\"{HUMAN_GATE_VALUE}\"\n\
+             type=\"{HUMAN_ACTION_TYPE_VALUE}\"\n\
+             ```\n\n\
+             <task type=\"auto\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(93)),
+            "a marker discussed in prose must not arm the auto-decide resume route"
+        );
+    }
+
+    #[test]
+    fn task_level_blocking_human_gate_is_human_only_on_both_predicates() {
+        let blocking_dir = tempfile::tempdir().unwrap();
+        let blocking_body = format!(
+            "---\nphase: 93\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(
+            blocking_dir.path(),
+            "93-blocking-human",
+            "93-01-PLAN.md",
+            &blocking_body,
+        );
+
+        assert!(phase_has_human_only_checkpoint(
+            blocking_dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(phase_has_blocking_human_checkpoint(
+            blocking_dir.path(),
+            PhaseId::new(93)
+        ));
+
+        let action_dir = tempfile::tempdir().unwrap();
+        let action_body = format!(
+            "---\nphase: 94\n---\n\n<task type=\"{HUMAN_ACTION_TYPE_VALUE}\" gate=\"{PLAIN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(
+            action_dir.path(),
+            "94-human-action",
+            "94-01-PLAN.md",
+            &action_body,
+        );
+
+        assert!(phase_has_human_only_checkpoint(
+            action_dir.path(),
+            PhaseId::new(94)
+        ));
+        assert!(
+            !phase_has_blocking_human_checkpoint(action_dir.path(), PhaseId::new(94)),
+            "human-action is preflight-only; it must not arm resume"
+        );
+    }
+
     /// The anchoring's KNOWN LIMIT, asserted rather than left to be discovered.
     ///
     /// The anchor is a single line: "contains a marker AND opens a task
