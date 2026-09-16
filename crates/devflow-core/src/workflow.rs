@@ -8,8 +8,10 @@
 
 use crate::phase_id::PhaseId;
 use crate::state::State;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 /// Errors produced while reading or writing workflow state.
@@ -30,6 +32,7 @@ pub enum WorkflowError {
 /// listing/migration never hardcode the naming scheme.
 const STATE_FILE_PREFIX: &str = "state-";
 const CORRUPT_LEGACY_STATE_HINT: &str = "devflow recover --clean";
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Return the `.devflow` directory for a project.
 pub fn devflow_dir(project_root: &Path) -> PathBuf {
@@ -180,15 +183,64 @@ pub fn save_state(state: &State) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+/// Return a unique sibling temporary path using the shared DevFlow temp shape.
+pub(crate) fn unique_temp_path(target: &Path) -> PathBuf {
+    unique_temp_path_with(
+        target,
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+fn unique_temp_path_with(target: &Path, pid: u32, sequence: u64) -> PathBuf {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    target.with_file_name(format!(".{name}.{pid}.{sequence}.tmp"))
+}
+
+/// Create a unique sibling temporary file, retrying only a colliding orphan.
+fn create_unique_temp_for_current_process(target: &Path) -> std::io::Result<(PathBuf, File)> {
+    loop {
+        let tmp = unique_temp_path(target);
+        match File::create_new(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub(crate) fn create_unique_temp(
+    target: &Path,
+    pid: u32,
+    sequence: &AtomicU64,
+) -> std::io::Result<(PathBuf, File)> {
+    loop {
+        let tmp = unique_temp_path_with(target, pid, sequence.fetch_add(1, Ordering::Relaxed));
+        match File::create_new(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Write state through a sibling temporary file so readers never observe a
 /// truncated or partially written state file.
 fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> {
     if let Some(parent) = path.parent() {
         ensure_devflow_dir(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
+    let (tmp, mut file) = create_unique_temp_for_current_process(path)?;
+    if let Err(error) = file.write_all(contents.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -258,7 +310,7 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<(), WorkflowEr
     let path = state_path(project_root, phase);
     if path.exists() {
         debug!("clearing state at {}", path.display());
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(&path)?;
     }
     // A legacy single-slot file for this phase is the same state under its
     // old name — clearing must not leave it behind to be re-migrated.
@@ -268,6 +320,25 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<(), WorkflowEr
         && state.phase == phase
     {
         std::fs::remove_file(&legacy)?;
+    }
+    let temp_prefix = format!(
+        ".{}.",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    if let Ok(entries) = std::fs::read_dir(devflow_dir(project_root)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&temp_prefix)
+                && name.ends_with(".tmp")
+                && let Err(error) = std::fs::remove_file(entry.path())
+            {
+                warn!(
+                    "could not remove orphaned state temp {}: {error}",
+                    entry.path().display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -458,7 +529,18 @@ mod tests {
         let loaded = load_state(dir.path(), PhaseId::new(1)).expect("load");
         assert_eq!(loaded.stage, Stage::Validate);
         assert_eq!(loaded.phase, state.phase);
-        assert!(!path.with_extension("tmp").exists());
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .all(|entry| {
+                    let entry = entry.file_name();
+                    let entry = entry.to_string_lossy();
+                    !entry.starts_with(&format!(".{name}.")) || !entry.ends_with(".tmp")
+                }),
+            "successful state writes leave no temporary files"
+        );
     }
 
     #[test]
@@ -494,6 +576,82 @@ mod tests {
             load_state(dir.path(), PhaseId::new(14)).is_ok(),
             "phase 14 must survive"
         );
+    }
+
+    #[test]
+    fn state_write_leaves_no_temp_and_list_states_ignores_a_planted_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        let state = state_in(dir.path(), phase, Stage::Code);
+
+        save_state(&state).unwrap();
+        let path = state_path(dir.path(), phase);
+        let temp_prefix = format!(".{}.", path.file_name().unwrap().to_string_lossy());
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|name| !name.starts_with(&temp_prefix)),
+            "successful state writes leave no unique temp"
+        );
+        let orphan = path.with_file_name(format!(
+            ".{}.1.0.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&orphan, "orphan").unwrap();
+
+        let states = list_states(dir.path());
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].phase, phase);
+        assert_eq!(states[0].stage, Stage::Code);
+        assert!(orphan.exists(), "the planted orphan is not a state file");
+    }
+
+    #[test]
+    fn clear_state_sweeps_orphan_temps_for_its_phase_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_48 = state_path(dir.path(), PhaseId::new(48));
+        let phase_49 = state_path(dir.path(), PhaseId::new(49));
+        std::fs::create_dir_all(phase_48.parent().unwrap()).unwrap();
+        let orphan_48 = phase_48.with_file_name(format!(
+            ".{}.1.0.tmp",
+            phase_48.file_name().unwrap().to_string_lossy()
+        ));
+        let orphan_49 = phase_49.with_file_name(format!(
+            ".{}.1.0.tmp",
+            phase_49.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&orphan_48, "orphan").unwrap();
+        std::fs::write(&orphan_49, "orphan").unwrap();
+
+        clear_state(dir.path(), PhaseId::new(48)).unwrap();
+
+        assert!(!orphan_48.exists());
+        assert!(orphan_49.exists());
+    }
+
+    #[test]
+    fn unique_temp_creation_retries_after_a_same_pid_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_path(dir.path(), PhaseId::new(48));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let orphan = path.with_file_name(format!(
+            ".{}.{pid}.0.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            pid = std::process::id()
+        ));
+        std::fs::write(&orphan, "orphan").unwrap();
+
+        let (tmp, _file) = create_unique_temp(&path, std::process::id(), &counter).unwrap();
+
+        assert!(orphan.exists());
+        assert!(tmp.ends_with(format!(
+            ".{}.{pid}.1.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            pid = std::process::id()
+        )));
     }
 
     #[test]
