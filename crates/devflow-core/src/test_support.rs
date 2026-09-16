@@ -139,6 +139,82 @@ pub use crate::git::{
     ALSO_REDIRECTING_GIT_VARS, REPO_LOCAL_GIT_VARS, git_command, hermetic_command,
 };
 
+/// Environment marker for a test process that was re-invoked by
+/// [`run_test_in_child`]. Its value is the exact module-qualified test name.
+pub const CHILD_TEST_ENV: &str = "DEVFLOW_CHILD_TEST";
+
+/// Returns whether this process is the child half for `test_name`.
+pub fn in_child_test(test_name: &str) -> bool {
+    std::env::var_os(CHILD_TEST_ENV).is_some_and(|value| value == std::ffi::OsStr::new(test_name))
+}
+
+/// Re-invokes this test binary for exactly `test_name` with a child-local
+/// `PATH` and environment. The caller owns `path_dir` for the duration of the
+/// child invocation.
+pub fn run_test_in_child(
+    test_name: &str,
+    path_dir: &std::path::Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    assert!(
+        path_dir.is_dir(),
+        "child test PATH must be an existing directory: {}",
+        path_dir.display()
+    );
+
+    let exe = std::env::current_exe().expect("current_exe for child test re-invocation");
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .env("PATH", path_dir)
+        .env(CHILD_TEST_ENV, test_name);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .expect("spawn child test process with an isolated PATH")
+}
+
+/// Asserts that a child test process ran precisely its requested test and did
+/// not turn an unmatched `--exact` filter into a vacuous green result.
+pub fn assert_child_ran_exactly_one_passing_test(output: &std::process::Output, test_name: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}\n--- end child output ---"
+    );
+
+    assert!(
+        output.status.success(),
+        "child test process must exit 0; status {status:?}{context}",
+        status = output.status
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "child must report exactly `1 passed`{context}"
+    );
+    assert!(
+        stdout.contains(&format!("test {test_name} ... ok")),
+        "child stdout must carry `test {test_name} ... ok` — without it the child may have run some other test, or none{context}"
+    );
+
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    let filtered_out: u64 = words
+        .windows(3)
+        .find(|words| words[1] == "filtered" && words[2].starts_with("out"))
+        .and_then(|words| words[0].parse().ok())
+        .unwrap_or_else(|| {
+            panic!("child stdout must carry a parseable `N filtered out` count{context}")
+        });
+    assert!(
+        filtered_out > 0,
+        "child must report a NON-ZERO `filtered out` count — zero is consistent with a binary containing only this test, in which case the filter proved nothing; got {filtered_out}{context}"
+    );
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
@@ -192,6 +268,54 @@ pub use crate::git::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_with_an_empty_path_dir_cannot_spawn_git_while_the_parent_can() {
+        const NAME: &str = "test_support::tests::child_with_an_empty_path_dir_cannot_spawn_git_while_the_parent_can";
+
+        if in_child_test(NAME) {
+            let err = std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .expect_err("an empty child PATH must not resolve git");
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            return;
+        }
+
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("the parent PATH must resolve git for this control");
+        let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
+        let output = run_test_in_child(NAME, empty_dir.path(), &[]);
+        assert_child_ran_exactly_one_passing_test(&output, NAME);
+    }
+
+    #[test]
+    #[should_panic(expected = "child must report exactly `1 passed`")]
+    fn child_guard_rejects_a_name_that_matches_no_test() {
+        let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
+        let output = run_test_in_child(
+            "test_support::tests::this_module_qualified_test_does_not_exist",
+            empty_dir.path(),
+            &[],
+        );
+        assert_child_ran_exactly_one_passing_test(
+            &output,
+            "test_support::tests::this_module_qualified_test_does_not_exist",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "child test PATH must be an existing directory")]
+    fn run_test_in_child_refuses_a_path_that_is_not_a_directory() {
+        let missing = std::path::Path::new("this-path-must-not-exist-for-child-test");
+        run_test_in_child(
+            "test_support::tests::run_test_in_child_refuses_a_path_that_is_not_a_directory",
+            missing,
+            &[],
+        );
+    }
 
     /// Positive case (25-11/999.47, the whole point of the barrier): a real
     /// child whose argv[0] basename is known and differs from this test
