@@ -357,6 +357,28 @@ pub(crate) fn start(
         return Ok(());
     }
 
+    let _phase_lock = match lock::acquire(project_root, phase) {
+        Ok(guard) => guard,
+        Err(lock::LockError::Contended { pid, .. }) => {
+            return Err(CliError::Message(format!(
+                "phase {phase}: another devflow process (pid {pid}) holds the per-phase lock \
+                 — refusing to start; nothing was written"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(err.to_string())),
+    };
+    for stage in [
+        Stage::Define,
+        Stage::Plan,
+        Stage::Code,
+        Stage::Validate,
+        Stage::Ship,
+    ] {
+        if let Err(err) = Gates::cleanup(project_root, phase, stage) {
+            eprintln!("warning: could not clear stale gate files for phase {phase} {stage}: {err}");
+        }
+    }
+
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
     ensure_agent_binary(agent_program(agent))?;
@@ -1785,10 +1807,13 @@ fn reap_stray_candidates(
 /// foreground child, `monitor_pid` already names a process that exited long
 /// ago; `lock::holder`'s recorded pid is the only correct target).
 pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    if !stop_via_gate(project_root, phase)? {
-        stop_via_lock(project_root, phase)?;
-    }
-    persist_stopped_state(project_root, phase)
+    let gate_answered = stop_via_gate(project_root, phase)?;
+    let signal_sent = if gate_answered {
+        false
+    } else {
+        stop_via_lock(project_root, phase)?
+    };
+    persist_stopped_state(project_root, phase, gate_answered, signal_sent)
 }
 
 /// The primary path: answer `phase`'s open gate with a rejection whose note
@@ -1849,24 +1874,24 @@ fn stop_via_gate(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> 
 /// does not look like a devflow process is refused, not signalled, since
 /// the lock may be stale with a recycled pid. Never reads
 /// `state.monitor_pid` — see [`stop`]'s doc comment.
-fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
     let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
         println!("stop: no lock held for phase {phase} — nothing is running `advance()`");
-        return Ok(());
+        return Ok(false);
     };
     let Ok(pid) = pid_str.parse::<u32>() else {
         println!(
             "stop: phase {phase}'s lock file holds a corrupt pid ({pid_str}) — treating it \
              as stale"
         );
-        return Ok(());
+        return Ok(false);
     };
     if !agent::agent_running(pid) {
         println!(
             "stop: phase {phase}'s lock names pid {pid}, which is not alive — stale lock, \
              nothing to signal"
         );
-        return Ok(());
+        return Ok(false);
     }
     // Identity must be MATCHED against what the lock recorded, never inferred
     // from /proc (999.47). A bare cmdline-basename check alone returns true
@@ -1914,10 +1939,11 @@ fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
     }
     if agent::terminate(pid) {
         println!("stop: signalled pid {pid}, phase {phase}'s lock holder");
+        Ok(true)
     } else {
         println!("stop: pid {pid} could not be signalled (it may have just exited)");
+        Ok(false)
     }
-    Ok(())
 }
 
 /// Persist the operator's intent: mark `stopped` and record why, preserving
@@ -1927,7 +1953,34 @@ fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
 /// --until`) and `transition()` reads it. A phase with no persisted state
 /// at all — never started, or already cleared by a completed abort — is
 /// already stopped; that is success, not an error.
-fn persist_stopped_state(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+fn persist_stopped_state(
+    project_root: &Path,
+    phase: PhaseId,
+    gate_answered: bool,
+    signal_sent: bool,
+) -> Result<(), CliError> {
+    let _phase_lock = if signal_sent {
+        lock::acquire_blocking(project_root, phase, agent::TERMINATE_VERIFY_WAIT)
+    } else {
+        lock::acquire(project_root, phase)
+    };
+    let _phase_lock = match _phase_lock {
+        Ok(guard) => guard,
+        Err(lock::LockError::Contended { pid, .. }) if gate_answered => {
+            println!(
+                "stop: phase {phase}'s lock holder (pid {pid}) is waiting on the gate and \
+                 will clear phase state as it aborts"
+            );
+            return Ok(());
+        }
+        Err(lock::LockError::Contended { pid, .. }) => {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s lock holder (pid {pid}) is still alive; phase state \
+                 was not marked stopped"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(err.to_string())),
+    };
     let mut state = match workflow::load_state(project_root, phase) {
         Ok(state) => state,
         Err(workflow::WorkflowError::MissingState(_)) => {
