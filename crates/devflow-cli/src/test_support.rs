@@ -23,9 +23,9 @@ use std::sync::Mutex;
 /// `remove_var` are process-wide and `cargo test` runs in parallel by
 /// default) so they don't race each other.
 ///
-/// **D-04 invariant, stated explicitly: every env var is guarded by
-/// exactly one mutex, and no var is touched under two.** This invariant currently
-/// holds only by accident across three independent statics — this one, and
+/// **D-04 invariant, stated explicitly: every remaining process-global env
+/// var is guarded by exactly one mutex, and no var is touched under two.** This
+/// invariant currently holds only by accident across three independent statics — this one, and
 /// two more in `devflow-core` (`gates.rs:348`, `config.rs:174`). Those two
 /// are safe today only because `devflow-core` and `devflow-cli` compile
 /// into different test binaries, so their env mutations can never race each
@@ -33,14 +33,15 @@ use std::sync::Mutex;
 /// invariant across that crate boundary — it is true today only because no
 /// env var is currently guarded by more than one of the three statics.
 ///
-/// This mutex currently guards five variables: `PATH`,
+/// `PATH` is no longer process-global in this crate's tests: child fixtures
+/// supply a directory-only value through `run_test_in_child`. This mutex
+/// currently guards the four deferred process-global variables
 /// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`,
-/// `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` (WR-02,
-/// phase 20 review). A future author adding a sixth mutated variable to
+/// `DEVFLOW_GATE_NOTIFY_CMD`, and `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
+/// (WR-02, phase 20 review). A future author adding another mutated variable to
 /// this crate's tests is joining this set — guard it here, not with a new
 /// mutex (D-02: per-module mutexes were rejected on measured evidence that
-/// `PATH` alone is mutated 36 times across 12 lock regions spanning at
-/// least three future target clusters).
+/// one process-global variable can span multiple future target clusters).
 ///
 /// One static suffices for the whole `devflow` binary crate after the
 /// `main.rs` split (19c–19f): every D-05 target module stays inside this
@@ -53,11 +54,9 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// Acquire [`ENV_MUTEX`], recovering the guard if a previous holder panicked.
 ///
 /// **This is the intended entry point; do not call `ENV_MUTEX.lock().unwrap()`
-/// directly.** [`NeutralPath`]'s doc comment already describes the cascade this
-/// exists to stop, in the paragraph beginning "What the trailing-statement
-/// shape costs" — one legible failing assertion becomes a `PoisonError` panic
-/// in every subsequent env-mutating test in the binary. That paragraph
-/// documents the amplification; this function is what prevents it. Measured on
+/// directly.** A failing assertion can otherwise become a `PoisonError` panic
+/// in every subsequent env-mutating test in the binary. This function prevents
+/// that amplification. Measured on
 /// this suite: a single induced `assert!(false)` under the lock reported **25
 /// failures (24 of them `PoisonError`)** through `.lock().unwrap()`, and
 /// **exactly 1** through this accessor.
@@ -69,8 +68,6 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// is restored on the unwinding path by an RAII guard rather than by a trailing
 /// statement:
 ///
-/// - [`NeutralPath`] restores (or removes) `PATH` in its `Drop`, and holds the
-///   neutral `TempDir` so `PATH` never transiently names a deleted directory.
 /// - [`ReapMonitorOnDrop`] reaps the detached monitor wrapper in its `Drop`,
 ///   with a `std::thread::panicking()` interlock so it cannot double-panic into
 ///   an `abort()` during the very unwind it is cleaning up after.
@@ -80,18 +77,16 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// restored. That is the whole argument, and it is conditional:
 ///
 /// **Without those guards this accessor WOULD be unsound.** It is stated
-/// plainly because the failure is silent — a future author who replaces a
-/// `NeutralPath` binding with a trailing `set_var("PATH", original)`, or drops a
+/// plainly because the failure is silent — a future author who replaces
+/// unwind-safe cleanup with a trailing restoration call, or drops a
 /// `ReapMonitorOnDrop` in favour of a trailing `reap_spawned_monitor` call, will
-/// see no compiler error and no failing test. They will instead have converted
-/// this function from "tolerates poison because cleanup already happened" into
-/// "silently hands the next test a `PATH` naming a deleted directory". If you
-/// are removing an unwind-safe guard, you are changing this function's premise;
-/// re-read [`NeutralPath`] before you do.
+/// see no compiler error and no failing test. They will instead hand the next
+/// test half-restored process-global state. If you are removing an unwind-safe
+/// guard, you are changing this function's premise.
 ///
 /// Directly mutated env vars inside a lock region are still the caller's
 /// responsibility to restore — this accessor does not make an unguarded
-/// `set_var` safe, any more than [`NeutralPath`] makes one safe on its own.
+/// `set_var` safe on its own.
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_MUTEX
         .lock()

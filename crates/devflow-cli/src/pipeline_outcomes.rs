@@ -1285,12 +1285,11 @@ mod tests {
     /// only thing that differs is `State::base_branch`.
     #[test]
     fn checkout_hooks_merge_into_the_persisted_base_not_the_ambient_default() {
-        // This test shells out to `git`, and sibling tests in this binary
-        // blank process-global `PATH` via `NeutralPath::install`, whose
-        // documented precondition is that the caller holds `ENV_MUTEX`.
-        // Without taking the same lock, a concurrent `NeutralPath` window
-        // makes every `git` spawn here fail with `NotFound` — a real,
-        // observed flake, not a theoretical one.
+        // This test shells out to `git`. Sibling fixtures now supply an empty
+        // PATH only on their child `Command`, so this parent cannot observe a
+        // concurrent PATH change. The retained shared lock follows the
+        // one-mutex-per-variable rule while other process-global mutations are
+        // still deferred.
         let _env = crate::test_support::env_lock();
 
         // Returns the branch the phase work actually landed on.
@@ -2436,14 +2435,15 @@ mod tests {
     /// a real, non-zero value throughout, so a green result here cannot be
     /// explained by the branch changing underneath the test.
     ///
-    /// **A child for cycle 1, `NeutralPath` in the parent for cycle 2.**
+    /// **A child for cycle 1, a command-local git-only PATH for cycle 2.**
     /// Cycle 1 needs `git` to be UNRESOLVABLE — only a spawn that fails makes
     /// `.output()` return `Err`, which is the sole could-not-measure condition
     /// (F-1); a shim that ran and exited non-zero would be a real observation
     /// and would exercise the already-correct `Some(0)` path (NC-4). The
     /// child owns that empty `PATH`, so no sibling test can observe it. Cycle
     /// 2 needs a real `git` but still no resolvable agent CLI, which is exactly
-    /// what `NeutralPath`'s git-only `PATH` provides in the parent.
+    /// what a child `Command` with a git-only PATH provides without exposing it
+    /// to sibling tests.
     ///
     /// **What this does NOT establish.** A forced-run boundary. `State::new`
     /// zeroes both `consecutive_failures` and the baseline on every `devflow
