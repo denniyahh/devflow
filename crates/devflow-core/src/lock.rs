@@ -34,6 +34,30 @@ pub fn acquire(project_root: &Path, phase: PhaseId) -> Result<LockGuard, LockErr
     acquire_path(lock_path(project_root, phase))
 }
 
+/// Blocking variant of [`acquire`]: waits out a live phase-lock holder,
+/// retrying acquisition so a stale lock is reclaimed by [`acquire`].
+pub fn acquire_blocking(
+    project_root: &Path,
+    phase: PhaseId,
+    timeout: std::time::Duration,
+) -> Result<LockGuard, LockError> {
+    let start = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(100);
+    loop {
+        match acquire(project_root, phase) {
+            Ok(guard) => return Ok(guard),
+            Err(err @ LockError::Contended { .. }) => {
+                if start.elapsed() >= timeout {
+                    return Err(err);
+                }
+                std::thread::sleep(backoff.min(timeout.saturating_sub(start.elapsed())));
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Acquire the short-held, project-wide lock that serializes mutations of the
 /// primary checkout (version-bump commits/tags, docs commits, branch
 /// integration/cleanup) across concurrently finishing phases
@@ -459,6 +483,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _held = acquire_project(dir.path()).expect("first acquire");
         let err = acquire_project_blocking(dir.path(), std::time::Duration::from_millis(300))
+            .expect_err("must time out while the live holder keeps the lock");
+        assert!(matches!(err, LockError::Contended { .. }));
+    }
+
+    #[test]
+    fn phase_lock_blocking_waits_for_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let held = acquire(dir.path(), phase).expect("first acquire");
+        let root = dir.path().to_path_buf();
+
+        std::thread::scope(|scope| {
+            let waiter = scope
+                .spawn(move || acquire_blocking(&root, phase, std::time::Duration::from_secs(10)));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+            waiter
+                .join()
+                .expect("waiter thread")
+                .expect("blocking acquire must succeed once the holder releases");
+        });
+    }
+
+    #[test]
+    fn phase_lock_blocking_times_out_against_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let _held = acquire(dir.path(), phase).expect("first acquire");
+        let err = acquire_blocking(dir.path(), phase, std::time::Duration::from_millis(300))
             .expect_err("must time out while the live holder keeps the lock");
         assert!(matches!(err, LockError::Contended { .. }));
     }
