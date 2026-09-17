@@ -18,7 +18,7 @@ use devflow_core::state::{AgentKind, State};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 fn devflow_bin() -> &'static str {
@@ -87,6 +87,147 @@ fn e2e_child_timeout() -> Duration {
         .and_then(|s| s.parse().ok())
         .unwrap_or(90);
     Duration::from_secs(secs)
+}
+
+fn write_live_lock(root: &Path, phase: PhaseId, child: &Child, recorded_start: u64) {
+    let lock = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(lock, format!("{}\n{recorded_start}", child.id())).unwrap();
+}
+
+fn kill_and_reap(child: &mut Child) {
+    if child.try_wait().expect("poll holder").is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[test]
+fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(103);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn holder");
+    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
+    write_live_lock(root, phase, &holder, start);
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!holder.wait().expect("reap holder").success());
+    let state = devflow_core::workflow::load_state(root, phase).unwrap();
+    assert!(state.stopped);
+    assert!(
+        state
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("devflow stop"))
+    );
+}
+
+#[test]
+fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(104);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
+    let before = std::fs::read(&state_path).unwrap();
+    let mut holder = Command::new("sh")
+        .args(["-c", "trap '' TERM; exec sleep 60"])
+        .spawn()
+        .expect("spawn TERM-ignoring holder");
+    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
+    write_live_lock(root, phase, &holder, start);
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        !output.status.success(),
+        "stop must refuse to mark state while the holder survives\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&holder.id().to_string()) && stderr.contains("not marked"));
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    kill_and_reap(&mut holder);
+}
+
+#[test]
+fn stop_never_signals_the_recorded_monitor_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(105);
+    let mut monitor = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn monitor");
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.monitor_pid = Some(monitor.id());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(output.status.success());
+    assert!(monitor.try_wait().expect("poll monitor").is_none());
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .stopped
+    );
+    kill_and_reap(&mut monitor);
+}
+
+#[test]
+fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(106);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
+    let before = std::fs::read(&state_path).unwrap();
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn holder");
+    let wrong_start =
+        devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
+    write_live_lock(root, phase, &holder, wrong_start);
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to signal"));
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    kill_and_reap(&mut holder);
 }
 
 /// Wait for `child` to exit, `try_wait`-polling on a short interval rather
