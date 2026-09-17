@@ -26,6 +26,39 @@ pub enum LockError {
     Io(#[from] io::Error),
 }
 
+/// What a read-only inspection can establish about a phase lock's holder.
+///
+/// A [`Recycled`](Self::Recycled) PID is not a waiter: the lock file names a
+/// process instance that has exited, even though that numeric PID now belongs
+/// to another live process. [`Unconfirmable`](Self::Unconfirmable) remains
+/// conservatively waiter-like because the process exists but its identity
+/// cannot be established from the lock record and `/proc` together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderStatus {
+    /// No readable lock record names a currently running process.
+    NoHolder,
+    /// A running process matches both recorded halves of its identity.
+    Live { pid: u32 },
+    /// A running process has reused the recorded PID with a different start time.
+    Recycled { pid: u32 },
+    /// A process is running but its identity cannot be checked safely.
+    Unconfirmable { pid: u32 },
+}
+
+impl HolderStatus {
+    /// Whether this status may still describe a process waiting on a gate.
+    ///
+    /// Command responses can treat [`Recycled`](Self::Recycled) as no waiter,
+    /// while destructive recovery must still use lock acquisition instead of
+    /// this observational result to serialize any cleanup.
+    pub fn may_be_waiting(self) -> bool {
+        match self {
+            Self::NoHolder | Self::Recycled { .. } => false,
+            Self::Live { .. } | Self::Unconfirmable { .. } => true,
+        }
+    }
+}
+
 /// Acquire an exclusive lock for the given project root and phase.
 ///
 /// Writes the current PID into `.devflow/lock-{phase:02}`. Returns a guard
@@ -190,6 +223,65 @@ fn read_holder_start_time(path: &Path) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HolderRecord {
+    pid: u32,
+    recorded_start_time: Option<u64>,
+}
+
+/// Read a lock record without changing the file.
+///
+/// This parser belongs only to [`holder_status`]. Unlike [`holder`], status
+/// inspection must let doctor report empty and corrupt artifacts without
+/// deleting them.
+fn read_holder_record(path: &Path) -> Option<HolderRecord> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse::<u32>().ok()?;
+    let recorded_start_time = lines.next().and_then(|line| line.trim().parse().ok());
+    Some(HolderRecord {
+        pid,
+        recorded_start_time,
+    })
+}
+
+fn classify_holder_record(
+    record: HolderRecord,
+    is_running: bool,
+    observed_start_time: Option<u64>,
+) -> HolderStatus {
+    if !is_running {
+        return HolderStatus::NoHolder;
+    }
+
+    match (record.recorded_start_time, observed_start_time) {
+        (Some(recorded), Some(observed)) if recorded == observed => {
+            HolderStatus::Live { pid: record.pid }
+        }
+        (Some(_), Some(_)) => HolderStatus::Recycled { pid: record.pid },
+        _ => HolderStatus::Unconfirmable { pid: record.pid },
+    }
+}
+
+/// Read the current phase lock without changing it and classify its holder.
+///
+/// Empty, unreadable, corrupt, and dead-holder records are all
+/// [`HolderStatus::NoHolder`]. A live PID is only [`HolderStatus::Live`] when
+/// the recorded start time matches the observed process start time; missing
+/// identity data is [`HolderStatus::Unconfirmable`] rather than an unsafe
+/// guess.
+pub fn holder_status(project_root: &Path, phase: PhaseId) -> HolderStatus {
+    let path = lock_path(project_root, phase);
+    let Some(record) = read_holder_record(&path) else {
+        return HolderStatus::NoHolder;
+    };
+    classify_holder_record(
+        record,
+        crate::agent::agent_running(record.pid),
+        crate::agent::process_start_time(record.pid),
+    )
 }
 
 /// The recorded identity of a phase lock's holder: its pid, and its start
@@ -386,6 +478,94 @@ mod tests {
         // Empty/stale lock should be removed so a fresh acquire succeeds.
         assert!(!path.exists());
         let _guard = acquire(dir.path(), PhaseId::new(1)).expect("acquire after stale cleanup");
+    }
+
+    #[test]
+    fn holder_status_reports_no_holder_and_preserves_empty_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
+
+        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        fs::write(&path, "not-a-pid").unwrap();
+        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
+
+        fs::write(&path, "9999999").unwrap();
+        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
+
+        fs::write(&path, "   \n").unwrap();
+        assert_eq!(holder_status(dir.path(), phase), HolderStatus::NoHolder);
+        assert!(
+            path.exists(),
+            "holder status inspection must preserve an empty lock file"
+        );
+    }
+
+    #[test]
+    fn holder_status_reports_live_for_an_identity_matched_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let _guard = acquire(dir.path(), phase).expect("acquire");
+
+        assert_eq!(
+            holder_status(dir.path(), phase),
+            HolderStatus::Live {
+                pid: std::process::id()
+            }
+        );
+    }
+
+    #[test]
+    fn holder_status_distinguishes_recycled_and_unconfirmable() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
+        let pid = std::process::id();
+        let start = crate::agent::process_start_time(pid)
+            .expect("the test process must expose its start time");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        fs::write(&path, format!("{pid}\n{}", start.saturating_add(1))).unwrap();
+        assert_eq!(
+            holder_status(dir.path(), phase),
+            HolderStatus::Recycled { pid }
+        );
+
+        fs::write(&path, pid.to_string()).unwrap();
+        assert_eq!(
+            holder_status(dir.path(), phase),
+            HolderStatus::Unconfirmable { pid }
+        );
+
+        fs::write(&path, format!("{pid}\nnot-a-start-time")).unwrap();
+        assert_eq!(
+            holder_status(dir.path(), phase),
+            HolderStatus::Unconfirmable { pid }
+        );
+
+        assert_eq!(
+            classify_holder_record(
+                HolderRecord {
+                    pid,
+                    recorded_start_time: Some(start),
+                },
+                true,
+                None,
+            ),
+            HolderStatus::Unconfirmable { pid },
+            "a live pid with an unavailable observed start time is unconfirmable"
+        );
+    }
+
+    #[test]
+    fn holder_status_may_be_waiting_only_for_live_and_unconfirmable() {
+        let pid = std::process::id();
+        assert!(!HolderStatus::NoHolder.may_be_waiting());
+        assert!(HolderStatus::Live { pid }.may_be_waiting());
+        assert!(!HolderStatus::Recycled { pid }.may_be_waiting());
+        assert!(HolderStatus::Unconfirmable { pid }.may_be_waiting());
     }
 
     /// 13-06 dogfood regression: a killed poller's abandoned lock wedged
