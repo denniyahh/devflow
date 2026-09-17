@@ -66,7 +66,7 @@ Asynchronous process and file effects use bounded polling helpers. Keep the asse
 There is no mocking framework. Tests replace only process boundaries that should not call a real external agent:
 
 - Fake `claude`, `codex`, or `opencode` executables are written into a temporary directory.
-- The temporary directory is prepended to `PATH` for the scoped test.
+- The temporary directory is supplied as a directory-only `PATH` on the child `Command` through `devflow_core::test_support::run_test_in_child`; it is never installed in the parent test process.
 - Fake agents print controlled output and `DEVFLOW_RESULT` markers.
 
 Do not mock Git or filesystem behavior when a temporary repository can exercise the real operation. The integration suite intentionally validates actual Git commands, worktrees, branches, commits, and capture files.
@@ -81,15 +81,18 @@ Do not mock Git or filesystem behavior when a temporary repository can exercise 
 - `agent_free_git_only_path_dir` and `agent_free_dir_with_agent_stub`
 - `stub_agent_binary`
 - `prepend_path`
+- `run_test_in_child` and `assert_child_ran_exactly_one_passing_test`
 - `stage_launched_count`
 
 Integration-test helpers remain local to their integration-test binary because sibling files under `tests/` compile as separate crates.
 
 ## Environment Mutation Rule
 
-Any CLI unit test that changes `PATH`, `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, or `DEVFLOW_GATE_NOTIFY_CMD` must hold `crate::test_support::ENV_MUTEX` for the complete save, mutate, exercise, and restore sequence. Do not declare a second mutex.
+`PATH` is supplied only on a child `Command` through `devflow_core::test_support::run_test_in_child`. Its replacement is always a directory, not a removed value, and every child result is checked with `assert_child_ran_exactly_one_passing_test` using the module-qualified test name so an exact filter that runs zero tests cannot look green.
 
-**D-04 invariant: every env var is guarded by exactly one mutex, and no var is touched under two.** This is a reviewer-enforced convention; no type or lint checks it mechanically.
+The remaining process-global test mutations (`DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `DEVFLOW_GATE_NOTIFY_CMD`, and `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`) are deliberately deferred. Each must hold `crate::test_support::ENV_MUTEX` for the complete save, mutate, exercise, and restore sequence, and must carry a reasoned `#[expect(clippy::disallowed_methods, reason = "...")]` on its smallest enclosing test-only item. `clippy.toml` enforces that exception rule; it does not match the repository's post-commit checklist trigger, so no `DEV-SETUP-CHECKLIST` change is needed. Do not declare a second mutex.
+
+**D-04 invariant: every remaining process-global env var is guarded by exactly one mutex, and no var is touched under two.** This is a reviewer-enforced convention; no type or lint checks it mechanically.
 
 `crates/devflow-core/src/gates.rs` and `crates/devflow-core/src/config.rs` each retain their own `ENV_MUTEX`. That is safe only because core and CLI tests compile into different test binaries, so their process-global environments cannot race across the crate boundary. Inside one test binary, a new mutex would violate the invariant.
 
