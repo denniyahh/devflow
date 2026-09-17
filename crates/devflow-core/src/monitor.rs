@@ -421,20 +421,13 @@ fn spawn_monitor_inner(
         // construction and `.envs(...)` runs after, so deliberate
         // configuration survives while inherited pollution does not.
         let child = hermetic_command(&binary, workdir_path)
-            .arg("__monitor")
-            .arg("--project")
-            .arg(project_root)
-            .arg("--phase")
-            .arg(state.phase.to_string())
-            .arg("--workdir")
-            .arg(workdir)
-            .arg("--prompt-file")
-            .arg(prompt_file)
-            .arg("--idle-timeout-secs")
-            .arg(idle.timeout.as_secs().to_string())
-            .arg("--agent")
-            .arg(state.agent.to_string())
-            .arg("--")
+            .args(pipe_owning_monitor_args(
+                project_root,
+                state,
+                workdir,
+                prompt_file,
+                idle.timeout.as_secs(),
+            ))
             .arg(program)
             .args(args)
             .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -471,12 +464,7 @@ fn spawn_monitor_inner(
     // before the trap is installed so a signal arriving before the agent is
     // even backgrounded doesn't reference an unset variable.
     let advance_tail = if run_advance {
-        format!(
-            "; {binary} advance {project_root} --phase {phase}",
-            binary = shell_escape(&binary),
-            project_root = shell_escape(project_root),
-            phase = state.phase,
-        )
+        advance_tail(&binary, project_root, state)
     } else {
         String::new()
     };
@@ -525,6 +513,43 @@ fn spawn_monitor_inner(
     let pid = child.id();
     info!("monitor spawned with pid {pid}");
     Ok(pid)
+}
+
+fn pipe_owning_monitor_args(
+    project_root: &str,
+    state: &State,
+    workdir: &str,
+    prompt_file: &str,
+    idle_timeout_secs: u64,
+) -> Vec<String> {
+    vec![
+        "__monitor".to_string(),
+        "--project".to_string(),
+        project_root.to_string(),
+        "--phase".to_string(),
+        state.phase.to_string(),
+        "--stage".to_string(),
+        state.stage.to_string(),
+        "--workdir".to_string(),
+        workdir.to_string(),
+        "--prompt-file".to_string(),
+        prompt_file.to_string(),
+        "--idle-timeout-secs".to_string(),
+        idle_timeout_secs.to_string(),
+        "--agent".to_string(),
+        state.agent.to_string(),
+        "--".to_string(),
+    ]
+}
+
+fn advance_tail(binary: &str, project_root: &str, state: &State) -> String {
+    format!(
+        "; {binary} advance {project_root} --phase {phase} --stage {stage}",
+        binary = shell_escape(binary),
+        project_root = shell_escape(project_root),
+        phase = state.phase,
+        stage = state.stage,
+    )
 }
 
 /// Constraint 4's close rule as a pure, line-fed state machine: stdin may be
@@ -1462,6 +1487,31 @@ mod tests {
     use crate::mode::Mode;
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
+
+    #[test]
+    fn legacy_advance_tail_passes_the_launched_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_in(dir.path());
+        state.stage = Stage::Code;
+        let root = dir.path().to_str().unwrap();
+
+        let tail = advance_tail("devflow", root, &state);
+        assert!(tail.contains(" advance "));
+        assert!(tail.contains(&format!("--phase {} --stage code", state.phase)));
+    }
+
+    #[test]
+    fn pipe_owning_monitor_args_pass_the_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_in(dir.path());
+        state.stage = Stage::Code;
+        let args = pipe_owning_monitor_args("/project", &state, "/workdir", "/prompt", 60);
+        let stage = args.iter().position(|arg| arg == "--stage").unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+
+        assert_eq!(args[stage + 1], "code");
+        assert!(stage < separator, "stage must be parsed before child argv");
+    }
 
     fn state_in(root: &Path) -> State {
         let mut state = State::new(

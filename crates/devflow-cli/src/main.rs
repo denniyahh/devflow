@@ -12,7 +12,7 @@ mod staleness;
 mod preflight;
 
 mod pipeline_launch;
-use pipeline_launch::{advance, resume, run_monitor};
+use pipeline_launch::{resume, run_monitor};
 
 mod pipeline_outcomes;
 
@@ -124,6 +124,9 @@ enum Command {
         /// spawn time so advance never depends on a shared state singleton.
         #[arg(long)]
         phase: Option<PhaseId>,
+        /// Stage the monitor launched; omitted only by monitors from older binaries.
+        #[arg(long)]
+        stage: Option<Stage>,
     },
     /// Internal: the pipe-owning monitor's own process entry point (Phase 31).
     ///
@@ -139,6 +142,9 @@ enum Command {
         /// Phase whose stage machine to advance once the child is reaped.
         #[arg(long)]
         phase: PhaseId,
+        /// Stage the monitor launched; passed to advance after the child exits.
+        #[arg(long)]
+        stage: Option<Stage>,
         /// Directory the supervised child runs in (the phase worktree when
         /// worktree mode is active, else the project root).
         #[arg(long)]
@@ -574,10 +580,15 @@ fn run() -> Result<(), CliError> {
                 legacy_claude_launch,
             )
         }
-        Command::Advance { project, phase } => advance(&project_root(project)?, phase),
+        Command::Advance {
+            project,
+            phase,
+            stage,
+        } => pipeline_launch::advance_for_stage(&project_root(project)?, phase, stage),
         Command::Monitor {
             project,
             phase,
+            stage,
             workdir,
             prompt_file,
             idle_timeout_secs,
@@ -586,6 +597,7 @@ fn run() -> Result<(), CliError> {
         } => run_monitor(
             &project_root(project)?,
             phase,
+            stage,
             &workdir,
             &prompt_file,
             idle_timeout_secs,

@@ -46,7 +46,13 @@ use devflow_core::{
     agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
 };
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// `advance` waits for a post-spawn lock holder because it normally finishes
+/// in seconds; after ten chosen (not measured) minutes the holder is likely at
+/// a gate or wedged, and doctor then resume is the explicit recovery path.
+pub(crate) const ADVANCE_LOCK_WAIT: Duration = Duration::from_secs(600);
 
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
 /// and spawning the monitor. (25b, D-03: this function no longer performs
@@ -905,9 +911,14 @@ impl Drop for AutoChainGuard {
 /// sufficient only because the sole adapter routed through the pipe-owning arm
 /// (Claude) declares no extra env; see the note at `spawn_monitor`'s
 /// `PipeOwning` arm before widening it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hidden CLI dispatch supplies these independently parsed monitor arguments"
+)]
 pub(crate) fn run_monitor(
     project_root: &Path,
     phase: PhaseId,
+    stage: Option<Stage>,
     workdir: &Path,
     prompt_file: &Path,
     idle_timeout_secs: u64,
@@ -978,7 +989,7 @@ pub(crate) fn run_monitor(
     )
     .map_err(|err| CliError::Message(format!("pipe-owning monitor failed: {err}")))?;
 
-    advance(project_root, Some(phase))
+    advance_for_stage(project_root, Some(phase), stage)
 }
 
 /// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
@@ -1507,7 +1518,16 @@ fn augment_unresolved_checkpoint_reason(reason: Option<String>, why: &str) -> St
 
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
 /// Invoked by the monitor process; not normally run by a human.
+#[cfg(test)]
 pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(), CliError> {
+    advance_for_stage(project_root, phase, None)
+}
+
+pub(crate) fn advance_for_stage(
+    project_root: &Path,
+    phase: Option<PhaseId>,
+    stage: Option<Stage>,
+) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor
     // (recorded at spawn time), so advance's identity never depends on a
     // shared state singleton — under `devflow parallel`, each monitor
@@ -1533,15 +1553,35 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
             }
         },
     };
+    advance_with(project_root, phase, stage, ADVANCE_LOCK_WAIT)
+}
+
+pub(crate) fn advance_with(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    lock_wait: Duration,
+) -> Result<(), CliError> {
     // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
     // advance() holds it across a gate's multi-day blocking wait, and every
     // successful run ends at a mandatory Ship gate — a project-wide lock
     // would starve `devflow parallel`'s sibling phases with no retry.
-    let _lock = match lock::acquire(project_root, phase) {
+    let _lock = match lock::acquire_blocking(project_root, phase, lock_wait) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, path: _ }) => {
+            events::emit(
+                project_root,
+                phase,
+                "advance_failed",
+                serde_json::json!({
+                    "reason": "lock wait expired",
+                    "holder_pid": pid,
+                    "waited_secs": lock_wait.as_secs_f64(),
+                }),
+            );
             return Err(CliError::Message(format!(
-                "another devflow process (pid {pid}) is already running"
+                "advance lock wait expired after {} seconds; holder pid {pid}",
+                lock_wait.as_secs_f64()
             )));
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
@@ -1549,9 +1589,35 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
     // Load under the lock: with per-phase state files keyed by the same
     // phase as the lock, there is no cross-phase TOCTOU left by
     // construction — a concurrent advance of another phase touches a
-    // different file and a duplicate advance of THIS phase is excluded by
-    // the lock itself.
+    // different file. A duplicate advance of THIS phase queues behind the
+    // lock, then stage binding below handles a launch that has moved on.
     let mut state = workflow::load_state(project_root, phase)?;
+
+    match stage {
+        Some(expected) if expected != state.stage => {
+            events::emit(
+                project_root,
+                phase,
+                "advance_failed",
+                serde_json::json!({
+                    "reason": "stage mismatch",
+                    "expected": expected.to_string(),
+                    "actual": state.stage.to_string(),
+                }),
+            );
+            return Err(CliError::Message(format!(
+                "advance stage mismatch: expected {expected}, state is {}",
+                state.stage
+            )));
+        }
+        None => events::emit(
+            project_root,
+            phase,
+            "advance_stage_unbound",
+            serde_json::json!({ "stage": state.stage.to_string() }),
+        ),
+        Some(_) => {}
+    }
 
     // Project-resolved (45-01): `evaluate_agent_result`'s Layer 2 counts
     // commits in a `{trunk}..{feature}` range, so a defaulted trunk
@@ -2701,7 +2767,7 @@ mod tests {
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                advance(root, Some(phase)).unwrap();
+                advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
             });
 
             let mut seen = false;
@@ -2871,7 +2937,7 @@ mod tests {
         )
         .unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         // advance_evaluated isn't the last event once the infra gate/abort
         // path runs, so read the raw log and find it by name rather than
@@ -2896,6 +2962,115 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| event["event"] == kind)
             .collect()
+    }
+
+    #[test]
+    fn advance_waits_for_a_held_lock_then_proceeds() {
+        const NAME: &str = "pipeline_launch::tests::advance_waits_for_a_held_lock_then_proceeds";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(48);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let held = lock::acquire(root, phase).expect("test holder acquires phase lock");
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                drop(held);
+            });
+            let result = advance_with(root, phase, None, Duration::from_secs(10));
+            assert!(result.is_ok(), "advance result: {result:?}");
+        });
+    }
+
+    #[test]
+    fn advance_lock_wait_expiry_emits_advance_failed() {
+        const NAME: &str = "pipeline_launch::tests::advance_lock_wait_expiry_emits_advance_failed";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(49);
+        let _held = lock::acquire(root, phase).expect("test holder acquires phase lock");
+
+        let err = advance_with(root, phase, None, Duration::from_millis(300))
+            .expect_err("advance must time out behind a live holder");
+        assert!(err.to_string().contains("holder pid"));
+        let failed = events_of_kind(root, "advance_failed");
+        assert_eq!(failed.len(), 1, "one durable failure event: {failed:?}");
+        assert_eq!(failed[0]["phase"], 49);
+        assert_eq!(failed[0]["reason"], "lock wait expired");
+        assert!(failed[0]["holder_pid"].as_str().is_some());
+    }
+
+    #[test]
+    fn advance_refuses_when_the_saved_stage_moved_on() {
+        const NAME: &str = "pipeline_launch::tests::advance_refuses_when_the_saved_stage_moved_on";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(50);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let err = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(1))
+            .expect_err("advance must reject a stage that has moved on");
+        assert!(err.to_string().contains("stage mismatch"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        let failed = events_of_kind(root, "advance_failed");
+        assert_eq!(failed.len(), 1, "one durable refusal event: {failed:?}");
+        assert_eq!(failed[0]["reason"], "stage mismatch");
+        assert_eq!(failed[0]["expected"], "define");
+        assert_eq!(failed[0]["actual"], "code");
+    }
+
+    #[test]
+    fn advance_without_stage_proceeds_and_records_the_legacy_invocation() {
+        const NAME: &str = "pipeline_launch::tests::advance_without_stage_proceeds_and_records_the_legacy_invocation";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(51);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        advance_with(root, phase, None, Duration::from_secs(1)).unwrap();
+        assert_eq!(events_of_kind(root, "advance_stage_unbound").len(), 1);
+    }
+
+    #[test]
+    fn existing_advance_test_callers_pass_their_fixture_stage() {
+        const NAME: &str =
+            "pipeline_launch::tests::existing_advance_test_callers_pass_their_fixture_stage";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(52);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        advance_with(root, phase, Some(Stage::Code), Duration::from_secs(1)).unwrap();
+        assert!(events_of_kind(root, "advance_failed").is_empty());
+        assert!(events_of_kind(root, "advance_stage_unbound").is_empty());
     }
 
     /// D-04/D-07 (28-03, Task 2): a checkpoint resume records the
@@ -3721,7 +3896,7 @@ mod tests {
 
         let phase = PhaseId::new(88);
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -3783,7 +3958,7 @@ mod tests {
         let phase = PhaseId::new(96);
         write_abort_gate_response(root, phase, Stage::Code);
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -3932,7 +4107,7 @@ mod tests {
     ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
         write_abort_gate_response(root, phase, Stage::Code);
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -4028,7 +4203,7 @@ mod tests {
 
         write_gate_response(root, phase, Stage::Code, true, None);
 
-        let first = advance(root, Some(phase));
+        let first = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_first = workflow::load_state(root, phase).ok();
         let _reap_first = reloaded_first.as_ref().map(ReapMonitorOnDrop::after_launch);
         first.unwrap();
@@ -4158,7 +4333,7 @@ mod tests {
             Some("the rewritten task needs review first"),
         );
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
         result.unwrap();
@@ -4260,7 +4435,7 @@ mod tests {
             Some("abort: the agent rewrote its own gate"),
         );
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
         result.unwrap();
@@ -4532,7 +4707,7 @@ mod tests {
         state.checkpoint_approval = recorded_approval_for(&worktree, phase);
         workflow::save_state(&state).unwrap();
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -4580,7 +4755,7 @@ mod tests {
         state.session_id = Some("sess-should-not-resume".to_string());
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
@@ -4613,7 +4788,7 @@ mod tests {
         state.session_id = Some("sess-unreported".to_string());
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
         assert!(!events_of_kind(root, "gate_fired").is_empty());
@@ -4639,7 +4814,7 @@ mod tests {
         state.session_id = None;
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
         let gate_fired = events_of_kind(root, "gate_fired");
@@ -4675,7 +4850,7 @@ mod tests {
         state.checkpoint_resumes = mode::MAX_CHECKPOINT_RESUMES;
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
         let gate_fired = events_of_kind(root, "gate_fired");
@@ -4710,7 +4885,7 @@ mod tests {
         state.session_id = Some("sess-non-claude".to_string());
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
