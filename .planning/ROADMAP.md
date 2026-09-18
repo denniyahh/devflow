@@ -1309,7 +1309,17 @@ static Rust enum consumes a dynamically-configured GSD hook list.
 
 ---
 
-### Phase 999.109: Self-Dogfood Staleness Check's Build-Relevance Heuristic Matches Any `.rs`/`Cargo.toml` Repo-Wide, Not Just Workspace Members (BACKLOG)
+### Phase 999.109: Self-Dogfood Staleness Check's Build-Relevance Heuristic Matches Any `.rs`/`Cargo.toml` Repo-Wide, Not Just Workspace Members (RESOLVED — shipped; verified 2026-09-18)
+
+**Resolution note (2026-09-18):** fixed by Phase 45 plan 45-02 (AUTO-02 / D-02, commit `e6738c0`),
+on `develop`. `affects_compiled_binary` (`crates/devflow-cli/src/staleness.rs:242`) now takes a
+`workspace_scoped` flag: inside DevFlow's own workspace it matches `.rs` files only under `crates/`
+(`WORKSPACE_MEMBER_PREFIX`), the four root build files by exact path, and rejects any `..` segment —
+so `.planning/spikes/*/Cargo.toml` no longer trips the D-18 block (the unit test at
+`staleness.rs:677` asserts that exact path). This is the entry's own "restrict matching to paths
+under `crates/`" option, not a parse of `[workspace] members`; the gap between those two is tracked
+separately as 999.117. Non-DevFlow projects keep the pre-Phase-45 rule unchanged. This entry was
+stale — found during the 2026-09-18 codebase-map refresh.
 
 **Found:** 2026-08-23, dogfooding Phase 43 (OpenCode Driver Completion) via `devflow start`. A bulk
 `.planning/` git-tracking commit on `workspace/denniyahh` incidentally re-tracked
@@ -1514,7 +1524,19 @@ satisfy, which is why it is a policy call for the operator rather than a drive-b
 resolved (by unlinking, or by `--document-private-items`) or accepted permanently as house style.
 The gate above is deliberately neutral on it.
 
-### Phase 999.90: `handle_validate_outcome` Counts Commits Against `GitFlowConfig::default()`, Not the Project's Configured Git-Flow (BACKLOG)
+### Phase 999.90: `handle_validate_outcome` Counts Commits Against `GitFlowConfig::default()`, Not the Project's Configured Git-Flow (RESOLVED — shipped; verified 2026-09-18)
+
+**Resolution note (2026-09-18):** fixed by Phase 45 plan 45-01 (commit `06b42fe`, "resolve the
+git-flow trunk from the project at every call site"), on `develop`. The `handle_validate_outcome`
+call site (`crates/devflow-cli/src/pipeline_outcomes.rs:598-601`) now passes
+`config::git_flow_for_project(project_root)` instead of `GitFlowConfig::default()`; the remaining
+`GitFlowConfig::default()` uses are inside `config.rs` itself and in tests. GitHub #163 was already
+closed on 2026-09-03 — only this entry lagged. Two things remain, neither of them this defect: the
+call site still re-resolves the trunk ambiently rather than reading the persisted
+`State::base_branch` (tracked as 999.120), and no test exercises this call site with a non-default
+base — 45-01's tests cover the sibling sites (`monitor::tests::enumerate_phase_commits_ranges_from_the_configured_base`,
+`hooks::tests::merge_feature_targets_the_configured_base_not_the_default`). This entry was stale —
+found during the 2026-09-18 codebase-map refresh.
 
 **GitHub:** [#163](https://github.com/denniyahh/devflow/issues/163) (migrated from Linear DEN-111)
 **Found:** 2026-08-07, Phase 35 code review (35-REVIEW.md, IN-02). **Pre-existing** — the line was
@@ -4573,7 +4595,19 @@ because that phase is already editing this file's neighbourhood.
 
 ---
 
-### Phase 999.66: `consecutive_failures` Accumulates on Healthy Multi-Wave Progress, Not Just Repeated Failure (BACKLOG)
+### Phase 999.66: `consecutive_failures` Accumulates on Healthy Multi-Wave Progress, Not Just Repeated Failure (RESOLVED — shipped; verified 2026-09-18)
+
+**Resolution note (2026-09-18):** fixed by Phase 33 (Loop-Back Correctness for Multi-Wave
+Validate→Code Cycles, 999.65 + 999.66; Complete 2026-08-05), on `develop`.
+`mode::consecutive_failures_made_progress` (`crates/devflow-core/src/mode.rs:180`, commit `558bf18`,
+33-02) compares the phase's commit count with the baseline persisted in
+`State::last_validate_failure_commit_count`, and `handle_validate_outcome`
+(`crates/devflow-cli/src/pipeline_outcomes.rs:604-626`, commit `7e356cf`, 33-03) restarts the streak
+at 1 when new commits landed since the last recorded failure and accumulates otherwise. A
+multi-wave phase making forward progress therefore no longer walks toward
+`MAX_CONSECUTIVE_FAILURES`. The design is this entry's own "commit set differs" candidate, not the
+naive reset-on-every-loop-back it warned against. This entry was stale — found during the
+2026-09-18 codebase-map refresh.
 
 **Found:** 2026-07-31, investigating the Phase 29 dogfood gate, before 999.65 was found to have
 gated first and masked it. Not yet observed firing in production — recorded because it is real
@@ -4605,10 +4639,6 @@ unreachable-ceiling bug in a different form.
 **Priority:** High — caps every unattended multi-wave phase at 2 waves. | **Size:** S–M. Depends
 on nothing; independent of 999.64 and 999.65, but only observable once a phase runs 3+ waves,
 which requires 999.64 and 999.65 both fixed first.
-
-Plans:
-
-- [ ] TBD — promote with `/gsd-review-backlog` when ready
 
 ### Phase 999.65: The Validate→Code Loop-Back Issues an Impossible Command on a Mid-Arc Phase (BACKLOG)
 
