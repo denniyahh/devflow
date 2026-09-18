@@ -1358,7 +1358,13 @@ start with no `.planning/` at all, since `develop` doesn't track it — blocks `
 
 ---
 
-### Phase 999.110: `--mode auto` Is Structurally Blocked for Every Phase Because `develop`-Based Worktrees Carry No `.planning/` (BACKLOG)
+### Phase 999.110: `devflow init` + `devflow doctor` — Make the `.planning/`-Tracking Base Branch an Explicit, Checked Setup Step (BACKLOG)
+
+**Status (revised 2026-09-18):** open, as an initiative. Originally filed as "`--mode auto` Is
+Structurally Blocked for Every Phase Because `develop`-Based Worktrees Carry No `.planning/`". That
+title no longer holds as written: Phase 45 (AUTO-01, plan 45-01; v2.12.0 per the milestone table)
+made the base branch configurable, so the block is now a setup gap rather than a structural one.
+What remains is that nothing creates that configuration or checks it — which is this initiative.
 
 **Found:** 2026-08-23, dogfooding Phase 43 via `devflow start --agent claude --mode auto --until
 validate`. The run reached Define, then `preflight_unattended_launch_check`'s "GSD config can hold
@@ -1373,7 +1379,7 @@ scoped to `Stage::Define | Stage::Code` and is **fail-closed only under `Mode::A
 launch Define or Code on any phase, unconditionally, until something puts a valid
 `.planning/config.json` in the worktree.
 
-**The item — DECIDED (operator, 2026-08-23):** modify worktree creation to check for the branch
+**The item — DECIDED (operator, 2026-08-23) — SUPERSEDED by Phase 45 D-01, see below:** modify worktree creation to check for the branch
 that has a tracked `.planning/` folder and fork off of THAT branch, instead of hardcoding `develop`
 as the base. Concretely: before `git worktree add -b feature/phase-{N} … develop`, detect which
 branch (`workspace/denniyahh` today, but the check should not hardcode that name either — it should
@@ -1386,17 +1392,78 @@ branch this session is running from, if it tracks `.planning/`" vs. a more gener
 reintroduce the Phase-16-era coupling `.gitignore` groups `.planning/` under ("runtime states, local
 databases").
 
+**What shipped instead (Phase 45 D-01, `45-CONTEXT.md`):** configuration, not detection.
+`config::base_branch` (`crates/devflow-core/src/config.rs:384`) resolves `DEVFLOW_BASE_BRANCH`, then
+`devflow.toml`'s `base_branch` key, then the built-in default `develop`. `devflow start` persists the
+resolved value to `State::base_branch` (`crates/devflow-cli/src/commands.rs:373-391`) so later
+processes read it back instead of re-resolving. The value is the project's whole integration trunk,
+not only the fork point: phase worktrees fork from it and the git-flow lifecycle merges back into it
+(`config.rs:103-111`; a separate start-point-only key was considered and rejected).
+
+**The remaining gap (verified 2026-09-18 by reading the code, not by a live run):**
+- Nothing creates the configuration. This checkout has no `devflow.toml` and `DEVFLOW_BASE_BRANCH`
+  is unset in both fish and bash, so the base resolves to `develop`, which does not track
+  `.planning/config.json` — a `devflow start --mode auto` from here would still be refused.
+- Nothing checks it before a launch. `devflow doctor` only reports — it always returns `Ok(())`
+  (`crates/devflow-cli/src/commands.rs:2564-2616`) — and `devflow start` never runs it.
+- The refusal does not name the fix. `unattended_config_condition` says "no `.planning/config.json`
+  under the launch root — nowhere for the chain flag to live" (`crates/devflow-cli/src/preflight.rs:994`),
+  with no mention of `base_branch` or `devflow.toml`.
+- The environment variable is the fragile channel: it does not reach the detached monitor (999.120).
+  A `devflow.toml` in the project root does.
+
+**The initiative — DECIDED (operator, 2026-09-18):** keep 999.110 open as the initiative to add a new
+`devflow init` command and to change `devflow doctor` so it checks that DevFlow is set up the way
+`init` sets it up. The base-branch setting lives in `devflow.toml`.
+
+**Design direction — approved by the operator 2026-09-18 on Claude's recommendation:**
+1. **`devflow init` (a new command — none exists today)** finds the local branch that tracks
+   `.planning/config.json` and writes it to `devflow.toml` as `base_branch`. This keeps the
+   2026-08-23 intent (detect the branch; hardcode neither `develop` nor a personal branch name) and
+   Phase 45's explicit configuration: detection runs once, at init, and its answer is saved where an
+   operator can read and change it.
+2. **`devflow doctor` checks the setup's effect, not the file's presence.** The check is whether the
+   resolved base branch tracks `.planning/config.json`. File presence fails in both directions: a
+   `devflow.toml` with no `base_branch`, or with `base_branch = "develop"`, passes and is still
+   broken, and a project whose `develop` already tracks `.planning/` needs no file and would fail.
+   On failure, doctor names the fix (`devflow init`, or `base_branch` in `devflow.toml`) and where
+   the current value came from.
+3. **Enforcement stays in `devflow start`.** Its existing refusal (above) names the same fix and
+   reports the resolved base and its source, so an operator who never ran doctor is still told.
+
+**Open questions — not decided:**
+- **Trunk semantics.** Pointing `base_branch` at a personal branch makes DevFlow's Ship merge phase
+  work into that branch, not `develop`; getting it to `develop` stays a separate step. Either `init`
+  says so when it writes the value, or the design revisits the rejected start-point-only key.
+- **Tracking `devflow.toml`.** Nothing ignores it today. A committed `devflow.toml` naming a personal
+  branch would reach `develop` with the next merge and redirect every other checkout. One option is
+  the pattern `.planning/` already uses: `develop`'s `.gitignore` ignores it and the personal branch
+  drops that line.
+- **Doctor's exit status.** Whether a failed setup check makes `doctor` exit non-zero (it never does
+  today) or it stays report-only.
+- **What else `init` sets up.** Its scope beyond `base_branch` is undecided; doctor's setup checks
+  follow whatever `init` ends up owning.
+
+**Interim workaround:** write `devflow.toml` with `base_branch = "<the branch that tracks
+.planning/>"` by hand, or keep using `--mode supervise` as below. Per the code path the hand-written
+file unblocks `--mode auto`; no live run has confirmed it (999.119).
+
 **Immediate workaround applied:** used `--mode supervise` instead of `--mode auto` for the Phase 43
 dogfood run — it runs Define→Plan→Code autonomously exactly like `auto` and still gates at Validate,
 so it satisfies "full auto until validate" without hitting this block. Does not fix the underlying
 gap; every future `--mode auto` launch will hit the identical refusal.
 
-**Priority:** High — `--mode auto` (the documented "runs to Ship unattended" mode) is currently
-unusable for any phase, not a corner case. **Size:** M — touches worktree creation and/or the
-preflight condition, needs tests for both the seeding mechanism and the fail-closed check.
+**Priority:** High, unchanged from filing — `--mode auto` still cannot launch from a checkout nobody
+configured, and nothing tells the operator how to configure it. **Size:** M — a new CLI command
+(detection plus write), a new doctor check, a clearer preflight message, and tests for each.
 
-**Depends on:** nothing structural. Related but separate: 999.109 (a different false-positive in the
-adjacent self-dogfood staleness check, found in the same dogfood run).
+**Depends on:** nothing structural. Related: 999.119 (live `--mode auto` end-to-end run of the
+configured-base chain), 999.120 (the environment variable not reaching the detached monitor, which a
+`devflow.toml` avoids), 999.109 (resolved 2026-09-18; found in the same 2026-08-23 dogfood run).
+
+Plans:
+
+- [ ] TBD — promote with `/gsd-review-backlog` when ready
 
 ---
 
