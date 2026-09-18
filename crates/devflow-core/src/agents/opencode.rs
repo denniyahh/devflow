@@ -138,6 +138,11 @@ fn spawn_with_timeout(
     use std::io::Read;
     use std::process::Stdio;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -145,6 +150,14 @@ fn spawn_with_timeout(
             break;
         }
         if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                let pid = child.id() as libc::pid_t;
+                if pid <= 0 || unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(unix))]
             let _ = child.kill();
             let _ = child.wait();
             return Err(std::io::Error::new(
@@ -401,7 +414,9 @@ mod tests {
     fn stub_hanging_opencode_on_path(sleep_secs: u64) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create stub dir");
         let stub = dir.path().join("opencode");
-        let script = format!("#!/bin/sh\nexec sleep {sleep_secs}\n");
+        let script = format!(
+            "#!/bin/sh\nsleep {sleep_secs} &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nwait \"$child\"\n"
+        );
         std::fs::write(&stub, script).expect("write hanging opencode stub");
         #[cfg(unix)]
         {
@@ -414,6 +429,14 @@ mod tests {
         std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
             .expect("link the required sleep utility into the isolated PATH");
         dir
+    }
+
+    fn hanging_stub_child_pid(stub_dir: &tempfile::TempDir) -> u32 {
+        std::fs::read_to_string(stub_dir.path().join("opencode.pid"))
+            .expect("hanging stub records its sleep pid")
+            .trim()
+            .parse()
+            .expect("hanging stub pid is numeric")
     }
 
     fn child_opencode_stub_dir() -> std::path::PathBuf {
@@ -616,6 +639,11 @@ mod tests {
         let err = spawn_with_timeout(&mut cmd, std::time::Duration::from_millis(200))
             .expect_err("a child sleeping 10s must not be allowed to finish under a 200ms bound");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let pid = hanging_stub_child_pid(&stub_dir);
+        assert!(
+            !crate::agent::agent_running(pid),
+            "the timed-out probe's sleep descendant must be dead: pid {pid}"
+        );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "the timeout must actually bound the wait, not merely be advisory: took {:?}",
@@ -645,6 +673,11 @@ mod tests {
             &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
         );
         crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        let pid = hanging_stub_child_pid(&stub_dir);
+        assert!(
+            !crate::agent::agent_running(pid),
+            "the timed-out health probe's sleep descendant must be dead: pid {pid}"
+        );
     }
 
     #[test]
