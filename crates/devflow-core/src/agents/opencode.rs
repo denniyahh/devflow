@@ -136,6 +136,120 @@ fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
     }
 }
 
+/// On Linux, make the process group established by `CommandExt::process_group`
+/// an inescapable containment boundary for the probe and every descendant it
+/// forks. A probe is only a small, non-interactive query; it has no legitimate
+/// reason to daemonize or rearrange process groups. Denying these two syscalls
+/// before `exec` means a later group kill reaches every descendant that could
+/// retain one of the probe pipes.
+///
+/// This runs in `pre_exec`, after std has placed the child in its dedicated
+/// process group and before the requested program starts. It deliberately
+/// allows every other syscall, so it does not turn the probe into a general
+/// sandbox. If the kernel rejects the filter, `spawn` fails closed instead of
+/// launching an uncontained Linux probe.
+#[cfg(target_os = "linux")]
+fn install_linux_probe_process_group_guard() -> std::io::Result<()> {
+    // The classic BPF program loads the syscall number, rejects `setsid` and
+    // `setpgid` with EPERM, and allows every other syscall. `seccomp_data.nr`
+    // is the first field in the kernel ABI, so its offset is zero.
+    let mut filter = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_setsid as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_setpgid as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let mut program = libc::sock_fprog {
+        len: filter.len() as libc::c_ushort,
+        filter: filter.as_mut_ptr(),
+    };
+
+    // `prctl` is async-signal-safe and this code performs no allocation or
+    // locking, which is required for a `pre_exec` callback in a multithreaded
+    // parent process.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &mut program as *mut libc::sock_fprog,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+type ProbePipeReceiver = std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>;
+
+/// Begin consuming a probe pipe immediately. This keeps a verbose-but-valid
+/// probe from blocking before it exits and, critically, leaves the caller with
+/// a deadline even if an unsupported-platform descendant retains the pipe.
+fn capture_probe_pipe(pipe: impl std::io::Read + Send + 'static) -> ProbePipeReceiver {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn collect_probe_pipe(
+    receiver: ProbePipeReceiver,
+    deadline: std::time::Instant,
+    name: &str,
+) -> std::io::Result<Vec<u8>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("probe {name} pipe remained open after the deadline"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("probe {name} reader disconnected"),
+        )),
+    }
+}
+
 /// Run `cmd` to completion, killing it if it does not exit within `timeout`
 /// (43-REVIEW.md WR-02). Without this, a blocked `opencode` subprocess
 /// (hung credential re-auth prompt, network stall) stalls `health()`/
@@ -143,16 +257,18 @@ fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
 /// hang is a de facto launch refusal that never surfaces as an `Err`, directly
 /// contradicting the "this probe can never refuse a launch" contract.
 ///
-/// Reads stdout/stderr only AFTER the child exits, not via a concurrent
-/// reader thread — safe here because both probed subcommands produce at most
-/// a few KB, far under the OS pipe buffer, so neither can block on a full
-/// pipe before exiting. This is not a general-purpose bounded-exec primitive;
-/// a probe with unbounded output would need a reader thread instead.
+/// On Linux, a pre-exec seccomp filter prevents the probe tree from calling
+/// `setsid` or `setpgid`, so its dedicated process group remains a complete
+/// kill boundary. Other platforms retain the group cleanup where available,
+/// but cannot make that stronger claim without a platform-native job/tree
+/// primitive. Their pipe readers are still deadline-bounded, so an escaped
+/// pipe holder fails the probe closed rather than hanging `health()` or
+/// `capabilities()`. Such an unsupported escape can leave a reader thread
+/// waiting for the inherited descriptor; it cannot leave the caller waiting.
 fn spawn_with_timeout(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
     use std::process::Stdio;
 
     #[cfg(unix)]
@@ -160,10 +276,26 @@ fn spawn_with_timeout(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // SAFETY: the callback only invokes `prctl` and reads/writes its
+        // stack-local BPF program. It allocates nothing and takes no locks.
+        std::os::unix::process::CommandExt::pre_exec(cmd, || {
+            install_linux_probe_process_group_guard()
+        });
+    }
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::other("probe stdout was not piped despite Stdio::piped configuration")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::other("probe stderr was not piped despite Stdio::piped configuration")
+    })?;
+    let stdout_receiver = capture_probe_pipe(stdout);
+    let stderr_receiver = capture_probe_pipe(stderr);
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if child.try_wait()?.is_some() {
+        if let Some(status) = child.try_wait()? {
             #[cfg(unix)]
             if kill_probe_group(child.id())? {
                 return Err(std::io::Error::new(
@@ -171,7 +303,13 @@ fn spawn_with_timeout(
                     "probe parent exited before its process group drained",
                 ));
             }
-            break;
+            let stdout = collect_probe_pipe(stdout_receiver, deadline, "stdout")?;
+            let stderr = collect_probe_pipe(stderr_receiver, deadline, "stderr")?;
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         if std::time::Instant::now() >= deadline {
             #[cfg(unix)]
@@ -190,21 +328,6 @@ fn spawn_with_timeout(
         }
         std::thread::sleep(PROBE_POLL_INTERVAL);
     }
-
-    let status = child.wait()?;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut stdout)?;
-    }
-    if let Some(mut err) = child.stderr.take() {
-        err.read_to_end(&mut stderr)?;
-    }
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 /// Hand-rolled CSI escape-sequence scrubber: on `\u{1b}` followed by `[`,
@@ -474,6 +597,59 @@ mod tests {
         dir
     }
 
+    /// Linux-only CR-01 fixture. Without the pre-exec guard, `setsid` moves
+    /// the `sleep` child out of the probe group while it keeps the inherited
+    /// stdout/stderr descriptors open after this shell exits. With the guard,
+    /// the real `setsid` utility receives EPERM and exits instead.
+    #[cfg(target_os = "linux")]
+    fn stub_parent_exits_after_attempting_setsid(sleep_secs: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create stub dir");
+        let stub = dir.path().join("opencode");
+        let script = format!(
+            "#!/bin/sh\nsetsid sleep {sleep_secs} &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nwait \"$child\"\nprintf '%s\\n' \"$?\" > \"$0.setsid-status\"\nexit 0\n"
+        );
+        std::fs::write(&stub, script).expect("write setsid escape stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        }
+        std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
+            .expect("link the required sleep utility into the isolated PATH");
+        std::os::unix::fs::symlink("/usr/bin/setsid", dir.path().join("setsid"))
+            .expect("link the required setsid utility into the isolated PATH");
+        dir
+    }
+
+    /// Linux-only CR-01 sibling fixture for a pure process-group escape.
+    /// The Python child records whether `setpgid(0, 0)` succeeded, then would
+    /// retain the inherited pipes after the shell parent exits. Unlike
+    /// `setsid`, this proves the second syscall denied by the guard.
+    #[cfg(target_os = "linux")]
+    fn stub_parent_exits_after_attempting_setpgid(sleep_secs: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create stub dir");
+        let stub = dir.path().join("opencode");
+        let escape = dir.path().join("opencode.setpgid.py");
+        let script = "#!/bin/sh\npython3 \"$0.setpgid.py\" \"$0.setpgid-status\" &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n";
+        let python = format!(
+            "import os, sys, time\nstatus = sys.argv[1]\ntry:\n    os.setpgid(0, 0)\nexcept OSError as error:\n    open(status, 'w', encoding='utf-8').write(str(error.errno))\n    raise\nopen(status, 'w', encoding='utf-8').write('0')\ntime.sleep({sleep_secs})\n"
+        );
+        std::fs::write(&stub, script).expect("write setpgid escape stub");
+        std::fs::write(&escape, python).expect("write setpgid escape helper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        }
+        std::os::unix::fs::symlink("/usr/bin/python3", dir.path().join("python3"))
+            .expect("link the required Python utility into the isolated PATH");
+        dir
+    }
+
     fn hanging_stub_child_pid(stub_dir: &tempfile::TempDir) -> u32 {
         std::fs::read_to_string(stub_dir.path().join("opencode.pid"))
             .expect("hanging stub records its sleep pid")
@@ -715,6 +891,137 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "a parent-exit descendant must not make output draining unbounded: took {:?}",
             start.elapsed()
+        );
+    }
+
+    /// CR-01 regression and negative control. The unguarded direct command
+    /// proves this host's `setsid` utility can create a session; the same
+    /// utility inside a probe must instead be denied before it can retain the
+    /// probe pipes from a different process group. Both `health` and
+    /// `capabilities` must return promptly and fail closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_rejects_a_setsid_pipe_holder_before_parent_exit() {
+        const NAME: &str =
+            "agents::opencode::tests::probe_rejects_a_setsid_pipe_holder_before_parent_exit";
+        if crate::test_support::in_child_test(NAME) {
+            let start = std::time::Instant::now();
+            let health = OpenCodeDriver.health(&test_state());
+            let capabilities = OpenCodeDriver.capabilities();
+            assert!(
+                health.is_err(),
+                "a rejected session escape must fail health closed"
+            );
+            assert!(
+                !capabilities.subagent_dispatch,
+                "a rejected session escape must fail capabilities closed"
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "an attempted setsid escape must not consume the five-second probe timeout: took {:?}",
+                start.elapsed()
+            );
+            return;
+        }
+
+        let stub_dir = stub_parent_exits_after_attempting_setsid(60);
+        let control = std::process::Command::new(stub_dir.path().join("setsid"))
+            .arg(stub_dir.path().join("sleep"))
+            .arg("0")
+            .status()
+            .expect("the unguarded negative control must run setsid");
+        assert!(
+            control.success(),
+            "the unguarded negative control must create a session; otherwise this fixture does not exercise an escape-capable utility"
+        );
+
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+
+        let status = std::fs::read_to_string(stub_dir.path().join("opencode.setsid-status"))
+            .expect("the guarded fixture records the setsid exit status");
+        assert_ne!(
+            status.trim(),
+            "0",
+            "the guarded probe must deny the escape syscall rather than merely timing out after it succeeds"
+        );
+        let pid = hanging_stub_child_pid(&stub_dir);
+        assert!(
+            !crate::agent::agent_running(pid),
+            "the attempted escape process must be reaped: pid {pid}"
+        );
+    }
+
+    /// CR-01's process-group sibling: `setpgid(0, 0)` creates a different
+    /// group without creating a session. The unguarded control must work; the
+    /// probe version must be denied and both public probe paths must return
+    /// fail-closed before the production timeout elapses.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_rejects_a_setpgid_pipe_holder_before_parent_exit() {
+        const NAME: &str =
+            "agents::opencode::tests::probe_rejects_a_setpgid_pipe_holder_before_parent_exit";
+        if crate::test_support::in_child_test(NAME) {
+            let start = std::time::Instant::now();
+            let health = OpenCodeDriver.health(&test_state());
+            let capabilities = OpenCodeDriver.capabilities();
+            assert!(
+                health.is_err(),
+                "a rejected process-group escape must fail health closed"
+            );
+            assert!(
+                !capabilities.subagent_dispatch,
+                "a rejected process-group escape must fail capabilities closed"
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "an attempted setpgid escape must not consume the five-second probe timeout: took {:?}",
+                start.elapsed()
+            );
+            return;
+        }
+
+        let stub_dir = stub_parent_exits_after_attempting_setpgid(60);
+        let control = std::process::Command::new(stub_dir.path().join("python3"))
+            .args(["-c", "import os; os.setpgid(0, 0)"])
+            .status()
+            .expect("the unguarded negative control must run Python");
+        assert!(
+            control.success(),
+            "the unguarded negative control must create a process group; otherwise this fixture does not exercise an escape-capable utility"
+        );
+
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            stub_dir.path(),
+            &[(OPENCODE_STUB_DIR_ENV, stub_dir.path().as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+
+        let status_path = stub_dir.path().join("opencode.setpgid-status");
+        let status_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !status_path.exists() && std::time::Instant::now() < status_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let status = std::fs::read_to_string(&status_path)
+            .expect("the guarded fixture records the setpgid exit status");
+        assert_ne!(
+            status.trim(),
+            "0",
+            "the guarded probe must deny setpgid rather than merely timing out after it succeeds"
+        );
+        let pid = hanging_stub_child_pid(&stub_dir);
+        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !crate::agent::agent_running(pid),
+            "the attempted group-escape process must be reaped: pid {pid}"
         );
     }
 
