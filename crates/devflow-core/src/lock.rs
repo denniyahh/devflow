@@ -11,8 +11,8 @@
 //! parallel`'s sibling phases with no retry (CR-03, 13-REVIEW.md).
 
 use crate::phase_id::PhaseId;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions, TryLockError};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
@@ -178,8 +178,29 @@ fn contended(path: PathBuf) -> LockError {
     }
 }
 
-fn acquire_after_existing(path: PathBuf) -> Result<LockGuard, LockError> {
-    let Some(record) = read_holder_record(&path) else {
+fn acquire_after_existing(
+    path: PathBuf,
+    before_reclaim: impl FnOnce(),
+) -> Result<LockGuard, LockError> {
+    let mut existing = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return match publish_lock(&path, || {})? {
+                LockPublication::Published => Ok(LockGuard { path }),
+                LockPublication::AlreadyExists => Err(contended(path)),
+            };
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match existing.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(contended(path)),
+        Err(TryLockError::Error(error)) => return Err(error.into()),
+    }
+    let mut contents = String::new();
+    existing.seek(SeekFrom::Start(0))?;
+    existing.read_to_string(&mut contents)?;
+    let Some(record) = parse_holder_record(&contents) else {
         return Err(contended(path));
     };
     if crate::agent::agent_running(record.pid) {
@@ -194,6 +215,7 @@ fn acquire_after_existing(path: PathBuf) -> Result<LockGuard, LockError> {
         path.display(),
         record.pid
     );
+    before_reclaim();
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -216,7 +238,7 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
 
     match publish_lock(&path, || {})? {
         LockPublication::Published => Ok(LockGuard { path }),
-        LockPublication::AlreadyExists => acquire_after_existing(path),
+        LockPublication::AlreadyExists => acquire_after_existing(path, || {}),
     }
 }
 
@@ -278,8 +300,7 @@ struct HolderRecord {
 /// This parser belongs only to [`holder_status`]. Unlike [`holder`], status
 /// inspection must let doctor report empty and corrupt artifacts without
 /// deleting them.
-fn read_holder_record(path: &Path) -> Option<HolderRecord> {
-    let text = fs::read_to_string(path).ok()?;
+fn parse_holder_record(text: &str) -> Option<HolderRecord> {
     let mut lines = text.lines();
     let pid = lines.next()?.trim().parse::<u32>().ok()?;
     let recorded_start_time = lines.next().and_then(|line| line.trim().parse().ok());
@@ -287,6 +308,10 @@ fn read_holder_record(path: &Path) -> Option<HolderRecord> {
         pid,
         recorded_start_time,
     })
+}
+
+fn read_holder_record(path: &Path) -> Option<HolderRecord> {
+    parse_holder_record(&fs::read_to_string(path).ok()?)
 }
 
 fn classify_holder_record(
@@ -564,6 +589,43 @@ mod tests {
             first.join().unwrap(),
             LockPublication::AlreadyExists
         ));
+        assert_eq!(
+            holder_status(dir.path(), phase),
+            HolderStatus::Live {
+                pid: std::process::id()
+            }
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn stale_reclaim_is_serialized_before_it_removes_the_lock_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "9999999\n1").unwrap();
+        let reclaim_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let allow_reclaim = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_path = path.clone();
+        let first_ready = reclaim_ready.clone();
+        let first_allow = allow_reclaim.clone();
+
+        let first = std::thread::spawn(move || {
+            acquire_after_existing(first_path, || {
+                first_ready.wait();
+                first_allow.wait();
+            })
+        });
+
+        reclaim_ready.wait();
+        let second = acquire(dir.path(), phase).expect_err("second reclaimer must contend");
+        assert!(matches!(second, LockError::Contended { .. }));
+        allow_reclaim.wait();
+        let guard = first
+            .join()
+            .expect("first reclaimer thread")
+            .expect("first reclaimer acquires the replacement lock");
         assert_eq!(
             holder_status(dir.path(), phase),
             HolderStatus::Live {

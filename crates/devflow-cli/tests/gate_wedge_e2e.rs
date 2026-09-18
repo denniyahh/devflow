@@ -203,3 +203,52 @@ fn self_resolving_arm_live_start_consumes_the_rejection() {
         "consuming the response clears the gate"
     );
 }
+
+#[test]
+fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(4818);
+    let ship_phase = PhaseId::new(4819);
+    Gates::write_gate(root, phase, Stage::Code, "abandoned").unwrap();
+    Gates::write_gate(root, ship_phase, Stage::Ship, "release").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "gate",
+            "sweep",
+            "--dry-run",
+            "--max-age-secs",
+            "0",
+            "--root",
+        ])
+        .arg(root)
+        .output()
+        .expect("run dry-run sweep");
+    assert!(
+        output.status.success(),
+        "dry-run sweep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("left phase {phase} code alone")),
+        "no-waiter gate must be left alone: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("would reap phase {phase} code")),
+        "no-waiter dry-run must not claim it would reap the Code gate: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("would reap phase {ship_phase} ship")),
+        "Ship remains the positive would-reap control: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 would be reaped"),
+        "summary must count only the Ship would-reap decision: {stdout}"
+    );
+    assert!(
+        !Gates::response_path(root, phase, Stage::Code).exists(),
+        "dry-run sweep must not write a response"
+    );
+}
