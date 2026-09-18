@@ -119,6 +119,12 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often [`spawn_with_timeout`] polls the child for exit.
 const PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+// `AUDIT_ARCH_X86_64` from Linux's `audit.h`: `EM_X86_64` (62) plus the
+// 64-bit and little-endian audit bits. `libc` exposes seccomp's structs but
+// not this audit-ABI constant.
+#[cfg(target_os = "linux")]
+const LINUX_AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
 #[cfg(unix)]
 fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
     let pid = pid as libc::pid_t;
@@ -150,15 +156,46 @@ fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
 /// launching an uncontained Linux probe.
 #[cfg(target_os = "linux")]
 fn install_linux_probe_process_group_guard() -> std::io::Result<()> {
-    // The classic BPF program loads the syscall number, rejects `setsid` and
-    // `setpgid` with EPERM, and allows every other syscall. `seccomp_data.nr`
-    // is the first field in the kernel ABI, so its offset is zero.
+    // Fail closed unless the filter sees native x86-64. Seccomp syscall
+    // numbers are ABI-specific: x32 adds `__X32_SYSCALL_BIT`, so checking
+    // `nr` without first checking `arch` would let it bypass the native
+    // `setsid`/`setpgid` rules.
     let mut filter = [
         libc::sock_filter {
             code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
             jt: 0,
             jf: 0,
-            k: 0,
+            k: std::mem::offset_of!(libc::seccomp_data, arch) as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 1,
+            jf: 0,
+            k: LINUX_AUDIT_ARCH_X86_64,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: std::mem::offset_of!(libc::seccomp_data, nr) as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: 0x4000_0000,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
         },
         libc::sock_filter {
             code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
@@ -216,6 +253,23 @@ fn install_linux_probe_process_group_guard() -> std::io::Result<()> {
 }
 
 type ProbePipeReceiver = std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>;
+
+#[cfg(unix)]
+fn probe_leader_exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
 
 /// Begin consuming a probe pipe immediately. This keeps a verbose-but-valid
 /// probe from blocking before it exits and, critically, leaves the caller with
@@ -295,14 +349,33 @@ fn spawn_with_timeout(
     let stderr_receiver = capture_probe_pipe(stderr);
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        #[cfg(unix)]
+        if probe_leader_exited_unreaped(child.id())? {
+            let stdout = match collect_probe_pipe(stdout_receiver, deadline, "stdout") {
+                Ok(stdout) => stdout,
+                Err(error) => {
+                    let _ = kill_probe_group(child.id());
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            let stderr = match collect_probe_pipe(stderr_receiver, deadline, "stderr") {
+                Ok(stderr) => stderr,
+                Err(error) => {
+                    let _ = kill_probe_group(child.id());
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            let status = child.wait()?;
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        #[cfg(not(unix))]
         if let Some(status) = child.try_wait()? {
-            #[cfg(unix)]
-            if kill_probe_group(child.id())? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "probe parent exited before its process group drained",
-                ));
-            }
             let stdout = collect_probe_pipe(stdout_receiver, deadline, "stdout")?;
             let stderr = collect_probe_pipe(stderr_receiver, deadline, "stderr")?;
             return Ok(std::process::Output {
@@ -1023,6 +1096,28 @@ mod tests {
             !crate::agent::agent_running(pid),
             "the attempted group-escape process must be reaped: pid {pid}"
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_probe_filter_rejects_the_x32_setsid_abi() {
+        const NAME: &str = "agents::opencode::tests::linux_probe_filter_rejects_the_x32_setsid_abi";
+        if crate::test_support::in_child_test(NAME) {
+            install_linux_probe_process_group_guard().expect("install probe filter");
+            let x32_setsid = 0x4000_0000u64 + libc::SYS_setsid as u64;
+            let result = unsafe { libc::syscall(x32_setsid as libc::c_long) };
+            assert_eq!(result, -1, "x32 setsid must not execute");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM),
+                "the filter, not this host's x32 support, must reject the syscall"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("child path directory");
+        let output = crate::test_support::run_test_in_child(NAME, dir.path(), &[]);
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
     }
 
     /// 43-REVIEW.md WR-02: `health()` itself must fail closed (not hang) when
