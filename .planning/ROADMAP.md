@@ -4640,7 +4640,18 @@ unreachable-ceiling bug in a different form.
 on nothing; independent of 999.64 and 999.65, but only observable once a phase runs 3+ waves,
 which requires 999.64 and 999.65 both fixed first.
 
-### Phase 999.65: The Validate→Code Loop-Back Issues an Impossible Command on a Mid-Arc Phase (BACKLOG)
+### Phase 999.65: The Validate→Code Loop-Back Issues an Impossible Command on a Mid-Arc Phase (RESOLVED — shipped; verified 2026-09-18)
+
+**Resolution note (2026-09-18):** fixed by Phase 33 plan 33-01 (commit `57f1d62`, "route mid-arc
+Validate loop-back to plain execute"; Phase 33 Complete 2026-08-05), on `develop`.
+`select_loop_back_fix` (`crates/devflow-cli/src/pipeline_outcomes.rs:317`) dispatches plain
+`/gsd-execute-phase {N}` when no `{N}-VERIFICATION.md` was authored this run and `--gaps-only` only
+when one was — the entry's own "does `{N}-VERIFICATION.md` exist" signal. Phase 35 (999.79 /
+HARDEN-03) later hardened it from existence to a per-run fingerprint, so a `--force` re-run's
+inherited artifact no longer counts. All three Validate loop-back sites call it (`:558`, `:741`,
+`:757`). Both directions are tested: `mid_arc_loop_back_issues_plain_execute_command` and its
+worktree-mode twin, plus `genuine_gaps_loop_back_still_issues_gaps_only`. This entry was stale —
+found while resolving 999.66 on 2026-09-18.
 
 **Found:** 2026-07-31, Phase 29 dogfood. The gate that actually halted the run that day —
 `999.64` was found investigating *why* the run got far enough to hit this one.
@@ -4673,10 +4684,6 @@ unattended; the loop-back mechanism that exists specifically to enable that is w
 **Size:** S–M. Depends on nothing structurally, but is unobservable in an autonomous run until
 999.64 is fixed (999.64 currently prevents any multi-wave phase from reaching a second
 loop-back at all).
-
-Plans:
-
-- [ ] TBD — promote with `/gsd-review-backlog` when ready
 
 ### Phase 999.61: Four Indirect Git-Reaching Spawn Edges a Literal Grep Cannot See (BACKLOG)
 
