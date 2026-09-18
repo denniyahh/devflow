@@ -11,8 +11,8 @@
 //! parallel`'s sibling phases with no retry (CR-03, 13-REVIEW.md).
 
 use crate::phase_id::PhaseId;
-use std::fs::{self, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
@@ -157,7 +157,13 @@ fn publish_lock(path: &Path, before_publish: impl FnOnce()) -> io::Result<LockPu
     let cleanup = fs::remove_file(&tmp);
     match publish {
         Ok(()) => {
-            cleanup?;
+            if let Err(error) = cleanup {
+                tracing::warn!(
+                    "published devflow lock at {} but could not remove temporary {}: {error}",
+                    path.display(),
+                    tmp.display()
+                );
+            }
             Ok(LockPublication::Published)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -178,29 +184,33 @@ fn contended(path: PathBuf) -> LockError {
     }
 }
 
+/// The advisory coordination inode is never replaced or removed by DevFlow.
+/// It serializes all mutation of the replaceable public lock pathname.
+fn coordination_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.coord"))
+}
+
+fn acquire_coordination(path: &Path) -> Result<File, LockError> {
+    let coordination = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(coordination_path(path))?;
+    match coordination.try_lock() {
+        Ok(()) => Ok(coordination),
+        Err(TryLockError::WouldBlock) => Err(contended(path.to_path_buf())),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 fn acquire_after_existing(
     path: PathBuf,
+    coordination: File,
     before_reclaim: impl FnOnce(),
 ) -> Result<LockGuard, LockError> {
-    let mut existing = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return match publish_lock(&path, || {})? {
-                LockPublication::Published => Ok(LockGuard { path }),
-                LockPublication::AlreadyExists => Err(contended(path)),
-            };
-        }
-        Err(error) => return Err(error.into()),
-    };
-    match existing.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Err(contended(path)),
-        Err(TryLockError::Error(error)) => return Err(error.into()),
-    }
-    let mut contents = String::new();
-    existing.seek(SeekFrom::Start(0))?;
-    existing.read_to_string(&mut contents)?;
-    let Some(record) = parse_holder_record(&contents) else {
+    let Some(record) = read_holder_record(&path) else {
         return Err(contended(path));
     };
     if crate::agent::agent_running(record.pid) {
@@ -222,7 +232,10 @@ fn acquire_after_existing(
         Err(error) => return Err(error.into()),
     }
     match publish_lock(&path, || {})? {
-        LockPublication::Published => Ok(LockGuard { path }),
+        LockPublication::Published => Ok(LockGuard {
+            path,
+            _coordination: coordination,
+        }),
         LockPublication::AlreadyExists => Err(contended(path)),
     }
 }
@@ -235,10 +248,14 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
         )
     })?;
     crate::workflow::ensure_devflow_dir(parent)?;
+    let coordination = acquire_coordination(&path)?;
 
     match publish_lock(&path, || {})? {
-        LockPublication::Published => Ok(LockGuard { path }),
-        LockPublication::AlreadyExists => acquire_after_existing(path, || {}),
+        LockPublication::Published => Ok(LockGuard {
+            path,
+            _coordination: coordination,
+        }),
+        LockPublication::AlreadyExists => acquire_after_existing(path, coordination, || {}),
     }
 }
 
@@ -364,18 +381,6 @@ pub fn holder_identity(project_root: &Path, phase: PhaseId) -> Option<(u32, Opti
     Some((pid, read_holder_start_time(&path)))
 }
 
-/// Whether the pid recorded in a lock file refers to a live process.
-///
-/// A non-numeric pid (corrupt lock) is treated as dead so the lock can be
-/// reclaimed. Delegates to [`crate::agent::agent_running`] — the crate's one
-/// PID-liveness implementation — which also rejects `0` (a `kill -0 0`
-/// probes the caller's own process group and always succeeds, making a
-/// corrupted lock permanently "held") and values that would wrap negative
-/// through the `pid_t` cast.
-fn pid_is_alive(pid: &str) -> bool {
-    pid.parse::<u32>().is_ok_and(crate::agent::agent_running)
-}
-
 /// Check whether a lock is currently held for this project/phase,
 /// returning the PID of the holder if the file exists.
 pub fn holder(project_root: &Path, phase: PhaseId) -> Option<(String, PathBuf)> {
@@ -403,6 +408,9 @@ fn release(path: &Path) {
 #[derive(Debug)]
 pub struct LockGuard {
     path: PathBuf,
+    // Kept alive until after Drop removes `path`, so a later acquirer cannot
+    // classify or reclaim a replaced lock while this guard owns the phase.
+    _coordination: File,
 }
 
 impl Drop for LockGuard {
@@ -451,18 +459,40 @@ pub fn remove_stale_locks(project_root: &Path) -> Vec<String> {
             continue;
         }
         let path = entry.path();
-        // First line only — line 2 is the holder's start time.
-        let holder_pid = read_holder_pid(&path);
-        if pid_is_alive(&holder_pid) {
+        let coordination = match acquire_coordination(&path) {
+            Ok(coordination) => coordination,
+            Err(LockError::Contended { .. }) => {
+                warnings.push(format!(
+                    "kept {} — lock coordination is busy",
+                    path.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                warnings.push(format!("could not coordinate {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let Some(record) = read_holder_record(&path) else {
             warnings.push(format!(
-                "kept {} — holder pid {holder_pid} is still alive",
+                "kept {} — lock record is unreadable",
                 path.display()
             ));
+            continue;
+        };
+        if crate::agent::agent_running(record.pid) {
+            warnings.push(format!(
+                "kept {} — holder pid {} is still alive",
+                path.display(),
+                record.pid
+            ));
+            drop(coordination);
             continue;
         }
         if let Err(err) = fs::remove_file(&path) {
             warnings.push(format!("could not remove {}: {err}", path.display()));
         }
+        drop(coordination);
     }
     warnings
 }
@@ -612,7 +642,9 @@ mod tests {
         let first_allow = allow_reclaim.clone();
 
         let first = std::thread::spawn(move || {
-            acquire_after_existing(first_path, || {
+            let coordination =
+                acquire_coordination(&first_path).expect("first reclaimer coordinates");
+            acquire_after_existing(first_path, coordination, || {
                 first_ready.wait();
                 first_allow.wait();
             })
@@ -633,6 +665,30 @@ mod tests {
             }
         );
         drop(guard);
+    }
+
+    #[test]
+    fn stale_sweeper_keeps_a_dead_lock_while_reclaim_coordination_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "9999999\n1").unwrap();
+        let coordination = acquire_coordination(&path).expect("hold reclaim coordination");
+
+        let warnings = remove_stale_locks(dir.path());
+
+        assert!(
+            path.exists(),
+            "sweeper must not unlink during coordinated reclaim"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("coordination is busy")),
+            "busy coordination must be reported: {warnings:?}"
+        );
+        drop(coordination);
     }
 
     #[test]

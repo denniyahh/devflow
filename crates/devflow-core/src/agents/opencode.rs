@@ -119,6 +119,23 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often [`spawn_with_timeout`] polls the child for exit.
 const PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+#[cfg(unix)]
+fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
+    let pid = pid as libc::pid_t;
+    if pid <= 0 {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
 /// Run `cmd` to completion, killing it if it does not exit within `timeout`
 /// (43-REVIEW.md WR-02). Without this, a blocked `opencode` subprocess
 /// (hung credential re-auth prompt, network stall) stalls `health()`/
@@ -147,13 +164,19 @@ fn spawn_with_timeout(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {
+            #[cfg(unix)]
+            if kill_probe_group(child.id())? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "probe parent exited before its process group drained",
+                ));
+            }
             break;
         }
         if std::time::Instant::now() >= deadline {
             #[cfg(unix)]
             {
-                let pid = child.id() as libc::pid_t;
-                if pid <= 0 || unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+                if !kill_probe_group(child.id())? {
                     let _ = child.kill();
                 }
             }
@@ -431,6 +454,26 @@ mod tests {
         dir
     }
 
+    fn stub_parent_exits_before_hanging_child(sleep_secs: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create stub dir");
+        let stub = dir.path().join("opencode");
+        let script = format!(
+            "#!/bin/sh\nsleep {sleep_secs} &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n"
+        );
+        std::fs::write(&stub, script).expect("write parent-exit stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
+            .expect("link the required sleep utility into the isolated PATH");
+        dir
+    }
+
     fn hanging_stub_child_pid(stub_dir: &tempfile::TempDir) -> u32 {
         std::fs::read_to_string(stub_dir.path().join("opencode.pid"))
             .expect("hanging stub records its sleep pid")
@@ -647,6 +690,30 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "the timeout must actually bound the wait, not merely be advisory: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn spawn_with_timeout_kills_a_descendant_after_its_parent_exits() {
+        let stub_dir = stub_parent_exits_before_hanging_child(10);
+        let mut cmd = std::process::Command::new(stub_dir.path().join("opencode"));
+        let start = std::time::Instant::now();
+        let err = spawn_with_timeout(&mut cmd, std::time::Duration::from_millis(200))
+            .expect_err("a pipe-holding descendant must keep the probe from succeeding");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let pid = hanging_stub_child_pid(&stub_dir);
+        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !crate::agent::agent_running(pid),
+            "the parent-exit probe's sleep descendant must be dead: pid {pid}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "a parent-exit descendant must not make output draining unbounded: took {:?}",
             start.elapsed()
         );
     }
