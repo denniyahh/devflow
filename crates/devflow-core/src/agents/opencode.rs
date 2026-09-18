@@ -401,7 +401,7 @@ mod tests {
     fn stub_hanging_opencode_on_path(sleep_secs: u64) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create stub dir");
         let stub = dir.path().join("opencode");
-        let script = format!("#!/bin/sh\nsleep {sleep_secs}\necho should-never-print\n");
+        let script = format!("#!/bin/sh\nexec sleep {sleep_secs}\n");
         std::fs::write(&stub, script).expect("write hanging opencode stub");
         #[cfg(unix)]
         {

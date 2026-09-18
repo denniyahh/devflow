@@ -11,9 +11,12 @@
 //! parallel`'s sibling phases with no retry (CR-03, 13-REVIEW.md).
 
 use crate::phase_id::PhaseId;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+
+static LOCK_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Errors produced by lock operations.
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +133,78 @@ pub fn acquire_project_blocking(
     }
 }
 
+enum LockPublication {
+    Published,
+    AlreadyExists,
+}
+
+/// Publish a fully written lock record without ever exposing an empty lock path.
+fn publish_lock(path: &Path, before_publish: impl FnOnce()) -> io::Result<LockPublication> {
+    let (tmp, mut file) =
+        crate::workflow::create_unique_temp(path, std::process::id(), &LOCK_TEMP_SEQ)?;
+    if let Err(error) = file
+        .write_all(lock_contents().as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(file);
+
+    before_publish();
+    let publish = fs::hard_link(&tmp, path);
+    let cleanup = fs::remove_file(&tmp);
+    match publish {
+        Ok(()) => {
+            cleanup?;
+            Ok(LockPublication::Published)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = cleanup;
+            Ok(LockPublication::AlreadyExists)
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error)
+        }
+    }
+}
+
+fn contended(path: PathBuf) -> LockError {
+    LockError::Contended {
+        pid: read_holder_pid(&path),
+        path,
+    }
+}
+
+fn acquire_after_existing(path: PathBuf) -> Result<LockGuard, LockError> {
+    let Some(record) = read_holder_record(&path) else {
+        return Err(contended(path));
+    };
+    if crate::agent::agent_running(record.pid) {
+        return Err(LockError::Contended {
+            pid: record.pid.to_string(),
+            path,
+        });
+    }
+
+    tracing::warn!(
+        "reclaiming stale devflow lock at {} (holder pid {} is not alive)",
+        path.display(),
+        record.pid
+    );
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match publish_lock(&path, || {})? {
+        LockPublication::Published => Ok(LockGuard { path }),
+        LockPublication::AlreadyExists => Err(contended(path)),
+    }
+}
+
 fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -139,42 +214,9 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
     })?;
     crate::workflow::ensure_devflow_dir(parent)?;
 
-    match File::create_new(&path) {
-        Ok(mut f) => {
-            write!(f, "{}", lock_contents())?;
-            Ok(LockGuard { path })
-        }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let pid = read_holder_pid(&path);
-            // Stale-holder recovery (13-06 dogfood finding): a killed or
-            // crashed holder never runs LockGuard's Drop, and its abandoned
-            // lock wedges every future `advance` for the project — silently,
-            // since advance usually runs from a detached monitor with no
-            // terminal. If the recorded holder is not alive, reclaim the
-            // lock and retry the atomic create once. Best-effort: PID reuse
-            // is theoretically possible but the window is negligible for a
-            // per-project lock.
-            if !pid_is_alive(&pid) {
-                tracing::warn!(
-                    "reclaiming stale devflow lock at {} (holder pid {pid} is not alive)",
-                    path.display()
-                );
-                let _ = fs::remove_file(&path);
-                return match File::create_new(&path) {
-                    Ok(mut f) => {
-                        write!(f, "{}", lock_contents())?;
-                        Ok(LockGuard { path })
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                        let pid = read_holder_pid(&path);
-                        Err(LockError::Contended { pid, path })
-                    }
-                    Err(err) => Err(err.into()),
-                };
-            }
-            Err(LockError::Contended { pid, path })
-        }
-        Err(err) => Err(err.into()),
+    match publish_lock(&path, || {})? {
+        LockPublication::Published => Ok(LockGuard { path }),
+        LockPublication::AlreadyExists => acquire_after_existing(path),
     }
 }
 
@@ -481,6 +523,57 @@ mod tests {
     }
 
     #[test]
+    fn acquire_treats_an_empty_lock_record_as_contended_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+
+        let err = acquire(dir.path(), phase)
+            .expect_err("an unreadable lock record must not be reclaimed");
+        assert!(matches!(err, LockError::Contended { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn complete_record_publication_loses_cleanly_to_a_concurrent_acquirer() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let temp_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let allow_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_path = path.clone();
+        let first_ready = temp_ready.clone();
+        let first_publish = allow_publish.clone();
+
+        let first = std::thread::spawn(move || {
+            publish_lock(&first_path, || {
+                first_ready.wait();
+                first_publish.wait();
+            })
+            .expect("first publication attempt")
+        });
+
+        temp_ready.wait();
+        let guard =
+            acquire(dir.path(), phase).expect("second acquirer publishes the complete record");
+        allow_publish.wait();
+        assert!(matches!(
+            first.join().unwrap(),
+            LockPublication::AlreadyExists
+        ));
+        assert_eq!(
+            holder_status(dir.path(), phase),
+            HolderStatus::Live {
+                pid: std::process::id()
+            }
+        );
+        drop(guard);
+    }
+
+    #[test]
     fn holder_status_reports_no_holder_and_preserves_empty_lock_file() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(1);
@@ -586,13 +679,16 @@ mod tests {
     }
 
     #[test]
-    fn acquire_reclaims_lock_with_corrupt_pid() {
+    fn acquire_treats_a_corrupt_lock_record_as_contended_without_deleting_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path(), PhaseId::new(1));
+        let phase = PhaseId::new(1);
+        let path = lock_path(dir.path(), phase);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "not-a-pid").unwrap();
 
-        acquire(dir.path(), PhaseId::new(1)).expect("corrupt lock must be reclaimed");
+        let err = acquire(dir.path(), phase).expect_err("corrupt lock must not be reclaimed");
+        assert!(matches!(err, LockError::Contended { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"not-a-pid");
     }
 
     /// `remove_stale_locks` must sweep dead-holder locks but never a live
