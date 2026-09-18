@@ -25,6 +25,12 @@ pub enum RecoverError {
     /// State loading failed.
     #[error("{0}")]
     Workflow(#[from] WorkflowError),
+    /// Phase-lock acquisition failed.
+    #[error("{0}")]
+    Lock(#[from] crate::lock::LockError),
+    /// Gate cleanup failed.
+    #[error("{0}")]
+    Gate(#[from] crate::gates::GateError),
 }
 
 /// Result of inspecting an existing workflow state.
@@ -128,6 +134,16 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
 /// escape hatch for a wedged-but-fresh run. Clears its state and cron
 /// record; warns (but proceeds) when the recorded agent still looks alive.
 pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
+    let guard = match crate::lock::acquire(project_root, phase) {
+        Ok(guard) => guard,
+        Err(crate::lock::LockError::Contended { pid, .. }) => {
+            return Ok(vec![format!(
+                "phase {phase} is live or contended by pid {pid}; recover --clean deleted neither state nor gate files"
+            )]);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
     let mut warnings = Vec::new();
     if let Ok(state) = workflow::load_state(project_root, phase)
         && agent_pid_for(&state).is_some_and(crate::agent::agent_running)
@@ -136,10 +152,20 @@ pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, R
             "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
         ));
     }
+    for stage in [
+        crate::stage::Stage::Define,
+        crate::stage::Stage::Plan,
+        crate::stage::Stage::Code,
+        crate::stage::Stage::Validate,
+        crate::stage::Stage::Ship,
+    ] {
+        crate::gates::Gates::cleanup(project_root, phase, stage)?;
+    }
     workflow::clear_state(project_root, phase)?;
     if let Err(err) = crate::ship::delete_cron_instructions(project_root, phase) {
         warnings.push(format!("could not remove cron-instructions: {err}"));
     }
+    drop(guard);
     warnings.append(&mut crate::lock::remove_stale_locks(project_root));
     Ok(warnings)
 }
@@ -198,7 +224,9 @@ pub fn format_age(started_at: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gates::{GateResponse, Gates};
     use crate::mode::Mode;
+    use crate::stage::Stage;
     use crate::state::{AgentKind, State};
 
     /// Build a state in `root` whose `started_at` is `age_secs` in the past,
@@ -229,6 +257,52 @@ mod tests {
 
     /// A PID that is essentially certain not to map to a live process.
     const DEAD_PID: u32 = 0x7FFF_FFFE;
+
+    fn write_phase_artifacts(root: &Path, phase: PhaseId) -> Vec<std::path::PathBuf> {
+        workflow::save_state(&state_aged_phase(root, phase, 0, None)).unwrap();
+        let cron = crate::ship::build_single_agent_cron_instructions(root, phase, "");
+        crate::ship::write_cron_instructions(root, &cron).unwrap();
+
+        let mut paths = vec![
+            workflow::state_path(root, phase),
+            crate::ship::cron_instructions_path(root, phase),
+        ];
+        for stage in [Stage::Validate, Stage::Ship] {
+            Gates::write_gate(root, phase, stage, "wedged gate").unwrap();
+            Gates::respond(
+                root,
+                phase,
+                stage,
+                &GateResponse {
+                    approved: false,
+                    note: Some("abort: test".into()),
+                    responded_by: Some("test".into()),
+                },
+            )
+            .unwrap();
+            Gates::ack(root, phase, stage).unwrap();
+            let gate = Gates::gate_path(root, phase, stage);
+            let temp = Gates::dir(root).join(format!(
+                ".{}.recovery.tmp",
+                gate.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&temp, "orphaned gate temp").unwrap();
+            paths.extend([
+                gate,
+                Gates::response_path(root, phase, stage),
+                Gates::ack_path(root, phase, stage),
+                temp,
+            ]);
+        }
+        paths
+    }
+
+    fn artifact_bytes(paths: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        paths
+            .iter()
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect()
+    }
 
     #[test]
     fn fresh_state_is_not_stale() {
@@ -469,5 +543,96 @@ mod tests {
 
         assert!(!crate::ship::cron_instructions_path(root, first).exists());
         assert!(crate::ship::cron_instructions_path(root, second).exists());
+    }
+
+    #[test]
+    fn clean_phase_removes_gate_files_when_no_process_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(48);
+        let paths = write_phase_artifacts(root, phase);
+
+        clean_phase(root, phase).expect("clean lock-free phase");
+
+        for path in paths {
+            assert!(
+                !path.exists(),
+                "cleaning a lock-free phase must remove {}",
+                path.display()
+            );
+        }
+        assert!(
+            !crate::lock::lock_path(root, phase).exists(),
+            "the cleanup lock must be dropped before stale-lock sweeping"
+        );
+    }
+
+    #[test]
+    fn clean_phase_returns_without_cleanup_while_the_per_phase_lock_is_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(49);
+        let paths = write_phase_artifacts(root, phase);
+        let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
+        let lock_path = crate::lock::lock_path(root, phase);
+        let mut before = artifact_bytes(&paths);
+        before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
+
+        let warnings = clean_phase(root, phase).expect("contended clean reports warning");
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("live or contended")),
+            "contention must be reported: {warnings:?}"
+        );
+        for (path, contents) in before {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                contents,
+                "contention must leave {} byte-identical",
+                path.display()
+            );
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn clean_phase_returns_without_cleanup_for_a_recycled_pid_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(50);
+        let paths = write_phase_artifacts(root, phase);
+        let lock_path = crate::lock::lock_path(root, phase);
+        let observed =
+            crate::agent::process_start_time(std::process::id()).expect("test pid start time");
+        std::fs::write(
+            &lock_path,
+            format!("{}\n{}", std::process::id(), observed + 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::lock::holder_status(root, phase),
+            crate::lock::HolderStatus::Recycled { .. }
+        ));
+        let mut before = artifact_bytes(&paths);
+        before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
+
+        let warnings = clean_phase(root, phase).expect("recycled lock reports warning");
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("live or contended")),
+            "acquisition contention, not read-only classification, controls cleanup: {warnings:?}"
+        );
+        for (path, contents) in before {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                contents,
+                "a recycled-pid lock must preserve {}",
+                path.display()
+            );
+        }
     }
 }

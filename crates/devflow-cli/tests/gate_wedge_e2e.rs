@@ -119,6 +119,53 @@ fn wedge_arm_killed_start_leaves_a_gate_that_reject_reports_honestly() {
         output_text.contains("no confirmed waiter"),
         "unexpected output: {output_text}"
     );
+
+    let recovery = Command::new(devflow_bin())
+        .args(["recover", "--clean", "--phase", &phase.to_string()])
+        .arg(root)
+        .output()
+        .expect("recover lock-free wedge");
+    assert!(
+        recovery.status.success(),
+        "recover --clean failed: {}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, phase).exists(),
+        "recovery must remove the wedged state"
+    );
+    assert!(
+        !Gates::dir(root)
+            .read_dir()
+            .expect("gates directory")
+            .any(|entry| entry
+                .expect("gate entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{}-", phase.padded()))),
+        "recovery must remove every gate artifact for the wedged phase"
+    );
+    assert!(
+        !root
+            .join(".devflow")
+            .read_dir()
+            .expect("devflow directory")
+            .any(|entry| {
+                entry
+                    .expect("devflow entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            }),
+        "recovery must remove orphaned temporary files"
+    );
+    assert!(
+        !root
+            .join(".devflow")
+            .join(format!("lock-{}", phase.padded()))
+            .exists(),
+        "recovery must not leave its own lock behind"
+    );
 }
 
 #[test]

@@ -3289,6 +3289,9 @@ pub(crate) struct PhaseFacts {
     pub(crate) phase: PhaseId,
     pub(crate) stage: Stage,
     pub(crate) gate_pending: bool,
+    /// Read-only phase-lock status, computed in `build_phase_facts`; all
+    /// lock I/O stays there so reconciliation remains pure.
+    pub(crate) waiter: lock::HolderStatus,
     pub(crate) agent_pid: Option<u32>,
     pub(crate) agent_alive: bool,
     /// The monitor pid recorded in `State.monitor_pid` (18b). `None` means
@@ -3340,10 +3343,29 @@ fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
     })
 }
 
+/// An open gate has no process that may still be waiting to consume an
+/// answer. Report the same recovery command the gate verbs already name;
+/// doctor remains report-only.
+fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if facts.open_gate_stages.is_empty() || facts.waiter.may_be_waiting() {
+        return None;
+    }
+    let gate_stage = facts.open_gate_stages[0];
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: gate open for stage {} but no waiter may still be waiting",
+            facts.phase, gate_stage
+        ),
+        repair: Some(no_waiter_repair(facts.phase, gate_stage)),
+    })
+}
+
 /// An open gate file exists but `gate_pending` is false — an unanswered
 /// operator question that `status`/`doctor` isn't surfacing as pending.
 fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.gate_pending || facts.open_gate_stages.is_empty() {
+    if facts.gate_pending || facts.open_gate_stages.is_empty() || !facts.waiter.may_be_waiting() {
         return None;
     }
     let gate_stage = facts.open_gate_stages[0];
@@ -3453,6 +3475,7 @@ fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
 fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     [
         check_gate_pending_without_gate(facts),
+        check_open_gate_without_waiter(facts),
         check_orphan_gate(facts),
         check_dead_agent(facts),
         check_dead_monitor(facts),
@@ -3496,6 +3519,7 @@ fn build_phase_facts(
 ) -> PhaseFacts {
     let phase = state.phase;
     let stopped = state.stopped;
+    let waiter = lock::holder_status(project_root, phase);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let monitor_pid = state.monitor_pid;
@@ -3520,6 +3544,7 @@ fn build_phase_facts(
         phase,
         stage: state.stage,
         gate_pending: state.gate_pending,
+        waiter,
         agent_pid,
         agent_alive,
         monitor_pid,
@@ -6278,6 +6303,7 @@ mod tests {
                 phase,
                 stage: Stage::Code,
                 gate_pending: false,
+                waiter: lock::HolderStatus::NoHolder,
                 agent_pid: Some(4242),
                 agent_alive: true,
                 monitor_pid: Some(4343),
@@ -6326,8 +6352,85 @@ mod tests {
             assert!(findings[0].detail.contains("gate open for stage validate"));
             assert_eq!(
                 findings[0].repair.as_deref(),
-                Some("devflow gate approve 3 --stage validate")
+                Some(no_waiter_repair(PhaseId::new(3), Stage::Validate).as_str())
             );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_open_gate_with_no_waiter_with_the_cli_repair() {
+            let phase = PhaseId::new(13);
+            let facts = PhaseFacts {
+                open_gate_stages: vec![Stage::Validate],
+                waiter: lock::HolderStatus::NoHolder,
+                ..agreeing_facts(phase)
+            };
+
+            let findings = reconcile_phase(&facts);
+
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some(no_waiter_repair(phase, Stage::Validate).as_str())
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_open_ship_gate_with_no_waiter_names_ship() {
+            let phase = PhaseId::new(14);
+            let facts = PhaseFacts {
+                open_gate_stages: vec![Stage::Ship],
+                waiter: lock::HolderStatus::NoHolder,
+                ..agreeing_facts(phase)
+            };
+
+            let findings = reconcile_phase(&facts);
+
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some(no_waiter_repair(phase, Stage::Ship).as_str())
+            );
+            assert!(
+                findings[0]
+                    .repair
+                    .as_deref()
+                    .is_some_and(|repair| repair.contains("devflow ship --phase 14"))
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_open_gate_with_a_recycled_waiter_as_no_waiter() {
+            let phase = PhaseId::new(15);
+            let facts = PhaseFacts {
+                open_gate_stages: vec![Stage::Validate],
+                waiter: lock::HolderStatus::Recycled { pid: 1234 },
+                ..agreeing_facts(phase)
+            };
+
+            let findings = reconcile_phase(&facts);
+
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some(no_waiter_repair(phase, Stage::Validate).as_str())
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_open_gate_with_a_live_waiter_is_not_a_no_waiter_finding() {
+            let phase = PhaseId::new(16);
+            let facts = PhaseFacts {
+                open_gate_stages: vec![Stage::Validate],
+                waiter: lock::HolderStatus::Live { pid: 1234 },
+                ..agreeing_facts(phase)
+            };
+
+            let findings = reconcile_phase(&facts);
+
+            assert!(findings.iter().all(|finding| {
+                finding.repair.as_deref() != Some(no_waiter_repair(phase, Stage::Validate).as_str())
+            }));
         }
 
         #[test]
@@ -6541,6 +6644,44 @@ mod tests {
             let facts = collect_phase_facts(dir.path());
             assert!(facts.is_empty());
             assert!(render_reconciliation_text(&facts).contains("no active phases"));
+        }
+
+        #[test]
+        fn collect_phase_facts_preserves_empty_and_corrupt_lock_records() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let empty_phase = PhaseId::new(93);
+            let corrupt_phase = PhaseId::new(94);
+            for (phase, contents) in [(empty_phase, ""), (corrupt_phase, "not-a-pid\nnever")] {
+                workflow::save_state(&State::new(
+                    phase,
+                    AgentKind::Claude,
+                    Mode::Auto,
+                    root.to_path_buf(),
+                ))
+                .unwrap();
+                let lock_path = root
+                    .join(".devflow")
+                    .join(format!("lock-{}", phase.padded()));
+                std::fs::write(lock_path, contents).unwrap();
+            }
+
+            let facts = collect_phase_facts(root);
+
+            assert_eq!(facts.len(), 2);
+            assert!(
+                facts
+                    .iter()
+                    .all(|fact| fact.waiter == lock::HolderStatus::NoHolder)
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(".devflow/lock-93")).unwrap(),
+                ""
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(".devflow/lock-94")).unwrap(),
+                "not-a-pid\nnever"
+            );
         }
 
         #[test]
