@@ -1459,7 +1459,9 @@ configured, and nothing tells the operator how to configure it. **Size:** M — 
 
 **Depends on:** nothing structural. Related: 999.119 (live `--mode auto` end-to-end run of the
 configured-base chain), 999.120 (the environment variable not reaching the detached monitor, which a
-`devflow.toml` avoids), 999.109 (resolved 2026-09-18; found in the same 2026-08-23 dogfood run).
+`devflow.toml` avoids), 999.109 (resolved 2026-09-18; found in the same 2026-08-23 dogfood run),
+spike 001 (`.planning/spikes/001-planning-repo-topology/`, not run) — where `.planning/` lives
+relative to the code repo, which decides whether `devflow.toml` holds one location or two.
 
 Plans:
 
