@@ -127,6 +127,57 @@ Variants within B to reason about:
 | **GSD support** | Its standard single-repo setup. | Documented (`sub_repos`). Executor worktrees with a nested repo are untested here. |
 | **Other users of DevFlow** | Needs a personal branch plus custom hooks; not something a new user gets by default. | Needs two repos; clearer boundary, but a bigger setup step (a natural job for `devflow init`). |
 
+## Assessment Against DevFlow's Goals (2026-09-18, Claude's analysis — not a decision)
+
+| Criterion | A (today) | A′ (DevFlow automates A) | B (separate spec repo) |
+|---|---|---|---|
+| Driving autonomous GSD runs | Works, except Ship would merge into the personal branch | **Best:** as A, plus Ship builds the PR branch to `develop` | Blocked: at least 4 DevFlow checks break; GSD executor worktrees with a nested repo unproven |
+| Finding and recovering failed runs | **Best:** one branch holds plan and code commits in order; one reset rolls both back | Same as A | **Worst:** two histories can disagree after a crash; rollback must reset both repos together |
+| Keeping planning/environment out of code | Rule-based, checked at push; planning branch is public (see below) | Same, unless the workspace branch pushes to a private remote | **Best:** structural; the spec repo can have a private remote |
+| Multiple agent types | Claude ✓; OpenCode ✓ via `CLAUDE.md` fallback; Codex ✗ (no `AGENTS.md`) | Same, plus the fix below | Depends on where agents start; parallel runs share one spec checkout |
+
+**Leaning:** A′, plus two fixes that apply whichever layout is chosen. Revisit B only if structural
+separation from the public, or keeping tested commit hashes on `develop`, becomes the priority — and
+only after the trial.
+
+**Findings behind the table (verified 2026-09-18):**
+- **The planning branch is public.** `denniyahh/devflow` is a public repo and `workspace/denniyahh`
+  is pushed to `origin`, so `.planning/` and `CLAUDE.md` are readable by anyone. Option A keeps them
+  out of `develop`, not out of view. A′ variant: push the workspace branch to a private remote, and
+  only the filtered `-pr` branches to `origin`.
+- **Agents find instruction files differently** (from each tool's docs):
+  - Claude Code reads `CLAUDE.md` in every directory above its starting directory.
+  - Codex reads `AGENTS.md` from the nearest `.git` down, never above. It is configurable via
+    `project_root_markers` and `project_doc_fallback_filenames`, neither set in `~/.codex/config.toml`.
+  - OpenCode searches upward for `AGENTS.md`, then falls back to `CLAUDE.md`.
+
+  Only `CLAUDE.md` is tracked, so Codex gets no project instructions in a phase worktree today, under
+  any layout. Under B with agents starting inside the nested code repo, Codex would also miss the
+  spec repo's files.
+- **Six drivers differ structurally.** Claude gets slash commands; Codex, OpenCode, Antigravity,
+  Hermes and Pi read GSD workflow files from their own home-directory install (for example
+  `$HOME/.codex/gsd-core/workflows`, `$HOME/.pi/agent/gsd-core/workflows`). Codex cannot run Define or
+  Plan headless without an existing artifact.
+- **Parallel runs:** `devflow parallel` runs several phases at once, each in its own worktree. Under
+  A each branch carries its own `.planning/`; under B they would share STATE.md and ROADMAP.md unless
+  the spec repo also gets a worktree per phase.
+- **No docs-only push path.** `scripts/hooks/pre-push` runs `scripts/check-in-container.sh all` on
+  every push (the only bypass, `DEVFLOW_SKIP_CONTAINER_CHECK=1`, still runs `scripts/check.sh all`
+  on the host), and CI has no path filters. A `.planning/`-only push costs the full 2–9 minute gate.
+  B avoids this; A′ could add a skip.
+- **Tested vs merged commits.** A/A′ send a filtered copy to `develop` (new hashes); B keeps the same
+  hashes.
+- **Run records are local in every layout.** `.devflow/` (state, events, gates, history) lives
+  untracked in the main checkout, keyed by phase number.
+
+**Fixes that apply whichever layout is chosen:** make project instructions readable by every agent
+(track `AGENTS.md` beside `CLAUDE.md`, or set Codex's `project_doc_fallback_filenames`), and decide
+whether the planning branch should stay public.
+
+**Not established:** where OpenCode's upward search stops; how Antigravity, Hermes and Pi find
+instruction files; whether GSD executor worktrees work under B; whether the 4 known DevFlow breakages
+under B are the only ones.
+
 ## DevFlow Coupling (what B would require)
 
 DevFlow assumes `.planning/` lives on the phase's own branch and in its worktree. Found 2026-09-18:
@@ -209,6 +260,10 @@ The trial answers three questions, each with a result that would count against B
   from the operator's description: `.planning/` is tracked and forked, not copied, and its commits
   are blocked at push, not at commit.
 - 2026-09-18: the operator deferred any trial in order to reason further *(operator)*.
+- 2026-09-18: assessed A, A′ and B against four operator-named criteria *(operator)*: autonomous GSD
+  runs, identifying and recovering failed runs, segregating planning/environment from code, and
+  multiple agent types. Checked the agent drivers, each tool's instruction-file docs (Codex, OpenCode,
+  Claude Code via Context7), `.devflow/` run records, repo visibility, and the pre-push gate.
 
 ## Results
 
