@@ -1,262 +1,102 @@
+---
+last_mapped_commit: d581384145e82fd8f7091fee6387d70c6a62fff5
+last_mapped_at: 2026-09-18
+---
 # Coding Conventions
 
-**Analysis Date:** 2026-07-17
+**Analysis Date:** 2026-09-18
+
+Rust 2024 edition workspace (`Cargo.toml`), toolchain pinned exactly to `1.97.1` in `rust-toolchain.toml` (never a floating channel). Two crates: `crates/devflow-core` (lib, package `devflow-core`) and `crates/devflow-cli` (binary-only, package `devflow`).
 
 ## Naming Patterns
 
 **Files:**
-- Rust source files use `snake_case`: `git.rs`, `agent_result.rs`, `lock.rs`
-- Test files in `tests/` directory use `snake_case`: `phase7_cli.rs`, `help_snapshot.rs`, `log_format_env.rs`
-- Integration tests colocated in crate's `tests/` subdirectory, not inline `#[cfg(test)]` modules
 
-**Functions:**
-- Public functions use `snake_case`: `feature_start()`, `branch_exists()`, `parse_gate_timeout()`
-- Internal helpers prefixed to indicate scope: `git_in()`, `git_output()`, `git()` for git wrapper variants
-- Constructor pattern: `new()` factory (e.g., `GitFlow::new()`) or `default()` for structs
-- Boolean query functions use `is_`/`has_` prefix: `branch_exists()`, `has_remote()`, `agent_running()`
+- `snake_case.rs`, one module per concern, flat under `src/` (e.g. `crates/devflow-core/src/agent_result.rs`, `crates/devflow-core/src/ship_evidence.rs`).
+- Sub-module directories use `mod.rs` (`crates/devflow-core/src/agents/mod.rs` plus one file per agent: `claude.rs`, `codex.rs`, `opencode.rs`, `pi.rs`, `hermes.rs`, `antigravity.rs`).
+- CLI modules are split by pipeline role with a `pipeline_` prefix: `crates/devflow-cli/src/pipeline_launch.rs`, `pipeline_outcomes.rs`, `pipeline_gate.rs`.
+- Integration tests: descriptive snake_case, `_e2e` suffix for real-process end-to-end tests (`crates/devflow-cli/tests/stop_e2e.rs`, `crates/devflow-core/tests/monitor_e2e.rs`).
 
-**Variables:**
-- Local variables use `snake_case`: `branch`, `phase`, `root`, `state`
-- Constants use `SCREAMING_SNAKE_CASE`: `MAIN`, `DEVELOP`, `FEATURE_PREFIX`, `SCHEMA_VERSION`
-- Module-level constants extracted to indicate intent: `STATE_FILE_PREFIX`, `SEVEN_DAYS`
-- Generic lifetime parameters: `'de` for deserialization, `'a` for borrows
+**Functions:** `snake_case`, verb-first and descriptive (`evaluate_agent_result`, `discover_stray_devflow_processes`, `wait_for_agent_pid`). Path helpers are named `<thing>_path` (`agent_pid_path`, `exit_code_path`, `stdout_path` in `agent_result.rs`).
 
-**Types:**
-- Struct names use `PascalCase`: `GitFlow`, `BranchInfo`, `State`, `AgentResult`
-- Enum variants use `PascalCase`: `AgentStatus::Success`, `Verdict::Pass`, `GitError::Command`
-- Error type suffix: `Error` (e.g., `GitError`, `WorkflowError`, `LockError`)
-- Custom error enum per module, deriving from `thiserror::Error`
+**Variables:** `snake_case`; constants `SCREAMING_SNAKE_CASE` with a doc comment explaining the value (`EXEC_VISIBILITY_WAIT`, `EXEC_VISIBILITY_POLL` in `crates/devflow-core/src/test_support.rs`). Do not use magic numbers — name the duration/limit.
+
+**Types:** `PascalCase`. Domain newtypes over primitives (`PhaseId` in `crates/devflow-core/src/phase_id.rs`, with `.padded()` for `feature/phase-NN` names). Enums for closed sets: `Stage`, `Mode`, `AgentKind`, `AgentStatus`. Error enums are `<Module>Error` (`GitError`, `LockError`, `WorkflowError`, `RegistryError`, `ShipError`, `HookError`, `GsdConfigError`, `VersionError`, `RecoverError`).
 
 ## Code Style
 
 **Formatting:**
-- Rust edition 2024
-- `rustfmt` (standard, no custom config in repo — uses stable defaults)
-- Line length: follows Rust conventions (generally 100 cols for readability)
-- Indentation: 4 spaces (enforced by rustfmt)
+
+- `rustfmt` defaults (no `rustfmt.toml`). Enforced by `cargo fmt --check` in `scripts/check.sh fmt`.
 
 **Linting:**
-- `cargo clippy -- -D warnings` (deny all warnings)
-- Configuration: `rust-toolchain.toml` pins `stable` with `clippy` + `rustfmt` components
-- No clippy overrides in source code; all warnings must be fixed
-- Example: `crates/devflow-core/src/git.rs` uses `.map(|o| o.status.success()).unwrap_or(false)` (functional style), avoiding explicit conditionals
 
-**Public API:**
-- All public items (structs, functions, enums, mods) must include doc comments (`///`)
-- Module-level documentation (crate root, submodules) via `//!` block comments
-- Example from `crates/devflow-core/src/lib.rs`: comprehensive module-level documentation covering logging levels, JSON output, structured events
-- Example from `crates/devflow-core/src/lock.rs`: brief purpose statement + conceptual notes in doc comments
+- `cargo clippy --workspace --all-targets -- -D warnings` (`scripts/check.sh clippy`) — test code is linted too.
+- Workspace lints (`Cargo.toml` `[workspace.lints.clippy]`): `dbg_macro`, `todo`, `unimplemented` = warn (so fatal under `-D warnings`). Both crates opt in with `[lints] workspace = true`.
+- `clippy.toml` disallows `std::env::set_var` / `std::env::remove_var`. Scope env to the child process with `Command::env` / `env_remove` / `env_clear`. A genuine test-only exception must carry `#[expect(clippy::disallowed_methods, reason = "...")]` (not `allow`) on the smallest enclosing test item — see `crates/devflow-core/src/monitor.rs:3404`.
+- Dependency hygiene: `cargo deny check` (`deny.toml`) and `cargo machete`, via `scripts/check.sh deps` (not in `all`; tools installed by `scripts/install-dep-tools.sh`).
+
+**Shell scripts (`scripts/*.sh`, `scripts/hooks/*`):** `#!/usr/bin/env bash`, `set -euo pipefail`, a header comment explaining why the script exists, `usage()` to stderr with exit 2, and missing tools are hard errors, never skips (`scripts/check.sh`).
 
 ## Import Organization
 
-**Order:**
-1. Standard library: `use std::{...}` grouped by module
-2. External crates: `use serde::{...}`, `use clap::{...}`, `use thiserror`
-3. Internal crates: `use devflow_core::{...}`, `use crate::{...}`
-4. Re-exports at module end: `pub use` for convenience exports
+**Order (as rustfmt sorts within the block):**
 
-**Example** from `crates/devflow-cli/src/main.rs`:
-```rust
-use clap::{Parser, Subcommand};
-use devflow_core::agent;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig};
-use devflow_core::gates::{self, GateAction, GateResponse, Gates};
-// ... more internal imports
-use std::path::{Path, PathBuf};
-use tracing::info;
-```
+1. External crates (`clap`, `serde`, `thiserror`, `tracing`)
+2. Workspace crate (`devflow_core::...`) / `crate::...`
+3. `std::...`
 
-**Path Aliases:**
-- No path aliases defined (uses full crate names)
-- Crate hierarchy: `devflow` (binary) → `devflow_core` (library)
+Imports are explicit item paths, one `use` per path, grouped with braces when from one module (`use devflow_core::agent_result::{AgentStatus, agent_pid_path, ...}`). No glob imports in production code.
+
+**Path Aliases:** None. The CLI consumes core via `devflow-core.workspace = true`.
 
 ## Error Handling
 
-**Pattern:**
-- Use `thiserror::Error` for all error types: `#[derive(Debug, thiserror::Error)]`
-- Define error enum per module (e.g., `GitError`, `WorkflowError`, `LockError`, `ResultError`)
-- Result type alias not used; explicit `Result<T, E>` throughout
+**Patterns:**
 
-**Error Variants:**
-- Variant per failure mode with context preserved
-- Use `#[from]` for automatic conversion: `#[error("...{0}")] Io(#[from] std::io::Error)`
-- Custom variants for domain logic: e.g., `GitError::Command(String)` for git command failures
-
-**Example** from `crates/devflow-core/src/git.rs`:
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum GitError {
-    #[error("failed to execute git: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("git command failed: {0}")]
-    Command(String),
-}
-```
-
-**Propagation:**
-- Use `?` operator in library code: `fn load_state(...) -> Result<State, WorkflowError> { ... }`
-- No `unwrap()` in library code (`devflow-core`); only in tests or CLI initialization
-- Result handling in CLI (`devflow` binary) uses explicit matching or `.expect()` with context
-
-**Fallible Operations:**
-- Best-effort operations (that must not abort the workflow) use `warn!()` logging and return silently
-- Example from `crates/devflow-core/src/events.rs`: event logging fails soft with `warn!()`, never aborts
-- Example from `crates/devflow-core/src/git.rs`: branch_exists() returns `false` on command failure (safe default)
+- Core: every fallible module defines its own `thiserror` enum; I/O and JSON wrapped with messages like `#[error("registry I/O failed: {0}")]` (`crates/devflow-core/src/registry.rs:37`). Parse errors for CLI values carry the valid options: `#[error("unsupported stage `{0}`; expected define, plan, code, validate, or ship")]` (`stage.rs:101`).
+- CLI: a single `pub(crate) enum CliError` in `crates/devflow-cli/src/main.rs:489` composing core errors via `#[error(transparent)] X(#[from] ...)` plus `Message(String)`. `main()` calls `run() -> Result<(), CliError>` and on error prints `error: {err}` to stderr and exits 1.
+- No `anyhow`, no `Box<dyn Error>` in signatures. Propagate with `?`; `unwrap()`/`expect()` are for tests (the high counts in `version.rs`, `monitor.rs`, `state.rs` sit in `mod tests`).
+- Never fail silently: a skipped or degraded check must print something distinguishable from a pass (principle stated repeatedly, e.g. `scripts/check.sh` `run_deps`, the "never-silent" commit checks in `agent_result.rs`).
 
 ## Logging
 
-**Framework:** `tracing` crate (structured, level-aware logging)
-
-**Output:**
-- All log output goes to **stderr** (not stdout)
-- stdout reserved for agent output, structured results, machine-readable data
-- `RUST_LOG` environment variable controls verbosity (default: `info`)
-- `DEVFLOW_LOG_FORMAT=json` for machine-readable JSON logs (one object per line)
+**Framework:** `tracing` (core) + `tracing-subscriber` with `json` and `env-filter` features (CLI only).
 
 **Patterns:**
-- **State transitions & milestones:** `info!()` — workflow events, stage changes, git operations
-- **Detailed I/O & operations:** `debug!()` — file reads/writes, command invocations
-- **Recoverable anomalies:** `warn!()` — force operations, fallbacks, degraded conditions
-- **Fatal conditions:** `error!()` — abort-level failures
 
-**Examples** from codebase:
-```rust
-// info! for milestones
-info!("creating feature branch: {branch}");
-info!("finishing feature branch: {branch}");
-info!("saving state: phase={} stage={}", state.phase, state.stage);
-
-// debug! for detail
-debug!("rebasing worktree at {} onto {onto}", dir.display());
-debug!("loading state from {}", path.display());
-
-// warn! for recoverable issues
-warn!("force-creating feature branch: {branch}");
-warn!("rebase conflict in {}; aborting", dir.display());
-
-// error! for fatal issues (in CLI only; library uses Results)
-```
-
-**Structured Fields:**
-- Use named fields in log macros: `info!(phase = phase, "event")`
-- Not string interpolation: avoid `info!("phase {phase}: event")`
-- Enables parsing by external tools (metrics, aggregation, filtering)
-
-**Controlling Output:**
-```bash
-RUST_LOG=info devflow start --phase 3              # Default verbosity
-RUST_LOG=debug devflow start --phase 3             # Detailed I/O
-RUST_LOG=devflow_core=debug devflow status         # Specific crate
-DEVFLOW_LOG_FORMAT=json RUST_LOG=info devflow start --phase 3 2>log.json
-```
+- All logs go to **stderr**; stdout is reserved for agent output and machine-readable results (`crates/devflow-core/src/lib.rs` module docs).
+- `RUST_LOG` controls level (default `info`); `DEVFLOW_LOG_FORMAT=json` switches to JSON lines (`main.rs` `main`).
+- Levels: `error` fatal, `warn` recoverable/forced, `info` state transitions and git ops, `debug` command/file I/O. Import the macros by name: `use tracing::{debug, info, warn};`.
+- Structured events carry named fields (`step_entered` / `step_exited` with `phase`).
+- User-facing CLI output uses `println!`/`eprintln!` directly in `crates/devflow-cli/src` (library code does not print, except where deliberately doubling a warning to stdout, `monitor.rs:391`).
 
 ## Comments
 
-**When to Comment:**
-- Doc comments (`///`) on all public items — required, enforced
-- Line comments (`//`) for non-obvious logic within functions
-- Comments should explain WHY, not WHAT (code shows WHAT)
-- Reference phase/decision records: e.g., `// WR-04 (13-REVIEW.md)`, `// CR-01 (15-REVIEW.md)`
+**When to Comment:** Heavily, and about *why*. Comments cite provenance: plan IDs (`48-09`), decision IDs (`D-14`), backlog items (`999.37`), and incidents with dates. Load-bearing config lines get a comment explaining what breaks without them (`serde_json` `preserve_order` in `Cargo.toml`, `INSTA_UPDATE=no` in `scripts/check.sh`). Follow this: when adding a non-obvious guard, state the failure it prevents and its source ID.
 
-**JSDoc/TSDoc:**
-- Rust uses `///` doc comments with markdown formatting
-- Structured as purpose statement + optional examples/notes
-- Multi-line doc comments on complex types:
-
-**Example** from `crates/devflow-core/src/agent_result.rs`:
-```rust
-/// Parsed agent completion result.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AgentResult {
-    pub status: AgentStatus,
-    /// The Validate stage's self-reported verdict — distinct from `status`.
-    /// `status` reports whether the stage's task completed; `verdict` reports
-    /// whether validation ITSELF passed.
-    #[serde(default, deserialize_with = "deserialize_verdict_lenient")]
-    pub verdict: Option<Verdict>,
-}
-```
+**Doc comments:** `//!` module docs at the top of every non-trivial module and test file; `///` on public items and on tests whose intent is not obvious from the name. Reference other code by backticked path/symbol.
 
 ## Function Design
 
-**Size:** 
-- Max ~40-50 lines per function (subjective, but prefer small)
-- Helpers extracted for readability: `git_output()`, `parse_marker_lines()`, `acquire_path()`
-- Example: `crates/devflow-core/src/git.rs` splits git operations into single-purpose methods
+**Size:** No enforced limit; several modules are very large (`agent_result.rs` 9134 lines, `commands.rs` 7458, `pipeline_outcomes.rs` 5546; the inline `mod tests` starts at line 3499 and 3984 respectively, so roughly half or more is tests). Prefer small helpers and reuse existing idioms rather than copying them (e.g. `crate::agent::argv_basename` is reused by `test_support`).
 
-**Parameters:**
-- Prefer concrete types over generic trait bounds (unless polymorphism is needed)
-- Use `&Path` not `&str` for filesystem paths
-- Use `impl AsRef<Path>` for constructor/factory flexibility: `GitFlow::new(root: impl AsRef<Path>)`
-- No default parameters; use builder pattern or `Option<T>` for optional behavior
+**Parameters:** Pass domain types (`PhaseId`, `Stage`, `AgentKind`, `&Path`) not raw strings. Launch configuration bundles into structs (`MonitorLaunch`).
 
-**Return Values:**
-- Fallible operations return `Result<T, E>`, never `Option<T>`
-- Pure functions (no I/O, no mutation) return values directly
-- Functions that check state return `bool` (e.g., `branch_exists()`, `agent_running()`)
-- Option-returning functions indicate missing data, not failure: e.g., `None` for "no active gate"
+**Return Values:** `Result<T, ModuleError>`; structured types from core, formatting left to the CLI ("core returns structured types; frontends format output", `lib.rs`).
 
 ## Module Design
 
-**Exports:**
-- Named exports preferred over glob imports
-- Re-exports via `pub use` at module root for convenience
-- Example from `crates/devflow-core/src/lib.rs`:
-  ```rust
-  pub mod agent;
-  pub mod config;
-  // ... other modules
-  pub use mode::Mode;
-  pub use stage::Stage;
-  pub use state::{AgentKind, State};
-  ```
+**Exports:** `crates/devflow-core/src/lib.rs` declares `pub mod` for each module; no re-export barrel. Test-only modules are gated: `#[cfg(test)] mod doc_check;` and `test_support` behind `#[cfg(any(test, feature = "test-support"))]`.
 
-**Barrel Files:**
-- `agents/mod.rs` aggregates submodules: `pub mod claude;`, `pub use self::claude::*;`
-- No re-export of private types through barrel files
-- Single module entry point: `agents::adapter_for(agent_kind)` instead of exposing each adapter
+**CLI:** binary-only crate; modules declared in `main.rs` with `mod x; use x::{...};`. Test helpers are `#[cfg(test)] mod test_support;` on the `mod` item (not `#![cfg(test)]` inside), to avoid `dead_code` under `-D warnings`.
 
-**Module Organization:**
-- One module per file: `src/git.rs` = `mod git`
-- Submodules (e.g., `agents/`) as subdirectories with `mod.rs`
-- All logic in crate root or dedicated modules, never in `lib.rs` after module declarations
-- Example: `crates/devflow-core/` has 13 modules, each in its own file
+**Barrel Files:** Not used.
 
-## Serialization
+## Commits
 
-**Format:** JSON (serde + serde_json)
-
-**Patterns:**
-- Structs derive `#[derive(Serialize, Deserialize)]`
-- Custom serialization via `#[serde(rename_all = "lowercase")]` for case conversion
-- Lenient deserialization for forward compatibility: `#[serde(default)]` + custom deserializers
-- Example from `crates/devflow-core/src/agent_result.rs`:
-  ```rust
-  #[serde(default, deserialize_with = "deserialize_verdict_lenient")]
-  pub verdict: Option<Verdict>,
-  ```
-  Handles absent, mis-cased, or unknown verdict values gracefully (falls back to `None` rather than error)
-
-**Atomic Writes:**
-- State persisted via sibling temp file + rename (not direct write)
-- Example from `crates/devflow-core/src/workflow.rs`: `write_state_atomic()` prevents torn reads
-
-## Process & System Interaction
-
-**Exit Codes:**
-- `0` for success, any non-zero for failure
-- Specific codes not standardized; all failures exit non-zero
-
-**Signals:**
-- Process-existence checks use `libc::kill(pid, 0)` (POSIX standard)
-- PID validation: reject 0 (process group signal), reject >i32::MAX (wrap risk)
-- Example from `crates/devflow-core/src/agent.rs`: `agent_running()` guards against corrupt PIDs
-
-**Environment Variables:**
-- Configuration via env vars (no config files for automation flags)
-- Parsing pure functions with env access only in CLI entry point
-- Example: `parse_gate_timeout()` is pure; `gate_timeout_secs()` calls `std::env::var()`
+Conventional Commits enforced by `scripts/hooks/commit-msg` (types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert, release, merge, sync; `!` for breaking; no trailing period). Hooks are installed via `git config core.hooksPath scripts/hooks`; `pre-commit` chains to any previously active hook; `pre-push` runs `scripts/check-in-container.sh all` (or `scripts/check.sh all` on its non-container path, `scripts/hooks/pre-push:217-220`).
 
 ---
 
-*Convention analysis: 2026-07-17*
+*Convention analysis: 2026-09-18*

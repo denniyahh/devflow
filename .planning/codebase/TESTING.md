@@ -1,151 +1,186 @@
+---
+last_mapped_commit: d581384145e82fd8f7091fee6387d70c6a62fff5
+last_mapped_at: 2026-09-18
+---
 # Testing Patterns
 
-**Analysis Date:** 2026-07-22
+**Analysis Date:** 2026-09-18
 
 ## Test Framework
 
-**Runner:** Rust's built-in `cargo test` harness. The repository does not use a separate test framework or assertion crate.
+**Runner:**
 
-**Common commands:**
+- Built-in `cargo test` (libtest), toolchain `1.97.1` (`rust-toolchain.toml`).
+- Config: none beyond `Cargo.toml` dev-dependencies and `clippy.toml`.
+
+**Assertion Library:**
+
+- `assert!` / `assert_eq!` with explanatory messages.
+- `insta` (workspace dev-dependency) for prompt-text snapshots.
+- Dev-dependencies: `tempfile = "3"`, `insta`, and `devflow-core` with `features = ["test-support"]` (both crates). No `proptest`, `mockall`, `rstest`, or `serial_test`.
+
+**Run Commands:**
 
 ```bash
-cargo test
-cargo test --workspace
-cargo test -p devflow project_root_walks_up_to_nearest_devflow_ancestor
-cargo test --workspace -- --list
-cargo test -- --nocapture
-cargo test -- --test-threads=1
+cargo test -p devflow-core --lib          # core unit tests
+cargo test -p devflow --bin devflow       # CLI unit tests (binary-only; `--lib` fails)
+scripts/check.sh test                     # env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo test --workspace --no-fail-fast
+scripts/check.sh all                      # fmt + clippy (--all-targets, -D warnings) + test
+scripts/check-in-container.sh all         # same, inside the pinned CI image
 ```
 
-`devflow` is the package name. `devflow-cli` is a directory/crate description, not a valid package name for `cargo test -p`. The CLI is binary-only, so `cargo test -p devflow --lib` also does not select a usable target.
+Always run through `scripts/check.sh` before declaring green: bare `cargo test` does not pin `INSTA_UPDATE=no`, so an exported `INSTA_UPDATE=always`/`INSTA_FORCE_UPDATE=1` silently re-blesses drifted snapshots.
 
-**CI:** `.github/workflows/ci.yml` runs these literal commands in separate jobs:
+When filtering with `--exact`, module-qualify the name (`prompt::tests::x`) and check the output says `1 passed` — a filter that matches nothing still exits 0.
 
-- `cargo test`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo fmt --check`
+**Coverage:** No coverage tool is wired into `scripts/check.sh` or the repo.
 
 ## Test File Organization
 
-**Unit tests:**
-- Each source module owns a bottom-of-file `#[cfg(test)] mod tests` block for the production functions it exercises.
-- A module imports its own items with `use super::*;`.
-- CLI modules import shared fixtures with `use crate::test_support::*;` where needed.
-- `crates/devflow-cli/src/main.rs` retains one test for its own `project_root` helper; split behavior tests moved with their production modules.
-- `crates/devflow-cli/src/test_support.rs` is declared as `#[cfg(test)] mod test_support;` so the binary's non-test build never sees test-only items.
+**Location:**
 
-**CLI integration tests:**
-- `crates/devflow-cli/tests/build_provenance.rs`
-- `crates/devflow-cli/tests/devcontainer_ci_failfast.rs`
-- `crates/devflow-cli/tests/gitignore_coverage.rs`
-- `crates/devflow-cli/tests/help_snapshot.rs`
-- `crates/devflow-cli/tests/log_format_env.rs`
-- `crates/devflow-cli/tests/phase7_cli.rs`
-- `crates/devflow-cli/tests/snapshots/devflow-help.txt` is the committed help snapshot.
+- Unit tests inline as `#[cfg(test)] mod tests { ... }` at the bottom of each source file (e.g. `crates/devflow-core/src/agent_result.rs:3499`, `crates/devflow-cli/src/commands.rs:3984`).
+- Integration tests in `crates/<crate>/tests/*.rs`, one binary per file.
+- Fixtures in `crates/<crate>/tests/fixtures/<topic>/`; snapshots in `src/snapshots/` (insta) and `tests/snapshots/` (plain text).
 
-**Core integration tests:**
-- `crates/devflow-core/tests/devflow_dir_gitignore.rs`
-- `crates/devflow-core/tests/monitor_e2e.rs`
+**Naming:**
 
-Test functions use behavior-oriented snake-case names. A verified CLI unit-test example is `project_root_walks_up_to_nearest_devflow_ancestor` in `crates/devflow-cli/src/main.rs`.
+- Test fns are long descriptive sentences stating the property: `claude_style_fix_prompts_that_must_not_carry_the_policy_still_omit_it`, `help_output_matches_committed_snapshot`.
+- `_e2e.rs` suffix for tests that spawn real processes/binaries.
+
+**Structure:**
+
+```
+crates/devflow-core/
+  src/*.rs                 # inline mod tests
+  src/snapshots/*.snap     # insta baselines (prompt.rs)
+  src/test_support.rs      # shared hermetic helpers (feature-gated)
+  tests/{monitor_e2e,devflow_dir_gitignore,decimal_phase_paths,agent_kind_antigravity}.rs
+  tests/fixtures/opencode/
+crates/devflow-cli/
+  src/*.rs                 # inline mod tests
+  src/snapshots/*.snap     # insta baselines (pipeline_launch.rs)
+  src/test_support.rs      # #[cfg(test)] shared fixtures, ENV_MUTEX
+  tests/*.rs               # 22 files: e2e, guards on scripts/CI/hooks, help snapshot
+  tests/fixtures/{ci-parity,plan-bashisms}/
+  tests/snapshots/devflow-help.txt
+```
+
+Scale: ~1327 `#[test]` functions across the workspace; heaviest in `agent_result.rs` (200), `commands.rs` (115), `pipeline_outcomes.rs` (73).
 
 ## Test Structure
 
-Tests use arrange, act, assert without a fixture framework:
+**Suite Organization:**
 
-1. Create a temporary directory with `tempfile::tempdir()`.
-2. Initialize a real Git fixture when repository behavior matters.
-3. Replace external agent CLIs with temporary executable scripts.
-4. Invoke the production function or the compiled `devflow` binary.
-5. Assert on the return value, exit status, stdout/stderr, emitted events, and on-disk state.
+```rust
+/// Doc comment stating the decision/incident the test guards (IDs like D-15, 999.37).
+#[test]
+fn claude_style_full_execute_fix_prompt_snapshot() {
+    let prompt = render_claude_style(&StageIntent::Code {
+        phase: PhaseId::new(47),
+        fix: Some(FixType::FullExecute),
+    });
+    insta::assert_snapshot!(prompt);
+}
+```
 
-Asynchronous process and file effects use bounded polling helpers. Keep the assertion inside the polling window when the condition can change after an earlier wait; checking several eventually-consistent files only after one combined wait has caused real flakes.
+(`crates/devflow-core/src/prompt.rs:1360`)
+
+**Patterns:**
+
+- Setup: build a throwaway repo in `tempfile::tempdir()` / `TempDir::new()`; auto-cleanup on drop.
+- Exhaustiveness: iterate enum variants through an exhaustive `match` so a new `AgentKind` is a compile error until tested (`policy_carrying_full_execute_fix_prompt_snapshots`, `prompt.rs`).
+- Assertions carry context: `assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr))`.
+- Guards and scanners have fixture pairs: a legit sample that must pass and bypass samples that must trip (`tests/fixtures/plan-bashisms/legit-PLAN.md` vs `*-bypass-PLAN.md`; `tests/fixtures/ci-parity/valid.yml` vs `decoy-job.yml`, `commented-out.yml`). Keep a known-positive and known-negative for every new guard.
 
 ## Mocking
 
-There is no mocking framework. Tests replace only process boundaries that should not call a real external agent:
+**Framework:** None. Use real processes and real git with fake executables.
 
-- Fake `claude`, `codex`, or `opencode` executables are written into a temporary directory.
-- The temporary directory is prepended to `PATH` for the scoped test.
-- Fake agents print controlled output and `DEVFLOW_RESULT` markers.
+**Patterns:**
 
-Do not mock Git or filesystem behavior when a temporary repository can exercise the real operation. The integration suite intentionally validates actual Git commands, worktrees, branches, commits, and capture files.
+```rust
+// fake agent binary written into a tempdir and put on the child's PATH
+let script = format!(
+    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\nprintf '%s' '{body}'\nexit {exit_code}\n",
+);
+```
+
+(`crates/devflow-core/src/agents/opencode.rs:381`; similar in `pi.rs:250`, `antigravity.rs:170`, `crates/devflow-cli/src/test_support.rs:482`)
+
+Hermetic git — always go through the helper, never bare `Command::new("git")` in fixtures:
+
+```rust
+let output = devflow_core::test_support::git_command(root)
+    .args(args)
+    .output()
+    .expect("spawn git");
+```
+
+(`crates/devflow-core/tests/monitor_e2e.rs`). `git_command` scrubs `GIT_DIR` and related repo-local vars; fixture repos set `user.email`, `user.name`, `commit.gpgsign false`, `core.hooksPath /dev/null`.
+
+Seam injection: where a process call must be faked in-process, pass a closure (`type OutputFn = Box<dyn FnOnce() -> std::io::Result<std::process::Output>>`, `opencode.rs:789`).
+
+**What to Mock:** External agent CLIs (claude, codex, opencode, pi, hermes, antigravity) via `#!/bin/sh` fakes; timeouts via env knobs (`DEVFLOW_GATE_TIMEOUT_SECS` etc.).
+
+**What NOT to Mock:** git, the filesystem, process spawning, `/proc` inspection. Integration tests invoke the real binary via `env!("CARGO_BIN_EXE_devflow")` (`crates/devflow-cli/tests/help_snapshot.rs`).
+
+## Environment Isolation
+
+- `std::env::set_var` / `remove_var` are disallowed by `clippy.toml`. Configure the spawned child with `Command::env` / `env_remove` / `env_clear`.
+- Remaining exceptions hold an `ENV_MUTEX` and carry `#[expect(clippy::disallowed_methods, reason = "...")]` (`crates/devflow-core/src/monitor.rs:3404`, `crates/devflow-core/src/gates.rs:381`). The CLI's shared `ENV_MUTEX` is in `crates/devflow-cli/src/test_support.rs`; its doc lists which vars it guards — add a new var there, not in a new mutex (D-04: each env var guarded by exactly one mutex).
+- `/proc` race: after spawning a child, call `test_support::wait_for_exec_visibility` before asserting on a `/proc/<pid>/cmdline` census; `agent_running` (kill 0) is not a barrier (`crates/devflow-core/src/test_support.rs`).
+- `crates/devflow-cli/tests/git_env_hermeticity.rs` fails fast if the suite runs with `GIT_DIR`-family vars set.
 
 ## Fixtures and Factories
 
-`crates/devflow-cli/src/test_support.rs` is the shared CLI unit-test fixture module. It owns:
+**Test Data:**
 
-- `ENV_MUTEX`
-- `init_repo` and `init_repo_no_version_file`
-- `AlwaysFailAdapter` and `FailOnceAdapter`
-- `agent_free_git_only_path_dir` and `agent_free_dir_with_agent_stub`
-- `stub_agent_binary`
-- `prepend_path`
-- `stage_launched_count`
+```rust
+fn init_repo(root: &Path, phase: PhaseId) {
+    git(root, &["init", "-q"]);
+    // ...identity, gpgsign off, hooksPath /dev/null...
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    // base commit, then feature/phase-NN with one commit
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+}
+```
 
-Integration-test helpers remain local to their integration-test binary because sibling files under `tests/` compile as separate crates.
+(`crates/devflow-core/tests/monitor_e2e.rs`)
 
-## Environment Mutation Rule
+**Location:** `crates/devflow-core/src/test_support.rs` (cross-crate via `test-support` feature), `crates/devflow-cli/src/test_support.rs` (CLI-internal), file fixtures under `tests/fixtures/`.
 
-Any CLI unit test that changes `PATH`, `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, or `DEVFLOW_GATE_NOTIFY_CMD` must hold `crate::test_support::ENV_MUTEX` for the complete save, mutate, exercise, and restore sequence. Do not declare a second mutex.
+## Snapshot Tests
 
-**D-04 invariant: every env var is guarded by exactly one mutex, and no var is touched under two.** This is a reviewer-enforced convention; no type or lint checks it mechanically.
-
-`crates/devflow-core/src/gates.rs` and `crates/devflow-core/src/config.rs` each retain their own `ENV_MUTEX`. That is safe only because core and CLI tests compile into different test binaries, so their process-global environments cannot race across the crate boundary. Inside one test binary, a new mutex would violate the invariant.
-
-Prefer a pure parse/read split: test parsing by passing raw values directly, and keep process-global environment access in a small wrapper. The tests in `crates/devflow-cli/src/config_parse.rs` follow this pattern and therefore do not need to mutate environment.
-
-## Coverage
-
-CI does not enforce a line-coverage percentage. Coverage expectations are behavioral:
-
-- Lock the intended contract with a test that fails for the right reason before the implementation change.
-- Exercise the real production boundary rather than a copied helper or weaker surrogate.
-- Inspect whether the test would still pass if the changed behavior were absent.
-- Keep the suite's full target and test-name inventory stable during pure-move refactors.
-
-The project acceptance contract is `.claude/skills/ai-change-acceptance/`, especially `rules/change-acceptance.md` and `rules/test-signal-rejection.md`.
+- `insta` baselines: `crates/devflow-core/src/snapshots/devflow_core__prompt__tests__*.snap` (one per agent adapter, deliberately duplicated — do not merge) and `crates/devflow-cli/src/snapshots/devflow__pipeline_launch__tests__*.snap`. A mismatch is a wording change to review; never re-bless to make a failure go away.
+- CLI `--help` is a plain-text snapshot (`crates/devflow-cli/tests/snapshots/devflow-help.txt`); on change, update docs then regenerate with `cargo run -q -p devflow -- --help > crates/devflow-cli/tests/snapshots/devflow-help.txt`.
 
 ## Test Types
 
-**Unit tests:** Pure parsing, policies, state transitions, path resolution, rendering, and error classification. They live beside the owning production module.
+**Unit Tests:** inline `mod tests`, pure logic plus tempdir-backed state/git.
 
-**Integration tests:** Full binary invocation, build provenance, CI source contracts, `.devflow` hygiene, logging formats, monitor lifecycle, and multi-step CLI workflows. They use real Git and temporary repositories while replacing agent CLIs.
+**Integration Tests:** `crates/*/tests/*.rs` — real `devflow` binary, real monitor with a fake agent (`monitor_e2e.rs`), and repo-policy guards over scripts/CI/hooks (`ci_parity_guards.rs`, `pre_push_signing_policy.rs`, `pre_commit_branch_guard.rs`, `workspace_version_pin.rs`, `gitignore_coverage.rs`, `plan_bashism_scanner.rs`, `worktree_guard_harness.rs`).
 
-**Regression guards:**
-- `help_snapshot.rs` protects the CLI surface recorded in `snapshots/devflow-help.txt`.
-- `devcontainer_ci_failfast.rs` checks shell/CI command ordering and source-level contract hooks.
-- `gitignore_coverage.rs` checks `.devflow` construction coverage.
-- `build_provenance.rs` rebuilds nested fixtures to validate embedded provenance.
+**E2E Tests:** `*_e2e.rs` (`gate_sweep_e2e.rs`, `stop_e2e.rs`, `reap_strays_e2e.rs`, `start_reachability_e2e.rs`, `auto_chain_*_e2e.rs`). No live-agent tests in the suite.
 
-There is no live-agent end-to-end test in the automated suite. Agent boundaries are exercised with deterministic fake executables.
-
-## False-Green Traps
-
-1. `cargo test --exact` with a bare function name can match zero tests and still exit successfully. Always inspect the harness output and require the intended target to report `1 passed`; exit status alone is insufficient.
-2. The package is `devflow`, not `devflow-cli`. A copied `cargo test -p devflow-cli ...` command does not validate this crate.
-3. `cargo test -p devflow --lib` is invalid for this binary-only package. Use `cargo test -p devflow <filter>` for its unit-test binary.
-4. For a pure-move proof, a green suite alone is insufficient. Diff the committed test-name inventory and compare per-target pass counts so dropped, renamed, or re-nested tests cannot disappear silently.
+**Ignored tests:** No `#[ignore]` attributes on tests in the tree (only mentioned in comments).
 
 ## Common Patterns
 
-**Temporary resources:** Use RAII types such as `tempfile::TempDir` so repositories, scripts, and captures are removed on drop.
+**Async Testing:** None — no async runtime. Waits are bounded polls with named constants (`EXEC_VISIBILITY_WAIT` 10s / `EXEC_VISIBILITY_POLL` 2ms) that fail loudly rather than hang.
 
-**Process assertions:** Include stderr in failure messages, and assert both exit status and the specific observable contract.
+**Error Testing:**
 
-**State assertions:** Inspect persisted state, events, gates, captures, branches, and commit history rather than relying only on printed success text.
+```rust
+assert!(matches!(
+    load_state(root, PhaseId::new(7)),
+    Err(WorkflowError::MissingState(_))
+));
+```
 
-**Polling:** Bound every wait and emit the missing path or PID in the timeout message.
-
-**Git fixtures:** Disable commit and tag signing, set a deterministic identity, and use real branches and commits.
-
-## Test Dependencies
-
-- `tempfile = "3"` provides temporary directories and files.
-- Rust stable is selected by `rust-toolchain.toml`.
-- Git and `/bin/sh` are required by integration fixtures.
-- No additional assertion or mocking library is used.
+(`crates/devflow-core/tests/monitor_e2e.rs:121`)
+Match the specific error variant or assert on the intended failure text — not merely on a non-zero exit code.
 
 ---
 
-*Testing analysis: 2026-07-22*
+*Testing analysis: 2026-09-18*

@@ -1,82 +1,38 @@
-<!-- refreshed: 2026-07-17 -->
+---
+last_mapped_commit: d581384145e82fd8f7091fee6387d70c6a62fff5
+last_mapped_at: 2026-09-18
+---
+<!-- refreshed: 2026-09-18 -->
+
 # Architecture
 
-**Analysis Date:** 2026-07-17
+**Analysis Date:** 2026-09-18
 
 ## System Overview
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│                   CLI Dispatcher                            │
-│              `crates/devflow-cli/src/main.rs`               │
-└────────────────┬────────────────────────────────────────────┘
-                 │
-                 ▼
+│              CLI frontend  (binary `devflow`)                │
+│  arg parsing + dispatch: `crates/devflow-cli/src/main.rs`    │
+├──────────────┬──────────────┬──────────────┬────────────────┤
+│ commands.rs  │ pipeline_    │ pipeline_    │ pipeline_gate  │
+│ (subcommand  │ launch.rs    │ outcomes.rs  │ .rs (transit., │
+│  handlers)   │ (seam A)     │ (seam B)     │  gates, abort) │
+│ preflight.rs │ staleness.rs │ parallel.rs  │ config_parse.rs│
+└──────┬───────┴──────┬───────┴──────┬───────┴───────┬────────┘
+       ▼              ▼              ▼               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│            State Machine (core lib)                          │
-│  Define → Plan → Code → Validate → Ship (linear chain)      │
-│         `crates/devflow-core/src/stage.rs`                  │
-│         `crates/devflow-core/src/state.rs`                  │
-└────┬─────────────────────┬───────────────────┬──────────────┘
-     │                     │                   │
-     ▼                     ▼                   ▼
-┌──────────────────┐ ┌────────────────┐ ┌──────────────────┐
-│  Agent Stage     │ │  Gate Stage    │ │  Execution Mode  │
-│  (Define/Plan/   │ │  (Validate/    │ │  (Auto/Supervise)│
-│   Code)          │ │   Ship)        │ │                  │
-│                  │ │                │ │  `mode.rs` (0-46)│
-│ ┌──────────────┐ │ │  Fires gates   │ └──────────────────┘
-│ │ Prompt       │ │ │  to .devflow/  │
-│ │ Stage-spec. │ │ │  gates/ for    │
-│ │ CLI command  │ │ │  human review  │
-│ │ `prompt.rs`  │ │ │  `gates.rs`    │
-│ └──────────────┘ │ │  (gate protocol)
-│                  │ │
-│ ┌──────────────┐ │ │
-│ │Agent Adapter │ │ │
-│ │(Claude/Codex │ │ │
-│ │/OpenCode)    │ │ │
-│ │`agents/`     │ │ │
-│ │ mod.rs,      │ │ │
-│ │ claude.rs    │ │ │
-│ └──────────────┘ │ │
-└──────────────────┘ └────────────────┘
-         │
-         ▼
+│          devflow-core library  (`crates/devflow-core/src`)   │
+│ stage/state/workflow │ agents/* (AgentDriver) │ monitor      │
+│ agent_result + outcome_policy │ gates │ hooks/git/worktree   │
+│ version/ship/ship_evidence │ lock/registry/events/recover    │
+└──────┬──────────────────────────────────────────────────────┘
+       ▼
 ┌─────────────────────────────────────────────────────────────┐
-│            Monitor Daemon                                    │
-│  Spawns detached process that owns the agent, captures      │
-│  output, records exit code, then calls devflow advance      │
-│  `crates/devflow-core/src/monitor.rs`                       │
-└────────────────┬─────────────────────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────┐
-│            Agent Process Tree                                │
-│  Agent binary (claude/codex/opencode) runs non-interactive  │
-│  Stdout/stderr captured to .devflow/phase-NN-{stdout,stderr}│
-│ Exit code written to .devflow/phase-NN-exit                 │
-└────────────────┬─────────────────────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────┐
-│            Git Operations                                    │
-│  Feature branching: develop → feature/phase-NN → develop    │
-│  Release branching: → release/vX.Y.Z → main + develop       │
-│  Worktree isolation: .worktrees/phase-NN (linked checkout)  │
-│  `crates/devflow-core/src/git.rs` (GitFlow helper)          │
-│  `crates/devflow-core/src/worktree.rs` (git worktree cmds)  │
-└────────────────┬─────────────────────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────┐
-│            State & Result Persistence                        │
-│  .devflow/state-NN.json  (per-phase state)                   │
-│  .devflow/phase-NN-exit  (exit code)                         │
-│  .devflow/lock-NN        (per-phase lock)                    │
-│  .devflow/gates/{NN,stage}*.json (gate protocol)             │
-│  `crates/devflow-core/src/workflow.rs` (state I/O)           │
-│  `crates/devflow-core/src/agent_result.rs` (result parsing)  │
+│ External processes + on-disk state                           │
+│ `git`, agent CLIs (claude, codex, opencode, pi, hermes, agy) │
+│ `.devflow/` (state-NN.json, events.jsonl, gates/, lock-NN)   │
+│ `.planning/` (GSD-owned; config.json via gsd_config.rs only) │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,307 +40,165 @@
 
 | Component | Responsibility | File |
 |-----------|----------------|------|
-| CLI | Argument parsing, command dispatch, error formatting | `crates/devflow-cli/src/main.rs` |
-| State Machine | Stage transitions, advance logic, gate decision | `crates/devflow-core/src/state.rs`, `stage.rs` |
-| Agent Adapter | Build CLI command for agent (Claude/Codex/OpenCode) | `crates/devflow-core/src/agents/mod.rs`, `claude.rs`, `codex.rs`, `opencode.rs` |
-| Prompt Builder | Stage-specific GSD commands + completion contract | `crates/devflow-core/src/prompt.rs` |
-| Monitor Daemon | Spawn agent, capture output, auto-advance state machine | `crates/devflow-core/src/monitor.rs` |
-| Git Helper | Feature/release branching, worktree lifecycle | `crates/devflow-core/src/git.rs`, `worktree.rs` |
-| Gate Protocol | Request/response/ack file I/O for human pause points | `crates/devflow-core/src/gates.rs` |
-| Result Evaluator | Three-layer result parsing (DEVFLOW_RESULT, exit code, heuristic) | `crates/devflow-core/src/agent_result.rs` |
-| Locking | Per-phase locks + optional project-wide lock | `crates/devflow-core/src/lock.rs` |
-| Recovery | Inspect/cleanup stale workflow state | `crates/devflow-core/src/recover.rs` |
+| CLI entry | tracing init, clap `Command` enum, `run()` dispatch, `CliError` | `crates/devflow-cli/src/main.rs` |
+| Subcommand handlers | start, status, logs, history, gate family, recover, doctor | `crates/devflow-cli/src/commands.rs` |
+| Pipeline seam A | `launch_stage`, `run_monitor`, `advance`, `resume` | `crates/devflow-cli/src/pipeline_launch.rs` |
+| Pipeline seam B | `handle_*_outcome`, validate classification, checkout hooks | `crates/devflow-cli/src/pipeline_outcomes.rs` |
+| Pipeline seam C | stage transitions, gate firing/resolution, loop-backs, finish/abort | `crates/devflow-cli/src/pipeline_gate.rs` |
+| Preflight | readiness gate before `monitor::spawn_monitor` | `crates/devflow-cli/src/preflight.rs` |
+| Staleness | binary provenance vs tree under test (self-dogfood guard) | `crates/devflow-cli/src/staleness.rs` |
+| Parallel | multi-phase concurrent runs, one worktree each | `crates/devflow-cli/src/parallel.rs` |
+| Stage machine | `Stage` enum Define→Plan→Code→Validate→Ship, GSD command mapping | `crates/devflow-core/src/stage.rs` |
+| Run state | `State` (`#[non_exhaustive]`), `AgentKind` | `crates/devflow-core/src/state.rs` |
+| Persistence | per-phase `.devflow/state-{phase:02}.json` load/save | `crates/devflow-core/src/workflow.rs` |
+| Agent drivers | `AgentDriver` trait + one module per agent | `crates/devflow-core/src/agents/` |
+| Monitor | detached daemon owning the agent process and capture files | `crates/devflow-core/src/monitor.rs` |
+| Completion detection | DEVFLOW_RESULT parsing, four-layer decision engine | `crates/devflow-core/src/agent_result.rs` |
+| Outcome policy | pure exhaustive `AgentStatus` → `Action` table | `crates/devflow-core/src/outcome_policy.rs` |
+| Gates | file-protocol human handoff in `.devflow/gates/` | `crates/devflow-core/src/gates.rs` |
+| Hooks | side effects at transitions (branch, docs, merge, changelog, version) | `crates/devflow-core/src/hooks.rs` |
+| Git / worktree | plain `git` / `git worktree` subprocess wrappers | `crates/devflow-core/src/git.rs`, `crates/devflow-core/src/worktree.rs` |
+| Versioning | git-derived SemVer | `crates/devflow-core/src/version.rs` |
+| Ship | ship bookkeeping + structural "did it ship" oracle | `crates/devflow-core/src/ship.rs`, `crates/devflow-core/src/ship_evidence.rs` |
+| Concurrency guards | per-phase PID lock; machine-global project registry | `crates/devflow-core/src/lock.rs`, `crates/devflow-core/src/registry.rs` |
+| Event log | append-only `.devflow/events.jsonl` (schema v1) | `crates/devflow-core/src/events.rs` |
+| GSD config writer | sole writer of `.planning/config.json` | `crates/devflow-core/src/gsd_config.rs` |
+| Verify | operator-approved post-condition probes from PLAN.md frontmatter | `crates/devflow-core/src/verify.rs` |
+| Canary | detects loss of the undocumented agent-CLI behaviour DevFlow relies on | `crates/devflow-core/src/canary.rs` |
+| Config | minimal `devflow.toml` + fixed git-flow branch model | `crates/devflow-core/src/config.rs` |
 
 ## Pattern Overview
 
-**Overall:** Linear state machine driven by a background monitor daemon. No scheduler, no cron, no shared global state across phases.
+**Overall:** Library + thin-ish CLI frontend driving a linear, file-persisted stage machine; each stage is executed by an external AI coding agent under a detached monitor process that re-invokes `devflow advance` on exit.
 
 **Key Characteristics:**
-- **Stateless CLI:** Each invocation reads state from disk, never maintains process memory between commands
-- **Per-phase isolation:** Every phase has its own state file, lock, and (optional) worktree; `devflow parallel` sibling phases never block each other
-- **Monitor ownership:** The background daemon owns the agent process and capture files — the CLI exits but the workflow continues unattended
-- **Three-layer result evaluation:** Agents communicate via DEVFLOW_RESULT JSON marker (authoritative); fallback to exit code + commit count (reliable); final fallback to heuristic (last resort)
-- **Gate as pause points:** Not exceptions — gates are the normal mechanism for human review (Validate in Supervise, Ship in both modes)
-- **Worktree by default:** Agent runs in an isolated `.worktrees/phase-NN/` linked checkout, preventing cross-phase git contamination
+
+- Core returns structured types; the CLI formats output (`crates/devflow-core/src/lib.rs` module doc).
+- All durable state is files under `.devflow/`, keyed per phase — no daemon or database.
+- External tools (git, agents, gh) are invoked as subprocesses; no git library dependency (`crates/devflow-core/Cargo.toml` deps: libc, serde, serde_json, toml, thiserror, tracing, semver, git-conventional).
+- Policy decisions are pure functions (`outcome_policy::decide_action`, `hooks::hooks_for_transition`) separated from I/O.
 
 ## Layers
 
-**Orchestration Layer (CLI):**
-- Purpose: Parse arguments, dispatch commands, format output for humans and machines
-- Location: `crates/devflow-cli/src/main.rs`
-- Contains: Command structs (Start, Advance, Gate, Logs, Parallel, Sequentagent), error handling, output formatting
-- Depends on: `devflow_core` library (all core modules)
-- Used by: Users via `devflow` binary
+**CLI layer:**
 
-**State Machine Layer (core lib):**
-- Purpose: Manage workflow stage transitions, gate decisions, and per-phase state persistence
-- Location: `crates/devflow-core/src/` (state.rs, stage.rs, mode.rs, workflow.rs)
-- Contains: State struct (phase, stage, agent, mode, gate_pending, consecutive_failures), Stage enum (Define/Plan/Code/Validate/Ship), Mode enum (Auto/Supervise)
-- Depends on: serde (JSON), tracing (logging)
-- Used by: CLI (reads/writes state), Advance command (transitions states), Monitor (spawns with state)
+- Purpose: parse args, orchestrate the pipeline, render output, map errors to `CliError`
+- Location: `crates/devflow-cli/src/`
+- Contains: `pub(crate)` functions only; binary-only crate (no lib target)
+- Depends on: `devflow-core`, clap, tracing-subscriber, serde_json, thiserror
+- Used by: operators, the monitor daemon (re-invokes `devflow advance`/`monitor`)
 
-**Agent Execution Layer (core lib):**
-- Purpose: Launch coding agents with stage-specific prompts, manage process lifecycle
-- Location: `crates/devflow-core/src/agents/`, monitor.rs, prompt.rs, agent.rs
-- Contains: AgentAdapter trait (name, exec_command, extra_env, completion_signal_detected), three adapter implementations (Claude/Codex/OpenCode), stage-specific prompts, DEVFLOW_RESULT completion contract
-- Depends on: Process control, shell escaping, prompt templates
-- Used by: Monitor (to build launch command), Stage Validate (to detect completion)
+**Core layer:**
 
-**Result Evaluation Layer (core lib):**
-- Purpose: Parse agent output and determine success/failure
-- Location: `crates/devflow-core/src/agent_result.rs`
-- Contains: AgentResult struct, three-layer decision logic (DEVFLOW_RESULT marker → exit code + commits → heuristic), rate-limit detection
-- Depends on: serde_json (parse JSON markers), file I/O (read capture files)
-- Used by: Advance command (evaluates result, decides next stage)
-
-**Git Operations Layer (core lib):**
-- Purpose: Git-flow operations (feature branch lifecycle, release branching, worktree management)
-- Location: `crates/devflow-core/src/git.rs`, worktree.rs
-- Contains: GitFlow struct (feature_start, feature_finish, release_start, release_finish, tag), Worktree helper (add, add_detached, remove, list)
-- Depends on: `git` command (spawned via Command), libc (for PID operations)
-- Used by: Start (creates feature branch + worktree), Advance (merges + tags on Ship), Cleanup (removes worktree)
-
-**Synchronization Layer (core lib):**
-- Purpose: Prevent concurrent state mutations within a phase, serialize project-wide git operations
-- Location: `crates/devflow-core/src/lock.rs`
-- Contains: LockGuard (per-phase lock), project-wide lock for git operations, stale-holder recovery
-- Depends on: File I/O (create_new with O_EXCL for atomicity), libc (PID checking)
-- Used by: Advance (acquires per-phase lock across entire stage execution, including gate waits), Ship (acquires project lock during version bump/merge)
-
-**Gate Protocol Layer (core lib):**
-- Purpose: File-based handoff between workflow and human (via Hermes or manual intervention)
-- Location: `crates/devflow-core/src/gates.rs`
-- Contains: GateFile (request), GateResponse (human answer), GateAck (receipt), gate action decision logic
-- Depends on: File I/O (atomic writes to .devflow/gates/), serde_json (gate payloads)
-- Used by: Advance (fires gates), Gate subcommand (human responds)
-
-**Capture & Persistence Layer (core lib):**
-- Purpose: Store workflow state, agent output, exit codes, gate records
-- Location: `crates/devflow-core/src/workflow.rs`, agent_result.rs, lock.rs, gates.rs, ship.rs
-- Contains: State JSON I/O (atomic writes), capture file paths, cron-instructions persistence
-- Depends on: File I/O, serde_json
-- Used by: All layers (read state, write results, capture output)
+- Purpose: stage machine, state, agent drivers, gates, hooks, git mechanics
+- Location: `crates/devflow-core/src/`
+- Contains: `pub mod` per concern; re-exports `Mode`, `Stage`, `State`, `AgentKind`
+- Depends on: std + small crates; shells out to `git` and agent CLIs
+- Used by: `devflow-cli` only (published separately to crates.io, core before cli)
 
 ## Data Flow
 
-### Primary Request Path: `devflow start --phase N --agent X --mode auto`
+### Primary Request Path (`devflow start`)
 
-1. **Start command** (`crates/devflow-cli/src/main.rs:Start { ... }`)
-   - Parse args: phase, agent kind, mode, worktree flag
-   - Call `workflow::state_path()` to locate `.devflow/state-{N:02}.json`
+1. Parse and dispatch `Command::Start` (`crates/devflow-cli/src/main.rs:531`)
+2. Handler validates flags / creates worktree + state (`crates/devflow-cli/src/commands.rs`)
+3. `launch_stage` runs preflight, renders the prompt via the agent's `AgentDriver::render_prompt`, and calls `monitor::spawn_monitor` (`crates/devflow-cli/src/pipeline_launch.rs:1234`, `crates/devflow-core/src/monitor.rs:296`)
+4. Monitor owns the agent, captures stdout/exit into `.devflow/`, then invokes `devflow advance --phase N` (`crates/devflow-core/src/monitor.rs`)
+5. `advance` acquires the per-phase lock, loads state, evaluates the result via `agent_result` (`crates/devflow-cli/src/pipeline_launch.rs:1510`)
+6. `outcome_policy::decide_action` maps status to `Advance | AutoResume | GateInfra | GateReview` (`crates/devflow-core/src/outcome_policy.rs:38`)
+7. Outcome handlers / gate seam transition, run hooks, write gates, or launch the next stage (`crates/devflow-cli/src/pipeline_outcomes.rs`, `crates/devflow-cli/src/pipeline_gate.rs`)
+8. Ship: `handle_ship_outcome` finishes the workflow; post-ship hooks merge, bump version, append changelog, clean up branch (`crates/devflow-cli/src/pipeline_outcomes.rs:838`, `crates/devflow-core/src/hooks.rs`)
 
-2. **Create state** (`crates/devflow-core/src/state.rs`)
-   - New state: stage=Define, phase=N, agent=X, mode=auto, project_root
-   - Worktree enabled → set `state.worktree_path = .worktrees/phase-{N:02}`
+### Gate Resolution
 
-3. **Create feature branch + worktree** (`crates/devflow-core/src/git.rs`, `worktree.rs`)
-   - GitFlow::feature_start(N) → `git checkout develop; git checkout -b feature/phase-NN`
-   - Worktree::add(.worktrees/phase-NN, feature/phase-NN, develop) → `git worktree add -b feature/phase-NN .worktrees/phase-NN develop`
-
-4. **Save initial state** (`crates/devflow-core/src/workflow.rs`)
-   - `workflow::save_state(&state)` → write to `.devflow/state-{N:02}.json` (atomic via temp file)
-
-5. **Spawn monitor** (`crates/devflow-core/src/monitor.rs`)
-   - Build agent command: `agents::adapter_for(X).exec_command(N, prompt, extra_writable_roots)`
-   - Spawn detached shell process:
-     - Sets up capture files: `.devflow/phase-{N:02}-{stdout,stderr,exit,agent-pid}`
-     - Launches agent with prompt (non-interactive: `claude -p`, `codex exec`, `opencode ...`)
-     - Waits for agent exit, records exit code to `.devflow/phase-{N:02}-exit`
-     - Calls `devflow advance --phase N` (CLI exits here; monitor stays alive)
-
-### Secondary Flow: `devflow advance --phase N` (auto-triggered by monitor)
-
-1. **Acquire per-phase lock** (`crates/devflow-core/src/lock.rs`)
-   - Acquire `.devflow/lock-{N:02}` (fails if held by sibling phase)
-   - Lock is held through entire stage execution, including gate waits
-
-2. **Load state** (`crates/devflow-core/src/workflow.rs`)
-   - Read `.devflow/state-{N:02}.json`
-
-3. **Evaluate result** (`crates/devflow-core/src/agent_result.rs`)
-   - Layer 1: Parse `.devflow/phase-{N:02}-stdout` for `DEVFLOW_RESULT: {...}` marker
-     - If found and valid JSON with `status: "success"`, use that result
-   - Layer 2: If Layer 1 failed, check exit code (must be 0) AND commit count on feature branch
-   - Layer 3: If Layer 2 failed, check heuristic (commits exist + no process = probable success)
-
-4. **Advance stage** (stage-specific logic in `advance()`)
-   - **Define → Plan:** Check result was success, advance to Plan, spawn monitor for next stage
-   - **Plan → Code:** Check result was success, advance to Code, spawn monitor for next stage
-   - **Code → Validate:** Check result was success, advance to Validate, spawn monitor for next stage
-   - **Validate → Ship or Code:** 
-     - Check result has `verdict: "pass"` (if "gaps", loop back to Code)
-     - If consecutive_failures >= MAX_CONSECUTIVE_FAILURES and mode=Auto, fire gate (else advance)
-   - **Ship → Done:** Merge feature branch to develop, create release branch, tag, merge to main
-
-5. **Gate decision** (stage-specific)
-   - If gate should fire (`mode.should_gate(stage, failures)`):
-     - Write gate request to `.devflow/gates/{N:02}-{stage}.json`
-     - If DEVFLOW_GATE_NOTIFY_CMD set, invoke it with phase/stage env
-     - Wait for human response (polling with backoff up to DEVFLOW_GATE_TIMEOUT_SECS, default 7 days)
-     - Read response from `.devflow/gates/{N:02}-{stage}.response.json`
-     - Write ACK to `.devflow/gates/{N:02}-{stage}.ack.json`
-     - GateAction::Advance → continue, GateAction::LoopBack(Code) → loop, GateAction::Abort → stop
-
-6. **Release the lock** (`crates/devflow-core/src/lock.rs`)
-   - Drop LockGuard → delete `.devflow/lock-{N:02}` (RAII cleanup)
-
-7. **If not at Ship, spawn monitor for next stage** (step 5 from Primary Flow)
-
-### Parallel Execution: `devflow parallel --phases 7,8`
-
-- Parse phase list and agent list
-- For each phase:
-  - Acquire project-wide lock (short-held, just for worktree/branch setup)
-  - Create feature branch + worktree
-  - Release project lock
-  - Spawn monitor (runs in background)
-- Return immediately; monitors advance sibling phases concurrently
-- Each monitor holds its own per-phase lock (not shared)
+1. Pipeline writes a gate request into `.devflow/gates/` and sets `State.gate_pending` (`crates/devflow-core/src/gates.rs`)
+2. Operator or Hermes poller runs `devflow gate approve|reject|show|list|sweep` (`crates/devflow-cli/src/main.rs` `GateCommand`)
+3. The blocked `advance` observes the response and continues or loops back (`crates/devflow-cli/src/pipeline_gate.rs`)
 
 **State Management:**
-- **Per-phase:** `.devflow/state-{N:02}.json` survives restarts; includes full workflow metadata
-- **Global (project-wide):** No singleton state file; only per-phase files exist
-- **Gates:** Request/response/ack files persist until cleaned up
-- **Locks:** Per-phase and project-wide locks cleaned up via RAII (LockGuard::Drop)
+
+- `.devflow/state-{phase:02}.json` per phase (`workflow.rs`); `.devflow/lock-{phase:02}` PID lock (`lock.rs`); `.devflow/events.jsonl` audit log (`events.rs`). `.devflow/` is self-ignored via its own `.gitignore` (`*`).
 
 ## Key Abstractions
 
-**AgentAdapter Trait:**
-- Purpose: Encapsulate agent-specific CLI flags and prompt wrapping
-- Examples: `crates/devflow-core/src/agents/claude.rs`, `codex.rs`, `opencode.rs`
-- Pattern: Adapter method `exec_command()` returns `(program, args)` from a stage prompt; no prompt modification, only CLI wrapping
-- Key methods:
-  - `name()` → "Claude Code" | "OpenAI Codex" | "OpenCode"
-  - `exec_command(phase, prompt, extra_writable_roots)` → (program, args)
-  - `extra_env()` → vec of env var overrides (Codex uses this to disable commit signing)
-  - `completion_signal_detected(output)` → bool (agent-specific heuristic for completion)
+**`AgentDriver`:**
 
-**Stage Enum:**
-- Purpose: Represent the five stages in the linear pipeline
-- Pattern: Immutable enum with methods (not a state struct)
-  - `next()` → Option<Stage> (Define→Plan→Code→Validate→Ship→None)
-  - `is_gate()` → bool (only Validate and Ship)
-  - `is_agent_stage()` → bool (only Define, Plan, Code)
-  - `gsd_command()` → &'static str ("/gsd-discuss-phase {N}", etc.)
+- Purpose: per-agent prompt rendering, command building, completion parsing, health, env, sandbox
+- Examples: `crates/devflow-core/src/agents/{claude,codex,opencode,pi,hermes,antigravity}.rs`
+- Pattern: trait with defaulted methods (`crates/devflow-core/src/agents/mod.rs:70`)
 
-**Mode Enum + MAX_CONSECUTIVE_FAILURES:**
-- Purpose: Determine whether gates fire and whether Code↔Validate auto-loops
-- Pattern: `mode.should_gate(stage, consecutive_failures)` → bool
-  - Ship always gates (both modes)
-  - Validate gates only in Supervise, or in Auto after ≥3 consecutive failures
-  - Other stages never gate
-  - `mode.should_auto_loop(stage)` → bool (only Validate in Auto mode auto-loops)
+**`Stage` / `State`:**
 
-**GitFlow Helper:**
-- Purpose: Wrap git commands for feature/release/tag operations
-- Pattern: Constructor takes project root; methods call `git` command, parse output, handle errors
-- Separation: Distinct from Worktree helper — GitFlow is high-level git-flow (branching, merging, tagging); Worktree is low-level `git worktree` management
+- Purpose: linear 5-stage chain and serialized run record
+- Examples: `crates/devflow-core/src/stage.rs`, `crates/devflow-core/src/state.rs`
+- Pattern: enum with `next()`; `#[non_exhaustive]` serde struct with `#[serde(default)]` for additive fields
 
-**Lock Pattern:**
-- Purpose: Serialize state transitions and git operations
-- Pattern: LockGuard (RAII) — acquire() returns a guard; lock released when guard dropped
-- Levels: Per-phase lock (held across stage + gate), project lock (held briefly during git ops)
-- Stale-holder recovery: If recorded PID is dead, reclaim lock (prevents wedging after crashes)
+**`Hook`:**
+
+- Purpose: side effects at transitions (only `Validate→Ship` → `DocsUpdate` in `hooks_for_transition`; merge/version/changelog/cleanup via `hooks_after_ship`)
+- Examples: `crates/devflow-core/src/hooks.rs`
+
+**`PhaseId`:**
+
+- Purpose: integer or decimal phase (`35`, `35.1`)
+- Examples: `crates/devflow-core/src/phase_id.rs`
 
 ## Entry Points
 
-**`devflow start`:**
-- Location: `crates/devflow-cli/src/main.rs:Cli::Start { ... }`
-- Triggers: User runs `devflow start --phase N --agent X --mode auto`
-- Responsibilities:
-  1. Parse args
-  2. Create state and feature branch + worktree
-  3. Save state to disk
-  4. Spawn monitor (CLI returns; monitor stays alive)
+**`devflow` binary:**
 
-**`devflow advance`:**
-- Location: `crates/devflow-cli/src/main.rs:Cli::Advance { ... }` (hidden command, internal use only)
-- Triggers: Monitor calls this after agent exits
-- Responsibilities:
-  1. Load state from disk
-  2. Evaluate agent result (three layers)
-  3. Decide next stage (or gate, or loop)
-  4. Save updated state
-  5. Fire gate or spawn monitor for next stage
-  6. Release lock
+- Location: `crates/devflow-cli/src/main.rs` (`fn main`, line 506)
+- Triggers: operator, monitor daemon, Hermes cron
+- Responsibilities: subcommands Start, Advance, Monitor, Resume, Gate, Logs, History, Parallel, Reference, Cleanup, Status, List, Recover, Test, Doctor, Release, Ship, Stop, Evidence
 
-**`devflow gate`:**
-- Location: `crates/devflow-cli/src/main.rs:Cli::Gate { ... }`
-- Triggers: Human uses `devflow gate list` or `devflow gate approve/reject <phase> ...`
-- Responsibilities:
-  1. Read open gate requests from `.devflow/gates/`
-  2. Write human response to `.devflow/gates/{phase}-{stage}.response.json`
-  3. Advance command wakes up and reads response, resumes workflow
+**Hidden re-entry (`devflow monitor` / `devflow advance`):**
 
-**`devflow logs`:**
-- Location: `crates/devflow-cli/src/main.rs:Cli::Logs { ... }`
-- Triggers: User runs `devflow logs --phase N [--follow]`
-- Responsibilities:
-  1. Read capture file (`.devflow/phase-{N:02}-stdout` or `-stderr.log`)
-  2. Print or tail with follow (useful for debugging agent runs)
-
-**`devflow parallel`:**
-- Location: `crates/devflow-cli/src/main.rs:Cli::Parallel { ... }`
-- Triggers: User runs `devflow parallel --phases 7,8 [--agents claude,codex]`
-- Responsibilities:
-  1. For each phase, run `devflow start` internally (isolated worktrees, feature branches)
-  2. Spawn all monitors concurrently
-  3. Return immediately; phases advance in parallel
-
-**`devflow sequentagent`:**
-- Location: `crates/devflow-cli/src/main.rs:Cli::Sequentagent { ... }`
-- Triggers: User runs `devflow sequentagent --phase N --agents claude,codex`
-- Responsibilities:
-  1. For first agent: spawn monitor (no auto-advance)
-  2. Wait for agent to exit
-  3. Rebase feature branch onto updated develop (or surface conflicts)
-  4. For second agent: spawn monitor with rebased base
-  5. Wait for agent to exit
-  6. Then call advance to ship the phase
+- Location: `crates/devflow-cli/src/pipeline_launch.rs` (`run_monitor`, `advance`)
+- Triggers: spawned by `monitor::spawn_monitor`
 
 ## Architectural Constraints
 
-- **Threading:** Single-threaded event loop per process (Rust standard library async not used; blocking I/O with monitor spawning as a detached child). No shared mutable state across threads within a single process. Per-phase locks prevent concurrent mutations on the same phase's state/branch.
-- **Global state:** No module-level singletons. State is always read from disk (`.devflow/state-NN.json`), never cached in process memory. This allows CLI to be invoked multiple times without state conflicts.
-- **Circular imports:** Minimal module coupling. Agent adapters depend on prompt; prompt is independent; state machine independent; gate protocol independent. No circular dependencies in the module graph.
-- **Worktree isolation:** When worktree mode is enabled (default), the agent's cwd is `.worktrees/phase-NN`, but all state/lock/capture files live under the project root. This prevents git confusion while keeping metadata centralized.
-- **Git operations are synchronous:** No async git operations. Every git command is spawned as a child process, waits for completion, and checks exit code. This is safe because git operations are fast relative to agent execution (seconds vs. minutes).
-- **Rate-limit resumption:** Detected via agent-specific heuristics in stdout (Claude JSON envelope, Codex plain-text "Try again at"). If detected, a `CronInstructions` manifest is written to `.devflow/cron-instructions-{N:02}.json` for Hermes to reschedule.
+- **Threading:** synchronous, no async runtime; concurrency is multi-process (detached monitor per stage, one per phase under `parallel`).
+- **Global state:** none in-process of note; shared state is on disk (`.devflow/`) and the machine-global registry (`crates/devflow-core/src/registry.rs`).
+- **Locking:** per-phase, not per-project (`lock.rs`); held by `advance` across long gate waits.
+- **External file ownership:** `.planning/config.json` belongs to GSD — only `gsd_config.rs` writes it, preserving key order (`serde_json` `preserve_order` in root `Cargo.toml`).
+- **Circular imports:** Not detected (CLI → core only).
 
 ## Anti-Patterns
 
-### Over-reliance on Global Config File
+### Wildcard arm in outcome dispatch
 
-**What happens:** Early designs used a `.devflow.toml` or `devflow.json` config file for workflow settings (mode, agent, phase). This led to ambiguity: was state in the file or on disk?
+**What happens:** Adding a `_ =>` arm to an `AgentStatus` match.
+**Why it's wrong:** A new status could silently advance; the policy is intentionally exhaustive.
+**Do this instead:** Extend `decide_action` in `crates/devflow-core/src/outcome_policy.rs` with an explicit arm.
 
-**Why it's wrong:** Config files become stale (e.g., a phase completes but the config still says "phase 3"). The source of truth splits between file and state. Also, `devflow parallel` requires different agents per-phase but only one config file exists.
+### Writing `.planning/config.json` directly
 
-**Do this instead:** All workflow options are supplied as CLI flags to `devflow start`. The state machine reads/writes `.devflow/state-{N:02}.json` as the single source of truth per phase. This is followed in `crates/devflow-core/src/workflow.rs` and enforced by the CLI.
+**What happens:** Serializing GSD config from another module.
+**Why it's wrong:** Races live GSD readers and clobbers operator keys.
+**Do this instead:** Go through `crates/devflow-core/src/gsd_config.rs`.
 
-### Shared Project-Wide State Lock Held Across Gates
+### Growing `main.rs`
 
-**What happens:** An early design held a single project-wide lock during the entire `advance()` call, including gate waits (which can last days). This would block any sibling phase under `devflow parallel`.
+**What happens:** Adding pipeline logic to `main.rs`.
+**Why it's wrong:** The pipeline was deliberately split into seams A/B/C.
+**Do this instead:** Place logic in the matching `pipeline_*.rs` seam or `commands.rs`.
 
-**Why it's wrong:** One phase waiting for human approval starves all other phases. A 3-day gate on phase 7 blocks phase 8's feature branch creation.
+## Error Handling
 
-**Do this instead:** Per-phase locks (held across stage + gate). Project-wide lock only for the brief critical section (version bump, branch merge). Implemented in `crates/devflow-core/src/lock.rs` with two separate `acquire()` and `acquire_project()` functions. Lock is held per-phase; released via LockGuard drop (RAII).
+**Strategy:** `thiserror` enums in core per module (e.g. `lock::LockError`); CLI wraps into `CliError` (`crates/devflow-cli/src/main.rs:489`), `main` prints `error: {err}` and exits 1.
 
-### Synchronous Agent Capture + CLI Blocking
+**Patterns:**
 
-**What happens:** Early design had the CLI spawn the agent process directly and capture its output in a thread. If the CLI crashed or was killed, the capture thread died with it, and the agent continued running unsupervised.
+- Failures that would otherwise be invisible (monitor output to /dev/null) are recorded in `events.jsonl` via `events::emit`.
+- Indeterminate agent outcomes gate for a human rather than advancing.
 
-**Why it's wrong:** No way to know if the agent succeeded (its exit code is lost). Future `devflow advance` calls have no output to parse.
+## Cross-Cutting Concerns
 
-**Do this instead:** Spawn a detached monitor process (shell script) that owns the agent, captures output to `.devflow/phase-{N:02}-{stdout,stderr,exit}`, records the PID to `.devflow/phase-{N:02}-agent-pid`, and calls `devflow advance` when the agent exits. The CLI returns immediately; the monitor persists. Implemented in `crates/devflow-core/src/monitor.rs`.
-
-### Single Global State File for All Phases
-
-**What happens:** Early design used `.devflow/state.json` for all phases. Under `devflow parallel`, phase 7's monitor and phase 8's monitor could both try to read/write it, causing race conditions or state clobbering.
-
-**Why it's wrong:** `devflow parallel` runs phases concurrently in separate worktrees. A global state file is a single point of failure. Also, each phase's monitor should advance only its own state machine, not depend on reading a "current phase" from a singleton.
-
-**Do this instead:** Per-phase state files (`.devflow/state-{N:02}.json`). Each phase's monitor reads/writes only its own state. Migration from legacy single-slot file is one-shot on first read (see `crates/devflow-core/src/workflow.rs`). This ensures phase 7's monitor never clobbers phase 8's state.
+**Logging:** `tracing` to stderr; `RUST_LOG` filter (default `info`); `DEVFLOW_LOG_FORMAT=json` for JSON lines.
+**Validation:** preflight (`preflight.rs`), staleness (`staleness.rs`), post-condition probes (`verify.rs`), ship evidence (`ship_evidence.rs`).
+**Authentication:** delegated to agent CLIs and `gh auth` (checked in preflight).
 
 ---
 
-*Architecture analysis: 2026-07-17*
+*Architecture analysis: 2026-09-18*

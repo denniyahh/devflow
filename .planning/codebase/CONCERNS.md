@@ -1,361 +1,174 @@
+---
+last_mapped_commit: d581384145e82fd8f7091fee6387d70c6a62fff5
+last_mapped_at: 2026-09-18
+---
 # Codebase Concerns
 
-**Analysis Date:** 2026-07-17
+**Analysis Date:** 2026-09-18
+
+Scope: `crates/`, `scripts/`, `.planning/ROADMAP.md` backlog, at `workspace/denniyahh` `d581384`
+(Phase 48 paused at 10/17 plans). Excludes `.worktrees/`, `target/`, lockfiles. Every item below
+was checked against current code; ROADMAP 999.x entries whose defect could not be confirmed at
+HEAD (e.g. 999.66 `consecutive_failures`, 999.90 default git-flow in validate, 999.109/999.110
+fixed in Phase 45) are omitted. Line numbers are at `d581384`.
 
 ## Tech Debt
 
-### Large Monolithic Files
+**Very large source files:**
 
-**Main CLI entry point:**
-- Issue: `crates/devflow-cli/src/main.rs` is 3,334 lines with multiple responsibilities (CLI parsing, orchestration, gate handling, hook dispatch, workflow control)
-- Files: `crates/devflow-cli/src/main.rs`
-- Impact: Difficult to test orchestration paths in isolation; changes risk affecting unrelated workflows
-- Fix approach: Extract orchestration concerns (`advance`, `transition`, `handle_validate_outcome`, `handle_ship_outcome`) into a separate module; split gate/hook logic into standalone functions testable without CLI context
+- Issue: Several modules each hold 2.5k-9k lines, much of it inline `#[cfg(test)]` modules.
+- Files: `crates/devflow-core/src/agent_result.rs` (9134; tests start at :1314/:3498), `crates/devflow-cli/src/commands.rs` (7458; tests from :3983), `crates/devflow-cli/src/pipeline_outcomes.rs` (5546; tests from :1108), `crates/devflow-cli/src/pipeline_launch.rs` (5343), `crates/devflow-cli/src/preflight.rs` (4443), `crates/devflow-core/src/monitor.rs` (3548), `crates/devflow-cli/src/staleness.rs` (2679), `crates/devflow-core/src/version.rs` (2507)
+- Impact: Parallel plans touching these files serialize into near-sequential waves; review and navigation cost is high.
+- Fix approach: Move inline test modules to sibling `tests.rs` files first (mechanical), then split `agent_result.rs` by evaluation layer.
 
-**Agent result evaluation:**
-- Issue: `crates/devflow-core/src/agent_result.rs` is 1,352 lines; the three-layer completion evaluation logic plus capture-file handling, exit-code parsing, and envelope parsing for multiple agent types are tightly coupled
-- Files: `crates/devflow-core/src/agent_result.rs`
-- Impact: Hard to reason about the multi-layer fallback chain; adding new agents or capture formats requires changes in multiple layers simultaneously
-- Fix approach: Extract each layer into its own module; create trait-based envelope parsers per agent type (Claude, Codex, OpenCode) separate from the generic marker scan
+**Duplicated non-unique atomic-write helper:**
 
-### Monolithic Config Module
+- Issue: Two copies of the same `with_extension("tmp")` write-then-rename helper.
+- Files: `crates/devflow-core/src/workflow.rs:185-193`, `crates/devflow-core/src/gates.rs:356-364` (contrast `crates/devflow-core/src/registry.rs:217`, which already uses a unique temp name)
+- Impact: See Known Bugs (999.118).
+- Fix approach: One shared helper with unique temp names; Phase 48 SURV-01 targets this.
 
-**Configuration handling:**
-- Issue: No formal config file (documented as a deliberate design choice in Phase 11), but Phase 16 opens this decision by introducing `devflow.toml` for Phase 16's knobs (review angles, capture retention, verification settings)
-- Files: `crates/devflow-core/src/config.rs`
-- Impact: Contradictory documentation; new config support will conflict with the stated "no config file" principle if not carefully integrated
-- Fix approach: Phase 16 plan (D-03) introduces minimal TOML with env-var override. Update `config.rs` docstring; design the loader (env > file > default) before implementation
+**Two checkpoint predicates for one concept (999.125, CHKPT-01, in progress):**
 
----
+- Issue: Preflight and resume use separate scanners.
+- Files: `crates/devflow-core/src/verify.rs:131` (`phase_has_blocking_human_checkpoint`), `crates/devflow-core/src/verify.rs:379` (`phase_has_human_only_checkpoint`)
+- Impact: A marker can block preflight but not arm resume, or the reverse.
+- Fix approach: A single parsed predicate (Phase 48 success criterion 5).
+
+**Ambient git-flow re-resolution in Validate loop-back (999.120):**
+
+- Issue: Validate failure counting re-resolves git-flow from the project instead of the persisted `State::base_branch`.
+- Files: `crates/devflow-cli/src/pipeline_outcomes.rs:598-601`; persisted field at `crates/devflow-core/src/state.rs:355`
+- Impact: If the config differs from what the run forked from, progress detection measures the wrong range.
+- Fix approach: Thread the persisted base through, as the Phase 45 resolve-once pattern does elsewhere.
+
+**Hardcoded `crates/` workspace-member prefix (999.117):**
+
+- Issue: The scoped staleness check treats any `crates/**/*.rs` as build-affecting instead of reading declared workspace members.
+- Files: `crates/devflow-cli/src/staleness.rs:24`, `crates/devflow-cli/src/staleness.rs:292-297`
+- Impact: False "stale" results for non-member paths under `crates/`. Fails toward Stale, so it is noisy rather than unsafe.
+- Fix approach: Parse `[workspace].members` from the root `Cargo.toml`.
 
 ## Known Bugs
 
-### Terminal Ship Signal Failure (16k — CRITICAL)
+**Fixed `.tmp` filename lets concurrent writers collide (999.118 / SURV-01):**
 
-**Ship completion false positive:**
-- Symptoms: After operator approves final Ship gate, DevFlow reports `workflow_finished` with `hook_run VersionBump ok=true` and `hook_run BranchCleanup ok=true`, but the merge never actually occurred (PR remains open, feature branch not merged to develop)
-- Files: `crates/devflow-core/src/ship.rs`, `crates/devflow-cli/src/main.rs` (`handle_ship_outcome`)
-- Trigger: Observable in Phase 15 dogfood run; reproducer: complete a full phase cycle, approve Ship gate, verify PR status and develop branch history
-- Root cause: VersionBump hook runs BEFORE branch integration and merge; if merge fails silently, hooks report success anyway. Also unclear: whether the merge is attempted via the `/gsd-ship` agent's GSD command or via DevFlow's own git primitives; current code suggests the former, but this is not explicit
-- Workaround: Manually verify PR merge status and develop branch history after Ship gate approval
-- Fix approach (16k scope): Reorder Ship path to ensure merge succeeds before terminal hooks fire; add explicit post-condition verification (16a in Phase 16 plan)
+- Symptoms: Two processes saving the same phase state or gate share one temp path. One rename can publish the other's bytes, or fail with ENOENT.
+- Files: `crates/devflow-core/src/workflow.rs:189`, `crates/devflow-core/src/gates.rs:360`
+- Trigger: Concurrent `save_state` for one phase (e.g. monitor and a CLI verb).
+- Workaround: None. Phase 48 plans 48-10..48-17 remain unexecuted.
 
-### Code-Stage False Positives (No Repo Diff)
+**Commit gate counts all phase-branch commits, not this stage's:**
 
-**Agent success without commits:**
-- Symptoms: Code stage reports `status: success` when agent made no commits (exits 0, runs define/plan idempotent logic, or completes without touching code)
-- Files: `crates/devflow-core/src/agent_result.rs` (Layer 2 gate)
-- Trigger: Phases where the agent runs Define or Plan (legitimately zero-commit tasks) and is mistakenly gated on commit count; also Code-stage false positives when the agent self-reports success without producing changes (e.g. a publish/push-only plan)
-- Root cause: Layer 2's commit-count gate was scoped to all stages initially; Phase 13 fix (1.2.0) scoped it to `Code` and `Plan` only, excluding `Define` and `Validate`. However, `Code` stage itself legitimately produces zero commits if the agent only performs external operations (crates.io publish, pushing tags) without touching the repo
-- Workaround: Ensure Code-stage agents produce at least one repo commit (e.g. a changelog or version bump) even for external-only work
-- Fix approach (16a in Phase 16 plan): Introduce Layer-0 external post-condition verification (e.g. verify crates.io publish succeeded, verify PR was created) separate from commit-count heuristic; add verification contract to stages that perform external work
+- Symptoms: A no-op Code retry passes the "made commits" check because Plan-stage commits already exist on the branch.
+- Files: `crates/devflow-core/src/agent_result.rs:2411-2431` (`phase_commit_count` uses `develop..feature/phase-NN`)
+- Trigger: A Code stage retried after Plan committed, with the agent producing no new work.
+- Workaround: Validate's SUMMARY.md check happens to catch it downstream.
 
-### Parallel Safety Flaw (CR-03 — DESIGN CRITICAL)
+**OpenCode capability probe never strips ANSI (999.112):**
 
-**Concurrent phases are unsafe by construction:**
-- Symptoms: `devflow parallel 13 14` can result in wrong-phase state evaluation, duplicate or lost agent runs, interleaved version-bump commits
-- Files: `crates/devflow-core/src/workflow.rs` (per-phase state), `crates/devflow-cli/src/main.rs` (`parallel` loop), `crates/devflow-core/src/monitor.rs` (advance invocation)
-- Trigger: Running `devflow parallel` with 2+ phases; documented in Phase 13 post-review (13-DEFERRED-CR-03.md)
-- Root cause: Phase-scoped locks (per-phase lock files `.devflow/lock-NN`) were introduced in Phase 13 to prevent one phase blocking at a multi-day gate from starving siblings. However, the resources those locks guard are still project-global:
-  1. `.devflow/state.json` is a single file — the second `start` overwrites the first's state; each phase's monitor loads whichever phase was started *last*
-  2. Main checkout git operations (version-bump commits/tags, branch cleanup) run unserialized when two phases finish concurrently
-- Workaround: Run phases sequentially with `devflow start`, or use `devflow sequentagent` (which has its own issues — see below)
-- Fix approach (Phase 14, already shipped): Per-phase state files `state-NN.json`, phase-threaded `devflow advance --phase N`, and a short project-wide checkout lock for git mutations. Acceptance criteria: two phases via `devflow parallel` each run independently without state clobbering; concurrent `finish_workflow`s serialize on the coarse lock
-
-### Sequentagent's Unguarded State
-
-**Rate-limit cron instructions are project-global:**
-- Symptoms: Running `devflow sequentagent` with rate-limited agents can produce a stale `.devflow/cron-instructions-NN.json` that interferes with future runs of other phases
-- Files: `crates/devflow-core/src/monitor.rs`, rate-limit detection in agent-result parsing
-- Impact: Not documented as a test case; identified as a residual issue in CR-03 scope (Phase 14)
-- Fix approach (planned Phase 14 but deferred): Adopt the per-phase state model for `cron-instructions-NN.json` as well; ensure it does not persist across phase boundaries
-
----
+- Symptoms: `subagent_dispatch` can report false when colored output wraps the `(subagent)` marker.
+- Files: `crates/devflow-core/src/agents/opencode.rs:298` (raw stdout passed to `parse_opencode_agent_list_for_subagent`, :329); `strip_ansi_escapes` exists at :183 but is not applied here
+- Trigger: `opencode agent list` emitting SGR sequences.
+- Workaround: Degrades to the single-agent path (safe direction).
 
 ## Security Considerations
 
-### Shell Command Injection (Mitigated)
+**Plaintext local state under `.devflow/`:**
 
-**Notify hook injection risk:**
-- Risk: `DEVFLOW_GATE_NOTIFY_CMD` is run via `sh -c` with gate metadata in environment variables. If the command string were interpolated (e.g. `sh -c "echo $DEVFLOW_GATE_PHASE"`) instead of passed via env, shell injection would be possible
-- Files: `crates/devflow-core/src/gates.rs` (`fire_gate_notify`)
-- Current mitigation: The command is invoked via `sh -c "command"` with env vars passed separately, never interpolated into the command string — the only way an attacker could inject is by controlling `DEVFLOW_GATE_NOTIFY_CMD` itself
-- Recommendations: Document this pattern clearly; consider using `shlex` or similar to validate the command at startup if needed (Phase 15 docs already covered this)
+- Risk: State, gate answers, events and history are world-readable per umask. Registry dirs use 0700 (`crates/devflow-core/src/registry.rs`, test at :423), but `.devflow/` has no equivalent.
+- Files: `crates/devflow-core/src/workflow.rs:185` (`ensure_devflow_dir`), `.devflow/events.jsonl`, `.devflow/gates/`
+- Current mitigation: Single-user host. The operator accepts local plaintext.
+- Recommendations: Low priority. Apply 0700 to `.devflow/` for parity with the registry.
 
-### State File Exposure
+**Gate answers written without verifying a live waiter (SURV-02, in progress):**
 
-**Risk:** `.devflow/state-NN.json` and `.devflow/events.jsonl` contain phase numbers, stage names, and agent exit status; if exposed to untrusted contexts, they reveal workflow internals
-- Files: `crates/devflow-core/src/workflow.rs`, `crates/devflow-core/src/events.rs`
-- Current mitigation: Marked in `.gitignore`; SECURITY.md advises not exposing these files
-- Recommendations: No secrets are persisted in these files (all auth is via agent CLI), so exposure risk is low; document as operator guidance in OPERATIONS.md
-
-### Agent Sandbox Scoping (Mitigated)
-
-**Risk:** Agent sandboxes (Codex) need access to `.git` metadata and worktree admin directories without exposing the operator's signing/auth infrastructure
-- Files: `crates/devflow-core/src/agents/codex.rs` (extra_writable_roots)
-- Current mitigation (Phase 13): Codex agent gets explicit sandbox grants for worktree's git admin (`.git/worktrees/<name>`); commit/tag signing is disabled via `GIT_CONFIG_*` env scoped to the Codex process tree
-- Status: Shipped in 1.2.0; no reported vulnerabilities
-
----
+- Risk: `gate approve/reject/stop/sweep` can write an answer that no process consumes. At the Ship gate a stale answer could be picked up by a later run.
+- Files: `crates/devflow-core/src/gates.rs`, `crates/devflow-core/src/lock.rs:178` (`holder_identity` exists as the building block)
+- Current mitigation: Partial, pending the remaining Phase 48 plans.
+- Recommendations: Complete Phase 48 success criterion 3.
 
 ## Performance Bottlenecks
 
-### Monitor Polling + Gate Blocking
+**CI fan-out and cold container gate (999.123):**
 
-**Slow gate response detection:**
-- Problem: `Gates::poll_response()` polls the gate response file with exponential backoff (1s → 2s → … 60s), which means a human response can be delayed up to 60 seconds before DevFlow checks it
-- Files: `crates/devflow-core/src/gates.rs` (`poll_response`)
-- Current capacity: 60-second max backoff is acceptable for multi-hour gate waits (default timeout 7 days), but noticeable in interactive usage
-- Scaling path: If gates become frequent (e.g. `--mode supervise` gates at every Validate), consider a notify/watch pattern or pushing gate decisions via a webhook instead of polling
-
-### Capture File Accumulation
-
-**No history retention by design:**
-- Problem: Each stage launch overwrites `.devflow/phase-NN-stdout` and `.devflow/phase-NN-stderr.log`; multi-stage phases have only the final stage's captured output visible
-- Files: `crates/devflow-core/src/agent_result.rs` (stdout_path/stderr_path)
-- Impact: Debugging multi-loop phases (Code → Validate → Code → Validate) requires manual log tailing during execution; post-mortem debugging is impossible
-- Scaling path (16b in Phase 16 plan): Retain per-stage capture history (e.g. `phase-NN-code-attempt-1-stdout`, `phase-NN-code-attempt-2-stdout`) instead of clobbering; add a retention policy (e.g. keep last N attempts or last 7 days)
-
----
+- Problem: Each commit triggers multiple workflow runs. The pre-push container gate runs cold fmt/clippy/test and takes minutes.
+- Files: `.github/workflows/ci.yml`, `.github/workflows/devcontainer.yml`, `scripts/check-in-container.sh`
+- Cause: Overlapping triggers. The container gate has no warm cache.
+- Improvement path: Deduplicate triggers per the 999.123 entry. Consider `cargo nextest` (999.122).
 
 ## Fragile Areas
 
-### Agent Result Evaluation Layer Ordering
+**Process-global env mutation in tests (TEST-01, partially addressed):**
 
-**Files:** `crates/devflow-core/src/agent_result.rs` (`evaluate_agent_result`)
-- Why fragile: Three-layer fallback chain (DEVFLOW_RESULT marker → exit code + commit count → process gone + commits heuristic) is tight coupling; small changes to one layer's assumptions can break another's fallback guarantee
-- Example: Layer 2's commit-count gate initially applied to all stages; the "fix" that scoped it to Plan/Code only created a silent success case where Validate with zero commits proceeds instead of failing (T-13-14 in the code comments)
-- Safe modification: Before changing any layer's logic, trace through all three paths for all stage types (Define, Plan, Code, Validate, Ship); add tests for the fallback path (Layer 3 heuristic) for each stage
-- Test coverage: Unit tests cover Layer 1 (marker parsing) and Layer 2 (exit code), but Layer 3 (heuristic) and multi-stage combinations are under-tested
+- Files: `clippy.toml:19-21` denies `set_var`/`remove_var` by default. Reasoned exceptions remain in `crates/devflow-cli/src/preflight.rs` (19 sites), `crates/devflow-core/src/monitor.rs:3412-3460`, `crates/devflow-cli/src/test_support.rs`, `crates/devflow-cli/src/pipeline_launch.rs`, `crates/devflow-cli/src/pipeline_gate.rs`, `crates/devflow-cli/src/pipeline_outcomes.rs`, `crates/devflow-cli/src/staleness.rs`, `crates/devflow-core/src/config.rs`, `crates/devflow-core/src/gates.rs:378`
+- Why fragile: Remaining sites depend on mutex discipline. A new test that spawns `git` without the mutex races PATH mutation (999.114 `NotFound` flakes).
+- Safe modification: Use `Command::env`/`env_remove`. Never add a new `expect(clippy::disallowed_methods)` without an ENV_MUTEX.
+- Test coverage: The race is load-dependent. A green local run does not prove its absence.
 
-### Gate Write and Response TOCTOU
+**`phase7_cli` fixture timing (999.55 / 999.23):**
 
-**Files:** `crates/devflow-core/src/gates.rs` (write/poll/respond flow)
-- Why fragile: Gate request is written atomically, but there's a window between write and poll where a stale response from a previous gate (same phase, different stage) could be picked up
-- Current safeguard: Gate files are stage-scoped (`.devflow/gates/NN-{stage}.json`), so cross-stage confusion is prevented; response format includes stage name for double-checking
-- Safe modification: Add integration tests for concurrent gate firing (two gates at different stages); verify that old responses are never misattributed
+- Files: `crates/devflow-cli/tests/phase7_cli.rs` (1949 lines; fixed 5s `wait_for` budget)
+- Why fragile: Real `git` plus a polling budget under CI contention.
+- Safe modification: Widen budgets only alongside a deterministic signal. Do not re-run red CI to green.
 
-### Worktree Cleanup on Crash
+**Unattended decision policy vs. auto-decide prompt (999.116):**
 
-**Files:** `crates/devflow-core/src/worktree.rs`, `crates/devflow-cli/src/main.rs` (cleanup command)
-- Why fragile: If the agent crashes hard (SIGKILL), the worktree cleanup hooks may not run; abandoned worktrees accumulate under `.worktrees/` and can interfere with subsequent `devflow start --force`
-- Current safeguard: `devflow cleanup` and `devflow recover --clean` can remove stale worktrees; `devflow start --force` overwrites existing worktrees
-- Safe modification: When `devflow start` detects an existing worktree for the same phase, verify it's associated with a live process before auto-cleaning; add a safety prompt or require `--force` to clean unknown stale worktrees
-- Test coverage: E2E test for crash-recovery path (kill agent mid-run, verify `devflow status` still works, verify `devflow cleanup` removes the orphan worktree)
-
----
+- Files: `crates/devflow-core/src/prompt.rs:97-125` (`CODE_STAGE_POLICY`), `crates/devflow-core/src/prompt.rs:613-626` (`checkpoint_auto_decide_prompt`)
+- Why fragile: Two independently worded instructions govern one resumed session. The auto-decide prompt does not repeat the merit-based comparison or the package-verification exclusion.
+- Safe modification: Derive both from shared literals, as `gate_resolution_rule!()` already does.
 
 ## Scaling Limits
 
-### Per-Phase Lock Holding Across Gate Wait
+**Per-phase state files and single global lock per phase:**
 
-**Resource:** Per-phase lock file `.devflow/lock-NN`
-- Current capacity: Locked for the entire gate wait (default 7 days if gate is not answered)
-- Limit: If a lock holder crashes and does not clean up, its stale lock wedges all future `devflow advance --phase N` calls for that phase. Mitigated (Phase 13, shipped) by stale-lock reclaim logic (`pid_is_alive` check), but still requires the stale process to be detectable
-- Scaling path: Consider a TTL-based lock file (e.g. a lock is considered stale if older than N days regardless of process liveness); add a TTL parameter to `acquire()` and raise a warning if a lock is near expiry during gate polling
-
-### Concurrent Phase State Enumeration
-
-**Resource:** Enumerating active phases in `devflow status`/`devflow recover` requires scanning all state files
-- Current capacity: `workflow::last_events_by_phase()` does one pass over `.devflow/events.jsonl`; state-file scan is O(phase_count)
-- Limit: With many phases (e.g. 50+ concurrent phases in `devflow parallel`), file I/O for enumeration becomes noticeable
-- Scaling path: Cache the phase list in memory per DevFlow invocation; consider an index file (e.g. `.devflow/.active_phases`) for faster enumeration (with atomic update discipline to avoid corruption)
-
-### Checkpoint File Fragmentation
-
-**Resource:** One file per artifact type, phase, stage
-- Current: `.devflow/phase-NN-stdout`, `.devflow/phase-NN-stderr.log`, `.devflow/phase-NN-exit`, `.devflow/phase-NN-agent-pid`, `.devflow/state-NN.json`, `.devflow/lock-NN`, `.devflow/cron-instructions-NN.json` (at least 7 files per phase)
-- Under Phase 16's capture history (16b), each phase could have 2-3 attempts per stage × 5 stages = 10-15 capture files, multiplied by phase count
-- Scaling path: Consider a per-phase directory (`.devflow/phases/NN/`) to group related files; update `.gitignore` accordingly; refactor path helpers in `agent_result.rs` and `workflow.rs`
-
----
+- Current capacity: One writer per phase via `crates/devflow-core/src/lock.rs:33`. State lives in `.devflow/state-NN.json`.
+- Limit: Readers that load outside the lock race writers until SURV-01 lands.
+- Scaling path: Phase 48 exclusion or loud refusal of second writers.
 
 ## Dependencies at Risk
 
-### Tracing Ecosystem (Unlinked from Tests)
+**Upstream GSD / Claude Code behavior coupling:**
 
-**Risk:** DevFlow uses `tracing` for structured logging, but test harness does not initialize a subscriber by default
-- Files: All logging via `tracing::info!`, `warn!`, `debug!`; `crates/devflow-cli/tests/` do not initialize `tracing_subscriber`
-- Impact: Test output is silent; if a test needs to debug log output, the developer must manually enable `RUST_LOG=debug` and run with `nocapture`, or add a tracing init to the test itself
-- Migration plan: Add a test helper that initializes `tracing_subscriber` at the start of integration tests; document the pattern in CONTRIBUTING.md
-
-### Serde JSON Round-Trip Leniency
-
-**Risk:** `agent_result.rs` deserializes the `verdict` field leniently to avoid silently dropping valid fields if the verdict is malformed. However, other JSON deserialization in the codebase (state.rs, gates.rs) does not use lenient patterns
-- Files: `crates/devflow-core/src/agent_result.rs` (`deserialize_verdict_lenient`); `crates/devflow-core/src/state.rs` (standard serde), `crates/devflow-core/src/gates.rs` (standard serde)
-- Impact: A malformed state.json or gate response file will fail to parse and abort the operation, while a malformed DEVFLOW_RESULT verdict falls through to Layer 2 silently
-- Migration plan: Document this asymmetry in the code; add a compatibility test that shows round-trip of edge-case JSON (unknown fields, wrong types, missing required fields) for all major types
-
----
+- Risk: DevFlow parses GSD artifacts and Claude/Codex/OpenCode output shapes that it does not control (999.101 upstream, 999.107 codex parser, 999.108 Pi dispatch).
+- Impact: Silent misclassification after an upstream format change.
+- Migration plan: Pin captured fixtures per adapter under `crates/devflow-core/src/agents/`. Add property tests (999.18).
 
 ## Missing Critical Features
 
-### Merge Integration Verification
+**Security verdict not checked before Ship (999.111):**
 
-**Problem:** The Ship stage runs `/gsd-ship {phase}` (which is expected to create a PR and merge it), but DevFlow does not verify the merge actually succeeded before reporting `workflow_finished`
-- Blocks: Full end-to-end automation of Ship; operator cannot trust the final gate approval
-- Files: `crates/devflow-cli/src/main.rs` (`handle_ship_outcome`), `crates/devflow-core/src/ship.rs`
-- Priority: Critical — identified as 16k in Phase 16 scope (external post-condition verification)
-- Planned fix: Add a post-condition check after `/gsd-ship` that verifies the feature branch is an ancestor of develop (or main, depending on git flow config)
+- Problem: The gap surfaces only at Ship time. Not re-verified in code this pass (no dedicated pre-Ship security check was found by grep); treat as unverified-open.
+- Blocks: Unattended runs reaching Ship cleanly.
 
-### Incremental Review for Long Phases
+**No live `--mode auto` end-to-end verification (999.119):**
 
-**Problem:** Ship's code review runs once at the end of the phase. If the phase has looped back multiple times (Code → Validate → Code → Ship), earlier Code stages are not re-reviewed
-- Blocks: Catching bugs introduced in intermediate Code stages before final Ship approval; current model gates only on the final Code stage's review
-- Files: `crates/devflow-core/src/prompt.rs` (Ship prompt generation), `crates/devflow-cli/src/main.rs` (no review orchestration between stages)
-- Priority: Medium — identified as 16e in Phase 16 scope (incremental per-wave review)
-- Planned fix: Add an optional Code-stage review (agent runs `/gsd-code-review` and adds findings to a running list); aggregate all reviews at Ship time
-
-### Persistent Gate Notification
-
-**Problem:** When a gate fires, a notify hook is run (if `DEVFLOW_GATE_NOTIFY_CMD` is set), but there's no persistent indicator in `devflow status` or the terminal that a gate is pending
-- Blocks: Operator can miss a gate response (reported as 16j in Phase 16 scope)
-- Files: `crates/devflow-cli/src/main.rs` (`run_gate`), `crates/devflow-core/src/gates.rs` (gate firing)
-- Priority: High — observed as a gate-notification gap in Phase 15 dogfood
-- Planned fix: Add a persistent banner to `devflow status` that lists all pending gates; consider a TUI indicator or a persistent background process that polls and alerts
-
----
+- Problem: The configured-base fork, preflight and merge chain is proven only by unit and fixture tests.
+- Blocks: Confidence in unattended mode. Phase 49 is planned to measure it.
 
 ## Test Coverage Gaps
 
-### Cross-Phase Parallelism Integration Tests
+**Concurrent writer path:**
 
-**Untested area:** The CR-03 fix (per-phase state files, phase-threaded advance) was shipped in Phase 14, but the integration test for concurrent phases is minimal
-- Files: `crates/devflow-cli/tests/phase7_cli.rs` has a dogfood test, but not a synthetic concurrent-phase test
-- What's missing: Two fake agents running concurrently with interleaved exits, verifying that each phase's state machine advances independently and events.jsonl logs both phases correctly
-- Risk: A subtle TOCTOU bug in state load/save under `devflow parallel` could go undetected until dogfooding
-- Priority: High — parallelism is a core feature; the flaw (CR-03) was caught by code review, not tests
-- Test approach: Minimal live test with two fake agents (shell scripts that exit cleanly), `devflow parallel`, and a post-run assertion on both phases' final state files
+- What's not tested: A second writer against `write_state_atomic`/`write_atomic`.
+- Files: `crates/devflow-core/src/workflow.rs`, `crates/devflow-core/src/gates.rs`
+- Risk: Silent state loss.
+- Priority: High (Phase 48 success criterion 1).
 
-### Agent Envelope Parsing for Each Adapter
+**OpenCode marker-less run at CLI level (999.121):**
 
-**Untested area:** Native envelope parsing (Layer 1) for Claude and Codex was added in Phase 13, but only the Claude envelope is tested in unit tests
-- Files: `crates/devflow-core/src/agents/claude.rs`, `crates/devflow-core/src/agents/codex.rs`; agent-result parsing in `agent_result.rs`
-- What's missing: End-to-end test for Codex JSONL envelope parsing (specifically, the `agent_message` item containing DEVFLOW_RESULT); OpenCode envelope parsing
-- Risk: Codex envelope parsing could regress without notice; a false positive in Phase 15 dogfood (commit-count heuristic) was traced to Codex envelope parsing bugs
-- Priority: High — Codex is a supported agent; false positives are critical
-- Test approach: Add snapshot tests for expected Codex/OpenCode output samples (envelope format + expected parsed result) to `agent_result.rs`
+- What's not tested: The CLI regression for "a marker-less run never advances".
+- Files: `crates/devflow-core/src/agents/opencode.rs`, `crates/devflow-cli/tests/`
+- Risk: An OpenCode run that emits no completion marker could advance the pipeline anyway, with no CLI test to catch it.
+- Priority: Medium.
 
-### Gate TOCTOU Under Concurrent Fires
+**Rustdoc and mutation testing absent from green (999.91, 999.95, 999.17):**
 
-**Untested area:** Multiple gates firing at different stages concurrently (e.g. phase A fires Validate gate, phase B fires Ship gate at the same time)
-- Files: `crates/devflow-core/src/gates.rs` (write/poll/respond flow)
-- What's missing: Synthetic test with two phases firing gates simultaneously; verify response files are not cross-contaminated
-- Risk: A gate response intended for one stage could be misrouted to another stage if response file lookup is not bulletproof
-- Priority: Medium
-- Test approach: Mock the filesystem; spawn two threads that fire gates concurrently; verify each thread reads its own response
-
-### Stale Lock Reclaim Under Load
-
-**Untested area:** The stale-lock reclaim logic (Phase 13) assumes `pid_is_alive` check is fast; under high process churn, the PID reuse window could allow a stale lock to be reclaimed by a different unrelated process
-- Files: `crates/devflow-core/src/lock.rs` (stale-holder recovery)
-- What's missing: Stress test with many phases and frequent crashes; verify that reclaim does not accidentally give a lock to the wrong holder
-- Risk: Very low in practice (PID reuse is rare on modern systems), but theoretically possible
-- Priority: Low
-- Test approach: Document the PID-reuse assumption and the window size; add a comment linking to the theory (PID reuse windows in Linux are typically hours)
+- What's not tested: `cargo doc` warnings. Surviving mutants in state machines.
+- Files: `scripts/check.sh`
+- Risk: Broken intra-doc links. Tests that pass without constraining behavior.
+- Priority: Low-Medium.
 
 ---
 
-## Code Quality
-
-### Unused or Minimal-Use Functions
-
-**Issue:** A few functions are defined but have zero or one call site
-- Examples: `GitFlow::release_start`, `GitFlow::release_finish` are defined but never called from production code (only exercised in tests)
-- Files: `crates/devflow-core/src/git.rs` (release functions)
-- Impact: Dead code adds to maintenance burden; unclear whether these are intentional stubs for future use or forgotten old APIs
-- Recommendation: If not planned for use in Phase 16/17, mark as `#[deprecated]` or remove with a comment explaining why they were removed (e.g. "Release branching was deferred to Phase X")
-
-### Inconsistent Error Handling Patterns
-
-**Issue:** Some modules use `?` for error propagation; others use `match` or `.map_err`
-- Files: Varies across `git.rs`, `worktree.rs`, `agent.rs`, `hooks.rs`
-- Impact: No runtime bug, but inconsistency makes code harder to scan
-- Recommendation: Enforce `?` propagation as the default pattern in CONTRIBUTING.md; use `match` only when error handling logic is non-trivial
-
-### Large Match Statements Without Exhaustiveness Guards
-
-**Issue:** `main.rs` has large match statements for stage handling, agent kinds, and commands that could become unmaintainable as new variants are added
-- Files: `crates/devflow-cli/src/main.rs` (match on Stage, AgentKind, Command variants)
-- Impact: If a new stage or agent is added, forgetting to handle it in a match statement could cause panics at runtime
-- Recommendation: Use `#[non_exhaustive]` on public enums to force recompilation on variant changes; add a lint rule or CI check that catches unreachable patterns
-
----
-
-## Architectural Anti-Patterns
-
-### No Validation Layer Between CLI and Core
-
-**What happens:** The CLI directly constructs `State`, `Mode`, and other core types from clap arguments without validation
-- Files: `crates/devflow-cli/src/main.rs` (clap parsing → immediate State construction)
-- Why it's wrong: If a clap argument parsing rule changes, the core layer doesn't know and could receive invalid inputs; no single place to verify that a combination of flags is valid
-- Do this instead: Create a `validate_start_args()` function in `devflow-core` that takes the parsed arguments and returns an error if they're inconsistent (e.g. `--phase 0` is invalid, `--mode supervise` with `--no-worktree` has no practical benefit)
-
-### State Loaded Outside the Advance Lock
-
-**What happens:** Some code paths load state, check a condition, then acquire the lock — creating a window where state changes
-- Files: `crates/devflow-core/src/workflow.rs`, `crates/devflow-cli/src/main.rs` (advance path)
-- Why it's wrong: Phase 13's fix (re-load state under the phase lock) closed the double-advance TOCTOU, but other state reads are still vulnerable
-- Do this instead: Restructure to acquire lock first, then load state; if the load is expensive, cache the result (with a comment explaining the cache is valid for the lock's duration)
-
-### No Clear Separation Between Reading and Writing State
-
-**What happens:** `workflow.rs` has `load_state`, `save_state`, and `clear_state`, but no invariants about when each is called or what state is valid before/after
-- Files: `crates/devflow-core/src/workflow.rs`, `crates/devflow-core/src/state.rs`
-- Why it's wrong: Easy to accidentally clear state before saving, or load state after it's been cleared; no transaction semantics
-- Do this instead: Define a clear protocol (e.g. "state is loaded at start of `advance`, saved at end, cleared only on `finish_workflow`"); document it prominently in state.rs; consider a state-machine type (e.g. `StateHandle { phase, guard }`) that enforces lock/load/save/release in order
-
----
-
-## Documentation vs. Implementation Gaps
-
-### `.devflow.yaml` Decoy Removed, But Config Comment Still Says "No Config"
-
-**Issue:** Phase 11's "no config file" stance is documented in code comments (`config.rs`), but Phase 16 deliberately opens this decision to add `devflow.toml`
-- Files: `crates/devflow-core/src/config.rs` (doc comment claiming no config)
-- Impact: Confusing for future maintainers; the docstring contradicts Phase 16's planned changes
-- Fix approach: Update the docstring to: "Phase 11–15 used no config file, relying on CLI flags and env vars. Phase 16 introduces a minimal `devflow.toml` for review angles and capture retention settings; env vars override file settings."
-
-### `ARCHITECTURE.md` Claims Idempotent Define/Plan, But Docs Don't Explain the Fallback
-
-**Issue:** ARCHITECTURE.md says "if the stage's deliverable already exists, the agent reports success without re-running the GSD command" but doesn't explain what happens if the deliverable is malformed or incomplete
-- Files: `ARCHITECTURE.md` (section on Define/Plan stages), `crates/devflow-core/src/prompt.rs` (actual idempotent logic)
-- Impact: Operator confusion if a stale CONTEXT.md blocks a phase from being re-planned
-- Fix approach: Add a note to ARCHITECTURE.md: "If the deliverable exists but is incomplete, the agent must be re-run (e.g. `devflow start --phase N --force`). Define/Plan idempotence is best-effort — a corrupt or partial file blocks re-runs."
-
-### `OPERATIONS.md` Doesn't Mention Worktree Awareness Bug (16f)
-
-**Issue:** `devflow gate approve 15` run from inside the worktree fails with "no project root found" because DevFlow defaults `--project` to `.` and doesn't walk up to find the primary checkout
-- Files: `OPERATIONS.md` (doesn't mention this limitation), `crates/devflow-cli/src/main.rs` (no walk-up resolver)
-- Impact: Operator must remember to run gate commands from the main checkout, not the worktree — surprise failure in automated workflows
-- Fix approach (16f in Phase 16 scope): Implement a shared `resolve_project_root()` walk-up function; use it in all subcommands (status, gate, logs, recover). Document the change in OPERATIONS.md.
-
----
-
-## Deferred Phase Issues
-
-### Phase 16 Scope (Inserted 2026-07-17)
-
-**Current:** Phase 16 is planned to address 11 reliability items (16a–16k, with 16k being critical). All are deferred to Phase 16 from Phase 15 dogfood findings.
-
-**16a – External Post-Condition Verification:** No verification that crates.io publish, PR creation, or merge actually succeeded; relies on agent self-report (Layer 1) or heuristics (Layer 2/3)
-
-**16b – Retained Capture History:** Current design wipes capture files on each stage launch; multi-loop phases have only the final stage's output visible
-
-**16c – Deterministic Doc Claim Checker:** Claims in operator docs (env vars, CLI flags, defaults) must be verified against source to catch drift
-
-**16d/16e – Ship Review Pipeline:** Current Ship prompt runs a single `/gsd-code-review` pass; Phase 15 dogfood had four Ship-stage loop-backs due to serial finding discovery. Phase 16 adds parallel/focused angles + incremental per-wave review
-
-**16f/16g – Project Root Walk-Up + Gate CLI UX:** `devflow gate approve 15` fails when run from the worktree; Gate CLI has a positional-arg footgun (trailing project path swallows `--stage` value)
-
-**16h – Cross-Attempt History View:** No visible log of which Code/Ship stages looped back and why; operator has no persistent context
-
-**16i – `.gitignore` Invariant Checker:** Every `.devflow/`-writing path must be covered by `.gitignore`; no verification today
-
-**16j – Persistent Gate Notification:** Gate fires, notify hook runs, but no persistent indicator that the gate is pending (16j was promoted from deferred list)
-
-**16k – Terminal Ship Path Forensics + Fix:** VersionBump runs before merge; if merge fails, hooks still report success. Gate-approval advance path unclear. Merge hook missing from terminal Ship flow.
-
----
-
-*Concerns audit: 2026-07-17*
+*Concerns audit: 2026-09-18*
