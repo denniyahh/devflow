@@ -1545,18 +1545,8 @@ pub(crate) fn gate_sweep(
                 left_alone += 1;
                 continue;
             }
-            if dry_run {
-                reaped += 1;
-                println!(
-                    "would reap phase {} {} (age {age}s) at {}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display()
-                );
-                continue;
-            }
             let holder_before_reap = lock::holder_status(project_root, gate.phase);
-            if gate.stage != Stage::Ship && !holder_before_reap.may_be_waiting() {
+            if !gate_sweep_may_reap(gate.stage, holder_before_reap) {
                 left_alone += 1;
                 println!(
                     "left phase {} {} alone at {} — no confirmed waiter; {}",
@@ -1564,6 +1554,16 @@ pub(crate) fn gate_sweep(
                     gate.stage,
                     project_root.display(),
                     no_waiter_repair(gate.phase, gate.stage)
+                );
+                continue;
+            }
+            if dry_run {
+                reaped += 1;
+                println!(
+                    "would reap phase {} {} (age {age}s) at {}",
+                    gate.phase,
+                    gate.stage,
+                    project_root.display()
                 );
                 continue;
             }
@@ -1723,6 +1723,10 @@ pub(crate) fn gate_sweep(
         println!("sweep complete: {reaped} reaped, {skipped} skipped, {left_alone} left alone");
     }
     Ok(())
+}
+
+fn gate_sweep_may_reap(stage: Stage, holder: lock::HolderStatus) -> bool {
+    stage == Stage::Ship || holder.may_be_waiting()
 }
 
 /// What became of one [`agent::StrayProcess`] candidate the opt-in
@@ -4184,6 +4188,26 @@ mod tests {
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
         assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+    }
+
+    #[test]
+    fn gate_sweep_preview_uses_the_no_waiter_matrix() {
+        assert!(!gate_sweep_may_reap(
+            Stage::Code,
+            lock::HolderStatus::NoHolder
+        ));
+        assert!(!gate_sweep_may_reap(
+            Stage::Code,
+            lock::HolderStatus::Recycled { pid: 42 }
+        ));
+        assert!(gate_sweep_may_reap(
+            Stage::Ship,
+            lock::HolderStatus::NoHolder
+        ));
+        assert!(gate_sweep_may_reap(
+            Stage::Code,
+            lock::HolderStatus::Live { pid: 42 }
+        ));
     }
 
     #[test]
