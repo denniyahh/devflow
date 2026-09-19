@@ -3575,6 +3575,19 @@ Plans:
 
 **Considered and deliberately excluded from Phase 26 (2026-07-29).** Confirmed still open at HEAD `76e49f1` (`phase7_cli.rs:100-124`, still `200 × 25ms`, 7 call sites). Not folded into Phase 26 because it's test-only, touches no file that phase's release-mechanics cluster touches, and is cheap enough to fix standalone via `gsd-quick`/`gsd-fast` rather than waiting on phase planning. Handled outside the phase sequence, separately — not excluded for cause.
 
+**Recurrence 2026-09-19, and the scope is wider than `wait_for`.** PR #216 (comment-only change to
+`.devcontainer/devcontainer.json`, head `24365ae`): `Devcontainer / Build + test in devcontainer`
+failed on the `pull_request` run `35408772328` (attempt 1) with
+`start_defaults_to_worktree ... FAILED — timed out waiting for phase 11 to settle (gate or stop)`
+(`phase7_cli.rs:1311`). The same job on the same commit passed on the concurrent `push` run
+`35408739085`, and in the local pre-push container gate. That is the 999.123 contention shape: push
+and pull_request runs of the same workflow running side by side. The helper here is
+`wait_for_settled`, not `wait_for`. `phase7_cli.rs` has six fixed-budget polling helpers:
+`wait_for` (`:200`) and `wait_for_pid` (`:215`) at `200 × 25ms` = 5s; `wait_for_state_cleared`
+(`:233`), `wait_for_stopped` (`:246`), `wait_for_settled` (`:1302`) and `wait_for_gate` (`:1314`) at
+`400 × 25ms` = 10s. The configurable-budget fix direction above should cover all six. If the run is
+re-run, attempt 1's conclusion stays readable via `gh run view 35408772328 --attempt 1`.
+
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
