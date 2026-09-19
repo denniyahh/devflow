@@ -965,11 +965,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ### Pending Todos
 
-3 pending in `.planning/todos/pending/` (captured 2026-09-13, all `minor`):
-
-- Review and normalize agent instruction files across tools (`tooling`)
-- True up development setup docs against live config (`docs`)
-- Evaluate skills, plugins, MCP and ACP servers to add (`tooling`)
+- [2026-09-19] [tooling] Merge devcontainer comment fix into phase 48 before its combined PR — [todo file](.planning/todos/pending/2026-09-18-merge-devcontainer-comment-fix-into-phase-48-before-its-comb.md)
 
 ### Roadmap Evolution
 
