@@ -646,6 +646,22 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.127: A `human-action` Gate Can Be Auto-Decided Because Another Checkpoint Is `blocking-human` (BACKLOG)
+
+**Found:** 2026-09-19, Phase 48 adversarial review finding D. The checkpoint
+auto-decision path asks whether a *phase* declares any `blocking-human`
+checkpoint, while the recorded approval set combines `blocking_human ||
+human_action`. When both declarations exist, an authorization checkpoint can
+therefore inherit the unrelated checkpoint's unattended decision path.
+
+**Fix shape:** bind auto-decision eligibility to the exact declaration that
+raised the gate, or classify `human-action` as a non-auto-decidable authority
+boundary independently of other phase declarations.
+
+**Acceptance:** a phase declaring both kinds of checkpoint parks for a human
+at its `human-action` authorization gate and emits no `checkpoint_auto_decided`
+event; the intended `blocking-human` path remains separately tested.
+
 ### Phase 999.126: A Checkpoint Added After Code Preflight Is Never Re-Scanned (PROMOTED — Phase 48, 2026-09-13)
 
 **Found:** 2026-09-11, Phase 47 D-13 source review. Preflight checks plans only at Define and
