@@ -122,7 +122,7 @@ const PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 // `AUDIT_ARCH_X86_64` from Linux's `audit.h`: `EM_X86_64` (62) plus the
 // 64-bit and little-endian audit bits. `libc` exposes seccomp's structs but
 // not this audit-ABI constant.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const LINUX_AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
 #[cfg(unix)]
@@ -154,7 +154,7 @@ fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
 /// allows every other syscall, so it does not turn the probe into a general
 /// sandbox. If the kernel rejects the filter, `spawn` fails closed instead of
 /// launching an uncontained Linux probe.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn install_linux_probe_process_group_guard() -> std::io::Result<()> {
     // Fail closed unless the filter sees native x86-64. Seccomp syscall
     // numbers are ABI-specific: x32 adds `__X32_SYSCALL_BIT`, so checking
@@ -252,6 +252,37 @@ fn install_linux_probe_process_group_guard() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn linux_group_has_live_member(group: u32) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == group {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let _ppid = fields.next();
+        let Some(pgrp) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pgrp == group && state != "Z" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 type ProbePipeReceiver = std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>;
 
 #[cfg(unix)]
@@ -311,7 +342,7 @@ fn collect_probe_pipe(
 /// hang is a de facto launch refusal that never surfaces as an `Err`, directly
 /// contradicting the "this probe can never refuse a launch" contract.
 ///
-/// On Linux, a pre-exec seccomp filter prevents the probe tree from calling
+/// On Linux x86-64, a pre-exec seccomp filter prevents the probe tree from calling
 /// `setsid` or `setpgid`, so its dedicated process group remains a complete
 /// kill boundary. Other platforms retain the group cleanup where available,
 /// but cannot make that stronger claim without a platform-native job/tree
@@ -330,7 +361,7 @@ fn spawn_with_timeout(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     unsafe {
         // SAFETY: the callback only invokes `prctl` and reads/writes its
         // stack-local BPF program. It allocates nothing and takes no locks.
@@ -351,28 +382,50 @@ fn spawn_with_timeout(
     loop {
         #[cfg(unix)]
         if probe_leader_exited_unreaped(child.id())? {
-            let stdout = match collect_probe_pipe(stdout_receiver, deadline, "stdout") {
-                Ok(stdout) => stdout,
-                Err(error) => {
-                    let _ = kill_probe_group(child.id());
-                    let _ = child.wait();
-                    return Err(error);
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let had_live_group_member = linux_group_has_live_member(child.id()).unwrap_or(true);
+                let _ = kill_probe_group(child.id())?;
+                let status = child.wait()?;
+                if had_live_group_member {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "probe parent exited with a live process-group descendant",
+                    ));
                 }
-            };
-            let stderr = match collect_probe_pipe(stderr_receiver, deadline, "stderr") {
-                Ok(stderr) => stderr,
-                Err(error) => {
-                    let _ = kill_probe_group(child.id());
-                    let _ = child.wait();
-                    return Err(error);
-                }
-            };
-            let status = child.wait()?;
-            return Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
+                let stdout = collect_probe_pipe(stdout_receiver, deadline, "stdout")?;
+                let stderr = collect_probe_pipe(stderr_receiver, deadline, "stderr")?;
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            {
+                let stdout = match collect_probe_pipe(stdout_receiver, deadline, "stdout") {
+                    Ok(stdout) => stdout,
+                    Err(error) => {
+                        let _ = kill_probe_group(child.id());
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                };
+                let stderr = match collect_probe_pipe(stderr_receiver, deadline, "stderr") {
+                    Ok(stderr) => stderr,
+                    Err(error) => {
+                        let _ = kill_probe_group(child.id());
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                };
+                let status = child.wait()?;
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
         }
         #[cfg(not(unix))]
         if let Some(status) = child.try_wait()? {
@@ -670,6 +723,23 @@ mod tests {
         dir
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn stub_parent_exits_with_silent_same_group_child(sleep_secs: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create stub dir");
+        let stub = dir.path().join("opencode");
+        let script = format!(
+            "#!/bin/sh\nsleep {sleep_secs} </dev/null >/dev/null 2>&1 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n"
+        );
+        std::fs::write(&stub, script).expect("write silent-child stub");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod +x stub");
+        std::os::unix::fs::symlink("/usr/bin/sleep", dir.path().join("sleep"))
+            .expect("link the required sleep utility into the isolated PATH");
+        dir
+    }
+
     /// Linux-only CR-01 fixture. Without the pre-exec guard, `setsid` moves
     /// the `sleep` child out of the probe group while it keeps the inherited
     /// stdout/stderr descriptors open after this shell exits. With the guard,
@@ -932,6 +1002,10 @@ mod tests {
             .expect_err("a child sleeping 10s must not be allowed to finish under a 200ms bound");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let pid = hanging_stub_child_pid(&stub_dir);
+        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             !crate::agent::agent_running(pid),
             "the timed-out probe's sleep descendant must be dead: pid {pid}"
@@ -939,6 +1013,31 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "the timeout must actually bound the wait, not merely be advisory: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn spawn_with_timeout_kills_a_silent_same_group_descendant_after_parent_exit() {
+        let stub_dir = stub_parent_exits_with_silent_same_group_child(60);
+        let mut cmd = std::process::Command::new(stub_dir.path().join("opencode"));
+        let start = std::time::Instant::now();
+        let err = spawn_with_timeout(&mut cmd, std::time::Duration::from_millis(200))
+            .expect_err("a silent same-group descendant must make the probe fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let pid = hanging_stub_child_pid(&stub_dir);
+        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !crate::agent::agent_running(pid),
+            "the silent same-group descendant must be dead: pid {pid}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "a silent descendant must not block the probe: took {:?}",
             start.elapsed()
         );
     }
