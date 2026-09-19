@@ -2046,7 +2046,11 @@ fn persist_stopped_state(
     let _phase_lock = match (_phase_lock, answered_gate) {
         (Ok(guard), _) => guard,
         (Err(lock::LockError::Contended { pid, .. }), Some((stage, holder))) => {
-            return report_answered_gate_contention(phase, stage, holder, &pid);
+            println!(
+                "{}",
+                answered_gate_contention_message(phase, stage, holder, &pid)?
+            );
+            return Ok(());
         }
         (Err(lock::LockError::Contended { pid, .. }), None) => {
             return Err(CliError::Message(format!(
@@ -2081,20 +2085,17 @@ fn persist_stopped_state(
 /// phase state, so that is a failure with the gate's repair command. Anything
 /// else — an unconfirmable identity, or a different process that took the
 /// lock after `stop_via_gate` looked — claims neither a waiter nor its absence.
-fn report_answered_gate_contention(
+fn answered_gate_contention_message(
     phase: PhaseId,
     stage: Stage,
     holder: lock::HolderStatus,
     contending_pid: &str,
-) -> Result<(), CliError> {
+) -> Result<String, CliError> {
     match holder {
-        lock::HolderStatus::Live { .. } => {
-            println!(
-                "stop: phase {phase}'s lock holder (pid {contending_pid}) is waiting on the gate \
-                 and will clear phase state as it aborts"
-            );
-            Ok(())
-        }
+        lock::HolderStatus::Live { pid } if pid.to_string() == contending_pid => Ok(format!(
+            "stop: phase {phase}'s lock holder (pid {contending_pid}) is waiting on the gate \
+             and will clear phase state as it aborts"
+        )),
         lock::HolderStatus::Recycled { pid } if pid.to_string() == contending_pid => {
             Err(CliError::Message(format!(
                 "stop: nothing is waiting on phase {phase}'s {stage} gate — pid {pid} is not its \
@@ -2102,13 +2103,10 @@ fn report_answered_gate_contention(
                 no_waiter_repair(phase, stage)
             )))
         }
-        _ => {
-            println!(
-                "stop: phase {phase}'s lock is held by pid {contending_pid}, whose identity \
-                 cannot be confirmed as the gate's waiter; phase state was not marked stopped"
-            );
-            Ok(())
-        }
+        _ => Ok(format!(
+            "stop: phase {phase}'s lock is held by pid {contending_pid}, whose identity \
+             cannot be confirmed as the gate's waiter; phase state was not marked stopped"
+        )),
     }
 }
 
@@ -4325,6 +4323,50 @@ mod tests {
             response_pickup_message(Stage::Code, lock::HolderStatus::Unconfirmable { pid: 42 });
         assert!(message.contains("cannot be confirmed"));
         assert!(!message.contains("waiting monitor"));
+    }
+
+    /// T-48-16-02 / T-48-16-03: after `stop` answers a gate it cannot take the
+    /// lock for, a waiter is claimed only when the process blocking the lock
+    /// is the live holder `stop_via_gate` observed. A queued `advance` can take
+    /// the lock after the real waiter aborts; that process is not the waiter.
+    #[test]
+    fn answered_gate_contention_claims_a_waiter_only_for_the_observed_live_holder() {
+        const WAITING: &str = "is waiting on the gate";
+        let phase = PhaseId::new(4808);
+        let message = |holder, contending_pid| {
+            answered_gate_contention_message(phase, Stage::Code, holder, contending_pid)
+        };
+
+        // Opposite-result case: the observed live holder still holds the lock.
+        let same = message(lock::HolderStatus::Live { pid: 7 }, "7").unwrap();
+        assert!(same.contains(WAITING), "{same}");
+
+        for (holder, contending_pid) in [
+            (lock::HolderStatus::Live { pid: 7 }, "8"),
+            (lock::HolderStatus::Unconfirmable { pid: 7 }, "7"),
+            (lock::HolderStatus::NoHolder, "8"),
+            (lock::HolderStatus::Recycled { pid: 7 }, "8"),
+        ] {
+            let neutral = message(holder, contending_pid).unwrap();
+            assert!(
+                !neutral.contains(WAITING) && neutral.contains("not marked stopped"),
+                "{holder:?} with pid {contending_pid} blocking: {neutral}"
+            );
+        }
+
+        let recycled = answered_gate_contention_message(
+            phase,
+            Stage::Ship,
+            lock::HolderStatus::Recycled { pid: 7 },
+            "7",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            recycled.contains("not marked stopped")
+                && recycled.contains("devflow ship --phase 4808"),
+            "{recycled}"
+        );
     }
 
     /// The doctor check's rendering maps the `pi list` capability probe onto a
