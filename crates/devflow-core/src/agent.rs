@@ -777,7 +777,11 @@ mod tests {
         // structurally shaped like either layer.
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg("sleep 30")
+            // A lone `sleep 30` is eligible for a shell tail-exec, which
+            // would replace both the shell argv[0] and the $0 fixture shape
+            // before the census runs. Keep the shell alive and have its TERM
+            // trap reap the child when this test cleans up the fixture.
+            .arg("trap 'kill \"$child\"; exit 0' TERM INT; sleep 30 & child=$!; wait \"$child\"")
             .arg("/tmp/devflow-scratch/looks-like-devflow")
             .spawn()
             .expect("spawn 999.47-shaped fixture");
@@ -800,9 +804,23 @@ mod tests {
             "pid {pid}: exec visibility timed out before the fixture became discoverable"
         );
 
+        let raw_cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .expect("exec-visible fixture must retain a readable cmdline");
+        let fixture_kept_its_devflow_looking_argument = raw_cmdline
+            .split(|&byte| byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .any(|arg| arg == b"/tmp/devflow-scratch/looks-like-devflow");
+        assert!(
+            fixture_kept_its_devflow_looking_argument,
+            "fixture must retain its devflow-looking argument when the census asserts its non-match"
+        );
+
         let found = discover_stray_devflow_processes();
 
-        let _ = child.kill();
+        assert!(
+            terminate(pid),
+            "TERM must reach the fixture shell so its trap reaps the sleep child"
+        );
         let _ = child.wait();
 
         assert!(

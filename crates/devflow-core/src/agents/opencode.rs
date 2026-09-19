@@ -252,7 +252,7 @@ fn install_linux_probe_process_group_guard() -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn linux_group_has_live_member(group: u32) -> std::io::Result<bool> {
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
@@ -744,7 +744,7 @@ mod tests {
     /// the `sleep` child out of the probe group while it keeps the inherited
     /// stdout/stderr descriptors open after this shell exits. With the guard,
     /// the real `setsid` utility receives EPERM and exits instead.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn stub_parent_exits_after_attempting_setsid(sleep_secs: u64) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create stub dir");
         let stub = dir.path().join("opencode");
@@ -770,7 +770,7 @@ mod tests {
     /// The Python child records whether `setpgid(0, 0)` succeeded, then would
     /// retain the inherited pipes after the shell parent exits. Unlike
     /// `setsid`, this proves the second syscall denied by the guard.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn stub_parent_exits_after_attempting_setpgid(sleep_secs: u64) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create stub dir");
         let stub = dir.path().join("opencode");
@@ -1071,7 +1071,7 @@ mod tests {
     /// utility inside a probe must instead be denied before it can retain the
     /// probe pipes from a different process group. Both `health` and
     /// `capabilities` must return promptly and fail closed.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn probe_rejects_a_setsid_pipe_holder_before_parent_exit() {
         const NAME: &str =
@@ -1132,7 +1132,7 @@ mod tests {
     /// group without creating a session. The unguarded control must work; the
     /// probe version must be denied and both public probe paths must return
     /// fail-closed before the production timeout elapses.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn probe_rejects_a_setpgid_pipe_holder_before_parent_exit() {
         const NAME: &str =
