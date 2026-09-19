@@ -4622,6 +4622,54 @@ mod tests {
         );
     }
 
+    /// D-03b: the unattended exception belongs to Auto only. A user who
+    /// selected Supervise must see a planner-declared human checkpoint as a
+    /// Code gate; recording it does not authorize DevFlow to resume Claude.
+    ///
+    /// `unchanged_recorded_checkpoint_still_auto_decides` is the opposite
+    /// control: it keeps D-03's original liveness guarantee for Auto.
+    #[test]
+    fn supervise_unchanged_recorded_checkpoint_requires_human_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::supervise_unchanged_recorded_checkpoint_requires_human_gate";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_SUPERVISE_CHECKPOINT_ROOT";
+        let phase = PhaseId::new(110);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_whitespace_only_edit(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Supervise,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let (auto_decided, gate_fired) = run_rescan_advance(root.as_path(), phase);
+        assert!(
+            auto_decided.is_empty(),
+            "Supervise must not auto-decide a human checkpoint: {auto_decided:?}"
+        );
+        assert!(
+            gate_fired.iter().any(|event| event["stage"] == "code"),
+            "Supervise must open a Code gate for a human checkpoint: {gate_fired:?}"
+        );
+    }
+
     /// 999.84 / HARDEN-04 (35-02): the WORKTREE-MODE sibling of the test
     /// above, which is deliberately left byte-unchanged rather than moved
     /// under a worktree — extending it in place would have deleted the only
