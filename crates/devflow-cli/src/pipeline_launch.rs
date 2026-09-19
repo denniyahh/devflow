@@ -1691,15 +1691,17 @@ pub(crate) fn advance_with(
         Action::GateReview => {
             // D-01/D-03/D-05 (28-03): before the ordinary per-stage failure
             // dispatch, check whether this failure is actually a confirmed
-            // human-blocking checkpoint DevFlow can resolve unattended by
-            // resuming the exact session that raised it. Evaluated IN THIS
+            // human-blocking checkpoint DevFlow can resolve unattended in
+            // Auto mode by resuming the exact session that raised it. Evaluated IN THIS
             // ORDER — load-bearing — (1) agent is Claude (D-05); (2) the
             // phase's plans statically declare a blocking-human checkpoint —
             // the PRIMARY, agent-uncontrollable gate, checked BEFORE
             // anything agent-controlled (T-28-01); (3) the capture confirms
-            // one was reported; (4) a session id is on record; (5) the
-            // resume ceiling has not been exhausted. All five true -> resume
-            // and return. Any false -> fall through to the unchanged
+            // one was reported; (4) a session id is on record; and (5) the
+            // resume ceiling has not been exhausted. A changed declaration
+            // always opens the re-scan gate. Only an unchanged, recorded set
+            // in Auto resumes without a human; Supervise falls through to a
+            // human gate. Any other false -> fall through to the unchanged
             // per-stage dispatch below.
             //
             // Steps (2) and (3) deliberately read DIFFERENT roots (999.76,
@@ -1808,8 +1810,13 @@ pub(crate) fn advance_with(
                                     return abort(project_root, &state, &note);
                                 }
                             }
-                        } else {
+                        } else if state.mode == Mode::Auto {
                             return relaunch_checkpoint_session(&mut state, &session_id);
+                        } else {
+                            reason = Some(augment_unresolved_checkpoint_reason(
+                                reason,
+                                "Supervise mode requires a human decision for the declared blocking-human checkpoint",
+                            ));
                         }
                     }
                     (Some(_), false) => {
