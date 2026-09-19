@@ -288,11 +288,11 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_reports_state_not_marked() {
     kill_and_reap(&mut holder);
 }
 
-/// T-48-16-02 (security audit, 2026-09-19): a legacy single-line lock makes
-/// the holder's identity unconfirmable. D-05: claim neither a waiter nor its
-/// absence.
+/// Finding B: a legacy single-line lock makes the holder's identity
+/// unconfirmable. `stop` must fail rather than return success after writing a
+/// response that no confirmed process can consume.
 #[test]
-fn stop_at_a_gate_with_an_unconfirmable_holder_claims_no_waiter() {
+fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(109);
@@ -310,14 +310,19 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_claims_no_waiter() {
         .expect("run devflow stop");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        !output.status.success(),
+        "stop must not report success without a confirmed response consumer; stdout: {stdout} stderr: {stderr}"
+    );
     assert!(
         !stdout.contains("is waiting on the gate"),
         "an unconfirmable holder must not be described as a waiter; stdout: {stdout}"
     );
     assert!(
-        stdout.contains("identity cannot be confirmed") && stdout.contains("not marked stopped"),
-        "stdout: {stdout}"
+        stderr.contains("identity cannot be confirmed")
+            && stderr.contains("not marked stopped")
+            && stderr.contains(&format!("devflow resume --phase {phase}")),
+        "stderr: {stderr}"
     );
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
