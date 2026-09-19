@@ -1,0 +1,91 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-19T15:35:10.656Z",
+  "phase": "48",
+  "phase_name": "survivable-state-writes-and-honest-gate-recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": 17,
+  "task": 38,
+  "total_tasks": 38,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": "48-01..48-17",
+      "name": "Phase 48 plan execution",
+      "status": "done",
+      "commit": "multiple phase commits through 07396ec"
+    },
+    {
+      "id": "tail-tdd-override",
+      "name": "Record operator-selected TDD commit-shape override",
+      "status": "done",
+      "commit": "07396ec"
+    },
+    {
+      "id": "tail-security-discovery",
+      "name": "Build preliminary Phase 48 threat register",
+      "status": "done",
+      "commit": "n/a"
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": "tail-security",
+      "name": "Obtain the operator's security-audit choice; then run the required security gate",
+      "status": "blocked_on_human"
+    },
+    {
+      "id": "tail-nyquist",
+      "name": "Run Nyquist validation from the planning-time draft and resolve any resulting gate",
+      "status": "not_started"
+    },
+    {
+      "id": "tail-mempalace",
+      "name": "Run enabled MemPalace capture hook",
+      "status": "not_started"
+    },
+    {
+      "id": "tail-goal-verification",
+      "name": "Run final phase-goal verification and phase completion reconciliation",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "Security enforcement requires an explicit operator choice before the auditor can run: verify all planned threats, accept unresolved threats, or cancel.",
+      "type": "human_action",
+      "workaround": "None; the decision has been presented and must not be inferred."
+    },
+    {
+      "description": "GSD issue #4799 prevents sequential executors from committing in this linked phase worktree despite workflow.use_worktrees=false.",
+      "type": "technical",
+      "workaround": "Keep executor-produced source and summaries unstaged; independently verify, then use a normal hook-enabled orchestrator commit. Never use --no-verify."
+    }
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {
+      "action": "Choose the security gate disposition: verify all threats, accept unresolved threats, or cancel.",
+      "context": "49 plan-authored threats exist; only 11 have summary-level dispositions and no 48-SECURITY.md audit exists.",
+      "blocking": true
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Accept the TDD commit-shape audit failure only as a Phase 48 override.",
+      "rationale": "The missing test-to-feat commit sequence is caused by the documented executor-commit defect, while source/test evidence remains subject to all other gates.",
+      "phase": "48"
+    },
+    {
+      "decision": "Do not treat the planning-time validation file as completed Nyquist validation.",
+      "rationale": "48-VALIDATION.md frontmatter remains status:draft and nyquist_compliant:false.",
+      "phase": "48"
+    }
+  ],
+  "uncommitted_files": [
+    "?? .planning/research/.cache/",
+    "?? .planning/user/errors/"
+  ],
+  "next_action": "Read the phase .continue-here.md, obtain the pending security choice, then resume with the security gate without treating summary language as an audit.",
+  "context_notes": "All 17 plan summaries exist; 38 task tags are present in the 17 plans. The final deep review artifact records zero findings for source through 3c90755; 07396ec is documentation-only. The known #999.47 test-fixture failure was resolved as a shell tail-exec fixture defect, not a production discovery defect. Do not state current full-suite or container success without rerunning it in the resumed session."
+}
