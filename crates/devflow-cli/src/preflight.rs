@@ -1300,16 +1300,20 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
 /// a recorded empty set against a populated one and gate on every resume
 /// (T-48-15-02).
 ///
-/// [`CheckpointApproval::Unrecorded`] is left untouched at every Code
-/// evaluation (T-48-07-02): a run whose first Code evaluation predates this
-/// field has an unobserved set, and recording it later would bless whatever
-/// the agent had already written by then. Every other approval state is
-/// replaced with the freshly scanned set.
+/// Records ONLY from [`CheckpointApproval::Pending`] — the pre-agent set
+/// (T-48-07-02, T-48-15-01). Every production Code launch passes a Code
+/// preflight that reaches this first, so `Pending` means no Code agent has run
+/// yet and the scan is the planner's output. Once a set is recorded, no
+/// preflight evaluation may widen it, whatever the stage, mode or answer: only
+/// the re-scan gate may, because only it names every unapproved plan file
+/// untruncated. [`CheckpointApproval::Unrecorded`] is never recorded either: a
+/// run whose first Code evaluation predates this field has an unobserved set,
+/// and recording it later would bless whatever the agent had already written.
 ///
 /// Callers own their own `save_state` so this can sit inside an arm that
 /// already saves once.
 fn record_checkpoint_set_for_code_evaluation(state: &mut State) -> Result<(), CliError> {
-    if state.checkpoint_approval == CheckpointApproval::Unrecorded {
+    if state.checkpoint_approval != CheckpointApproval::Pending {
         return Ok(());
     }
     let execution_root = state
@@ -1404,25 +1408,28 @@ pub(crate) fn run_preflight(
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 state.gate_pending = false;
                 state.preflight_retries = 0;
-                // 48-15 / R-8, T-48-15-01: in Auto mode a Code launch whose
-                // plans declare a human-only checkpoint is REFUSED, so the
-                // pass path below can only ever record an EMPTY set. THIS is
-                // where a non-empty set becomes legitimate: a human read the
-                // Code refusal — which says a plan declares a human-only
-                // checkpoint — and approved.
+                // 48-15 / R-8, T-48-15-01, T-48-07-02: in Auto mode a Code
+                // launch whose plans declare a human-only checkpoint is
+                // REFUSED, so the pass path below never runs for it. THIS is
+                // where that run's pre-agent set is recorded — consuming
+                // `Pending` before `launch_stage_inner` starts the agent, in
+                // every mode, or the agent would run with `Pending` still in
+                // place and the next passing evaluation would record what it
+                // wrote.
                 //
-                // Code and Auto only: every stage runs this gate, and
-                // Supervise reports the checkpoint condition without refusing
-                // on it (D-08). Approving a refusal that never named the
-                // checkpoint (a failing driver check, say) is not approval of
-                // checkpoints an agent added during Code; left unrecorded,
-                // they reach the re-scan gate, which names the plan files.
+                // Recording only ever fills `Pending` (see the recorder): once
+                // a set exists, approving a refusal never widens it. A refusal's
+                // text is capped and may not mention the checkpoint at all —
+                // Supervise does not refuse on it (D-08), and any stage can
+                // refuse on a failing driver check — so agent-added
+                // checkpoints are left for the re-scan gate, which names the
+                // plan files. Code only: before Code the plans may still be
+                // changing, and after it the agent has run.
                 //
-                // Only a human answer widens the set. The LoopBack arm below
-                // deliberately records nothing: "I will fix it and retry" is
-                // not approval, and treating it as approval is the
-                // repudiation path T-48-15-03 names.
-                if stage == Stage::Code && state.mode == Mode::Auto {
+                // The LoopBack arm below deliberately records nothing: "I will
+                // fix it and retry" is not approval, and treating it as
+                // approval is the repudiation path T-48-15-03 names.
+                if stage == Stage::Code {
                     record_checkpoint_set_for_code_evaluation(state)?;
                 }
                 workflow::save_state(state)?;
@@ -2847,50 +2854,154 @@ mod tests {
         );
     }
 
-    /// T-48-15-01 (security audit, 2026-09-19): only an approval of a refusal
-    /// that NAMED the checkpoint condition may widen the recorded set — the
-    /// Auto-mode Code refusal gate. Every stage runs `run_preflight`, and
-    /// Supervise mode reports the checkpoint condition without refusing on it,
-    /// so without both checks a human approving an unrelated refusal — here a
-    /// failing driver check — would silently bless a human-only checkpoint an
-    /// agent added during Code, and the re-scan compare would then auto-decide
-    /// it.
+    /// T-48-15-01 / T-48-07-02 (security audit, 2026-09-19): a preflight
+    /// refusal approval records only the PRE-AGENT set — at Code, from
+    /// `Pending` — exactly like the pass path. Once a set is recorded, only the
+    /// re-scan gate may widen it, because only that gate names every unapproved
+    /// plan file untruncated; a refusal's text is capped and may never mention
+    /// the checkpoint at all (a failing driver check, or Supervise, which does
+    /// not refuse on it).
     ///
     /// Opposite-result case: `approving_the_preflight_refusal_gate_records_the_set`
-    /// approves the Auto-mode Code refusal and must record.
+    /// approves a Code refusal from `Pending` and must record.
     #[test]
     fn approving_a_non_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_non_code_preflight_refusal_records_nothing";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
         let _guard = env_lock();
-        assert_approving_an_unrelated_refusal_records_nothing(
+        assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Validate,
             Mode::Auto,
             PhaseId::new(628),
         );
     }
 
-    /// T-48-15-01, Supervise arm: the Code refusal here is the failing driver
-    /// check alone — Supervise never refuses on the checkpoint condition.
+    /// Supervise never refuses on the checkpoint condition, so this Code
+    /// refusal is the failing driver check alone.
     #[test]
     fn approving_a_supervise_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_supervise_code_preflight_refusal_records_nothing";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
         let _guard = env_lock();
-        assert_approving_an_unrelated_refusal_records_nothing(
+        assert_approving_a_refusal_never_widens_a_recorded_set(
             Stage::Code,
             Mode::Supervise,
             PhaseId::new(629),
         );
     }
 
+    /// Auto refuses on the checkpoint condition, but the gate text is capped
+    /// at 300 characters and the condition is joined last, so even here the
+    /// approver may never have seen it.
+    #[test]
+    fn approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set() {
+        const NAME: &str = "preflight::tests::\
+                            approving_an_auto_code_preflight_refusal_never_widens_a_recorded_set";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+        assert_approving_a_refusal_never_widens_a_recorded_set(
+            Stage::Code,
+            Mode::Auto,
+            PhaseId::new(630),
+        );
+    }
+
+    /// T-48-07-02 regression (introduced by 25aa87c, which left `Pending` in
+    /// place on a Supervise approval): the approval must consume `Pending` by
+    /// recording the pre-agent set, or the agent runs with `Pending` still in
+    /// place and the NEXT passing Code evaluation records what it wrote.
+    #[test]
+    fn a_supervise_code_refusal_approval_records_the_pre_agent_set_once() {
+        const NAME: &str =
+            "preflight::tests::a_supervise_code_refusal_approval_records_the_pre_agent_set_once";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(631);
+        let worktree = root.join("phase-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // The planner's checkpoint, present before any Code agent runs.
+        write_human_only_plan(&worktree, phase);
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.worktree_path = Some(worktree.clone());
+        state.legacy_claude_launch = true;
+        assert_eq!(state.checkpoint_approval, CheckpointApproval::Pending);
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let adapter = FailOnceAdapter::new();
+        let approved = run_preflight(root, &mut state, &adapter);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        assert!(
+            matches!(approved, Ok(false)),
+            "the refusal gate must have fired and been approved, got {approved:?}"
+        );
+        let baseline = verify::phase_checkpoint_declarations(&worktree, phase);
+        assert_eq!(
+            state.checkpoint_approval,
+            crate::pipeline_launch::recorded_approval(&baseline),
+            "the approval must consume Pending with the pre-agent set"
+        );
+
+        // The Code agent now adds a second human-only checkpoint.
+        let plan_dir = worktree.join(".planning/phases").join(format!(
+            "{padded}-recording-fixture",
+            padded = phase.padded()
+        ));
+        std::fs::write(
+            plan_dir.join(format!("{padded}-02-PLAN.md", padded = phase.padded())),
+            format!(
+                "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:human-verify\" \
+                 gate=\"{HUMAN_GATE_VALUE_FOR_RECORDING_TEST}\">\n</task>\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            human_only_count(&worktree, phase),
+            2,
+            "the fixture must now hold the planner's and the agent's checkpoints"
+        );
+
+        // A later Code evaluation passes (the driver check fails only once).
+        let passed = run_preflight(root, &mut state, &adapter);
+        assert!(
+            matches!(passed, Ok(true)),
+            "the second evaluation must pass, got {passed:?}"
+        );
+        let current = verify::phase_checkpoint_declarations(&worktree, phase);
+        let unapproved = state.checkpoint_approval.unapproved(&current);
+        assert_eq!(
+            unapproved.len(),
+            1,
+            "the agent's checkpoint must stay unapproved for the re-scan gate"
+        );
+        assert!(
+            unapproved[0].plan_file.ends_with("-02-PLAN.md"),
+            "the unapproved entry must be the agent's plan, got {}",
+            unapproved[0].plan_file
+        );
+    }
+
     /// A `mode` run at `stage` whose Code evaluation recorded an empty set, and
     /// whose worktree now holds an agent-added human-only checkpoint, hits a
-    /// refusal from a failing driver check; a human approves it. The set must
-    /// be unchanged, in memory and on disk.
-    fn assert_approving_an_unrelated_refusal_records_nothing(
+    /// preflight refusal; a human approves it. The set must be unchanged, in
+    /// memory and on disk.
+    fn assert_approving_a_refusal_never_widens_a_recorded_set(
         stage: Stage,
         mode: Mode,
         phase: PhaseId,
@@ -2932,8 +3043,7 @@ mod tests {
         assert_eq!(
             state.checkpoint_approval,
             CheckpointApproval::Recorded(vec![]),
-            "approving a {mode} {stage} refusal that never named the checkpoint \
-             must not approve it"
+            "approving a {mode} {stage} refusal must not widen an already-recorded set"
         );
         assert_eq!(
             workflow::load_state(root, phase)
