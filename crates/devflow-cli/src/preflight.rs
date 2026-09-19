@@ -1411,16 +1411,18 @@ pub(crate) fn run_preflight(
                 // Code refusal — which says a plan declares a human-only
                 // checkpoint — and approved.
                 //
-                // Code only: every stage runs this gate, and approving an
-                // unrelated refusal at another stage (a failing driver check
-                // at Validate, say) is not approval of checkpoints an agent
-                // added during Code.
+                // Code and Auto only: every stage runs this gate, and
+                // Supervise reports the checkpoint condition without refusing
+                // on it (D-08). Approving a refusal that never named the
+                // checkpoint (a failing driver check, say) is not approval of
+                // checkpoints an agent added during Code; left unrecorded,
+                // they reach the re-scan gate, which names the plan files.
                 //
                 // Only a human answer widens the set. The LoopBack arm below
                 // deliberately records nothing: "I will fix it and retry" is
                 // not approval, and treating it as approval is the
                 // repudiation path T-48-15-03 names.
-                if stage == Stage::Code {
+                if stage == Stage::Code && state.mode == Mode::Auto {
                     record_checkpoint_set_for_code_evaluation(state)?;
                 }
                 workflow::save_state(state)?;
@@ -2845,30 +2847,59 @@ mod tests {
         );
     }
 
-    /// T-48-15-01 (security audit, 2026-09-19): only the CODE refusal gate's
-    /// approval may widen the recorded set. Every stage runs `run_preflight`,
-    /// so without a stage check a human approving an unrelated refusal — here
-    /// a failing driver check at Validate — would silently bless a human-only
-    /// checkpoint an agent added during Code, and the re-scan compare would
-    /// then auto-decide it.
+    /// T-48-15-01 (security audit, 2026-09-19): only an approval of a refusal
+    /// that NAMED the checkpoint condition may widen the recorded set — the
+    /// Auto-mode Code refusal gate. Every stage runs `run_preflight`, and
+    /// Supervise mode reports the checkpoint condition without refusing on it,
+    /// so without both checks a human approving an unrelated refusal — here a
+    /// failing driver check — would silently bless a human-only checkpoint an
+    /// agent added during Code, and the re-scan compare would then auto-decide
+    /// it.
     ///
     /// Opposite-result case: `approving_the_preflight_refusal_gate_records_the_set`
-    /// approves the same shape of refusal at Code and must record.
+    /// approves the Auto-mode Code refusal and must record.
     #[test]
     fn approving_a_non_code_preflight_refusal_records_nothing() {
         const NAME: &str =
             "preflight::tests::approving_a_non_code_preflight_refusal_records_nothing";
         enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
         let _guard = env_lock();
+        assert_approving_an_unrelated_refusal_records_nothing(
+            Stage::Validate,
+            Mode::Auto,
+            PhaseId::new(628),
+        );
+    }
 
+    /// T-48-15-01, Supervise arm: the Code refusal here is the failing driver
+    /// check alone — Supervise never refuses on the checkpoint condition.
+    #[test]
+    fn approving_a_supervise_code_preflight_refusal_records_nothing() {
+        const NAME: &str =
+            "preflight::tests::approving_a_supervise_code_preflight_refusal_records_nothing";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+        assert_approving_an_unrelated_refusal_records_nothing(
+            Stage::Code,
+            Mode::Supervise,
+            PhaseId::new(629),
+        );
+    }
+
+    /// A `mode` run at `stage` whose Code evaluation recorded an empty set, and
+    /// whose worktree now holds an agent-added human-only checkpoint, hits a
+    /// refusal from a failing driver check; a human approves it. The set must
+    /// be unchanged, in memory and on disk.
+    fn assert_approving_an_unrelated_refusal_records_nothing(
+        stage: Stage,
+        mode: Mode,
+        phase: PhaseId,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let phase = PhaseId::new(628);
         let worktree = root.join("phase-worktree");
         std::fs::create_dir_all(&worktree).unwrap();
-        // The checkpoint an agent added during Code, after Code's own
-        // evaluation recorded an empty set.
         write_human_only_plan(&worktree, phase);
         assert_eq!(
             human_only_count(&worktree, phase),
@@ -2877,8 +2908,8 @@ mod tests {
              would leave the set unchanged and nothing would be tested"
         );
 
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Validate;
+        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        state.stage = stage;
         state.worktree_path = Some(worktree);
         state.checkpoint_approval = CheckpointApproval::Recorded(vec![]);
         // Same launch path as `run_preflight_advance_gate_launches_agent_exactly_once`:
@@ -2886,7 +2917,7 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        let response_path = Gates::response_path(root, phase, stage);
         std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
 
@@ -2901,7 +2932,8 @@ mod tests {
         assert_eq!(
             state.checkpoint_approval,
             CheckpointApproval::Recorded(vec![]),
-            "approving a Validate refusal must not approve Code's checkpoints"
+            "approving a {mode} {stage} refusal that never named the checkpoint \
+             must not approve it"
         );
         assert_eq!(
             workflow::load_state(root, phase)
