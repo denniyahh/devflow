@@ -1408,13 +1408,21 @@ pub(crate) fn run_preflight(
                 // plans declare a human-only checkpoint is REFUSED, so the
                 // pass path below can only ever record an EMPTY set. THIS is
                 // where a non-empty set becomes legitimate: a human read the
-                // refusal — which names the declaring plans — and approved.
+                // Code refusal — which says a plan declares a human-only
+                // checkpoint — and approved.
+                //
+                // Code only: every stage runs this gate, and approving an
+                // unrelated refusal at another stage (a failing driver check
+                // at Validate, say) is not approval of checkpoints an agent
+                // added during Code.
                 //
                 // Only a human answer widens the set. The LoopBack arm below
                 // deliberately records nothing: "I will fix it and retry" is
                 // not approval, and treating it as approval is the
                 // repudiation path T-48-15-03 names.
-                record_checkpoint_set_for_code_evaluation(state)?;
+                if stage == Stage::Code {
+                    record_checkpoint_set_for_code_evaluation(state)?;
+                }
                 workflow::save_state(state)?;
                 launch_stage_inner(state, None, None)?;
             }
@@ -2834,6 +2842,73 @@ mod tests {
             loopback_state.checkpoint_approval,
             CheckpointApproval::Pending,
             "a LoopBack answer is not approval and must record nothing"
+        );
+    }
+
+    /// T-48-15-01 (security audit, 2026-09-19): only the CODE refusal gate's
+    /// approval may widen the recorded set. Every stage runs `run_preflight`,
+    /// so without a stage check a human approving an unrelated refusal — here
+    /// a failing driver check at Validate — would silently bless a human-only
+    /// checkpoint an agent added during Code, and the re-scan compare would
+    /// then auto-decide it.
+    ///
+    /// Opposite-result case: `approving_the_preflight_refusal_gate_records_the_set`
+    /// approves the same shape of refusal at Code and must record.
+    #[test]
+    fn approving_a_non_code_preflight_refusal_records_nothing() {
+        const NAME: &str =
+            "preflight::tests::approving_a_non_code_preflight_refusal_records_nothing";
+        enter_path_isolated_child!(NAME, agent_free_dir_with_agent_stub("claude"));
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(628);
+        let worktree = root.join("phase-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // The checkpoint an agent added during Code, after Code's own
+        // evaluation recorded an empty set.
+        write_human_only_plan(&worktree, phase);
+        assert_eq!(
+            human_only_count(&worktree, phase),
+            1,
+            "a fresh scan must see a human-only declaration, or recording \
+             would leave the set unchanged and nothing would be tested"
+        );
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.worktree_path = Some(worktree);
+        state.checkpoint_approval = CheckpointApproval::Recorded(vec![]);
+        // Same launch path as `run_preflight_advance_gate_launches_agent_exactly_once`:
+        // the subject is what the Advance arm records, not the relaunch.
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let adapter = FailOnceAdapter::new();
+        let result = run_preflight(root, &mut state, &adapter);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        assert!(
+            matches!(result, Ok(false)),
+            "the refusal gate must have fired and been approved, got {result:?}"
+        );
+        assert_eq!(
+            state.checkpoint_approval,
+            CheckpointApproval::Recorded(vec![]),
+            "approving a Validate refusal must not approve Code's checkpoints"
+        );
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .checkpoint_approval,
+            CheckpointApproval::Recorded(vec![]),
+            "the persisted set must be unchanged too"
         );
     }
 

@@ -230,6 +230,100 @@ fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
     kill_and_reap(&mut holder);
 }
 
+/// Saves a fresh state for `phase`, starts a live `sleep` as the process the
+/// lock names, and returns the state path, its bytes, and the holder.
+fn gated_phase_with_foreign_holder(
+    root: &Path,
+    phase: PhaseId,
+) -> (std::path::PathBuf, Vec<u8>, Child) {
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
+    let before = std::fs::read(&state_path).unwrap();
+    let holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn holder");
+    (state_path, before, holder)
+}
+
+/// T-48-16-03 (security audit, 2026-09-19): a lock naming a recycled pid has
+/// no waiter. At a Ship gate `stop` still writes the answer (D-05), but the
+/// unrelated process will never clear phase state, so `stop` must not claim
+/// it will — it must report the state as not marked and name `devflow ship`.
+#[test]
+fn stop_at_a_ship_gate_with_a_recycled_holder_reports_state_not_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(108);
+    let (state_path, before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let wrong_start =
+        devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
+    write_live_lock(root, phase, &holder, wrong_start);
+    Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "phase state was not marked, so stop must fail; stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("is waiting on the gate") && !stderr.contains("is waiting on the gate"),
+        "a recycled pid must never be described as a waiter; stdout: {stdout}"
+    );
+    assert!(stderr.contains("not marked stopped"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("devflow ship --phase {phase}")),
+        "stderr: {stderr}"
+    );
+    assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    kill_and_reap(&mut holder);
+}
+
+/// T-48-16-02 (security audit, 2026-09-19): a legacy single-line lock makes
+/// the holder's identity unconfirmable. D-05: claim neither a waiter nor its
+/// absence.
+#[test]
+fn stop_at_a_gate_with_an_unconfirmable_holder_claims_no_waiter() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(109);
+    let (state_path, before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let lock = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    std::fs::write(lock, holder.id().to_string()).unwrap();
+    Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        !stdout.contains("is waiting on the gate"),
+        "an unconfirmable holder must not be described as a waiter; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("identity cannot be confirmed") && stdout.contains("not marked stopped"),
+        "stdout: {stdout}"
+    );
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    kill_and_reap(&mut holder);
+}
+
 /// Wait for `child` to exit, `try_wait`-polling on a short interval rather
 /// than blocking indefinitely on `wait()`. On expiry, reaps the child (a
 /// bounded `wait()` — the child's own deliberately short

@@ -1863,19 +1863,21 @@ fn reap_stray_candidates(
 /// foreground child, `monitor_pid` already names a process that exited long
 /// ago; `lock::holder`'s recorded pid is the only correct target).
 pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    let (gate_answered, gate_holder_status) = stop_via_gate(project_root, phase)?;
+    let (gate_answered, gate_holder) = stop_via_gate(project_root, phase)?;
     let signal_sent = if gate_answered {
         false
     } else {
         stop_via_lock(project_root, phase)?
     };
-    if matches!(
-        gate_holder_status,
-        Some(lock::HolderStatus::Recycled { .. })
-    ) {
+    if matches!(gate_holder, Some((_, lock::HolderStatus::Recycled { .. }))) {
         println!("stop: phase {phase}'s lock holder was recycled; treating it as no waiter");
     }
-    persist_stopped_state(project_root, phase, gate_answered, signal_sent)
+    persist_stopped_state(
+        project_root,
+        phase,
+        gate_answered.then_some(gate_holder).flatten(),
+        signal_sent,
+    )
 }
 
 /// The primary path: answer `phase`'s open gate with a rejection whose note
@@ -1893,7 +1895,7 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
 fn stop_via_gate(
     project_root: &Path,
     phase: PhaseId,
-) -> Result<(bool, Option<lock::HolderStatus>), CliError> {
+) -> Result<(bool, Option<(Stage, lock::HolderStatus)>), CliError> {
     let Some(gate) = Gates::list_open(project_root)
         .into_iter()
         .find(|g| g.phase == phase)
@@ -1907,7 +1909,7 @@ fn stop_via_gate(
             gate.stage,
             no_waiter_repair(phase, gate.stage)
         );
-        return Ok((false, Some(holder_before_reap)));
+        return Ok((false, Some((gate.stage, holder_before_reap))));
     }
     match Gates::reap(
         project_root,
@@ -1923,7 +1925,7 @@ fn stop_via_gate(
                 path.display(),
                 response_pickup_message(gate.stage, lock::holder_status(project_root, phase))
             );
-            Ok((true, Some(holder_before_reap)))
+            Ok((true, Some((gate.stage, holder_before_reap))))
         }
         // A human, `--yes-ship`, or `devflow gate sweep` already answered
         // this gate between our `list_open` scan and this `reap` call. The
@@ -1935,9 +1937,9 @@ fn stop_via_gate(
                  is already ending",
                 gate.stage
             );
-            Ok((true, Some(holder_before_reap)))
+            Ok((true, Some((gate.stage, holder_before_reap))))
         }
-        Err(GateError::NoOpenGate { .. }) => Ok((false, Some(holder_before_reap))),
+        Err(GateError::NoOpenGate { .. }) => Ok((false, Some((gate.stage, holder_before_reap)))),
         Err(err) => Err(err.into()),
     }
 }
@@ -2027,10 +2029,13 @@ fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> 
 /// --until`) and `transition()` reads it. A phase with no persisted state
 /// at all — never started, or already cleared by a completed abort — is
 /// already stopped; that is success, not an error.
+///
+/// `answered_gate` is the stage and holder status [`stop_via_gate`] observed
+/// when it answered a gate, or `None` when no gate was answered.
 fn persist_stopped_state(
     project_root: &Path,
     phase: PhaseId,
-    gate_answered: bool,
+    answered_gate: Option<(Stage, lock::HolderStatus)>,
     signal_sent: bool,
 ) -> Result<(), CliError> {
     let _phase_lock = if signal_sent {
@@ -2038,22 +2043,18 @@ fn persist_stopped_state(
     } else {
         lock::acquire(project_root, phase)
     };
-    let _phase_lock = match _phase_lock {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, .. }) if gate_answered => {
-            println!(
-                "stop: phase {phase}'s lock holder (pid {pid}) is waiting on the gate and \
-                 will clear phase state as it aborts"
-            );
-            return Ok(());
+    let _phase_lock = match (_phase_lock, answered_gate) {
+        (Ok(guard), _) => guard,
+        (Err(lock::LockError::Contended { pid, .. }), Some((stage, holder))) => {
+            return report_answered_gate_contention(phase, stage, holder, &pid);
         }
-        Err(lock::LockError::Contended { pid, .. }) => {
+        (Err(lock::LockError::Contended { pid, .. }), None) => {
             return Err(CliError::Message(format!(
                 "stop: phase {phase}'s lock holder (pid {pid}) is still alive; phase state \
                  was not marked stopped"
             )));
         }
-        Err(err) => return Err(CliError::Message(err.to_string())),
+        (Err(err), _) => return Err(CliError::Message(err.to_string())),
     };
     let mut state = match workflow::load_state(project_root, phase) {
         Ok(state) => state,
@@ -2071,6 +2072,44 @@ fn persist_stopped_state(
     });
     workflow::save_state(&state)?;
     Ok(())
+}
+
+/// What `stop` can honestly say after answering a gate whose lock it then
+/// cannot take (D-05; T-48-16-02, T-48-16-03). Lock contention alone is not
+/// evidence of a waiter: only a `Live` holder is described as one. A recycled
+/// pid still blocking the lock is an unrelated process that will never clear
+/// phase state, so that is a failure with the gate's repair command. Anything
+/// else — an unconfirmable identity, or a different process that took the
+/// lock after `stop_via_gate` looked — claims neither a waiter nor its absence.
+fn report_answered_gate_contention(
+    phase: PhaseId,
+    stage: Stage,
+    holder: lock::HolderStatus,
+    contending_pid: &str,
+) -> Result<(), CliError> {
+    match holder {
+        lock::HolderStatus::Live { .. } => {
+            println!(
+                "stop: phase {phase}'s lock holder (pid {contending_pid}) is waiting on the gate \
+                 and will clear phase state as it aborts"
+            );
+            Ok(())
+        }
+        lock::HolderStatus::Recycled { pid } if pid.to_string() == contending_pid => {
+            Err(CliError::Message(format!(
+                "stop: nothing is waiting on phase {phase}'s {stage} gate — pid {pid} is not its \
+                 lock holder; phase state was not marked stopped. {}",
+                no_waiter_repair(phase, stage)
+            )))
+        }
+        _ => {
+            println!(
+                "stop: phase {phase}'s lock is held by pid {contending_pid}, whose identity \
+                 cannot be confirmed as the gate's waiter; phase state was not marked stopped"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
@@ -4256,7 +4295,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
         Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        stop(root, phase).unwrap();
+        // T-48-16-03: the recycled pid still blocks the lock, so phase state
+        // is not marked — and `stop` must say so rather than claim a waiter.
+        let err = stop(root, phase).unwrap_err().to_string();
+        assert!(err.contains("not marked stopped"), "{err}");
+        assert!(err.contains("devflow ship --phase 4806"), "{err}");
         assert!(Gates::response_path(root, phase, Stage::Ship).exists());
         assert!(
             response_pickup_message(Stage::Ship, lock::HolderStatus::Recycled { pid: 42 })
