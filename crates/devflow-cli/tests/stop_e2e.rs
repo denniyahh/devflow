@@ -324,6 +324,40 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_claims_no_waiter() {
     kill_and_reap(&mut holder);
 }
 
+/// Finding E: persisting an answer is not evidence that a process will act on
+/// it. Ship permits the response for manual `devflow ship` recovery, but its
+/// CLI confirmation must not claim that the workflow will advance while no
+/// live holder exists.
+#[test]
+fn gate_approve_without_a_live_holder_does_not_claim_advance() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(110);
+    Gates::write_gate(root, phase, Stage::Ship, "approve merge").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["gate", "approve", &phase.to_string(), "--project"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate approve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+    assert!(
+        !stdout.contains("workflow will advance"),
+        "no-holder response must not claim an outcome: {stdout}"
+    );
+    assert!(
+        stdout.contains("no confirmed live holder will act"),
+        "no-holder response must name the evidence limit: {stdout}"
+    );
+}
+
 /// Wait for `child` to exit, `try_wait`-polling on a short interval rather
 /// than blocking indefinitely on `wait()`. On expiry, reaps the child (a
 /// bounded `wait()` — the child's own deliberately short
