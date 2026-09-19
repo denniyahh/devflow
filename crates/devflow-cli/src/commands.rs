@@ -1438,15 +1438,19 @@ pub(crate) fn gate_respond(
             "via": "cli",
         }),
     );
-    let outcome = match GateAction::from_response(&response) {
-        GateAction::Advance => "workflow will advance",
-        GateAction::LoopBack(_) => "workflow will loop back to Code",
-        GateAction::Abort(_) => "phase will abort",
+    let holder_after_response = lock::holder_status(project_root, phase);
+    let pickup = match holder_after_response {
+        lock::HolderStatus::Live { .. } => {
+            response_pickup_message(stage, holder_after_response).to_owned()
+        }
+        _ => format!(
+            "response was written, but no confirmed live holder will act. {}",
+            no_waiter_repair(phase, stage)
+        ),
     };
     println!(
-        "{} gate for phase {phase} {stage} — {outcome}; {} (response at {})",
+        "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})",
         if approved { "approved" } else { "rejected" },
-        response_pickup_message(stage, lock::holder_status(project_root, phase)),
         path.display()
     );
     Ok(())
@@ -1725,8 +1729,8 @@ pub(crate) fn gate_sweep(
     Ok(())
 }
 
-fn gate_sweep_may_reap(stage: Stage, holder: lock::HolderStatus) -> bool {
-    stage == Stage::Ship || holder.may_be_waiting()
+fn gate_sweep_may_reap(_stage: Stage, holder: lock::HolderStatus) -> bool {
+    matches!(holder, lock::HolderStatus::Live { .. })
 }
 
 /// What became of one [`agent::StrayProcess`] candidate the opt-in
@@ -1927,20 +1931,62 @@ fn stop_via_gate(
             );
             Ok((true, Some((gate.stage, holder_before_reap))))
         }
-        // A human, `--yes-ship`, or `devflow gate sweep` already answered
-        // this gate between our `list_open` scan and this `reap` call. The
-        // phase is already ending — that is success, not a failure to
-        // report.
+        // A human, `--yes-ship`, or `devflow gate sweep` answered this gate
+        // between our scan and this reap. Read its action: an approval or
+        // loop-back is not `stop`'s outcome and must fall through to the
+        // lock path; only an abort response can be treated as the requested
+        // stop action, and only with a still-live holder.
         Err(GateError::AlreadyResponded { .. }) => {
-            println!(
-                "stop: phase {phase} {} already has a response awaiting pickup — the phase \
-                 is already ending",
-                gate.stage
-            );
-            Ok((true, Some((gate.stage, holder_before_reap))))
+            stop_with_existing_response(project_root, phase, gate.stage, holder_before_reap)
         }
         Err(GateError::NoOpenGate { .. }) => Ok((false, Some((gate.stage, holder_before_reap)))),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Classify a response which appeared after `stop_via_gate` saw an open gate.
+/// An approval or loop-back is not attributable to `stop`, so that path must
+/// fall through to the lock holder. An abort can be the requested action only
+/// while the original holder is still confirmed live.
+fn stop_with_existing_response(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    holder_before_reap: lock::HolderStatus,
+) -> Result<(bool, Option<(Stage, lock::HolderStatus)>), CliError> {
+    let response_path = Gates::response_path(project_root, phase, stage);
+    let response_text = std::fs::read_to_string(&response_path).map_err(|err| {
+        CliError::Message(format!(
+            "stop: phase {phase} {stage} already has an unreadable response at {}: {err}",
+            response_path.display()
+        ))
+    })?;
+    let response: GateResponse = serde_json::from_str(&response_text).map_err(|err| {
+        CliError::Message(format!(
+            "stop: phase {phase} {stage} already has an unreadable response at {}: {err}",
+            response_path.display()
+        ))
+    })?;
+    match GateAction::from_response(&response) {
+        GateAction::Abort(_) if matches!(holder_before_reap, lock::HolderStatus::Live { .. }) => {
+            println!(
+                "stop: phase {phase} {stage} already has an abort response awaiting a live lock holder; stop did not write it"
+            );
+            Ok((true, Some((stage, holder_before_reap))))
+        }
+        GateAction::Abort(_) => {
+            println!(
+                "stop: phase {phase} {stage} already has an abort response, but no confirmed live holder will act; stop did not write it. {}",
+                no_waiter_repair(phase, stage)
+            );
+            Ok((false, None))
+        }
+        GateAction::Advance | GateAction::LoopBack(_) => {
+            println!(
+                "stop: phase {phase} {stage} already has a non-abort response; stop did not write it or claim its outcome"
+            );
+            Ok((false, None))
+        }
     }
 }
 
@@ -2103,10 +2149,11 @@ fn answered_gate_contention_message(
                 no_waiter_repair(phase, stage)
             )))
         }
-        _ => Ok(format!(
+        _ => Err(CliError::Message(format!(
             "stop: phase {phase}'s lock is held by pid {contending_pid}, whose identity \
-             cannot be confirmed as the gate's waiter; phase state was not marked stopped"
-        )),
+             cannot be confirmed as the gate's waiter; phase state was not marked stopped. {}",
+            no_waiter_repair(phase, stage)
+        ))),
     }
 }
 
@@ -4310,7 +4357,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_at_a_non_ship_gate_with_an_unconfirmable_holder_claims_neither() {
+    fn stop_at_a_non_ship_gate_with_an_unconfirmable_holder_refuses_success() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4807);
@@ -4321,8 +4368,10 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, pid.to_string()).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        stop(root, phase).unwrap();
+        let error = stop(root, phase).unwrap_err().to_string();
         assert!(Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(error.contains("not marked stopped"), "{error}");
+        assert!(error.contains("devflow resume --phase 4807"), "{error}");
         let message =
             response_pickup_message(Stage::Code, lock::HolderStatus::Unconfirmable { pid: 42 });
         assert!(message.contains("cannot be confirmed"));
@@ -4375,6 +4424,51 @@ mod tests {
                 && recycled.contains("devflow ship --phase 4808"),
             "{recycled}"
         );
+    }
+
+    #[test]
+    fn existing_response_stops_only_for_a_live_abort_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4809);
+        let stage = Stage::Code;
+        let path = Gates::response_path(root, phase, stage);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let write_response = |approved, note: Option<&str>| {
+            std::fs::write(
+                &path,
+                serde_json::to_string(&GateResponse {
+                    approved,
+                    note: note.map(str::to_owned),
+                    responded_by: Some("test".into()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_response(true, None);
+        let non_abort =
+            stop_with_existing_response(root, phase, stage, lock::HolderStatus::Live { pid: 7 })
+                .unwrap();
+        assert_eq!(non_abort, (false, None));
+
+        write_response(false, Some("abort"));
+        let no_holder =
+            stop_with_existing_response(root, phase, stage, lock::HolderStatus::NoHolder).unwrap();
+        assert_eq!(no_holder, (false, None));
+
+        let live_abort =
+            stop_with_existing_response(root, phase, stage, lock::HolderStatus::Live { pid: 7 })
+                .unwrap();
+        assert!(matches!(
+            live_abort,
+            (
+                true,
+                Some((Stage::Code, lock::HolderStatus::Live { pid: 7 }))
+            )
+        ));
     }
 
     /// The doctor check's rendering maps the `pi list` capability probe onto a
@@ -5153,12 +5247,20 @@ mod tests {
     fn gate_sweep_emits_gate_reaped_event_on_reap() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(32), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(32), Stage::Ship, aged_past_threshold());
+        let phase = PhaseId::new(32);
+        let pid = std::process::id();
+        let start = agent::process_start_time(pid).unwrap();
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{}", phase.padded()));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
+        Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, phase, Stage::Ship, aged_past_threshold());
 
         gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
 
-        let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(32)).unwrap();
+        let event = devflow_core::events::last_event_for_phase(root, phase).unwrap();
         assert_eq!(event["event"], "gate_reaped");
         assert_eq!(event["stage"], "ship");
     }
