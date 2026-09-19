@@ -549,11 +549,16 @@ mod tests {
     #[test]
     fn dropping_guard_releases_lock() {
         let dir = tempfile::tempdir().unwrap();
+        let path = lock_path(dir.path(), PhaseId::new(1));
         {
             let _guard = acquire(dir.path(), PhaseId::new(1)).expect("acquire");
             assert!(holder(dir.path(), PhaseId::new(1)).is_some());
         }
         // After the guard drops the lock file is gone and re-acquiring works.
+        assert!(
+            !path.exists(),
+            "dropping the guard must remove the public lock path before another acquirer runs"
+        );
         assert!(holder(dir.path(), PhaseId::new(1)).is_none());
         let _again = acquire(dir.path(), PhaseId::new(1)).expect("re-acquire after release");
     }
