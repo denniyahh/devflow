@@ -1,0 +1,55 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-19T20:25:44.397Z",
+  "phase": "48",
+  "phase_name": "survivable-state-writes-and-honest-gate-recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": 17,
+  "task": 38,
+  "total_tasks": 38,
+  "status": "paused",
+  "handoff_to": "codex (operator request)",
+  "completed_tasks": [
+    {"id": "48-01..48-17", "name": "Phase 48 plan execution", "status": "done", "commit": "through 07396ec"},
+    {"id": "sec-choice", "name": "Operator security choice: verify all threats (option 1)", "status": "done", "commit": "9365602"},
+    {"id": "sec-audit-1", "name": "Security audit round 1 (3 split auditors, 49 threats): 45 closed, 2 blocking + 2 non-blocking open", "status": "done", "commit": "6942aca"},
+    {"id": "sec-fix-1", "name": "T-48-15-01 Code-stage guard; T-48-16-03/02 stop holder-status messaging", "status": "done", "commit": "76867df"},
+    {"id": "sec-fix-2", "name": "Round-2 gaps: Supervise Code path; Live-arm pid race", "status": "done", "commit": "25aa87c"},
+    {"id": "sec-fix-3", "name": "Class rule: record checkpoint approval only from Pending (operator option 1); fixes 25aa87c's T-48-07-02 regression and Auto truncation path", "status": "done", "commit": "d3beb19"},
+    {"id": "ext-review", "name": "Adversarial review of d3beb19 by codex + agy (operator-chosen lanes): Pending-only rule held; findings A-F", "status": "done", "commit": "4cdd72b"}
+  ],
+  "remaining_tasks": [
+    {"id": "finding-A", "name": "Obtain operator disposition for finding A (Supervise auto-decide of planner checkpoints = Phase 28 D-03 by design)", "status": "blocked_on_human"},
+    {"id": "fix-BCEF", "name": "TDD-fix findings B, C, E, F as one class: no recovery command states an outcome unless a confirmed live holder will act on it", "status": "not_started"},
+    {"id": "backlog-D", "name": "File finding D (auth gate auto-decided when blocking-human also declared) as a ROADMAP 999.x backlog entry", "status": "not_started"},
+    {"id": "audit-4", "name": "Re-run the round-4 security audit (gsd-security-auditor, State A) on d3beb19 + the B/C/E/F commit; T-48-15-01 and T-48-07-02 stay open until it passes", "status": "not_started"},
+    {"id": "ext-review-2", "name": "Focused codex + agy adversarial pass on the B/C/E/F diff (and A's, if amended)", "status": "not_started"},
+    {"id": "security-close", "name": "Update 48-SECURITY.md statuses; threats_open 0; status verified; sign-off", "status": "not_started"},
+    {"id": "tail-nyquist", "name": "Run /gsd-validate-phase 48 (48-VALIDATION.md is status: draft)", "status": "not_started"},
+    {"id": "tail-mempalace", "name": "Run the enabled MemPalace capture hook (onError: skip; record any skip)", "status": "not_started"},
+    {"id": "tail-goal-verification", "name": "Phase goal verification, then phase.complete and inspection of every STATE/ROADMAP/REQUIREMENTS surface", "status": "not_started"}
+  ],
+  "blockers": [
+    {"description": "Finding A needs an operator decision: it reverses Phase 28 D-03 (unconditional agent auto-decide, reversibility 'costly') if fixed. The operator chose 'fix A' before learning this; the question was re-opened and is unanswered.", "type": "human_action", "workaround": "None; do not infer. Options offered: backlog with D (recommended), amend D-03 for Supervise now, accept under D-03."},
+    {"description": "GSD #4799: sequential executors cannot commit in this linked phase worktree.", "type": "technical", "workaround": "Independently verify, then make normal hook-enabled commits from the orchestrator. Never --no-verify."}
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {"action": "Choose finding A's disposition: backlog with D / amend D-03 for Supervise now / accept under D-03", "context": "48-SECURITY.md 'Out-of-register findings'; 28-CONTEXT.md:50-64 (D-03); mode.rs Mode::Supervise = Validate gate to Hermes -> Human before Ship (Code stays headless)", "blocking": true}
+  ],
+  "decisions": [
+    {"decision": "Security gate: verify all 49 threats (option 1)", "rationale": "Operator choice; 38 threats had no summary disposition", "phase": "48"},
+    {"decision": "Fix blocking threats inline, test-first", "rationale": "Operator choice after round 1", "phase": "48"},
+    {"decision": "Checkpoint approval is recorded only from Pending (pre-agent set), at Code, in every mode; once Recorded only the re-scan gate widens it", "rationale": "Operator option 1 after three rounds of instance fixes; class-level rule", "phase": "48"},
+    {"decision": "Adversarial review lanes: codex + agy (not opencode)", "rationale": "Operator choice", "phase": "48"},
+    {"decision": "Fix B, C, E, F; backlog D", "rationale": "Operator choice (recommended); B/C/E/F are one honesty class; D predates Phase 48 and needs a product decision about auth gates", "phase": "48"},
+    {"decision": "Finding A: operator's 'fix A' is SUSPENDED pending a re-asked decision", "rationale": "Fix A reverses Phase 28 D-03, which the operator was not told when choosing", "phase": "48"},
+    {"decision": "stop with an unconfirmable holder after answering a gate currently exits 0 (orchestrator judgement in 76867df)", "rationale": "Both external lanes rejected it (finding B); operator decided to fix", "phase": "48"}
+  ],
+  "uncommitted_files": [
+    "?? .planning/research/.cache/",
+    "?? .planning/user/errors/"
+  ],
+  "next_action": "Read the phase .continue-here.md; ask the operator for finding A's disposition; then TDD-fix B/C/E/F as one class, re-run the round-4 security audit, and run a focused codex+agy pass before closing 48-SECURITY.md.",
+  "context_notes": "HEAD 4cdd72b. Source last changed in d3beb19; full suite at d3beb19: check.sh all OK, 1387 passed / 0 failed across 33 result lines (pinned container parity NOT run; nothing pushed). A RED test for finding A (supervise_mode_never_auto_decides_a_recorded_checkpoint, a Mode::Supervise copy of pipeline_launch::tests::unchanged_recorded_checkpoint_still_auto_decides, phase 101) was reverted from the tree and saved at /tmp/claude-1000/-var-home-denniyahh-Github-devflow--worktrees-phase-48/217c05ac-06db-485d-ae71-e2db225480c8/scratchpad/finding-A-supervise-test.patch; it failed with the 'no human operator is available' auto-decide event. Use it only if A is amended. The round-4 gsd-security-auditor died on an HTTP 429 session limit and produced no verdict; it is NOT a pass."
+}
