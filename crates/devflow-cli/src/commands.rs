@@ -4237,9 +4237,13 @@ mod tests {
             Stage::Code,
             lock::HolderStatus::Recycled { pid: 42 }
         ));
-        assert!(gate_sweep_may_reap(
+        assert!(!gate_sweep_may_reap(
             Stage::Ship,
             lock::HolderStatus::NoHolder
+        ));
+        assert!(!gate_sweep_may_reap(
+            Stage::Ship,
+            lock::HolderStatus::Unconfirmable { pid: 42 }
         ));
         assert!(gate_sweep_may_reap(
             Stage::Code,
@@ -4347,9 +4351,13 @@ mod tests {
             (lock::HolderStatus::NoHolder, "8"),
             (lock::HolderStatus::Recycled { pid: 7 }, "8"),
         ] {
-            let neutral = message(holder, contending_pid).unwrap();
+            let neutral = message(holder, contending_pid)
+                .expect_err("only the observed live holder can consume stop's rejection")
+                .to_string();
             assert!(
-                !neutral.contains(WAITING) && neutral.contains("not marked stopped"),
+                !neutral.contains(WAITING)
+                    && neutral.contains("not marked stopped")
+                    && neutral.contains("devflow resume --phase 4808"),
                 "{holder:?} with pid {contending_pid} blocking: {neutral}"
             );
         }
