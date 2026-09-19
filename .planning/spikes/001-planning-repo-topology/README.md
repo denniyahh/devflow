@@ -134,7 +134,7 @@ Variants within B to reason about:
 | Driving autonomous GSD runs | Works, except Ship would merge into the personal branch | **Best:** as A, plus Ship builds the PR branch to `develop` | Blocked: at least 4 DevFlow checks break; GSD executor worktrees with a nested repo unproven |
 | Finding and recovering failed runs | **Best:** one branch holds plan and code commits in order; one reset rolls both back | Same as A | **Worst:** two histories can disagree after a crash; rollback must reset both repos together |
 | Keeping planning/environment out of code | Rule-based, checked at push; planning branch is public (see below) | Same, unless the workspace branch pushes to a private remote | **Best:** structural; the spec repo can have a private remote |
-| Multiple agent types | Claude ✓; OpenCode ✓ via `CLAUDE.md` fallback; Codex ✗ (no `AGENTS.md`) | Same, plus the fix below | Depends on where agents start; parallel runs share one spec checkout |
+| Multiple agent types | Claude ✓; OpenCode ✓ via `CLAUDE.md` fallback; Codex gets global rules but not the repo's `CLAUDE.md` | Same, plus the fix below | Depends on where agents start; parallel runs share one spec checkout |
 
 **Leaning:** A′, plus two fixes that apply whichever layout is chosen. Revisit B only if structural
 separation from the public, or keeping tested commit hashes on `develop`, becomes the priority — and
@@ -151,9 +151,14 @@ only after the trial.
     `project_root_markers` and `project_doc_fallback_filenames`, neither set in `~/.codex/config.toml`.
   - OpenCode searches upward for `AGENTS.md`, then falls back to `CLAUDE.md`.
 
-  Only `CLAUDE.md` is tracked, so Codex gets no project instructions in a phase worktree today, under
-  any layout. Under B with agents starting inside the nested code repo, Codex would also miss the
-  spec repo's files.
+  Codex does load the operator's global rules everywhere: `~/.codex/AGENTS.md` is a symlink to
+  `~/.config/agents/AGENTS.md`. That file was consolidated on 2026-09-13, and the repo-level
+  `AGENTS.md` was deleted then as a graphify-only duplicate. What Codex misses is the repo's
+  `CLAUDE.md`: crate layout, canonical test commands, worktree rules and the dev-setup checklist
+  rule, none of which appear in the global file (checked 2026-09-18). That holds under any layout.
+  Under B with agents starting inside the nested code repo, Codex would also miss the spec repo's
+  files. *(Corrected 2026-09-18: this section first said Codex gets no project instructions at
+  all.)*
 - **Six drivers differ structurally.** Claude gets slash commands; Codex, OpenCode, Antigravity,
   Hermes and Pi read GSD workflow files from their own home-directory install (for example
   `$HOME/.codex/gsd-core/workflows`, `$HOME/.pi/agent/gsd-core/workflows`). Codex cannot run Define or
@@ -170,9 +175,10 @@ only after the trial.
 - **Run records are local in every layout.** `.devflow/` (state, events, gates, history) lives
   untracked in the main checkout, keyed by phase number.
 
-**Fixes that apply whichever layout is chosen:** make project instructions readable by every agent
-(track `AGENTS.md` beside `CLAUDE.md`, or set Codex's `project_doc_fallback_filenames`), and decide
-whether the planning branch should stay public.
+**Fixes that apply whichever layout is chosen:** make the repo's rules readable by every agent,
+for example by setting Codex's `project_doc_fallback_filenames = ["CLAUDE.md"]`, or by tracking a
+repo `AGENTS.md` that points at `CLAUDE.md` (not the graphify-only duplicate removed on 2026-09-13).
+Also decide whether the planning branch should stay public.
 
 **Not established:** where OpenCode's upward search stops; how Antigravity, Hermes and Pi find
 instruction files; whether GSD executor worktrees work under B; whether the 4 known DevFlow breakages
