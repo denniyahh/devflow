@@ -324,9 +324,62 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
             && stderr.contains(&format!("devflow resume --phase {phase}")),
         "stderr: {stderr}"
     );
+    assert!(
+        !Gates::response_path(root, phase, Stage::Code).exists(),
+        "an unconfirmable non-Ship holder must not receive a stale abort response"
+    );
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
     kill_and_reap(&mut holder);
+}
+
+/// Finding C-3: an old gate request is not evidence that the current live
+/// lock holder is polling it. `stop` must signal that holder instead of
+/// writing an abort response and reporting an unevidenced successful stop.
+#[test]
+fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(112);
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Code;
+    state.gate_pending = false;
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn live non-waiting holder");
+    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
+    write_live_lock(root, phase, &holder, start);
+    Gates::write_gate(root, phase, Stage::Code, "stale request").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "stale gate must fall through to live-holder stop\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let Some(status) = holder.try_wait().expect("poll holder") else {
+        kill_and_reap(&mut holder);
+        panic!("stop must signal the live holder instead of trusting the stale gate");
+    };
+    assert!(!status.success(), "SIGTERM must end the live holder");
+    assert!(
+        !Gates::response_path(root, phase, Stage::Code).exists(),
+        "a stale gate must not receive a response"
+    );
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .stopped,
+        "the actually stopped holder must allow state to be marked"
+    );
 }
 
 /// Finding E: persisting an answer is not evidence that a process will act on

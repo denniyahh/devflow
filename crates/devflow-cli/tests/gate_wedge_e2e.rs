@@ -210,8 +210,17 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     let root = dir.path();
     let phase = PhaseId::new(4818);
     let ship_phase = PhaseId::new(4819);
+    let live_ship_phase = PhaseId::new(4820);
     Gates::write_gate(root, phase, Stage::Code, "abandoned").unwrap();
     Gates::write_gate(root, ship_phase, Stage::Ship, "release").unwrap();
+    let pid = std::process::id();
+    let start = devflow_core::agent::process_start_time(pid).expect("test process start time");
+    let lock_path = root
+        .join(".devflow")
+        .join(format!("lock-{}", live_ship_phase.padded()));
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
+    Gates::write_gate(root, live_ship_phase, Stage::Ship, "live poller").unwrap();
 
     let output = Command::new(devflow_bin())
         .args([
@@ -248,8 +257,12 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
         "no-holder dry-run must not claim it would reap the Ship gate: {stdout}"
     );
     assert!(
-        stdout.contains("0 would be reaped"),
-        "summary must report no would-reap decision without a live holder: {stdout}"
+        stdout.contains(&format!("would reap phase {live_ship_phase} ship")),
+        "a live Ship holder must remain the positive would-reap control: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 would be reaped"),
+        "summary must count only the confirmed-live would-reap decision: {stdout}"
     );
     assert!(
         !Gates::response_path(root, phase, Stage::Code).exists(),
