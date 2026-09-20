@@ -1907,9 +1907,19 @@ fn stop_via_gate(
         return Ok((false, None));
     };
     let holder_before_reap = lock::holder_status(project_root, phase);
-    if gate.stage != Stage::Ship && !holder_before_reap.may_be_waiting() {
+    let gate_is_current = workflow::load_state(project_root, phase)
+        .is_ok_and(|state| state.gate_pending && state.stage == gate.stage);
+    if !gate_is_current {
         println!(
-            "stop: phase {phase} {} has no confirmed waiter; no response was written. {}",
+            "stop: phase {phase} {} has a stale gate request; no response was written. {}",
+            gate.stage,
+            no_waiter_repair(phase, gate.stage)
+        );
+        return Ok((false, None));
+    }
+    if gate.stage != Stage::Ship && !matches!(holder_before_reap, lock::HolderStatus::Live { .. }) {
+        println!(
+            "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
             no_waiter_repair(phase, gate.stage)
         );
@@ -2091,10 +2101,15 @@ fn persist_stopped_state(
     };
     let _phase_lock = match (_phase_lock, answered_gate) {
         (Ok(guard), _) => guard,
-        (Err(lock::LockError::Contended { pid, .. }), Some((stage, holder))) => {
+        (Err(lock::LockError::Contended { pid, .. }), Some((stage, _holder))) => {
             println!(
                 "{}",
-                answered_gate_contention_message(phase, stage, holder, &pid)?
+                answered_gate_contention_message(
+                    phase,
+                    stage,
+                    lock::holder_status(project_root, phase),
+                    &pid,
+                )?
             );
             return Ok(());
         }
@@ -4252,6 +4267,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4805);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_pending = true;
+        workflow::save_state(&state).unwrap();
         let pid = std::process::id();
         let start = agent::process_start_time(pid).unwrap();
         let path = root
@@ -4336,6 +4355,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4806);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.gate_pending = true;
+        workflow::save_state(&state).unwrap();
         let pid = std::process::id();
         let start = agent::process_start_time(pid).unwrap();
         let path = root
@@ -4361,6 +4384,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4807);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_pending = true;
+        workflow::save_state(&state).unwrap();
         let pid = std::process::id();
         let path = root
             .join(".devflow")
@@ -4369,9 +4396,8 @@ mod tests {
         std::fs::write(path, pid.to_string()).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         let error = stop(root, phase).unwrap_err().to_string();
-        assert!(Gates::response_path(root, phase, Stage::Code).exists());
-        assert!(error.contains("not marked stopped"), "{error}");
-        assert!(error.contains("devflow resume --phase 4807"), "{error}");
+        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(error.contains("refusing to signal"), "{error}");
         let message =
             response_pickup_message(Stage::Code, lock::HolderStatus::Unconfirmable { pid: 42 });
         assert!(message.contains("cannot be confirmed"));

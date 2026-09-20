@@ -256,7 +256,12 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_reports_state_not_marked() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(108);
-    let (state_path, before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let (state_path, _before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let mut state = devflow_core::workflow::load_state(root, phase).unwrap();
+    state.stage = Stage::Ship;
+    state.gate_pending = true;
+    devflow_core::workflow::save_state(&state).unwrap();
+    let before = std::fs::read(&state_path).unwrap();
     let wrong_start =
         devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
     write_live_lock(root, phase, &holder, wrong_start);
@@ -296,7 +301,12 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(109);
-    let (state_path, before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let (state_path, _before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let mut state = devflow_core::workflow::load_state(root, phase).unwrap();
+    state.stage = Stage::Code;
+    state.gate_pending = true;
+    devflow_core::workflow::save_state(&state).unwrap();
+    let before = std::fs::read(&state_path).unwrap();
     let lock = root
         .join(".devflow")
         .join(format!("lock-{}", phase.padded()));
@@ -319,9 +329,12 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
         "an unconfirmable holder must not be described as a waiter; stdout: {stdout}"
     );
     assert!(
-        stderr.contains("identity cannot be confirmed")
-            && stderr.contains("not marked stopped")
-            && stderr.contains(&format!("devflow resume --phase {phase}")),
+        stdout.contains("no confirmed live waiter")
+            && stdout.contains(&format!("devflow resume --phase {phase}")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("refusing to signal") && stderr.contains("no start time"),
         "stderr: {stderr}"
     );
     assert!(
@@ -556,7 +569,9 @@ fn stop_marks_state_stopped_and_records_reason() {
     let phase = PhaseId::new(96);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
-    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Ship;
+    state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
 
     let output = Command::new(devflow_bin())
@@ -677,7 +692,9 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
     let phase = PhaseId::new(99);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
-    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Ship;
+    state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
 
     let run_stop = || {

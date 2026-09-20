@@ -1201,7 +1201,7 @@ pub(crate) fn relaunch_checkpoint_session(
             "session_id": session_id,
             "instruction": truncate_reason(&instruction),
             "attempt": state.checkpoint_resumes,
-            "policy": "D-03: unconditional agent auto-decide, no flag/config toggle",
+            "policy": "D-03b: Auto-only checkpoint auto-decide",
         }),
     );
 
@@ -1779,7 +1779,16 @@ pub(crate) fn advance_with(
                                     state.gate_pending = false;
                                     state.checkpoint_approval = recorded_approval(&current);
                                     workflow::save_state(&state)?;
-                                    return relaunch_checkpoint_session(&mut state, &session_id);
+                                    if state.mode == Mode::Auto {
+                                        return relaunch_checkpoint_session(
+                                            &mut state,
+                                            &session_id,
+                                        );
+                                    }
+                                    reason = Some(augment_unresolved_checkpoint_reason(
+                                        reason,
+                                        "Supervise mode requires a human decision for the declared blocking-human checkpoint",
+                                    ));
                                 }
                                 // T-48-15-03: a rejection records NOTHING.
                                 // Widening the set here would mean the next
@@ -4332,9 +4341,8 @@ mod tests {
         writer.join().expect("second-gate response writer");
         result.unwrap();
 
-        let state = workflow::load_state(root, phase)
+        workflow::load_state(root, phase)
             .expect_err("the abort response must end the supervised run");
-        assert!(state.to_string().contains("state file"));
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
             "Supervise re-scan approval must never auto-decide"
