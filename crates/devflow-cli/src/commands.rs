@@ -1855,6 +1855,8 @@ fn reap_stray_candidates(
         .collect()
 }
 
+type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
+
 /// End a running phase cleanly (23c) — the missing primitive
 /// `23-ORPHAN-FORENSICS.md` names as the reason 54 processes accumulated
 /// with no remedy but `kill(1)`. Answers `phase`'s open gate if it has one —
@@ -1873,7 +1875,10 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
     } else {
         stop_via_lock(project_root, phase)?
     };
-    if matches!(gate_holder, Some((_, lock::HolderStatus::Recycled { .. }))) {
+    if matches!(
+        gate_holder,
+        Some((_, lock::HolderStatus::Recycled { .. }, _))
+    ) {
         println!("stop: phase {phase}'s lock holder was recycled; treating it as no waiter");
     }
     persist_stopped_state(
@@ -1899,7 +1904,7 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
 fn stop_via_gate(
     project_root: &Path,
     phase: PhaseId,
-) -> Result<(bool, Option<(Stage, lock::HolderStatus)>), CliError> {
+) -> Result<(bool, Option<AnsweredGate>), CliError> {
     let Some(gate) = Gates::list_open(project_root)
         .into_iter()
         .find(|g| g.phase == phase)
@@ -1907,6 +1912,7 @@ fn stop_via_gate(
         return Ok((false, None));
     };
     let holder_before_reap = lock::holder_status(project_root, phase);
+    let holder_identity_before_reap = lock::holder_identity(project_root, phase);
     let gate_is_current = workflow::load_state(project_root, phase)
         .is_ok_and(|state| state.gate_pending && state.stage == gate.stage);
     if !gate_is_current {
@@ -1923,7 +1929,10 @@ fn stop_via_gate(
             gate.stage,
             no_waiter_repair(phase, gate.stage)
         );
-        return Ok((false, Some((gate.stage, holder_before_reap))));
+        return Ok((
+            false,
+            Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
+        ));
     }
     match Gates::reap(
         project_root,
@@ -1939,17 +1948,27 @@ fn stop_via_gate(
                 path.display(),
                 response_pickup_message(gate.stage, lock::holder_status(project_root, phase))
             );
-            Ok((true, Some((gate.stage, holder_before_reap))))
+            Ok((
+                true,
+                Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
+            ))
         }
         // A human, `--yes-ship`, or `devflow gate sweep` answered this gate
         // between our scan and this reap. Read its action: an approval or
         // loop-back is not `stop`'s outcome and must fall through to the
         // lock path; only an abort response can be treated as the requested
         // stop action, and only with a still-live holder.
-        Err(GateError::AlreadyResponded { .. }) => {
-            stop_with_existing_response(project_root, phase, gate.stage, holder_before_reap)
-        }
-        Err(GateError::NoOpenGate { .. }) => Ok((false, Some((gate.stage, holder_before_reap)))),
+        Err(GateError::AlreadyResponded { .. }) => stop_with_existing_response(
+            project_root,
+            phase,
+            gate.stage,
+            holder_before_reap,
+            holder_identity_before_reap,
+        ),
+        Err(GateError::NoOpenGate { .. }) => Ok((
+            false,
+            Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
+        )),
         Err(err) => Err(err.into()),
     }
 }
@@ -1963,7 +1982,8 @@ fn stop_with_existing_response(
     phase: PhaseId,
     stage: Stage,
     holder_before_reap: lock::HolderStatus,
-) -> Result<(bool, Option<(Stage, lock::HolderStatus)>), CliError> {
+    holder_identity_before_reap: Option<(u32, Option<u64>)>,
+) -> Result<(bool, Option<AnsweredGate>), CliError> {
     let response_path = Gates::response_path(project_root, phase, stage);
     let response_text = std::fs::read_to_string(&response_path).map_err(|err| {
         CliError::Message(format!(
@@ -1982,7 +2002,10 @@ fn stop_with_existing_response(
             println!(
                 "stop: phase {phase} {stage} already has an abort response awaiting a live lock holder; stop did not write it"
             );
-            Ok((true, Some((stage, holder_before_reap))))
+            Ok((
+                true,
+                Some((stage, holder_before_reap, holder_identity_before_reap)),
+            ))
         }
         GateAction::Abort(_) => {
             println!(
@@ -2091,7 +2114,7 @@ fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> 
 fn persist_stopped_state(
     project_root: &Path,
     phase: PhaseId,
-    answered_gate: Option<(Stage, lock::HolderStatus)>,
+    answered_gate: Option<AnsweredGate>,
     signal_sent: bool,
 ) -> Result<(), CliError> {
     let _phase_lock = if signal_sent {
@@ -2101,13 +2124,16 @@ fn persist_stopped_state(
     };
     let _phase_lock = match (_phase_lock, answered_gate) {
         (Ok(guard), _) => guard,
-        (Err(lock::LockError::Contended { pid, .. }), Some((stage, _holder))) => {
+        (Err(lock::LockError::Contended { pid, .. }), Some((stage, holder, identity))) => {
             println!(
                 "{}",
                 answered_gate_contention_message(
                     phase,
                     stage,
+                    holder,
+                    identity,
                     lock::holder_status(project_root, phase),
+                    lock::holder_identity(project_root, phase),
                     &pid,
                 )?
             );
@@ -2149,15 +2175,37 @@ fn persist_stopped_state(
 fn answered_gate_contention_message(
     phase: PhaseId,
     stage: Stage,
-    holder: lock::HolderStatus,
+    observed_holder: lock::HolderStatus,
+    observed_identity: Option<(u32, Option<u64>)>,
+    current_holder: lock::HolderStatus,
+    current_identity: Option<(u32, Option<u64>)>,
     contending_pid: &str,
 ) -> Result<String, CliError> {
-    match holder {
-        lock::HolderStatus::Live { pid } if pid.to_string() == contending_pid => Ok(format!(
-            "stop: phase {phase}'s lock holder (pid {contending_pid}) is waiting on the gate \
-             and will clear phase state as it aborts"
-        )),
-        lock::HolderStatus::Recycled { pid } if pid.to_string() == contending_pid => {
+    match (
+        observed_holder,
+        observed_identity,
+        current_holder,
+        current_identity,
+    ) {
+        (
+            lock::HolderStatus::Live { pid: observed_pid },
+            Some((observed_identity_pid, Some(observed_start))),
+            lock::HolderStatus::Live { pid: current_pid },
+            Some((current_identity_pid, Some(current_start))),
+        ) if observed_pid == observed_identity_pid
+            && observed_pid == current_pid
+            && observed_pid == current_identity_pid
+            && observed_start == current_start
+            && current_pid.to_string() == contending_pid =>
+        {
+            Ok(format!(
+                "stop: phase {phase}'s lock holder (pid {contending_pid}) is waiting on the gate \
+                 and will clear phase state as it aborts"
+            ))
+        }
+        (_, _, lock::HolderStatus::Recycled { pid }, Some((current_pid, _)))
+            if pid == current_pid && pid.to_string() == contending_pid =>
+        {
             Err(CliError::Message(format!(
                 "stop: nothing is waiting on phase {phase}'s {stage} gate — pid {pid} is not its \
                  lock holder; phase state was not marked stopped. {}",
@@ -4412,35 +4460,91 @@ mod tests {
     fn answered_gate_contention_claims_a_waiter_only_for_the_observed_live_holder() {
         const WAITING: &str = "is waiting on the gate";
         let phase = PhaseId::new(4808);
-        let message = |holder, contending_pid| {
-            answered_gate_contention_message(phase, Stage::Code, holder, contending_pid)
+        let message = |observed_holder,
+                       observed_identity,
+                       current_holder,
+                       current_identity,
+                       contending_pid| {
+            answered_gate_contention_message(
+                phase,
+                Stage::Code,
+                observed_holder,
+                observed_identity,
+                current_holder,
+                current_identity,
+                contending_pid,
+            )
         };
 
-        // Opposite-result case: the observed live holder still holds the lock.
-        let same = message(lock::HolderStatus::Live { pid: 7 }, "7").unwrap();
+        // Opposite-result control: exactly the observed live holder, including
+        // its recorded start time, still holds the lock.
+        let same = message(
+            lock::HolderStatus::Live { pid: 7 },
+            Some((7, Some(700))),
+            lock::HolderStatus::Live { pid: 7 },
+            Some((7, Some(700))),
+            "7",
+        )
+        .unwrap();
         assert!(same.contains(WAITING), "{same}");
 
-        for (holder, contending_pid) in [
-            (lock::HolderStatus::Live { pid: 7 }, "8"),
-            (lock::HolderStatus::Unconfirmable { pid: 7 }, "7"),
-            (lock::HolderStatus::NoHolder, "8"),
-            (lock::HolderStatus::Recycled { pid: 7 }, "8"),
+        for (
+            observed_holder,
+            observed_identity,
+            current_holder,
+            current_identity,
+            contending_pid,
+        ) in [
+            // The regression: the original waiter exited and a queued
+            // `advance` acquired the lock. A fresh read alone makes this look
+            // like a valid waiter unless its identity is compared with what
+            // `stop_via_gate` observed before writing the abort response.
+            (
+                lock::HolderStatus::Live { pid: 7 },
+                Some((7, Some(700))),
+                lock::HolderStatus::Live { pid: 8 },
+                Some((8, Some(800))),
+                "8",
+            ),
+            (
+                lock::HolderStatus::Unconfirmable { pid: 7 },
+                Some((7, None)),
+                lock::HolderStatus::Live { pid: 7 },
+                Some((7, Some(700))),
+                "7",
+            ),
+            (
+                lock::HolderStatus::NoHolder,
+                None,
+                lock::HolderStatus::Live { pid: 8 },
+                Some((8, Some(800))),
+                "8",
+            ),
         ] {
-            let neutral = message(holder, contending_pid)
-                .expect_err("only the observed live holder can consume stop's rejection")
-                .to_string();
+            let neutral = message(
+                observed_holder,
+                observed_identity,
+                current_holder,
+                current_identity,
+                contending_pid,
+            )
+            .expect_err("only the observed live holder can consume stop's rejection")
+            .to_string();
             assert!(
                 !neutral.contains(WAITING)
                     && neutral.contains("not marked stopped")
                     && neutral.contains("devflow resume --phase 4808"),
-                "{holder:?} with pid {contending_pid} blocking: {neutral}"
+                "{observed_holder:?} with pid {contending_pid} blocking: {neutral}"
             );
         }
 
         let recycled = answered_gate_contention_message(
             phase,
             Stage::Ship,
+            lock::HolderStatus::Live { pid: 7 },
+            Some((7, Some(700))),
             lock::HolderStatus::Recycled { pid: 7 },
+            Some((7, Some(701))),
             "7",
         )
         .unwrap_err()
@@ -4475,24 +4579,35 @@ mod tests {
         };
 
         write_response(true, None);
-        let non_abort =
-            stop_with_existing_response(root, phase, stage, lock::HolderStatus::Live { pid: 7 })
-                .unwrap();
+        let non_abort = stop_with_existing_response(
+            root,
+            phase,
+            stage,
+            lock::HolderStatus::Live { pid: 7 },
+            None,
+        )
+        .unwrap();
         assert_eq!(non_abort, (false, None));
 
         write_response(false, Some("abort"));
         let no_holder =
-            stop_with_existing_response(root, phase, stage, lock::HolderStatus::NoHolder).unwrap();
+            stop_with_existing_response(root, phase, stage, lock::HolderStatus::NoHolder, None)
+                .unwrap();
         assert_eq!(no_holder, (false, None));
 
-        let live_abort =
-            stop_with_existing_response(root, phase, stage, lock::HolderStatus::Live { pid: 7 })
-                .unwrap();
+        let live_abort = stop_with_existing_response(
+            root,
+            phase,
+            stage,
+            lock::HolderStatus::Live { pid: 7 },
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             live_abort,
             (
                 true,
-                Some((Stage::Code, lock::HolderStatus::Live { pid: 7 }))
+                Some((Stage::Code, lock::HolderStatus::Live { pid: 7 }, None))
             )
         ));
     }
