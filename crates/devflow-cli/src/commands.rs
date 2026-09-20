@@ -7334,18 +7334,26 @@ mod tests {
         /// runs.
         #[test]
         fn doctor_finds_a_real_stray_and_never_signals_it_across_two_runs() {
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("monitor-wrapper-block");
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("create private monitor-wrapper FIFO");
+            assert!(status.success(), "mkfifo must create the fixture FIFO");
+
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
-                // Two full doctor inventories probe several external CLIs;
-                // the fixture is killed explicitly below, so its lifetime
-                // must exceed their loaded-wall-clock duration rather than
-                // turning a slow probe into a false "doctor signalled it".
-                .arg("trap cleanup TERM INT; sleep 120")
+                // Keep the wrapper-shaped shell blocked in its own builtin:
+                // no `sleep` child exists to outlive `child.kill()` if an
+                // assertion panics. `$1` is supplied as a distinct argv
+                // element, never interpolated into shell source.
+                .arg("trap cleanup TERM INT; read _ < \"$1\"")
+                .arg("sh")
+                .arg(&fifo)
                 .spawn()
                 .expect("spawn monitor-wrapper-shaped fixture");
             let pid = child.id();
-
-            let dir = tempfile::tempdir().unwrap();
 
             // 999.47: cross the exec-visibility barrier before either census
             // read below, or both races the fixture's own fork()->execve()

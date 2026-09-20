@@ -252,7 +252,7 @@ fn gated_phase_with_foreign_holder(
 /// abort response for an unrelated live process would permanently poison the
 /// gate for the real recovery path.
 #[test]
-fn stop_at_a_ship_gate_with_a_recycled_holder_reports_state_not_marked() {
+fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(108);
