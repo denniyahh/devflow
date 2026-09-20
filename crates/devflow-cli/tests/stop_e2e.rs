@@ -247,10 +247,10 @@ fn gated_phase_with_foreign_holder(
     (state_path, before, holder)
 }
 
-/// T-48-16-03 (security audit, 2026-09-19): a lock naming a recycled pid has
-/// no waiter. At a Ship gate `stop` still writes the answer (D-05), but the
-/// unrelated process will never clear phase state, so `stop` must not claim
-/// it will — it must report the state as not marked and name `devflow ship`.
+/// T-48-16-03: a lock naming a recycled pid has no waiter. Ship's manual
+/// recovery exception applies only when there is no holder at all; writing an
+/// abort response for an unrelated live process would permanently poison the
+/// gate for the real recovery path.
 #[test]
 fn stop_at_a_ship_gate_with_a_recycled_holder_reports_state_not_marked() {
     let dir = tempfile::tempdir().unwrap();
@@ -282,12 +282,14 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_reports_state_not_marked() {
         !stdout.contains("is waiting on the gate") && !stderr.contains("is waiting on the gate"),
         "a recycled pid must never be described as a waiter; stdout: {stdout}"
     );
-    assert!(stderr.contains("not marked stopped"), "stderr: {stderr}");
     assert!(
-        stderr.contains(&format!("devflow ship --phase {phase}")),
+        stderr.contains("refusing to signal") && stderr.contains("recycled"),
         "stderr: {stderr}"
     );
-    assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+    assert!(
+        !Gates::response_path(root, phase, Stage::Ship).exists(),
+        "a recycled Ship holder must not receive an unconsumable abort response"
+    );
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
     kill_and_reap(&mut holder);
