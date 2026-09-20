@@ -1124,7 +1124,9 @@ fn rescan_gate_context(unapproved: &[&CheckpointDeclaration], mode: Mode) -> Str
     plan_files.sort_unstable();
     plan_files.dedup();
     let next_step = match mode {
-        Mode::Auto => "approve, park for supervised repair, or abort",
+        Mode::Auto => {
+            "approve, or switch this phase to Supervise for its remaining stages to repair, or abort"
+        }
         Mode::Supervise => {
             "approve then make a separate human Code decision, repair under Supervise, or abort"
         }
@@ -1153,7 +1155,8 @@ fn park_auto_rescan_repair(
     state.stopped = true;
     state.gate_pending = false;
     let reason = format!(
-        "checkpoint re-scan rejected in Auto mode; parked for supervised repair of {}",
+        "checkpoint re-scan rejected in Auto mode; phase switched to Supervise for its remaining \
+         stages and parked for repair of {}",
         unapproved_files.join(", ")
     );
     state.stop_reason = Some(match state.stop_reason.take() {
@@ -1174,8 +1177,8 @@ fn park_auto_rescan_repair(
         }),
     );
     println!(
-        "checkpoint re-scan rejected in Auto mode; phase {} is parked for supervised repair. \
-         Review the changed plan, then run `devflow resume --phase {}`.",
+        "checkpoint re-scan rejected in Auto mode; phase {} is now Supervise for its remaining \
+         stages and parked for repair. Review the changed plan, then run `devflow resume --phase {}`.",
         state.phase, state.phase
     );
     Ok(())
@@ -4377,27 +4380,24 @@ mod tests {
                 .expect("child test must receive its parent-built fixture root"),
         );
         let root = root.as_path();
-        let response_path = Gates::response_path(root, phase, Stage::Code);
         let expected_approval = recorded_from_body(phase, &rescan_plan_body_rewritten());
         write_gate_response(root, phase, Stage::Code, true, None);
 
         let writer_root = root.to_path_buf();
         let writer = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while response_path.exists() {
+            loop {
+                if workflow::load_state(&writer_root, phase)
+                    .is_ok_and(|state| state.checkpoint_approval == expected_approval)
+                {
+                    break;
+                }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the re-scan response was not consumed"
+                    "approval was not persisted before the human Code gate"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            assert_eq!(
-                workflow::load_state(&writer_root, phase)
-                    .expect("approval must be persisted before the human Code gate")
-                    .checkpoint_approval,
-                expected_approval,
-                "Supervise approval must durably record the declaration before the next gate"
-            );
             write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
         });
 
@@ -4421,9 +4421,9 @@ mod tests {
     /// An Auto-mode rejection cannot reuse the ordinary failure loop-back: the
     /// next unattended Code preflight correctly refuses the still-unapproved
     /// human-only checkpoint. Park the phase in Supervise before cleaning the
-    /// response, so the writer below is a negative control: it only supplies
-    /// an abort for the pre-fix third-gate path and must stay inert after the
-    /// supervised-repair handoff is durable.
+    /// response. The bounded writer feeds an abort only if the pre-fix third
+    /// gate appears; its marker and the exact one-gate assertion below make
+    /// both directions observable rather than treating a short run as proof.
     #[test]
     fn auto_rescan_rejection_parks_for_supervised_repair() {
         const NAME: &str =
@@ -4470,6 +4470,10 @@ mod tests {
 
         let writer_root = root.to_path_buf();
         let writer_response_path = response_path.clone();
+        let third_gate_response_written =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_third_gate_response_written =
+            std::sync::Arc::clone(&third_gate_response_written);
         let writer = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             loop {
@@ -4479,6 +4483,8 @@ mod tests {
                 }
                 if !writer_response_path.exists() {
                     write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
+                    writer_third_gate_response_written
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
                 assert!(
@@ -4500,13 +4506,26 @@ mod tests {
             after
                 .stop_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("checkpoint re-scan rejected")),
+                .is_some_and(|reason| reason.contains("switched to Supervise")),
             "the parked reason must explain why Auto did not retry: {:?}",
             after.stop_reason
         );
         assert_eq!(
             after.checkpoint_approval, before,
             "a rejection must not bless the changed declaration"
+        );
+        let parked_code_gates = events_of_kind(root, "gate_fired")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .count();
+        assert_eq!(
+            parked_code_gates, 1,
+            "only the re-scan gate may fire before supervised resume; a second gate is the \
+             pre-fix unattended loopback, not a successful park"
+        );
+        assert!(
+            !third_gate_response_written.load(std::sync::atomic::Ordering::SeqCst),
+            "the negative-control writer must stay inert unless the old third gate appears"
         );
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
@@ -4526,6 +4545,10 @@ mod tests {
             .expect("Supervise resume must leave a live state for its monitor");
         let _reap_guard = ReapMonitorOnDrop::after_launch(&resumed);
         assert_eq!(resumed.mode, Mode::Supervise);
+        assert_eq!(
+            resumed.checkpoint_approval, before,
+            "a supervised repair launch must not reinterpret the rejected declaration as approved"
+        );
         assert!(
             !resumed.stopped,
             "resume clears the park only after launching the supervised continuation"
