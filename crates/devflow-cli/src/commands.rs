@@ -1923,7 +1923,9 @@ fn stop_via_gate(
         );
         return Ok((false, None));
     }
-    if gate.stage != Stage::Ship && !matches!(holder_before_reap, lock::HolderStatus::Live { .. }) {
+    let ship_without_holder =
+        gate.stage == Stage::Ship && matches!(holder_before_reap, lock::HolderStatus::NoHolder);
+    if !matches!(holder_before_reap, lock::HolderStatus::Live { .. }) && !ship_without_holder {
         println!(
             "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
@@ -4415,15 +4417,50 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
         Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        // T-48-16-03: the recycled pid still blocks the lock, so phase state
-        // is not marked — and `stop` must say so rather than claim a waiter.
+        // A recycled pid is an unrelated process, not Ship's manual-recovery
+        // no-holder case. `stop` must not leave it an abort response that no
+        // legitimate waiter can consume.
         let err = stop(root, phase).unwrap_err().to_string();
-        assert!(err.contains("not marked stopped"), "{err}");
-        assert!(err.contains("devflow ship --phase 4806"), "{err}");
-        assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(
+            err.contains("refusing to signal") && err.contains("recycled"),
+            "{err}"
+        );
+        assert!(
+            !Gates::response_path(root, phase, Stage::Ship).exists(),
+            "a recycled holder must not receive an unconsumable Ship abort response"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().gate_pending,
+            "without a confirmed waiter, stop must leave the live phase state untouched"
+        );
         assert!(
             response_pickup_message(Stage::Ship, lock::HolderStatus::Recycled { pid: 42 })
                 .contains("no confirmed waiter")
+        );
+    }
+
+    /// The Ship exception is intentionally narrow: no holder permits a stored
+    /// response for manual recovery, but a recycled live PID does not.
+    #[test]
+    fn stop_at_a_ship_gate_without_a_holder_keeps_manual_recovery_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4810);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.gate_pending = true;
+        workflow::save_state(&state).unwrap();
+        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
+
+        stop(root, phase).expect("Ship with no holder may retain its abort response");
+
+        assert!(
+            Gates::response_path(root, phase, Stage::Ship).exists(),
+            "the manual-recovery Ship exception must remain available"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().stopped,
+            "the stop request itself is still recorded"
         );
     }
 
@@ -7299,7 +7336,11 @@ mod tests {
         fn doctor_finds_a_real_stray_and_never_signals_it_across_two_runs() {
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
-                .arg("trap cleanup TERM INT; sleep 30")
+                // Two full doctor inventories probe several external CLIs;
+                // the fixture is killed explicitly below, so its lifetime
+                // must exceed their loaded-wall-clock duration rather than
+                // turning a slow probe into a false "doctor signalled it".
+                .arg("trap cleanup TERM INT; sleep 120")
                 .spawn()
                 .expect("spawn monitor-wrapper-shaped fixture");
             let pid = child.id();
