@@ -240,12 +240,16 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
         "no-waiter dry-run must not claim it would reap the Code gate: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("would reap phase {ship_phase} ship")),
-        "Ship remains the positive would-reap control: {stdout}"
+        stdout.contains(&format!("left phase {ship_phase} ship alone")),
+        "no-holder Ship gate must also be left alone: {stdout}"
     );
     assert!(
-        stdout.contains("1 would be reaped"),
-        "summary must count only the Ship would-reap decision: {stdout}"
+        !stdout.contains(&format!("would reap phase {ship_phase} ship")),
+        "no-holder dry-run must not claim it would reap the Ship gate: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 would be reaped"),
+        "summary must report no would-reap decision without a live holder: {stdout}"
     );
     assert!(
         !Gates::response_path(root, phase, Stage::Code).exists(),
