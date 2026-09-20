@@ -1,9 +1,9 @@
 ---
 phase: "48"
 slug: "survivable-state-writes-and-honest-gate-recovery"
-status: draft
+status: verified
 # threats_open = count of OPEN threats at or above workflow.security_block_on severity (the blocking gate)
-threats_open: 2
+threats_open: 0
 asvs_level: 1
 created: "2026-09-19"
 ---
@@ -37,8 +37,8 @@ created: "2026-09-19"
 
 ## Threat Register
 
-Register authored at plan time: 49 threats across the 17 `<threat_model>` blocks. Evidence line
-references are to `9365602` (the audited HEAD; source unchanged since `3c90755`).
+Register authored at plan time: 49 threats across the 17 `<threat_model>` blocks. Historical evidence
+retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 formal re-audit.
 
 | Threat ID | Category | Component | Severity | Disposition | Mitigation | Status |
 |-----------|----------|-----------|----------|-------------|------------|--------|
@@ -57,7 +57,7 @@ references are to `9365602` (the audited HEAD; source unchanged since `3c90755`)
 | T-48-06-01 | Elevation of Privilege | abort-fixture tests (999.80) | medium | mitigate | Child with agent-free PATH; helper child-mode assertion — **Evidence:** preflight.rs:1468-1480, pipeline_gate.rs:713-725 (`enter_path_isolated_child!`); staleness.rs:1192-1198 | closed |
 | T-48-06-02 | Denial of Service | vacuous child | medium | mitigate | Guards; test counts ≥ base — **Evidence:** guard inside both macros and staleness.rs:1198; `#[test]` counts at or above base | closed |
 | T-48-07-01 | Elevation of Privilege | agent adds a checkpoint to self-route into auto-decide | high | mitigate | Fresh-scan compare against the recorded set; new or changed parks at a human gate (Tasks 1-2) — **Evidence:** pipeline_launch.rs:1741-1762 (fresh scan → unapproved → gate); tests :3925, :4462, control :4582; state.rs:767 | closed |
-| T-48-07-02 | Elevation of Privilege | loop-back Code evaluation silently widens the set | high | mitigate | Record only from `Pending`; `Unrecorded` never recorded by an evaluation (Task 3 test) — **Evidence:** closed in round 1; **regressed by 25aa87c** (Supervise refusal approval left `Pending`, so the next passing Code evaluation recorded agent-written checkpoints — found in round 3). Fix d3beb19; test preflight.rs:2916 — **under round-4 re-audit and external review** | open |
+| T-48-07-02 | Elevation of Privilege | loop-back Code evaluation silently widens the set | high | mitigate | Record only from `Pending`; `Unrecorded` is never promoted by later Code evaluation. The only production recorder sites are Code preflight paths, and the Supervise-refusal regression test adds an agent declaration after approval and leaves it unapproved — **Evidence:** formal GSD re-audit 2026-09-20, `preflight.rs` Pending-only recorder and Code-stage callers | closed |
 | T-48-07-03 | Tampering | old state file loads with a permissive default | medium | mitigate | serde default is `Unrecorded`, which gates — **Evidence:** state.rs:427-428 (`serde(default)`), :456 (`Unrecorded` default), :487; tests state.rs:703, pipeline_launch.rs:4499 | closed |
 | T-48-07-04 | Denial of Service | re-scan gate fires on every resume after approval | low | mitigate | Approval records the set (R-8 test) — **Evidence:** pipeline_launch.rs:1771-1780 (48-15 records on Advance before relaunch); test :4170, control :4260 | closed |
 | T-48-08-01 | Elevation of Privilege | fixture reworded or parser changed → LoopBack → real `claude` spawn | medium | mitigate | Child with agent-free PATH; helpers panic outside a child; should-panic control — **Evidence:** devflow-core test_support.rs:154-172; first-statement asserts pipeline_outcomes.rs:1443/4660/4706; `should_panic` :1651-1659 | closed |
@@ -83,12 +83,12 @@ references are to `9365602` (the audited HEAD; source unchanged since `3c90755`)
 | T-48-14-01 | Denial of Service | cleanup strands a live waiter until its timeout | high | mitigate | CX-1 / PI-S2 acquisition guard holds the phase lock across cleanup; contended-lock controls prove state and gates are untouched — **Evidence:** recover.rs:137-145, :155-168 (lock before cleanup); recover.rs:570-637; gate_wedge_e2e.rs:123-167 | closed |
 | T-48-14-02 | Repudiation | doctor prescribes a repair that does nothing | medium | mitigate | Shared `no_waiter_repair`; orphan-gate check yields to the new finding — **Evidence:** commands.rs:3353-3367 (`no_waiter_repair`), :3371-3374; tests commands.rs:6367-6459 | closed |
 | T-48-14-03 | Tampering | doctor mutates state | low | mitigate | PI-1 read-only holder status plus report-only unchanged (T-18-02) — **Evidence:** commands.rs:3526 (read-only `holder_status`); test commands.rs:6804 | closed |
-| T-48-15-01 | Elevation of Privilege | re-scan approval | high | mitigate | Record fresh declarations only on Advance before relaunch — **Evidence:** open after rounds 1-3 (any-stage recording; Supervise Code; Auto 300-char truncation of the checkpoint reason). Class fix d3beb19: the recorder fills only `Pending` (preflight.rs:1315), called at Code in every mode (:1432); tests preflight.rs:2868/2883/2899 — **under round-4 re-audit and external review** | open |
+| T-48-15-01 | Elevation of Privilege | re-scan approval | high | mitigate | Only re-scan `Advance` records the freshly scanned declaration set; `LoopBack` preserves the prior set. A rejected Auto re-scan parks for Supervise repair without auto-deciding, and the resumed phase retains the rejection's prior approval set — **Evidence:** formal GSD re-audit 2026-09-20, `pipeline_launch.rs` re-scan action handling and Auto-park regression test | closed |
 | T-48-15-02 | Tampering | Code preflight records from project root | high | mitigate | Worktree fixture proves recording and comparison use the same execution root — **Evidence:** preflight.rs:1311-1321 (execution root) matches pipeline_launch.rs:1717/1741; decoy-root tests preflight.rs:2582, :2684 | closed |
 | T-48-15-03 | Repudiation | LoopBack silently accepts changed plans | medium | mitigate | LoopBack keeps approval unchanged and names unapproved plan files — **Evidence:** pipeline_launch.rs:1795-1803; preflight.rs:1422-1427; tests pipeline_launch.rs:4275-4393 | closed |
 | T-48-16-01 | Tampering | stale response decides a later non-Ship gate | high | mitigate | NoHolder and Recycled write no response — **Evidence:** commands.rs:1414-1420, 1548-1559 + 1728-1730, 1903-1911 (status checked before writing); tests commands.rs:4157/4184/4225; gate_wedge_e2e.rs:94-110 | closed |
-| T-48-16-02 | Repudiation | command claims a waiter without evidence | medium | mitigate | HolderStatus matrix and post-publish Live recheck — **Evidence:** fixed 76867df + 25aa87c, closed by audit round 3: waiter claimed only when the observed `Live` pid is the one blocking the lock, commands.rs:2095; every other arm neutral; unit commands.rs:4333 covers every holder arm, e2e stop_e2e.rs:295 | closed |
-| T-48-16-03 | Spoofing | recycled pid treated as a waiter | high | mitigate | Recycled handling stays no-waiter in every response path — **Evidence:** fixed 76867df, closed by audit round 2: `answered_gate_contention_message` commands.rs:2099 (a recycled pid still blocking the lock → error, "not marked stopped", D-05 repair line); e2e stop_e2e.rs:255, unit commands.rs:4284 (line refs at d3beb19) | closed |
+| T-48-16-02 | Repudiation | command claims a waiter without evidence | medium | mitigate | A waiter claim now requires the observed and current lock records to have the same live `(pid, start-time)` identity; a successor holder fails closed — **Evidence:** commands.rs `answered_gate_contention_message` and its same-identity/successor negative-control matrix, refreshed 2026-09-20 | closed |
+| T-48-16-03 | Spoofing | recycled pid treated as a waiter | high | mitigate | Recycled holders receive no response at every gate, including Ship; Ship's stored-response exception is limited to `NoHolder` — **Evidence:** commands.rs Ship recycled/no-holder counterpart tests, refreshed 2026-09-20 | closed |
 | T-48-17-01 | Tampering | stale test guidance | low | mitigate | Documentation uses the helper and lint names verified by Task 1 — **Evidence:** .planning/codebase/TESTING.md:69, :84, :91; named helpers exist; clippy.toml `disallowed-methods` | closed |
 | T-48-17-02 | Repudiation | timing result presented as reliability proof | low | mitigate | SUMMARY records one-run and concurrent-load limits — **Evidence:** 48-17-SUMMARY.md:131-133 (Evidence Limits — the SUMMARY is the mitigation) | closed |
 
@@ -122,6 +122,7 @@ located. No open threat has been accepted at audit time.
 | 2026-09-19 (round 3, 25aa87c) | 7 re-checked | 5 | 2 (T-48-15-01 high — Auto truncation path; T-48-07-02 high — regressed by 25aa87c) | gsd-security-auditor (State A re-audit) |
 | 2026-09-19 (round 4, d3beb19) | — | — | — | gsd-security-auditor **DID NOT RUN** — terminated by a session rate limit (HTTP 429) before any verdict; must be re-run |
 | 2026-09-19 (external, d3beb19) | rule + diff | — | 6 out-of-register findings (A–F below) | codex (gpt-5.6-terra, high) + agy (gemini-3.8-flash-high) on a `git archive` snapshot; both completed (~8 min); snapshot unmodified (139/139 hashes) |
+| 2026-09-20 (round 5, 3aca386) | 2 re-checked | 2 | 0 blocking (1 medium threat remains non-blocking) | gsd-security-auditor, State A, ASVS L1; operator selected Verify all open threats |
 
 ### Audit 2026-09-19 — notes
 
@@ -149,30 +150,30 @@ located. No open threat has been accepted at audit time.
   could not: codex traced fresh/retry launches through `run_preflight` and found only the recorder and
   the re-scan gate as writers; agy traced every Code entry point (`start`, `transition`, loop-back,
   `resume`, stage-failure retry, ambiguous-outcome relaunch) and non-Claude drivers. This supports
-  T-48-15-01 / T-48-07-02 closing, but they stay **open until the round-4 audit re-runs**.
+  T-48-15-01 / T-48-07-02 closing; the later round-5 auditor confirmed both closed.
+- **Round 5 re-audit (2026-09-20):** the formal State A auditor returned `SECURED` for T-48-07-02 and
+  T-48-15-01. It verified that the Pending-only recorder is called only at Code preflight and that the
+  re-scan Advance arm is the only post-agent writer; Auto rejection preserves the old approval through
+  the parked Supervise resume. `threats_open: 0` is therefore correct at the configured `high` threshold.
 - **Out-of-register findings (external review, 2026-09-19)** — operator dispositions:
-  - **A (high, both lanes)** Supervise mode auto-decides a planner-declared human-only checkpoint with no
-    human involved. Verified in code. **This is Phase 28 D-03 by design** ("unconditional agent
-    auto-decide, no flag/config toggle", 28-CONTEXT.md:50-64, reversibility "costly") and predates
-    Phase 48 (base add41a6 auto-decided every Claude-reported blocking-human stop with no recorded set).
-    The reviewers flagged it against the orchestrator's prompt, which wrongly framed the set as
-    "human-approved". **Disposition: OPEN — operator decision pending** (backlog with D / amend D-03 for
-    Supervise / accept under D-03).
-  - **B (high, both lanes)** `stop` exits 0 with state unmarked when an answered gate's lock is held by an
-    unconfirmable holder, a different pid, or after `NoHolder` (`answered_gate_contention_message` `_`
-    arm, commands.rs:2106). **Disposition: fix (operator, 2026-09-19) — not yet implemented.**
-  - **C (high, agy)** `stop` after `AlreadyResponded` says "the phase is already ending" and, for a live
-    holder, "will clear phase state as it aborts", even when the existing response is an approval
-    (commands.rs:1934-1941, :2095). **Disposition: fix — not yet implemented.**
-  - **D (medium, agy)** with both `blocking-human` and `human-action` declared, a stop at the auth gate can
-    be auto-decided (`phase_has_blocking_human_checkpoint` vs `unapproved`'s `blocking_human ||
-    human_action`). Predates Phase 48. **Disposition: backlog (999.x) — not yet filed.**
-  - **E (medium, codex, reproduced)** `gate approve/reject` print "workflow will advance" / "phase will
-    abort" for an unconfirmable holder. **Disposition: fix — not yet implemented.**
-  - **F (medium, codex, reproduced)** `gate sweep` prints "reaped phase" for an unconfirmable holder.
-    **Disposition: fix — not yet implemented.**
-  - B, C, E, F are one class: *no recovery command states an outcome unless a confirmed live holder will
-    act on it*. Fix them together.
+  - **A (high, both lanes)** Supervise mode auto-decided a planner-declared human-only checkpoint with no
+    human involved. **Closed by D-03b:** only Auto resumes an unchanged, recorded checkpoint; Supervise
+    records a re-scan approval then opens a separate human Code gate. The scope is now explicit in source
+    policy text and tests.
+  - **B (high, both lanes)** `stop` could return success with state unmarked after an answered gate's holder
+    changed or could not be confirmed. **Closed:** it now claims a waiter only when the observed and current
+    holder share the same `(pid, start-time)` identity; every other result fails closed.
+  - **C (high, agy)** `stop` could claim an existing response would end a phase when it was not an abort.
+    **Closed:** only a live holder plus an existing abort response is attributed to `stop`; all other actions
+    fall through without an outcome claim.
+  - **D (medium, agy)** mixed `blocking-human` and `human-action` declarations could reach the wrong
+    auto-decision predicate. **Disposition: backlog 999.127** — scoped outside Phase 48.
+  - **E (medium, codex, reproduced)** `gate approve/reject` claimed a workflow outcome with no confirmed
+    live holder. **Closed:** response persistence is described without claiming pickup.
+  - **F (medium, codex, reproduced)** `gate sweep` claimed it reaped an unconfirmable-holder phase.
+    **Closed:** sweep reaps only confirmed live holders and its dry-run has a live-holder positive control.
+  - B, C, E, F were one class: *no recovery command states an outcome unless a confirmed live holder will
+    act on it*. The class is closed by the post-review recovery fixes and their holder-matrix tests.
 - **Outside the register (not counted):** `recover --clean` prints "cleaned up workflow state" after
   refusing on a contended lock (commands.rs:2417-2421); 48-07-SUMMARY cites a test name that does not
   exist (the real pin is `preflight::tests::code_preflight_does_not_record_an_unrecorded_set`); stale
@@ -186,7 +187,7 @@ located. No open threat has been accepted at audit time.
 
 - [x] All threats have a disposition (mitigate / accept / transfer)
 - [x] Accepted risks documented in Accepted Risks Log
-- [ ] `threats_open: 0` confirmed
-- [ ] `status: verified` set in frontmatter
+- [x] `threats_open: 0` confirmed
+- [x] `status: verified` set in frontmatter
 
 **Approval:** pending
