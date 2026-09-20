@@ -3114,6 +3114,10 @@ mod tests {
         assert_eq!(matches[0]["session_id"], "sess-abc-123");
         assert_eq!(matches[0]["stage"], "code");
         assert_eq!(matches[0]["attempt"], 1);
+        assert_eq!(
+            matches[0]["policy"], "D-03b: Auto-only checkpoint auto-decide",
+            "the audit event must name the policy the runtime actually applied"
+        );
     }
 
     /// D-04 (28-03, Task 2): the resume ceiling increments with saturating
@@ -4271,6 +4275,75 @@ mod tests {
             1,
             "the pre-approval set must still leave one declaration unapproved"
         );
+    }
+
+    /// D-03b: a Supervise operator may approve the re-scan's new declaration
+    /// set, but that approval is not permission for Claude to decide the
+    /// checkpoint. It records the set, then opens the ordinary Code gate.
+    #[test]
+    fn supervise_rescan_approval_records_but_requires_a_human_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::supervise_rescan_approval_records_but_requires_a_human_gate";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_SUPERVISE_RESCAN_ROOT";
+        let phase = PhaseId::new(111);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Supervise,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        write_gate_response(root, phase, Stage::Code, true, None);
+
+        let writer_root = root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while response_path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the re-scan response was not consumed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
+        });
+
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
+        writer.join().expect("second-gate response writer");
+        result.unwrap();
+
+        let state = workflow::load_state(root, phase)
+            .expect_err("the abort response must end the supervised run");
+        assert!(state.to_string().contains("state file"));
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "Supervise re-scan approval must never auto-decide"
+        );
+        let code_gates = events_of_kind(root, "gate_fired")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .count();
+        assert_eq!(code_gates, 2, "re-scan plus human-decision gates must fire");
     }
 
     /// 48-15 Task 1 / T-48-15-03: a non-abort rejection must record NOTHING.
