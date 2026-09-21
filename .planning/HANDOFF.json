@@ -1,0 +1,101 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-21T10:24:32.208Z",
+  "phase": 48,
+  "phase_name": "Survivable State Writes and Honest Gate Recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": 17,
+  "task": 17,
+  "total_tasks": 17,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": "48-01..48-17",
+      "name": "Phase implementation and plan summaries",
+      "status": "done",
+      "commit": "planned work plus follow-up commits through 4514ae3"
+    },
+    {
+      "id": "security-remediation",
+      "name": "Adversarial-review remediation and formal threat re-audit",
+      "status": "done",
+      "commit": "b69a9ab, 3aca386, a128d06, 0617df1"
+    },
+    {
+      "id": "fixture-leak-remediation",
+      "name": "Doctor recovery fixture blocks on a private FIFO instead of a timed sleep",
+      "status": "done",
+      "commit": "4514ae3"
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": "tail-1",
+      "name": "Establish a terminal result for the pinned container validation at source HEAD; the prior session output did not include an exit status",
+      "status": "not_started"
+    },
+    {
+      "id": "tail-2",
+      "name": "Run $gsd-validate-phase 48 and address only confirmed validation gaps",
+      "status": "not_started"
+    },
+    {
+      "id": "tail-3",
+      "name": "Run phase goal verification and the remaining completion gates after Nyquist validation",
+      "status": "not_started"
+    },
+    {
+      "id": "review-lead",
+      "name": "Independently assess the external review's possible unreachable Recycled-holder diagnostic before changing it",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "The final scripts/check-in-container.sh run emitted partial all-green output but its terminal exit code and final marker were not captured. Its process is no longer discoverable, and the original tool session is unavailable.",
+      "type": "technical",
+      "workaround": "Rerun the pinned container gate or otherwise capture a terminal exit 0 and its final success marker before reporting container parity."
+    },
+    {
+      "description": "Memtrace incremental index job b45174c1-2f99-43e7-85ea-398b77f45a1e stalled at persist after 112 symbols and the MCP transport closed.",
+      "type": "technical",
+      "workaround": "Diagnose or reindex through the Memtrace skills before relying on graph results; do not treat this pause record as an index-health result."
+    }
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "D-03b: unchanged recorded checkpoints auto-decide only in Auto mode; Supervise receives a human Code gate.",
+      "rationale": "This closes the unconditional D-03 exception that contradicted Supervise semantics.",
+      "phase": 48
+    },
+    {
+      "decision": "A rejected Auto re-scan parks the phase in Supervise, preserves the prior approval, and requires repair plus explicit resume.",
+      "rationale": "A rejected agent-authored checkpoint must not be auto-decided or silently discarded.",
+      "phase": 48
+    },
+    {
+      "decision": "Recovery commands may attribute an answered gate to a waiter only when observed and current live lock holders have the same pid and start time.",
+      "rationale": "PID reuse, successor holders, and unconfirmable holders fail closed.",
+      "phase": 48
+    },
+    {
+      "decision": "Ship's stored-response recovery exception is limited to NoHolder; Recycled is never treated as a waiting holder.",
+      "rationale": "A recycled PID is not evidence that a process will consume a response.",
+      "phase": 48
+    },
+    {
+      "decision": "Formal security review used Verify all threats and returned SECURED at the configured high threshold.",
+      "rationale": "T-48-07-02 and T-48-15-01 were rechecked after the class-level remediation; 48-SECURITY.md now records threats_open: 0.",
+      "phase": 48
+    }
+  ],
+  "uncommitted_files": [
+    "?? .planning/research/.cache/",
+    "?? .planning/reviews/48-adversarial-recheck/",
+    "?? .planning/user/errors/"
+  ],
+  "next_action": "First capture a terminal result for the pinned container validation at 4514ae3 (or its descendant containing only this handoff). Then run $gsd-validate-phase 48; do not declare container parity from prior partial output.",
+  "context_notes": "All 17 plans are implemented. Phase state is stale: STATE.md still names plan 14 even though it records 17 of 17 plans complete and tail gates pending. The host full check was observed successful in the prior session, but is historical evidence rather than a check run during this pause. The slow build-provenance test historically passed in roughly 58-96 seconds; that duration was dominated by build/rebuild work and is not a reliability claim. Preserve all three untracked planning directories."
+}
