@@ -425,6 +425,11 @@ impl Drop for LockGuard {
 /// deliberately: the same stale-holder sweep covers it.
 const LOCK_FILE_PREFIX: &str = "lock-";
 
+pub(crate) enum StaleLockRemovalOutcome {
+    Notice(String),
+    Failure(String),
+}
+
 pub(crate) fn lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     project_root.join(".devflow").join(format!(
         "{LOCK_FILE_PREFIX}{padded}",
@@ -447,6 +452,18 @@ pub(crate) fn project_lock_path(project_root: &Path) -> PathBuf {
 /// delete, so callers surface problems instead of reporting a clean sweep
 /// that left wedging locks behind.
 pub fn remove_stale_locks(project_root: &Path) -> Vec<String> {
+    remove_stale_locks_with_outcomes(project_root)
+        .into_iter()
+        .map(|outcome| match outcome {
+            StaleLockRemovalOutcome::Notice(message)
+            | StaleLockRemovalOutcome::Failure(message) => message,
+        })
+        .collect()
+}
+
+pub(crate) fn remove_stale_locks_with_outcomes(
+    project_root: &Path,
+) -> Vec<StaleLockRemovalOutcome> {
     let mut warnings = Vec::new();
     let devflow_dir = project_root.join(".devflow");
     let Ok(entries) = fs::read_dir(&devflow_dir) else {
@@ -462,35 +479,41 @@ pub fn remove_stale_locks(project_root: &Path) -> Vec<String> {
         let coordination = match acquire_coordination(&path) {
             Ok(coordination) => coordination,
             Err(LockError::Contended { .. }) => {
-                warnings.push(format!(
+                warnings.push(StaleLockRemovalOutcome::Notice(format!(
                     "kept {} — lock coordination is busy",
                     path.display()
-                ));
+                )));
                 continue;
             }
             Err(error) => {
-                warnings.push(format!("could not coordinate {}: {error}", path.display()));
+                warnings.push(StaleLockRemovalOutcome::Failure(format!(
+                    "could not coordinate {}: {error}",
+                    path.display()
+                )));
                 continue;
             }
         };
         let Some(record) = read_holder_record(&path) else {
-            warnings.push(format!(
+            warnings.push(StaleLockRemovalOutcome::Notice(format!(
                 "kept {} — lock record is unreadable",
                 path.display()
-            ));
+            )));
             continue;
         };
         if crate::agent::agent_running(record.pid) {
-            warnings.push(format!(
+            warnings.push(StaleLockRemovalOutcome::Notice(format!(
                 "kept {} — holder pid {} is still alive",
                 path.display(),
                 record.pid
-            ));
+            )));
             drop(coordination);
             continue;
         }
         if let Err(err) = fs::remove_file(&path) {
-            warnings.push(format!("could not remove {}: {err}", path.display()));
+            warnings.push(StaleLockRemovalOutcome::Failure(format!(
+                "could not remove {}: {err}",
+                path.display()
+            )));
         }
         drop(coordination);
     }
