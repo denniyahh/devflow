@@ -687,6 +687,22 @@ five parts:
 
 Parked for Phase 50, which rebuilds the monitor supervisor.
 
+**Stale gate answers (folded in 2026-09-22, Phase 48 code review finding B).** Gate answers are not
+bound to a gate incarnation. `Gates::write_gate` rewrites only the request, and `Gates::poll_response`
+takes any response file on its first read. So an answer left on disk decides the next gate at the same
+phase and stage without a new decision. Two sources, both confirmed from source:
+- a waiter killed within the ≤60 s poll backoff after an answer is written, followed by `resume`, which
+  relaunches without clearing it (pinned by `resume_relaunches_without_consuming_a_pending_gate_answer`
+  and its control);
+- a late `Gates::respond`, which has no re-check after its hard-link publish, racing a
+  consume-and-cleanup.
+
+48-CONTEXT D-05 calls this hazard closed by (3)+(4); it is only partly closed. The operator decided to
+record it as a Phase 48 limit and to fix it through this item's gate-waiter registration. A plain
+"clear leftovers when a gate opens" fix would break the intended Supervise re-scan rejection reuse
+(`rejecting_the_rescan_gate_records_nothing_and_falls_through`). Evidence:
+`.planning/reviews/48-code-review-2026-09-22/VERIFIED.md`.
+
 **Revisit when (from 48-CONTEXT):**
 - Phase 49's live run, or any run, records a concurrent state write or an `advance_failed` refusal;
 - Phase 50's discussion reworks the monitor-to-`advance` handoff;

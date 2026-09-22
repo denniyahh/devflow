@@ -142,6 +142,25 @@ marks Ship unverified).
 
 ---
 
+## Post-Validation Code-Review Fixes (2026-09-22)
+
+The codex + agy production-code review (`.planning/reviews/48-code-review-2026-09-22/VERIFIED.md`) found
+three defects after this audit. Each got a test that failed before its fix, with an opposite-result control:
+
+| Task ID | Requirement | Behavior | Automated Command | Control | Commit | Status |
+|---------|-------------|----------|-------------------|---------|--------|--------|
+| R-48-A | SURV-01 | The implicit `recover --clean` sweep keeps a stale phase whose per-phase lock is held | `cargo test -p devflow-core --lib recover::tests::clean_keeps_a_stale_phase_whose_lock_is_held -- --exact` | `recover::tests::clean_clears_stale_phase_state` | `fb2c4f8` | ✅ |
+| R-48-E | SURV-02 (T-48-16-03) | `gate approve|reject` writes no Ship response for a Recycled holder | `cargo test -p devflow --bin devflow commands::tests::gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing -- --exact` | `commands::tests::gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship` | `f1accee` | ✅ |
+| R-48-D | SURV-02 | `recover --clean` exits non-zero and says nothing was cleaned when refused; the sweep names what it cleared | `cargo test -p devflow --test recover_clean_e2e` (4 tests) | `explicit_clean_without_a_lock_holder_cleans_and_says_so`, `sweep_names_the_stale_phase_it_cleared` | `9a33c70` | ✅ |
+
+**Recorded limit (operator decision, 2026-09-22):** gate answers are not bound to a gate incarnation. A leftover
+answer, from a waiter killed within the poll window and then `resume`d, or from a late `Gates::respond` racing a
+consume-and-cleanup, decides the next gate at the same phase and stage. D-05's stale-answer hazard is only partly
+closed. It is tracked under backlog 999.130 (gate-waiter registration), not fixed in Phase 48. N-48-01 pins the
+`resume` half of this behavior: it shows the answer survives.
+
+---
+
 ## Validation Audit 2026-09-22
 
 | Metric | Count |
