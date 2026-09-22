@@ -2764,6 +2764,415 @@ kill -9 $$
         );
     }
 
+    // ---- monitor-sigterm-orphans-agent (.planning/debug, 2026-09-22): a TERM
+    //      that lands inside one of the Legacy monitor script's spawn windows.
+    //
+    // Window A (dash only; Debian's /bin/sh, so CI's): the forked agent child
+    // keeps the monitor's *caught* TERM handler until dash's fork-reset clears
+    // the trap. A TERM that lands first is recorded by that handler and then
+    // discarded (`dotrap` skips a signal whose trap is now NULL), and the child
+    // goes on to exec the agent, which never sees a TERM and is orphaned when
+    // the monitor exits. bash does not lose it, which is why the Fedora host
+    // never reproduced `sigterm_to_monitor_also_kills_the_agent`'s CI failures.
+    //
+    // Window F (dash and bash): a TERM that reaches the monitor after its fork
+    // but before `apid=$!` runs `cleanup` with an empty `apid`, so it kills
+    // nothing.
+    //
+    // Both windows are microseconds wide, so these tests hold them open
+    // deterministically instead of racing them. An LD_PRELOAD `fork()` shim,
+    // compiled here with `cc` and handed to the monitor through
+    // `spawn_monitor`'s own `envs`, holds ONE side of the monitor's first fork
+    // (the agent launch) until the test creates a release file. The shim
+    // records when a signal handler interrupted its hold, so each test asserts
+    // that the TERM really landed inside the window instead of assuming it.
+
+    /// The `fork()` interposer. Only the first fork, on the configured side,
+    /// in a process carrying these variables holds: that side unlinks the
+    /// `HOLDFORK_ONCE` file, and every later fork (the exec'd agent inherits
+    /// `LD_PRELOAD`) finds it gone.
+    #[cfg(target_os = "linux")]
+    const HOLDFORK_SHIM_C: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+pid_t fork(void) {
+    pid_t (*real_fork)(void) = (pid_t (*)(void))dlsym(RTLD_NEXT, "fork");
+    pid_t pid = real_fork();
+    if (pid < 0) return pid;
+    int saved_errno = errno;
+    const char *side = getenv("HOLDFORK_SIDE");
+    const char *once = getenv("HOLDFORK_ONCE");
+    const char *release = getenv("HOLDFORK_RELEASE");
+    const char *interrupted = getenv("HOLDFORK_INTERRUPTED");
+    if (side && once && release && interrupted
+        && strcmp(side, pid == 0 ? "child" : "parent") == 0
+        && unlink(once) == 0) {
+        /* Hold until released: 10 ms ticks, capped at 20 s so a crashed test
+           cannot wedge a process forever. A tick cut short by a signal
+           handler is recorded, then the hold resumes. */
+        for (int tick = 0; tick < 2000 && access(release, F_OK) != 0; tick++) {
+            struct timespec step = {0, 10 * 1000 * 1000};
+            if (nanosleep(&step, NULL) != 0 && errno == EINTR) {
+                int fd = open(interrupted, O_WRONLY | O_CREAT, 0600);
+                if (fd >= 0) close(fd);
+            }
+        }
+    }
+    errno = saved_errno;
+    return pid;
+}
+"#;
+
+    /// Which side of the monitor's first `fork()` the shim holds.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum HoldSide {
+        /// The agent child, before any of the shell's post-fork code runs.
+        Child,
+        /// The monitor, after the fork returned and before `apid=$!`.
+        Parent,
+    }
+
+    /// A Legacy monitor whose first fork is held open by the shim. Dropping it
+    /// releases the hold and SIGKILLs every still-tracked process that is
+    /// still recognisably ours, so a failing assertion leaks neither a held
+    /// monitor nor a 30-second agent.
+    #[cfg(target_os = "linux")]
+    struct HeldMonitor {
+        state: State,
+        monitor_pid: u32,
+        release: std::path::PathBuf,
+        interrupted: std::path::PathBuf,
+        tracked: Vec<u32>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl HeldMonitor {
+        fn spawn(root: &Path, side: HoldSide) -> Self {
+            let shim = compile_holdfork_shim(root);
+            let once = root.join("holdfork-once");
+            std::fs::write(&once, "").unwrap();
+            let release = root.join("holdfork-release");
+            let interrupted = root.join("holdfork-interrupted");
+            let side = match side {
+                HoldSide::Child => "child",
+                HoldSide::Parent => "parent",
+            };
+            let envs = [
+                ("LD_PRELOAD", shim.to_str().unwrap()),
+                ("HOLDFORK_SIDE", side),
+                ("HOLDFORK_ONCE", once.to_str().unwrap()),
+                ("HOLDFORK_RELEASE", release.to_str().unwrap()),
+                ("HOLDFORK_INTERRUPTED", interrupted.to_str().unwrap()),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string()));
+            let state = state_in(root);
+            let args = vec!["-c".to_string(), "sleep 30".to_string()];
+            let monitor_pid =
+                spawn_monitor(&state, "sh", &args, &envs, MonitorLaunch::Legacy).unwrap();
+            Self {
+                state,
+                monitor_pid,
+                release,
+                interrupted,
+                tracked: vec![monitor_pid],
+            }
+        }
+
+        fn release(&self) {
+            std::fs::write(&self.release, "").unwrap();
+        }
+
+        fn hold_was_interrupted(&self) -> bool {
+            self.interrupted.exists()
+        }
+
+        fn sigterm_monitor(&self) {
+            let rc = unsafe { libc::kill(self.monitor_pid as libc::pid_t, libc::SIGTERM) };
+            assert_eq!(
+                rc,
+                0,
+                "kill(monitor, TERM): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        /// Reap the monitor (this test process is its parent) and require that
+        /// it left through its trap: `cleanup` ends in `exit 0`, whereas a
+        /// shell killed by the TERM itself reports a signal. Once reaped, its
+        /// pid may be reused, so it is no longer tracked.
+        fn reap_monitor_expecting_trap_exit(&mut self) {
+            let pid = self.monitor_pid as libc::pid_t;
+            let mut reaped = None;
+            for _ in 0..250 {
+                let mut status: libc::c_int = 0;
+                let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if rc == pid {
+                    reaped = Some(status);
+                    break;
+                }
+                assert_eq!(
+                    rc,
+                    0,
+                    "waitpid(monitor): {}",
+                    std::io::Error::last_os_error()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let status = reaped.expect("the monitor did not exit within 5s of SIGTERM");
+            self.tracked.retain(|&tracked| tracked != self.monitor_pid);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the monitor must leave through its trap (`cleanup` → `exit 0`); \
+                 wait status {status:#x}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HeldMonitor {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, "");
+            for &pid in &self.tracked {
+                let cmd = cmdline_of(pid);
+                let ours = cmd.contains("trap cleanup TERM INT") || cmd.contains("sleep 30");
+                if ours && crate::agent::agent_running(pid) {
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compile_holdfork_shim(dir: &Path) -> std::path::PathBuf {
+        let source = dir.join("holdfork.c");
+        std::fs::write(&source, HOLDFORK_SHIM_C).unwrap();
+        let shim = dir.join("holdfork.so");
+        let out = std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&shim)
+            .arg(&source)
+            .arg("-ldl")
+            .output()
+            .expect(
+                "these tests compile an LD_PRELOAD fork() shim and need `cc`, \
+                 the C toolchain cargo already links with on Linux",
+            );
+        assert!(
+            out.status.success(),
+            "compiling the fork() shim failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        shim
+    }
+
+    /// `/proc/<pid>/cmdline` with its NULs as spaces; empty once the pid is
+    /// gone or a zombie.
+    #[cfg(target_os = "linux")]
+    fn cmdline_of(pid: u32) -> String {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                raw.split(|&byte| byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether `pid` has exec'd the stub agent (`sh -c 'sleep 30'`, or
+    /// `sleep 30` itself where the shell execs its last command).
+    #[cfg(target_os = "linux")]
+    fn runs_the_agent(pid: u32) -> bool {
+        let cmd = cmdline_of(pid);
+        !cmd.contains("trap cleanup TERM INT") && cmd.contains("sleep 30")
+    }
+
+    /// Whether SIGTERM is set in the named signal mask of `pid`'s
+    /// `/proc/<pid>/status` (`SigCgt`, `SigPnd`, `ShdPnd`, ...). Panics when
+    /// the field cannot be read: an absent field must not read as "clear".
+    #[cfg(target_os = "linux")]
+    fn sigterm_in_mask(pid: u32, field: &str) -> bool {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .expect("/proc/<pid>/status must be readable for a live child");
+        let hex = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("/proc/{pid}/status has no {field} line"))
+            .trim();
+        let mask = u64::from_str_radix(hex, 16).expect("signal masks are hex");
+        mask & (1 << (libc::SIGTERM - 1)) != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sigterm_is_caught(pid: u32) -> bool {
+        sigterm_in_mask(pid, "SigCgt")
+    }
+
+    /// Whether a TERM has reached `pid` while it was held. dash leaves signals
+    /// unblocked across its fork, so the handler runs at once and interrupts
+    /// the hold; bash blocks them around its fork, so the TERM sits pending
+    /// instead. Either way the signal was generated inside the window.
+    #[cfg(target_os = "linux")]
+    fn held_process_received_sigterm(held: &HeldMonitor, pid: u32) -> bool {
+        held.hold_was_interrupted()
+            || sigterm_in_mask(pid, "ShdPnd")
+            || sigterm_in_mask(pid, "SigPnd")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn within_5s(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..250 {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    /// Window A. Fails under dash before the fix (bash does not lose the TERM,
+    /// so on a bash `/bin/sh` this passes either way).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigterm_before_the_agent_child_resets_its_traps_still_kills_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = HeldMonitor::spawn(dir.path(), HoldSide::Child);
+        let agent_pid = wait_for_agent_pid(dir.path(), held.state.phase)
+            .expect("the monitor records the agent pid right after its fork");
+        held.tracked.push(agent_pid);
+
+        // The injection landed where this test claims it did: the agent child
+        // is held before its trap reset, still running the monitor's script
+        // and still catching TERM with the handler it inherited.
+        let held_cmd = cmdline_of(agent_pid);
+        assert!(
+            held_cmd.contains("trap cleanup TERM INT"),
+            "the hold did not land on the agent fork; child already runs [{held_cmd}]"
+        );
+        assert!(
+            sigterm_is_caught(agent_pid),
+            "the held agent child does not catch TERM, so it is not in the pre-reset window"
+        );
+
+        held.sigterm_monitor();
+        held.reap_monitor_expecting_trap_exit();
+        // `cleanup` has run, so its `kill` was sent while the child was held,
+        // and the child's inherited handler must have caught it.
+        assert!(
+            within_5s(|| held_process_received_sigterm(&held, agent_pid)),
+            "the held agent child never received the monitor's TERM, so the kill did \
+             not land inside the window"
+        );
+
+        held.release();
+        let died = within_5s(|| !crate::agent::agent_running(agent_pid));
+        assert!(
+            died,
+            "agent (pid {agent_pid}) survived a TERM that reached it before its trap \
+             reset, orphaned: {}",
+            proc_snapshot(agent_pid)
+        );
+    }
+
+    /// Opposite-result control for the test above: the same shim and the same
+    /// hold, but released BEFORE the TERM, so the TERM finds an exec'd agent.
+    /// Passes before and after the fix; if it ever fails, the harness, not the
+    /// monitor, is what keeps the agent alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigterm_after_a_held_agent_child_execs_kills_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = HeldMonitor::spawn(dir.path(), HoldSide::Child);
+        let agent_pid = wait_for_agent_pid(dir.path(), held.state.phase)
+            .expect("the monitor records the agent pid right after its fork");
+        held.tracked.push(agent_pid);
+        let held_cmd = cmdline_of(agent_pid);
+        assert!(
+            held_cmd.contains("trap cleanup TERM INT"),
+            "the hold did not land on the agent fork; child already runs [{held_cmd}]"
+        );
+
+        held.release();
+        assert!(
+            within_5s(|| runs_the_agent(agent_pid)),
+            "the released agent child never exec'd the agent: [{}]",
+            cmdline_of(agent_pid)
+        );
+        held.sigterm_monitor();
+        held.reap_monitor_expecting_trap_exit();
+
+        let died = within_5s(|| !crate::agent::agent_running(agent_pid));
+        assert!(
+            died,
+            "agent (pid {agent_pid}) survived a TERM sent after it exec'd: {}",
+            proc_snapshot(agent_pid)
+        );
+        assert!(
+            !held.hold_was_interrupted(),
+            "a signal landed inside the hold; this control must only TERM after exec"
+        );
+    }
+
+    /// Window F. Fails under dash and bash before the fix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigterm_before_the_monitor_records_the_agent_pid_still_kills_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = HeldMonitor::spawn(dir.path(), HoldSide::Parent);
+        // The monitor is held right after its fork, so it has not written the
+        // pidfile; the agent is the monitor's only child.
+        let children = format!("/proc/{0}/task/{0}/children", held.monitor_pid);
+        let mut agent_pid = None;
+        let found = within_5s(|| {
+            agent_pid = std::fs::read_to_string(&children)
+                .expect("/proc/<pid>/task/<tid>/children must be readable")
+                .split_whitespace()
+                .next()
+                .map(|pid| pid.parse::<u32>().expect("children lists numeric pids"));
+            agent_pid.is_some()
+        });
+        assert!(found, "the held monitor never forked its agent");
+        let agent_pid = agent_pid.unwrap();
+        held.tracked.push(agent_pid);
+        assert!(
+            within_5s(|| runs_the_agent(agent_pid)),
+            "the agent child of the held monitor never exec'd: [{}]",
+            cmdline_of(agent_pid)
+        );
+        let pidfile = crate::agent_result::agent_pid_path(dir.path(), held.state.phase);
+        assert!(
+            !pidfile.exists(),
+            "the monitor already wrote the pidfile, so the hold did not land between \
+             its fork and `apid=$!`"
+        );
+
+        held.sigterm_monitor();
+        let monitor_pid = held.monitor_pid;
+        assert!(
+            within_5s(|| held_process_received_sigterm(&held, monitor_pid)),
+            "the held monitor never received the TERM"
+        );
+        held.release();
+        held.reap_monitor_expecting_trap_exit();
+
+        let died = within_5s(|| !crate::agent::agent_running(agent_pid));
+        assert!(
+            died,
+            "agent (pid {agent_pid}) survived a TERM that reached the monitor before \
+             it recorded the agent pid, orphaned: {}",
+            proc_snapshot(agent_pid)
+        );
+    }
+
     #[test]
     fn spawn_monitor_runs_agent_in_worktree_but_captures_in_project_root() {
         let dir = tempfile::tempdir().unwrap();
