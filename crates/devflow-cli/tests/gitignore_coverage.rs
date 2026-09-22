@@ -33,6 +33,7 @@ const RUNTIME_PATHS: &[&str] = &[
     ".devflow/phase-01-stderr.log",
     ".devflow/phase-01-exit",
     ".devflow/phase-01-agent-pid",
+    ".devflow/phase-01-monitor-stop",
     ".devflow/last-ship.json",
     ".devflow/cron-instructions.json",
     ".devflow/cron-instructions-01.json",

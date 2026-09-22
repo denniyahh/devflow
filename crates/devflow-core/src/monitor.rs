@@ -463,18 +463,50 @@ fn spawn_monitor_inner(
     // `devflow advance` once it finished. `apid` is initialized to empty
     // before the trap is installed so a signal arriving before the agent is
     // even backgrounded doesn't reference an unset variable.
+    //
+    // A single `kill` from the trap is NOT enough on its own
+    // (monitor-sigterm-orphans-agent, .planning/debug, 2026-09-22). Two
+    // windows lose it, and both orphaned the agent (PPid=1) in the tests
+    // that hold them open:
+    //
+    // - Window A (dash, i.e. Debian's /bin/sh and CI's): the forked agent
+    //   child keeps the monitor's *caught* TERM handler until dash's
+    //   post-fork trap reset. A TERM landing first is recorded, then
+    //   discarded (the trap it would run is gone), and the child execs an
+    //   agent that never saw it. bash does not lose it.
+    // - Window F (dash and bash): a TERM reaching the monitor after its fork
+    //   but before `apid=$!` ran `cleanup` with an empty `apid`.
+    //
+    // So `cleanup` creates a stop marker BEFORE it kills, and the agent child
+    // checks that marker right before `exec`. The check runs after the
+    // child's trap reset, so a TERM it lost is always followed by a check
+    // that sees the marker — no timing assumption. `echo`, not `:`, creates
+    // the marker: a failed redirect on the special builtin `:` would exit the
+    // shell before the `kill`. `${apid:-$!}` closes window F, since `$!` is
+    // set as soon as the fork returns. The marker is removed in Rust before
+    // the spawn, never by the script, so the agent launch stays the monitor's
+    // first fork and a stale marker cannot stop the next agent.
+    let stop_path = crate::agent_result::stop_marker_path(&state.project_root, state.phase);
+    if let Err(err) = std::fs::remove_file(&stop_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(err.into());
+    }
+    let stop_file = stop_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
     let advance_tail = if run_advance {
         advance_tail(&binary, project_root, state)
     } else {
         String::new()
     };
     let script = format!(
-        "apid=''; cleanup() {{ [ -n \"$apid\" ] && kill \"$apid\" 2>/dev/null; exit 0; }}; \
+        "apid=''; cleanup() {{ echo > {stop_file}; \
+         [ -n \"${{apid:-$!}}\" ] && kill \"${{apid:-$!}}\" 2>/dev/null; exit 0; }}; \
          trap cleanup TERM INT; \
          cd {workdir} || exit 1; \
-         \"$@\" > {stdout_file} 2>{stderr_file} & \
+         {{ [ -e {stop_file} ] && exit 143; exec \"$@\"; }} > {stdout_file} 2>{stderr_file} & \
          apid=$!; echo $apid > {pid_file}; \
          wait $apid; echo $? > {exit_file}{advance_tail}",
+        stop_file = shell_escape(stop_file),
         workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
         stderr_file = shell_escape(stderr_file),
@@ -2717,15 +2749,19 @@ kill -9 $$
         // defect behind a green check — the exact false negative this
         // repository keeps getting bitten by.
         //
-        // The trap mechanism itself is verified working: DevFlow's real
-        // monitor script shape was run under both `bash` and `dash` (the
-        // container's /bin/sh is dash, the Fedora host's is bash) and both
-        // killed the backgrounded agent correctly. So the defect is in how
-        // the agent is spawned or identified under container timing, not in
-        // the shell trap — see 999.47, whose confirmed transient fork/exec
-        // window is the prime suspect for the same class of failure here.
+        // 2026-09-22 diagnosis (monitor-sigterm-orphans-agent,
+        // .planning/debug): under dash (the container's /bin/sh; the Fedora
+        // host's is bash), a TERM that lands in the agent child after its
+        // fork but before dash's post-fork trap reset is caught by the
+        // inherited handler and then discarded, and the child execs an agent
+        // that never saw it. The CI failures' `agent before` snapshot shows
+        // the child still pre-exec, consistent with that window; this test
+        // only races it. The `sigterm_before_*` tests below hold it (and the
+        // monitor-side `apid=$!` window) open deterministically; the Legacy
+        // script's stop marker closes the first and `${apid:-$!}` the second.
         //
-        // Leave this red until that is fixed. Do NOT widen it again.
+        // Do NOT widen this window: a failure here is a lost TERM, not a slow
+        // one.
         let mut still_running = true;
         for _ in 0..250 {
             if !crate::agent::agent_running(agent_pid) {
@@ -3189,6 +3225,59 @@ pid_t fork(void) {
             "agent (pid {agent_pid}) survived a TERM that reached the monitor before \
              it recorded the agent pid, orphaned: {}",
             proc_snapshot(agent_pid)
+        );
+    }
+
+    /// The stop marker a TERM'd monitor leaves behind must not stop the NEXT
+    /// agent for that phase: the Legacy launch removes a stale marker before
+    /// it spawns. Without that, the agent child finds the marker, exits 143
+    /// without ever running, and the stage records a kill nobody sent.
+    ///
+    /// `run_advance` is off so the monitor does not re-exec this test binary
+    /// as `devflow advance`; the marker handling does not depend on it.
+    #[test]
+    fn a_stale_stop_marker_does_not_stop_the_next_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        let marker = crate::agent_result::stop_marker_path(dir.path(), state.phase);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "\n").unwrap();
+        let args = vec![
+            "-c".to_string(),
+            "echo STALE_MARKER_AGENT_RAN; exit 7".to_string(),
+        ];
+
+        spawn_monitor_inner(&state, "sh", &args, &[], MonitorLaunch::Legacy, false).unwrap();
+
+        let exit_path = crate::agent_result::exit_code_path(dir.path(), state.phase);
+        let mut recorded = None;
+        for _ in 0..250 {
+            recorded = std::fs::read_to_string(&exit_path)
+                .ok()
+                .filter(|contents| contents.ends_with('\n'));
+            if recorded.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let recorded = recorded.expect("the monitor never recorded the agent's exit code");
+        assert_eq!(
+            recorded.trim(),
+            "7",
+            "a stale stop marker stopped the next agent: its exit code is {:?}, not the \
+             agent's own 7 (143 means the agent child found the marker and never exec'd)",
+            recorded.trim()
+        );
+        let captured =
+            std::fs::read_to_string(crate::agent_result::stdout_path(dir.path(), state.phase))
+                .unwrap();
+        assert!(
+            captured.contains("STALE_MARKER_AGENT_RAN"),
+            "the agent did not run under a stale stop marker; captured stdout: {captured:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the stale stop marker survived the launch that should have removed it"
         );
     }
 
