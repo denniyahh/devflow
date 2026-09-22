@@ -2554,19 +2554,44 @@ pub(crate) fn recover_cmd(
     phase: Option<PhaseId>,
 ) -> Result<(), CliError> {
     if do_clean {
-        let warnings = match phase {
+        match phase {
             // Explicit phase: clear it regardless of staleness (14-CR-01's
             // escape hatch for a wedged-but-fresh run).
-            Some(phase) => recover::clean_phase(project_root, phase)?,
+            Some(phase) => {
+                let warnings = match recover::clean_phase(project_root, phase) {
+                    Ok(warnings) => warnings,
+                    Err(recover::RecoverError::Lock(lock::LockError::Contended {
+                        pid, ..
+                    })) => {
+                        return Err(CliError::Message(format!(
+                            "phase {phase} is live or contended by pid {pid}; recover --clean \
+                             deleted neither state nor gate files — nothing was cleaned"
+                        )));
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                for warning in &warnings {
+                    println!("warning: {warning}");
+                }
+                println!("cleaned up workflow state for phase {phase}");
+            }
             // Implicit sweep: stale phases only.
-            None => recover::clean(project_root)?,
-        };
-        for warning in &warnings {
-            println!("warning: {warning}");
-        }
-        match phase {
-            Some(phase) => println!("cleaned up workflow state for phase {phase}"),
-            None => println!("cleaned up stale workflow state"),
+            None => {
+                let report = recover::clean_report(project_root)?;
+                for warning in &report.warnings {
+                    println!("warning: {warning}");
+                }
+                if report.cleared.is_empty() {
+                    println!("no stale workflow state was cleaned");
+                } else {
+                    let phases: Vec<String> =
+                        report.cleared.iter().map(ToString::to_string).collect();
+                    println!(
+                        "cleaned up stale workflow state for phase {}",
+                        phases.join(", ")
+                    );
+                }
+            }
         }
         return Ok(());
     }
