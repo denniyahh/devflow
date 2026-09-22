@@ -167,7 +167,38 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
 /// [`crate::lock::LockError::Contended`] when the per-phase lock is live or
 /// contended, so a refused clean cannot read as a successful one.
 pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
+    clean_phase_report(project_root, phase).map(|report| report.warnings)
+}
+
+/// Every stage whose gate files a phase can leave behind.
+const STAGES: [crate::stage::Stage; 5] = [
+    crate::stage::Stage::Define,
+    crate::stage::Stage::Plan,
+    crate::stage::Stage::Code,
+    crate::stage::Stage::Validate,
+    crate::stage::Stage::Ship,
+];
+
+/// What [`clean_phase_report`] did for one phase.
+#[derive(Debug, Default)]
+pub struct PhaseCleanReport {
+    /// Whether the phase had state, a gate request/response/ack or a cron
+    /// record on disk when the clean began. Legacy single-slot files are not
+    /// counted.
+    pub found_anything: bool,
+    /// Removals that failed and agents that looked alive, in human-readable
+    /// form.
+    pub warnings: Vec<String>,
+}
+
+/// [`clean_phase`], reporting whether the phase had anything to clean so a
+/// caller does not claim a cleanup of a phase that left nothing on disk.
+pub fn clean_phase_report(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<PhaseCleanReport, RecoverError> {
     let guard = crate::lock::acquire(project_root, phase)?;
+    let found_anything = phase_has_artifacts(project_root, phase);
 
     let mut warnings = Vec::new();
     if let Ok(state) = workflow::load_state(project_root, phase)
@@ -177,13 +208,7 @@ pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, R
             "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
         ));
     }
-    for stage in [
-        crate::stage::Stage::Define,
-        crate::stage::Stage::Plan,
-        crate::stage::Stage::Code,
-        crate::stage::Stage::Validate,
-        crate::stage::Stage::Ship,
-    ] {
+    for stage in STAGES {
         crate::gates::Gates::cleanup(project_root, phase, stage)?;
     }
     workflow::clear_state(project_root, phase)?;
@@ -192,7 +217,23 @@ pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, R
     }
     drop(guard);
     warnings.append(&mut crate::lock::remove_stale_locks(project_root));
-    Ok(warnings)
+    Ok(PhaseCleanReport {
+        found_anything,
+        warnings,
+    })
+}
+
+/// Whether `phase` has state, any gate request/response/ack, or a cron record
+/// on disk.
+fn phase_has_artifacts(project_root: &Path, phase: PhaseId) -> bool {
+    use crate::gates::Gates;
+    workflow::state_path(project_root, phase).exists()
+        || crate::ship::cron_instructions_path(project_root, phase).exists()
+        || STAGES.into_iter().any(|stage| {
+            Gates::gate_path(project_root, phase, stage).exists()
+                || Gates::response_path(project_root, phase, stage).exists()
+                || Gates::ack_path(project_root, phase, stage).exists()
+        })
 }
 
 /// Check whether a state is stale: >24h old with no running agent.
@@ -611,6 +652,35 @@ mod tests {
 
         assert!(!crate::ship::cron_instructions_path(root, first).exists());
         assert!(crate::ship::cron_instructions_path(root, second).exists());
+    }
+
+    #[test]
+    fn clean_phase_report_finds_nothing_for_an_absent_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = clean_phase_report(dir.path(), PhaseId::new(51)).expect("clean");
+        assert!(
+            !report.found_anything,
+            "a phase with nothing on disk must not report a cleanup"
+        );
+    }
+
+    /// Control for the test above: a leftover gate file alone, with no state,
+    /// is something to clean.
+    #[test]
+    fn clean_phase_report_counts_a_lone_gate_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(52);
+        Gates::write_gate(root, phase, Stage::Code, "leftover").unwrap();
+        assert!(!workflow::state_path(root, phase).exists());
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(
+            report.found_anything,
+            "a lone gate file must count as found"
+        );
+        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
     }
 
     #[test]
