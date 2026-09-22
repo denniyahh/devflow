@@ -164,6 +164,39 @@ fn sweep_that_clears_nothing_does_not_claim_a_cleanup() {
     assert!(devflow_core::workflow::state_path(root, phase).exists());
 }
 
+/// R-6: removing a corrupt legacy state file is a cleanup that the sweep
+/// must report, not a warning followed by an empty-sweep claim.
+#[test]
+fn sweep_removes_and_names_corrupt_legacy_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let legacy = root.join(".devflow/state.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "{\"stage\":").unwrap();
+
+    let output = recover_clean(root, None);
+
+    let text = combined(&output);
+    assert!(output.status.success(), "sweep failed: {text}");
+    assert!(
+        !legacy.exists(),
+        "the corrupt legacy state file must be removed"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.contains("legacy state.json")
+                && line.contains("removed")
+                && !line.starts_with("warning:")
+        }),
+        "the removal must have a non-warning report line: {text}"
+    );
+    assert!(
+        !text.contains("no stale workflow state was cleaned"),
+        "a sweep that removed legacy state must not say it cleaned nothing: {text}"
+    );
+}
+
 #[test]
 fn sweep_names_the_stale_phase_it_cleared() {
     let dir = tempfile::tempdir().unwrap();
