@@ -989,6 +989,49 @@ mod tests {
         );
     }
 
+    /// R-3: a stale lock whose coordination inode cannot be opened must be
+    /// reported as a failed removal, not only as a warning.
+    #[test]
+    fn clean_phase_report_flags_a_stale_lock_with_unusable_coordination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cleaned_phase = PhaseId::new(65);
+        let stale_lock = crate::lock::lock_path(root, PhaseId::new(66));
+        std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
+        std::fs::write(&stale_lock, DEAD_PID.to_string()).unwrap();
+        let coordination = stale_lock.with_file_name(format!(
+            ".{}.coord",
+            stale_lock.file_name().unwrap().to_string_lossy()
+        ));
+        // A directory where the coordination inode belongs: opening it fails
+        // before the sweeper can remove the dead-holder lock.
+        std::fs::create_dir_all(&coordination).unwrap();
+
+        let report = clean_phase_report(root, cleaned_phase).expect("clean");
+
+        assert!(
+            stale_lock.is_file(),
+            "the stale lock must remain when its coordination cannot be opened"
+        );
+        assert!(
+            coordination.is_dir(),
+            "the coordination directory is the negative control for this failure"
+        );
+        assert!(
+            report.removal_failed,
+            "the unremovable stale lock must be reported as a failed removal"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not coordinate")
+                    && warning.contains("lock-66")),
+            "the stale-lock failure must be reported: {:?}",
+            report.warnings
+        );
+    }
+
     #[test]
     fn clean_phase_removes_gate_files_when_no_process_holds_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1261,6 +1304,75 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains(temp.file_name().unwrap().to_str().unwrap())),
             "the unremovable state temp must be named in a warning: {:?}",
+            report.warnings
+        );
+    }
+
+    /// R-3: the stale-lock sweep must classify an unusable coordination inode
+    /// as a failed removal rather than a harmless kept-lock notice.
+    #[test]
+    fn clean_report_flags_a_stale_lock_with_unusable_coordination() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stale_lock = crate::lock::lock_path(root, PhaseId::new(67));
+        std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
+        std::fs::write(&stale_lock, DEAD_PID.to_string()).unwrap();
+        let coordination = stale_lock.with_file_name(format!(
+            ".{}.coord",
+            stale_lock.file_name().unwrap().to_string_lossy()
+        ));
+        // A directory where the coordination inode belongs: opening it fails
+        // before the sweeper can remove the dead-holder lock.
+        std::fs::create_dir_all(&coordination).unwrap();
+
+        let report = clean_report(root).expect("clean");
+
+        assert!(
+            stale_lock.is_file(),
+            "the stale lock must remain when its coordination cannot be opened"
+        );
+        assert!(
+            coordination.is_dir(),
+            "the coordination directory is the negative control for this failure"
+        );
+        assert!(
+            report.removal_failed,
+            "the unremovable stale lock must be reported as a failed removal"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not coordinate")
+                    && warning.contains("lock-67")),
+            "the stale-lock failure must be reported: {:?}",
+            report.warnings
+        );
+    }
+
+    /// A live-holder lock is kept intentionally, so its notice must not make
+    /// the stale-lock sweep report a failed removal.
+    #[test]
+    fn clean_report_does_not_flag_a_live_stale_lock_notice_as_a_removal_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let live_lock = crate::lock::lock_path(root, PhaseId::new(68));
+        std::fs::create_dir_all(live_lock.parent().unwrap()).unwrap();
+        std::fs::write(&live_lock, std::process::id().to_string()).unwrap();
+
+        let report = clean_report(root).expect("clean");
+
+        assert!(live_lock.is_file(), "a live holder's lock must be kept");
+        assert!(
+            !report.removal_failed,
+            "a live-holder notice must not be classified as a failed removal"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("still alive") && warning.contains("lock-68")),
+            "the kept live lock must be reported: {:?}",
             report.warnings
         );
     }
