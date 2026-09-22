@@ -2618,7 +2618,16 @@ pub(crate) fn recover_cmd(
                         join(&report.orphan_gates_cleared)
                     );
                 }
-                if report.cleared.is_empty() && report.orphan_gates_cleared.is_empty() {
+                if !report.orphan_cron_records_removed.is_empty() {
+                    println!(
+                        "removed orphan cron records for phase {}",
+                        join(&report.orphan_cron_records_removed)
+                    );
+                }
+                if report.cleared.is_empty()
+                    && report.orphan_gates_cleared.is_empty()
+                    && report.orphan_cron_records_removed.is_empty()
+                {
                     println!("no stale workflow state was cleaned");
                 }
                 if report.removal_failed {
