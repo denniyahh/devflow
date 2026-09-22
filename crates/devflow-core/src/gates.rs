@@ -181,6 +181,27 @@ impl Gates {
         open
     }
 
+    /// Every phase that has a gate request, response, ack, or orphaned write
+    /// temp on disk, whether or not the gate is still open — so a reset can
+    /// reach gate files that outlived their phase's state.
+    pub fn phases_on_disk(project_root: &Path) -> std::collections::BTreeSet<PhaseId> {
+        let mut phases = std::collections::BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
+            return phases;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let name = name.strip_prefix('.').unwrap_or(name);
+            if let Some((phase, _)) = name.split_once('-')
+                && let Ok(phase) = phase.parse::<PhaseId>()
+            {
+                phases.insert(phase);
+            }
+        }
+        phases
+    }
+
     /// Answer an open gate by writing its response file atomically — the
     /// programmatic form of what a human previously hand-edited. Refuses
     /// when no gate request is open for the phase+stage, and when a
@@ -298,21 +319,25 @@ impl Gates {
         Ok(path)
     }
 
-    /// Remove the gate, response, and ack files for a stage. Idempotent.
-    pub fn cleanup(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<(), GateError> {
+    /// Remove the gate, response, and ack files for a stage, and their
+    /// orphaned write temps. Idempotent. Returns whether this call removed
+    /// any file, so a caller can report only what it actually cleaned.
+    pub fn cleanup(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<bool, GateError> {
         let paths = [
             Self::gate_path(project_root, phase, stage),
             Self::response_path(project_root, phase, stage),
             Self::ack_path(project_root, phase, stage),
         ];
+        let mut removed = false;
         for path in &paths {
             if path.exists() {
                 std::fs::remove_file(path)?;
+                removed = true;
             }
         }
         let dir = Self::dir(project_root);
         let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(());
+            return Ok(removed);
         };
         let prefixes = paths
             .iter()
@@ -329,9 +354,10 @@ impl Gates {
             let Some(name) = name.to_str() else { continue };
             if name.ends_with(".tmp") && prefixes.iter().any(|prefix| name.starts_with(prefix)) {
                 std::fs::remove_file(entry.path())?;
+                removed = true;
             }
         }
-        Ok(())
+        Ok(removed)
     }
 }
 

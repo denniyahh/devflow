@@ -186,3 +186,95 @@ fn sweep_names_the_stale_phase_it_cleared() {
     );
     assert!(!devflow_core::workflow::state_path(root, phase).exists());
 }
+
+/// 48-REVIEW WR-02: gate files whose phase has no state are removed by the
+/// sweep and named, rather than left as open gates nothing will answer.
+#[test]
+fn sweep_removes_and_names_orphan_gate_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let phase = PhaseId::new(67);
+    let gate = devflow_core::gates::Gates::write_gate(
+        root,
+        phase,
+        devflow_core::stage::Stage::Code,
+        "orphaned",
+    )
+    .unwrap();
+
+    let output = recover_clean(root, None);
+
+    let text = combined(&output);
+    assert!(output.status.success(), "sweep failed: {text}");
+    assert!(
+        text.contains("removed orphan gate files for phase 67"),
+        "the sweep must name the orphan gate files it removed: {text}"
+    );
+    assert!(
+        !text.contains("no stale workflow state was cleaned"),
+        "a sweep that removed files must not say it cleaned nothing: {text}"
+    );
+    assert!(!gate.exists());
+}
+
+/// 48-REVIEW WR-03: removing a phase held only in a legacy `state.json` is a
+/// cleanup, not "nothing to clean".
+#[test]
+fn explicit_clean_of_legacy_state_says_it_cleaned() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let phase = PhaseId::new(68);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let legacy = root.join(".devflow/state.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
+
+    let output = recover_clean(root, Some(phase));
+
+    let text = combined(&output);
+    assert!(output.status.success(), "legacy clean failed: {text}");
+    assert!(
+        text.contains("cleaned up workflow state for phase 68"),
+        "removing legacy state must be reported as a cleanup: {text}"
+    );
+    assert!(!legacy.exists());
+    assert!(!devflow_core::workflow::state_path(root, phase).exists());
+}
+
+/// 48-REVIEW WR-03/WR-04: a removal that fails exits non-zero and never
+/// claims a cleanup — for an explicit clean and for the sweep.
+#[test]
+fn a_failed_removal_exits_non_zero_without_claiming_a_cleanup() {
+    for phase_arg in [Some(PhaseId::new(69)), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(69);
+        // A directory in place of a gate file: removing it fails EISDIR, on
+        // both the explicit path and the sweep's orphan-gate path.
+        std::fs::create_dir_all(devflow_core::gates::Gates::gate_path(
+            root,
+            phase,
+            devflow_core::stage::Stage::Code,
+        ))
+        .unwrap();
+
+        let output = recover_clean(root, phase_arg);
+
+        let text = combined(&output);
+        assert!(
+            !output.status.success(),
+            "a failed removal must exit non-zero ({phase_arg:?}): {text}"
+        );
+        assert!(
+            text.contains("could not remove everything"),
+            "the failure must be stated ({phase_arg:?}): {text}"
+        );
+        assert!(
+            !text.contains("cleaned up"),
+            "a failed removal must not claim a cleanup ({phase_arg:?}): {text}"
+        );
+    }
+}

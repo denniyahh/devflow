@@ -86,69 +86,66 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// unparsable legacy `state.json` (14-CR-04 — this reset is the one
 /// sanctioned place), lock files whose holder is dead (the sweep lives in
 /// [`crate::lock::remove_stale_locks`], which refuses to delete a live
-/// holder's lock), and cron-instruction records for phases that no longer
-/// have state — self-describing "auto-re-run this phase" records that must
-/// not survive an operator-driven reset. Returns warnings for anything kept
-/// or that could not be removed.
+/// holder's lock), gate files whose phase has no state file, and
+/// cron-instruction records for phases that no longer have state —
+/// self-describing "auto-re-run this phase" records that must not survive an
+/// operator-driven reset. Returns warnings for anything kept or that could
+/// not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
     clean_report(project_root).map(|report| report.warnings)
 }
 
-/// What [`clean_report`] did: the phases whose state it cleared, and warnings
-/// for anything it kept or could not remove.
+/// What [`clean_report`] did: the phases whose state it cleared, the
+/// stateless phases whose orphaned gate files it removed, and warnings for
+/// anything it kept or could not remove.
 #[derive(Debug, Default)]
 pub struct CleanReport {
     /// Phases whose persisted state was cleared.
     pub cleared: Vec<PhaseId>,
+    /// Phases with no state file whose leftover gate files were removed.
+    pub orphan_gates_cleared: Vec<PhaseId>,
+    /// Whether a removal the sweep attempted failed. Each failure is also
+    /// described in `warnings`.
+    pub removal_failed: bool,
     /// Phases kept, and removals that failed, in human-readable form.
     pub warnings: Vec<String>,
 }
 
-/// [`clean`], reporting which phases it cleared so a caller can say so
-/// instead of claiming a cleanup that did not happen.
+impl CleanReport {
+    fn fail(&mut self, warning: String) {
+        self.removal_failed = true;
+        self.warnings.push(warning);
+    }
+}
+
+/// [`clean`], reporting what it removed so a caller can say so instead of
+/// claiming a cleanup that did not happen. One phase's failure is recorded
+/// and the sweep goes on (48-REVIEW WR-04): aborting would hide the phases
+/// already cleared and skip every later step.
 pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
-    let mut cleared = Vec::new();
-    let mut warnings = Vec::new();
-    for state in workflow::list_states(project_root) {
-        let phase = state.phase;
-        if agent_pid_for(&state).is_some_and(crate::agent::agent_running) {
-            warnings.push(format!(
-                "kept phase {phase} — its agent is still running (clear explicitly with --phase {phase})"
-            ));
-            continue;
-        }
-        if !is_stale_state(&state) {
-            warnings.push(format!(
-                "kept phase {phase} — state is not stale yet (clear explicitly with --phase {phase})"
-            ));
-            continue;
-        }
-        // A monitor waiting at a gate holds this lock after its agent exited,
-        // so staleness by agent pid alone cannot license the delete.
-        let _guard = match crate::lock::acquire(project_root, phase) {
-            Ok(guard) => guard,
-            Err(crate::lock::LockError::Contended { pid, .. }) => {
-                warnings.push(format!(
-                    "kept phase {phase} — its per-phase lock is live or contended by pid {pid}"
-                ));
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        // Same order as `clean_phase_report`: a gate left behind would outlive
-        // the state that explains it, and no command would answer it.
-        for stage in STAGES {
-            crate::gates::Gates::cleanup(project_root, phase, stage)?;
-        }
-        workflow::clear_state(project_root, phase)?;
-        cleared.push(phase);
+    let mut report = CleanReport::default();
+    let states = workflow::list_states(project_root);
+    for state in &states {
+        sweep_phase(project_root, state, &mut report);
     }
+    for phase in workflow::state_file_phases(project_root) {
+        if !states.iter().any(|state| state.phase == phase) {
+            report.warnings.push(format!(
+                "kept phase {phase} — its state file cannot be parsed (clear explicitly with --phase {phase})"
+            ));
+        }
+    }
+    sweep_orphan_gates(project_root, &mut report);
     match workflow::remove_corrupt_legacy_state(project_root) {
-        Ok(true) => warnings.push("removed unparsable legacy state.json".into()),
+        Ok(true) => report
+            .warnings
+            .push("removed unparsable legacy state.json".into()),
         Ok(false) => {}
-        Err(err) => warnings.push(format!("could not remove corrupt legacy state.json: {err}")),
+        Err(err) => report.fail(format!("could not remove corrupt legacy state.json: {err}")),
     }
-    warnings.append(&mut crate::lock::remove_stale_locks(project_root));
+    report
+        .warnings
+        .append(&mut crate::lock::remove_stale_locks(project_root));
     // Drop cron records only for phases without surviving state, so a kept
     // phase's pending re-run record is preserved.
     for instructions in crate::ship::list_cron_instructions(project_root) {
@@ -156,13 +153,108 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
             continue;
         }
         if let Err(err) = crate::ship::delete_cron_instructions(project_root, instructions.phase) {
-            warnings.push(format!(
+            report.fail(format!(
                 "could not remove cron-instructions for phase {}: {err}",
                 instructions.phase
             ));
         }
     }
-    Ok(CleanReport { cleared, warnings })
+    Ok(report)
+}
+
+/// Clear one listed phase if it is stale and its lock is free.
+fn sweep_phase(project_root: &Path, state: &State, report: &mut CleanReport) {
+    let phase = state.phase;
+    if agent_pid_for(state).is_some_and(crate::agent::agent_running) {
+        report.warnings.push(format!(
+            "kept phase {phase} — its agent is still running (clear explicitly with --phase {phase})"
+        ));
+        return;
+    }
+    if !is_stale_state(state) {
+        report.warnings.push(format!(
+            "kept phase {phase} — state is not stale yet (clear explicitly with --phase {phase})"
+        ));
+        return;
+    }
+    // A monitor waiting at a gate holds this lock after its agent exited,
+    // so staleness by agent pid alone cannot license the delete.
+    let Some(_guard) = lock_for_sweep(project_root, phase, "phase", report) else {
+        return;
+    };
+    // Same order as `clean_phase_report`: a gate left behind would outlive
+    // the state that explains it, and no command would answer it. So a
+    // failed gate removal keeps the state.
+    if let Err(err) = remove_gate_files(project_root, phase) {
+        report.fail(format!(
+            "kept phase {phase}'s state — could not remove all of its gate files: {err}"
+        ));
+        return;
+    }
+    match workflow::clear_state(project_root, phase) {
+        Ok(true) => report.cleared.push(phase),
+        Ok(false) => {}
+        Err(err) => report.fail(format!(
+            "could not clear phase {phase}'s state after removing its gate files: {err}"
+        )),
+    }
+}
+
+/// Remove gate files whose phase has no state file (48-REVIEW WR-02): left by
+/// a sweep that predates gate cleanup, or by `abort` for another stage. They
+/// show as open gates nothing will ever answer.
+fn sweep_orphan_gates(project_root: &Path, report: &mut CleanReport) {
+    for phase in crate::gates::Gates::phases_on_disk(project_root) {
+        if workflow::state_path(project_root, phase).exists() {
+            continue;
+        }
+        let what = "the orphan gate files of phase";
+        let Some(_guard) = lock_for_sweep(project_root, phase, what, report) else {
+            continue;
+        };
+        // A run may have started between the listing and the lock.
+        if workflow::state_path(project_root, phase).exists() {
+            continue;
+        }
+        match remove_gate_files(project_root, phase) {
+            Ok(true) => report.orphan_gates_cleared.push(phase),
+            Ok(false) => {}
+            Err(err) => report.fail(format!("could not remove all of {what} {phase}: {err}")),
+        }
+    }
+}
+
+/// Take `phase`'s lock for the sweep, or record why `what` was kept.
+fn lock_for_sweep(
+    project_root: &Path,
+    phase: PhaseId,
+    what: &str,
+    report: &mut CleanReport,
+) -> Option<crate::lock::LockGuard> {
+    match crate::lock::acquire(project_root, phase) {
+        Ok(guard) => Some(guard),
+        Err(crate::lock::LockError::Contended { pid, .. }) => {
+            report.warnings.push(format!(
+                "kept {what} {phase} — its per-phase lock is live or contended by pid {pid}"
+            ));
+            None
+        }
+        Err(err) => {
+            report.fail(format!(
+                "kept {what} {phase} — could not take its per-phase lock: {err}"
+            ));
+            None
+        }
+    }
+}
+
+/// Remove every stage's gate files for `phase`; whether any file went.
+fn remove_gate_files(project_root: &Path, phase: PhaseId) -> Result<bool, crate::gates::GateError> {
+    let mut removed = false;
+    for stage in STAGES {
+        removed |= crate::gates::Gates::cleanup(project_root, phase, stage)?;
+    }
+    Ok(removed)
 }
 
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
@@ -170,7 +262,8 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
 /// record; warns (but proceeds) when the recorded agent still looks alive.
 /// Deletes nothing and returns [`RecoverError::Lock`] with
 /// [`crate::lock::LockError::Contended`] when the per-phase lock is live or
-/// contended, so a refused clean cannot read as a successful one.
+/// contended, so a refused clean cannot read as a successful one. A removal
+/// that fails is among the warnings; [`clean_phase_report`] flags it.
 pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
     clean_phase_report(project_root, phase).map(|report| report.warnings)
 }
@@ -187,58 +280,71 @@ const STAGES: [crate::stage::Stage; 5] = [
 /// What [`clean_phase_report`] did for one phase.
 #[derive(Debug, Default)]
 pub struct PhaseCleanReport {
-    /// Whether the phase had state, a gate request/response/ack or a cron
-    /// record on disk when the clean began. Legacy single-slot files are not
-    /// counted.
-    pub found_anything: bool,
+    /// Whether this call removed any of the phase's state (including a
+    /// legacy single-slot file naming it), gate files, cron record, or their
+    /// orphaned write temps.
+    pub removed_anything: bool,
+    /// Whether a removal failed. Each failure is also in `warnings`.
+    pub removal_failed: bool,
     /// Removals that failed and agents that looked alive, in human-readable
     /// form.
     pub warnings: Vec<String>,
 }
 
-/// [`clean_phase`], reporting whether the phase had anything to clean so a
-/// caller does not claim a cleanup of a phase that left nothing on disk.
+/// [`clean_phase`], reporting what it removed and whether a removal failed,
+/// so a caller claims neither a cleanup that did not happen nor "nothing to
+/// clean" after deleting something (48-REVIEW WR-03). A failure stops the
+/// clean where it is: gate files that could not go keep the state that
+/// explains them, and state that could not go keeps its cron record.
 pub fn clean_phase_report(
     project_root: &Path,
     phase: PhaseId,
 ) -> Result<PhaseCleanReport, RecoverError> {
     let guard = crate::lock::acquire(project_root, phase)?;
-    let found_anything = phase_has_artifacts(project_root, phase);
-
-    let mut warnings = Vec::new();
+    let mut report = PhaseCleanReport::default();
     if let Ok(state) = workflow::load_state(project_root, phase)
         && agent_pid_for(&state).is_some_and(crate::agent::agent_running)
     {
-        warnings.push(format!(
+        report.warnings.push(format!(
             "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
         ));
     }
-    for stage in STAGES {
-        crate::gates::Gates::cleanup(project_root, phase, stage)?;
-    }
-    workflow::clear_state(project_root, phase)?;
-    if let Err(err) = crate::ship::delete_cron_instructions(project_root, phase) {
-        warnings.push(format!("could not remove cron-instructions: {err}"));
-    }
+    clean_phase_files(project_root, phase, &mut report);
     drop(guard);
-    warnings.append(&mut crate::lock::remove_stale_locks(project_root));
-    Ok(PhaseCleanReport {
-        found_anything,
-        warnings,
-    })
+    report
+        .warnings
+        .append(&mut crate::lock::remove_stale_locks(project_root));
+    Ok(report)
 }
 
-/// Whether `phase` has state, any gate request/response/ack, or a cron record
-/// on disk.
-fn phase_has_artifacts(project_root: &Path, phase: PhaseId) -> bool {
-    use crate::gates::Gates;
-    workflow::state_path(project_root, phase).exists()
-        || crate::ship::cron_instructions_path(project_root, phase).exists()
-        || STAGES.into_iter().any(|stage| {
-            Gates::gate_path(project_root, phase, stage).exists()
-                || Gates::response_path(project_root, phase, stage).exists()
-                || Gates::ack_path(project_root, phase, stage).exists()
-        })
+fn clean_phase_files(project_root: &Path, phase: PhaseId, report: &mut PhaseCleanReport) {
+    match remove_gate_files(project_root, phase) {
+        Ok(removed) => report.removed_anything |= removed,
+        Err(err) => {
+            return report.fail(format!(
+                "kept phase {phase}'s state — could not remove all of its gate files: {err}"
+            ));
+        }
+    }
+    match workflow::clear_state(project_root, phase) {
+        Ok(removed) => report.removed_anything |= removed,
+        Err(err) => {
+            return report.fail(format!(
+                "kept phase {phase}'s cron record — could not clear its state: {err}"
+            ));
+        }
+    }
+    match crate::ship::delete_cron_instructions(project_root, phase) {
+        Ok(removed) => report.removed_anything |= removed,
+        Err(err) => report.fail(format!("could not remove cron-instructions: {err}")),
+    }
+}
+
+impl PhaseCleanReport {
+    fn fail(&mut self, warning: String) {
+        self.removal_failed = true;
+        self.warnings.push(warning);
+    }
 }
 
 /// Check whether a state is stale: >24h old with no running agent.
@@ -735,7 +841,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = clean_phase_report(dir.path(), PhaseId::new(51)).expect("clean");
         assert!(
-            !report.found_anything,
+            !report.removed_anything,
             "a phase with nothing on disk must not report a cleanup"
         );
     }
@@ -753,8 +859,8 @@ mod tests {
         let report = clean_phase_report(root, phase).expect("clean");
 
         assert!(
-            report.found_anything,
-            "a lone gate file must count as found"
+            report.removed_anything,
+            "a lone gate file it removes must count as removed"
         );
         assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
     }
@@ -1006,9 +1112,25 @@ mod tests {
         assert!(!legacy.exists());
         assert!(!workflow::state_path(root, phase).exists());
         assert!(
-            report.found_anything,
+            report.removed_anything,
             "removing a phase's legacy state is a cleanup, not \"nothing to clean\""
         );
+    }
+
+    /// Control for the test below: a cron record the clean does remove is a
+    /// cleanup.
+    #[test]
+    fn clean_phase_report_counts_a_lone_cron_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(12);
+        let record = crate::ship::build_single_agent_cron_instructions(root, phase, "");
+        crate::ship::write_cron_instructions(root, &record).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(!crate::ship::cron_instructions_path(root, phase).exists());
+        assert!(report.removed_anything && !report.removal_failed);
     }
 
     /// WR-03: a removal that fails is not a cleanup. The only artifact here is
@@ -1023,8 +1145,12 @@ mod tests {
         let report = clean_phase_report(root, phase).expect("clean");
 
         assert!(
-            !report.found_anything,
+            !report.removed_anything,
             "a cron record that could not be removed must not count as cleaned"
+        );
+        assert!(
+            report.removal_failed,
+            "a failed removal must be flagged, not only warned about"
         );
         assert!(
             report.warnings.iter().any(|w| w.contains("cron")),
