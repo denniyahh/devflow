@@ -154,5 +154,6 @@ devflow status                       # idle — phase shipped, version tagged
 ```
 
 When something wedges: `devflow recover` to inspect,
-`devflow recover --clean` (stale phases only) or
+`devflow recover --clean` (stale phases, plus gate files whose phase has no
+state; exits non-zero if anything could not be removed) or
 `devflow recover --clean --phase N` to reset one phase, then re-`start`.

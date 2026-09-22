@@ -2573,7 +2573,18 @@ pub(crate) fn recover_cmd(
                 for warning in &report.warnings {
                     println!("warning: {warning}");
                 }
-                if report.found_anything {
+                if report.removal_failed {
+                    let removed = if report.removed_anything {
+                        "some of its files were removed"
+                    } else {
+                        "nothing was removed"
+                    };
+                    return Err(CliError::Message(format!(
+                        "recover --clean could not remove everything for phase {phase} \
+                         ({removed}) — see the warnings above"
+                    )));
+                }
+                if report.removed_anything {
                     println!("cleaned up workflow state for phase {phase}");
                 } else {
                     println!(
@@ -2588,15 +2599,33 @@ pub(crate) fn recover_cmd(
                 for warning in &report.warnings {
                     println!("warning: {warning}");
                 }
-                if report.cleared.is_empty() {
-                    println!("no stale workflow state was cleaned");
-                } else {
-                    let phases: Vec<String> =
-                        report.cleared.iter().map(ToString::to_string).collect();
+                let join = |phases: &[PhaseId]| {
+                    phases
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if !report.cleared.is_empty() {
                     println!(
                         "cleaned up stale workflow state for phase {}",
-                        phases.join(", ")
+                        join(&report.cleared)
                     );
+                }
+                if !report.orphan_gates_cleared.is_empty() {
+                    println!(
+                        "removed orphan gate files for phase {}",
+                        join(&report.orphan_gates_cleared)
+                    );
+                }
+                if report.cleared.is_empty() && report.orphan_gates_cleared.is_empty() {
+                    println!("no stale workflow state was cleaned");
+                }
+                if report.removal_failed {
+                    return Err(CliError::Message(
+                        "recover --clean could not remove everything — see the warnings above"
+                            .into(),
+                    ));
                 }
             }
         }

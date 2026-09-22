@@ -285,6 +285,30 @@ pub fn list_states(project_root: &Path) -> Vec<State> {
     states
 }
 
+/// Every phase with a per-phase state file on disk, parsable or not — the
+/// complement [`list_states`] cannot give, since it skips a file it cannot
+/// parse. Named by file, so no content is read.
+pub fn state_file_phases(project_root: &Path) -> Vec<PhaseId> {
+    let mut phases = Vec::new();
+    let Ok(entries) = std::fs::read_dir(devflow_dir(project_root)) else {
+        return phases;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(phase) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(STATE_FILE_PREFIX))
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|phase| phase.parse::<PhaseId>().ok())
+        else {
+            continue;
+        };
+        phases.push(phase);
+    }
+    phases.sort();
+    phases
+}
+
 /// Delete a legacy `state.json` that cannot be parsed — and therefore can
 /// never be migrated by [`migrate_legacy_state`] or matched by
 /// [`clear_state`]'s phase check (14-CR-04). Ordinary reads deliberately
@@ -305,12 +329,16 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
     Ok(true)
 }
 
-/// Remove a phase's persisted state if present.
-pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<(), WorkflowError> {
+/// Remove a phase's persisted state if present, with a legacy single-slot
+/// file naming the same phase and orphaned write temps. Returns whether this
+/// call removed any file, so a caller can report only what it cleaned.
+pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
     let path = state_path(project_root, phase);
+    let mut removed = false;
     if path.exists() {
         debug!("clearing state at {}", path.display());
         std::fs::remove_file(&path)?;
+        removed = true;
     }
     // A legacy single-slot file for this phase is the same state under its
     // old name — clearing must not leave it behind to be re-migrated.
@@ -320,6 +348,7 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<(), WorkflowEr
         && state.phase == phase
     {
         std::fs::remove_file(&legacy)?;
+        removed = true;
     }
     let temp_prefix = format!(
         ".{}.",
@@ -329,18 +358,19 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<(), WorkflowEr
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with(&temp_prefix)
-                && name.ends_with(".tmp")
-                && let Err(error) = std::fs::remove_file(entry.path())
-            {
-                warn!(
+            if !name.starts_with(&temp_prefix) || !name.ends_with(".tmp") {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed = true,
+                Err(error) => warn!(
                     "could not remove orphaned state temp {}: {error}",
                     entry.path().display()
-                );
+                ),
             }
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -557,10 +587,24 @@ mod tests {
         save_state(&state).unwrap();
         assert!(state_path(dir.path(), PhaseId::new(1)).exists());
 
-        clear_state(dir.path(), PhaseId::new(1)).expect("clear");
+        assert!(clear_state(dir.path(), PhaseId::new(1)).expect("clear"));
         assert!(!state_path(dir.path(), PhaseId::new(1)).exists());
-        // Clearing when nothing is present is a no-op success.
-        clear_state(dir.path(), PhaseId::new(1)).expect("clear again");
+        // Clearing when nothing is present is a no-op success, and says so.
+        assert!(!clear_state(dir.path(), PhaseId::new(1)).expect("clear again"));
+    }
+
+    /// `clear_state` reports a legacy single-slot file it removes for the
+    /// phase, not only a per-phase file (48-REVIEW WR-03).
+    #[test]
+    fn clear_state_counts_a_legacy_file_it_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path(), PhaseId::new(14), Stage::Code);
+        let legacy = legacy_state_path(dir.path());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
+
+        assert!(clear_state(dir.path(), PhaseId::new(14)).expect("clear"));
+        assert!(!legacy.exists());
     }
 
     #[test]
