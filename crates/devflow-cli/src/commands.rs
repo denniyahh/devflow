@@ -1412,7 +1412,11 @@ pub(crate) fn gate_respond(
         None => resolve_single_open_gate_stage(&Gates::list_open(project_root), phase)?,
     };
     let holder_before_response = lock::holder_status(project_root, phase);
-    if stage != Stage::Ship && !holder_before_response.may_be_waiting() {
+    // Ship's stored-response exception is for `NoHolder` alone (T-48-16-03);
+    // a recycled pid is an unrelated process, not manual-recovery territory.
+    let ship_without_holder =
+        stage == Stage::Ship && matches!(holder_before_response, lock::HolderStatus::NoHolder);
+    if !holder_before_response.may_be_waiting() && !ship_without_holder {
         return Err(CliError::Message(format!(
             "no confirmed waiter holds phase {phase}'s lock for {stage}; no response was written. {}",
             no_waiter_repair(phase, stage)
@@ -4392,6 +4396,38 @@ mod tests {
             "repair must name the concrete phase: {err}"
         );
         assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+    }
+
+    /// T-48-16-03 at the `gate` verbs, not only at `stop`: Ship's
+    /// stored-response exception is for `NoHolder` alone. A recycled pid is
+    /// an unrelated live process, and a response left for it cannot be
+    /// consumed by `devflow ship` while that pid holds the lock.
+    /// `gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship`
+    /// is the `NoHolder` control that must still write.
+    #[test]
+    fn gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4848);
+        let pid = std::process::id();
+        let start = agent::process_start_time(pid).unwrap();
+        let path = root
+            .join(".devflow")
+            .join(format!("lock-{}", phase.padded()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
+        assert!(matches!(
+            lock::holder_status(root, phase),
+            lock::HolderStatus::Recycled { .. }
+        ));
+        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
+        let err = gate_respond(root, phase, Some(Stage::Ship), true, None)
+            .expect_err("a recycled Ship holder must not receive a response");
+        assert!(
+            err.to_string().contains("no response was written"),
+            "the refusal must say nothing was written: {err}"
+        );
+        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
     }
 
     #[test]
