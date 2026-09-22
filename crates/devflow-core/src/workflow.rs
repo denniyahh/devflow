@@ -333,11 +333,22 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
 /// file naming the same phase and orphaned write temps. Returns whether this
 /// call removed any file, so a caller can report only what it cleaned.
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
+    let (removed, result) = clear_state_with_partial_result(project_root, phase);
+    result.map(|()| removed)
+}
+
+/// Clear state while retaining removals that happened before an error.
+pub(crate) fn clear_state_with_partial_result(
+    project_root: &Path,
+    phase: PhaseId,
+) -> (bool, Result<(), WorkflowError>) {
     let path = state_path(project_root, phase);
     let mut removed = false;
     if path.exists() {
         debug!("clearing state at {}", path.display());
-        std::fs::remove_file(&path)?;
+        if let Err(error) = std::fs::remove_file(&path) {
+            return (removed, Err(error.into()));
+        }
         removed = true;
     }
     // A legacy single-slot file for this phase is the same state under its
@@ -347,7 +358,9 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, Workflow
         && let Ok(state) = serde_json::from_str::<State>(&contents)
         && state.phase == phase
     {
-        std::fs::remove_file(&legacy)?;
+        if let Err(error) = std::fs::remove_file(&legacy) {
+            return (removed, Err(error.into()));
+        }
         removed = true;
     }
     let temp_prefix = format!(
@@ -370,7 +383,7 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, Workflow
             }
         }
     }
-    Ok(removed)
+    (removed, Ok(()))
 }
 
 #[cfg(test)]

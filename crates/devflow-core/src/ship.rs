@@ -151,10 +151,21 @@ pub fn list_cron_instructions(project_root: &Path) -> Vec<CronInstructions> {
 /// naming the same phase, or one too corrupt to name any). Idempotent.
 /// Returns whether this call removed a record.
 pub fn delete_cron_instructions(project_root: &Path, phase: PhaseId) -> Result<bool, ShipError> {
+    let (removed, result) = delete_cron_instructions_with_partial_result(project_root, phase);
+    result.map(|()| removed)
+}
+
+/// Delete cron instructions while retaining removals that happened before an error.
+pub(crate) fn delete_cron_instructions_with_partial_result(
+    project_root: &Path,
+    phase: PhaseId,
+) -> (bool, Result<(), ShipError>) {
     let path = cron_instructions_path(project_root, phase);
     let mut removed = false;
     if path.exists() {
-        std::fs::remove_file(path)?;
+        if let Err(error) = std::fs::remove_file(path) {
+            return (removed, Err(error.into()));
+        }
         removed = true;
     }
     let legacy = legacy_cron_instructions_path(project_root);
@@ -164,10 +175,12 @@ pub fn delete_cron_instructions(project_root: &Path, phase: PhaseId) -> Result<b
             .map(|i| i.phase == phase)
             .unwrap_or(true)
     {
-        std::fs::remove_file(&legacy)?;
+        if let Err(error) = std::fs::remove_file(&legacy) {
+            return (removed, Err(error.into()));
+        }
         removed = true;
     }
-    Ok(removed)
+    (removed, Ok(()))
 }
 
 /// Remove `path` if still present, reporting whether THIS call was the one
