@@ -946,6 +946,46 @@ mod tests {
         );
     }
 
+    /// R-4: an orphaned state-write temp that cannot be removed is a failed
+    /// removal, even though the phase's actual state file was cleared first.
+    #[test]
+    fn clean_phase_report_reports_an_unremovable_state_temp_after_clearing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(63);
+        workflow::save_state(&state_aged_phase(root, phase, 0, None)).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let temp = workflow::devflow_dir(root).join(".state-63.json.1.0.tmp");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(
+            !state_path.exists(),
+            "the state file must be removed before the temp-removal failure"
+        );
+        assert!(
+            temp.is_dir(),
+            "the state-temp directory is the negative control for this failure"
+        );
+        assert!(
+            report.removal_failed,
+            "the unremovable state temp must be reported as a failed removal"
+        );
+        assert!(
+            report.removed_anything,
+            "the successfully removed state file must remain reportable"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(temp.file_name().unwrap().to_str().unwrap())),
+            "the unremovable state temp must be named in a warning: {:?}",
+            report.warnings
+        );
+    }
+
     #[test]
     fn clean_phase_removes_gate_files_when_no_process_holds_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1171,6 +1211,53 @@ mod tests {
                 .iter()
                 .any(|w| w.contains(&format!("phase {failing}")) && w.contains("gate")),
             "the failed phase must be reported: {:?}",
+            report.warnings
+        );
+    }
+
+    /// R-4: the stale-state sweep must report an orphaned state temp it
+    /// cannot remove, while retaining the record of the state it did clear.
+    #[test]
+    fn clean_report_flags_an_unremovable_state_temp_for_a_lock_free_stale_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(64);
+        workflow::save_state(&state_aged_phase(
+            root,
+            phase,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(DEAD_PID),
+        ))
+        .unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let temp = workflow::devflow_dir(root).join(".state-64.json.1.0.tmp");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let report = clean_report(root).expect("clean lock-free stale phase");
+
+        assert!(
+            !state_path.exists(),
+            "the stale state file must be removed before the temp-removal failure"
+        );
+        assert!(
+            temp.is_dir(),
+            "the state-temp directory is the negative control for this failure"
+        );
+        assert!(
+            report.removal_failed,
+            "the unremovable state temp must be reported as a failed removal"
+        );
+        assert_eq!(
+            report.cleared,
+            vec![phase],
+            "the successfully removed state must remain reportable"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(temp.file_name().unwrap().to_str().unwrap())),
+            "the unremovable state temp must be named in a warning: {:?}",
             report.warnings
         );
     }
