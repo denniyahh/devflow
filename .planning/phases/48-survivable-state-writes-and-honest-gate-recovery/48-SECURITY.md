@@ -76,19 +76,19 @@ retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 
 | T-48-12-02 | Tampering | stop re-creates state for an aborted phase (D-01 hazard b) | high | mitigate | R-5 lock-then-load; no state write while a live process holds the lock after the gate path answered — **Evidence:** commands.rs:2036-2072 (lock, then load, then save) | closed |
 | T-48-12-03 | Denial of Service | stop leaves a signalled phase un-stopped | medium | mitigate | F-1 bounded retry; explicit message when the holder survives — **Evidence:** commands.rs:2036-2040 (bounded retry), :2050-2054 ("not marked"); stop_e2e.rs:107-174 | closed |
 | T-48-12-04 | Spoofing | signalling a recycled pid or the stale `monitor_pid` | medium | mitigate | T-23-51/T-23-52 unchanged, now pinned by `stop_never_signals_the_recorded_monitor_pid` and `stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match` — **Evidence:** commands.rs:1951-2021 (never reads `monitor_pid`; start-time match); stop_e2e.rs:176-231 | closed |
-| T-48-12-05 | Tampering | stale response decides a fresh run's gate | medium | mitigate | start cleans leftovers under its lock (R-1) — **Evidence:** commands.rs:370-380; gates.rs:302-332; start_lock_e2e.rs:199-251 | closed |
+| T-48-12-05 | Tampering | stale response decides a fresh run's gate | medium | mitigate | start cleans leftovers under its lock (R-1) — **Evidence (re-audited 2026-09-22 at ab37d90):** lock commands.rs:360-369, then all five stages' gate cleanup :370-380 (gates.rs:302-335); `start_lock_e2e::start_clears_leftover_gate_files_after_taking_the_lock` (:200), which fails when the cleanup loop is removed. Caveat: an I/O error deleting a leftover only warns and proceeds (:377-379), so that leftover survives into the fresh run | closed |
 | T-48-13-01 | Spoofing | recycled pid classified live | high | mitigate | Start-time mismatch test and Recycled status — **Evidence:** lock.rs:343-347 (start-time mismatch → `Recycled`), :737-750 | closed |
 | T-48-13-02 | Tampering | doctor mutates a lock while observing it | medium | mitigate | Read-only parser and empty-lock preservation control — **Evidence:** lock.rs:320-332, :359-369 (read-only parser), :700-720 | closed |
 | T-48-13-03 | Denial of Service | legacy waiter treated as absent | medium | mitigate | Unconfirmable remains may_be_waiting — **Evidence:** lock.rs:57-62 (`Unconfirmable` may be waiting), :752-762, :778-785 | closed |
-| T-48-14-01 | Denial of Service | cleanup strands a live waiter until its timeout | high | mitigate | CX-1 / PI-S2 acquisition guard holds the phase lock across cleanup; contended-lock controls prove state and gates are untouched — **Evidence:** recover.rs:137-145, :155-168 (lock before cleanup); recover.rs:570-637; gate_wedge_e2e.rs:123-167 | closed |
+| T-48-14-01 | Denial of Service | cleanup strands a live waiter until its timeout | high | mitigate | CX-1 / PI-S2 acquisition guard holds the phase lock across cleanup; contended-lock controls prove state and gates are untouched — **Evidence (re-audited 2026-09-22 at ab37d90):** explicit `clean_phase_report` recover.rs:201-229 takes the lock (`?`, :205) before gate cleanup and `clear_state`. The implicit sweep `clean_report` recover.rs:109-166 takes the lock (:128-137, `fb2c4f8`) before gate cleanup (`854bbce`) and `clear_state`, and skips a contended phase. Tests: `recover::tests::clean_phase_returns_without_cleanup_while_the_per_phase_lock_is_contended`, `..._for_a_recycled_pid_lock`, and `clean_keeps_a_stale_phase_whose_lock_is_held`, which covers state and gate bytes since `f73990f`; moving gate cleanup above the lock fails it. Also `recover_clean_e2e.rs`. The 2026-09-19/20 closure covered only the explicit path: the implicit sweep deleted live state without the lock until `fb2c4f8` | closed |
 | T-48-14-02 | Repudiation | doctor prescribes a repair that does nothing | medium | mitigate | Shared `no_waiter_repair`; orphan-gate check yields to the new finding — **Evidence:** commands.rs:3353-3367 (`no_waiter_repair`), :3371-3374; tests commands.rs:6367-6459 | closed |
 | T-48-14-03 | Tampering | doctor mutates state | low | mitigate | PI-1 read-only holder status plus report-only unchanged (T-18-02) — **Evidence:** commands.rs:3526 (read-only `holder_status`); test commands.rs:6804 | closed |
 | T-48-15-01 | Elevation of Privilege | re-scan approval | high | mitigate | Only re-scan `Advance` records the freshly scanned declaration set; `LoopBack` preserves the prior set. A rejected Auto re-scan parks for Supervise repair without auto-deciding, and the resumed phase retains the rejection's prior approval set — **Evidence:** formal GSD re-audit 2026-09-20, `pipeline_launch.rs` re-scan action handling and Auto-park regression test | closed |
 | T-48-15-02 | Tampering | Code preflight records from project root | high | mitigate | Worktree fixture proves recording and comparison use the same execution root — **Evidence:** preflight.rs:1311-1321 (execution root) matches pipeline_launch.rs:1717/1741; decoy-root tests preflight.rs:2582, :2684 | closed |
 | T-48-15-03 | Repudiation | LoopBack silently accepts changed plans | medium | mitigate | LoopBack keeps approval unchanged and names unapproved plan files — **Evidence:** pipeline_launch.rs:1795-1803; preflight.rs:1422-1427; tests pipeline_launch.rs:4275-4393 | closed |
-| T-48-16-01 | Tampering | stale response decides a later non-Ship gate | high | mitigate | NoHolder and Recycled write no response — **Evidence:** commands.rs:1414-1420, 1548-1559 + 1728-1730, 1903-1911 (status checked before writing); tests commands.rs:4157/4184/4225; gate_wedge_e2e.rs:94-110 | closed |
+| T-48-16-01 | Tampering | stale response decides a later non-Ship gate | high | mitigate | NoHolder and Recycled write no response — **Evidence (re-audited 2026-09-22 at ab37d90):** holder checked before writing at commands.rs:1419 (`gate_respond`), :1557 + :1736 (sweep), :1926 (`stop`), with `stop`'s stale-gate check at :1914-1923. Tests: `commands::tests::gate_respond_with_a_recycled_lock_pid_at_a_non_ship_gate_writes_nothing`, `stop_via_gate_with_no_waiter_at_a_non_ship_gate_writes_nothing`, `gate_sweep_leaves_a_no_waiter_non_ship_gate_alone`, live control `stop_via_gate_with_a_live_waiter_writes_the_rejection`; `gate_wedge_e2e.rs:94`. **Residual accepted as AR-48-04:** the write-time check does not cover an answer that outlives its waiter | closed (residual: AR-48-04) |
 | T-48-16-02 | Repudiation | command claims a waiter without evidence | medium | mitigate | A waiter claim now requires the observed and current lock records to have the same live `(pid, start-time)` identity; a successor holder fails closed — **Evidence:** commands.rs `answered_gate_contention_message` and its same-identity/successor negative-control matrix, refreshed 2026-09-20 | closed |
-| T-48-16-03 | Spoofing | recycled pid treated as a waiter | high | mitigate | Recycled holders receive no response at every gate, including Ship; Ship's stored-response exception is limited to `NoHolder` — **Evidence:** commands.rs Ship recycled/no-holder counterpart tests, refreshed 2026-09-20 | closed |
+| T-48-16-03 | Spoofing | recycled pid treated as a waiter | high | mitigate | Recycled holders receive no response at every gate, including Ship; Ship's stored-response exception is limited to `NoHolder` — **Evidence (re-audited 2026-09-22 at ab37d90; every production response writer enumerated):** `gate_respond` commands.rs:1414-1424 (Ship exception `NoHolder` only since `f1accee`); `gate sweep` :1556-1567 with `gate_sweep_may_reap` :1736-1738 (Live only); `stop_via_gate` :1924-1936 (Live, or Ship with `NoHolder`); the `--yes-ship` auto-response pipeline_gate.rs:414-422 is written by the waiter itself. Tests: `commands::tests::gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing` (fails if `f1accee` is reverted), `..._at_a_non_ship_gate_writes_nothing`, `stop_at_a_ship_gate_with_a_recycled_holder_claims_no_waiter`; NoHolder control `gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship`. The 2026-09-20 closure was false for `gate approve|reject` at Ship until `f1accee` | closed |
 | T-48-17-01 | Tampering | stale test guidance | low | mitigate | Documentation uses the helper and lint names verified by Task 1 — **Evidence:** .planning/codebase/TESTING.md:69, :84, :91; named helpers exist; clippy.toml `disallowed-methods` | closed |
 | T-48-17-02 | Repudiation | timing result presented as reliability proof | low | mitigate | SUMMARY records one-run and concurrent-load limits — **Evidence:** 48-17-SUMMARY.md:131-133 (Evidence Limits — the SUMMARY is the mitigation) | closed |
 
@@ -100,11 +100,13 @@ retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 
 
 ## Accepted Risks Log
 
-These three are plan-time `accept` dispositions, recorded here with the rationale the auditors
-located. No open threat has been accepted at audit time.
+AR-48-01 to AR-48-03 are plan-time `accept` dispositions, recorded with the rationale the auditors
+located. AR-48-04 is a residual on a closed threat, accepted by operator decision after the
+2026-09-22 code review. No open threat has been accepted.
 
 | Risk ID | Threat Ref | Rationale | Accepted By | Date |
 |---------|------------|-----------|-------------|------|
+| AR-48-04 | T-48-16-01 (residual) | Gate answers are not bound to a gate incarnation, so an answer that outlives its waiter decides the next gate at the same phase and stage on its first poll (gates.rs:276-279). The write-time holder check cannot see three paths: (a) a waiter killed within the ≤60 s poll backoff after an answer is written, then `resume`, which relaunches without clearing it (pinned by `pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer` and its control); (b) a late `Gates::respond`, with no re-check after its hard-link publish (gates.rs:195-201 → :404), landing after a consume-and-cleanup; (c) the check-to-write window in the three CLI writers (commands.rs:1414→1434, :1556→1578, :1912→1937). (a) was confirmed through its pinned tests; (b) and (c) were reasoned from source, not reproduced. 48-CONTEXT D-05's claim that (3)+(4) close this hazard is superseded. Fix path: 999.130's gate-waiter registration | Operator decision 2026-09-22 (record as a Phase 48 limit; fold into backlog 999.130) | 2026-09-22 |
 | AR-48-01 | T-48-09-03 | The 21 non-PATH environment mutations stay process-global under `ENV_MUTEX`, each justified in-source; per-`Command` scoping cannot reach an in-process reader (48-CONTEXT.md D-09 :217-221; TESTING.md:93) | Plan-time disposition, 48-09-PLAN (D-09) | 2026-09-19 |
 | AR-48-02 | T-48-10-04 | Filesystems without hard links fail with `GateError::Io`; no rename fallback, so no silent overwrite (48-CONTEXT.md:337; gates.rs:384-386, :412-414) | Plan-time disposition, 48-10-PLAN | 2026-09-19 |
 | AR-48-03 | T-48-11-04 | An older monitor script without `--stage` falls back to an unbound advance (48-RESEARCH.md:374 F-8; main.rs:127; pipeline_launch.rs:1613-1618) | Plan-time disposition, 48-11-PLAN | 2026-09-19 |
@@ -123,6 +125,7 @@ located. No open threat has been accepted at audit time.
 | 2026-09-19 (round 4, d3beb19) | — | — | — | gsd-security-auditor **DID NOT RUN** — terminated by a session rate limit (HTTP 429) before any verdict; must be re-run |
 | 2026-09-19 (external, d3beb19) | rule + diff | — | 6 out-of-register findings (A–F below) | codex (gpt-5.6-terra, high) + agy (gemini-3.8-flash-high) on a `git archive` snapshot; both completed (~8 min); snapshot unmodified (139/139 hashes) |
 | 2026-09-20 (round 5, 3aca386) | 2 re-checked | 2 | 0 blocking (1 medium threat remains non-blocking) | gsd-security-auditor, State A, ASVS L1; operator selected Verify all open threats |
+| 2026-09-22 (round 6, ab37d90) | 4 re-checked (T-48-16-03, T-48-14-01, T-48-16-01, T-48-12-05) | 4 | 0 blocking (T-48-09-02 still non-blocking) | gsd-security-auditor, State A, ASVS L1, operator-requested after the 2026-09-22 code review; orchestrator added the T-48-14-01 gate-half test (`f73990f`) and AR-48-04 |
 
 ### Audit 2026-09-19 — notes
 
@@ -180,6 +183,41 @@ located. No open threat has been accepted at audit time.
   `NeutralPath` doc comment at cli test_support.rs:296-322; bare-`\r` plan files read as one line and fail
   open at preflight; child-mode checks test `DEVFLOW_CHILD_TEST` presence only; T-48-17-01's mitigation
   document lives in the mapper-owned `.planning/codebase/`.
+
+### Audit 2026-09-22 — notes (round 6)
+
+- **Trigger.** A codex + agy production-code review and a fix-round review
+  (`.planning/reviews/48-code-review-2026-09-22/`) showed that two CLOSED high threats had rested on
+  incomplete evidence:
+  - **T-48-16-03:** `gate approve|reject` wrote a Ship response for a Recycled holder. Fixed in `f1accee`.
+  - **T-48-14-01:** the implicit `recover --clean` sweep deleted live state without the lock. Fixed in
+    `fb2c4f8`; gate cleanup was added under the lock in `854bbce`.
+
+  Both are the pattern recorded in round 3: the evidence covered one instance of a class.
+- **Verdict.** The round-6 auditor enumerated every production gate-response writer and both recover
+  cleanup paths, and returned SECURED on the declared mitigations. It ran mutation checks against a
+  `git archive` snapshot:
+  - reverting `f1accee` failed the recycled-Ship test for the intended reason;
+  - removing `start`'s cleanup loop failed `start_clears_leftover_gate_files_after_taking_the_lock`;
+  - moving the sweep's gate cleanup above the lock passed all 32 sweep tests.
+
+  The last one was a test gap. The orchestrator closed it in `f73990f` and confirmed that the same
+  reorder now fails `clean_keeps_a_stale_phase_whose_lock_is_held` on the gate-file assertion.
+- **T-48-16-01 residual.** The planned write-time check is present, but it does not cover answers that
+  outlive their waiter; recorded as AR-48-04 on the operator's decision.
+- **Non-blocking caveats, not counted:**
+  - T-48-12-05 fails open on an I/O error while deleting a leftover gate file.
+  - No test drives `stop` at a non-Ship gate with a Recycled holder.
+  - The real `gate sweep` is never driven with a Recycled holder; only its predicate is tested.
+
+  Both untested paths allow Live holders only.
+- **Resolved from the round-1 "outside the register" list:** `recover --clean` no longer prints
+  "cleaned up" after a refusal (`9a33c70`) or for a phase with nothing on disk (`d36936e`).
+- **Evidence limits:**
+  - Every test ran once.
+  - Four hand-picked mutations are not a mutation sweep.
+  - The late-responder and check-to-write races were reasoned from source.
+  - At L1, the lock discipline of in-process `Gates::cleanup` callers rests on D-05's text-search claim.
 
 ---
 

@@ -132,6 +132,9 @@ Claude (remit) entry as an operator mandate.
     unverified.
   - *Reasoned hazard closed by (3) and (4):* an unread answer persists and silently decides the next firing of
     that gate, including in a later run of the phase — the hazard `pipeline_gate.rs:463-464` names.
+    **Superseded 2026-09-22:** only partly closed. An answer that outlives its waiter still decides the next
+    same-stage gate, for example after `resume`. It is accepted as `48-SECURITY.md` AR-48-04 and tracked in
+    backlog 999.130.
   - Rejected: `stop` running `abort()` itself. `recover --clean --phase N` already ends a dead phase, so it
     would save one command rather than provide the only way out.
   - Unconfirmable waiter identity (non-Linux, or a legacy single-line lock): the message says a process holds

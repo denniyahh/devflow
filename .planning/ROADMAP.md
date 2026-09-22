@@ -722,6 +722,14 @@ phase and stage without a new decision. Two sources, both confirmed from source:
 - a late `Gates::respond`, which has no re-check after its hard-link publish, racing a
   consume-and-cleanup.
 
+The 2026-09-22 security re-audit added two related paths:
+- the check-to-write window in the three CLI answer writers (`gate_respond`, `gate sweep`, `stop`), where
+  a waiter that dies after the holder check still gets an answer;
+- `start`, which only warns when it cannot delete a leftover gate file, so that answer survives into the
+  fresh run.
+
+Both are recorded in `48-SECURITY.md` as AR-48-04 and in the T-48-12-05 caveat.
+
 48-CONTEXT D-05 calls this hazard closed by (3)+(4); it is only partly closed. The operator decided to
 record it as a Phase 48 limit and to fix it through this item's gate-waiter registration. A plain
 "clear leftovers when a gate opens" fix would break the intended Supervise re-scan rejection reuse
