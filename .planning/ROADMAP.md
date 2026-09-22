@@ -646,6 +646,94 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.132: Gate List and Status Disagree After an Unwaited Ship Answer (BACKLOG)
+
+**Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision to track all five Phase 48 deferrals here. After a Ship-gate answer with nothing waiting,
+`devflow gate list` reports "no open gates" while `devflow status` still says a gate is pending.
+Recorded as cosmetic: D-05's message already names `devflow ship --phase N`. Not re-verified at
+filing time.
+
+**Fix shape:** not decided.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.131: Convert the Remaining Test Environment Mutations (BACKLOG)
+
+**Found:** Phase 48 D-09/D-10 (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision. TEST-01 converted only the tests that replace `PATH`; the other process-global
+environment mutations in tests stayed, each under an explicit `#[expect(clippy::disallowed_methods)]`,
+and `ENV_MUTEX` still serialises them. Line counts from `rg` at `395feb4` (a line census, not a
+per-test one): 21 `expect(clippy::disallowed_methods` attributes across 7 files, 48 lines calling
+`env::set_var`/`env::remove_var`, 123 `ENV_MUTEX` references. The discussion estimated ~40
+mutations.
+
+**Fix shape (from 48-CONTEXT):** convert them, either to a child process or by passing values
+directly, then delete `ENV_MUTEX`.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.130: Split-Lock State-Handling Overhaul (BACKLOG)
+
+**Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision. Phase 48 made state writes survivable with unique temp files, first-answer-wins gate
+publishing and the per-phase lock, not by restructuring state handling. The deferred design has
+five parts:
+- a short OS lock (`flock`) around every state write;
+- an `update_state(root, phase, |s| …)` API, with `State` consumed by value across blocking calls;
+- a launcher-to-monitor ownership token handoff;
+- gate-waiter registration;
+- fsync of the file and its directory.
+
+Parked for Phase 50, which rebuilds the monitor supervisor.
+
+**Revisit when (from 48-CONTEXT):**
+- Phase 49's live run, or any run, records a concurrent state write or an `advance_failed` refusal;
+- Phase 50's discussion reworks the monitor-to-`advance` handoff;
+- a new state writer appears that cannot take the per-phase lock.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.129: Ship Finalization-Retry Gate Recovery Is Unverified (BACKLOG)
+
+**Found:** Phase 48 D-05 (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision. Nobody has verified whether `devflow ship --phase N`, or anything else, consumes an answer
+at the Ship finalization-retry gate when nothing is waiting. D-05 names `ship` as the repair and
+relies on its ack guard to refuse. The 2026-09-22 Nyquist test
+`pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer` covers only a
+Code stage-failure gate; Validate and Ship finalization-retry gates have no equivalent test.
+
+**Fix shape:** not decided. Reproduce first: an answered finalization-retry gate with no live holder,
+then `devflow ship --phase N`.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.128: Lock Reclaim Ignores the Holder's Start Time (BACKLOG)
+
+**Found:** Phase 48 D-05 limits and `<deferred>` (`48-CONTEXT.md`), which defer it to Phase 50's
+liveness work. Phase 50's roadmap entry does not carry it, so it is filed here. The operator decided
+on 2026-09-22 to accept it as a Phase 48 limit and track it here.
+
+Confirmed at `395feb4`: `lock::acquire_after_existing` (`crates/devflow-core/src/lock.rs`) returns
+`Contended` whenever the recorded pid is alive and never compares the recorded start time. A lock
+whose pid an unrelated process has reused (`HolderStatus::Recycled`) therefore blocks every
+lock-taking verb until that process exits. Pinned examples:
+- `recover --clean` deletes nothing (`recover::tests::clean_phase_returns_without_cleanup_for_a_recycled_pid_lock`);
+- `stop` refuses to signal the recycled pid.
+
+**Why it matters for SURV-02:** at a gate whose holder is `Recycled`, `stop`, `gate` and `doctor`
+correctly say nothing is waiting. The repair they name (`resume`, `recover --clean`, or `ship` at
+Ship) then refuses for as long as the recycled pid lives. Success criterion 3 asks for "the repair
+that works", and in this case it does not work.
+
+**Fix shape (from 48-CONTEXT):** reclaim a lock by pid plus start time, so a live pid with a different
+start time counts as stale. It must stay serialised through the existing reclaim coordination
+(`stale_reclaim_is_serialized_before_it_removes_the_lock_path`).
+
+**Acceptance (proposed at filing, not operator-reviewed):** a lock whose pid is alive with a
+different start time is reclaimed; at a `Recycled` gate, the repair `stop`/`doctor` names succeeds;
+a lock held by a live process whose start time matches is never reclaimed.
+
 ### Phase 999.127: A `human-action` Gate Can Be Auto-Decided Because Another Checkpoint Is `blocking-human` (BACKLOG)
 
 **Found:** 2026-09-19, Phase 48 adversarial review finding D. The checkpoint
