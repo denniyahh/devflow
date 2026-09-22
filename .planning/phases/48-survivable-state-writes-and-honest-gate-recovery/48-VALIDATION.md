@@ -151,7 +151,12 @@ three defects after this audit. Each got a test that failed before its fix, with
 |---------|-------------|----------|-------------------|---------|--------|--------|
 | R-48-A | SURV-01 | The implicit `recover --clean` sweep keeps a stale phase whose per-phase lock is held | `cargo test -p devflow-core --lib recover::tests::clean_keeps_a_stale_phase_whose_lock_is_held -- --exact` | `recover::tests::clean_clears_stale_phase_state` | `fb2c4f8` | ✅ |
 | R-48-E | SURV-02 (T-48-16-03) | `gate approve|reject` writes no Ship response for a Recycled holder | `cargo test -p devflow --bin devflow commands::tests::gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing -- --exact` | `commands::tests::gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship` | `f1accee` | ✅ |
-| R-48-D | SURV-02 | `recover --clean` exits non-zero and says nothing was cleaned when refused; the sweep names what it cleared | `cargo test -p devflow --test recover_clean_e2e` (4 tests) | `explicit_clean_without_a_lock_holder_cleans_and_says_so`, `sweep_names_the_stale_phase_it_cleared` | `9a33c70` | ✅ |
+| R-48-D | SURV-02 | `recover --clean` exits non-zero and says nothing was cleaned when refused; the sweep names what it cleared | `cargo test -p devflow --test recover_clean_e2e` (5 tests since `d36936e`) | `explicit_clean_without_a_lock_holder_cleans_and_says_so`, `sweep_names_the_stale_phase_it_cleared` | `9a33c70` | ✅ |
+| R-48-D2 | SURV-02 | An explicit clean of a phase with nothing on disk says "nothing to clean" instead of claiming a cleanup | `cargo test -p devflow --test recover_clean_e2e explicit_clean_of_a_phase_with_nothing_to_clean_says_so -- --exact`; `recover::tests::clean_phase_report_finds_nothing_for_an_absent_phase` | `recover::tests::clean_phase_report_counts_a_lone_gate_file` | `d36936e` | ✅ |
+| R-48-G | SURV-02 | The sweep removes a cleared stale phase's gate files | `cargo test -p devflow-core --lib recover::tests::clean_removes_the_gate_files_of_a_stale_phase_it_clears -- --exact` | `recover::tests::clean_keeps_the_gate_files_of_a_phase_it_keeps` | `854bbce` | ✅ |
+
+R-48-D2 and R-48-G come from the fix-round review (`.planning/reviews/48-code-review-2026-09-22/fix-round/VERIFIED.md`),
+which also filed backlog 999.133 for three older false-success messages (`abort`, `cleanup`, `recover --phase` inspection).
 
 **Recorded limit (operator decision, 2026-09-22):** gate answers are not bound to a gate incarnation. A leftover
 answer, from a waiter killed within the poll window and then `resume`d, or from a late `Gates::respond` racing a
