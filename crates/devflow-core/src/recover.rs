@@ -135,6 +135,11 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
             }
             Err(err) => return Err(err.into()),
         };
+        // Same order as `clean_phase_report`: a gate left behind would outlive
+        // the state that explains it, and no command would answer it.
+        for stage in STAGES {
+            crate::gates::Gates::cleanup(project_root, phase, stage)?;
+        }
         workflow::clear_state(project_root, phase)?;
         cleared.push(phase);
     }
@@ -535,6 +540,50 @@ mod tests {
         clean(dir.path()).expect("clean");
 
         assert!(workflow::list_states(dir.path()).is_empty());
+    }
+
+    /// Fix-review finding (agy C-2): the sweep cleared a stale phase's state
+    /// but left its gate files, so `gate list` kept showing a gate no command
+    /// would answer. `clean_keeps_the_gate_files_of_a_phase_it_keeps` is the
+    /// opposite-result control.
+    #[test]
+    fn clean_removes_the_gate_files_of_a_stale_phase_it_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(53);
+        workflow::save_state(&state_aged_phase(
+            root,
+            phase,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(DEAD_PID),
+        ))
+        .unwrap();
+        Gates::write_gate(root, phase, Stage::Code, "left open").unwrap();
+
+        clean(root).expect("clean");
+
+        assert!(!workflow::state_path(root, phase).exists());
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "clearing a stale phase must also remove its gate files"
+        );
+    }
+
+    #[test]
+    fn clean_keeps_the_gate_files_of_a_phase_it_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(54);
+        workflow::save_state(&state_aged_phase(root, phase, 60, Some(DEAD_PID))).unwrap();
+        Gates::write_gate(root, phase, Stage::Code, "still fresh").unwrap();
+
+        clean(root).expect("clean");
+
+        assert!(workflow::state_path(root, phase).exists());
+        assert!(
+            Gates::gate_path(root, phase, Stage::Code).exists(),
+            "a kept phase must keep its gate files"
+        );
     }
 
     /// A monitor waiting at a gate holds the per-phase lock after its agent
