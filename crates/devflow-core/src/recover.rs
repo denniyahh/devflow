@@ -1387,6 +1387,31 @@ mod tests {
         );
     }
 
+    /// R-1: the sweep must retain an orphan cron-record removal in its
+    /// report, so a caller can name that cleanup instead of claiming it did
+    /// nothing.
+    #[test]
+    fn clean_report_retains_a_removed_orphan_cron_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(69);
+        let record = crate::ship::build_single_agent_cron_instructions(root, phase, "");
+        crate::ship::write_cron_instructions(root, &record).unwrap();
+        let record_path = crate::ship::cron_instructions_path(root, phase);
+
+        let report = clean_report(root).expect("clean");
+
+        assert!(
+            !record_path.exists(),
+            "the valid orphan cron record must be removed"
+        );
+        let rendered_report = format!("{report:?}");
+        assert!(
+            rendered_report.contains(&format!("{phase:?}")) && rendered_report.contains("cron"),
+            "the removed orphan cron record must remain reportable: {rendered_report}"
+        );
+    }
+
     /// WR-03 (48-REVIEW.md): `found_anything` was computed before the legacy
     /// `state.json` migration, so clearing a phase held only in the legacy
     /// file reported "nothing to clean" after deleting its state.
