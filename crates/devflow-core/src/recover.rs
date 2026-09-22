@@ -604,6 +604,25 @@ mod tests {
         .unwrap();
         let state_path = workflow::state_path(root, phase);
         let state_before = std::fs::read(&state_path).unwrap();
+        // The gate files a waiting monitor is blocked on: the sweep must not
+        // clean them either, so the lock has to be taken before gate cleanup
+        // as well as before the state delete.
+        Gates::write_gate(root, phase, Stage::Code, "waiting").unwrap();
+        std::fs::write(
+            Gates::response_path(root, phase, Stage::Code),
+            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
+        )
+        .unwrap();
+        std::fs::write(Gates::ack_path(root, phase, Stage::Code), "{}").unwrap();
+        let gate_paths = [
+            Gates::gate_path(root, phase, Stage::Code),
+            Gates::response_path(root, phase, Stage::Code),
+            Gates::ack_path(root, phase, Stage::Code),
+        ];
+        let gates_before: Vec<Vec<u8>> = gate_paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
         let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
         let lock_path = crate::lock::lock_path(root, phase);
         let lock_before = std::fs::read(&lock_path).unwrap();
@@ -615,6 +634,14 @@ mod tests {
             Some(state_before),
             "a stale phase whose lock is held must keep its state byte-identical"
         );
+        for (path, before) in gate_paths.iter().zip(gates_before) {
+            assert_eq!(
+                std::fs::read(path).ok(),
+                Some(before),
+                "a stale phase whose lock is held must keep {} byte-identical",
+                path.display()
+            );
+        }
         assert!(
             warnings
                 .iter()
