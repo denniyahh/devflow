@@ -1,0 +1,133 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-22T18:43:41.738Z",
+  "phase": 48,
+  "phase_name": "Survivable State Writes and Honest Gate Recovery",
+  "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
+  "plan": 17,
+  "task": 17,
+  "total_tasks": 17,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": "48-01..48-17",
+      "name": "Phase implementation and plan summaries",
+      "status": "done",
+      "commit": "through 4514ae3"
+    },
+    {
+      "id": "gate-container",
+      "name": "Pinned container gate re-established with a terminal result",
+      "status": "done",
+      "commit": "last full green run at 3ca90b6: exit 0, '==> check.sh: all OK', 1411 passed / 0 failed"
+    },
+    {
+      "id": "gate-nyquist",
+      "name": "Nyquist validation: compliant, one gap filled",
+      "status": "done",
+      "commit": "3a7f9a8 tests, 3c60cfb VALIDATION.md"
+    },
+    {
+      "id": "review-lead",
+      "name": "Agy's unreachable Recycled-holder message: confirmed race-only, removed",
+      "status": "done",
+      "commit": "395feb4"
+    },
+    {
+      "id": "backlog-deferrals",
+      "name": "Phase 48's five deferred ideas filed as 999.128-999.132",
+      "status": "done",
+      "commit": "3f6669b"
+    },
+    {
+      "id": "code-review",
+      "name": "codex + agy production-code review; 3 confirmed defects fixed, B recorded as a limit",
+      "status": "done",
+      "commit": "fb2c4f8, f1accee, 9a33c70, f745bd5"
+    },
+    {
+      "id": "fix-review",
+      "name": "codex + agy fix review; 2 more defects fixed, 3 older ones filed as 999.133",
+      "status": "done",
+      "commit": "d36936e, 854bbce, 41e3d46, ab37d90"
+    },
+    {
+      "id": "gate-security",
+      "name": "Security re-audit round 6: SECURED, threats_open 0, AR-48-04 recorded",
+      "status": "done",
+      "commit": "f73990f test, 47dfceb SECURITY.md"
+    },
+    {
+      "id": "flake-monitor",
+      "name": "Container-gate flake: Legacy monitor lost-TERM root-caused and fixed",
+      "status": "done",
+      "commit": "4fbe23c RED, 745ad9b harness, 3ca90b6 fix, 1515e0b session archived"
+    },
+    {
+      "id": "flake-probe",
+      "name": "OpenCode probe flake: not root-caused; diagnostics landed, filed as 999.135",
+      "status": "done",
+      "commit": "e683f89, 2e54770, 71d19a7"
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": "gate-verify",
+      "name": "Phase goal verification — the only Phase 48 tail gate never run",
+      "status": "not_started"
+    },
+    {
+      "id": "gate-container-head",
+      "name": "Re-run scripts/check-in-container.sh all at HEAD: the last FULL gate was at 3ca90b6, and e683f89 changed opencode.rs test code after it",
+      "status": "not_started"
+    },
+    {
+      "id": "phase-complete",
+      "name": "Phase completion and its state writes, after goal verification",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [],
+  "async_jobs": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "Do not push feature/phase-48 until ship.",
+      "rationale": "The repo's pre-push hook refuses .planning/ files on feature/* branches, and the operator declined both a workspace/ backup ref and an early code-only PR branch. All Phase 48 work is local-only.",
+      "phase": 48
+    },
+    {
+      "decision": "Accept the recycled-PID lock limit; track it as 999.128.",
+      "rationale": "Every lock-taking repair refuses while an unrelated process holds a recycled PID. 48-CONTEXT already deferred lock reclaim by pid+start time to Phase 50, but Phase 50's roadmap did not carry it.",
+      "phase": 48
+    },
+    {
+      "decision": "Stale gate answers (code review finding B) are a recorded Phase 48 limit, folded into 999.130, not fixed now.",
+      "rationale": "A real fix changes the gate protocol; the cheap fix would break the intended Supervise re-scan rejection reuse. Recorded as AR-48-04 in 48-SECURITY.md and marked superseded in 48-CONTEXT D-05.",
+      "phase": 48
+    },
+    {
+      "decision": "Fix A, D and E from the code review inside Phase 48; file the older false-success instances as the 999.133 class entry.",
+      "rationale": "A, D and E were bounded defects in code this phase touched; abort, cleanup and recover-inspect predate it.",
+      "phase": 48
+    },
+    {
+      "decision": "Fix the Legacy monitor lost-TERM race in this phase; backlog the PipeOwning equivalent as 999.134.",
+      "rationale": "The Legacy race was the recurring container-gate failure. PipeOwning needs its own failing test and design approval, and only an external TERM reaches it.",
+      "phase": 48
+    },
+    {
+      "decision": "Accept the OpenCode probe flake unreproduced; land diagnostics and file 999.135 rather than spend ~1h on 15 full-gate runs.",
+      "rationale": "The diagnostics make the next occurrence self-explaining; forcing it buys a faster answer, not a better one.",
+      "phase": 48
+    }
+  ],
+  "uncommitted_files": [
+    "?? .planning/research/.cache/",
+    "?? .planning/reviews/48-adversarial-recheck/",
+    "?? .planning/reviews/48-code-review-2026-09-22/codex-trace-tail.log",
+    "?? .planning/user/errors/"
+  ],
+  "next_action": "Run Phase 48 goal verification (the gsd-verifier / /gsd-verify-work path). Before claiming container parity at HEAD, re-run scripts/check-in-container.sh all and capture BOTH its exit code and the final '==> check.sh: all OK' line — the last full gate ran at 3ca90b6 and e683f89 changed test code afterwards.",
+  "context_notes": "All 17 plans plus every tail gate except goal verification are done. 25 commits this session, all local. The four untracked planning paths are deliberate and must be preserved. Two GSD debug sessions ran: monitor-sigterm-orphans-agent is resolved and archived; probe-sleep-survives-group-kill is intentionally left OPEN and not root-caused (resume with /gsd-debug continue probe-sleep-survives-group-kill). Treat the security register as fallible: this session found that two high threats had been closed on evidence covering one instance of a class, and the same instance-not-class pattern recurred in the code-review fixes."
+}
