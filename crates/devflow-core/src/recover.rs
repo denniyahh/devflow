@@ -15,6 +15,7 @@ pub const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Errors produced by recover operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RecoverError {
     /// No state file exists — nothing to recover.
     #[error("no state to recover — project is idle")]

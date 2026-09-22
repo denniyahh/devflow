@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 
 /// Errors produced while reading or writing workflow state.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WorkflowError {
     /// Filesystem operation failed.
     #[error("state I/O failed: {0}")]
