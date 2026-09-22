@@ -646,6 +646,31 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.133: Commands Report Success After a Failed or No-Op Action (BACKLOG)
+
+**Found:** 2026-09-22, the codex + agy review of Phase 48's code-review fixes. The operator decided to
+backlog these instances as one entry for the class. Phase 48 itself fixed two instances in
+`recover --clean` (`9a33c70`, `d36936e`). All three below predate Phase 48, and each was confirmed by
+reading the source at `854bbce`:
+
+- **`abort` (codex C-2, agy C-7).** `pipeline_gate::abort` (`crates/devflow-cli/src/pipeline_gate.rs`)
+  prints "workflow aborted for phase N" before doing any cleanup. It then discards the errors from
+  `Gates::cleanup` and `workflow::clear_state` (`let _ =`), emits `workflow_aborted` and returns `Ok(())`.
+  If the state cannot be removed, the run is reported and recorded as aborted while its state stays on
+  disk. codex reproduced this with the state path made a directory. The code dates from `33f7962`
+  (2026-07-22). abort sits on the gate-resolution path, so a fix needs its own tests.
+- **`devflow cleanup` (agy C-6).** `commands::cleanup` counts only successful removals. When every
+  worktree removal fails, it prints the per-worktree warning, then "no worktrees to clean up", and
+  exits 0.
+- **`devflow recover --phase N` inspection (agy S-1; agy marked it suspected, confirmed from source).**
+  Without `--clean`, when phase N has no state but other phases do, the phase filter skips every entry,
+  so the command prints nothing and exits 0.
+
+**Fix shape:** not decided. Each command should report only what it established, and exit non-zero
+when the action it was asked for did not happen.
+
+**Acceptance:** not decided; set at promotion.
+
 ### Phase 999.132: Gate List and Status Disagree After an Unwaited Ship Answer (BACKLOG)
 
 **Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
