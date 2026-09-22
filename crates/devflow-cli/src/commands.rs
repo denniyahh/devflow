@@ -2624,9 +2624,13 @@ pub(crate) fn recover_cmd(
                         join(&report.orphan_cron_records_removed)
                     );
                 }
+                if report.corrupt_legacy_state_removed {
+                    println!("removed unparsable legacy state.json");
+                }
                 if report.cleared.is_empty()
                     && report.orphan_gates_cleared.is_empty()
                     && report.orphan_cron_records_removed.is_empty()
+                    && !report.corrupt_legacy_state_removed
                 {
                     println!("no stale workflow state was cleaned");
                 }

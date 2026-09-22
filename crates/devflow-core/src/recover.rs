@@ -96,8 +96,9 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
 }
 
 /// What [`clean_report`] did: the phases whose state it cleared, the
-/// stateless phases whose orphaned gate files or cron records it removed, and
-/// warnings for anything it kept or could not remove.
+/// stateless phases whose orphaned gate files or cron records it removed,
+/// whether it removed an unparsable legacy state file, and warnings for
+/// anything it kept or could not remove.
 #[derive(Debug, Default)]
 pub struct CleanReport {
     /// Phases whose persisted state was cleared.
@@ -106,6 +107,8 @@ pub struct CleanReport {
     pub orphan_gates_cleared: Vec<PhaseId>,
     /// Phases with no state file whose leftover cron records were removed.
     pub orphan_cron_records_removed: Vec<PhaseId>,
+    /// Whether the unparsable legacy `.devflow/state.json` was removed.
+    pub corrupt_legacy_state_removed: bool,
     /// Whether a removal the sweep attempted failed. Each failure is also
     /// described in `warnings`.
     pub removal_failed: bool,
@@ -139,9 +142,7 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
     }
     sweep_orphan_gates(project_root, &mut report);
     match workflow::remove_corrupt_legacy_state(project_root) {
-        Ok(true) => report
-            .warnings
-            .push("removed unparsable legacy state.json".into()),
+        Ok(true) => report.corrupt_legacy_state_removed = true,
         Ok(false) => {}
         Err(err) => report.fail(format!("could not remove corrupt legacy state.json: {err}")),
     }
@@ -839,11 +840,22 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "{\"stage\":").unwrap();
 
-        clean(dir.path()).expect("clean");
+        let report = clean_report(dir.path()).expect("clean");
 
         assert!(
             !legacy.exists(),
             "recover --clean must remove an unparsable legacy state.json"
+        );
+        assert!(
+            report.corrupt_legacy_state_removed,
+            "the report must retain the corrupt legacy-state removal"
+        );
+
+        let no_legacy = tempfile::tempdir().unwrap();
+        let report = clean_report(no_legacy.path()).expect("clean without legacy state");
+        assert!(
+            !report.corrupt_legacy_state_removed,
+            "the report must not claim a legacy-state removal when no legacy file exists"
         );
     }
 
