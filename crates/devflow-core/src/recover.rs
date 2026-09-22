@@ -96,14 +96,16 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
 }
 
 /// What [`clean_report`] did: the phases whose state it cleared, the
-/// stateless phases whose orphaned gate files it removed, and warnings for
-/// anything it kept or could not remove.
+/// stateless phases whose orphaned gate files or cron records it removed, and
+/// warnings for anything it kept or could not remove.
 #[derive(Debug, Default)]
 pub struct CleanReport {
     /// Phases whose persisted state was cleared.
     pub cleared: Vec<PhaseId>,
     /// Phases with no state file whose leftover gate files were removed.
     pub orphan_gates_cleared: Vec<PhaseId>,
+    /// Phases with no state file whose leftover cron records were removed.
+    pub orphan_cron_records_removed: Vec<PhaseId>,
     /// Whether a removal the sweep attempted failed. Each failure is also
     /// described in `warnings`.
     pub removal_failed: bool,
@@ -161,6 +163,9 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
             project_root,
             instructions.phase,
         );
+        if removed {
+            report.orphan_cron_records_removed.push(instructions.phase);
+        }
         if let Err(err) = result {
             let partial = if removed {
                 " after removing its per-phase record"
@@ -1405,11 +1410,7 @@ mod tests {
             !record_path.exists(),
             "the valid orphan cron record must be removed"
         );
-        let rendered_report = format!("{report:?}");
-        assert!(
-            rendered_report.contains(&format!("{phase:?}")) && rendered_report.contains("cron"),
-            "the removed orphan cron record must remain reportable: {rendered_report}"
-        );
+        assert_eq!(report.orphan_cron_records_removed, vec![phase]);
     }
 
     /// WR-03 (48-REVIEW.md): `found_anything` was computed before the legacy
