@@ -300,7 +300,18 @@ pub fn spawn_monitor(
     envs: &[(String, String)],
     launch: MonitorLaunch,
 ) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(state, program, args, envs, launch, true)
+    spawn_monitor_inner(state, program, args, envs, launch, MonitorTail::Advance)
+}
+
+/// What the Legacy monitor runs after it records the agent's exit code.
+enum MonitorTail {
+    /// `devflow advance` for this phase and stage — every production launch.
+    Advance,
+    /// Test-only stand-in for `advance` (empty for none), so a test neither
+    /// re-execs the test binary as `devflow advance` nor loses the window in
+    /// which the monitor outlives its agent.
+    #[cfg(test)]
+    Script(String),
 }
 
 fn spawn_monitor_inner(
@@ -309,7 +320,7 @@ fn spawn_monitor_inner(
     args: &[String],
     envs: &[(String, String)],
     launch: MonitorLaunch,
-    run_advance: bool,
+    tail: MonitorTail,
 ) -> Result<u32, MonitorError> {
     let project_root = state
         .project_root
@@ -353,12 +364,12 @@ fn spawn_monitor_inner(
     let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
     if let MonitorLaunch::PipeOwning { prompt } = launch {
-        // `run_advance` is not consulted on this arm: the `__monitor`
+        // `tail` is not consulted on this arm: the `__monitor`
         // subcommand always advances after reaping, and `spawn_monitor` is the
-        // only caller of this function — it hardcodes `true`. Adding a
+        // only caller of this function — it hardcodes `Advance`. Adding a
         // `--no-advance` flag for a case nothing exercises would be an
         // untested branch; add it when a caller actually needs it.
-        let _ = run_advance;
+        let _ = tail;
 
         // The adapter's extra env rides down by INHERITANCE here (set via
         // `.envs(...)` on the `__monitor` process below), and that is only
@@ -493,10 +504,12 @@ fn spawn_monitor_inner(
         return Err(err.into());
     }
     let stop_file = stop_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
-    let advance_tail = if run_advance {
-        advance_tail(&binary, project_root, state)
-    } else {
-        String::new()
+    let advance_tail = match tail {
+        MonitorTail::Advance => advance_tail(&binary, project_root, state),
+        #[cfg(test)]
+        MonitorTail::Script(script) if script.is_empty() => String::new(),
+        #[cfg(test)]
+        MonitorTail::Script(script) => format!("; {script}"),
     };
     let script = format!(
         "apid=''; cleanup() {{ echo > {stop_file}; \
@@ -3233,8 +3246,8 @@ pid_t fork(void) {
     /// it spawns. Without that, the agent child finds the marker, exits 143
     /// without ever running, and the stage records a kill nobody sent.
     ///
-    /// `run_advance` is off so the monitor does not re-exec this test binary
-    /// as `devflow advance`; the marker handling does not depend on it.
+    /// The tail is empty so the monitor does not re-exec this test binary as
+    /// `devflow advance`; the marker handling does not depend on it.
     #[test]
     fn a_stale_stop_marker_does_not_stop_the_next_agent() {
         let dir = tempfile::tempdir().unwrap();
@@ -3247,7 +3260,15 @@ pid_t fork(void) {
             "echo STALE_MARKER_AGENT_RAN; exit 7".to_string(),
         ];
 
-        spawn_monitor_inner(&state, "sh", &args, &[], MonitorLaunch::Legacy, false).unwrap();
+        spawn_monitor_inner(
+            &state,
+            "sh",
+            &args,
+            &[],
+            MonitorLaunch::Legacy,
+            MonitorTail::Script(String::new()),
+        )
+        .unwrap();
 
         let exit_path = crate::agent_result::exit_code_path(dir.path(), state.phase);
         let mut recorded = None;
@@ -3278,6 +3299,104 @@ pid_t fork(void) {
         assert!(
             !marker.exists(),
             "the stale stop marker survived the launch that should have removed it"
+        );
+    }
+
+    /// WR-01 (48-REVIEW.md): a TERM that reaches the monitor after its agent
+    /// has been reaped — while the `advance` tail runs — must not act on the
+    /// agent. The shell defers the trap until the foreground tail returns, and
+    /// by then `advance` has launched the next stage's monitor, which removed
+    /// the phase's stop marker. A `cleanup` that writes the marker anyway stops
+    /// that next agent (exit 143) and `kill`s a pid reaped long ago.
+    ///
+    /// The tail stands in for `advance`: it announces itself, blocks until
+    /// released (capped at 10 s so a failed test cannot leak it), then exits 5.
+    /// `kill()` queues the TERM before it returns and the release comes after,
+    /// so the TERM always lands while the tail runs; and the monitor exiting 0
+    /// rather than the tail's 5 proves `cleanup` ran rather than being missed.
+    #[test]
+    fn a_term_after_the_agent_exits_leaves_no_stop_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        let marker = crate::agent_result::stop_marker_path(dir.path(), state.phase);
+        let started = dir.path().join("tail-started");
+        let release = dir.path().join("tail-release");
+        let tail = format!(
+            "sh -c 'echo > \"$1\"; i=0; while [ ! -e \"$2\" ] && [ $i -lt 500 ]; do \
+             sleep 0.02; i=$((i+1)); done; exit 5' tail {} {}",
+            shell_escape(started.to_str().unwrap()),
+            shell_escape(release.to_str().unwrap()),
+        );
+        let args = vec!["-c".to_string(), "exit 7".to_string()];
+        let monitor_pid = spawn_monitor_inner(
+            &state,
+            "sh",
+            &args,
+            &[],
+            MonitorLaunch::Legacy,
+            MonitorTail::Script(tail),
+        )
+        .unwrap();
+
+        let mut tail_running = false;
+        for _ in 0..250 {
+            if started.exists() {
+                tail_running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(tail_running, "the monitor never reached its tail");
+        let recorded =
+            std::fs::read_to_string(crate::agent_result::exit_code_path(dir.path(), state.phase))
+                .unwrap();
+        assert_eq!(
+            recorded.trim(),
+            "7",
+            "the tail runs only after the agent was reaped and its exit recorded"
+        );
+        let monitor_cmd = std::fs::read(format!("/proc/{monitor_pid}/cmdline")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&monitor_cmd).contains("trap cleanup TERM INT"),
+            "the monitor shell exec'd its tail, so no trap is left to test"
+        );
+
+        let rc = unsafe { libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(
+            rc,
+            0,
+            "kill(monitor, TERM): {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::write(&release, "").unwrap();
+
+        let pid = monitor_pid as libc::pid_t;
+        let mut status = None;
+        for _ in 0..600 {
+            let mut raw: libc::c_int = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG) };
+            if waited == pid {
+                status = Some(raw);
+                break;
+            }
+            assert_eq!(
+                waited,
+                0,
+                "waitpid(monitor): {}",
+                std::io::Error::last_os_error()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = status.expect("the monitor did not exit within 12s of its release");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the monitor must leave through its trap (`cleanup` → `exit 0`), not finish \
+             its tail (exit 5); wait status {status:#x}"
+        );
+        assert!(
+            !marker.exists(),
+            "a TERM after the agent was reaped wrote the phase's stop marker, which stops \
+             the next stage's agent before it runs"
         );
     }
 
