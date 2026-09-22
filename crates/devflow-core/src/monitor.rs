@@ -497,6 +497,16 @@ fn spawn_monitor_inner(
     // set as soon as the fork returns. The marker is removed in Rust before
     // the spawn, never by the script, so the agent launch stays the monitor's
     // first fork and a stale marker cannot stop the next agent.
+    //
+    // Once `wait` has reaped the agent, `cleanup` must leave it alone (WR-01,
+    // 48-REVIEW.md). The trap stays armed through the advance tail, and the
+    // shell defers it until that foreground command returns — after
+    // `advance` has launched the next stage's monitor, which removed the
+    // marker. Writing it then stops that next agent, and the `kill` targets a
+    // pid reaped long ago. `reaped` gates both; clearing `apid` would not,
+    // because `$!` still names the same pid. A TERM landing between `wait`
+    // returning and `reaped=1` still writes the marker, but the trap then
+    // exits before `advance` runs, so the next launch removes it as stale.
     let stop_path = crate::agent_result::stop_marker_path(&state.project_root, state.phase);
     if let Err(err) = std::fs::remove_file(&stop_path)
         && err.kind() != std::io::ErrorKind::NotFound
@@ -512,13 +522,13 @@ fn spawn_monitor_inner(
         MonitorTail::Script(script) => format!("; {script}"),
     };
     let script = format!(
-        "apid=''; cleanup() {{ echo > {stop_file}; \
-         [ -n \"${{apid:-$!}}\" ] && kill \"${{apid:-$!}}\" 2>/dev/null; exit 0; }}; \
+        "apid=''; reaped=''; cleanup() {{ if [ -z \"$reaped\" ]; then echo > {stop_file}; \
+         [ -n \"${{apid:-$!}}\" ] && kill \"${{apid:-$!}}\" 2>/dev/null; fi; exit 0; }}; \
          trap cleanup TERM INT; \
          cd {workdir} || exit 1; \
          {{ [ -e {stop_file} ] && exit 143; exec \"$@\"; }} > {stdout_file} 2>{stderr_file} & \
          apid=$!; echo $apid > {pid_file}; \
-         wait $apid; echo $? > {exit_file}{advance_tail}",
+         wait $apid; rc=$?; reaped=1; echo $rc > {exit_file}{advance_tail}",
         stop_file = shell_escape(stop_file),
         workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
