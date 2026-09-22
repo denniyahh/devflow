@@ -142,6 +142,30 @@ fn kill_probe_group(pid: u32) -> std::io::Result<bool> {
     }
 }
 
+// Test-only breadcrumb recording which containment path `spawn_with_timeout`
+// actually took, so a probe descendant that outlives the kill is explainable
+// from the failure output alone rather than only by re-reading that function.
+// `spawn_with_timeout` runs entirely on its caller's thread, so a thread-local
+// keeps parallel tests from overwriting each other's record.
+#[cfg(test)]
+thread_local! {
+    static LAST_PROBE_KILL_PATH: std::cell::RefCell<Option<(u32, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the kill path for [`LAST_PROBE_KILL_PATH`]. In non-test builds this
+/// is a no-op: `describe` is never called, so the diagnostic string is never
+/// built and no production behaviour changes.
+#[cfg(unix)]
+fn record_probe_kill_path(leader_pid: u32, describe: impl FnOnce() -> String) {
+    #[cfg(test)]
+    LAST_PROBE_KILL_PATH.with(|slot| *slot.borrow_mut() = Some((leader_pid, describe())));
+    #[cfg(not(test))]
+    {
+        let _ = (leader_pid, describe);
+    }
+}
+
 /// On Linux, make the process group established by `CommandExt::process_group`
 /// an inescapable containment boundary for the probe and every descendant it
 /// forks. A probe is only a small, non-interactive query; it has no legitimate
@@ -385,7 +409,14 @@ fn spawn_with_timeout(
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             {
                 let had_live_group_member = linux_group_has_live_member(child.id()).unwrap_or(true);
-                let _ = kill_probe_group(child.id())?;
+                let group_killed = kill_probe_group(child.id())?;
+                record_probe_kill_path(child.id(), || {
+                    format!(
+                        "leader-exited-unreaped branch: had_live_group_member={had_live_group_member}, \
+                         kill(-pgid, SIGKILL) reached the group={group_killed} \
+                         (false means ESRCH: the group was already empty)"
+                    )
+                });
                 let status = child.wait()?;
                 if had_live_group_member {
                     return Err(std::io::Error::new(
@@ -440,9 +471,18 @@ fn spawn_with_timeout(
         if std::time::Instant::now() >= deadline {
             #[cfg(unix)]
             {
-                if !kill_probe_group(child.id())? {
+                let group_killed = kill_probe_group(child.id())?;
+                if !group_killed {
                     let _ = child.kill();
                 }
+                record_probe_kill_path(child.id(), || {
+                    format!(
+                        "deadline branch: kill(-pgid, SIGKILL) reached the group={group_killed}, \
+                         child.kill() leader-only fallback used={} \
+                         (the fallback cannot reach descendants)",
+                        !group_killed
+                    )
+                });
             }
             #[cfg(not(unix))]
             let _ = child.kill();
@@ -801,6 +841,217 @@ mod tests {
             .expect("hanging stub pid is numeric")
     }
 
+    /// Diagnostic `/proc` snapshot for the probe-containment tests. A bare
+    /// liveness bool cannot separate "the SIGKILL never reached this process
+    /// group" from "it did, and this pid now names something else": that needs
+    /// the process's state, parent, process group and command line.
+    /// `starttime` is included so a `before`/`after` pair proves whether the
+    /// pid was recycled between them.
+    fn probe_proc_snapshot(pid: u32) -> String {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return format!("GONE (no /proc/{pid}/status)");
+        };
+        let field = |key: &str| {
+            status
+                .lines()
+                .find(|line| line.starts_with(key))
+                .map(|line| {
+                    line.split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "?".into())
+        };
+        // `/proc/<pid>/stat` past the comm field's closing paren runs state,
+        // ppid, pgrp, session, ... with starttime the 20th of those (field 22
+        // overall). `linux_group_has_live_member` reads pgrp at the same
+        // offset, and `probe_proc_snapshot_separates_a_live_process_from_a_
+        // reaped_one` pins it against a group this test created.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let past_comm = stat.rfind(')').map_or("", |close| &stat[close + 1..]);
+        let stat_field = |index: usize| past_comm.split_whitespace().nth(index).unwrap_or("?");
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                let joined = raw
+                    .split(|&byte| byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if joined.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    joined
+                }
+            })
+            .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+        format!(
+            "PRESENT Name={} State={} PPid={} pgid={} starttime={} cmdline=[{cmdline}]",
+            field("Name:"),
+            field("State:"),
+            field("PPid:"),
+            stat_field(2),
+            stat_field(19),
+        )
+    }
+
+    /// Every process still in `group`, so a survivor reads as "the whole probe
+    /// group outlived the SIGKILL" rather than only "this one pid did".
+    #[cfg(target_os = "linux")]
+    fn probe_group_snapshot(group: u32) -> String {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return "<unreadable /proc>".to_string();
+        };
+        let mut members = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
+            let mut fields = stat[close + 1..].split_whitespace();
+            let state = fields.next().unwrap_or("?").to_string();
+            let _ppid = fields.next();
+            let Some(pgrp) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pgrp == group {
+                members.push(format!("{pid}(State={state})"));
+            }
+        }
+        if members.is_empty() {
+            "<no members left>".to_string()
+        } else {
+            members.join(" ")
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn probe_group_snapshot(_group: u32) -> String {
+        "<process-group listing needs /proc>".to_string()
+    }
+
+    fn last_probe_kill_path() -> (Option<u32>, String) {
+        super::LAST_PROBE_KILL_PATH.with(|slot| match slot.borrow().as_ref() {
+            Some((leader_pid, path)) => (Some(*leader_pid), path.clone()),
+            None => (
+                None,
+                "<never recorded: spawn_with_timeout returned without killing anything>"
+                    .to_string(),
+            ),
+        })
+    }
+
+    /// Poll until the probe's recorded descendant is gone, then assert that it
+    /// is. On failure, dump everything needed to tell the candidate causes
+    /// apart: the 2026-09-22 flake
+    /// (`.planning/debug/probe-sleep-survives-group-kill.md`, 1 in ~35
+    /// container runs) was unexplainable precisely because this assertion used
+    /// to print a bare pid and nothing else.
+    ///
+    /// Do NOT widen the two-second window to make a failure here go away. The
+    /// probe kills with SIGKILL, which cannot be caught or deferred by the
+    /// target; a descendant still running two seconds later is a containment
+    /// defect, not a slow reap.
+    fn assert_probe_descendant_reaped(
+        pid: u32,
+        what: &str,
+        probe_error: &std::io::Error,
+        stub_dir: &tempfile::TempDir,
+    ) {
+        let before = probe_proc_snapshot(pid);
+        let started_polling = std::time::Instant::now();
+        let reaped_by = started_polling + std::time::Duration::from_secs(2);
+        let mut polls = 0u32;
+        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
+            polls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let still_running = crate::agent::agent_running(pid);
+        let after = probe_proc_snapshot(pid);
+        if !still_running {
+            return;
+        }
+        let waited = started_polling.elapsed();
+        let (leader_pid, kill_path) = last_probe_kill_path();
+        let group = leader_pid.map_or_else(
+            || "<no leader pid recorded>".to_string(),
+            probe_group_snapshot,
+        );
+        let leader = leader_pid.map_or_else(|| "<unrecorded>".to_string(), |pid| pid.to_string());
+        let pidfile = std::fs::read_to_string(stub_dir.path().join("opencode.pid"))
+            .map(|raw| raw.trim().to_string())
+            .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+        panic!(
+            "{what}: pid {pid} was still running {waited:?} after spawn_with_timeout returned\n\
+             \x20 probe error:      {probe_error} (kind {kind:?})\n\
+             \x20 kill path:        {kill_path}\n\
+             \x20 probe leader pid: {leader}\n\
+             \x20 stub pidfile:     {pidfile}\n\
+             \x20 polls:            {polls} x 20ms\n\
+             \x20 survivor before:  {before}\n\
+             \x20 survivor after:   {after}\n\
+             \x20 leader group now: {group}\n\
+             Read `kill path` first. `reached the group=false` means the group \
+             was already empty (ESRCH) and the leader-only `child.kill()` \
+             fallback ran, which by construction cannot reach this descendant. \
+             If the group kill did reach the group, compare `survivor after`'s \
+             pgid against the probe leader pid: a different pgid means the \
+             descendant left the group despite the pre-exec seccomp guard on \
+             setsid/setpgid. Same pgid with State=D means the SIGKILL is \
+             pending on a task in uninterruptible sleep — delivery is late, not \
+             lost. State=Z means `agent_running` counted a zombie as alive, \
+             which it is written not to do. GONE while the poll still reported \
+             it running means `/proc/<pid>/status` was unreadable and \
+             `is_zombie` defaulted to not-a-zombie, so the pid was already \
+             fully reaped. A Name or cmdline that is not the stub's `sleep`, or \
+             a starttime that differs between `before` and `after`, means this \
+             pid was recycled and probe containment is not implicated.",
+            kind = probe_error.kind(),
+        );
+    }
+
+    /// Negative control for the containment diagnostics themselves. A snapshot
+    /// that always printed `GONE`, or that read the wrong `stat` field as the
+    /// process group, would quietly turn every future containment failure back
+    /// into "no information" — the exact hole this session was opened to close.
+    /// So: one process that must read as present in a group this test created,
+    /// and the same pid after reaping, which must read as gone.
+    #[cfg(unix)]
+    #[test]
+    fn probe_proc_snapshot_separates_a_live_process_from_a_reaped_one() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/usr/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().expect("spawn the control sleep");
+        let pid = child.id();
+        let present = probe_proc_snapshot(pid);
+        child.kill().expect("kill the control sleep");
+        child.wait().expect("reap the control sleep");
+        let gone = probe_proc_snapshot(pid);
+        assert!(
+            present.starts_with("PRESENT"),
+            "a live process must read as present: {present}"
+        );
+        assert!(
+            present.contains("sleep 30"),
+            "the snapshot must show the real command line: {present}"
+        );
+        assert!(
+            present.contains(&format!("pgid={pid}")),
+            "the snapshot must read stat's pgrp field, and process_group(0) makes this child its own leader: {present}"
+        );
+        assert!(
+            gone.starts_with("GONE"),
+            "a reaped pid must read as gone, otherwise the snapshot cannot disconfirm survival: {gone}"
+        );
+    }
+
     fn child_opencode_stub_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(
             std::env::var_os(OPENCODE_STUB_DIR_ENV)
@@ -1002,13 +1253,11 @@ mod tests {
             .expect_err("a child sleeping 10s must not be allowed to finish under a 200ms bound");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let pid = hanging_stub_child_pid(&stub_dir);
-        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            !crate::agent::agent_running(pid),
-            "the timed-out probe's sleep descendant must be dead: pid {pid}"
+        assert_probe_descendant_reaped(
+            pid,
+            "the timed-out probe's sleep descendant must be dead",
+            &err,
+            &stub_dir,
         );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
@@ -1027,13 +1276,11 @@ mod tests {
             .expect_err("a silent same-group descendant must make the probe fail closed");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let pid = hanging_stub_child_pid(&stub_dir);
-        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            !crate::agent::agent_running(pid),
-            "the silent same-group descendant must be dead: pid {pid}"
+        assert_probe_descendant_reaped(
+            pid,
+            "the silent same-group descendant must be dead",
+            &err,
+            &stub_dir,
         );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
@@ -1051,13 +1298,11 @@ mod tests {
             .expect_err("a pipe-holding descendant must keep the probe from succeeding");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let pid = hanging_stub_child_pid(&stub_dir);
-        let reaped_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::agent::agent_running(pid) && std::time::Instant::now() < reaped_by {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            !crate::agent::agent_running(pid),
-            "the parent-exit probe's sleep descendant must be dead: pid {pid}"
+        assert_probe_descendant_reaped(
+            pid,
+            "the parent-exit probe's sleep descendant must be dead",
+            &err,
+            &stub_dir,
         );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
