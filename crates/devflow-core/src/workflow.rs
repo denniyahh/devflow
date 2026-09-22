@@ -20,6 +20,15 @@ pub enum WorkflowError {
     /// Filesystem operation failed.
     #[error("state I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// An orphaned state-write temporary file could not be removed.
+    #[error("could not remove orphaned state temp {path}: {source}")]
+    StateTempRemoval {
+        /// Temporary path whose removal failed.
+        path: PathBuf,
+        /// Filesystem error returned while removing the temporary path.
+        #[source]
+        source: std::io::Error,
+    },
     /// JSON parse or serialization failed.
     #[error("state JSON failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -333,14 +342,23 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
 /// file naming the same phase and orphaned write temps. Returns whether this
 /// call removed any file, so a caller can report only what it cleaned.
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
-    let (removed, result) = clear_state_with_partial_result(project_root, phase);
+    let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, false);
     result.map(|()| removed)
 }
 
-/// Clear state while retaining removals that happened before an error.
+/// Clear state for recovery while retaining removals that happened before an
+/// error, including a failed orphaned-temp removal.
 pub(crate) fn clear_state_with_partial_result(
     project_root: &Path,
     phase: PhaseId,
+) -> (bool, Result<(), WorkflowError>) {
+    clear_state_with_partial_result_impl(project_root, phase, true)
+}
+
+fn clear_state_with_partial_result_impl(
+    project_root: &Path,
+    phase: PhaseId,
+    report_temp_removal_failure: bool,
 ) -> (bool, Result<(), WorkflowError>) {
     let path = state_path(project_root, phase);
     let mut removed = false;
@@ -374,11 +392,21 @@ pub(crate) fn clear_state_with_partial_result(
             if !name.starts_with(&temp_prefix) || !name.ends_with(".tmp") {
                 continue;
             }
-            match std::fs::remove_file(entry.path()) {
+            let temp = entry.path();
+            match std::fs::remove_file(&temp) {
                 Ok(()) => removed = true,
+                Err(error) if report_temp_removal_failure => {
+                    return (
+                        removed,
+                        Err(WorkflowError::StateTempRemoval {
+                            path: temp,
+                            source: error,
+                        }),
+                    );
+                }
                 Err(error) => warn!(
                     "could not remove orphaned state temp {}: {error}",
-                    entry.path().display()
+                    temp.display()
                 ),
             }
         }
@@ -686,6 +714,28 @@ mod tests {
 
         assert!(!orphan_48.exists());
         assert!(orphan_49.exists());
+    }
+
+    #[test]
+    fn clear_state_warns_but_succeeds_when_an_orphan_temp_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        let path = state_path(dir.path(), phase);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "state").unwrap();
+        let orphan = path.with_file_name(format!(
+            ".{}.1.0.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        assert!(clear_state(dir.path(), phase).expect("clear"));
+
+        assert!(!path.exists(), "the state file was removed");
+        assert!(
+            orphan.is_dir(),
+            "the temp directory is the negative control for the warn-only path"
+        );
     }
 
     #[test]
