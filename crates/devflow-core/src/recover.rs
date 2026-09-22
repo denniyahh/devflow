@@ -106,6 +106,18 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
             ));
             continue;
         }
+        // A monitor waiting at a gate holds this lock after its agent exited,
+        // so staleness by agent pid alone cannot license the delete.
+        let _guard = match crate::lock::acquire(project_root, phase) {
+            Ok(guard) => guard,
+            Err(crate::lock::LockError::Contended { pid, .. }) => {
+                warnings.push(format!(
+                    "kept phase {phase} — its per-phase lock is live or contended by pid {pid}"
+                ));
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         workflow::clear_state(project_root, phase)?;
     }
     match workflow::remove_corrupt_legacy_state(project_root) {
@@ -469,6 +481,49 @@ mod tests {
         clean(dir.path()).expect("clean");
 
         assert!(workflow::list_states(dir.path()).is_empty());
+    }
+
+    /// A monitor waiting at a gate holds the per-phase lock after its agent
+    /// has exited, so an old run looks stale by agent pid alone. The implicit
+    /// sweep must take the lock like `clean_phase`, and keep the phase when it
+    /// cannot. `clean_clears_stale_phase_state` is the unlocked control.
+    #[test]
+    fn clean_keeps_a_stale_phase_whose_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4);
+        workflow::save_state(&state_aged_phase(
+            root,
+            phase,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(DEAD_PID),
+        ))
+        .unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let state_before = std::fs::read(&state_path).unwrap();
+        let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
+        let lock_path = crate::lock::lock_path(root, phase);
+        let lock_before = std::fs::read(&lock_path).unwrap();
+
+        let warnings = clean(root).expect("clean");
+
+        assert_eq!(
+            std::fs::read(&state_path).ok(),
+            Some(state_before),
+            "a stale phase whose lock is held must keep its state byte-identical"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&format!("kept phase {phase}")) && w.contains("lock")),
+            "the kept phase must be reported with its lock as the reason: {warnings:?}"
+        );
+        assert_eq!(
+            std::fs::read(&lock_path).ok(),
+            Some(lock_before),
+            "the sweep must leave the holder's lock file untouched"
+        );
+        drop(guard);
     }
 
     /// 14-CR-04: a corrupt legacy `state.json` (old binary killed mid-write)
