@@ -114,6 +114,33 @@ fn explicit_clean_without_a_lock_holder_cleans_and_says_so() {
     assert!(!devflow_core::workflow::state_path(root, phase).exists());
 }
 
+/// Fix-review finding C-3: `clean_phase` is idempotent, so an explicit clean
+/// of a phase with nothing on disk succeeded and printed "cleaned up".
+/// `explicit_clean_without_a_lock_holder_cleans_and_says_so` is the control.
+#[test]
+fn explicit_clean_of_a_phase_with_nothing_to_clean_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let phase = PhaseId::new(66);
+
+    let output = recover_clean(root, Some(phase));
+
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a no-op clean is not an error: {text}"
+    );
+    assert!(
+        text.contains("nothing to clean for phase 66"),
+        "a no-op clean must say it found nothing: {text}"
+    );
+    assert!(
+        !text.contains("cleaned up workflow state"),
+        "a no-op clean must not claim a cleanup: {text}"
+    );
+}
+
 #[test]
 fn sweep_that_clears_nothing_does_not_claim_a_cleanup() {
     let dir = tempfile::tempdir().unwrap();

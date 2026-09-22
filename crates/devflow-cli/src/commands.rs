@@ -2558,8 +2558,8 @@ pub(crate) fn recover_cmd(
             // Explicit phase: clear it regardless of staleness (14-CR-01's
             // escape hatch for a wedged-but-fresh run).
             Some(phase) => {
-                let warnings = match recover::clean_phase(project_root, phase) {
-                    Ok(warnings) => warnings,
+                let report = match recover::clean_phase_report(project_root, phase) {
+                    Ok(report) => report,
                     Err(recover::RecoverError::Lock(lock::LockError::Contended {
                         pid, ..
                     })) => {
@@ -2570,10 +2570,17 @@ pub(crate) fn recover_cmd(
                     }
                     Err(err) => return Err(err.into()),
                 };
-                for warning in &warnings {
+                for warning in &report.warnings {
                     println!("warning: {warning}");
                 }
-                println!("cleaned up workflow state for phase {phase}");
+                if report.found_anything {
+                    println!("cleaned up workflow state for phase {phase}");
+                } else {
+                    println!(
+                        "nothing to clean for phase {phase}: no workflow state, gate files or \
+                         cron record"
+                    );
+                }
             }
             // Implicit sweep: stale phases only.
             None => {
