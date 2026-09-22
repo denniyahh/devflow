@@ -181,7 +181,7 @@ before Phase 49's live unattended run measures the chain.
   7. **TEST-01 (999.38 + 999.80):** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: 17/17 plans executed in 11 waves
+**Plans**: 17/19 plans executed in 11 waves; 2 gap-closure plans pending (48-18, 48-19, from 48-VERIFICATION.md)
 
 **Wave 1**
 
@@ -232,6 +232,14 @@ before Phase 49's live unattended run measures the chain.
 **Wave 11**
 
 - [x] 48-14-PLAN.md *(depends on 48-16)*
+
+**Wave 12**
+
+- [ ] 48-18-PLAN.md *(depends on 48-14)* — gap closure, criterion 4: start-driven #200 arms (interrupted `start` wedges; live `start` self-resolves), advance arms renamed truthfully
+
+**Wave 13**
+
+- [ ] 48-19-PLAN.md *(depends on 48-18)* — gap closure, criterion 2: `start` refuses a phase whose recorded monitor or agent is live, test first; 999.136 recorded as a known limit
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
@@ -645,6 +653,30 @@ needs to be visible outside the repo, using the existing
 add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
+
+### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (BACKLOG)
+
+**Found:** 2026-09-22 by the Phase 48 gap planner while wording 48-19's refusal message.
+**Reasoned from source only — not reproduced.**
+
+**Defect:** with no open gate and no per-phase lock holder — the window while a Legacy agent is running
+and its monitor waits on it — `devflow stop --phase N` prints "no lock held for phase N — nothing is
+running `advance()`", signals nothing, and only sets `stopped=true` in the state. No production code acts
+on that flag: `advance` (`pipeline_launch.rs`) and `devflow-core` never read it; its only production
+readers are `resume` (which clears it) and doctor/cleanup (which report it). So `stop` in that window
+leaves the agent and monitor running, and the next stage launches anyway — an operator-facing command
+that reports success without stopping anything (the 999.133 class).
+
+**Relation:** 48-19's refusal message is worded around this limit (it tells the operator `stop` "would
+only mark the state stopped" in that window and names the pids to signal instead). 999.136 is the
+adjacent lock-free window between agent exit and `advance` taking the lock.
+
+**Fix shape (not decided):** either `advance` honours `stopped=true` at the next stage boundary, or `stop`
+signals the recorded monitor (SIGTERM to the Legacy monitor also ends its agent —
+`sigterm_to_monitor_also_kills_the_agent`), or both; `stop` must not claim a stop it did not perform.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test that runs `stop` against a live
+lock-free run first.
 
 ### Phase 999.137: Recover Sweep Does Not Reach Every Artifact It Resets (BACKLOG)
 
