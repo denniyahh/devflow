@@ -646,6 +646,31 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.136: Recover Sweep Deletes a Live Run Between Agent Exit and Advance (BACKLOG)
+
+**Found:** 2026-09-22, Phase 48 scoped code review (`48-REVIEW.md` WR-05, reviewed at `2070a65`).
+**Reasoned from code only — not reproduced.**
+
+**Defect:** `recover::clean_report` treats a phase as stale when `started_at` is older than 24 h and
+the agent-pid file names no live process (`is_stale_state`). `started_at` is written only by
+`State::new`, so any phase that has sat on a long gate is permanently "old" and only the agent pid
+protects it. In the Legacy flow no lock is held between the agent exiting (`wait $apid` returns) and
+the monitor tail's `devflow advance` acquiring the phase lock. A sweep landing in that window sees a
+dead agent and an old `started_at`, takes the free lock, and deletes the live run's state and — since
+`854bbce` — its gate files; `advance` then fails on missing state. `state.monitor_pid` is never
+consulted, and the staleness decision uses the pre-lock `list_states` snapshot without re-checking
+once the lock is held. `inspect_state` has the same blind spot.
+
+**Why backlog, not Phase 48:** it predates Phase 48 (Phase 48 only widened what the sweep deletes);
+the operator split it out when choosing to fix WR-01..WR-04 inside the phase (2026-09-22).
+
+**Fix shape (reviewer's suggestion, not decided):** after taking the phase lock, reload the state and
+re-run the staleness checks; treat an identity-checked live `state.monitor_pid` as not stale; give
+`inspect_state` the same monitor check.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test that holds the agent-exited /
+advance-not-yet-locked window open before any fix.
+
 ### Phase 999.135: Probe Descendant Survives the Group Kill Under Full-Gate Load (BACKLOG)
 
 **Found:** 2026-09-22, in a full `scripts/check-in-container.sh all` at `1d93895`:
