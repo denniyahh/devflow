@@ -646,6 +646,39 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.135: Probe Descendant Survives the Group Kill Under Full-Gate Load (BACKLOG)
+
+**Found:** 2026-09-22, in a full `scripts/check-in-container.sh all` at `1d93895`:
+`agents::opencode::tests::spawn_with_timeout_kills_a_hung_child` failed with `the timed-out probe's
+sleep descendant must be dead: pid 11529` — the stub's `sleep` was still alive 2 s after
+`spawn_with_timeout` SIGKILLed the probe's process group. **Not root-caused**; the open session is
+`.planning/debug/probe-sleep-survives-group-kill.md` (`/gsd-debug continue probe-sleep-survives-group-kill`).
+
+**Rate, and why the regime matters:** 1 of 5 full-gate runs that day, against 0 of 70 bare
+`cargo test -p devflow-core --lib` container runs (30 + a 40-run campaign at `e683f89`). The bare loop
+cannot distinguish "gone" from "load-gated", so its green runs are not evidence the containment is
+sound. A full gate (fmt + clippy + build, then 830 parallel tests on `taskset -c 0,1`) is a far heavier
+load than the loop.
+
+**Leading hypothesis (UNTESTED, zero supporting measurements):** the SIGKILL reached the group and the
+containment is correct, but the dying `sleep` was not scheduled to process it within the 2-second poll;
+until it runs, `/proc/<pid>/status` reads `State: R`, which `agent_running` correctly calls alive. If a
+dump confirms that, the defect is the assertion measuring scheduler latency, and the fix is a redesign
+of the check — **not** widening the window.
+
+**Diagnostics are already in place (`e683f89`).** On failure the three probe-containment tests dump the
+survivor's Name/State/PPid/pgid/starttime/cmdline before and after the poll, the stub's recorded pid,
+what remains of the probe's process group, the probe error, and which kill path ran (group kill reached,
+or the ESRCH leader-only fallback). Seven candidate causes have distinct signatures, tabulated in the
+session file. The dump is test-only: in non-test builds the closure is never invoked. A negative control
+(`probe_proc_snapshot_separates_a_live_process_from_a_reaped_one`) keeps a future snapshot from silently
+reading `GONE` for everything.
+
+**Fix shape:** not decided — the cause is unknown. Next step is evidence, not a patch: read the dump
+from the next natural full-gate failure, or force it with ~15 repeated full-gate runs (~1 h).
+
+**Acceptance:** not decided; set at promotion.
+
 ### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (BACKLOG)
 
 **Found:** 2026-09-22, while debugging the Legacy monitor's lost-TERM flake
