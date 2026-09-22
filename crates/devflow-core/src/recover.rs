@@ -91,6 +91,23 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// not survive an operator-driven reset. Returns warnings for anything kept
 /// or that could not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
+    clean_report(project_root).map(|report| report.warnings)
+}
+
+/// What [`clean_report`] did: the phases whose state it cleared, and warnings
+/// for anything it kept or could not remove.
+#[derive(Debug, Default)]
+pub struct CleanReport {
+    /// Phases whose persisted state was cleared.
+    pub cleared: Vec<PhaseId>,
+    /// Phases kept, and removals that failed, in human-readable form.
+    pub warnings: Vec<String>,
+}
+
+/// [`clean`], reporting which phases it cleared so a caller can say so
+/// instead of claiming a cleanup that did not happen.
+pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
+    let mut cleared = Vec::new();
     let mut warnings = Vec::new();
     for state in workflow::list_states(project_root) {
         let phase = state.phase;
@@ -119,6 +136,7 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
             Err(err) => return Err(err.into()),
         };
         workflow::clear_state(project_root, phase)?;
+        cleared.push(phase);
     }
     match workflow::remove_corrupt_legacy_state(project_root) {
         Ok(true) => warnings.push("removed unparsable legacy state.json".into()),
@@ -139,22 +157,17 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
             ));
         }
     }
-    Ok(warnings)
+    Ok(CleanReport { cleared, warnings })
 }
 
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
 /// escape hatch for a wedged-but-fresh run. Clears its state and cron
 /// record; warns (but proceeds) when the recorded agent still looks alive.
+/// Deletes nothing and returns [`RecoverError::Lock`] with
+/// [`crate::lock::LockError::Contended`] when the per-phase lock is live or
+/// contended, so a refused clean cannot read as a successful one.
 pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
-    let guard = match crate::lock::acquire(project_root, phase) {
-        Ok(guard) => guard,
-        Err(crate::lock::LockError::Contended { pid, .. }) => {
-            return Ok(vec![format!(
-                "phase {phase} is live or contended by pid {pid}; recover --clean deleted neither state nor gate files"
-            )]);
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let guard = crate::lock::acquire(project_root, phase)?;
 
     let mut warnings = Vec::new();
     if let Ok(state) = workflow::load_state(project_root, phase)
@@ -633,13 +646,14 @@ mod tests {
         let mut before = artifact_bytes(&paths);
         before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
 
-        let warnings = clean_phase(root, phase).expect("contended clean reports warning");
+        let err = clean_phase(root, phase).expect_err("a contended clean must be refused");
 
         assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("live or contended")),
-            "contention must be reported: {warnings:?}"
+            matches!(
+                err,
+                RecoverError::Lock(crate::lock::LockError::Contended { .. })
+            ),
+            "contention must be reported as a lock refusal: {err:?}"
         );
         for (path, contents) in before {
             assert_eq!(
@@ -673,13 +687,14 @@ mod tests {
         let mut before = artifact_bytes(&paths);
         before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
 
-        let warnings = clean_phase(root, phase).expect("recycled lock reports warning");
+        let err = clean_phase(root, phase).expect_err("a recycled-pid lock must be refused");
 
         assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("live or contended")),
-            "acquisition contention, not read-only classification, controls cleanup: {warnings:?}"
+            matches!(
+                err,
+                RecoverError::Lock(crate::lock::LockError::Contended { .. })
+            ),
+            "acquisition contention, not read-only classification, controls cleanup: {err:?}"
         );
         for (path, contents) in before {
             assert_eq!(
