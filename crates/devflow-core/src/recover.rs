@@ -152,10 +152,19 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
         if workflow::state_path(project_root, instructions.phase).exists() {
             continue;
         }
-        if let Err(err) = crate::ship::delete_cron_instructions(project_root, instructions.phase) {
+        let (removed, result) = crate::ship::delete_cron_instructions_with_partial_result(
+            project_root,
+            instructions.phase,
+        );
+        if let Err(err) = result {
+            let partial = if removed {
+                " after removing its per-phase record"
+            } else {
+                ""
+            };
             report.fail(format!(
-                "could not remove cron-instructions for phase {}: {err}",
-                instructions.phase
+                "could not remove cron-instructions for phase {}{partial}: {err}",
+                instructions.phase,
             ));
         }
     }
@@ -185,18 +194,33 @@ fn sweep_phase(project_root: &Path, state: &State, report: &mut CleanReport) {
     // Same order as `clean_phase_report`: a gate left behind would outlive
     // the state that explains it, and no command would answer it. So a
     // failed gate removal keeps the state.
-    if let Err(err) = remove_gate_files(project_root, phase) {
+    let (gates_removed, gate_result) = remove_gate_files(project_root, phase);
+    if let Err(err) = gate_result {
+        let partial = if gates_removed {
+            " after removing some of its gate files"
+        } else {
+            ""
+        };
         report.fail(format!(
-            "kept phase {phase}'s state — could not remove all of its gate files: {err}"
+            "kept phase {phase}'s state{partial} — could not remove all of its gate files: {err}"
         ));
         return;
     }
-    match workflow::clear_state(project_root, phase) {
-        Ok(true) => report.cleared.push(phase),
-        Ok(false) => {}
-        Err(err) => report.fail(format!(
-            "could not clear phase {phase}'s state after removing its gate files: {err}"
-        )),
+    let (state_removed, state_result) =
+        workflow::clear_state_with_partial_result(project_root, phase);
+    match state_result {
+        Ok(()) if state_removed => report.cleared.push(phase),
+        Ok(()) => {}
+        Err(err) => {
+            let partial = if state_removed {
+                " after removing some of its state files"
+            } else {
+                ""
+            };
+            report.fail(format!(
+                "could not clear phase {phase}'s state{partial} after removing its gate files: {err}"
+            ));
+        }
     }
 }
 
@@ -216,10 +240,20 @@ fn sweep_orphan_gates(project_root: &Path, report: &mut CleanReport) {
         if workflow::state_path(project_root, phase).exists() {
             continue;
         }
-        match remove_gate_files(project_root, phase) {
-            Ok(true) => report.orphan_gates_cleared.push(phase),
-            Ok(false) => {}
-            Err(err) => report.fail(format!("could not remove all of {what} {phase}: {err}")),
+        let (removed, result) = remove_gate_files(project_root, phase);
+        match result {
+            Ok(()) if removed => report.orphan_gates_cleared.push(phase),
+            Ok(()) => {}
+            Err(err) => {
+                let partial = if removed {
+                    " after removing some of them"
+                } else {
+                    ""
+                };
+                report.fail(format!(
+                    "could not remove all of {what} {phase}{partial}: {err}"
+                ));
+            }
         }
     }
 }
@@ -248,13 +282,21 @@ fn lock_for_sweep(
     }
 }
 
-/// Remove every stage's gate files for `phase`; whether any file went.
-fn remove_gate_files(project_root: &Path, phase: PhaseId) -> Result<bool, crate::gates::GateError> {
+/// Remove every stage's gate files for `phase`, retaining partial removal on error.
+fn remove_gate_files(
+    project_root: &Path,
+    phase: PhaseId,
+) -> (bool, Result<(), crate::gates::GateError>) {
     let mut removed = false;
     for stage in STAGES {
-        removed |= crate::gates::Gates::cleanup(project_root, phase, stage)?;
+        let (stage_removed, result) =
+            crate::gates::Gates::cleanup_with_partial_result(project_root, phase, stage);
+        removed |= stage_removed;
+        if let Err(error) = result {
+            return (removed, Err(error));
+        }
     }
-    Ok(removed)
+    (removed, Ok(()))
 }
 
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
@@ -318,25 +360,32 @@ pub fn clean_phase_report(
 }
 
 fn clean_phase_files(project_root: &Path, phase: PhaseId, report: &mut PhaseCleanReport) {
-    match remove_gate_files(project_root, phase) {
-        Ok(removed) => report.removed_anything |= removed,
+    let (gates_removed, gate_result) = remove_gate_files(project_root, phase);
+    report.removed_anything |= gates_removed;
+    match gate_result {
+        Ok(()) => {}
         Err(err) => {
             return report.fail(format!(
                 "kept phase {phase}'s state — could not remove all of its gate files: {err}"
             ));
         }
     }
-    match workflow::clear_state(project_root, phase) {
-        Ok(removed) => report.removed_anything |= removed,
+    let (state_removed, state_result) =
+        workflow::clear_state_with_partial_result(project_root, phase);
+    report.removed_anything |= state_removed;
+    match state_result {
+        Ok(()) => {}
         Err(err) => {
             return report.fail(format!(
                 "kept phase {phase}'s cron record — could not clear its state: {err}"
             ));
         }
     }
-    match crate::ship::delete_cron_instructions(project_root, phase) {
-        Ok(removed) => report.removed_anything |= removed,
-        Err(err) => report.fail(format!("could not remove cron-instructions: {err}")),
+    let (cron_removed, cron_result) =
+        crate::ship::delete_cron_instructions_with_partial_result(project_root, phase);
+    report.removed_anything |= cron_removed;
+    if let Err(err) = cron_result {
+        report.fail(format!("could not remove cron-instructions: {err}"));
     }
 }
 

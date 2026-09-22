@@ -323,6 +323,16 @@ impl Gates {
     /// orphaned write temps. Idempotent. Returns whether this call removed
     /// any file, so a caller can report only what it actually cleaned.
     pub fn cleanup(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<bool, GateError> {
+        let (removed, result) = Self::cleanup_with_partial_result(project_root, phase, stage);
+        result.map(|()| removed)
+    }
+
+    /// Clean up a gate while retaining removals that happened before an error.
+    pub(crate) fn cleanup_with_partial_result(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (bool, Result<(), GateError>) {
         let paths = [
             Self::gate_path(project_root, phase, stage),
             Self::response_path(project_root, phase, stage),
@@ -331,13 +341,15 @@ impl Gates {
         let mut removed = false;
         for path in &paths {
             if path.exists() {
-                std::fs::remove_file(path)?;
+                if let Err(error) = std::fs::remove_file(path) {
+                    return (removed, Err(error.into()));
+                }
                 removed = true;
             }
         }
         let dir = Self::dir(project_root);
         let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(removed);
+            return (removed, Ok(()));
         };
         let prefixes = paths
             .iter()
@@ -349,15 +361,20 @@ impl Gates {
             })
             .collect::<Vec<_>>();
         for entry in entries {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => return (removed, Err(error.into())),
+            };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.ends_with(".tmp") && prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-                std::fs::remove_file(entry.path())?;
+                if let Err(error) = std::fs::remove_file(entry.path()) {
+                    return (removed, Err(error.into()));
+                }
                 removed = true;
             }
         }
-        Ok(removed)
+        (removed, Ok(()))
     }
 }
 
@@ -574,6 +591,30 @@ mod tests {
         assert!(!Gates::ack_path(dir.path(), PhaseId::new(11), Stage::Validate).exists());
         // Idempotent: cleaning again with nothing present succeeds.
         Gates::cleanup(dir.path(), PhaseId::new(11), Stage::Validate).unwrap();
+    }
+
+    #[test]
+    fn cleanup_retains_an_earlier_removal_when_a_later_path_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(12);
+        let stage = Stage::Validate;
+        let gate = Gates::gate_path(dir.path(), phase, stage);
+        let response = Gates::response_path(dir.path(), phase, stage);
+        Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        std::fs::create_dir_all(&response).unwrap();
+
+        let (removed, result) = Gates::cleanup_with_partial_result(dir.path(), phase, stage);
+
+        assert!(
+            removed,
+            "the gate file was removed before the response failed"
+        );
+        assert!(result.is_err(), "the response directory must fail removal");
+        assert!(!gate.exists(), "the earlier gate removal must persist");
+        assert!(
+            response.is_dir(),
+            "the response directory is the negative control"
+        );
     }
 
     #[test]
