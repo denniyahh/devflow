@@ -1875,12 +1875,6 @@ pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> 
     } else {
         stop_via_lock(project_root, phase)?
     };
-    if matches!(
-        gate_holder,
-        Some((_, lock::HolderStatus::Recycled { .. }, _))
-    ) {
-        println!("stop: phase {phase}'s lock holder was recycled; treating it as no waiter");
-    }
     persist_stopped_state(
         project_root,
         phase,
