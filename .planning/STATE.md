@@ -6,8 +6,8 @@ current_phase: 48
 current_phase_name: Survivable State Writes and Honest Gate Recovery
 current_plan: 14
 status: executing
-stopped_at: Phase 48 tail gates done except goal verification; container-gate flake investigated: Legacy monitor lost-TERM fixed (3ca90b6), 999.134/999.135 filed; next: phase goal verification
-last_updated: "2026-09-22T18:05:00Z"
+stopped_at: Phase 48 goal verification ran: gaps_found 6/7 (criterion 4: #200 repro interrupts advance, not start; criterion 2 exclusion scope needs an operator ruling); review-fix rounds WR-01..04 and R-1/R-3..R-6 landed through a692468, container gate green 1437/0; next: operator decision on criterion 4 and 2, then /gsd-plan-phase 48 --gaps
+last_updated: "2026-09-22T21:45:00Z"
 last_activity: 2026-09-22
 last_activity_desc: Phase 48 container-gate flake investigation and monitor TERM fix
 state_head: be6e496f5baf0712dcd38c1c931680be0ff5c1fa
@@ -192,7 +192,7 @@ Phase: 48 (Survivable State Writes and Honest Gate Recovery) — EXECUTING
 Plans: 17 plans in 11 waves (48-01..48-17)
 Current Plan: 14
 Total Plans in Phase: 17
-Completed Plans: 17 of 17 (tail gates pending: security, Nyquist, MemPalace, goal verification)
+Completed Plans: 17 of 17 (security, Nyquist and code review done; goal verification: gaps_found 6/7; MemPalace capture runs after verification passes)
 Status: Executing Phase 48
 Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
@@ -950,8 +950,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-09-22T18:05:00Z
-**Stopped at:** Phase 48 tail gates done except goal verification; container-gate flake investigated: Legacy monitor lost-TERM fixed (3ca90b6), 999.134/999.135 filed; next: phase goal verification
+**Last session:** 2026-09-22T21:45:00Z
+**Stopped at:** Phase 48 goal verification ran: gaps_found 6/7 (criterion 4: #200 repro interrupts advance, not start; criterion 2 exclusion scope needs an operator ruling); review-fix rounds WR-01..04 and R-1/R-3..R-6 landed through a692468, container gate green 1437/0; next: operator decision on criterion 4 and 2, then /gsd-plan-phase 48 --gaps
 **Resume file:** None
 
 ## Operator Next Steps
