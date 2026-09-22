@@ -851,4 +851,185 @@ mod tests {
             );
         }
     }
+
+    /// WR-02 (48-REVIEW.md): gate files whose phase has no state file — left by
+    /// a pre-`854bbce` sweep, or by `abort` for another stage — were never
+    /// reached, because the sweep only cleaned gates inside its per-state loop.
+    /// `clean_keeps_the_orphan_gate_files_of_a_locked_phase` is the control.
+    #[test]
+    fn clean_removes_the_gate_files_of_a_phase_with_no_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(9);
+        Gates::write_gate(root, phase, Stage::Code, "orphaned").unwrap();
+        Gates::write_gate(root, phase, Stage::Validate, "orphaned").unwrap();
+        Gates::respond(
+            root,
+            phase,
+            Stage::Validate,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        Gates::ack(root, phase, Stage::Validate).unwrap();
+        assert!(!workflow::state_path(root, phase).exists());
+        assert_eq!(Gates::list_open(root).len(), 1, "fixture: one open gate");
+
+        clean(root).expect("clean");
+
+        for path in [
+            Gates::gate_path(root, phase, Stage::Code),
+            Gates::gate_path(root, phase, Stage::Validate),
+            Gates::response_path(root, phase, Stage::Validate),
+            Gates::ack_path(root, phase, Stage::Validate),
+        ] {
+            assert!(
+                !path.exists(),
+                "the sweep must remove orphan gate file {}",
+                path.display()
+            );
+        }
+        assert!(Gates::list_open(root).is_empty());
+    }
+
+    /// Control: an orphan gate whose phase lock is held is left alone, like a
+    /// locked phase's state.
+    #[test]
+    fn clean_keeps_the_orphan_gate_files_of_a_locked_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(10);
+        Gates::write_gate(root, phase, Stage::Code, "held").unwrap();
+        let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
+
+        let warnings = clean(root).expect("clean");
+
+        assert!(
+            Gates::gate_path(root, phase, Stage::Code).exists(),
+            "an orphan gate under a held lock must be kept"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&format!("phase {phase}")) && w.contains("lock")),
+            "the kept orphan gate must be reported with its lock as the reason: {warnings:?}"
+        );
+        drop(guard);
+    }
+
+    /// A state file that cannot be parsed is skipped by `list_states`, so its
+    /// phase was dropped from the sweep without a word. It must be kept — a
+    /// newer binary may have written it — but reported.
+    #[test]
+    fn clean_reports_a_phase_whose_state_cannot_be_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(11);
+        let state_path = workflow::state_path(root, phase);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, "{\"stage\":").unwrap();
+        Gates::write_gate(root, phase, Stage::Code, "behind corrupt state").unwrap();
+
+        let warnings = clean(root).expect("clean");
+
+        assert!(state_path.exists(), "an unparsable state file must be kept");
+        assert!(
+            Gates::gate_path(root, phase, Stage::Code).exists(),
+            "the gates of a phase with unparsable state must be kept with it"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&format!("kept phase {phase}")) && w.contains("parse")),
+            "a phase kept for unparsable state must be reported: {warnings:?}"
+        );
+    }
+
+    /// WR-04 (48-REVIEW.md): one phase's failed gate removal aborted the whole
+    /// sweep with `?`, hiding phases already cleared and skipping the rest.
+    /// The failing phase must keep its state (its gate is still there to
+    /// explain) and be reported; the other phase must still be cleared.
+    #[test]
+    fn a_failed_gate_removal_does_not_abort_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let failing = PhaseId::new(61);
+        let healthy = PhaseId::new(62);
+        for phase in [failing, healthy] {
+            workflow::save_state(&state_aged_phase(
+                root,
+                phase,
+                STALE_THRESHOLD.as_secs() + 60,
+                Some(DEAD_PID),
+            ))
+            .unwrap();
+        }
+        // A directory where a gate file belongs: `remove_file` fails EISDIR.
+        std::fs::create_dir_all(Gates::gate_path(root, failing, Stage::Code)).unwrap();
+
+        let report = clean_report(root).expect("one phase's failure must not abort the sweep");
+
+        assert_eq!(report.cleared, vec![healthy]);
+        assert!(
+            workflow::state_path(root, failing).exists(),
+            "a phase whose gates could not be removed must keep its state"
+        );
+        assert!(!workflow::state_path(root, healthy).exists());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("phase {failing}")) && w.contains("gate")),
+            "the failed phase must be reported: {:?}",
+            report.warnings
+        );
+    }
+
+    /// WR-03 (48-REVIEW.md): `found_anything` was computed before the legacy
+    /// `state.json` migration, so clearing a phase held only in the legacy
+    /// file reported "nothing to clean" after deleting its state.
+    #[test]
+    fn clean_phase_report_counts_legacy_state_it_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(7);
+        let legacy = workflow::legacy_state_path(root);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let state = state_aged_phase(root, phase, 0, None);
+        std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(!legacy.exists());
+        assert!(!workflow::state_path(root, phase).exists());
+        assert!(
+            report.found_anything,
+            "removing a phase's legacy state is a cleanup, not \"nothing to clean\""
+        );
+    }
+
+    /// WR-03: a removal that fails is not a cleanup. The only artifact here is
+    /// a cron record that cannot be removed (a directory in its place).
+    #[test]
+    fn clean_phase_report_does_not_count_a_failed_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(8);
+        std::fs::create_dir_all(crate::ship::cron_instructions_path(root, phase)).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(
+            !report.found_anything,
+            "a cron record that could not be removed must not count as cleaned"
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.contains("cron")),
+            "the failed removal must be reported: {:?}",
+            report.warnings
+        );
+    }
 }
