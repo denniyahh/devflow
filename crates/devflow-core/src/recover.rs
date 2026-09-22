@@ -865,6 +865,38 @@ mod tests {
         assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
     }
 
+    /// R-5: an earlier successful gate removal remains reportable when a
+    /// later stage's gate path cannot be removed.
+    #[test]
+    fn clean_phase_report_preserves_earlier_gate_removal_when_later_gate_removal_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(61);
+        let early_gate = Gates::gate_path(root, phase, Stage::Define);
+        let later_gate = Gates::gate_path(root, phase, Stage::Plan);
+        Gates::write_gate(root, phase, Stage::Define, "leftover").unwrap();
+        std::fs::create_dir_all(&later_gate).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(
+            !early_gate.exists(),
+            "the early Define gate must have been removed before the failure"
+        );
+        assert!(
+            later_gate.is_dir(),
+            "the Plan gate directory is the negative control for this failure"
+        );
+        assert!(
+            report.removal_failed,
+            "the Plan gate directory must be reported as a failed removal"
+        );
+        assert!(
+            report.removed_anything,
+            "the Define gate was removed before the Plan removal failed"
+        );
+    }
+
     #[test]
     fn clean_phase_removes_gate_files_when_no_process_holds_the_lock() {
         let dir = tempfile::tempdir().unwrap();
