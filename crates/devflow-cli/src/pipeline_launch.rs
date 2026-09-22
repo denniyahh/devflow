@@ -2253,6 +2253,157 @@ mod tests {
         );
     }
 
+    /// A phase parked at an open, already-answered Code gate: the state says
+    /// `gate_pending`, the request file is on disk, and an unconsumed response
+    /// sits beside it. Returns the (request, response) bytes as planted.
+    fn seed_code_gate_with_pending_answer(
+        root: &Path,
+        phase: PhaseId,
+        mode: Mode,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_pending = true;
+        state.stopped = true;
+        state.stop_reason = Some("stage failed; gate open".to_string());
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            "[never-silent] stage code failed — human review needed",
+        )
+        .unwrap();
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: stale answer nobody polled","responded_by":"test"}"#,
+        )
+        .unwrap();
+        (
+            std::fs::read(Gates::gate_path(root, phase, Stage::Code)).unwrap(),
+            std::fs::read(&response_path).unwrap(),
+        )
+    }
+
+    /// SURV-02 / Phase 48 criterion 3 (48-CONTEXT D-05 "verified correction"):
+    /// `resume` relaunches the saved stage and never reads a pending answer.
+    /// The gate here is a stage-failure gate, not a preflight refusal: the
+    /// relaunch's preflight PASSES (Supervise mode), so nothing re-fires the
+    /// gate, and the planted answer must survive byte-identical — not read,
+    /// not acked, not deleted.
+    ///
+    /// Scope: asserts on the state immediately after `resume()` returns. The
+    /// detached monitor it spawns is reaped at drop; what that monitor would
+    /// do with the answer later is outside this test.
+    #[test]
+    fn resume_relaunches_without_consuming_a_pending_gate_answer() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(91);
+        let (request_before, response_before) =
+            seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        // (a) the saved stage was relaunched.
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.stage,
+            Stage::Code,
+            "resume must relaunch the saved stage"
+        );
+        assert!(
+            reloaded.monitor_pid.is_some(),
+            "resume must have spawned a monitor for the saved stage"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            1,
+            "resume must launch the saved stage exactly once"
+        );
+
+        // (b) the pending answer was neither read-and-consumed nor deleted.
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        assert_eq!(
+            std::fs::read(&response_path).ok(),
+            Some(response_before),
+            "resume must leave the pending gate answer on disk byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(Gates::gate_path(root, phase, Stage::Code)).ok(),
+            Some(request_before),
+            "resume must leave the gate request untouched"
+        );
+        assert!(
+            !Gates::ack_path(root, phase, Stage::Code).exists(),
+            "an ack file means a poller consumed the answer"
+        );
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            !events.contains("\"gate_resolved\""),
+            "resume must not resolve the gate: {events}"
+        );
+    }
+
+    /// THE CONTROL for the test above: the one path 48-CONTEXT says DOES
+    /// consume a stale answer on resume — a preflight refusal. Mode::Auto at
+    /// Code with the legacy launch forced is refused by
+    /// `preflight_unattended_launch_check`, the refusal gate re-fires at the
+    /// same phase+stage, reads the planted abort answer, and `abort()` cleans
+    /// it up. Same fixture, opposite result: proves the assertions above can
+    /// observe consumption when it happens.
+    #[test]
+    fn resume_preflight_refusal_consumes_a_pending_gate_answer() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_preflight_refusal_consumes_a_pending_gate_answer";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(92);
+        seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        assert!(
+            !Gates::response_path(root, phase, Stage::Code).exists(),
+            "the preflight-refusal gate must have consumed the stale answer"
+        );
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events.contains("\"gate_resolved\""),
+            "the stale answer must have resolved the re-fired gate: {events}"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "an aborted preflight must not launch the stage"
+        );
+    }
+
     /// D-15 (999.60): `resume` is also the recovery verb for a rate-limited
     /// or infra-paused phase — a case where `stopped` is `false` and
     /// `stop_until` is a cap the operator set that has NOT yet fired. Before
