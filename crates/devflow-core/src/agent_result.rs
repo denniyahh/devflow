@@ -3076,6 +3076,18 @@ pub fn agent_pid_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{}-agent-pid", phase.padded()))
 }
 
+/// Path to the Legacy `sh` monitor's stop marker for a phase.
+///
+/// The monitor's TERM/INT trap creates this file BEFORE it signals the
+/// agent, and the backgrounded agent child checks for it just before its
+/// `exec`. A TERM that the child loses (dash discards one that lands before
+/// its post-fork trap reset) is therefore always followed by a check that
+/// sees the marker, so the agent never starts unsupervised. `spawn_monitor`
+/// removes a stale marker before every Legacy launch.
+pub fn stop_marker_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-monitor-stop", phase.padded()))
+}
+
 /// Path to the file holding the stage prompt handed to the pipe-owning
 /// monitor (Phase 31).
 ///
