@@ -2784,8 +2784,9 @@ kill -9 $$
     // compiled here with `cc` and handed to the monitor through
     // `spawn_monitor`'s own `envs`, holds ONE side of the monitor's first fork
     // (the agent launch) until the test creates a release file. The shim
-    // records when a signal handler interrupted its hold, so each test asserts
-    // that the TERM really landed inside the window instead of assuming it.
+    // blocks every signal for the hold, so a TERM sent inside it stays pending
+    // (kernel-visible in /proc) until the hold ends, and each test asserts that
+    // the TERM really landed inside the window instead of assuming it.
 
     /// The `fork()` interposer. Only the first fork, on the configured side,
     /// in a process carrying these variables holds: that side unlinks the
@@ -2797,10 +2798,19 @@ kill -9 $$
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static void record_pending_term(const char *path) {
+    sigset_t pending;
+    if (sigpending(&pending) == 0 && sigismember(&pending, SIGTERM)) {
+        int fd = open(path, O_WRONLY | O_CREAT, 0600);
+        if (fd >= 0) close(fd);
+    }
+}
 
 pid_t fork(void) {
     pid_t (*real_fork)(void) = (pid_t (*)(void))dlsym(RTLD_NEXT, "fork");
@@ -2810,20 +2820,28 @@ pid_t fork(void) {
     const char *side = getenv("HOLDFORK_SIDE");
     const char *once = getenv("HOLDFORK_ONCE");
     const char *release = getenv("HOLDFORK_RELEASE");
-    const char *interrupted = getenv("HOLDFORK_INTERRUPTED");
-    if (side && once && release && interrupted
+    const char *term_seen = getenv("HOLDFORK_TERM_SEEN");
+    if (side && once && release && term_seen
         && strcmp(side, pid == 0 ? "child" : "parent") == 0
         && unlink(once) == 0) {
-        /* Hold until released: 10 ms ticks, capped at 20 s so a crashed test
-           cannot wedge a process forever. A tick cut short by a signal
-           handler is recorded, then the hold resumes. */
+        /* Every signal is blocked for the hold, so one sent inside it stays
+           pending instead of running a handler whose only trace would be a
+           cut-short sleep, which a process that is descheduled when the
+           signal lands never sees. A pending TERM is recorded each tick and
+           once more at release; restoring the mask then delivers it to the
+           handler this process already had, still before any of the shell's
+           own post-fork code. Hold until released: 10 ms ticks, capped at
+           20 s so a crashed test cannot wedge a process forever. */
+        sigset_t all, saved;
+        sigfillset(&all);
+        sigprocmask(SIG_BLOCK, &all, &saved);
         for (int tick = 0; tick < 2000 && access(release, F_OK) != 0; tick++) {
             struct timespec step = {0, 10 * 1000 * 1000};
-            if (nanosleep(&step, NULL) != 0 && errno == EINTR) {
-                int fd = open(interrupted, O_WRONLY | O_CREAT, 0600);
-                if (fd >= 0) close(fd);
-            }
+            nanosleep(&step, NULL);
+            record_pending_term(term_seen);
         }
+        record_pending_term(term_seen);
+        sigprocmask(SIG_SETMASK, &saved, NULL);
     }
     errno = saved_errno;
     return pid;
@@ -2849,7 +2867,7 @@ pid_t fork(void) {
         state: State,
         monitor_pid: u32,
         release: std::path::PathBuf,
-        interrupted: std::path::PathBuf,
+        term_seen: std::path::PathBuf,
         tracked: Vec<u32>,
     }
 
@@ -2860,7 +2878,7 @@ pid_t fork(void) {
             let once = root.join("holdfork-once");
             std::fs::write(&once, "").unwrap();
             let release = root.join("holdfork-release");
-            let interrupted = root.join("holdfork-interrupted");
+            let term_seen = root.join("holdfork-term-seen");
             let side = match side {
                 HoldSide::Child => "child",
                 HoldSide::Parent => "parent",
@@ -2870,7 +2888,7 @@ pid_t fork(void) {
                 ("HOLDFORK_SIDE", side),
                 ("HOLDFORK_ONCE", once.to_str().unwrap()),
                 ("HOLDFORK_RELEASE", release.to_str().unwrap()),
-                ("HOLDFORK_INTERRUPTED", interrupted.to_str().unwrap()),
+                ("HOLDFORK_TERM_SEEN", term_seen.to_str().unwrap()),
             ]
             .map(|(key, value)| (key.to_string(), value.to_string()));
             let state = state_in(root);
@@ -2881,7 +2899,7 @@ pid_t fork(void) {
                 state,
                 monitor_pid,
                 release,
-                interrupted,
+                term_seen,
                 tracked: vec![monitor_pid],
             }
         }
@@ -2890,8 +2908,9 @@ pid_t fork(void) {
             std::fs::write(&self.release, "").unwrap();
         }
 
-        fn hold_was_interrupted(&self) -> bool {
-            self.interrupted.exists()
+        /// Whether the shim saw a TERM pending during its hold.
+        fn hold_saw_a_pending_term(&self) -> bool {
+            self.term_seen.exists()
         }
 
         fn sigterm_monitor(&self) {
@@ -3017,13 +3036,12 @@ pid_t fork(void) {
         sigterm_in_mask(pid, "SigCgt")
     }
 
-    /// Whether a TERM has reached `pid` while it was held. dash leaves signals
-    /// unblocked across its fork, so the handler runs at once and interrupts
-    /// the hold; bash blocks them around its fork, so the TERM sits pending
-    /// instead. Either way the signal was generated inside the window.
+    /// Whether a TERM has reached `pid` while it was held. The shim blocks
+    /// signals for the hold, so the TERM sits pending (`ShdPnd` for a
+    /// process-directed `kill`) until the hold ends, and the shim records it.
     #[cfg(target_os = "linux")]
     fn held_process_received_sigterm(held: &HeldMonitor, pid: u32) -> bool {
-        held.hold_was_interrupted()
+        held.hold_saw_a_pending_term()
             || sigterm_in_mask(pid, "ShdPnd")
             || sigterm_in_mask(pid, "SigPnd")
     }
@@ -3065,8 +3083,9 @@ pid_t fork(void) {
 
         held.sigterm_monitor();
         held.reap_monitor_expecting_trap_exit();
-        // `cleanup` has run, so its `kill` was sent while the child was held,
-        // and the child's inherited handler must have caught it.
+        // `cleanup` has run, so its `kill` was sent while the child was held.
+        // It is pending there, and the handler the child inherited catches it
+        // when the hold ends, before the child's trap reset.
         assert!(
             within_5s(|| held_process_received_sigterm(&held, agent_pid)),
             "the held agent child never received the monitor's TERM, so the kill did \
@@ -3117,8 +3136,8 @@ pid_t fork(void) {
             proc_snapshot(agent_pid)
         );
         assert!(
-            !held.hold_was_interrupted(),
-            "a signal landed inside the hold; this control must only TERM after exec"
+            !held.hold_saw_a_pending_term(),
+            "a TERM landed inside the hold; this control must only TERM after exec"
         );
     }
 
