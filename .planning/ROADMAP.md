@@ -646,6 +646,33 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (BACKLOG)
+
+**Found:** 2026-09-22, while debugging the Legacy monitor's lost-TERM flake
+(`.planning/debug/resolved/monitor-sigterm-orphans-agent.md`). The operator decided to backlog it and
+close that session on the Legacy fix.
+
+The `PipeOwning` monitor is the re-exec'd `__monitor` subcommand, used whenever the Claude stream-json
+launch is enabled. Unlike the Legacy `sh` monitor, it installs no signal handler — confirmed at
+`3ca90b6`: no `sigaction`, `libc::signal`, `signal_hook` or equivalent appears in
+`crates/devflow-core/src/monitor.rs` or `crates/devflow-cli/src/main.rs` — and it spawns the agent with
+`.process_group(0)` (monitor.rs:961), putting it in its own process group. A TERM delivered to the
+monitor therefore kills the monitor by default and never reaches the agent, which is left orphaned.
+
+Unlike the Legacy defect this is not a race: with no handler it happens every time. The debugger's probe
+saw the monitor exit 143 with the agent still alive 3 s later; its control, a TERM sent straight to the
+agent, killed it.
+
+**Reachability:** none of DevFlow's own senders TERM a monitor — `stop` signals the per-phase lock
+holder, and the idle-timeout path signals the agent's own group. It takes a TERM from outside DevFlow:
+an operator's `kill`, or a host or container shutdown.
+
+**Fix shape:** not decided. The shape to consider is a TERM/INT handler in `__monitor` that forwards to
+the agent's process group and then exits, matching what the Legacy script's trap now guarantees.
+
+**Acceptance:** not decided; set at promotion. A fix needs a failing test first: TERM the `__monitor`
+process and require the agent to be gone, with a control proving the test can observe the agent dying.
+
 ### Phase 999.133: Commands Report Success After a Failed or No-Op Action (BACKLOG)
 
 **Found:** 2026-09-22, the codex + agy review of Phase 48's code-review fixes. The operator decided to
