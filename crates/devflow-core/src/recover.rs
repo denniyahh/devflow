@@ -143,9 +143,14 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
         Ok(false) => {}
         Err(err) => report.fail(format!("could not remove corrupt legacy state.json: {err}")),
     }
-    report
-        .warnings
-        .append(&mut crate::lock::remove_stale_locks(project_root));
+    for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
+        match outcome {
+            crate::lock::StaleLockRemovalOutcome::Notice(warning) => {
+                report.warnings.push(warning);
+            }
+            crate::lock::StaleLockRemovalOutcome::Failure(warning) => report.fail(warning),
+        }
+    }
     // Drop cron records only for phases without surviving state, so a kept
     // phase's pending re-run record is preserved.
     for instructions in crate::ship::list_cron_instructions(project_root) {
@@ -356,9 +361,14 @@ pub fn clean_phase_report(
     }
     clean_phase_files(project_root, phase, &mut report);
     drop(guard);
-    report
-        .warnings
-        .append(&mut crate::lock::remove_stale_locks(project_root));
+    for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
+        match outcome {
+            crate::lock::StaleLockRemovalOutcome::Notice(warning) => {
+                report.warnings.push(warning);
+            }
+            crate::lock::StaleLockRemovalOutcome::Failure(warning) => report.fail(warning),
+        }
+    }
     Ok(report)
 }
 
