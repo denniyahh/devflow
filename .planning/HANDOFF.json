@@ -55,11 +55,6 @@
       "description": "The final scripts/check-in-container.sh run emitted partial all-green output but its terminal exit code and final marker were not captured. Its process is no longer discoverable, and the original tool session is unavailable.",
       "type": "technical",
       "workaround": "Rerun the pinned container gate or otherwise capture a terminal exit 0 and its final success marker before reporting container parity."
-    },
-    {
-      "description": "Memtrace incremental index job b45174c1-2f99-43e7-85ea-398b77f45a1e stalled at persist after 112 symbols and the MCP transport closed.",
-      "type": "technical",
-      "workaround": "Diagnose or reindex through the Memtrace skills before relying on graph results; do not treat this pause record as an index-health result."
     }
   ],
   "async_jobs": [],
