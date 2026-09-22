@@ -212,6 +212,9 @@ fn sweep_phase(project_root: &Path, state: &State, report: &mut CleanReport) {
         Ok(()) if state_removed => report.cleared.push(phase),
         Ok(()) => {}
         Err(err) => {
+            if state_removed {
+                report.cleared.push(phase);
+            }
             let partial = if state_removed {
                 " after removing some of its state files"
             } else {
