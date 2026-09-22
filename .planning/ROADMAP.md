@@ -646,6 +646,33 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.137: Recover Sweep Does Not Reach Every Artifact It Resets (BACKLOG)
+
+**Found:** 2026-09-22, external review of the Phase 48 review-fix diff (`69c3ada..4d119fb`; codex,
+agy and DeepSeek lanes). Records: `.planning/reviews/48-code-review-2026-09-22/review-fix-round/`.
+**Verified against source by reading; the DeepSeek and agy lanes reproduced R-2 in scratch copies.**
+
+The operator split these out of Phase 48 (option 1, 2026-09-22): Phase 48 fixes the honest-reporting
+and exit-code findings (R-1, R-3..R-6); these three concern how far the sweep reaches, and leave only
+inert leftovers.
+
+- **R-2 — corrupt cron records are unreachable by the sweep, silently.** `ship::list_cron_instructions`
+  skips any `cron-instructions*.json` it cannot parse, and `recover::clean_report` deletes only records
+  that listing returns, so a corrupt per-phase or legacy record survives `recover --clean` with no
+  warning (`--phase N` does remove it). `write_cron_instructions` writes non-atomically, so a crash
+  mid-write produces exactly such a file.
+- **R-7 — a phase with only an orphaned state temp is never swept.** `workflow::state_file_phases`
+  matches `state-NN.json` only, so `.state-NN.json.<pid>.<seq>.tmp` with no state file is never
+  reached by the sweep; `clear_state` would remove it but is never called for that phase.
+- **R-8 — `Gates::phases_on_disk` accepts any `NN-*` name in the gates directory as a phase.** A
+  non-gate file makes the orphan sweep take and release that phase's lock needlessly (and create its
+  coordination inode). No non-gate file is deleted: `Gates::cleanup` removes only the canonical names.
+
+**Fix shape (not decided):** name-based complements for cron records and state temps, reported like
+the unparsable-state case; restrict `phases_on_disk` to the canonical gate/response/ack/temp names.
+
+**Acceptance:** not decided; set at promotion.
+
 ### Phase 999.136: Recover Sweep Deletes a Live Run Between Agent Exit and Advance (BACKLOG)
 
 **Found:** 2026-09-22, Phase 48 scoped code review (`48-REVIEW.md` WR-05, reviewed at `2070a65`).

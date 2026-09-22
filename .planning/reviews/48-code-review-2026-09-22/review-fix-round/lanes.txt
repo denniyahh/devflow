@@ -1,0 +1,3 @@
+lane=codex exit=0 start=2026-09-22T20:07:48Z end=2026-09-22T20:16:04Z
+lane=pi-deepseek exit=0 start=2026-09-22T20:07:52Z end=2026-09-22T20:18:41Z
+lane=agy exit=0 start=2026-09-22T20:07:50Z end=2026-09-22T20:19:49Z
