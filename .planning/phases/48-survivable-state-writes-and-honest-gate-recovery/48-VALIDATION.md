@@ -7,7 +7,7 @@ status: validated
 nyquist_compliant: true
 wave_0_complete: true
 created: "2026-09-14"
-validated: "2026-09-22"
+validated: "2026-09-23"
 ---
 
 # Phase 48 — Validation Strategy
@@ -85,6 +85,11 @@ plus the pinned container suite (exit 0, `==> check.sh: all OK`, 1394 passed / 0
 | 48-17-T1 | 48-17 | 7 | TEST-01 | T-48-17-01..02 | PATH child-process rule published in TESTING.md; `NeutralPath` gone | docs structural + unit | 48-17-PLAN T1 gate | ✅ | ✅ |
 | 48-17-T2 | 48-17 | 7 | TEST-01 | T-48-17-01..02 | Full suite plus 2-CPU pinned sanity run | full suite | 48-17-PLAN T2 gate — not re-run 2026-09-22; the container suite (pinned to CPUs 0,1) stands in for its pinned half, the host unpinned half was not repeated | ✅ | ✅ |
 | N-48-01 | Nyquist | — | SURV-02 (criterion 3) | — | `resume` relaunches the saved stage and never reads a pending answer; the preflight-refusal path is the opposite-result control | unit (cli) | `cargo test -p devflow --bin devflow pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer -- --exact`; control `pipeline_launch::tests::resume_preflight_refusal_consumes_a_pending_gate_answer` | ✅ | ✅ |
+| 48-18-T1 | 48-18 | 12 | SURV-02 (criterion 4) | T-48-18-01..02 | Interrupted `start` parked at Define: lock holder is the start pid; reject refuses with no response; `recover --clean` clears state, gates, temps (planted, both dirs) and lock | integration (`gate_wedge_e2e`) | `cargo test -p devflow --test gate_wedge_e2e start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers -- --exact` (48-18-PLAN T1 gate) | ✅ | ✅ |
+| 48-18-T2 | 48-18 | 12 | SURV-02 (criterion 4) | T-48-18-01, -03 | Live `start` consumes the same reject; lock-drop mutant turns the arm red | integration + mutation | 48-18-PLAN T2 gate (`mutant_exit=101`, `commands_restored_diff_exit=0`) | ✅ | ✅ |
+| 48-18-T3 | 48-18 | 12 | SURV-02 | T-48-18-01 | Advance arms renamed truthfully; 5 tests in file | integration + lint | 48-18-PLAN T3 gate (`five_passed_line=1`, `misnamed_arms=0`, clippy/fmt 0) | ✅ | ✅ |
+| 48-19-T1 | 48-19 | 13 | SURV-01, SURV-02 (criterion 2) | T-48-19-01..03 | RED: both refusal arms fail on their named assertion; dead-leftover and no-state controls pass | integration (`start_lock_e2e`) | 48-19-PLAN T1 gate at RED `047c88e` | ✅ | ✅ |
+| 48-19-T2 | 48-19 | 13 | SURV-01, SURV-02 (criterion 2) | T-48-19-01..07 | `start` refuses a live run under the lock, writes nothing, `--force` no bypass; refusal guidance pinned sentence by sentence | integration + bin unit + lint | 48-19-PLAN T2 gate — see note ⁵; `start_lock_e2e` 7 passed at `bb639f5` | ✅ | ✅ |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -100,6 +105,13 @@ plus the pinned container suite (exit 0, `==> check.sh: all OK`, 1394 passed / 0
    a working form is `c=$(rg -c -F "once the waiting monitor polls it" crates/devflow-cli/src/commands.rs); [ "${c:-0}" -eq 0 ]`.
 4. **48-16-T2** — names `stop_at_a_non_ship_gate_with_an_unconfirmable_holder_claims_neither`, which `877a238` (require evidence
    before recovery claims) renamed to `…_refuses_success`; the old name now matches 0 tests. The renamed test passes.
+5. **48-19-T2** — the bin-suite check requires exactly one `ok. N passed; 0 failed` line; two phase-27 hostile-GIT_DIR tests
+   (`1542de6`, `48fa2de`) re-run the test binary and print their own `… 407 filtered out` lines, so the suite prints three.
+   Everything else in the gate passes. Corrected check (top-level line only, `0 filtered out`) tested three ways on a real
+   log: full run counts 1, a filtered run 0, a FAILED top-level line 0 (48-19-SUMMARY Deviations).
+6. **48-16-T1 / 48-14-T1 (2026-09-23)** — 48-18 renamed the advance arms, so 48-16's gate names tests that no longer exist
+   (fails loudly, `one_passed=0`); 48-14's whole-file count is now `5 passed`. Both behaviours are carried by the renamed
+   `advance_*` arms (48-18-SUMMARY name mapping).
 
 ---
 
@@ -180,3 +192,19 @@ closed. It is tracked under backlog 999.130 (gate-waiter registration), not fixe
   The auditor's negative control (deleting the answer file before the assertion) failed with exit 101 on the byte-identical
   assertion.
 - Plan-gate drift found, not a coverage gap: see notes ¹–⁴ above.
+
+## Validation Audit 2026-09-23
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+- Scope: gap-closure plans 48-18 (3 tasks) and 48-19 (2 tasks). Every task has an automated plan gate; the orchestrator re-ran
+  each one independently before committing (48-19-T2 with the note ⁵ correction), and the pinned container suite ran
+  `all OK`, 1443 passed / 0 failed across 34 suites at `a33060f`. No gap, so no nyquist auditor was spawned.
+- Post-review test strengthening counted as coverage, not gaps: WR-06 (`a33060f`, planted temps with negative controls) and
+  T-48-19-06 (`bb639f5`, protective refusal sentences, two-way attack-mutant control).
+- Not covered by any automated check: the refusal guidance is never followed end to end (no signal is sent); the e2e
+  tests still write the operator's real `~/.cache/devflow/roots` (backlog 999.141).
