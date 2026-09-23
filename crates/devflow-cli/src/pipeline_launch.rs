@@ -1405,6 +1405,10 @@ pub(crate) fn handle_ambiguous_outcome(
 /// it. The combination is OR-only — see [`apply_legacy_launch_opt_out`] for why
 /// a plain `devflow resume` must not clear an opt-out the operator already
 /// chose.
+///
+/// Criterion 2's 48-20 guard refuses to resume while the recorded monitor or
+/// agent remains live. It runs under the phase lock before state is loaded or
+/// written; see [`crate::commands::refuse_resume_over_a_live_run`].
 pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
@@ -1420,6 +1424,7 @@ pub(crate) fn resume(
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
+    crate::commands::refuse_resume_over_a_live_run(project_root, phase)?;
     let mut state = workflow::load_state(project_root, phase)?;
     if let Some(requested) = agent
         && requested != state.agent

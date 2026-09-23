@@ -2424,6 +2424,48 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
 /// Out of scope: the lock-free window between agent exit and `advance` taking
 /// the lock stays backlog 999.136. This check says nothing about a gate waiter.
 fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    refuse_launch_over_a_live_run(project_root, phase, LaunchVerb::Start)
+}
+
+/// Criterion 2, D-01 and D-02's `resume` half, promoted by the operator on
+/// 2026-09-23 as backlog 999.140: `pipeline_launch::resume` calls this just
+/// after it has acquired its phase lock and before it loads or writes state.
+/// The `devflow resume` CLI arm is resume's only production caller; no monitor
+/// or advance path calls resume, so a recorded pid is never that process. An
+/// agent that runs `devflow resume` for its own phase is refused correctly.
+///
+/// Liveness is shared with `start` and uses the same pid-only Option A that
+/// the operator accepted for start. A recycled pid can therefore refuse a
+/// resume; that distinct resume cost is the known limit recorded in 48-20,
+/// not an operator-approved permanent limit. Without a state file, resume
+/// still reports its own missing-state error. For an unloadable state, this
+/// checks only the agent pid file (999.139, backlog), and resume then cannot
+/// launch because its own `load_state` fails immediately afterwards.
+///
+/// Production hints remain unchanged in this plan (backlog 999.142): status
+/// and doctor for a dead monitor with a live agent, doctor's dead-agent and
+/// gate-pending findings, cleanup's worktree messages, and `no_waiter_repair`
+/// through the gate verbs, gate sweep, stop and doctor (48-20 H1-H10). The
+/// agent-exit-to-advance window remains 999.136, and this check says nothing
+/// about a gate waiter.
+pub(crate) fn refuse_resume_over_a_live_run(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<(), CliError> {
+    refuse_launch_over_a_live_run(project_root, phase, LaunchVerb::Resume)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchVerb {
+    Start,
+    Resume,
+}
+
+fn refuse_launch_over_a_live_run(
+    project_root: &Path,
+    phase: PhaseId,
+    verb: LaunchVerb,
+) -> Result<(), CliError> {
     let loaded = workflow::load_state(project_root, phase);
     if loaded.is_err() && !workflow::state_path(project_root, phase).exists() {
         return Ok(());
@@ -2440,13 +2482,20 @@ fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(
     if live.is_empty() {
         return Ok(());
     }
-    Err(CliError::Message(live_run_refusal(phase, &live)))
+    Err(CliError::Message(live_run_refusal(phase, verb, &live)))
 }
 
 /// The refusal text for [`refuse_start_over_a_live_run`]. It fires while
 /// `start` holds the lock, so no other process holds it: `stop` would signal
 /// nothing here (see `stop_via_lock`).
-fn live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
+fn live_run_refusal(phase: PhaseId, verb: LaunchVerb, live: &[(&str, u32)]) -> String {
+    match verb {
+        LaunchVerb::Start => start_live_run_refusal(phase, live),
+        LaunchVerb::Resume => resume_live_run_refusal(phase, live),
+    }
+}
+
+fn start_live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
     let named = live
         .iter()
         .map(|(role, pid)| format!("{role} pid {pid}"))
@@ -2485,6 +2534,48 @@ fn live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
          `devflow recover --clean --phase {phase}` first, then `devflow start`. Do neither while this \
          phase's processes are live: `recover --clean` clears state even while an agent runs, and a later \
          `start` would launch a second agent beside it."
+    )
+}
+
+fn resume_live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
+    let named = live
+        .iter()
+        .map(|(role, pid)| format!("{role} pid {pid}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let checks = live
+        .iter()
+        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"))
+        .collect::<String>();
+    let padded = phase.padded();
+    format!(
+        "phase {phase}: a run is still live ({named} alive) — refusing to resume; nothing was written\n\
+         No process holds the phase lock right now, so `devflow stop --phase {phase}` would only mark the \
+         state stopped: it signals nothing and does not end this run. stop ends a run through the process \
+         that holds the lock: one parked at a gate, or this run's own `devflow advance` once it takes the \
+         lock after this refusal.\n\
+         A state already marked stopped does not mean these processes have exited. `devflow status` and \
+         `devflow doctor` name `devflow resume` for a phase whose monitor is dead even while its agent is \
+         still alive; resume refuses until every named process has exited.\n\
+         Check each pid before signalling it. `ps -p` shows only the executable name, which cannot tell \
+         phases apart; `-ww` keeps a long command line from being cut at the terminal width:{checks}\n\
+         This phase's monitor is either a `__monitor` process with this project's path and `--phase {phase}` \
+         in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` \
+         with `--phase {phase}`. This phase's agent has that monitor as its parent (`ps -o ppid= -p <pid>`); \
+         an agent whose monitor has exited cannot be tied to this phase that way, so do not signal it on the \
+         pid alone.\n\
+         To end this run now, send SIGTERM to the confirmed monitor first — signalling the agent first lets \
+         the monitor launch the next stage. If the agent has already exited, an `sh` monitor may be running \
+         `devflow advance` as a foreground child: the monitor defers SIGTERM until that child returns, and \
+         the child may take the lock as soon as this resume exits. Find it with \
+         `ps -ww -o pid=,args= --ppid <monitor pid>` and signal that child, not only the monitor.\n\
+         If the named processes have exited, run `devflow resume --phase {phase}` again. If a named pid is \
+         live but is not this phase's process (a recycled pid), `resume` refuses again, and no DevFlow verb \
+         clears a recorded pid while keeping the phase's work: `devflow recover --clean --phase {phase}` \
+         removes the phase state, after which `resume` has nothing to resume, and `devflow start` refuses \
+         while the phase's worktree or branch exists; `devflow start --force` recreates them from the base \
+         and discards the phase's work. Do neither while this phase's processes are live: `recover --clean` \
+         clears state even while an agent runs, and a later `start` would launch a second agent beside it."
     )
 }
 
