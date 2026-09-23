@@ -37,7 +37,7 @@ created: "2026-09-19"
 
 ## Threat Register
 
-Register authored at plan time: 49 threats across the 17 `<threat_model>` blocks. Historical evidence
+Register authored at plan time: 60 threats across the 19 `<threat_model>` blocks (49 in plans 01-17; 11 in gap plans 48-18 and 48-19, added 2026-09-23). Historical evidence
 retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 formal re-audit.
 
 | Threat ID | Category | Component | Severity | Disposition | Mitigation | Status |
@@ -91,6 +91,17 @@ retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 
 | T-48-16-03 | Spoofing | recycled pid treated as a waiter | high | mitigate | Recycled holders receive no response at every gate, including Ship; Ship's stored-response exception is limited to `NoHolder` — **Evidence (re-audited 2026-09-22 at ab37d90; every production response writer enumerated):** `gate_respond` commands.rs:1414-1424 (Ship exception `NoHolder` only since `f1accee`); `gate sweep` :1556-1567 with `gate_sweep_may_reap` :1736-1738 (Live only); `stop_via_gate` :1924-1936 (Live, or Ship with `NoHolder`); the `--yes-ship` auto-response pipeline_gate.rs:414-422 is written by the waiter itself. Tests: `commands::tests::gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing` (fails if `f1accee` is reverted), `..._at_a_non_ship_gate_writes_nothing`, `stop_at_a_ship_gate_with_a_recycled_holder_claims_no_waiter`; NoHolder control `gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship`. The 2026-09-20 closure was false for `gate approve|reject` at Ship until `f1accee` | closed |
 | T-48-17-01 | Tampering | stale test guidance | low | mitigate | Documentation uses the helper and lint names verified by Task 1 — **Evidence:** .planning/codebase/TESTING.md:69, :84, :91; named helpers exist; clippy.toml `disallowed-methods` | closed |
 | T-48-17-02 | Repudiation | timing result presented as reliability proof | low | mitigate | SUMMARY records one-run and concurrent-load limits — **Evidence:** 48-17-SUMMARY.md:131-133 (Evidence Limits — the SUMMARY is the mitigation) | closed |
+| T-48-18-01 | Repudiation | criterion 4 evidence: a pin that names `start` but drives another process | medium | mitigate | Both start arms assert the lock holder pid is the `start` child — **Evidence:** gate_wedge_e2e.rs:435-439, :549-553; advance arms renamed (:247, :325); lock-drop mutant fails (48-18-SUMMARY, mutant_exit=101) | closed |
+| T-48-18-02 | Denial of Service | a parked `devflow start` leaked by a panicking assertion | low | mitigate | `ReapOnDrop` owns the file's only `start` spawn — **Evidence:** gate_wedge_e2e.rs:169-178, :188-193 | closed |
+| T-48-18-03 | Tampering | commands.rs left mutated after the Task 2 gate | medium | mitigate | Checked backup + EXIT-trap restore + post-restore `git diff --quiet` — **Evidence:** 48-18-PLAN.md:219; commands.rs clean at HEAD, mutant string absent from history | closed |
+| T-48-18-04 | Repudiation | pickup_ms read as a wedge measurement | low | accept | See AR-48-05 — **Evidence:** 48-18-SUMMARY.md:143, :195; gates.rs:293, :308 | closed |
+| T-48-19-01 | Tampering | `start` overwriting a live run's state and wiping its gates | high | mitigate | Guard under lock-NN before cleanup, git and `save_state` — **Evidence:** commands.rs:360 lock, :370 guard, :378 cleanup, :541 git, :693 save; byte-identity arms start_lock_e2e.rs:403-417, :472-479. Residual deferred (not accepted): 999.139 | closed |
+| T-48-19-02 | Elevation of Privilege | a second agent launched against a live phase worktree | high | mitigate | Same guard; arms assert no lock, branch or workflow_started — **Evidence:** start_lock_e2e.rs:480-503. Residual deferred (not accepted): 999.140 (`resume`) | closed |
+| T-48-19-03 | Tampering | `--force` used as a bypass | medium | mitigate | Guard takes no `force`; call is unconditional — **Evidence:** commands.rs:2426, :370; agent arm runs `--force` (start_lock_e2e.rs:536) | closed |
+| T-48-19-04 | Denial of Service | a recycled pid makes a dead run look live (false refusal) | low | accept | See AR-48-06 | closed |
+| T-48-19-05 | Tampering | writes in the agent-exit → advance lock-free window | medium | accept | See AR-48-07 | closed |
+| T-48-19-06 | Elevation of Privilege | operator follows the refusal's repair and launches a second agent | high | mitigate | Corrected text (20cc64c) pinned sentence by sentence in `bb639f5` — **Evidence:** commands.rs:2466-2487; start_lock_e2e.rs fragment list; an attack-text mutant passes the pre-`bb639f5` test and fails the new one on a new fragment (two mutants). Residual: operator-approved no-state carve-out (pinned by the phase-98 test) | closed |
+| T-48-19-07 | Denial of Service | operator signals an unrelated process named by a recycled pid | medium | mitigate | `ps -ww -o pid=,lstart=,args= -p <pid>` with identity claims matching the spawn argv (20cc64c) — **Evidence:** commands.rs:2457, :2471-2477; monitor.rs:573-598, :600-607; tests pin the fragments and forbid `ps -p <pid>` | closed |
 
 *Status: open · closed · open — below high threshold (non-blocking)*
 *Severity: critical > high > medium > low — only open threats at or above workflow.security_block_on count toward threats_open*
@@ -111,6 +122,10 @@ located. AR-48-04 is a residual on a closed threat, accepted by operator decisio
 | AR-48-02 | T-48-10-04 | Filesystems without hard links fail with `GateError::Io`; no rename fallback, so no silent overwrite (48-CONTEXT.md:337; gates.rs:384-386, :412-414) | Plan-time disposition, 48-10-PLAN | 2026-09-19 |
 | AR-48-03 | T-48-11-04 | An older monitor script without `--stage` falls back to an unbound advance (48-RESEARCH.md:374 F-8; main.rs:127; pipeline_launch.rs:1613-1618) | Plan-time disposition, 48-11-PLAN | 2026-09-19 |
 
+| AR-48-05 | T-48-18-04 | `pickup_ms` in the self-resolving arms measures the gate poll's first 1 s backoff step, not a wedge; the SUMMARY says so | Plan-time disposition, 48-18-PLAN | 2026-09-23 |
+| AR-48-06 | T-48-19-04 | Pid liveness, not identity: a recycled pid gives a fail-closed false refusal; the refusal directs `ps -ww -o … args=` and `recover --clean` then `start` | Plan-time disposition, 48-19-PLAN (records the operator's Option A, 2026-09-22; the operator's wording appears only in planner/executor-written files) | 2026-09-23 |
+| AR-48-07 | T-48-19-05 | The agent-exit → advance lock-free window is not closed by the guard | Operator-deferred to backlog 999.136 (ROADMAP.md, 2026-09-22) | 2026-09-23 |
+
 *Accepted risks do not resurface in future audit runs.*
 
 ---
@@ -126,6 +141,7 @@ located. AR-48-04 is a residual on a closed threat, accepted by operator decisio
 | 2026-09-19 (external, d3beb19) | rule + diff | — | 6 out-of-register findings (A–F below) | codex (gpt-5.6-terra, high) + agy (gemini-3.8-flash-high) on a `git archive` snapshot; both completed (~8 min); snapshot unmodified (139/139 hashes) |
 | 2026-09-20 (round 5, 3aca386) | 2 re-checked | 2 | 0 blocking (1 medium threat remains non-blocking) | gsd-security-auditor, State A, ASVS L1; operator selected Verify all open threats |
 | 2026-09-22 (round 6, ab37d90) | 4 re-checked (T-48-16-03, T-48-14-01, T-48-16-01, T-48-12-05) | 4 | 0 blocking (T-48-09-02 still non-blocking) | gsd-security-auditor, State A, ASVS L1, operator-requested after the 2026-09-22 code review; orchestrator added the T-48-14-01 gate-half test (`f73990f`) and AR-48-04 |
+| 2026-09-23 (round 7, 60da104 → bb639f5) | 11 new (gap plans 48-18, 48-19) | 11 | 0 blocking (T-48-19-06 was open until `bb639f5`) | gsd-security-auditor, State A, ASVS L1; operator selected Verify all open threats; orchestrator added the missing refusal fragments and ran the two-way mutant control |
 
 ### Audit 2026-09-19 — notes
 
@@ -220,6 +236,26 @@ located. AR-48-04 is a residual on a closed threat, accepted by operator decisio
   - At L1, the lock discipline of in-process `Gates::cleanup` callers rests on D-05's text-search claim.
 
 ---
+
+### Audit 2026-09-23 — notes (round 7)
+
+- **T-48-19-06 was open at 60da104.** The register said the tests pinned the repair guidance. They did
+  not pin the monitor-first ordering, the recycled-pid condition on the recover path, or the "do neither
+  while live" ban. An attack-text mutant ("if a named pid is live, run `recover --clean` then `start`")
+  passed both refusal arms. `bb639f5` pins these sentences plus check-before-signal and do-not-signal-on-pid-alone.
+  The orchestrator reran the attack mutant against the old and new tests:
+  - old test: 1 passed;
+  - new test: failed on "send SIGTERM to the confirmed monitor first";
+  - a second mutant, which keeps that sentence: failed on the recycled-pid condition.
+
+  The "do neither" fragment is masked behind the earlier failures and has no mutant of its own.
+- **Residuals deferred, not accepted:** 999.139 (a state file that won't load hides a live monitor,
+  T-48-19-01) and 999.140 (`resume` has no live-run check, T-48-19-02). Neither is in the Accepted
+  Risks Log, because neither has an operator ruling.
+- **Evidence limits:**
+  - Tests ran once each.
+  - Nothing sends a signal end to end to check the refusal guidance; the identity claims were read against the spawn code.
+  - The auditor's runs used a scratch `DEVFLOW_CACHE_DIR`. The test suite itself still writes the operator's real cache (999.141).
 
 ## Sign-Off
 
