@@ -214,3 +214,18 @@ Both leave a live monitor or agent with no state, so the next `start` proceeds.
 _Reviewed: 2026-09-23T12:09:09Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_
+
+## Dispositions (2026-09-23, orchestrator)
+
+The operator chose one text+tests fix round and deferred the rest. The orchestrator re-ran every RED and GREEN below before committing.
+
+| Finding | Disposition |
+|---------|-------------|
+| CR-01 | Fixed: RED `6ee9459`, GREEN `20cc64c`. The refusal now names `ps -ww -o pid=,lstart=,args= -p <pid>` and what identifies this phase's monitor and agent. `-ww` was added after a pty probe showed `ps -o args=` cut off the phase-identifying tail at 80 columns. |
+| WR-01 | Fixed (`6ee9459`, `20cc64c`). For a recycled live pid, the text now says to run `recover --clean` and then `start`. |
+| WR-02 | Fixed as a text qualification only, by operator choice; no `/proc` child reading was added (`6ee9459`, `20cc64c`). The advice to signal the monitor first, and the claim about `stop`, are now qualified for the Legacy monitor's foreground `devflow advance` child. |
+| WR-03 | Backlog 999.139 (behaviour change; needs an operator ruling). |
+| WR-04 | Backlog 999.140. |
+| WR-05 | Backlog 999.141. Verified 2026-09-23: 14,767 of 14,796 `~/.cache/devflow/roots` entries point at `/tmp/.tmp*` test roots. |
+| WR-06 | Fixed in `a33060f`. The test plants state and gate temps, checks its preconditions before recovery, and scans both directories. The negative controls fail as they should in each directory. |
+| IN-01..IN-05 | Not actioned in this round (info). IN-05 (the process group of the pipe-owning launch) remains a limit of the SIGTERM advice. |

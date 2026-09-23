@@ -248,3 +248,14 @@ Criterion 2's residual hole is closed for `start`. Re-verification can close hum
 ---
 *Phase: 48-survivable-state-writes-and-honest-gate-recovery*
 *Completed: 2026-09-23*
+
+## Post-review fix (2026-09-23)
+
+The gap-closure code review (48-REVIEW.md) found that three pieces of the refusal guidance recorded above were false. They were fixed test-first: RED `6ee9459`, GREEN `20cc64c`. The fix changes text only, not behaviour.
+- **CR-01.** `ps -p <pid>` shows only the executable name, so it cannot confirm that a pid belongs to this phase. The text now names `ps -ww -o pid=,lstart=,args= -p <pid>` and says what identifies this phase's processes:
+  - the monitor is a `__monitor` process with `--phase N` in its args, or an `sh -c` script that names `.devflow/phase-NN-` files and ends in `advance --phase N`;
+  - the agent's parent is that monitor.
+  This matters because the operator's acceptance of Option A relied on this identity check.
+- **WR-01.** A recycled live pid needs `recover --clean` and then `start`. Running `start` again only refuses again.
+- **WR-02.** The advice to signal the monitor first, and the claim that `stop` "does not end this run", are now qualified. While the Legacy monitor runs a foreground `devflow advance` child, that child has to be signalled too.
+Deferred to backlog: WR-03 → 999.139, WR-04 → 999.140, WR-05 → 999.141. The guidance is still not exercised end to end.

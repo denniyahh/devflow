@@ -216,3 +216,7 @@ Verification gap A (criterion 4) is closed at the test level, pending the orches
 ---
 *Phase: 48-survivable-state-writes-and-honest-gate-recovery*
 *Completed: 2026-09-23*
+
+## Post-review fix (2026-09-23)
+
+The gap-closure code review (48-REVIEW.md WR-06) found that the wedge arm's temp-removal assertion could not fail. No temp existed in the fixture, and the scan covered only `.devflow/`. The claim above that the arm proves temp removal was false until `a33060f`. That commit plants a state temp and a Define gate temp, asserts that they, the state file and lock-93 all exist before recovery, and scans `.devflow/` and `.devflow/gates/` afterwards. Negative control: a temp name the sweep does not remove turns the arm red in either directory.
