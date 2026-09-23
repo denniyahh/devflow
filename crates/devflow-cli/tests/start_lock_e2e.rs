@@ -6,12 +6,14 @@
 //! `commands::start`'s implementation details.
 
 use devflow_core::gates::{GateResponse, Gates};
+use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
+use devflow_core::state::{AgentKind, State};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
 fn devflow_bin() -> &'static str {
@@ -248,4 +250,323 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
         "the planted response must be removed"
     );
     kill_and_reap(&mut process);
+}
+
+// ---------------------------------------------------------------------------
+// 48-19 (criterion 2, D-01, D-02): `start` must not overwrite a live run.
+//
+// Each arm plants the same leftover run (Code-stage state, a Code gate request
+// and response, optionally an agent pid file) and differs from the others only
+// in whether the recorded pids name a live process, plus `--force` on the agent
+// arm. The live process is a test-owned `sleep`, reaped in `Drop` so a failing
+// assertion leaks nothing.
+// ---------------------------------------------------------------------------
+
+/// Existing never-live pid idiom (phase7_cli.rs): above Linux's maximum
+/// `pid_max` of 2^22, so no process can hold it.
+const NEVER_LIVE_PID: u32 = 0x7FFF_FFFE;
+
+/// Bounds any gate a launched monitor parks at, so a start that proceeds
+/// (every control, and the refusal arms at RED) leaves no immortal monitor.
+const GATE_TIMEOUT_SECS: &str = "15";
+
+/// A test-owned live process whose pid the fixtures record as a monitor or
+/// agent. Killed and waited on drop, including while a failed assertion
+/// unwinds.
+struct LiveProcess {
+    child: Child,
+}
+
+impl LiveProcess {
+    fn spawn() -> Self {
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn test-owned live process");
+        Self { child }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for LiveProcess {
+    fn drop(&mut self) {
+        // No `expect` here: a panic inside drop during unwinding aborts.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The planted Code gate files, returned so a control can assert they are gone.
+struct PlantedGate {
+    request: PathBuf,
+    response: PathBuf,
+}
+
+fn plant_leftover_run(
+    root: &Path,
+    phase: PhaseId,
+    monitor_pid: Option<u32>,
+    agent_pid: Option<u32>,
+) -> PlantedGate {
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Code;
+    state.monitor_pid = monitor_pid;
+    devflow_core::workflow::save_state(&state).expect("plant leftover state");
+    if let Some(pid) = agent_pid {
+        write_agent_pid(root, phase, pid);
+    }
+    let request = Gates::write_gate(root, phase, Stage::Code, "planted leftover Code gate")
+        .expect("plant Code gate request");
+    let response = Gates::response_path(root, phase, Stage::Code);
+    fs::create_dir_all(response.parent().unwrap()).unwrap();
+    fs::write(
+        &response,
+        serde_json::to_vec(&GateResponse {
+            approved: false,
+            note: Some("abort: planted leftover response".into()),
+            responded_by: Some("start-lock-e2e-planted-leftover".into()),
+        })
+        .unwrap(),
+    )
+    .expect("plant Code gate response");
+    PlantedGate { request, response }
+}
+
+fn write_agent_pid(root: &Path, phase: PhaseId, pid: u32) {
+    let path = devflow_core::agent_result::agent_pid_path(root, phase);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, pid.to_string()).expect("write agent pid file");
+}
+
+/// Every file a live run for `phase` depends on, with its exact bytes, sorted
+/// by path: the state file, the agent pid file, and each gate-directory entry
+/// named `{padded}-…`. Only existing files are listed, so a deleted file shows
+/// up as a different snapshot rather than a read panic.
+fn phase_file_snapshot(root: &Path, phase: PhaseId) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut paths = vec![
+        devflow_core::workflow::state_path(root, phase),
+        devflow_core::agent_result::agent_pid_path(root, phase),
+    ];
+    let prefix = format!("{}-", phase.padded());
+    if let Ok(entries) = fs::read_dir(Gates::dir(root)) {
+        for entry in entries {
+            let entry = entry.expect("read gates dir entry");
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.retain(|path| path.exists());
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).expect("read snapshot file");
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn snapshot_paths(snapshot: &[(PathBuf, Vec<u8>)]) -> Vec<&Path> {
+    snapshot.iter().map(|(path, _)| path.as_path()).collect()
+}
+
+fn run_start(root: &Path, phase: PhaseId, fake_bin: &FakeBin, extra: &[&str]) -> Output {
+    child(root, phase, fake_bin, "supervise")
+        .args(extra)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS)
+        .output()
+        .expect("run devflow start")
+}
+
+fn events_contain_workflow_started(root: &Path) -> bool {
+    // An absent events file counts as not containing the event.
+    fs::read_to_string(devflow_core::events::events_path(root))
+        .unwrap_or_default()
+        .contains("\"workflow_started\"")
+}
+
+/// Drives `start` against a planted live run and asserts the refusal plus
+/// the absence of every side effect. `refusal` is the first assertion's
+/// message and names the arm.
+fn assert_start_refuses_live_run(
+    root: &Path,
+    phase: PhaseId,
+    extra: &[&str],
+    live_pid: u32,
+    refusal: &str,
+) {
+    let fake_bin = fake_bin_dir("exit 0");
+    let before = phase_file_snapshot(root, phase);
+    // Negative control on the snapshot itself: it must cover the planted
+    // state and both planted gate files, or byte-identity would prove nothing.
+    for required in [
+        devflow_core::workflow::state_path(root, phase),
+        Gates::gate_path(root, phase, Stage::Code),
+        Gates::response_path(root, phase, Stage::Code),
+    ] {
+        assert!(
+            snapshot_paths(&before).contains(&required.as_path()),
+            "fixture snapshot must cover {}; it has {:?}",
+            required.display(),
+            snapshot_paths(&before)
+        );
+    }
+
+    let output = run_start(root, phase, &fake_bin, extra);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "{refusal}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    for fragment in [
+        phase.to_string(),
+        live_pid.to_string(),
+        "refusing to start; nothing was written".to_string(),
+        format!("devflow stop --phase {phase}"),
+        "would only mark the state stopped".to_string(),
+        format!("ps -p {live_pid}"),
+        format!("devflow recover --clean --phase {phase}"),
+        "only after the named processes have exited".to_string(),
+    ] {
+        assert!(
+            stderr.contains(&fragment),
+            "refusal must contain {fragment:?}\nstderr: {stderr}"
+        );
+    }
+
+    let after = phase_file_snapshot(root, phase);
+    assert!(
+        after == before,
+        "a refused start must leave the phase's state, agent pid and gate files \
+         byte-identical\nbefore: {:?}\nafter:  {:?}",
+        snapshot_paths(&before),
+        snapshot_paths(&after)
+    );
+    let lock = root.join(format!(".devflow/lock-{}", phase.padded()));
+    assert!(
+        !lock.exists(),
+        "a refused start must not leave {}",
+        lock.display()
+    );
+    let branches = devflow_core::test_support::git_command(root)
+        .args([
+            "branch",
+            "--list",
+            &format!("feature/phase-{padded}", padded = phase.padded()),
+        ])
+        .output()
+        .expect("list phase branch");
+    assert!(branches.status.success());
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+        "a refused start must not create the phase branch: {}",
+        String::from_utf8_lossy(&branches.stdout)
+    );
+    assert!(
+        !events_contain_workflow_started(root),
+        "a refused start must not emit workflow_started"
+    );
+}
+
+#[test]
+fn start_refuses_a_phase_whose_recorded_monitor_is_alive() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(95);
+    init_repo(root, phase);
+    let monitor = LiveProcess::spawn();
+    plant_leftover_run(root, phase, Some(monitor.pid()), None);
+
+    assert_start_refuses_live_run(
+        root,
+        phase,
+        &[],
+        monitor.pid(),
+        "start must refuse a phase whose recorded monitor is alive",
+    );
+}
+
+#[test]
+fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(96);
+    init_repo(root, phase);
+    let agent = LiveProcess::spawn();
+    plant_leftover_run(root, phase, None, Some(agent.pid()));
+
+    assert_start_refuses_live_run(
+        root,
+        phase,
+        &["--force"],
+        agent.pid(),
+        "start must refuse a phase whose recorded agent is alive",
+    );
+}
+
+#[test]
+fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(97);
+    init_repo(root, phase);
+    let planted = plant_leftover_run(root, phase, Some(NEVER_LIVE_PID), Some(NEVER_LIVE_PID));
+    let fake_bin = fake_bin_dir("exit 0");
+
+    let output = run_start(root, phase, &fake_bin, &[]);
+    assert!(
+        output.status.success(),
+        "a leftover state whose recorded processes are dead must be replaced as today\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !planted.request.exists(),
+        "the leftover Code gate request must be cleared: {}",
+        planted.request.display()
+    );
+    assert!(
+        !planted.response.exists(),
+        "the leftover Code gate response must be cleared: {}",
+        planted.response.display()
+    );
+    assert!(
+        events_contain_workflow_started(root),
+        "replacing a dead leftover must emit workflow_started"
+    );
+}
+
+#[test]
+fn start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_process() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(98);
+    init_repo(root, phase);
+    let agent = LiveProcess::spawn();
+    write_agent_pid(root, phase, agent.pid());
+    assert!(
+        !devflow_core::workflow::state_path(root, phase).exists(),
+        "the carve-out fixture must have no phase state"
+    );
+    let fake_bin = fake_bin_dir("exit 0");
+
+    let output = run_start(root, phase, &fake_bin, &[]);
+    assert!(
+        output.status.success(),
+        "without phase state, start must proceed even if the agent pid file names a live process\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        events_contain_workflow_started(root),
+        "the no-state carve-out must emit workflow_started"
+    );
 }
