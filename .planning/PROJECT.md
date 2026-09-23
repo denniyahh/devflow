@@ -396,6 +396,22 @@ version is still derived automatically from conventional-commit classification a
   resume route is gated on `AgentKind::Claude`), and which instruction a model actually follows is
   not settled by source — that behavioural arm resolves against Phase 49's live run under
   `47-PHASE49-OBSERVATION.md`'s evidence standard.
+- ✓ **SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01** — two writers for one phase can no longer
+  silently lose a state update: state and gate writes use collision-retrying sibling temp files, gate
+  responses publish first-answer-wins, `start` owns the phase lock before any effect, and `start` and
+  `resume` both refuse, under that lock, to launch over a run whose recorded monitor or agent is alive, leaving the
+  state and pid files byte-identical (a second-writer test failed pre-fix; the single-writer control
+  round-trips). Gate verbs (`approve`/`reject`/`stop`/`sweep`) check for a live waiter and, with none,
+  say so and name the repair instead of asserting one; the #200 wedge is reproducible on demand and
+  pinned both ways. Preflight and resume share one fence-aware checkpoint parser, and a human-only
+  checkpoint added after Code's preflight parks at a human gate. Process-global `PATH` mutation moved
+  into child processes, with a clippy `disallowed-methods` ban on new `set_var`/`remove_var`.
+  Verified 7/7 on 2026-09-23 after gap closures 48-18..48-20 — Phase 48, milestone v3.0.0; not yet
+  merged to `develop`. **Closure limits:** the agent-exit → `advance` lock-free window (999.136),
+  a state file that will not load hiding a live monitor from `start` (999.139, reproduced; ruled
+  outside the criterion by the operator), `stop` in a lock-free run (999.138) and a recycled pid
+  falsely refusing `resume` (999.143) stay backlog; SURV-01's field arm is observed, not settled,
+  in Phase 49; TEST-01's two-CPU full-suite run is a sanity check, not proof the flakes cannot recur.
 
 ### Partially delivered
 
@@ -414,12 +430,10 @@ version is still derived automatically from conventional-commit classification a
 ### Active
 
 **v3.0.0 Unattended Run Survivability** — declared 2026-09-03. Requirement IDs in
-`REQUIREMENTS.md`; the backlog/issue each traces to is named inline. Phases 46 and 47 delivered
-five of the ten (#174, #204, #206, 999.115, 999.116); those moved to Validated.
+`REQUIREMENTS.md`; the backlog/issue each traces to is named inline. Phases 46-48 delivered
+seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.125, 999.126 and
+999.38 promoted into Phase 48; those moved to Validated.
 
-- [ ] `write_state_atomic` cannot lose an update to a concurrent writer (999.118)
-- [ ] A gate with no consumer reports the recovery that exists rather than asserting a waiter
-      (#200)
 - [ ] A live `devflow start --mode auto` run is recorded fork-point through Ship merge target
       against a configured base (999.119)
 - [ ] Monitor liveness is answerable without a PID — GONE / STALE / ALIVE (#185)
@@ -427,9 +441,9 @@ five of the ten (#174, #204, #206, 999.115, 999.116); those moved to Validated.
 
 Carried-forward follow-ups NOT in this milestone (backlog): **999.120** (one residual ambient
 `git_flow_for_project` re-resolution in the Validate loop-back), **999.121** (OpenCode has no
-`devflow start`-level marker-less regression test). Filed by Phase 47, also backlog: **999.125**
-(preflight and resume disagree on where a `blocking-human` gate exists) and **999.126** (a
-checkpoint added after Code preflight is never re-scanned). Phase 46's C-05/C-07 are deferred to
+`devflow start`-level marker-less regression test). Filed by Phase 47 and closed by Phase 48 as
+CHKPT-01/CHKPT-02: **999.125** and **999.126**. Phase 48 left 999.136-999.139, 999.141-999.143
+in the backlog. Phase 46's C-05/C-07 are deferred to
 GitHub #207. Promote with `/gsd-review-backlog` when ready.
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
@@ -543,6 +557,9 @@ close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 | `GATE_RESOLUTION_RULE` is defined once as a `macro_rules!` literal spliced into `CODE_STAGE_POLICY`, and pinned by a test-owned literal (Phase 47, 47-03) | `concat!` rejects a const name, and a pin built from the constants under test would widen along with them | ✓ Good |
 | DECN-03 is closed at the prompt level only, for claude alone; its behavioural arm goes to Phase 49 with a Followed / Not followed / Void evidence standard (Phase 47, 47-05) | Which of two instructions a model follows is not answerable from source, and `checkpoint_auto_decided` is emitted before the spawn, so the event alone would label a failed spawn as followed | — Pending (Phase 49) |
 | Result parser left unchanged; the policy's required decision reasoning goes above a last-line `DEVFLOW_RESULT` (Phase 47, 47-06, closing CR-01) | Operator decision A1: no text after the `DEVFLOW_RESULT` line, no second record format, no parser change; the parser's 4000-character tail boundary stays explicit | ✓ Good |
+| `start` and `resume` share one live-run guard, run under the phase lock before state is loaded or written, keyed on recorded monitor/agent pid liveness (Phase 48, 48-19/48-20) | Two agents for one phase were reproduced live via `start --force` and then `resume`; pid-only liveness (Option A) accepts a recycled pid's false refusal as the cost of never launching beside a live run | ✓ Good — verified by live probe and a guard-removal mutant |
+| 999.139 (an unloadable state file hides a live monitor from `start`) is outside Phase 48's criterion 2 (operator ruling 2026-09-23) | The hole needs a dead agent beside a live monitor — the agent-exit → `advance` window already deferred as 999.136 | — Pending (backlog) |
+| TDD commit-shape audit overridden for Phase 48's sequential-worktree plans (operator, 2026-09-19, `48-TDD-OVERRIDE.md`) | The #4799 workaround made the orchestrator commit after verification, so the `test(…)`→`feat(…)` grep cannot see the recorded RED/GREEN evidence | ✓ Accepted; applies to the commit-shape gate only |
 
 ## Key Files
 
@@ -587,6 +604,13 @@ delivered most of it. Major version chosen because #185 changes the monitor mech
 socket path to `state.json`, breaking state-file compatibility with 2.x on a published crate.
 Research skipped by operator decision — every item is a verified defect in this codebase with a
 known fix direction, and the #185 socket design is already spike-proven.*
+
+---
+*Last updated: 2026-09-23 after Phase 48 (Survivable State Writes and Honest Gate Recovery) — 20/20
+plans, including gap closures 48-18..48-20 (48-20 executed by codex); verification passed 7/7 after
+the operator ruled 999.139 on `start` outside criterion 2. SURV-01, SURV-02, CHKPT-01, CHKPT-02 and
+TEST-01 moved to Validated with their closure limits; three decisions logged. The 48-20 code review
+left 4 test-coverage/duplication warnings unfixed at close. Three of v3.0.0's Active items remain.*
 
 ---
 *Last updated: 2026-09-13 after Phase 47 (Unattended Decision Policy Consistency) — 7/7 plans;
