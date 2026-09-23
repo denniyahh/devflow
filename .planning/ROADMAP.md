@@ -181,7 +181,7 @@ before Phase 49's live unattended run measures the chain.
   7. **TEST-01 (999.38 + 999.80):** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: 17/19 plans executed in 11 waves; 2 gap-closure plans pending (48-18, 48-19, from 48-VERIFICATION.md)
+**Plans**: 18/19 plans executed in 13 waves; 1 gap-closure plan pending (48-19; 48-18 done, both from 48-VERIFICATION.md)
 
 **Wave 1**
 
@@ -235,7 +235,7 @@ before Phase 49's live unattended run measures the chain.
 
 **Wave 12**
 
-- [ ] 48-18-PLAN.md *(depends on 48-14)* — gap closure, criterion 4: start-driven #200 arms (interrupted `start` wedges; live `start` self-resolves), advance arms renamed truthfully
+- [x] 48-18-PLAN.md *(depends on 48-14)* — gap closure, criterion 4: start-driven #200 arms (interrupted `start` wedges; live `start` self-resolves), advance arms renamed truthfully
 
 **Wave 13**
 
@@ -482,7 +482,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
-| 48 | 17/17 | In Progress|  |
+| 48 | 18/19 | In Progress|  |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
