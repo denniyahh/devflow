@@ -6,7 +6,9 @@ use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use std::path::Path;
+use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -88,6 +90,151 @@ fn reject(root: &Path, phase: PhaseId) -> std::process::Output {
         .arg(root)
         .output()
         .expect("run same gate reject command")
+}
+
+/// A `develop`-only repo whose ROADMAP names `phase` and which has no
+/// `.planning/config.json`, so `start --mode auto` parks at its Define
+/// preflight gate. Same shape as start_lock_e2e.rs `init_repo`.
+fn init_start_repo(root: &Path, phase: PhaseId) {
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "devflow@example.com"]);
+    git(root, &["config", "user.name", "DevFlow Tests"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    fs::create_dir_all(root.join(".planning")).unwrap();
+    fs::write(root.join("README.md"), "base\n").unwrap();
+    fs::write(
+        root.join(".planning/ROADMAP.md"),
+        format!("# Roadmap\n\n### Phase {phase}: lock fixture\n"),
+    )
+    .unwrap();
+    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    git(root, &["commit", "-q", "-m", "base"]);
+}
+
+struct FakeBin {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+fn fake_bin_dir(agent_body: &str) -> FakeBin {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = dir.path().join("claude");
+    fs::write(&claude, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
+    let mut permissions = fs::metadata(&claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude, permissions).unwrap();
+    for program in ["git", "sh"] {
+        symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
+    }
+    FakeBin {
+        path: dir.path().to_path_buf(),
+        _dir: dir,
+    }
+}
+
+/// A foreground `devflow start --mode auto` with the fake agent first on the
+/// child's PATH. PATH is set on the child only (TEST-01).
+fn start_child(root: &Path, phase: PhaseId, fake_bin: &FakeBin) -> Command {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
+    let mut command = Command::new(devflow_bin());
+    command
+        .args([
+            "start",
+            "--phase",
+            &phase.to_string(),
+            "--agent",
+            "claude",
+            "--mode",
+            "auto",
+            "--no-worktree",
+            "--legacy-claude-launch",
+        ])
+        .arg(root)
+        .current_dir(root)
+        .env("PATH", path);
+    command
+}
+
+/// Owns a spawned `devflow start` so a panicking assertion never leaks a
+/// parked process for the length of its gate timeout.
+struct ReapOnDrop(Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawns `start` (owned by `ReapOnDrop` from the moment it exists) and waits
+/// up to 20 s for it to park at the Define preflight gate.
+fn spawn_parked_start(
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &FakeBin,
+    gate_timeout_secs: &str,
+) -> ReapOnDrop {
+    let mut start = ReapOnDrop(
+        start_child(root, phase, fake_bin)
+            .env("DEVFLOW_GATE_TIMEOUT_SECS", gate_timeout_secs)
+            .spawn()
+            .expect("spawn foreground start"),
+    );
+    let waited = Instant::now();
+    while !Gates::gate_path(root, phase, Stage::Define).exists() {
+        if let Some(status) = start.0.try_wait().expect("poll start child") {
+            panic!("start exited ({status:?}) before parking at its Define gate");
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(20),
+            "timed out after 20s waiting for start's Define gate"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    start
+}
+
+fn reject_define(root: &Path, phase: PhaseId) -> std::process::Output {
+    Command::new(devflow_bin())
+        .args([
+            "gate",
+            "reject",
+            &phase.to_string(),
+            "define",
+            "--note",
+            "abort: #200 start e2e",
+        ])
+        .arg(root)
+        .output()
+        .expect("run same gate reject define command")
+}
+
+/// Names of entries in `dir` accepted by `keep`; a missing directory is empty.
+fn dir_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<String> {
+    match dir.read_dir() {
+        Ok(entries) => entries
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| keep(name))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read {}: {error}", dir.display()),
+    }
+}
+
+fn phase_gate_entries(root: &Path, phase: PhaseId) -> Vec<String> {
+    let prefix = format!("{}-", phase.padded());
+    dir_entries(&Gates::dir(root), |name| name.starts_with(&prefix))
 }
 
 #[test]
@@ -267,5 +414,90 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     assert!(
         !Gates::response_path(root, phase, Stage::Code).exists(),
         "dry-run sweep must not write a response"
+    );
+}
+
+#[test]
+fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(93);
+    init_start_repo(root, phase);
+    let fake_bin = fake_bin_dir("sleep 60");
+    let mut start = spawn_parked_start(root, phase, &fake_bin, "30");
+
+    assert_eq!(
+        devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
+        Some(start.0.id()),
+        "the parked start must hold its own phase lock"
+    );
+
+    start.0.kill().expect("kill foreground start");
+    start.0.wait().expect("reap foreground start");
+    assert!(
+        Gates::gate_path(root, phase, Stage::Define).exists(),
+        "the interrupted start must leave its Define gate behind"
+    );
+
+    let output = reject_define(root, phase);
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "reject against an interrupted start unexpectedly succeeded: {output_text}"
+    );
+    assert!(
+        output_text.contains("no confirmed waiter"),
+        "reject must say no confirmed waiter: {output_text}"
+    );
+    let recovery_hint = format!("devflow recover --clean --phase {phase}");
+    assert!(
+        output_text.contains(&recovery_hint),
+        "reject must name `{recovery_hint}`: {output_text}"
+    );
+    assert!(
+        !Gates::response_path(root, phase, Stage::Define).exists(),
+        "an unanswerable Define gate must receive no response"
+    );
+
+    assert!(
+        !phase_gate_entries(root, phase).is_empty(),
+        "control: the gate scan must see the wedged phase's gate before recovery"
+    );
+    let recovery = Command::new(devflow_bin())
+        .args(["recover", "--clean", "--phase", &phase.to_string()])
+        .arg(root)
+        .output()
+        .expect("recover interrupted start");
+    assert!(
+        recovery.status.success(),
+        "recover --clean failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&recovery.stdout),
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, phase).exists(),
+        "recovery must remove the interrupted start's state"
+    );
+    let gates_left = phase_gate_entries(root, phase);
+    assert!(
+        gates_left.is_empty(),
+        "recovery must remove every gate file for the phase: {gates_left:?}"
+    );
+    let devflow_dir = root.join(".devflow");
+    let temps_left = dir_entries(&devflow_dir, |name| name.ends_with(".tmp"));
+    assert!(
+        temps_left.is_empty(),
+        "recovery must remove orphaned write temps: {temps_left:?}"
+    );
+    assert!(
+        !devflow_dir
+            .join(format!("lock-{}", phase.padded()))
+            .exists(),
+        "recovery must not leave lock-{} behind",
+        phase.padded()
     );
 }
