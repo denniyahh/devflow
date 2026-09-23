@@ -2454,19 +2454,37 @@ fn live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
         .join(", ");
     let checks = live
         .iter()
-        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -p {pid}"))
+        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"))
         .collect::<String>();
+    let padded = phase.padded();
+    // Identity details below match the argv the monitors are spawned with:
+    // `pipe_owning_monitor_args` and the Legacy script plus `advance_tail` in
+    // devflow-core's monitor.rs (48-REVIEW CR-01). A Legacy monitor whose
+    // agent has exited runs `devflow advance` as a foreground child and
+    // defers SIGTERM until it returns (48-REVIEW WR-02).
     format!(
         "phase {phase}: a run is still live ({named} alive) — refusing to start; nothing was written\n\
-         No process holds the phase lock, so `devflow stop --phase {phase}` would only mark the state stopped: \
-         it signals nothing and does not end this run. (stop does end a run that holds the lock, for example \
-         one parked at a gate.)\n\
-         To end this run now, confirm each pid is this phase's DevFlow monitor or agent with `ps -p <pid>`, \
-         then send it SIGTERM, monitor first — signalling the agent first lets the monitor launch the next \
-         stage:{checks}\n\
-         Run `devflow recover --clean --phase {phase}` or `devflow start` again only after the named processes have exited, \
-         or after `ps -p` shows they are no longer this phase's processes: `recover --clean` clears state even \
-         while an agent runs, and a later `start` would launch a second agent beside it."
+         No process holds the phase lock right now, so `devflow stop --phase {phase}` would only mark the \
+         state stopped: it signals nothing and does not end this run. stop ends a run through the process \
+         that holds the lock: one parked at a gate, or this run's own `devflow advance` once it takes the \
+         lock after this refusal.\n\
+         Check each pid before signalling it. `ps -p` shows only the executable name, which cannot tell \
+         phases apart; `-ww` keeps a long command line from being cut at the terminal width:{checks}\n\
+         This phase's monitor is either a `__monitor` process with this project's path and `--phase {phase}` \
+         in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` \
+         with `--phase {phase}`. This phase's agent has that monitor as its parent (`ps -o ppid= -p <pid>`); \
+         an agent whose monitor has exited cannot be tied to this phase that way, so do not signal it on the \
+         pid alone.\n\
+         To end this run now, send SIGTERM to the confirmed monitor first — signalling the agent first lets \
+         the monitor launch the next stage. If the agent has already exited, an `sh` monitor may be running \
+         `devflow advance` as a foreground child: the monitor defers SIGTERM until that child returns, and \
+         the child may take the lock as soon as this start exits. Find it with \
+         `ps -ww -o pid=,args= --ppid <monitor pid>` and signal that child, not only the monitor.\n\
+         If the named processes have exited, run `devflow start` again. If a named pid is live but is not \
+         this phase's process (a recycled pid), `start` refuses again: run \
+         `devflow recover --clean --phase {phase}` first, then `devflow start`. Do neither while this \
+         phase's processes are live: `recover --clean` clears state even while an agent runs, and a later \
+         `start` would launch a second agent beside it."
     )
 }
 
