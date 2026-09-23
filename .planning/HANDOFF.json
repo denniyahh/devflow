@@ -1,126 +1,39 @@
 {
   "version": "1.0",
-  "timestamp": "2026-09-22T18:43:41.738Z",
+  "timestamp": "2026-09-22T23:08:15.359Z",
   "phase": 48,
   "phase_name": "Survivable State Writes and Honest Gate Recovery",
   "phase_dir": ".planning/phases/48-survivable-state-writes-and-honest-gate-recovery",
-  "plan": 17,
-  "task": 17,
-  "total_tasks": 17,
+  "plan": 18,
+  "task": 0,
+  "total_tasks": 5,
   "status": "paused",
   "completed_tasks": [
-    {
-      "id": "48-01..48-17",
-      "name": "Phase implementation and plan summaries",
-      "status": "done",
-      "commit": "through 4514ae3"
-    },
-    {
-      "id": "gate-container",
-      "name": "Pinned container gate re-established with a terminal result",
-      "status": "done",
-      "commit": "last full green run at 3ca90b6: exit 0, '==> check.sh: all OK', 1411 passed / 0 failed"
-    },
-    {
-      "id": "gate-nyquist",
-      "name": "Nyquist validation: compliant, one gap filled",
-      "status": "done",
-      "commit": "3a7f9a8 tests, 3c60cfb VALIDATION.md"
-    },
-    {
-      "id": "review-lead",
-      "name": "Agy's unreachable Recycled-holder message: confirmed race-only, removed",
-      "status": "done",
-      "commit": "395feb4"
-    },
-    {
-      "id": "backlog-deferrals",
-      "name": "Phase 48's five deferred ideas filed as 999.128-999.132",
-      "status": "done",
-      "commit": "3f6669b"
-    },
-    {
-      "id": "code-review",
-      "name": "codex + agy production-code review; 3 confirmed defects fixed, B recorded as a limit",
-      "status": "done",
-      "commit": "fb2c4f8, f1accee, 9a33c70, f745bd5"
-    },
-    {
-      "id": "fix-review",
-      "name": "codex + agy fix review; 2 more defects fixed, 3 older ones filed as 999.133",
-      "status": "done",
-      "commit": "d36936e, 854bbce, 41e3d46, ab37d90"
-    },
-    {
-      "id": "gate-security",
-      "name": "Security re-audit round 6: SECURED, threats_open 0, AR-48-04 recorded",
-      "status": "done",
-      "commit": "f73990f test, 47dfceb SECURITY.md"
-    },
-    {
-      "id": "flake-monitor",
-      "name": "Container-gate flake: Legacy monitor lost-TERM root-caused and fixed",
-      "status": "done",
-      "commit": "4fbe23c RED, 745ad9b harness, 3ca90b6 fix, 1515e0b session archived"
-    },
-    {
-      "id": "flake-probe",
-      "name": "OpenCode probe flake: not root-caused; diagnostics landed, filed as 999.135",
-      "status": "done",
-      "commit": "e683f89, 2e54770, 71d19a7"
-    }
+    {"id": "review-wr01-04", "name": "48-REVIEW WR-01..WR-04 fixed test-first (monitor late-TERM guard; recover --clean reach/report/failure)", "status": "done", "commit": "b1f1f3f c5f40fc abb35e8 4d119fb"},
+    {"id": "review-fix-round", "name": "External review of those fixes (codex+agy+DeepSeek), R-1/R-3/R-4/R-5/R-6 fixed by codex terra xhigh, test-first", "status": "done", "commit": "e507306..a692468; records 7ef2ad8"},
+    {"id": "container-gate", "name": "Full container gate at a692468", "status": "done", "commit": "exit 0, all OK, 1437 passed / 0 failed"},
+    {"id": "goal-verification", "name": "gsd-verifier: gaps_found 6/7 (criterion 4 partial; criterion 2 scope)", "status": "done", "commit": "02a704f"},
+    {"id": "api-break", "name": "WorkflowError/RecoverError #[non_exhaustive], declared BREAKING (next release 3.0.0)", "status": "done", "commit": "39017ad"},
+    {"id": "gap-plans", "name": "Gap plans 48-18 (start-driven #200 arms) and 48-19 (start refusal guard) planned, checker PASSED after 2 revisions", "status": "done", "commit": "2902c62"}
   ],
   "remaining_tasks": [
-    {
-      "id": "gate-verify",
-      "name": "Phase goal verification — the only Phase 48 tail gate never run",
-      "status": "not_started"
-    },
-    {
-      "id": "gate-container-head",
-      "name": "Re-run scripts/check-in-container.sh all at HEAD: the last FULL gate was at 3ca90b6, and e683f89 changed opencode.rs test code after it",
-      "status": "not_started"
-    },
-    {
-      "id": "phase-complete",
-      "name": "Phase completion and its state writes, after goal verification",
-      "status": "not_started"
-    }
+    {"id": "48-18", "name": "Execute 48-18 (3 tasks, test-only, wave 12)", "status": "not_started"},
+    {"id": "48-19", "name": "Execute 48-19 (2 tasks, TDD: RED test(48-19), GREEN feat(48-19), wave 13)", "status": "not_started"},
+    {"id": "container-gate-2", "name": "Full scripts/check-in-container.sh all at the new HEAD", "status": "not_started"},
+    {"id": "re-verify", "name": "Re-run goal verification (gsd-verifier); close human_verification item 1 from 48-19-SUMMARY's Operator rulings", "status": "not_started"},
+    {"id": "phase-complete", "name": "update_roadmap / phase.complete, MemPalace capture (verify:post), STATE diff check", "status": "not_started"}
   ],
   "blockers": [],
   "async_jobs": [],
   "human_actions_pending": [],
   "decisions": [
-    {
-      "decision": "Do not push feature/phase-48 until ship.",
-      "rationale": "The repo's pre-push hook refuses .planning/ files on feature/* branches, and the operator declined both a workspace/ backup ref and an early code-only PR branch. All Phase 48 work is local-only.",
-      "phase": 48
-    },
-    {
-      "decision": "Accept the recycled-PID lock limit; track it as 999.128.",
-      "rationale": "Every lock-taking repair refuses while an unrelated process holds a recycled PID. 48-CONTEXT already deferred lock reclaim by pid+start time to Phase 50, but Phase 50's roadmap did not carry it.",
-      "phase": 48
-    },
-    {
-      "decision": "Stale gate answers (code review finding B) are a recorded Phase 48 limit, folded into 999.130, not fixed now.",
-      "rationale": "A real fix changes the gate protocol; the cheap fix would break the intended Supervise re-scan rejection reuse. Recorded as AR-48-04 in 48-SECURITY.md and marked superseded in 48-CONTEXT D-05.",
-      "phase": 48
-    },
-    {
-      "decision": "Fix A, D and E from the code review inside Phase 48; file the older false-success instances as the 999.133 class entry.",
-      "rationale": "A, D and E were bounded defects in code this phase touched; abort, cleanup and recover-inspect predate it.",
-      "phase": 48
-    },
-    {
-      "decision": "Fix the Legacy monitor lost-TERM race in this phase; backlog the PipeOwning equivalent as 999.134.",
-      "rationale": "The Legacy race was the recurring container-gate failure. PipeOwning needs its own failing test and design approval, and only an external TERM reaches it.",
-      "phase": 48
-    },
-    {
-      "decision": "Accept the OpenCode probe flake unreproduced; land diagnostics and file 999.135 rather than spend ~1h on 15 full-gate runs.",
-      "rationale": "The diagnostics make the next occurrence self-explaining; forcing it buys a faster answer, not a better one.",
-      "phase": 48
-    }
+    {"decision": "Fix WR-01..WR-04 in Phase 48; WR-05 backlogged as 999.136", "rationale": "Operator option 1: fix what this phase introduced, backlog what predates it", "phase": 48},
+    {"decision": "Review-fix round option 1: fix R-1, R-3..R-6; backlog R-2/R-7/R-8 as 999.137", "rationale": "Honest reporting/exit codes make OPERATIONS.md's non-zero-exit claim true; reach findings are older and inert", "phase": 48},
+    {"decision": "Execute review fixes with codex (gpt-5.6-terra, xhigh), sequentially, handing over at 85% of its 5h window", "rationale": "Operator instruction; codex peaked at 72%", "phase": 48},
+    {"decision": "Criterion 4: add start-driven interrupted and live arms (48-18)", "rationale": "The committed repro drove advance, not the foreground start the criterion names", "phase": 48},
+    {"decision": "Criterion 2: start refuses when the recorded agent or monitor pid is alive (48-19), plain pid liveness via existing helpers; recycled-pid false refusal accepted; no-state carve-out explicitly approved", "rationale": "Operator rulings 2026-09-22; the carve-out keeps recover --clean as the escape from a recycled pid", "phase": 48},
+    {"decision": "Declare the devflow-core API break and mark both error enums #[non_exhaustive]", "rationale": "v3.0.0 milestone; cargo semver-checks vs published 2.12.0", "phase": 48},
+    {"decision": "No hermes gateway restart", "rationale": "load_config re-reads on file-signature change; no cron job pins an old model id", "phase": 48}
   ],
   "uncommitted_files": [
     "?? .planning/research/.cache/",
@@ -128,6 +41,6 @@
     "?? .planning/reviews/48-code-review-2026-09-22/codex-trace-tail.log",
     "?? .planning/user/errors/"
   ],
-  "next_action": "Run Phase 48 goal verification (the gsd-verifier / /gsd-verify-work path). Before claiming container parity at HEAD, re-run scripts/check-in-container.sh all and capture BOTH its exit code and the final '==> check.sh: all OK' line — the last full gate ran at 3ca90b6 and e683f89 changed test code afterwards.",
-  "context_notes": "All 17 plans plus every tail gate except goal verification are done. 25 commits this session, all local. The four untracked planning paths are deliberate and must be preserved. Two GSD debug sessions ran: monitor-sigterm-orphans-agent is resolved and archived; probe-sleep-survives-group-kill is intentionally left OPEN and not root-caused (resume with /gsd-debug continue probe-sleep-survives-group-kill). Treat the security register as fallible: this session found that two high threats had been closed on evidence covering one instance of a class, and the same instance-not-class pattern recurred in the code-review fixes."
+  "next_action": "Execute 48-18 then 48-19 (/gsd-execute-phase 48 --gaps-only, or codex per the operator's earlier choice — ask the operator which executor), committing RED and GREEN separately; then run the full container gate and re-verify.",
+  "context_notes": "Four untracked planning paths are deliberate; preserve them. The Bash tool should now run bash (CLAUDE_CODE_SHELL=/usr/bin/bash in ~/.claude/settings.json) — confirm with echo $0 at session start. Executors cannot commit from this worktree (#4799 workaround); the orchestrator commits. Codex runner and brief used this session: scratchpad codex/run.sh and CONTEXT.md (session-scoped; re-create if gone). 48-19's refusal wording is pinned by tests; 999.138 records that stop cannot end a lock-free run."
 }
