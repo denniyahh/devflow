@@ -1,60 +1,42 @@
 ---
 phase: 48-survivable-state-writes-and-honest-gate-recovery
-verified: 2026-09-23T17:00:00Z
-status: gaps_found
-score: 6/7 must-haves verified
-covered_files: [".planning/REQUIREMENTS.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-01-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-01-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-02-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-02-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-03-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-03-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-04-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-04-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-05-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-05-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-06-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-06-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-07-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-07-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-08-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-08-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-09-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-09-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-10-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-10-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-11-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-11-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-12-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-12-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-13-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-13-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-14-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-14-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-15-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-15-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-16-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-16-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-17-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-17-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-18-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-18-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-19-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-19-SUMMARY.md","clippy.toml","crates/devflow-cli/src/commands.rs","crates/devflow-cli/src/main.rs","crates/devflow-cli/src/pipeline_gate.rs","crates/devflow-cli/src/pipeline_launch.rs","crates/devflow-cli/src/pipeline_outcomes.rs","crates/devflow-cli/src/preflight.rs","crates/devflow-cli/src/staleness.rs","crates/devflow-cli/src/test_support.rs","crates/devflow-cli/tests/gate_sweep_e2e.rs","crates/devflow-cli/tests/gate_wedge_e2e.rs","crates/devflow-cli/tests/gitignore_coverage.rs","crates/devflow-cli/tests/plan_bashism_scanner.rs","crates/devflow-cli/tests/recover_clean_e2e.rs","crates/devflow-cli/tests/start_lock_e2e.rs","crates/devflow-cli/tests/stop_e2e.rs","crates/devflow-core/src/agent.rs","crates/devflow-core/src/agent_result.rs","crates/devflow-core/src/agents/opencode.rs","crates/devflow-core/src/agents/pi.rs","crates/devflow-core/src/config.rs","crates/devflow-core/src/doc_check.rs","crates/devflow-core/src/gates.rs","crates/devflow-core/src/lock.rs","crates/devflow-core/src/monitor.rs","crates/devflow-core/src/recover.rs","crates/devflow-core/src/ship.rs","crates/devflow-core/src/state.rs","crates/devflow-core/src/test_support.rs","crates/devflow-core/src/verify.rs","crates/devflow-core/src/workflow.rs","scripts/lint-plan-bashisms.sh"]
-covered_digest: "v1:sha256:407a3085884ddf3f615ce16931a41ec4917a5744944be941d7d785b297c02ac1"
+verified: 2026-09-23T23:26:51Z
+status: passed
+score: 7/7 must-haves verified
+covered_files: [".planning/REQUIREMENTS.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-01-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-01-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-02-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-02-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-03-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-03-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-04-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-04-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-05-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-05-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-06-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-06-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-07-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-07-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-08-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-08-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-09-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-09-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-10-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-10-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-11-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-11-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-12-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-12-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-13-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-13-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-14-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-14-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-15-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-15-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-16-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-16-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-17-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-17-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-18-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-18-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-19-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-19-SUMMARY.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-20-PLAN.md",".planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-20-SUMMARY.md","clippy.toml","crates/devflow-cli/src/commands.rs","crates/devflow-cli/src/main.rs","crates/devflow-cli/src/pipeline_gate.rs","crates/devflow-cli/src/pipeline_launch.rs","crates/devflow-cli/src/pipeline_outcomes.rs","crates/devflow-cli/src/preflight.rs","crates/devflow-cli/src/staleness.rs","crates/devflow-cli/src/test_support.rs","crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs","crates/devflow-cli/tests/gate_sweep_e2e.rs","crates/devflow-cli/tests/gate_wedge_e2e.rs","crates/devflow-cli/tests/gitignore_coverage.rs","crates/devflow-cli/tests/plan_bashism_scanner.rs","crates/devflow-cli/tests/recover_clean_e2e.rs","crates/devflow-cli/tests/start_lock_e2e.rs","crates/devflow-cli/tests/stop_e2e.rs","crates/devflow-core/src/agent.rs","crates/devflow-core/src/agent_result.rs","crates/devflow-core/src/agents/opencode.rs","crates/devflow-core/src/agents/pi.rs","crates/devflow-core/src/config.rs","crates/devflow-core/src/doc_check.rs","crates/devflow-core/src/gates.rs","crates/devflow-core/src/lock.rs","crates/devflow-core/src/monitor.rs","crates/devflow-core/src/recover.rs","crates/devflow-core/src/ship.rs","crates/devflow-core/src/state.rs","crates/devflow-core/src/test_support.rs","crates/devflow-core/src/verify.rs","crates/devflow-core/src/workflow.rs","scripts/lint-plan-bashisms.sh"]
+covered_digest: "v1:sha256:6ae6481e5f2a2b8afad782c7f093b4c1389352056ea07718d08fde01df2e5051"
 behavior_unverified: 0
 overrides_applied: 0
 re_verification:
   previous_status: gaps_found
   previous_score: 6/7
   gaps_closed:
-    - "Criterion 4: #200 now pinned on the foreground `start` shape in both directions (48-18); verifier re-ran both arms and an independent lock-drop mutant"
-    - "Human verification item 1 (criterion 2 scope): resolved by the operator rulings recorded in 48-19-SUMMARY (Gap B ruled a gap and closed for `start`; 999.136 deferred). The ruling text was written by the planner and copied by the executor; no operator-authored record was found"
+    - "Criterion 2 (`resume` half, 999.140): `devflow resume --phase N` over a live lock-free Legacy run now exits 1 with 'refusing to resume; nothing was written'. The state file and agent pid file are byte-identical afterwards, no lock is left, no stage_launched is emitted, and the recorded monitor and agent are still alive. Reproduced by the verifier against a freshly built HEAD binary (5eb3a61). The dead-leftover control relaunches. A mutant that removes the one guard call turns exactly the two resume refusal arms red with their named reasons"
+    - "Operator decision on 999.139 (the previous report's second missing item): recorded 2026-09-23 in 6d31299 as '999.139 stays in the backlog'. This is a deferral, not an acceptance, and not an explicit scope ruling (see truth 2)"
   gaps_remaining: []
   regressions: []
-  new_gaps:
-    - "Criterion 2: `devflow resume` over a live lock-free run is neither excluded nor refused (backlog 999.140, WR-04). Reproduced by the verifier at HEAD d5376fa. Same class as Gap B, which the operator ruled a criterion-2 gap"
-gaps:
-  - truth: "Criterion 2: after the fix, a second writer for the same phase is excluded or refused loudly and never silently overwrites; the single-writer control exercising the same path still round-trips"
-    status: partial
-    reason: >-
-      48-19 closed this for `start`. The sibling launch verb `resume` has no live-run check.
-      A verifier probe against the HEAD binary made a real Legacy launch: `start --mode supervise`
-      recorded monitor pid M1 and agent pid A1, and no lock was held while the agent ran.
-      A second `start --force` over that run was refused, and the state bytes did not change.
-      That is the control. `resume --phase N` over the same live run exited 0.
-      It rewrote the state (monitor_pid M1→M2) and overwrote the agent pid file (A1→A2), while M1 and A1 were still alive.
-      Two fake agents were then running for one phase.
-      The operator ruled this exact class a criterion-2 gap for `start` (Gap B). 48-SECURITY.md round 7 records
-      999.140 as "deferred, not accepted", with no operator ruling. The same guard also fails open when the state
-      file exists but will not load (999.139). That is confirmed by reading `refuse_start_over_a_live_run`
-      (`loaded.ok()` → no monitor pid) but not reproduced.
-    artifacts:
-      - path: "crates/devflow-cli/src/pipeline_launch.rs"
-        issue: "`resume` (line 1408) takes the lock, loads state and calls `launch_stage` with no `agent::agent_running` check on the recorded monitor pid or agent pid"
-      - path: "crates/devflow-cli/src/commands.rs"
-        issue: "`refuse_start_over_a_live_run` (line 2426) reads monitor_pid only from a state that loads, so an unloadable state hides a live monitor (999.139, reasoned only)"
-    missing:
-      - "Either (a) the same live-run refusal in `resume` under its lock, with a failing-first e2e test: `resume` against a live recorded monitor/agent, plus the dead-leftover control; or (b) an explicit operator override scoping criterion 2 to `start` and deferring `resume` to 999.140 (template in the Gaps Summary)"
-      - "Operator decision on 999.139 (fail closed on an unloadable state, or accept it as a limit)"
+gaps: []
 deferred: []
 advisory:
-  - finding: "The e2e proceed arms write to the operator's real ~/.cache/devflow/roots and do not reap the monitors they launch (999.141). The verifier's own targeted runs in this session added about 11 entries there (phases 91, 92, 97, 98 and others)"
+  - finding: "999.141 is still open: the e2e proceed arms write to the operator's real ~/.cache/devflow/roots. 34 entries newer than 19:20 local appeared during this session. Some or all came from this verifier's start_lock_e2e runs. A concurrent reviewer was also active, so the count is not attributable to one source. 48-20's new resume helper uses a per-child cache dir; the older start arms do not"
     category: other
-    reason: "Test hermeticity. It does not fall under TEST-01 as written, which covers process-global PATH mutation and the lint. It would be resolved by a per-child DEVFLOW_CACHE_DIR or HOME in the e2e helpers"
-    evidence_status: "cache entry count observed (14,816 total; 11 newer than 12:40 local today). No leaked /tmp/.tmp* devflow process was found after the runs"
+    reason: "Outside TEST-01 as written, which covers process-global PATH mutation. It would be resolved by per-child HOME/DEVFLOW_CACHE_DIR in the older e2e helpers"
+    evidence_status: "count observed; no leaked monitor or /tmp/.tmp* devflow process found afterwards"
 human_verification: []
 ---
 
 # Phase 48: Survivable State Writes and Honest Gate Recovery: Verification Report
 
 **Phase Goal:** A second writer cannot silently erase another's state update. A gate whose consumer is gone tells the operator the repair that actually works, instead of asserting a waiter that does not exist. Preflight and resume agree on where blocking-human gates exist. Checkpoints added after preflight are re-scanned. The test-suite PATH race is isolated.
-**Verified:** 2026-09-23 at HEAD `d5376fa` (worktree `.worktrees/phase-48`, branch `feature/phase-48`)
-**Status:** gaps_found. The criterion 4 gap is closed. A new criterion 2 gap was found: `resume`, reproduced.
-**Re-verification:** Yes. Previous: gaps_found 6/7 at `a692468`.
+**Verified:** 2026-09-23T23:26:51Z at HEAD `5eb3a61` (worktree `.worktrees/phase-48`, branch `feature/phase-48`)
+**Status:** passed. The one open gap, criterion 2 for `resume`, is closed.
+**Re-verification:** Yes. Previous: gaps_found 6/7 at `d5376fa`.
+
+## What argues against this result (read first)
+
+- **The criterion-2 hole 999.139 still exists on `start`, and the verifier reproduced it with a stand-in.** The setup had a state file that will not load, an agent pid file naming a dead pid, and a live process standing in for the monitor. `start --force` exited 0, overwrote the state and launched a second agent. The hole is excluded here on one basis only: the operator's recorded deferral ("999.139 stays in the backlog", 6d31299). That is the same basis the previous report used to exclude 999.136. **No ruling explicitly places 999.139 outside criterion 2.** 48-SECURITY.md still lists it as "deferred, not accepted". If the operator does not treat that deferral as exclusion from this phase, criterion 2 reverts to partial, for `start` only. `resume` is closed either way.
+- **Provenance of the operator decision.** The deferral text was committed in 6d31299 by an agent session (Claude co-author trailer). The operator did not write it. The 48-19 rulings had the same provenance, and the previous report accepted them.
+- **The residue is narrow, and the verifier observed that directly.** With the state corrupted while the agent was alive, both `start --force` and `resume` refused through the agent pid file. So 999.139 bites only when the agent is dead or its pid file is gone while the monitor lives. That is the agent-exit → `advance` window, which is 999.136's window and is also operator-deferred.
 
 ## Goal Achievement
 
@@ -62,132 +44,129 @@ human_verification: []
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | A second-writer test fails pre-fix; a single-writer control round-trips | ✓ VERIFIED (regression check) | RED was reproduced by the previous verifier against pre-fix `167363f`. Since `a692468`, production changed only in `commands.rs` (new guard and refusal text) and in two `#[non_exhaustive]` attributes (`recover.rs`, `workflow.rs`); `git diff a692468..HEAD`. This session at HEAD: `stop_e2e` 22 passed / 0 failed; `start_lock_e2e` 7 passed / 0 failed, including `start_refuses_while_another_process_holds_the_phase_lock` and the control `start_proceeds_when_no_process_holds_the_phase_lock`. |
-| 2 | After the fix, a second writer for the same phase is excluded or refused loudly and never silently overwrites | ✗ FAILED (partial) | **`start`: fixed and verified.** The guard at `commands.rs:370` sits between the `_phase_lock` binding (`:360`) and `Gates::cleanup` (`:378`). The four 48-19 tests pass. Verifier mutant M1 (guard call deleted) turned exactly the two refusal arms red with their named reasons ("start must refuse a phase whose recorded monitor/agent is alive"). The dead-leftover and no-state controls stayed green. A real-launch probe also confirmed the refusal: `start --force` over a live Legacy run gave rc=1 and left the state unchanged. **`resume`: not fixed.** The same probe then ran `resume --phase 77`: rc=0, monitor_pid and agent pid file overwritten, old monitor and agent still alive, two agents running. See Gaps. |
-| 3 | approve/reject/stop/sweep check for a live waiter; with none they say so, write no non-Ship answer, and name the repair; no `rm -f`; resume never reads a pending answer | ✓ VERIFIED (regression check) | The code on these paths did not change since `a692468`: the only `commands.rs` additions are the guard and refusal functions (`git diff`, comment-stripped). `stop_e2e` passed 22/22 at HEAD. `dry_run_sweep_reports_no_waiter_gates_as_left_alone` and both start wedge arms passed; they exercise the "no confirmed waiter … `devflow recover --clean --phase N`" refusal with no response file. The previous report's D-05 caveat (Unconfirmable holders still get an answer from approve/reject) and AR-48-04 still stand. |
-| 4 | #200 wedge reproducible on demand; shape pinned both ways (interrupted `start` wedges, left-alone self-resolves) | ✓ VERIFIED | `gate_wedge_e2e.rs` now drives a real `devflow start --mode auto`, parked at its Define preflight gate. Both start arms assert that `lock::holder_identity` equals the start child's pid. **Interrupted** (`start_wedge_arm_…`): after the kill, reject exits non-zero with "no confirmed waiter" and names `devflow recover --clean --phase 93`. No response file is written. `recover --clean` removes the state, gate files, the planted state and gate temps, and lock-93, and each of those is checked to exist first (WR-06 fix `a33060f`). **Left alone** (`start_self_resolving_arm_…`): reject_wording=live, start exits 0, and the state and gate are cleared. `pickup_ms=993` this run. The file ran 5 passed / 0 failed. **Negative control run by the verifier:** mutant M2 (`let _phase_lock` → `let _`) turned both start arms red and left both advance arms and the sweep test green. `commands.rs` was restored byte-identical (`git diff --quiet` exit 0), and a rebuilt HEAD went back to 5/5 and 7/7. |
-| 5 | CHKPT-01: one shared checkpoint parser; a marker off a task-opening line neither blocks preflight nor arms resume | ✓ VERIFIED (regression check) | `verify.rs` and `preflight.rs` are unchanged since `a692468`, which the previous report verified by test. Not re-run this session. |
-| 6 | CHKPT-02: checkpoints added or changed after Code's preflight are re-scanned before the resume decision | ✓ VERIFIED (regression check) | The re-scan code in `pipeline_launch.rs` is unchanged since `a692468`: the file has no diff in that range. Not re-run this session. |
-| 7 | TEST-01: process-global PATH mutations isolated or converted to per-Command scoping | ✓ VERIFIED (structural) | `git grep 'set_var("PATH"\|remove_var("PATH"' -- crates` finds 1 line at HEAD, a doc comment (`test_support.rs:302`). `clippy.toml` still disallows `std::env::set_var` and `std::env::remove_var`. The new 48-18 and 48-19 helpers set PATH through `Command::env` only. The lint's discriminating control was run by the previous verifier and was not repeated. |
+| 1 | A second-writer test fails pre-fix; a single-writer control round-trips | ✓ VERIFIED (regression) | RED was reproduced by an earlier verifier against pre-fix `167363f`. Since `1590100`, production changed only in `commands.rs` (the shared guard and the resume text) and in `pipeline_launch.rs` (one call and a doc comment); checked with `git diff 1590100..HEAD --stat -- crates`. At HEAD this session: `start_lock_e2e` 12 passed / 0 failed, including `start_refuses_while_another_process_holds_the_phase_lock` and its control `start_proceeds_when_no_process_holds_the_phase_lock`. |
+| 2 | After the fix, a second writer for the same phase is excluded or refused loudly and never silently overwrites; the single-writer control still round-trips | ✓ VERIFIED (999.139 on `start` excluded by operator deferral; see above) | **resume (the gap):** `pipeline_launch::resume` now calls `refuse_resume_over_a_live_run`. The call is at line 16 of the function, after `lock::acquire` (line 7) and before `load_state` (line 17), the `--agent` handoff, `repair_leaked_auto_chain_flag`, `save_state` and `launch_stage`. **Live probe on a real HEAD binary:** the refusal arm is refused, the dead arm relaunches, and bytes were compared in both arms (see Behavioral Spot-Checks). **Mutant (guard call deleted, scratch worktree):** 10 passed / 2 failed. The two failures were exactly `resume_refuses_a_phase_whose_recorded_monitor_is_alive` and `resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive`, and each panicked at `start_lock_e2e.rs:745` with its named reason ("resume must refuse a phase whose recorded monitor/agent is alive"). The mutant's stdout showed "stage code → launched Claude Code". The dead-leftover control, the no-state carve-out, the start golden and all start arms stayed green. **start:** `start --force` over the same live run still refused, with state unchanged. `start_live_run_refusal`'s body is textually identical to 48-19's `live_run_refusal` body at `1590100`, compared with a `diff` of the extracted function bodies. `pipeline_launch::resume` has one production caller: `main.rs:612`. Every other caller is in `#[cfg(test)]`, which starts at line 1578. |
+| 3 | approve/reject/stop/sweep check for a live waiter; with none they say so, write no non-Ship answer, and name the repair; no `rm -f`; resume never reads a pending answer | ✓ VERIFIED (regression) | 48-20 did not touch these paths; the only `commands.rs` hunks are the guard and refusal functions. At HEAD: `stop_e2e` 22/0, `gate_sweep_e2e` 4/0, `recover_clean_e2e` 11/0. The guard only adds a refusal ahead of `load_state` and does not read gate files. The previous report's caveats still stand: D-05 (Unconfirmable holders still get an answer) and AR-48-04. After 48-20, the no-waiter hint "`devflow resume --phase N`" can point at a verb that refuses when the run is live and lock-free. The criterion prescribes that hint literally. The operator filed the hint question as 999.142 (option b), and the refusal text itself names the working repair. |
+| 4 | #200 wedge reproducible on demand; shape pinned both ways | ✓ VERIFIED (regression) | `gate_wedge_e2e` 5/0 at HEAD. The test file has not changed since the previous report verified the M2 mutant. |
+| 5 | CHKPT-01: one shared checkpoint parser | ✓ VERIFIED (regression by diff) | `verify.rs` and `preflight.rs` are unchanged since `1590100`. The orchestrator's full workspace run at HEAD reported 1448 passed / 0 failed. That count is the orchestrator's; the verifier did not reproduce it. |
+| 6 | CHKPT-02: checkpoints added after Code's preflight are re-scanned | ✓ VERIFIED (regression by diff) | The only change in `pipeline_launch.rs` is the resume guard line and its doc comment. The re-scan code is untouched. |
+| 7 | TEST-01: PATH mutations isolated | ✓ VERIFIED (structural) | `git grep 'set_var("PATH"\|remove_var("PATH"' -- crates` finds 1 hit, a doc comment (`test_support.rs:302`). `clippy.toml` still disallows `std::env::set_var` and `std::env::remove_var`. The 48-20 test diff adds no `set_var` or `remove_var`; the new `resume_command` scopes PATH and DEVFLOW_CACHE_DIR through `Command::env`. |
 
-**Score:** 6/7 truths verified (0 present-but-behavior-unverified).
+**Score:** 7/7 truths verified (0 present-but-behavior-unverified).
 
-### What each piece of evidence does NOT establish
+### 48-20 plan must-haves (merged)
 
-- **Criterion 2 (start):** the e2e refusal arms fabricate a live run: a test-owned `sleep` is recorded as the monitor or agent. The verifier's scratch probe adds one real Legacy launch, supervise mode, a single run. It does not cover the pipe-owning launch or a run parked mid-`advance`. Liveness is pid-only, and a recycled pid gives a false refusal (accepted, Option A). The refusal's recovery guidance (ps identity, SIGTERM order, the `recover --clean` sequence) is asserted as text only. No test and no probe here followed it end to end.
-- **Criterion 2 (resume):** the probe ran once, supervise mode, Legacy launch. It shows that `resume` overwrites and relaunches. It does not show the downstream effects: which monitor's `advance` wins, and whether a state update is later lost.
-- **Criterion 4:** the start arms pin one parked shape: Define preflight, auto mode, no `.planning/config.json`. `pickup_ms` is pinned by the gate poll's first 1 s backoff step and measures nothing about the wedge. The `no_holder_after_exit` wording was accepted but never observed. Each arm was run 3 times this session (full file, M2 control, post-restore). That bounds nothing about flakiness under load.
-- **Criteria 5–7:** these are regression checks by diff, plus the previous session's test evidence. They were not re-executed here.
-- **Full suite:** the verifier did not run it. The orchestrator reports the pinned container gate as all OK at `d5376fa` (1443 passed, 0 failed, 34 suites). 48-VALIDATION.md's audit cites the same count at `a33060f`. Neither was reproduced here.
+| Must-have | Status | Evidence |
+|-----------|--------|----------|
+| Live monitor: resume exits non-zero and leaves state and agent-pid bytes identical, with no lock, no stage_launched, and the process not signalled | ✓ | Test arm, plus a real-launch probe in which both the monitor and the agent were live |
+| Live agent, dead monitor, stopped=true: refuses, and the stop mark survives | ✓ | `resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive` (runs the refusal twice) |
+| Dead-pid control: relaunches for stopped=false and stopped=true | ✓ | `resume_relaunches_a_phase_whose_recorded_processes_are_dead`, plus the probe's dead arm |
+| Refusal text: says "resume", names each pid by role, and carries no start-only text | ✓ | 27 required fragments and 4+ forbidden fragments are asserted in `assert_resume_refuses_live_run`. The probe showed "(monitor pid 3070616, agent pid 3070617 alive) — refusing to resume" |
+| Start text byte-identical | ✓ | Function-body `diff` against `1590100`, plus the golden test |
+| Guard under the lock, before `load_state` | ✓ | Line order 7 < 16 < 17 in `resume` |
+| Shared liveness (48-19's) | ✓ | `refuse_start_over_a_live_run` and `refuse_resume_over_a_live_run` both delegate to `refuse_launch_over_a_live_run`, and the liveness body is unchanged |
+| One production caller of resume | ✓ | `main.rs:612` |
+| No-state carve-out | ✓ | `resume_without_phase_state_reports_the_missing_state_not_a_live_run` |
+| RED against pre-fix | ✓ (verifier's own mutant) | See truth 2. The verifier did not re-run the executor's RED commit; it ran an independent guard-removal mutant instead |
+| Idempotency | ✓ | The agent arm refuses twice. In the probe, a second resume refused and the bytes were unchanged |
+| Prohibition: the refusal never signals a recorded pid | ✓ | The test asserts `agent_running(live_pid)` after the refusal. In the probe, M1 and A1 were still alive after both resumes |
+| Prohibition: never claims `stop` ends a lock-free run | ✓ | Fragment "would only mark the state stopped: it signals nothing" is asserted |
+| Prohibition (judgment): unloadable state changes no launch or write for resume | ✓ | Probe `p139.sh`: resume exited 1 with "state JSON failed: EOF while parsing…". State sha unchanged, 0 launches, no lock left. The hint texts H1–H10 were not touched: no hunk outside the guard functions in `git diff 1590100..HEAD -- crates/*/src` |
 
-### Human verification item 1 (previous report): disposition
+### 999.139: status for each verb
 
-The item asked whether criterion 2 covers windows in which no process holds `lock-NN` during a live run. 48-19-SUMMARY § "Operator rulings (2026-09-22)" states the ruling:
-- Gap B (a second `start` over a live run) is ruled a gap, and 48-19 closes it for `start`.
-- Liveness is Option A: "refuse when the recorded agent pid or monitor pid is alive".
-- The no-state carve-out is approved.
-- The agent-exit → `advance` window stays backlog 999.136, operator-deferred.
+| Verb | Unloadable state + live agent pid file | Unloadable state + dead or missing agent pid + live monitor | Covered? |
+|------|-----------------------------------------|-------------------------------------------------------------|----------|
+| `resume` | Refused with the live-run refusal. Probe: rc=1, "agent pid 3070617 alive", state and agent-pid bytes unchanged, launches stayed at 1 | Fails closed on its own `load_state`. Probe: rc=1, "state JSON failed", state bytes unchanged, 0 launches, no lock | **Covered** (no launch, no write, in both shapes) |
+| `start --force` | Refused. Probe: rc=1, "refusing to start; nothing was written", state unchanged | **Proceeds.** Probe: rc=0, "stage define → launched Claude Code (monitor pid 3072055)", state overwritten, a second agent started while the stand-in monitor was still alive | **Open**: the residue of 999.139 |
 
-**Provenance:** the wording was written by the planner (48-19-PLAN context and Known limits) and copied by the executor, whose summary says "Recorded as the plan records them". 48-SECURITY.md AR-48-06 notes the same: "the operator's wording appears only in planner/executor-written files". No operator-authored record was found. The only other hits for "Gap B" and "Option A" are these files and STATE.md, which refers to an unrelated Phase 47 decision. On that basis the item is closed.
-
-The ruling picked "open a gap" rather than "scope criterion 2 to the lock-held inventory". It did not address `resume`, because WR-04 surfaced a day later. That is why `resume` is scored as a gap and not absorbed.
-
-### Deferred backlog items against the criteria as written
-
-| Item | Relation to the criteria | Why |
-|------|--------------------------|-----|
-| **999.136**: the recover sweep deletes a live run between agent exit and `advance` | **Would undermine criterion 2 as written; excluded by the recorded operator deferral** | The sweep is a second writer that deletes a live run's state and gates. That contradicts "never silently overwrites" and the goal's first clause. The operator explicitly kept it out (48-19 rulings; 48-SECURITY AR-48-07 lists it as operator-deferred). It is reasoned from source and was not reproduced here. The 48-19 guard does not close it. |
-| **999.138**: `stop` cannot end a lock-free run | **Outside the criteria** | Criterion 3 governs `stop` when it answers a gate. In this window no gate is open and no answer is written. `stop` takes the lock before it writes, so it is not a lost update (criterion 2). **Reproduced by the verifier:** `stop` exited 0 and printed "no lock held … nothing is running `advance()`". The monitor and agent were still alive, and the state was set to `stopped=True`. It is an honesty defect in the 999.133 class, next to the phase goal's "repair that actually works" wording but not covered by any criterion. The 48-19 refusal text works around it. |
-| **999.139**: an unloadable state file hides a live monitor from `start`'s guard | **Undermines criterion 2 as written (narrow)** | When the state exists but does not load, `refuse_start_over_a_live_run` never sees `monitor_pid`. With the agent dead and the monitor alive, `start` proceeds over a live run. The code path is confirmed by reading `commands.rs:2426-2434`. The trigger (serde or version skew, EACCES) was not reproduced. 48-SECURITY round 7 lists it as "deferred, not accepted" with no operator ruling. It is folded into the criterion 2 gap as a secondary item. |
-| **999.140**: `resume` has no live-run check | **Undermines criterion 2 as written (reproduced)** | See truth 2 and Gaps. This is the same class as Gap B, which the operator ruled a criterion-2 gap. There is no operator ruling accepting it. |
-| **999.141**: e2e tests write the real `~/.cache/devflow` and leak monitors | **Outside criterion 7 as written** | TEST-01 and criterion 7 cover process-global PATH mutation, per-Command scoping and the lint. 999.141 concerns an inherited, un-isolated `HOME`/cache dir and unreaped monitors, which is test hermeticity, not the PATH race. It does undermine the operator's global test-isolation rule. This verification's own runs added about 11 entries to the real cache (Advisory). |
+**Scope:** the operator's recorded decision (6d31299, ROADMAP 999.140 promotion note; STATE `stopped_at`) is "999.139 stays in the backlog". 48-20-PLAN repeats it as "Out of scope, by operator decision". No artifact contains an explicit ruling that 999.139 is outside criterion 2. The exclusion applied here is an inference, consistent with how the previous report treated the operator-deferred 999.136. The stand-in monitor's pid is recorded nowhere readable, which is the point of 999.139. The probe therefore shows that the guard cannot see such a monitor. It does not show a real monitor ending up in that state.
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `crates/devflow-cli/tests/gate_wedge_e2e.rs` | start-driven #200 arms, advance arms renamed | ✓ VERIFIED | `fn start_self_resolving_arm_live_start_consumes_the_define_rejection()` present. 5 tests listed and all 5 passed. No `wedge_arm_killed_start` / `self_resolving_arm_live_start` names remain. |
-| `crates/devflow-cli/src/commands.rs` | `refuse_start_over_a_live_run` under the lock | ✓ VERIFIED (for `start`) | Guard at `:370`; helper at `:2426`; refusal text at `:2449` |
-| `crates/devflow-cli/tests/start_lock_e2e.rs` | two refusal arms, dead-leftover control, no-state carve-out | ✓ VERIFIED | 7 listed and 7 passed. The 22+ protective fragments and the 3 forbidden stale phrasings are asserted (`bb639f5`) |
-| `crates/devflow-cli/src/pipeline_launch.rs` `resume` | (criterion 2) a sibling launch verb must also refuse a live run | ✗ MISSING guard | See Gaps |
+| `crates/devflow-cli/src/commands.rs` | `pub(crate) fn refuse_resume_over_a_live_run`, shared `refuse_launch_over_a_live_run`, `resume_live_run_refusal` | ✓ VERIFIED | Present, substantive, called from `pipeline_launch.rs:1427` |
+| `crates/devflow-cli/src/pipeline_launch.rs` | `refuse_resume_over_a_live_run(project_root, phase)` under the lock | ✓ VERIFIED | Line 1427; the mutant proves it is load-bearing |
+| `crates/devflow-cli/tests/start_lock_e2e.rs` | two resume refusal arms, dead control, no-state carve-out, start golden | ✓ VERIFIED | 12 listed and 12 passed. The refusal arms discriminate (mutant) |
+| `crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs` | waits for `fixture.child_pid().is_some()` before resume | ✓ VERIFIED | A 6-line test-only wait, so the SIGKILL fixture knows its orphan before resuming; 2/0 at HEAD |
 
 ### Key Link Verification
 
 | From | To | Via | Status |
 |------|----|-----|--------|
-| `gate_wedge_e2e.rs` start arms | `commands::start` lock | `lock::holder_identity` == start child pid | WIRED (M2 mutant breaks it) |
-| `commands::start` | `agent::agent_running` | `refuse_start_over_a_live_run` on `monitor_pid` + `agent_pid_from_file` | WIRED (M1 mutant breaks it) |
-| guard call | between `_phase_lock` and `Gates::cleanup` | line order 360 < 370 < 378 | WIRED |
-| `resume` | live-run check | none | NOT_WIRED (gap) |
+| `pipeline_launch::resume` | `commands::refuse_resume_over_a_live_run` | call between `lock::acquire` and `load_state` | WIRED (mutant breaks it) |
+| `refuse_launch_over_a_live_run` | `agent::agent_running` | monitor_pid plus agent pid file | WIRED (probe: real live pids detected) |
+| `commands::start` | `refuse_start_over_a_live_run` | between `_phase_lock` (line 55 of fn) and `Gates::cleanup` (line 73), guard at line 65 | WIRED (probe: `start --force` refused) |
 
 ### Behavioral Spot-Checks
 
-| Behavior | Command | Result | Status |
-|----------|---------|--------|--------|
-| Gap-closure tests exist | `cargo test -p devflow --test gate_wedge_e2e -- --list`; same for `start_lock_e2e` | 5 and 7 tests listed | ✓ PASS |
-| Criterion 4 and criterion 2 (start) green at HEAD | `cargo test -p devflow --test gate_wedge_e2e -- --nocapture`; `cargo test -p devflow --test start_lock_e2e` | 5 passed / 0 failed, `reject_wording=live`, `pickup_ms=993`; 7 passed / 0 failed | ✓ PASS |
-| M1: guard removed → refusal arms fail | transient `sed` removal of the guard call, backup plus EXIT-trap restore | 5 passed / 2 failed: exactly the monitor and agent arms, each with its named reason (1 hit each); controls ok | ✓ PASS (discriminates) |
-| M2: start lock dropped → start pin fails | transient `let _phase_lock` → `let _` | 3 passed / 2 failed: both start arms; "the parked start must hold its own phase lock" appears 2 times; advance arms ok | ✓ PASS (discriminates) |
-| Source restored after mutants | `git diff --quiet -- commands.rs`, then rebuild and re-run both files | exit 0; 5/5 and 7/7 | ✓ PASS |
-| Criterion 3 regression | `cargo test -p devflow --test stop_e2e` | 22 passed / 0 failed | ✓ PASS |
-| Real Legacy launch: second `start` refused | scratch probe `/tmp/v48/probe.sh`, HEAD binary, scratch `DEVFLOW_CACHE_DIR` | first start rc=0 (monitor 2376759, agent 2376761, no lock-77 held); `start --force` rc=1 "refusing to start; nothing was written", state unchanged | ✓ PASS |
-| Real Legacy launch: `resume` over the same live run | same probe | rc=0; monitor_pid 2376759→2376782, agent pid 2376761→2376784; old monitor and agent alive; 2 fake agents running | ✗ FAIL (criterion 2) |
-| 999.138 shape | scratch probe `/tmp/v48/p2.sh` | `stop` rc=0, "no lock held … nothing is running `advance()`", monitor and agent alive, `stopped=True` | reproduced (outside the criteria) |
-| TEST-01 structural | `git grep` for PATH set_var/remove_var | 1 hit, a doc comment | ✓ PASS |
+The binary was built with `cargo build -p devflow` at HEAD `5eb3a61` (19:22:45 local, sha256 `84cda2d1…`), from a clean `crates/` tree (`git diff --quiet HEAD -- crates`). It contains the string "refusing to resume". Probe scripts are under `/home/denniyahh/.claude/jobs/d73e94fd/tmp/v48r/`. Each uses a scratch repo, a scratch `DEVFLOW_CACHE_DIR`, and a fake `claude` that runs `exec sleep 97` (or 96).
 
-All probe processes were confirmed gone afterwards by `ps -p` on each recorded pid and `pgrep` for the fake agent.
+| Behavior | Result | Status |
+|----------|--------|--------|
+| **Setup:** real `start --phase 77 --mode supervise --no-worktree --legacy-claude-launch` | rc=0. Monitor 3070616 is an `sh -c apid=…` script; agent 3070617 (`sleep 97`) has ppid 3070616. No lock-77 held. stage_launched=1 | ✓ |
+| **Live arm:** `resume --phase 77` over the live run | rc=1: "phase 77: a run is still live (monitor pid 3070616, agent pid 3070617 alive) — refusing to resume; nothing was written" (9 lines). State sha `ac6950f2…` → `ac6950f2…`; agent-pid sha `b9c7a9e3…` → `b9c7a9e3…`; monitor_pid and agent pid unchanged; no lock left; stage_launched 1 → 1; M1 and A1 alive; exactly 1 fake agent running | ✓ refusal |
+| **Live arm, second time** (idempotency) | rc=1 with the same refusal; both shas unchanged; still 1 fake agent | ✓ |
+| **Live arm:** `start --force` (48-19 regression) | rc=1, "refusing to start; nothing was written", state sha unchanged | ✓ |
+| **999.139, live agent:** state corrupted to `{"not a state` | resume rc=1 and start --force rc=1, both naming "agent pid 3070617 alive"; corrupt state bytes unchanged; launches stayed at 1 | ✓ |
+| **Dead arm:** followed the refusal's guidance, SIGTERM to the monitor first | After SIGTERM to M1, both M1 and A1 were gone (the sh monitor's cleanup took the agent down). No `advance` ran: state sha unchanged, launches stayed at 1. The pid files still recorded the dead 3070616/3070617 | ✓ (the guidance worked for this shape) |
+| **Dead arm:** `resume --phase 77` over the dead leftover | rc=0, relaunched. State sha `ac6950f2…` → `2e4363ee…`; monitor_pid 3070616 → 3070842 (alive); agent 3070617 → 3070843 (alive); stage_launched 1 → 2; stopped=False; 1 fake agent | ✓ control |
+| **999.139 residue:** unloadable state, dead agent pid, live stand-in monitor | resume: rc=1, "state JSON failed", state unchanged, 0 launches, no lock. start --force: rc=0, launched monitor 3072055 and agent 3072056 beside the live stand-in, state overwritten | resume ✓ / start open (operator-deferred) |
+| Mutant: resume guard call deleted (temporary `git worktree` at HEAD, reflinked target dir) | `start_lock_e2e`: 10 passed / 2 failed, exactly the two resume refusal arms, each with its named reason at `:745`. The mutant launched a stage | ✓ discriminates |
+| HEAD e2e | `start_lock_e2e` 12/0, `auto_chain_leak_repair_e2e` 2/0, `stop_e2e` 22/0, `gate_wedge_e2e` 5/0, `gate_sweep_e2e` 4/0, `recover_clean_e2e` 11/0 | ✓ |
 
-### Probe Execution
+Cleanup was checked after each run. `kill -0` on every recorded pid (3070616, 3070617, 3070842, 3070843, 3072055, 3072056 and the stand-in 3072001) found none alive, and `pgrep` for the fake-agent sleeps and the scratch roots found nothing. The scratch worktree was removed with `git worktree remove` and the reflinked target dir deleted; `git worktree list` no longer shows it. One harness defect: the live probe's final `pkill -f "$P"` matched the probe script's own path and killed the script, which exited 144. This happened after every probed process had already been signalled, and every result line above was printed before it.
 
-No `scripts/*/tests/probe-*.sh` exist, and no PLAN declares one, so Step 7c does not apply.
+### What this evidence does NOT establish
+
+- **One launch shape.** Both probes use Legacy supervise with an `sh -c` monitor. The pipe-owning (`__monitor`) launch, which is the default Claude path, was not probed live. It uses the same guard and liveness function, but no real pipe-owning run was refused here.
+- **One run per arm.** Each arm ran once, so this bounds nothing about races. The refusal is pid-only (Option A). A recycled pid gives a false refusal, and the costly repair for that is backlog 999.143.
+- **The dead arm's guidance check covers one shape only.** SIGTERM to the sh monitor ended the agent too and ran no `advance`. The "monitor defers SIGTERM while an `advance` child runs" branch of the guidance was not exercised.
+- **The refused resume's downstream effects on hints (999.142)** are reasoned from source, not exercised. `status`, doctor and the gate verbs can still name `devflow resume` in states where it now refuses.
+- **The full suite count** (1448/0) is the orchestrator's; the verifier ran six e2e files, not the workspace.
+- **The RED commit's own failure** was not replayed. Discrimination is shown by the verifier's independent mutant.
 
 ### Requirements Coverage
 
 | Requirement | Source Plans | Status | Evidence |
-|-------------|-------------|--------|----------|
-| SURV-01 | 48-01, 48-10, 48-11, 48-12, 48-19 | ⚠️ PARTIAL | The test arm (criterion 1) is satisfied. Criterion 2 holds for `start` but not for `resume`. The field arm is owned by Phase 49 criterion 5 |
-| SURV-02 | 48-01, 48-10, 48-12, 48-13, 48-14, 48-16, 48-18, 48-19 | ✓ SATISFIED | Criteria 3 and 4 are verified, including the interrupted-`start` shape REQUIREMENTS names |
-| CHKPT-01 | 48-01, 48-02 | ✓ SATISFIED | Criterion 5 (regression by diff) |
-| CHKPT-02 | 48-01, 48-07, 48-15 | ✓ SATISFIED | Criterion 6 (regression by diff) |
+|-------------|--------------|--------|----------|
+| SURV-01 | 48-01, 48-10, 48-11, 48-12, 48-19, 48-20 | ✓ SATISFIED (test arm; field arm is Phase 49's) | Criteria 1 and 2. 999.139 on `start` is operator-deferred |
+| SURV-02 | 48-01, 48-10, 48-12, 48-13, 48-14, 48-16, 48-18, 48-19 | ✓ SATISFIED | Criteria 3 and 4 |
+| CHKPT-01 | 48-01, 48-02 | ✓ SATISFIED | Criterion 5 |
+| CHKPT-02 | 48-01, 48-07, 48-15 | ✓ SATISFIED | Criterion 6 |
 | TEST-01 | 48-01, 48-03..48-06, 48-08, 48-09, 48-17 | ✓ SATISFIED (structural) | Criterion 7 |
 
-All five IDs are claimed by at least one plan, and none is orphaned. REQUIREMENTS.md still marks SURV-01, SURV-02, CHKPT-02 and TEST-01 as Pending. That is bookkeeping for phase completion.
+All 5 IDs are claimed by at least one plan, and none is orphaned. REQUIREMENTS.md maps exactly these five to Phase 48 and now marks all five Complete.
+
+### Deferred backlog items against the criteria
+
+| Item | Relation | Status |
+|------|----------|--------|
+| 999.136: sweep deletes a live run in the agent-exit → advance window | Undermines criterion 2 as written | Operator-deferred (48-19 rulings); unchanged |
+| 999.138: `stop` cannot end a lock-free run | Outside the criteria | Unchanged. The resume refusal now tells the truth about it |
+| 999.139: unloadable state hides a live monitor | Undermines criterion 2 as written, for `start` only | Operator-deferred ("stays in the backlog", 6d31299). Residue reproduced with a stand-in; covered for `resume` |
+| 999.142: hints prescribe `resume` where it refuses | Next to criterion 3 | Operator decision option (b), 2026-09-23 |
+| 999.143: a recycled pid leaves `resume` no work-preserving exit | Cost of Option A | Operator-deferred 2026-09-23 |
+| 999.141: e2e tests write the real cache | Outside TEST-01 as written | Advisory |
+
+### Probe Execution
+
+No `scripts/*/tests/probe-*.sh` exists, and no PLAN declares one, so Step 7c does not apply. The verifier's ad-hoc probes are recorded above.
 
 ### Anti-Patterns Found
 
-Lines added in `crates/` since `a692468`: no TBD, FIXME, XXX, TODO, HACK, `todo!` or `unimplemented!`. The pattern was checked against a known-positive sample and matched it.
+No TBD, FIXME, XXX, TODO, HACK, `todo!` or `unimplemented!` in lines added to `crates/` since `1590100`. The search was checked against a known-positive sample line, which it matched. No `set_var` or `remove_var` was added in tests.
 
-| File | Line | Pattern | Severity | Impact |
-|------|------|---------|----------|--------|
-| `crates/devflow-cli/tests/start_lock_e2e.rs` | fragment list in `assert_start_refuses_live_run` | Role (`monitor pid N` vs `agent pid N`) never asserted (48-REVIEW IN-02, not actioned) | ℹ️ Info | Swapping the roles in the guard would pass both arms |
-
-### Advisory (New Scope, Unevidenced)
-
-| # | Finding | Category | Why Advisory |
-|---|---------|----------|--------------|
-| 1 | The e2e proceed arms write to the real `~/.cache/devflow/roots` (999.141); this verification added about 11 entries | other | Outside TEST-01 as written; hermeticity only |
+| File | Pattern | Severity | Impact |
+|------|---------|----------|--------|
+| `crates/devflow-cli/src/commands.rs` `resume_live_run_refusal` | Near-duplicate of `start_live_run_refusal` (about 40 lines of parallel text) | ℹ️ Info | A deliberate choice to keep the start text byte-identical; the texts can drift apart |
 
 ### Gaps Summary
 
-There is one gap. Criterion 2 holds for `start` and not for `resume`.
-
-48-18 fully closes the criterion-4 gap from the previous report. The pin is on the real `start` shape, and an independent mutant shows it discriminates. 48-19 closes Gap B for `start`: an independent mutant and a real-launch probe both confirm the refusal.
-
-But the operator's Gap B ruling established that a second launch verb over a live, lock-free run is a criterion-2 violation. `resume` is such a verb, and it has no check. The verifier reproduced it at HEAD: `resume` over a live Legacy run exited 0, rewrote the state's `monitor_pid`, overwrote the agent pid file, and started a second agent beside the live one. 48-SECURITY round 7 records 999.140 as "deferred, not accepted", and no operator ruling accepts it. 999.139 is the same class, a narrow fail-open in the new guard, and is reasoned only.
-
-**Fix shape:** move the guard into a shared helper and call it in `resume` right after its lock. Write a failing-first e2e arm for `resume` against a live recorded monitor or agent, plus the dead-leftover control. Separately, decide whether 999.139 fails closed.
-
-**If the operator instead accepts `start`-only scope for this phase,** add an override:
-
-```yaml
-overrides:
-  - must_have: "Criterion 2: after the fix, a second writer for the same phase is excluded or refused loudly and never silently overwrites"
-    reason: "Closed for `start` (48-19). `resume` over a live lock-free run (999.140) and an unloadable state hiding a live monitor (999.139) are deferred to backlog by operator decision"
-    accepted_by: "{operator}"
-    accepted_at: "{ISO timestamp}"
-```
+There are no open gaps. The `resume` half of criterion 2 is closed and was verified three ways: a real-launch probe with a refusal arm and a relaunch control, both with byte comparisons; an independent mutant; and a source-order check. `start` keeps its refusal and its text. One criterion-2 residue remains: 999.139 on `start`, reproduced with a stand-in monitor. It is excluded only through the operator's recorded backlog deferral, which is an inference and not an explicit scope ruling.
 
 ---
 
-_Verified: 2026-09-23_
+_Verified: 2026-09-23T23:26:51Z_
 _Verifier: Claude (gsd-verifier)_

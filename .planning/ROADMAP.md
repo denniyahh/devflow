@@ -746,8 +746,14 @@ the lock; decide whether `status` should stop suggesting `resume` while the agen
 
 ### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (BACKLOG)
 
-**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-03). **Reasoned from
-source only — not reproduced; no test covers it.**
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-03). **Reproduced
+2026-09-23 by the Phase 48 re-verification** (HEAD `5eb3a61`): corrupt state + dead agent + live stand-in
+monitor → `start --force` exited 0, overwrote the state and launched a second agent. `resume` is not
+affected (its own `load_state` fails before launch). No test covers the branch (48-20 review WR-01: a
+skip-on-load-error mutant survives all `start_lock_e2e` tests).
+
+**Operator ruling 2026-09-23:** outside Phase 48 criterion 2 — the hole needs a dead agent beside a live
+monitor, the agent-exit → `advance` window already deferred as 999.136. Phase 48 passes without it.
 
 **Defect:** `refuse_start_over_a_live_run` (commands.rs) reads `monitor_pid` only from a state that loads.
 When the state file exists but does not parse or cannot be read, only the agent pid file is checked, so a

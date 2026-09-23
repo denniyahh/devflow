@@ -852,6 +852,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 48]: Closed fences are ignored; unclosed fence tails rescan unfenced so malformed plans cannot hide declarations.
 - [Phase 48]: Child marker value is the exact module-qualified test name, and the guard requires a non-vacuous exact-test result.
 - [Phase 48]: Driver fixtures supply PATH and configuration only through the spawned child Command.
+- [Phase 48]: close: re-verification after 48-20 (executed by codex) passed 7/7; the operator ruled 2026-09-23 that 999.139 on `start` (corrupt state + dead agent + live monitor, reproduced live) is outside criterion 2, being 999.136's agent-exit → `advance` window. 48-20 review: 0 critical / 4 warnings (test-coverage and duplication), not fixed at close.
 
 ## Roadmap Evolution
 
