@@ -501,3 +501,65 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         phase.padded()
     );
 }
+
+#[test]
+fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(94);
+    init_start_repo(root, phase);
+    let fake_bin = fake_bin_dir("sleep 60");
+    let mut start = spawn_parked_start(root, phase, &fake_bin, "60");
+
+    assert_eq!(
+        devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
+        Some(start.0.id()),
+        "the parked start must hold its own phase lock"
+    );
+
+    let before = Instant::now();
+    let output = reject_define(root, phase);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "live reject failed\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `gate_respond` re-checks the holder after publishing: a start that has
+    // already consumed the answer and released its lock yields the no-holder
+    // wording. That is accepted only because the start must then be seen to
+    // exit successfully below.
+    let reject_wording = if stdout.contains("a live lock holder may pick up this response") {
+        "live"
+    } else if stdout.contains("response was written, but no confirmed live holder will act") {
+        "no_holder_after_exit"
+    } else {
+        panic!("reject reported neither a live holder nor a post-exit no-holder: {stdout}");
+    };
+    println!("reject_wording={reject_wording}");
+
+    let status = loop {
+        if let Some(status) = start.0.try_wait().expect("poll start child") {
+            break status;
+        }
+        assert!(
+            before.elapsed() < Duration::from_secs(30),
+            "live start did not consume the rejection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let pickup_ms = before.elapsed().as_millis();
+    println!("pickup_ms={pickup_ms}");
+    assert!(
+        status.success(),
+        "start must exit cleanly after consuming the rejection: {status:?}"
+    );
+    assert!(
+        !devflow_core::workflow::state_path(root, phase).exists(),
+        "the rejected start must clear its state"
+    );
+    assert!(
+        !Gates::gate_path(root, phase, Stage::Define).exists(),
+        "consuming the response clears the Define gate request"
+    );
+}
