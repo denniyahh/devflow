@@ -672,7 +672,9 @@ it is the operator's real cache).
 **Acceptance:** not decided; set at promotion. Needs a test that fails when a spawned `devflow` child
 writes outside its tempdir `HOME`.
 
-### Phase 999.140: `resume` Launches With No Live-Run Check (BACKLOG)
+### Phase 999.140: `resume` Launches With No Live-Run Check (PROMOTED — Phase 48 gap closure)
+
+**Promoted 2026-09-23 by operator decision:** Phase 48 re-verification (`1590100`) reproduced a second monitor and agent launched by `resume` beside live ones at `d5376fa`; the operator chose to close criterion 2 with a Phase 48 gap plan for `resume` (reuse the 48-19 live-run refusal under the lock, test first). 999.139 stays in the backlog.
 
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-04). **Reasoned from
 source only — not reproduced.**

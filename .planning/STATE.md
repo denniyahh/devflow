@@ -6,7 +6,7 @@ current_phase: 48
 current_phase_name: Survivable State Writes and Honest Gate Recovery
 current_plan: 19
 status: executing
-stopped_at: "Gap closures 48-18 and 48-19 executed (RED 047c88e, GREEN fd9be36); container gate all OK 1443/0 at fd9be36; next: goal re-verification"
+stopped_at: "Re-verification gaps_found 6/7 (1590100): criterion 2 fails on `resume` over a live run (reproduced, 999.140). Operator decision 2026-09-23: close it with a gap plan for resume (reuse the 48-19 live-run refusal, TDD); 999.139 stays backlog. Next: /gsd-plan-phase 48 --gaps"
 last_updated: "2026-09-23T11:32:12.014Z"
 last_activity: 2026-09-23
 last_activity_desc: Phase 48 execution started
@@ -192,7 +192,7 @@ Phase: 48 (Survivable State Writes and Honest Gate Recovery) — EXECUTING
 Plans: 19 plans in 13 waves (48-01..48-19; 48-18/48-19 are gap closures)
 Current Plan: 19
 Total Plans in Phase: 19
-Completed Plans: 19 of 19 (48-18 done at a57a24a, 48-19 at 7c92aa5; container gate all OK 1443/0 at fd9be36; security, Nyquist and code review done; goal verification: gaps_found 6/7; MemPalace capture runs after verification passes)
+Completed Plans: 19 of 19 (re-verification 2026-09-23 gaps_found 6/7, resume gap pending a plan; 48-18 done at a57a24a, 48-19 at 7c92aa5; container gate all OK 1443/0 at fd9be36; security, Nyquist and code review done; goal verification: gaps_found 6/7; MemPalace capture runs after verification passes)
 Status: Executing Phase 48
 Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
