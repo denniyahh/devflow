@@ -473,6 +473,35 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         !phase_gate_entries(root, phase).is_empty(),
         "control: the gate scan must see the wedged phase's gate before recovery"
     );
+    // The SIGKILL lands in a gate wait with no write in flight, so no temp
+    // exists on its own (48-REVIEW WR-06). Plant one orphaned write temp per
+    // directory in the shape `unique_temp_path_with` builds:
+    // `.{target name}.{pid}.{sequence}.tmp`.
+    let devflow_dir = root.join(".devflow");
+    let gates_dir = Gates::dir(root);
+    let state_path = devflow_core::workflow::state_path(root, phase);
+    let lock_path = devflow_dir.join(format!("lock-{}", phase.padded()));
+    let state_temp = devflow_dir.join(format!(
+        ".{}.1.0.tmp",
+        state_path.file_name().unwrap().to_string_lossy()
+    ));
+    let gate_temp = gates_dir.join(format!(
+        ".{}.1.0.tmp",
+        Gates::gate_path(root, phase, Stage::Define)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+    ));
+    fs::write(&state_temp, b"orphaned state write").unwrap();
+    fs::write(&gate_temp, b"orphaned gate write").unwrap();
+    for precondition in [&state_temp, &gate_temp, &state_path, &lock_path] {
+        assert!(
+            precondition.exists(),
+            "precondition: {} must exist before recovery, or its removal proves nothing",
+            precondition.display()
+        );
+    }
+
     let recovery = Command::new(devflow_bin())
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
@@ -485,7 +514,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         String::from_utf8_lossy(&recovery.stderr)
     );
     assert!(
-        !devflow_core::workflow::state_path(root, phase).exists(),
+        !state_path.exists(),
         "recovery must remove the interrupted start's state"
     );
     let gates_left = phase_gate_entries(root, phase);
@@ -493,16 +522,16 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         gates_left.is_empty(),
         "recovery must remove every gate file for the phase: {gates_left:?}"
     );
-    let devflow_dir = root.join(".devflow");
-    let temps_left = dir_entries(&devflow_dir, |name| name.ends_with(".tmp"));
+    for temp_dir in [&devflow_dir, &gates_dir] {
+        let temps_left = dir_entries(temp_dir, |name| name.ends_with(".tmp"));
+        assert!(
+            temps_left.is_empty(),
+            "recovery must remove orphaned write temps in {}: {temps_left:?}",
+            temp_dir.display()
+        );
+    }
     assert!(
-        temps_left.is_empty(),
-        "recovery must remove orphaned write temps: {temps_left:?}"
-    );
-    assert!(
-        !devflow_dir
-            .join(format!("lock-{}", phase.padded()))
-            .exists(),
+        !lock_path.exists(),
         "recovery must not leave lock-{} behind",
         phase.padded()
     );
