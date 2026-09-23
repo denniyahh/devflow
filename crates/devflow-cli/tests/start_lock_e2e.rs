@@ -430,13 +430,42 @@ fn assert_start_refuses_live_run(
         "refusing to start; nothing was written".to_string(),
         format!("devflow stop --phase {phase}"),
         "would only mark the state stopped".to_string(),
-        format!("ps -p {live_pid}"),
-        format!("devflow recover --clean --phase {phase}"),
-        "only after the named processes have exited".to_string(),
+        // stop is not a no-op once this run's own advance holds the lock
+        // (48-REVIEW WR-02).
+        "once it takes the lock after this refusal".to_string(),
+        // Identity, not the bare executable name `ps -p` prints (48-REVIEW
+        // CR-01). `-ww`: at a terminal `args` is cut at the screen width,
+        // which drops the Legacy script's phase paths.
+        format!("ps -ww -o pid=,lstart=,args= -p {live_pid}"),
+        "`ps -p` shows only the executable name".to_string(),
+        format!("`--phase {phase}`"),
+        "`__monitor`".to_string(),
+        format!("`.devflow/phase-{}-`", phase.padded()),
+        "`ps -o ppid= -p <pid>`".to_string(),
+        // A Legacy monitor in its advance tail defers SIGTERM behind a
+        // foreground `devflow advance` child (48-REVIEW WR-02).
+        "may be running `devflow advance` as a foreground child".to_string(),
+        "`ps -ww -o pid=,args= --ppid <monitor pid>`".to_string(),
+        "signal that child, not only the monitor".to_string(),
+        // A live recycled pid refuses start again; only recover --clean
+        // then start gets past it (48-REVIEW WR-01).
+        "If the named processes have exited, run `devflow start` again".to_string(),
+        format!("run `devflow recover --clean --phase {phase}` first, then `devflow start`"),
     ] {
         assert!(
             stderr.contains(&fragment),
             "refusal must contain {fragment:?}\nstderr: {stderr}"
+        );
+    }
+    // The superseded guidance must be gone, not merely joined by new text.
+    for stale in [
+        format!("ps -p {live_pid}"),
+        "or after `ps -p` shows they are no longer this phase's processes".to_string(),
+        "(stop does end a run that holds the lock, for example one parked at a gate.)".to_string(),
+    ] {
+        assert!(
+            !stderr.contains(&stale),
+            "refusal must not contain superseded guidance {stale:?}\nstderr: {stderr}"
         );
     }
 
