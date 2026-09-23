@@ -391,6 +391,12 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
          without this the fixture never engaged the guard and nothing below can \
          be concluded",
     );
+    wait_for(
+        || fixture.child_pid().is_some(),
+        Duration::from_secs(30),
+        "the monitor to spawn the sleeper after setting the chain flag — resume now refuses \
+         over a live recorded agent, so the orphan must be known and terminated before resume",
+    );
     let child_pid = fixture.child_pid();
 
     // A real SIGKILL: `Child::kill` sends SIGKILL on Unix. The monitor dies
