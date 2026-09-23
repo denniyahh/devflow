@@ -1,231 +1,251 @@
 ---
 phase: 48-survivable-state-writes-and-honest-gate-recovery
-reviewed: 2026-09-23T12:09:09Z
+reviewed: 2026-09-23T23:27:57Z
 depth: deep
-files_reviewed: 3
+files_reviewed: 4
 files_reviewed_list:
   - crates/devflow-cli/src/commands.rs
-  - crates/devflow-cli/tests/gate_wedge_e2e.rs
+  - crates/devflow-cli/src/pipeline_launch.rs
   - crates/devflow-cli/tests/start_lock_e2e.rs
+  - crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs
 findings:
-  critical: 1
-  warning: 6
+  critical: 0
+  warning: 4
   info: 5
-  total: 12
+  total: 9
 status: issues_found
 ---
 
-# Phase 48: Code Review Report
+# Phase 48: Code Review Report (plan 48-20)
 
-**Reviewed:** 2026-09-23T12:09:09Z
+**Reviewed:** 2026-09-23T23:27:57Z
 **Depth:** deep
-**Files Reviewed:** 3
+**Files Reviewed:** 4
 **Status:** issues_found
+
+> This report replaces the 48-18/48-19 review (CR-01, WR-01..WR-06, IN-01..IN-05). That report is in git history
+> (`git log -- .planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-REVIEW.md`). Its WR-04
+> (`resume` has no live-run check) is the gap 48-20 closes. The findings below are only about the 48-20 diff.
 
 ## Summary
 
-Scope: `git diff ea8ac12..HEAD` of the three files. That covers plan 48-18 (the start-driven #200 arms in `gate_wedge_e2e.rs`) and plan 48-19 (`refuse_start_over_a_live_run` and `live_run_refusal` in `commands.rs`, called from `start` under the phase lock, plus four tests in `start_lock_e2e.rs`). I traced these call chains in source: `lock::acquire`/`lock_path`/`LockGuard::drop`, `workflow::load_state` with `migrate_legacy_state`, `agent_pid_from_file`, `agent::agent_running`/`is_zombie`, `Gates::cleanup`/`Gates::dir`, `stop`/`stop_via_gate`/`stop_via_lock`/`persist_stopped_state`, `recover::clean_phase_report`/`is_stale_state`, the Legacy monitor script (`monitor.rs:510-531`), the pipe-owning `__monitor` (`run_monitor` → `run_pipe_owning_monitor` → `advance_for_stage`), `spawn_agent_and_record` and `resume`.
+Scope: `git diff 60da104..HEAD` of the four files. This covers commits `bb639f5` (48-19 fragment pins), `97a1c94`
+(48-20 RED tests) and `fa04bfe` (48-20 GREEN guard). I traced these callees and callers in source:
+`pipeline_launch::resume`, `lock::acquire` (including the `.coord` inode), `workflow::load_state` and
+`migrate_legacy_state`, `agent_pid_from_file`, `agent::agent_running`/`is_zombie`, `spawn_agent_and_record`
+(where it clears `monitor_pid`), `transition`'s `--until` clear, `archive_phase_files_with_stamp` (the only
+remover of the agent pid file), `liveness`/`recovery_hints`, doctor's `check_dead_agent`/`check_dead_monitor`,
+and `ship::build_single_agent_cron_instructions`. `pipeline_launch::resume` has exactly one production caller,
+`main.rs:612`. No production code spawns `devflow resume`: the only non-CLI source of that command is the Hermes
+cron text in `ship.rs:277-299`.
 
-The guard itself sits where it should: after `lock::acquire`, before `Gates::cleanup`. It does refuse when a recorded monitor or agent pid is live. I checked that against production traces. The operator's machine-global registry holds tempdir entries for phases 95 and 96 (the refusal arms) only up to 07:48, which is before the GREEN commit. Phases 97 and 98 (the proceed arms) keep registering through 07:54 (see WR-05).
+Answers to the orchestrator's four questions. Each answer is labelled with how it was established.
 
-The defects are in the refusal text, in one unguarded sibling launch verb, and in the tests:
+1. **Does `resume` refuse over a live recorded pid in every path?**
+   - **Loadable state:** yes. Both refusal arms pass at HEAD (12/12 `start_lock_e2e`, run this session).
+   - **No state file:** the carve-out returns Ok, then `load_state` fails with MissingState. Nothing launches.
+     The test asserts this.
+   - **Unloadable state:** nothing launches either way. I checked this with a manual probe of the HEAD binary
+     against a corrupt `state-61.json`:
+     - With a live agent pid, the probe printed the resume refusal (rc=1).
+     - With a dead agent pid, it printed only `state JSON failed: …` (rc=1).
+     - The state file's sha256 was unchanged in both runs.
+   - **The gap on an unloadable state:** a live monitor is invisible there, and the operator gets a parse error
+     with no live-run warning (999.139, backlog). No test covers any part of this branch (WR-01).
+2. **Does the refusal leave state and pid files byte-identical?** Yes, for the state file, the agent pid file and
+   the phase's gate files. The tests assert it. Mutant M2 below proves the snapshot comparison is sensitive to
+   bytes. "Nothing was written" is still not literally true (IN-03).
+3. **Can the tests fail against a reverted fix?** Yes. I ran mutants in a scratch copy (`git archive HEAD`, a
+   separate target dir, deleted afterwards). The unmutated scratch copy passed 4/4 first.
+   - **M1** deleted the guard call. Both refusal arms turned red with their named reasons ("resume must refuse a
+     phase whose recorded monitor/agent is alive"). The controls stayed green.
+   - **M4** disabled the no-state carve-out. The no-state test and the 48-19 start carve-out test turned red.
+   - **M2** moved the guard to just before `launch_stage`. Only the stopped-agent arm caught it. The monitor arm
+     passed (WR-02).
+   - **M5** skipped the guard on any load error. It **survived all 12 tests** (WR-01).
+4. **Does the shared guard change `start`?** No. In the diff of `refuse_launch_over_a_live_run`, the only change
+   is that the verb now selects the message. The start call site at `commands.rs:370` is unchanged, between
+   `_phase_lock` and `Gates::cleanup`. `start_live_run_refusal` is the old body with a new name. The start golden
+   test and the four 48-19 start arms pass.
 
-- **Refusal text (the (b) question).** Three of its claims are false against source. `ps -p` cannot confirm what the text says it confirms (CR-01). A recycled pid does not let `start` proceed (WR-01). "SIGTERM the monitor to end the run now" fails during the Legacy monitor's advance tail (WR-02).
-- **Paths past the guard (the (a) question).** An unloadable state file hides a live monitor, and that path is not on the approved list (WR-03). `resume` is an unguarded sibling of `start` (WR-04).
-- **Tests.** The proceed arms leak detached monitors and pollute the operator's real registry (WR-05). The 48-18 wedge arm asserts that `recover --clean` removes temps, but no temp ever exists in that test (WR-06).
+I found no Critical defects. The guard is correct where it runs, and the tests discriminate the obvious revert. The
+weaknesses are two branches the tests do not pin, and two copies of the safety text that must be kept in step.
 
-What I verified by execution: the `ps -p` output shape (CR-01), and the registry pollution with a before/after-GREEN negative control (WR-05). Everything else is traced from source, not reproduced.
-
-## Narrative Findings (AI reviewer)
-
-## Critical Issues
-
-### CR-01: The refusal tells the operator that `ps -p <pid>` confirms process identity before a SIGTERM, but `ps -p` shows only the executable name
-
-**Class:** an identity check that cannot discriminate, offered as the safeguard before a destructive signal.
-**Sites:**
-- `crates/devflow-cli/src/commands.rs:2457`: the per-pid `ps -p {pid}` lines.
-- `crates/devflow-cli/src/commands.rs:2464-2465`: "confirm each pid is this phase's DevFlow monitor or agent with `ps -p <pid>`, then send it SIGTERM".
-- `crates/devflow-cli/src/commands.rs:2468`: "after `ps -p` shows they are no longer this phase's processes".
-- `crates/devflow-cli/tests/start_lock_e2e.rs:433`: the test pins the non-discriminating command as a required fragment.
-- Related pre-existing sites say only "inspect it manually (e.g. `ps -p`)" and do not claim confirmation: `commands.rs:1684`, `:1693`, `:2070`, `:2083`, `:2092`.
-
-**Issue:** The plan's Known limits and the SUMMARY accept pid-liveness-not-identity (Option A) on one condition: "The refusal tells the operator to check each pid with `ps -p <pid>` before signalling it, so an unrelated process is not killed." Default `ps -p` output is `PID TTY TIME CMD`, and CMD is the executable name only. I checked it here. For an `sh -c "sleep 5; echo x"` process, `ps -p` prints `sh`, while `ps -o args= -p` prints `sh -c sleep 5; echo x`.
-
-So the Legacy monitor shows as `sh`, the pipe-owning monitor as `devflow`, and the agent as `claude` or `node`. Nothing in that output names the phase or the project. Under `devflow parallel`, a recycled pid that now belongs to another phase's live monitor looks identical. The operator is then told to SIGTERM it, "monitor first", which ends a different phase's run. The compensating control for the accepted recycled-pid limit does not establish what it claims.
-
-**Fix:** Name a command whose output carries the identity, and say what to look for.
-```rust
-.map(|(role, pid)| format!("\n  {role} pid {pid}: ps -o pid=,lstart=,args= -p {pid}"))
-// and in the body:
-"confirm each pid is this phase's DevFlow process: the monitor's args contain \
- `--phase {phase}` (pipe-owning `__monitor`) or `phase-{padded}-` paths (Legacy `sh`), \
- and the agent's parent (`ps -o ppid= -p <pid>`) is the named monitor"
-```
-Update the `start_lock_e2e.rs:433` fragment to match.
+Not re-scored, still open by operator decision: H1-H10 production hints (999.142). `status` (Stuck), doctor's
+`check_dead_monitor`/`check_dead_agent` (`commands.rs:3742/3801/3826`) and cleanup (`commands.rs:934`) still send
+the operator to `devflow resume`. In the states this guard covers, that resume now always refuses. The refusal
+text says so accurately (I checked the `liveness` matrix at `commands.rs:1012-1021`). Recycled-pid false
+refusals are deferred to 999.143, and the lock-free window stays 999.136.
 
 ## Warnings
 
-### WR-01: The refusal says `devflow start` may be run again once `ps -p` shows the pids are not this phase's processes, but `start` refuses again for any live pid
+### WR-01: The unloadable-state branch of the shared guard is untested for both verbs; the mutant that deletes it survives the suite
 
-**Class:** refusal text that promises a path the guard blocks.
-**Site:** `crates/devflow-cli/src/commands.rs:2467-2470`
+**File:** `crates/devflow-cli/src/commands.rs:2469-2477`, `crates/devflow-cli/tests/start_lock_e2e.rs` (no arm)
 
-**Issue:** The text reads: "Run `devflow recover --clean --phase N` or `devflow start` again only after the named processes have exited, **or after `ps -p` shows they are no longer this phase's processes**". The second condition is the recycled-pid case. `refuse_start_over_a_live_run` tests only `agent::agent_running(pid)` (`commands.rs:2431-2435`). A recycled pid is live, so `start` refuses again with the same text. Only `recover --clean` followed by `start` works: it removes the state, and the no-state carve-out then skips the agent pid file. The plan's own Known limits states the correct sequence ("`recover --clean` removes the state and the next `start` proceeds"). The shipped text does not.
+**Issue:** When the state file exists but does not load, `refuse_launch_over_a_live_run` still checks the agent
+pid file. The 48-20 plan's prohibition relies on that: "when the agent pid file names a live process, resume now
+prints the live-run refusal instead of the load error".
 
-**Fix:** Split the sentence. If the processes have exited, run `start` again. If they are live but not this phase's processes, run `devflow recover --clean --phase N` first, then `start`.
+Mutant M5 replaces the condition with `if loaded.is_err() { return Ok(()) }`. It passed all 12 `start_lock_e2e`
+tests. No other test file references the refusal text: `rg` finds it only in `start_lock_e2e.rs` and
+`commands.rs`, and `commands.rs` has no unit test of the guard.
 
-### WR-02: "To end this run now … send it SIGTERM, monitor first" does not end the run while the Legacy monitor is in its advance tail
+- **Impact on `resume`:** only the error message changes, because `load_state` at `pipeline_launch.rs:1428` still
+  fails.
+- **Impact on `start`:** the same mutant is a real safety regression. `start` does not fail on a state it cannot
+  load. `carried_phase_failures` (`commands.rs:283-300`) warns and restarts the failure budget at zero, and `start`
+  then saves a fresh `State`. So with a corrupt state file and a live agent, M5's `start` would overwrite the state
+  and launch a second agent beside the live one (reasoned from source; I did not run it), and no test would
+  notice (verified: M5 survived). That holds with `--no-worktree` or
+  `--force`. Without `--force`, a worktree-mode start would stop later, at the existing-worktree check.
 
-**Class:** a claim that holds in one window of the run and is presented as holding in all of them.
-**Sites:**
-- `crates/devflow-cli/src/commands.rs:2461-2466`: the refusal text.
-- `crates/devflow-core/src/monitor.rs:500-509`: the script's own comment says the trap is deferred.
-- `crates/devflow-core/src/monitor.rs:525-531`: `reaped=1` gates `cleanup`.
-- SUMMARY class-enumeration row 10: claims the guard covers this window.
+The SUMMARY lists this branch as untested. It is the only line of defence on that path for `start`.
 
-**Issue:** After the agent exits, the Legacy `sh` monitor sets `reaped=1` and runs `devflow advance` as a foreground child. That child blocks in `acquire_blocking` while `start` holds the lock. The monitor's pid is live, so the guard fires and names only "monitor pid X", because the agent pid is dead. Following the advice then fails:
+**Fix:** add e2e arms that plant a non-JSON `state-NN.json`:
 
-- SIGTERM to the `sh` is deferred until the foreground `advance` returns. monitor.rs says so: "the shell defers it until that foreground command returns". When the trap does run, `reaped` is set, so `cleanup` kills nothing and just exits.
-- Meanwhile the unrecorded `advance` child takes the lock as soon as the refused `start` exits, and launches the next stage.
-
-The run continues. Also, once that `advance` holds the lock, `devflow stop` would signal it, so "stop … does not end this run" becomes false moments after the refusal. Plan 48-19 reasoned that the guard *refuses* in this window, and that part is true. It never checked that the *remedy text* works there. 999.136 defers the lock gap, not the correctness of the new text.
-
-**Fix:** When only the monitor is live, read its children (`/proc/<pid>/task/<pid>/children`; `monitor.rs:3211` already uses this in tests). If a child is a `devflow advance`, name it in the refusal as the process to signal, or tell the operator to wait and re-run `start`. At minimum, qualify the claim: "if the agent is already dead, the monitor may be running `devflow advance`; signal that child (`ps -o pid=,args= --ppid <monitor pid>`), not the monitor".
-
-### WR-03: A state file that exists but does not load hides a live monitor from the guard, and that path is not operator-approved
-
-**Class:** fail-open on an unreadable liveness record.
-**Site:** `crates/devflow-cli/src/commands.rs:2427-2434`
-
-**Issue:** When `load_state` returns an error and the file exists, the guard sets `loaded.ok()` to `None`, so `monitor` is `None` and only the agent pid file is checked. Two ways a live monitor goes unseen:
-
-- A serde failure, for example an older binary reading a newer `Stage` variant.
-- A read error (EACCES).
-
-If the agent is dead at that moment (the Legacy advance tail, or the pipe-owning monitor between the child exiting and its in-process advance taking the lock), `start` proceeds. It clears the gates, overwrites the state and launches beside the live monitor. The approved paths are the no-state carve-out, the recycled-pid false refusal and 999.136. This path appears only as an executor-recorded limit ("A state file that exists but cannot be loaded … is checked on the agent pid file only"), and no test covers it.
-
-**Fix:** Fail closed, or read the one field leniently.
 ```rust
-let monitor_pid = match &loaded {
-    Ok(state) => state.monitor_pid,
-    Err(_) => std::fs::read_to_string(workflow::state_path(project_root, phase))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("monitor_pid")?.as_u64())
-        .and_then(|pid| u32::try_from(pid).ok()),
-};
+// unloadable state + live agent pid → both verbs refuse, and the corrupt file stays byte-identical
+fs::write(devflow_core::workflow::state_path(root, phase), b"{\"not\":\"a state").unwrap();
+write_agent_pid(root, phase, agent.pid());
+// assert: start → "refusing to start", resume → "refusing to resume", snapshot unchanged
+// control: agent pid NEVER_LIVE_PID → resume stderr contains "state JSON failed", no "refusing to"
 ```
-Add an e2e arm with a corrupt state file that still records a live `monitor_pid`.
 
-### WR-04: `resume` launches under the lock with no live-run check, and `status` recommends `resume` for a phase whose agent is alive
+### WR-02: The guard's placement before any write is pinned only by a one-off plan gate; the tests catch a late guard only when the state is already stopped
 
-**Class:** an operator verb that launches an agent without refusing a recorded live run (one writer per phase, D-01). `start` is fixed; this is the sibling.
-**Sites:**
-- `crates/devflow-cli/src/pipeline_launch.rs:1408-1504` (`resume`): takes the lock, loads state, and calls `launch_stage` with no `agent_running` check.
-- `crates/devflow-cli/src/commands.rs:1012-1019` (`liveness`): `(false, _)` becomes `Stuck`, including when the agent is alive.
-- `crates/devflow-cli/src/commands.rs:1031-1038` (`recovery_hints`): `Stuck` becomes "devflow resume --phase N".
+**File:** `crates/devflow-cli/src/pipeline_launch.rs:1427`, `crates/devflow-cli/tests/start_lock_e2e.rs:825-891`
 
-**Issue:** The new refusal tells the operator to SIGTERM the monitor first. On the pipe-owning launch (the Claude default), the `__monitor` process installs no SIGTERM handler; I found none with `rg` across `crates/*/src`. It dies, and the agent keeps running in its own process group (`process_group(0)`, `monitor.rs:984`). Between the two signals, `status` reports "stuck — needs devflow resume". If the operator runs it, `resume` spawns a second agent beside the live one. `spawn_agent_and_record` also archives the live run's capture and overwrites the agent pid file, which hides the first agent from every later check.
+**Issue:** The plan requires the guard to run after `lock::acquire` and before `load_state`. That means before the
+`--agent` handoff (`save_state` plus `agent_handoff`), before `repair_leaked_auto_chain_flag` (which writes and
+commits `.planning/config.json`), and before `save_state`. The only check on this ordering was a line-number probe
+in the plan gate. Nothing durable checks it.
 
-**Fix:** Extract the guard into a shared `refuse_launch_over_a_live_run(project_root, phase)` and call it in `resume` right after its lock. Make `liveness(Some(_), false, true)` return a distinct state ("orphaned agent — signal it first") instead of `Stuck`/`resume`.
+- **M2** moved the guard to just before `launch_stage`, after `repair_leaked_auto_chain_flag` and `save_state`.
+  The monitor arm (`stopped=false`) still passed, because `save_state` rewrites identical bytes. Only the
+  stopped-agent arm failed, and only because the stop mark was cleared.
+- **Unexercised writes:** the tests never pass `--agent`, and the snapshot (`phase_file_snapshot`, `:348`) does not
+  cover `.planning/config.json`, git HEAD, or any event except `stage_launched`. So a guard placed after the
+  handoff block or after the auto-chain repair is indistinguishable in tests whenever the state is not stopped.
+- **Harm this hides:** a late guard over a live pipe-owning run would clear that live run's `_auto_chain_active`
+  flag, commit the change, and emit `auto_chain_flag_repaired`, all before refusing. That breaks the chain-flag
+  guard of the run it is supposed to protect.
 
-### WR-05: The proceed-arm tests leak detached monitors past their TempDir and write into the operator's real `~/.cache/devflow` registry
+The matrix also lacks three cells: both pids live (the two-role `monitor pid X, agent pid Y` rendering), monitor
+live with `stopped=true`, and agent live with `stopped=false`.
 
-**Class:** tests that launch a real run without isolating machine-global state or reaping what the run spawns.
-**Sites:**
-- `crates/devflow-cli/tests/start_lock_e2e.rs:74-94` (`child`) and `:377-383` (`run_start`): only `PATH` and `DEVFLOW_GATE_TIMEOUT_SECS` are set. `HOME`, `XDG_CACHE_HOME` and `DEVFLOW_CACHE_DIR` are inherited.
-- New tests that launch: `start_replaces_a_leftover_state_whose_recorded_processes_are_dead` (`:514`) and `start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_process` (`:547`).
-- Same file, pre-existing: `start_proceeds_when_no_process_holds_the_phase_lock` (`:174`, which has no gate timeout at all) and `start_clears_leftover_gate_files_after_taking_the_lock` (`:202`, where `kill_and_reap` reaps only `start`, not the `sleep 60` monitor it launched).
+**Fix:** extend the monitor arm to exercise the writes that precede the current guard position:
+- plant `.planning/config.json` with `workflow._auto_chain_active: true`;
+- run `resume --agent <other>` with a fake binary for that agent;
+- assert that the config bytes and `git rev-parse HEAD` are unchanged, and that there is no `agent_handoff` or
+  `auto_chain_flag_repaired` event.
 
-**Issue:**
-- **(d) Reaping.** `run_start` waits on `devflow start`, but `start` detaches a Legacy `sh` monitor, which runs the fake agent and then a real `devflow advance`. Nothing in the test kills or waits on those processes, on success or on panic. They outlive the test and run against a deleted TempDir until the 15 s gate timeout expires.
-- **Hermeticity.** `spawn_agent_and_record` calls `registry::register`. `registry::cache_dir` resolves `DEVFLOW_CACHE_DIR`, then `XDG_CACHE_HOME`, then `HOME/.cache/devflow`, so each run writes into the operator's real registry. Observed: `~/.cache/devflow/roots` holds 14,796 entries, 14,787 of them `/tmp/.tmp*` roots.
-- **Negative control.** Phase 97 and 98 entries with tempdir roots were registered at 07:49-07:54 on 2026-09-23 (after GREEN `fd9be36` at 07:54 and the RED runs). Phase 95 and 96 entries stop at 07:48, the RED runs, because the fixed guard refuses before launch. That also confirms the refusal arms no longer launch.
+Add one arm with both pids live to pin the two-role message.
 
-This breaks the project's own test-hermeticity rule. `devflow gate list --all-roots` walks this registry.
+### WR-03: The start and resume refusal texts are two ~40-line copies of the same safety guidance
 
-**Fix:** In `child`, set `.env("DEVFLOW_CACHE_DIR", root.join(".test-cache"))`. For the proceed arms, add a drop guard. It reads `state.monitor_pid` and the agent pid file after `start` returns, SIGTERMs the monitor (whose trap kills the agent), and waits for both to be gone before the TempDir drops. Apply the same guard to the pre-existing arms at `:174` and `:202`.
+**File:** `crates/devflow-cli/src/commands.rs:2498-2538` and `:2540-2580`
 
-### WR-06: The 48-18 wedge arm asserts that `recover --clean` removes orphaned temps, but no temp exists in the fixture
+**Issue:** `start_live_run_refusal` and `resume_live_run_refusal` duplicate:
+- the `named` and `checks` builders;
+- the `stop` paragraph;
+- the identity-check paragraph;
+- the pid-alone warning;
+- the monitor-first/advance-child paragraph;
+- the "do neither while live" sentence.
 
-**Class:** a removal assertion with no observed precondition, which cannot fail.
-**Site:** `crates/devflow-cli/tests/gate_wedge_e2e.rs:486-508`. It covers state `:486-490`, temps `:496-501` and lock `:502-507`, inside `start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers`.
+These sentences needed three review rounds to get right (48-REVIEW CR-01, WR-01, WR-02, and T-48-19-06/07). The
+next correction must be made in both copies. The tests pin selected fragments of each, so a change to an unpinned
+sentence in one copy will drift silently. Only `start`'s text has a byte-for-byte golden.
 
-**Issue:**
-- **Temps.** The `start` is SIGKILLed while parked in a gate wait, with no write in flight, and the test plants no temp. `temps_left.is_empty()` holds whether or not `recover --clean` removes temps. It is also scoped wrong. The scan covers only `.devflow/`, but gate temps are written beside their targets in `.devflow/gates/` (`Gates::dir`, `gates.rs:121-123`). Temp names start with `.`, so `phase_gate_entries`' `{padded}-` prefix filter misses them too.
-- **State and lock.** Only the gate scan has a before-recovery control (`:471-475`). The state and lock-NN assertions never check that those files existed before `recover`.
+**Fix:** build the shared paragraphs once and pass in the parts that differ by verb: the verb word, "as soon as
+this {verb} exits", the stopped-state paragraph (resume only), and the repair paragraph. Keep
+`start_refusal_text_stays_byte_identical_for_a_live_monitor` to prove `start`'s bytes do not change. Add a resume
+golden so the refactor cannot change resume's bytes either.
 
-48-18-SUMMARY coverage row D claims "recover --clean removes state, gate files, temps and lock-NN" for this test. The temps part is unproven here. It is covered only by the unit test at `recover.rs:531-540`.
+### WR-04: The no-state carve-out test passes on any failure of `resume`
 
-**Fix:** Before calling `recover`, plant `.devflow/.state-93.json.1.0.tmp` and `.devflow/gates/.93-define.json.1.0.tmp`. Assert that `state_path` and `.devflow/lock-93` exist. After recovery, scan both directories for `.tmp`.
+**File:** `crates/devflow-cli/tests/start_lock_e2e.rs:929-960`
+
+**Issue:** `resume_without_phase_state_reports_the_missing_state_not_a_live_run` asserts only three things:
+- the exit is non-zero;
+- stderr lacks "refusing to resume";
+- the snapshot is unchanged.
+
+It never asserts the missing-state error its name promises. It would pass if `resume` failed for an unrelated
+reason, for example a CLI argument change that rejects `--legacy-claude-launch` or a lock error. In that case it
+would no longer show that the carve-out is reached. M4 shows it discriminates today, but it has no positive
+control.
+
+**Fix:** assert on the MissingState error text. `WorkflowError::MissingState` displays as
+`no active DevFlow state at <path>` (`workflow.rs:37`), so assert
+`stderr.contains("no active DevFlow state at")`.
 
 ## Info
 
-### IN-01: The no-state carve-out is reachable from more producers than the one its approval was reasoned on
+### IN-01: The golden test's "sensitive to the launch verb" assertion always passes
 
-**Sites:** `crates/devflow-cli/src/commands.rs:699-701`; `crates/devflow-cli/src/pipeline_launch.rs:1067-1068`; `crates/devflow-core/src/recover.rs:419-438`
+**File:** `crates/devflow-cli/tests/start_lock_e2e.rs:984-989`
 
-**Issue:** The operator approved the carve-out on the reasoning that `recover --clean` leaves the agent pid file behind. Two other writers also remove state while a recorded process is live:
+**Issue:** The assertion is
+`!stderr.contains(&expected.replacen("refusing to start", "refusing to resume", 1))`. It runs after
+`stderr.contains(&expected)` has passed, so it can only fail if stderr holds both texts. It proves nothing about
+sensitivity. The earlier `contains(&expected)` assertion already fails on a resume text.
 
-- `start`'s own `clear_state` after a failed `launch_stage`. This is reached when the post-spawn `save_state(state)?` fails after `spawn_monitor` has already succeeded.
-- The `recover` sweep's `is_stale_state`. It checks only the agent, never the monitor. This one is within 999.136's scope.
+**Fix:** delete it. Alternatively, make it a real negative control: render the golden with the wrong verb and
+assert that the equality check fails.
 
-Both leave a live monitor or agent with no state, so the next `start` proceeds.
+### IN-02: `live_run_refusal`'s doc comment still describes only `start`
 
-**Fix:** Bring these producers to the operator's attention when 999.136 is triaged. In `start`, do not `clear_state` once a monitor pid has been returned.
+**File:** `crates/devflow-cli/src/commands.rs:2488-2490`
 
-### IN-02: The refusal tests never assert the role, and two fragments are redundant
+**Issue:** The comment says "The refusal text for [`refuse_start_over_a_live_run`]. It fires while `start` holds
+the lock". The function now dispatches both verbs.
 
-**Site:** `crates/devflow-cli/tests/start_lock_e2e.rs:427-436`
+**Fix:** reword it to cover both `start` and `resume`, or point it at `refuse_launch_over_a_live_run`.
 
-**Issue:** `phase.to_string()` is contained in `devflow stop --phase {phase}`, and `live_pid.to_string()` in `ps -p {live_pid}`. Neither fragment can fail on its own. Nothing asserts `"monitor pid {pid}"` versus `"agent pid {pid}"`, so swapping the roles in `refuse_start_over_a_live_run` would pass both arms.
+### IN-03: A refused resume still writes to `.devflow/` (carried from the prior IN-03)
 
-**Fix:** Assert `format!("monitor pid {pid}")` in the monitor arm and `format!("agent pid {pid}")` in the agent arm. Drop the two redundant fragments.
+**File:** `crates/devflow-cli/src/commands.rs:2552`, `crates/devflow-cli/tests/start_lock_e2e.rs:810`
 
-### IN-03: "nothing was written" is not strictly true
+**Issue:** I probed a refused resume against a fresh `.devflow/`. It left `.devflow/.lock-61.coord` behind: the
+coordination inode, which by design is never removed (`lock.rs:187`). It also left `.devflow/.gitignore`. The
+guard's `load_state` can also migrate or remove a legacy `state.json`.
 
-**Sites:** `crates/devflow-cli/src/commands.rs:321` (via `fresh_state_carrying_phase_failures`, before the lock), `:2427` (the guard's own `load_state`), `:2459`
+The test asserts only that `lock-NN` is absent, and the SUMMARY calls the lock "transient". The coord file is not
+transient. All of this is harmless, but the refusal's "nothing was written" clause is broader than what holds.
 
-**Issue:** `load_state` runs `migrate_legacy_state`, which can rename a legacy `.devflow/state.json` or delete it. `lock::acquire` creates and removes `lock-NN`, and `ensure_devflow_dir` may create `.devflow/.gitignore`. The contention refusal at `:363-364` makes the same claim, so this is pre-existing. The SUMMARY acknowledges the migration write.
+**Fix:** narrow the clause to "state, pid and gate files are unchanged", or accept this as documented.
 
-**Fix:** Word it as "no phase state, gate or branch was changed".
+### IN-04: `resume` loads the state twice, and the guard's load has a side effect
 
-### IN-04: The `sleep 60` live process can go zombie on a slow run and fail the refusal arms spuriously
+**File:** `crates/devflow-cli/src/commands.rs:2469`, `crates/devflow-cli/src/pipeline_launch.rs:1428`
 
-**Site:** `crates/devflow-cli/tests/start_lock_e2e.rs:281-286`
+**Issue:** The guard's `load_state` result is discarded, and `resume` reads the file again one line later. Under
+the lock only lock-free writers such as `stop` or `recover --clean` can change the file in between, so the risk is
+small. The two reads can still disagree. The first read also runs `migrate_legacy_state`.
 
-**Issue:** If more than 60 s pass between `LiveProcess::spawn` and the guard (a cold container), `sleep` exits. It stays unreaped until Drop, and `agent_running` treats zombies as dead. `start` then proceeds and the arm fails. This fails loudly rather than passing vacuously.
+**Fix:** have the guard return the loaded `State`, or accept a `&Result<State, _>`, and let `resume` reuse it.
 
-**Fix:** Use `sleep 3600`; Drop kills it anyway.
+### IN-05: The Hermes cron resume is one-shot, so a false refusal on that path is never retried
 
-### IN-05: The "monitor first" advice ignores the pipe-owning launch's process group and its SIGTERM disposition
+**File:** `crates/devflow-core/src/ship.rs:299-300`, `crates/devflow-core/src/agent_result.rs:3184`
 
-**Sites:** `crates/devflow-cli/src/commands.rs:2464-2466`; `crates/devflow-core/src/monitor.rs:984`, `:1469-1485`; `crates/devflow-cli/src/pipeline_launch.rs:962-977`
+**Issue:** The cron job is built with `once: true`. The agent pid file survives the whole rate-limit pause,
+because only the next launch archives it. So a recycled agent pid (999.143) makes the single cron `resume` refuse,
+and that phase stays paused.
 
-**Issue:** On the pipe-owning arm the agent leads its own process group. The monitor itself terminates the whole group (`terminate_child_group`), but the refusal tells the operator to signal only the leader pid. The `__monitor` has no SIGTERM handler, so `AutoChainGuard`'s Drop does not run and `_auto_chain_active` leaks into the worktree config. The next `start` or `resume` repairs it.
+The operator sees this only through `status`'s cron-pending hint. That hint recommends `devflow resume` again,
+which refuses again. The SUMMARY describes this path as "refused once", which undersells it: nothing fires a
+second time.
 
-"Signalling the agent first lets the monitor launch the next stage" is also imprecise. `advance` evaluates exit 143 and may relaunch the same stage or open a gate. The direction (another agent may launch) is right.
+The existing `sleep 60` zombie flake (prior IN-04) also applies to the new resume refusal arms. They use the same
+`LiveProcess`.
 
-**Fix:** For the pipe-owning launch, suggest `kill -TERM -- -<agent pid>`. Say "lets the monitor run `advance`, which may launch another agent".
+**Fix:** record the one-shot consequence in 999.143. Consider having the cron-pending hint name the refusal case.
 
 ---
 
-_Reviewed: 2026-09-23T12:09:09Z_
+_Reviewed: 2026-09-23T23:27:57Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_
-
-## Dispositions (2026-09-23, orchestrator)
-
-The operator chose one text+tests fix round and deferred the rest. The orchestrator re-ran every RED and GREEN below before committing.
-
-| Finding | Disposition |
-|---------|-------------|
-| CR-01 | Fixed: RED `6ee9459`, GREEN `20cc64c`. The refusal now names `ps -ww -o pid=,lstart=,args= -p <pid>` and what identifies this phase's monitor and agent. `-ww` was added after a pty probe showed `ps -o args=` cut off the phase-identifying tail at 80 columns. |
-| WR-01 | Fixed (`6ee9459`, `20cc64c`). For a recycled live pid, the text now says to run `recover --clean` and then `start`. |
-| WR-02 | Fixed as a text qualification only, by operator choice; no `/proc` child reading was added (`6ee9459`, `20cc64c`). The advice to signal the monitor first, and the claim about `stop`, are now qualified for the Legacy monitor's foreground `devflow advance` child. |
-| WR-03 | Backlog 999.139 (behaviour change; needs an operator ruling). |
-| WR-04 | Backlog 999.140. |
-| WR-05 | Backlog 999.141. Verified 2026-09-23: 14,767 of 14,796 `~/.cache/devflow/roots` entries point at `/tmp/.tmp*` test roots. |
-| WR-06 | Fixed in `a33060f`. The test plants state and gate temps, checks its preconditions before recovery, and scans both directories. The negative controls fail as they should in each directory. |
-| IN-01..IN-05 | Not actioned in this round (info). IN-05 (the process group of the pipe-owning launch) remains a limit of the SIGTERM advice. |
