@@ -451,6 +451,18 @@ fn assert_start_refuses_live_run(
         // then start gets past it (48-REVIEW WR-01).
         "If the named processes have exited, run `devflow start` again".to_string(),
         format!("run `devflow recover --clean --phase {phase}` first, then `devflow start`"),
+        // Every sentence that keeps the operator from signalling the wrong
+        // process or launching a second agent is pinned, not only the
+        // repair commands (T-48-19-06, T-48-19-07): a text that drops these
+        // but keeps the commands must fail.
+        "Check each pid before signalling it".to_string(),
+        "so do not signal it on the pid alone".to_string(),
+        "send SIGTERM to the confirmed monitor first".to_string(),
+        "signalling the agent first lets the monitor launch the next stage".to_string(),
+        "If a named pid is live but is not this phase's process (a recycled pid), `start` refuses again"
+            .to_string(),
+        "Do neither while this phase's processes are live".to_string(),
+        "a later `start` would launch a second agent beside it".to_string(),
     ] {
         assert!(
             stderr.contains(&fragment),
