@@ -658,6 +658,56 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.143: A Recycled Recorded Pid Leaves `resume` No Work-Preserving Way Out (BACKLOG)
+
+**Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md Known limits, T-48-20-05). **Reasoned from source
+only — not reproduced; no test covers it.** **Filed by operator decision 2026-09-23:** defer to a later
+phase rather than accept it inside 48-20.
+
+**Defect:** after 48-20, `resume` refuses while a recorded monitor or agent pid is alive, and liveness is
+pid-only (Option A). If an unrelated process reuses a recorded pid, resume keeps refusing, and no DevFlow
+verb clears a recorded pid while keeping the phase's work: after `recover --clean`, plain `start` refuses
+while the phase's worktree or branch exists (parallel.rs:24-51, git.rs:157-172), and `start --force`
+recreates them from the base, discarding the work. 48-19's `start` refusal has the same shape: it names
+`recover --clean` then `devflow start` without warning that only `--force` gets through, and `--force`
+loses the work. Low probability: the reused pid must be live at the moment of resume. The refusal fails
+closed (nothing launched or written).
+
+**Overlap:** Phase 50 (Addressable Monitor Liveness) answers monitor liveness from a socket, not a pid,
+which removes the monitor-pid half. The agent pid file stays pid-only; this item is the agent half plus
+the missing work-preserving repair.
+
+**Fix shape (not decided):** identity for the recorded agent pid (e.g. process start time from
+`/proc/<pid>/stat`, or a pidfd), and/or a recovery path that clears recorded pids while keeping the
+worktree and branch so `resume` can proceed; correct the 48-19/48-20 refusal texts to match.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test: a recorded agent pid reused by an
+unrelated live process, where the fix lets the phase resume without losing its work.
+
+### Phase 999.142: Hints Prescribe `devflow resume` Where the Live-Run Guard Refuses It (BACKLOG)
+
+**Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md "Hint inventory", H1-H10); the fix-shape half
+of 999.140 the promotion did not cover (48-REVIEW.md WR-04). **Operator decision 2026-09-23:** option (b),
+file for later instead of folding into 48-20. **Depends on 48-20 landing.**
+
+**Defect:** after 48-20, `resume` refuses while a recorded monitor or agent is live, but production hints
+still tell the operator to run `devflow resume` in some of those states. Lasting: `status`
+(`Liveness::describe` "stuck — needs devflow resume", `recovery_hints`) and doctor `check_dead_monitor`
+for a dead monitor with a live agent; doctor `check_dead_agent` for a live monitor; `cleanup`'s
+halted-via-until message for a stop-marked live run (999.138) and its live-phase refusal; doctor
+`check_gate_pending_without_gate` and `no_waiter_repair` (gate approve/reject, gate sweep, stop, doctor)
+when a stale gate request carries into a relaunched live run. Transient (until the printing monitor
+exits): the park message, the cron hints and the "resume manually" rate-limit gate reason. Line numbers
+and firing conditions for each site at 6d31299 are in the 48-20 inventory. H3-H5 are reasoned from
+source, not reproduced.
+
+**Fix shape (not decided):** report a distinct state (an orphaned agent, or a live run holding no lock)
+and name the repair that works there, as the 48-19/48-20 refusal text does, instead of prescribing
+`resume`.
+
+**Acceptance:** not decided; set at promotion. Needs a test per lasting site: the hint never names
+`devflow resume` in a state where `resume` refuses, with a control that still names it for a dead leftover.
+
 ### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (BACKLOG)
 
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-05); cache count verified
@@ -678,7 +728,7 @@ writes outside its tempdir `HOME`.
 
 ### Phase 999.140: `resume` Launches With No Live-Run Check (PROMOTED — Phase 48 gap closure)
 
-**Promoted 2026-09-23 by operator decision:** Phase 48 re-verification (`1590100`) reproduced a second monitor and agent launched by `resume` beside live ones at `d5376fa`; the operator chose to close criterion 2 with a Phase 48 gap plan for `resume` (reuse the 48-19 live-run refusal under the lock, test first). 999.139 stays in the backlog.
+**Promoted 2026-09-23 by operator decision:** Phase 48 re-verification (`1590100`) reproduced a second monitor and agent launched by `resume` beside live ones at `d5376fa`; the operator chose to close criterion 2 with a Phase 48 gap plan for `resume` (reuse the 48-19 live-run refusal under the lock, test first). 999.139 stays in the backlog. The "should hints stop suggesting `resume`" half is split out to 999.142, and the recycled-pid cost on `resume` to 999.143 (operator decisions 2026-09-23).
 
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-04). **Reasoned from
 source only — not reproduced.**
