@@ -92,7 +92,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-13)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 48 (Survivable State Writes and Honest Gate Recovery), all 20 plans executed; container and goal verification pending. Phases 46 and 47 are complete and integrated; 47's
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 48 (Survivable State Writes and Honest Gate Recovery), all 20 plans executed; container passed and goal verification pending. Phases 46 and 47 are complete and integrated; 47's
 verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
@@ -191,7 +191,7 @@ Phase: 48 (Survivable State Writes and Honest Gate Recovery) — VERIFYING
 Plans: 20 — 48-01..48-19 in 13 waves (executed; 48-18/48-19 are gap closures); gap closure 48-20 in wave 14
 Current Plan: 20
 Total Plans in Phase: 20
-Completed Plans: 20 of 20 (48-20 closes the resume live-run gap; container and goal verification pending)
+Completed Plans: 20 of 20 (48-20 closes the resume live-run gap; container passed and goal verification pending)
 Status: Phase complete — ready for verification
 Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since

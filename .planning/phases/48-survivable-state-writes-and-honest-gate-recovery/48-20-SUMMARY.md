@@ -125,7 +125,7 @@ None.
 
 ## Next Phase Readiness
 
-All 20 Phase 48 plans now have summaries. Phase verification still needs the pinned container gate and the phase verifier; this plan's test results alone do not establish container parity or the untested known-limit routes.
+All 20 Phase 48 plans now have summaries. The pinned container gate passed with exit 0 and one normalized `==> check.sh: all OK` marker; the phase verifier remains pending. This plan's tests do not establish the untested known-limit routes.
 
 ## Self-Check: PASSED
 
