@@ -62,7 +62,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Run Survivability (SURV)
 
-- [ ] **SURV-01**: Two processes writing state for the same phase cannot silently lose an update.
+- [x] **SURV-01**: Two processes writing state for the same phase cannot silently lose an update.
       *Traces to 999.118.* Verified unchanged: `workflow.rs:185-193` derives
       `path.with_extension("tmp")`, a pure function of the state path, so every writer for a phase
       writes the same temp file.
@@ -70,7 +70,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       test that fails on the current implementation, with a single-writer negative control that
       must still round-trip.
 
-- [ ] **SURV-02**: A gate whose consumer is gone reports the recovery that exists instead of
+- [x] **SURV-02**: A gate whose consumer is gone reports the recovery that exists instead of
       asserting a waiter that does not.
       *Traces to #200.* Reproduced live on v2.12.0, and the original filing corrected in two
       directions: the wedge requires the foreground `start` to be **interrupted** (left running, it
@@ -88,14 +88,14 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       resume route versus the line-anchored preflight match (`verify.rs:131-137` and `:207-220`, at
       time of filing).
 
-- [ ] **CHKPT-02**: A human-only checkpoint that is new or changed relative to the set DevFlow
+- [x] **CHKPT-02**: A human-only checkpoint that is new or changed relative to the set DevFlow
       recorded at Code's preflight parks at a human gate before the resume decision can auto-decide
       it; a state file with no recorded set gates.
       *Traces to 999.126.*
 
 ### Test Isolation (TEST)
 
-- [ ] **TEST-01**: Tests that replace process-global `PATH` run in a child process with `PATH` set
+- [x] **TEST-01**: Tests that replace process-global `PATH` run in a child process with `PATH` set
       on the child `Command` only; tests kept from spawning a real agent only by an abort fixture
       note (999.80) run the same way; a clippy `disallowed-methods` lint rejects new process-global
       environment mutation.
@@ -194,11 +194,11 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | VALID-02 | Phase 46 — CI Load Shape and Operator Input Validation | 1 | Complete |
 | DECN-02 | Phase 47 — Unattended Decision Policy Consistency | 1 | Complete |
 | DECN-03 | Phase 47 — Unattended Decision Policy Consistency (behavioural arm resolves against Phase 49) | 1 | Complete |
-| SURV-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery (field arm observed, not settled, in Phase 49) | 2 | Pending |
-| SURV-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| SURV-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery (field arm observed, not settled, in Phase 49) | 2 | Complete |
+| SURV-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | CHKPT-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
-| CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
-| TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Pending |
+| CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
+| TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Pending |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Pending |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |

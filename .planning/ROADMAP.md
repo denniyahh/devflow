@@ -181,7 +181,7 @@ before Phase 49's live unattended run measures the chain.
   7. **TEST-01 (999.38 + 999.80):** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: 19/20 plans executed (14 waves), including gap closures 48-18, 48-19 and 48-20 (from 48-VERIFICATION.md)
+**Plans**: 20/20 plans executed (14 waves), including gap closures 48-18, 48-19 and 48-20 (from 48-VERIFICATION.md)
 
 **Wave 1**
 
@@ -243,7 +243,7 @@ before Phase 49's live unattended run measures the chain.
 
 **Wave 14**
 
-- [ ] 48-20-PLAN.md *(depends on 48-19)* — gap closure, criterion 2 (999.140 promoted): `resume` refuses a phase whose recorded monitor or agent is live through the 48-19 guard shared under its lock, test first; `start` text byte-identical; 999.139 stays backlog
+- [x] 48-20-PLAN.md *(depends on 48-19)* — gap closure, criterion 2 (999.140 promoted): `resume` refuses a phase whose recorded monitor or agent is live through the 48-19 guard shared under its lock, test first; `start` text byte-identical; 999.139 stays backlog
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
@@ -486,7 +486,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
-| 48 | 19/20 | In Progress|  |
+| 48 | 20/20 | In Progress|  |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
