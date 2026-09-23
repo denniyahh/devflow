@@ -1,5 +1,11 @@
-//! #200 regression: the same `gate reject` command must distinguish a gate
-//! left by an interrupted foreground driver from a live `advance` consumer.
+//! #200 regression: the same `gate reject` command must tell a gate left by an
+//! interrupted foreground driver apart from a live consumer of that gate.
+//!
+//! The file pins both drivers:
+//! - the `start_*` arms cover criterion 4's shape: a foreground `devflow
+//!   start` parked at its Define preflight gate holds lock-NN itself;
+//! - the `advance_*` arms cover a foreground `devflow advance` parked at a
+//!   Code gate.
 
 use devflow_core::gates::Gates;
 use devflow_core::mode::Mode;
@@ -238,7 +244,7 @@ fn phase_gate_entries(root: &Path, phase: PhaseId) -> Vec<String> {
 }
 
 #[test]
-fn wedge_arm_killed_start_leaves_a_gate_that_reject_reports_honestly() {
+fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_honestly() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4816);
@@ -316,7 +322,7 @@ fn wedge_arm_killed_start_leaves_a_gate_that_reject_reports_honestly() {
 }
 
 #[test]
-fn self_resolving_arm_live_start_consumes_the_rejection() {
+fn advance_self_resolving_arm_live_advance_consumes_the_code_rejection() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4817);
@@ -340,7 +346,7 @@ fn self_resolving_arm_live_start_consumes_the_rejection() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let pickup_ms = before.elapsed().as_millis();
-    println!("pickup_ms={pickup_ms}");
+    println!("advance_pickup_ms={pickup_ms}");
     assert!(
         status.success(),
         "advance must abort cleanly after pickup: {status:?}"
