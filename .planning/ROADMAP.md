@@ -27,7 +27,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 |---|---|---|---|---|
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
-| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | In Progress |
+| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |

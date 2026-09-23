@@ -2,21 +2,21 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: 48
-current_phase_name: Survivable State Writes and Honest Gate Recovery
-current_plan: 20
-status: verifying
-stopped_at: Completed 48-20-PLAN.md
-last_updated: "2026-09-23T22:49:37.521Z"
+current_phase: 49
+current_phase_name: Live Unattended Run — The Milestone's Instrument
+current_plan: Not started
+status: planning
+stopped_at: Phase 48 complete, ready to plan Phase 49
+last_updated: "2026-09-23T23:35:42.312Z"
 last_activity: 2026-09-23
-last_activity_desc: Plan 48-20 completed; phase verification pending
-state_head: fa04bfebea8847d26d2b4d7898dac19dcccbc759
+last_activity_desc: Phase 48 complete, transitioned to Phase 49
+state_head: cd72cfa45d3698c425219ac213ffee660df49a16
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 36
   completed_plans: 36
-  percent: 33
+  percent: 50
 ---
 
 # DevFlow — Project State
@@ -187,13 +187,13 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 48 (Survivable State Writes and Honest Gate Recovery) — VERIFYING
-Plans: 20 — 48-01..48-19 in 13 waves (executed; 48-18/48-19 are gap closures); gap closure 48-20 in wave 14
-Current Plan: 20
-Total Plans in Phase: 20
-Completed Plans: 20 of 20 (48-20 closes the resume live-run gap; container passed and goal verification pending)
-Status: Phase complete — ready for verification
-Previous phase: 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
+Phase: 49 — Live Unattended Run — The Milestone's Instrument
+Plans: not yet planned
+Current Plan: Not started
+Total Plans in Phase: 0
+Completed Plans: 0 of 0
+Status: Ready to plan
+Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
 The D-13 assumption was verified false and its two latent defects are now backlog entries 999.125
@@ -202,7 +202,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-23 — Phase 48 execution started
+Last activity: 2026-09-23 — Phase 48 complete, transitioned to Phase 49
 
 Progress: [███░░░░░░░] 33% (2 of 6 phases complete — `roadmap.analyze` counts 1 while 47 reads `stale`)
 
@@ -952,7 +952,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Session
 
 **Last session:** 2026-09-23T22:49:37.263Z
-**Stopped at:** Completed 48-20-PLAN.md
+**Stopped at:** Phase 48 complete, ready to plan Phase 49
 **Resume file:** None
 
 ## Operator Next Steps
