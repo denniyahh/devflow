@@ -654,6 +654,56 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-05); cache count verified
+by the orchestrator the same day.
+
+**Defect:** e2e tests whose `start` proceeds (start_lock_e2e phases 91, 92, 97, 98 at least) do not isolate
+`HOME`, so every run registers a `/tmp/.tmp*` root in the operator's real `~/.cache/devflow/roots`, and
+the background monitors those `start` calls launch are never reaped by the test. Measured 2026-09-23:
+14,796 entries, 14,767 of them `/tmp/.tmp*` test roots, newest written 07:54 by this session's runs.
+Violates TEST-01's environment-isolation rule (`HOME`/`XDG_*` must point at scratch paths).
+
+**Fix shape (not decided):** set `HOME` (and `XDG_CACHE_HOME`) per child `Command` in the e2e helpers;
+own launched monitors so a test can reap them; one-off cleanup of the polluted cache (operator decision —
+it is the operator's real cache).
+
+**Acceptance:** not decided; set at promotion. Needs a test that fails when a spawned `devflow` child
+writes outside its tempdir `HOME`.
+
+### Phase 999.140: `resume` Launches With No Live-Run Check (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-04). **Reasoned from
+source only — not reproduced.**
+
+**Defect:** 48-19 made `start` refuse a phase whose recorded monitor or agent pid is alive; `resume`
+(`pipeline_launch.rs` resume path) launches with no equivalent check. `status` suggests `devflow resume`
+whenever the monitor is dead, even while the agent is alive — a state the refusal's own "SIGTERM the
+monitor first" advice creates on the default Claude launch between the two signals. Same class as
+48-19 (a second writer over a live run), sibling site not covered.
+
+**Fix shape (not decided):** reuse `refuse_start_over_a_live_run` (or a shared helper) in `resume` under
+the lock; decide whether `status` should stop suggesting `resume` while the agent pid is live.
+
+**Acceptance:** not decided; set at promotion. Needs a failing e2e test: `resume` against a live agent pid.
+
+### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-03). **Reasoned from
+source only — not reproduced; no test covers it.**
+
+**Defect:** `refuse_start_over_a_live_run` (commands.rs) reads `monitor_pid` only from a state that loads.
+When the state file exists but does not parse or cannot be read, only the agent pid file is checked, so a
+live monitor is invisible and `start` proceeds over it. This path is not on the operator-approved list
+(no-state carve-out, recycled-pid false refusal, 999.136).
+
+**Fix shape (not decided — behaviour change, needs an operator ruling):** refuse when a state file exists
+but will not load (fail closed, pointing at `recover --clean`), or recover the monitor pid another way.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test with a corrupt state file and a live
+recorded monitor.
+
 ### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (BACKLOG)
 
 **Found:** 2026-09-22 by the Phase 48 gap planner while wording 48-19's refusal message.
