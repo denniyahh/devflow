@@ -37,7 +37,7 @@ created: "2026-09-19"
 
 ## Threat Register
 
-Register authored at plan time: 60 threats across the 19 `<threat_model>` blocks (49 in plans 01-17; 11 in gap plans 48-18 and 48-19, added 2026-09-23). Historical evidence
+Register authored at plan time: 71 threats across the 20 `<threat_model>` blocks (49 in plans 01-17; 11 in gap plans 48-18 and 48-19, added 2026-09-23; 11 in gap plan 48-20, added 2026-09-23 round 8). Historical evidence
 retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 formal re-audit.
 
 | Threat ID | Category | Component | Severity | Disposition | Mitigation | Status |
@@ -102,6 +102,17 @@ retains its recorded SHA; the blocking entries were refreshed by the 2026-09-20 
 | T-48-19-05 | Tampering | writes in the agent-exit → advance lock-free window | medium | accept | See AR-48-07 | closed |
 | T-48-19-06 | Elevation of Privilege | operator follows the refusal's repair and launches a second agent | high | mitigate | Corrected text (20cc64c) pinned sentence by sentence in `bb639f5` — **Evidence:** commands.rs:2466-2487; start_lock_e2e.rs fragment list; an attack-text mutant passes the pre-`bb639f5` test and fails the new one on a new fragment (two mutants). Residual: operator-approved no-state carve-out (pinned by the phase-98 test) | closed |
 | T-48-19-07 | Denial of Service | operator signals an unrelated process named by a recycled pid | medium | mitigate | `ps -ww -o pid=,lstart=,args= -p <pid>` with identity claims matching the spawn argv (20cc64c) — **Evidence:** commands.rs:2457, :2471-2477; monitor.rs:573-598, :600-607; tests pin the fragments and forbid `ps -p <pid>` | closed |
+| T-48-20-01 | Tampering | `resume` overwriting a live run's `monitor_pid`, agent pid file and capture | high | mitigate | `refuse_resume_over_a_live_run` under lock-NN before `load_state` and every write — **Evidence:** pipeline_launch.rs:1418 lock, :1427 guard, :1428 `load_state`; every write follows the guard (handoff save :1462, auto-chain repair :1502, save :1508, `launch_stage` :1509); guard core commands.rs:2464-2486; arms start_lock_e2e.rs:825, :861 assert byte-identity (:804-808), no lock (:809-812), no stage_launched (:813-816). Discrimination: guard removed → both arms fail; guard before `launch_stage` → stopped arm fails (:805). **Durability caveat:** guard moved after the auto-chain repair passes both arms (round-8 M3) — ordering ahead of the `--agent` handoff and the repair rests on source position and the one-off 48-20 T2 placement gate only (48-REVIEW WR-02) | closed |
+| T-48-20-02 | Elevation of Privilege | a second agent launched beside a live one for the same worktree | high | mitigate | Same guard; both roles refused — **Evidence:** monitor arm start_lock_e2e.rs:825-858, agent arm :861-890 (run twice); both pin no second launch. Placement gate re-run at `a3a0506` (lock 7 < guard 16 < load 17, 1 call; swapped copy fails) — one-off plan gate, not a standing check. Untested cell: both pids live | closed |
+| T-48-20-03 | Repudiation | operator believes `devflow stop` ended a lock-free run, then resumes (999.138) | medium | mitigate | Refusal says stop only marks state and a stop mark is not an exit — **Evidence:** commands.rs:2553-2559; agent arm plants `stopped=true` (start_lock_e2e.rs:870), asserts :757, :759-761 and the mark surviving (:884-889). Positive-only pin | closed |
+| T-48-20-04 | Denial of Service | legitimate recovery wrongly refused | medium | mitigate | Dead-leftover control, no-state carve-out, named unit tests, de-raced fixture — **Evidence:** start_lock_e2e.rs:893-926 (stopped false and true), carve-out :929-960; auto_chain_leak_repair_e2e.rs:394-399, :425-431; unit tests pipeline_launch.rs:2195, :2307, :2914, :4584 each `1 passed`. Weaknesses: :920 also accepts `None`; carve-out does not assert the missing-state text (WR-04) | closed |
+| T-48-20-05 | Denial of Service | a recycled pid makes a dead run look live; resume refuses and its only repair discards the phase's work | low | accept | See AR-48-08 | closed |
+| T-48-20-06 | Denial of Service | operator signals an unrelated process named by a recycled pid | medium | mitigate | `ps -ww -o pid=,lstart=,args=` identity before SIGTERM; DevFlow signals nothing — **Evidence:** commands.rs:2546-2549, :2560-2561, :2567; guard path calls only `kill(pid, 0)` (agent.rs:36-46); tests :762, :764, :793 forbids `ps -p <pid>`, :817-821 `agent_running` after refusal (catches a terminating signal only) | closed |
+| T-48-20-07 | Elevation of Privilege | the guard refuses its own caller | medium | mitigate | Only production caller is the CLI arm — **Evidence:** main.rs:607-612; all other `resume(` calls are under `mod tests` (pipeline_launch.rs:1950); only external argv is the Hermes cron (ship.rs:277). Probe `production_resume_calls=1 from_main_rs=1`; injected second caller prints 2. One-off source gate | closed |
+| T-48-20-08 | Tampering | unloadable state hides a live monitor (999.139) | low | accept | See AR-48-09 | closed |
+| T-48-20-09 | Tampering | writes in the agent-exit → advance lock-free window (999.136) | medium | accept | See AR-48-10 | closed |
+| T-48-20-10 | Denial of Service | Hermes cron resume refused while the writer monitor still runs; the job is one-shot | low | accept | See AR-48-11 | closed |
+| T-48-20-11 | Information Disclosure | e2e tests write the operator's real cache and leak monitors | low | mitigate | Per-child `DEVFLOW_CACHE_DIR` plus `LaunchedRunReaper` — **Evidence:** start_lock_e2e.rs:673 (child `Command`), registry.rs:54 reads it; reaper :677-713 bound at :833, :869, :900. Round 8 scratch-cache run: entries only from the older start helper (phases 91/97/98, 999.141), none from resume phases 87/88; `sleep 60` count 0 → 0 with a planted-sleeper control counting 1 | closed |
 
 *Status: open · closed · open — below high threshold (non-blocking)*
 *Severity: critical > high > medium > low — only open threats at or above workflow.security_block_on count toward threats_open*
@@ -125,6 +136,10 @@ located. AR-48-04 is a residual on a closed threat, accepted by operator decisio
 | AR-48-05 | T-48-18-04 | `pickup_ms` in the self-resolving arms measures the gate poll's first 1 s backoff step, not a wedge; the SUMMARY says so | Plan-time disposition, 48-18-PLAN | 2026-09-23 |
 | AR-48-06 | T-48-19-04 | Pid liveness, not identity: a recycled pid gives a fail-closed false refusal; the refusal directs `ps -ww -o … args=` and `recover --clean` then `start` | Plan-time disposition, 48-19-PLAN (records the operator's Option A, 2026-09-22; the operator's wording appears only in planner/executor-written files) | 2026-09-23 |
 | AR-48-07 | T-48-19-05 | The agent-exit → advance lock-free window is not closed by the guard | Operator-deferred to backlog 999.136 (ROADMAP.md, 2026-09-22) | 2026-09-23 |
+| AR-48-08 | T-48-20-05 | Pid liveness, not identity, on `resume`: a recycled recorded pid gives a fail-closed false refusal, and the only DevFlow repair (`recover --clean` then `start --force`) discards the phase's work; the refusal says so (commands.rs:2572-2578; pinned start_lock_e2e.rs:777-780). A one-shot Hermes cron resume refused this way is never retried (ship.rs:300; 48-REVIEW IN-05) — not yet recorded in 999.143 | Plan-time disposition, 48-20-PLAN (:663). The "operator deferred to 999.143 rather than accept it" wording appears only in planner/executor-written files (PLAN, SUMMARY :98-101, ROADMAP 999.143 via `601b435`) | 2026-09-23 |
+| AR-48-09 | T-48-20-08 | For an unloadable state the guard checks only the agent pid file, so a live monitor is invisible to it. For `resume` nothing can launch or be written: `load_state(...)?` (pipeline_launch.rs:1428) fails right after the guard; only the error text changes. Branch untested (WR-01) | Operator ruling 2026-09-23 (ROADMAP 999.139, `cd72cfa`): outside Phase 48 criterion 2 — the ruling addresses `start`; the `resume` half is the plan-time disposition 48-20-PLAN (:666) | 2026-09-23 |
+| AR-48-10 | T-48-20-09 | The agent-exit → `advance` lock-free window is not closed; for `resume` the guard should refuse there while the recorded monitor lives (reasoned, not tested live) | Operator-deferred to backlog 999.136 (2026-09-22); same basis as AR-48-07 | 2026-09-23 |
+| AR-48-11 | T-48-20-10 | A cron `devflow resume` firing while the writing monitor is alive is refused and, the job being `once: true` (ship.rs:300), never retried — the unattended resume is lost until the operator resumes by hand. The plan row and SUMMARY say "refused once", which understates this. Timing reasoned implausible (schedule rounded up past `retry_after`, ship.rs:309), not tested | Plan-time disposition, 48-20-PLAN (:668). No operator ruling found | 2026-09-23 |
 
 *Accepted risks do not resurface in future audit runs.*
 
@@ -142,6 +157,7 @@ located. AR-48-04 is a residual on a closed threat, accepted by operator decisio
 | 2026-09-20 (round 5, 3aca386) | 2 re-checked | 2 | 0 blocking (1 medium threat remains non-blocking) | gsd-security-auditor, State A, ASVS L1; operator selected Verify all open threats |
 | 2026-09-22 (round 6, ab37d90) | 4 re-checked (T-48-16-03, T-48-14-01, T-48-16-01, T-48-12-05) | 4 | 0 blocking (T-48-09-02 still non-blocking) | gsd-security-auditor, State A, ASVS L1, operator-requested after the 2026-09-22 code review; orchestrator added the T-48-14-01 gate-half test (`f73990f`) and AR-48-04 |
 | 2026-09-23 (round 7, 60da104 → bb639f5) | 11 new (gap plans 48-18, 48-19) | 11 | 0 blocking (T-48-19-06 was open until `bb639f5`) | gsd-security-auditor, State A, ASVS L1; operator selected Verify all open threats; orchestrator added the missing refusal fragments and ran the two-way mutant control |
+| 2026-09-23 (round 8, a3a0506) | 11 new (gap plan 48-20) | 11 (7 mitigate; 4 accept via AR-48-08..11) | 0 blocking | gsd-security-auditor, State A, ASVS L1, operator-requested after the Phase 48 close; independent placement mutants on a `git archive` copy |
 
 ### Audit 2026-09-19 — notes
 
@@ -256,6 +272,18 @@ located. AR-48-04 is a residual on a closed threat, accepted by operator decisio
   - Tests ran once each.
   - Nothing sends a signal end to end to check the refusal guidance; the identity claims were read against the spawn code.
   - The auditor's runs used a scratch `DEVFLOW_CACHE_DIR`. The test suite itself still writes the operator's real cache (999.141).
+
+### Audit 2026-09-23 — notes (round 8, 48-20)
+
+- **Placement is pinned only in part (WR-02, extended).** Mutants on a `git archive` copy: guard moved to just before
+  `launch_stage` → only the stopped-agent arm fails; guard moved to just after `repair_leaked_auto_chain_flag` (before
+  `save_state`) → **both arms pass**. Nothing standing pins the guard ahead of the `--agent` handoff write or the auto-chain repair
+  (which writes and commits `.planning/config.json`). The 48-20 T2 plan gate's structural check does (negative-controlled by the
+  orchestrator: moved or removed guard → rejected), but it lives only in the PLAN. The second-agent vector stays closed.
+- **T-48-20-10 understated in the plan and SUMMARY:** the cron resume is one-shot; AR-48-11 carries the corrected consequence.
+- **Provenance:** AR-48-08 and AR-48-11 are plan-time acceptances with no operator ruling; AR-48-09's operator ruling covers `start`.
+- **Evidence limits:** tests ran once each; three hand-placed mutants are not a mutation sweep; no live run was refused in this
+  audit (the live probe is the 2026-09-23 verifier's, Legacy launch shape only).
 
 ## Sign-Off
 
