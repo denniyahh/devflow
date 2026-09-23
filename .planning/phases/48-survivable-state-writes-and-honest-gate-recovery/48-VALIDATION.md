@@ -90,6 +90,8 @@ plus the pinned container suite (exit 0, `==> check.sh: all OK`, 1394 passed / 0
 | 48-18-T3 | 48-18 | 12 | SURV-02 | T-48-18-01 | Advance arms renamed truthfully; 5 tests in file | integration + lint | 48-18-PLAN T3 gate (`five_passed_line=1`, `misnamed_arms=0`, clippy/fmt 0) | ✅ | ✅ |
 | 48-19-T1 | 48-19 | 13 | SURV-01, SURV-02 (criterion 2) | T-48-19-01..03 | RED: both refusal arms fail on their named assertion; dead-leftover and no-state controls pass | integration (`start_lock_e2e`) | 48-19-PLAN T1 gate at RED `047c88e` | ✅ | ✅ |
 | 48-19-T2 | 48-19 | 13 | SURV-01, SURV-02 (criterion 2) | T-48-19-01..07 | `start` refuses a live run under the lock, writes nothing, `--force` no bypass; refusal guidance pinned sentence by sentence | integration + bin unit + lint | 48-19-PLAN T2 gate — see note ⁵; `start_lock_e2e` 7 passed at `bb639f5` | ✅ | ✅ |
+| 48-20-T1 | 48-20 | 14 | SURV-01 (criterion 2, `resume`) | T-48-20-01, -02 | RED: both resume refusal arms fail on their named assertion; dead-leftover, no-state and start-golden controls pass | integration (`start_lock_e2e`) | RED gate not re-runnable at HEAD (it expects failures); equivalent evidence — 2026-09-23 verifier mutant removing the one guard call: `start_lock_e2e` 10 passed / 2 failed, exactly the two refusal arms, each at its named reason (48-VERIFICATION truth 2) | ✅ | ✅ |
+| 48-20-T2 | 48-20 | 14 | SURV-01 (criterion 2, `resume`) | T-48-20-01..07, -11 | `resume` refuses a live run under its lock before loading or writing state; `start` text byte-identical; guard placement lock < guard < load | integration + bin unit + structural + lint | 48-20-PLAN T2 gate re-run at `a3a0506` minus its execution-time preamble (see note ⁷): `gate_rc=0`, `start_lock_e2e` 12 passed, 8 e2e files + bin suite green, clippy/fmt 0 | ✅ | ✅ |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -112,6 +114,11 @@ plus the pinned container suite (exit 0, `==> check.sh: all OK`, 1394 passed / 0
 6. **48-16-T1 / 48-14-T1 (2026-09-23)** — 48-18 renamed the advance arms, so 48-16's gate names tests that no longer exist
    (fails loudly, `one_passed=0`); 48-14's whole-file count is now `5 passed`. Both behaviours are carried by the renamed
    `advance_*` arms (48-18-SUMMARY name mapping).
+7. **48-20-T2 (2026-09-23)** — the gate's first three checks assert the execution-time tree (HEAD subject `test(48-20):`,
+   tests unchanged since RED, exactly two uncommitted source files) and cannot pass after commit. Re-run with only those
+   removed. Its guard-placement check was negative-controlled on copies of `resume`: guard moved after `load_state` →
+   rejected; guard removed → rejected; HEAD → passes. This structural check, not the e2e arms, is what pins placement
+   (48-REVIEW WR-02: only the stopped-agent arm catches a late guard).
 
 ---
 
@@ -208,3 +215,20 @@ closed. It is tracked under backlog 999.130 (gate-waiter registration), not fixe
   T-48-19-06 (`bb639f5`, protective refusal sentences, two-way attack-mutant control).
 - Not covered by any automated check: the refusal guidance is never followed end to end (no signal is sent); the e2e
   tests still write the operator's real `~/.cache/devflow/roots` (backlog 999.141).
+
+## Validation Audit 2026-09-23 (48-20)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+- Scope: gap-closure plan 48-20 (2 tasks, executed by codex outside GSD's executor). Both rows added to the map. T2's gate was
+  re-run at `a3a0506` (note ⁷); T1's RED evidence is the verifier's guard-removal mutant. Full workspace at `5eb3a61`:
+  1448 passed / 0 failed across 34 result lines (host run, not the pinned container). No gap, so no nyquist auditor was spawned.
+- Not covered by any automated check (from 48-REVIEW, 48-20 round): the shared guard's unloadable-state branch for both verbs
+  (WR-01; a skip-on-load-error mutant survives `start_lock_e2e` — the `start` side is backlog 999.139, ruled outside criterion 2
+  by the operator 2026-09-23; for `resume` nothing launches either way); the no-state test accepts any failure (WR-04); the
+  resume refusal text has no byte-for-byte golden (WR-03). One run per gate; the refusal guidance is still never followed end to
+  end; e2e tests still write the real `~/.cache/devflow/roots` (999.141).
