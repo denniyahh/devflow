@@ -367,6 +367,7 @@ pub(crate) fn start(
         }
         Err(err) => return Err(CliError::Message(err.to_string())),
     };
+    refuse_start_over_a_live_run(project_root, phase)?;
     for stage in [
         Stage::Define,
         Stage::Plan,
@@ -2402,6 +2403,71 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     newest.map(|(_, phase)| phase).ok_or_else(|| {
         CliError::Message("no active phase and no capture files — nothing to show".into())
     })
+}
+
+/// Refuse `start` while the phase's recorded monitor or agent is alive
+/// (criterion 2, D-01: one writer per phase). `start` calls this under the
+/// per-phase lock and before any gate cleanup, git mutation or `save_state`,
+/// so a refusal writes nothing. `--force` does not bypass it.
+///
+/// Liveness is pid liveness through the helpers `status` uses
+/// (`agent_pid_from_file`, `agent::agent_running`), not identity: neither pid
+/// records a start time. A recycled pid gives a fail-closed false refusal,
+/// accepted by the operator with Option A (2026-09-22).
+///
+/// No-state carve-out (operator-approved 2026-09-22): without a state file this
+/// returns Ok even if the agent pid file names a live process, because
+/// `recover --clean` leaves that file behind and a recycled pid would otherwise
+/// block `start` with no DevFlow repair. A state file that does not load is
+/// checked on the agent pid file only.
+///
+/// Out of scope: the lock-free window between agent exit and `advance` taking
+/// the lock stays backlog 999.136. This check says nothing about a gate waiter.
+fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    let loaded = workflow::load_state(project_root, phase);
+    if loaded.is_err() && !workflow::state_path(project_root, phase).exists() {
+        return Ok(());
+    }
+    let monitor = loaded
+        .ok()
+        .and_then(|state| state.monitor_pid)
+        .filter(|&pid| agent::agent_running(pid));
+    let agent = agent_pid_from_file(project_root, phase).filter(|&pid| agent::agent_running(pid));
+    let live: Vec<(&str, u32)> = [("monitor", monitor), ("agent", agent)]
+        .into_iter()
+        .filter_map(|(role, pid)| pid.map(|pid| (role, pid)))
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Message(live_run_refusal(phase, &live)))
+}
+
+/// The refusal text for [`refuse_start_over_a_live_run`]. It fires while
+/// `start` holds the lock, so no other process holds it: `stop` would signal
+/// nothing here (see `stop_via_lock`).
+fn live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
+    let named = live
+        .iter()
+        .map(|(role, pid)| format!("{role} pid {pid}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let checks = live
+        .iter()
+        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -p {pid}"))
+        .collect::<String>();
+    format!(
+        "phase {phase}: a run is still live ({named} alive) — refusing to start; nothing was written\n\
+         No process holds the phase lock, so `devflow stop --phase {phase}` would only mark the state stopped: \
+         it signals nothing and does not end this run. (stop does end a run that holds the lock, for example \
+         one parked at a gate.)\n\
+         To end this run now, confirm each pid is this phase's DevFlow monitor or agent with `ps -p <pid>`, \
+         then send it SIGTERM, monitor first — signalling the agent first lets the monitor launch the next \
+         stage:{checks}\n\
+         Run `devflow recover --clean --phase {phase}` or `devflow start` again only after the named processes have exited, \
+         or after `ps -p` shows they are no longer this phase's processes: `recover --clean` clears state even \
+         while an agent runs, and a later `start` would launch a second agent beside it."
+    )
 }
 
 /// Read the launched agent PID the monitor recorded for `phase`, if present.
