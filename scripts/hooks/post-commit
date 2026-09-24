@@ -22,6 +22,12 @@
 # The marker lives under .devflow/, which is gitignored with `*`.
 set -uo pipefail
 
+# Workspace-only hook. core.hooksPath is an absolute path into the main
+# checkout, so this also runs for commits in develop-based worktrees, which
+# have no .planning/ to check. Only a checkout carrying .workspace-divergence
+# is a workspace branch.
+[ -f "$(git rev-parse --show-toplevel 2>/dev/null)/.workspace-divergence" ] || exit 0
+
 # `git show` (rather than diff-tree) so a root commit still reports its files.
 changed=$(git show --pretty=format: --name-only HEAD 2>/dev/null) || changed=""
 summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/.*SUMMARY\.md$' || true)
