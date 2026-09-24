@@ -7,23 +7,8 @@
 # .planning/, graphify-out/, agent-tool paths, devflow.toml and this file are
 # built in and need no line.
 
-# Phase-worktree guard and its tests
-only scripts/phase-worktree.sh
-only scripts/lint-phase-worktree.sh
-only scripts/test-phase-worktree-guard.sh
-only crates/devflow-cli/tests/worktree_guard_harness.rs
-only scripts/hooks/pre-commit.d/
-
-# Personal hooks and this file's checker
+# Personal hook (develop removed its post-commit)
 only scripts/hooks/post-commit
-only scripts/hooks/pre-push.d/
-only scripts/check-workspace-divergence.sh
 
 # Tracks .planning/ and graphify-out/ instead of ignoring them
 modified .gitignore
-# Flatpak/GitHub Desktop routing for the pinned-container gate
-modified scripts/check-in-container.sh
-# Workspace lint tables; upstream or keep is still undecided
-modified Cargo.toml
-modified crates/devflow-cli/Cargo.toml
-modified crates/devflow-core/Cargo.toml
