@@ -48,12 +48,13 @@ pub fn agent_running(pid: u32) -> bool {
 /// Classify a pid that `kill(0)` has just reported as existing, from the read
 /// of its `/proc/<pid>/status`.
 ///
-/// A zombie is not running. When the status file cannot be read the answer is
+/// A zombie is not running. A NotFound read means the pid was reaped between
+/// `kill(0)` and the read, so it is gone. Any other unreadable status is
 /// "cannot tell", so `kill(0)`'s answer stands rather than an invented one.
 fn running_per_status(status: std::io::Result<String>) -> bool {
     match status {
         Ok(status) => !status_is_zombie(&status),
-        Err(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
