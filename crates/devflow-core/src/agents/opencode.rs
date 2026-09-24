@@ -815,7 +815,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create stub dir");
         let stub = dir.path().join("opencode");
         let escape = dir.path().join("opencode.setpgid.py");
-        let script = "#!/bin/sh\npython3 \"$0.setpgid.py\" \"$0.setpgid-status\" &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n";
+        let script = "#!/bin/sh\npython3 \"$0.setpgid.py\" \"$0.setpgid-status\" &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nwhile [ ! -e \"$0.setpgid-status\" ]; do :; done\nexit 0\n";
         let python = format!(
             "import os, sys, time\nstatus = sys.argv[1]\ntry:\n    os.setpgid(0, 0)\nexcept OSError as error:\n    open(status, 'w', encoding='utf-8').write(str(error.errno))\n    raise\nopen(status, 'w', encoding='utf-8').write('0')\ntime.sleep({sleep_secs})\n"
         );
