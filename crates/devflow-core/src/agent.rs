@@ -60,6 +60,7 @@ fn running_per_status(status: std::io::Result<String>) -> bool {
 
 /// Whether `pid` has exited but not yet been reaped — `State: Z` in
 /// `/proc/<pid>/status`. Returns `false` when the status file cannot be read.
+#[cfg(test)]
 fn is_zombie(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/status"))
         .is_ok_and(|status| status_is_zombie(&status))
