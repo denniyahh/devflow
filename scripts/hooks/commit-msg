@@ -67,6 +67,19 @@ if ! [[ "$subject" =~ $pattern ]]; then
     exit 1
 fi
 
+# The header above documents "Does not end with a period", but the pattern's
+# trailing `.+$` accepts one — verified with a negative control: the subject
+# `feat(cli): trailing period.` passed while three other malformed controls
+# were correctly rejected. Checked separately rather than folded into the
+# pattern so a one-character description (`feat: x`) still passes.
+if [[ "$subject" =~ \.$ ]]; then
+    echo "commit-msg error: commit subject must not end with a period." >&2
+    echo "" >&2
+    echo "  Commit message subject was:" >&2
+    echo "    $subject" >&2
+    exit 1
+fi
+
 if [ "${#subject}" -gt 72 ]; then
     echo "commit-msg warning: commit subject is longer than 72 characters (${#subject} chars)." >&2
     echo "  Subject: $subject" >&2
