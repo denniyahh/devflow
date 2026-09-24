@@ -201,6 +201,27 @@ if [ -n "$RELEASE_KEY" ]; then
     done
 fi
 
+# Drop-in extension point: every file in scripts/hooks/pre-push.d/ runs, in name
+# order, with this hook's arguments, and the first failure fails the hook.
+# develop ships none; a personal workspace branch adds its own checks here as
+# new files instead of editing this hook (CONTRIBUTING.md, Workflow B). A
+# non-executable drop-in is an error, not a skip: a check that silently stops
+# running is the failure these hooks exist to prevent.
+dropin_dir="$(dirname "$0")/pre-push.d"
+if [ -d "$dropin_dir" ]; then
+    for dropin in "$dropin_dir"/*; do
+        [ -e "$dropin" ] || continue
+        if [ ! -f "$dropin" ] || [ ! -x "$dropin" ]; then
+            echo "pre-push: drop-in '$dropin' is not an executable file." >&2
+            exit 1
+        fi
+        if ! "$dropin" "$@"; then
+            echo "pre-push: drop-in '$dropin' failed." >&2
+            exit 1
+        fi
+    done
+fi
+
 # Verify in the pinned devcontainer image, not against the host toolchain.
 #
 # This hook used to run host `cargo` directly. That is how a commit passed
