@@ -148,11 +148,25 @@ pub fn list_cron_instructions(project_root: &Path) -> Vec<CronInstructions> {
 }
 
 /// Remove a phase's cron-instructions record (and a legacy single-slot record
-/// naming the same phase). Idempotent.
-pub fn delete_cron_instructions(project_root: &Path, phase: PhaseId) -> Result<(), ShipError> {
+/// naming the same phase, or one too corrupt to name any). Idempotent.
+/// Returns whether this call removed a record.
+pub fn delete_cron_instructions(project_root: &Path, phase: PhaseId) -> Result<bool, ShipError> {
+    let (removed, result) = delete_cron_instructions_with_partial_result(project_root, phase);
+    result.map(|()| removed)
+}
+
+/// Delete cron instructions while retaining removals that happened before an error.
+pub(crate) fn delete_cron_instructions_with_partial_result(
+    project_root: &Path,
+    phase: PhaseId,
+) -> (bool, Result<(), ShipError>) {
     let path = cron_instructions_path(project_root, phase);
+    let mut removed = false;
     if path.exists() {
-        std::fs::remove_file(path)?;
+        if let Err(error) = std::fs::remove_file(path) {
+            return (removed, Err(error.into()));
+        }
+        removed = true;
     }
     let legacy = legacy_cron_instructions_path(project_root);
     if legacy.exists()
@@ -161,9 +175,12 @@ pub fn delete_cron_instructions(project_root: &Path, phase: PhaseId) -> Result<(
             .map(|i| i.phase == phase)
             .unwrap_or(true)
     {
-        std::fs::remove_file(&legacy)?;
+        if let Err(error) = std::fs::remove_file(&legacy) {
+            return (removed, Err(error.into()));
+        }
+        removed = true;
     }
-    Ok(())
+    (removed, Ok(()))
 }
 
 /// Remove `path` if still present, reporting whether THIS call was the one
@@ -554,9 +571,30 @@ mod tests {
         );
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap();
+        assert!(delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap());
         assert!(!cron_instructions_path(dir.path(), PhaseId::new(7)).exists());
-        delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap();
+        assert!(
+            !delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap(),
+            "a delete that found nothing must say it removed nothing"
+        );
+    }
+
+    /// A legacy single-slot record naming the phase counts as removed
+    /// (48-REVIEW WR-03), like the per-phase record.
+    #[test]
+    fn delete_cron_instructions_counts_a_legacy_record_it_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(9),
+            "2026-06-18T15:45:30Z",
+        );
+        let legacy = legacy_cron_instructions_path(dir.path());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&record).unwrap()).unwrap();
+
+        assert!(delete_cron_instructions(dir.path(), PhaseId::new(9)).unwrap());
+        assert!(!legacy.exists());
     }
 
     /// 13-DEFERRED-CR-03 re-check: two phases' rate-limit records must

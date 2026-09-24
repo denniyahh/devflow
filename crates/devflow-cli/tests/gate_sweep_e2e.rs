@@ -167,6 +167,17 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let phase = PhaseId::new(91);
     let stage = Stage::Ship;
 
+    // The poller runs in this test process. Record that live process as the
+    // gate holder so sweep has evidence that a consumer exists before it
+    // writes an abort response.
+    let pid = std::process::id();
+    let start = devflow_core::agent::process_start_time(pid).unwrap();
+    let lock_path = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
+
     Gates::write_gate(root, phase, stage, "approve merge?").unwrap();
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 

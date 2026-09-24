@@ -27,7 +27,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 |---|---|---|---|---|
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
-| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | In Progress |
+| 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
@@ -181,7 +181,7 @@ before Phase 49's live unattended run measures the chain.
   7. **TEST-01 (999.38 + 999.80):** Process-global `PATH` mutations in tests are isolated from concurrent `git`/shell
      invocations or converted to per-`Command` environment scoping, eliminating spawn `NotFound` flakes.
 
-**Plans**: 10/17 plans executed in 11 waves
+**Plans**: 20/20 plans executed (14 waves), including gap closures 48-18, 48-19 and 48-20 (from 48-VERIFICATION.md)
 
 **Wave 1**
 
@@ -213,25 +213,37 @@ before Phase 49's live unattended run measures the chain.
 
 **Wave 7**
 
-- [ ] 48-10-PLAN.md *(depends on 48-09)*
-- [ ] 48-11-PLAN.md *(depends on 48-09)*
-- [ ] 48-17-PLAN.md *(depends on 48-09)*
+- [x] 48-10-PLAN.md *(depends on 48-09)*
+- [x] 48-11-PLAN.md *(depends on 48-09)*
+- [x] 48-17-PLAN.md *(depends on 48-09)*
 
 **Wave 8**
 
-- [ ] 48-12-PLAN.md *(depends on 48-10, 48-11)*
+- [x] 48-12-PLAN.md *(depends on 48-10, 48-11)*
 
 **Wave 9**
 
-- [ ] 48-13-PLAN.md *(depends on 48-12)*
+- [x] 48-13-PLAN.md *(depends on 48-12)*
 
 **Wave 10**
 
-- [ ] 48-16-PLAN.md *(depends on 48-13)*
+- [x] 48-16-PLAN.md *(depends on 48-13)*
 
 **Wave 11**
 
-- [ ] 48-14-PLAN.md *(depends on 48-16)*
+- [x] 48-14-PLAN.md *(depends on 48-16)*
+
+**Wave 12**
+
+- [x] 48-18-PLAN.md *(depends on 48-14)* — gap closure, criterion 4: start-driven #200 arms (interrupted `start` wedges; live `start` self-resolves), advance arms renamed truthfully
+
+**Wave 13**
+
+- [x] 48-19-PLAN.md *(depends on 48-18)* — gap closure, criterion 2: `start` refuses a phase whose recorded monitor or agent is live, test first; 999.136 recorded as a known limit
+
+**Wave 14**
+
+- [x] 48-20-PLAN.md *(depends on 48-19)* — gap closure, criterion 2 (999.140 promoted): `resume` refuses a phase whose recorded monitor or agent is live through the 48-19 guard shared under its lock, test first; `start` text byte-identical; 999.139 stays backlog
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
@@ -474,7 +486,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 45 | 3/3 | Complete | 2026-09-02 |
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
-| 48 | 10/17 | In Progress|  |
+| 48 | 20/20 | In Progress|  |
 | 49 | — | Not started | — |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
@@ -645,6 +657,426 @@ needs to be visible outside the repo, using the existing
 add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
+
+### Phase 999.144: No Test Pins `resume`'s Live-Run Guard Ahead of Its Early Writes (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 close-out checks: 48-REVIEW.md WR-02 (48-20 round), extended by the
+48-SECURITY.md round-8 audit. **Mutation-tested on a scratch copy; the shipped code is correctly placed.**
+**Filed by operator decision 2026-09-23:** not critical for Phase 48, backlog.
+
+**Defect (test gap, not a live bug):** `pipeline_launch::resume` calls `refuse_resume_over_a_live_run` right
+after taking the lock and before `load_state` (lock → guard → load, verified at `a3a0506`). Two writes follow
+before `launch_stage`: the `--agent` handoff save and `repair_leaked_auto_chain_flag`, which rewrites and
+commits `.planning/config.json`. No standing test would catch the guard moving below them. With the guard
+after the auto-chain repair, both `start_lock_e2e` resume refusal arms still pass (audit mutant M3). With it
+just before `launch_stage`, only the stopped-agent arm fails. The only check that pins the order is the
+one-off structural gate inside 48-20-PLAN.md Task 2 (negative-controlled: moved or removed guard → rejected),
+which no test, script or CI step runs. A misplaced guard would still refuse the second agent, but only after
+changing a live run's config, handoff state and git HEAD.
+
+**Fix shape:** a `start_lock_e2e` arm that plants the auto-chain flag, runs `resume --agent <other>` over a
+live recorded run, and asserts `.planning/config.json` bytes, git HEAD and the events log unchanged. Or make the
+48-20 placement check a standing test.
+
+**Acceptance:** the new arm fails against the M3 mutant (guard after the auto-chain repair) and against a
+guard placed just before `launch_stage`, and passes at HEAD.
+
+### Phase 999.143: A Recycled Recorded Pid Leaves `resume` No Work-Preserving Way Out (BACKLOG)
+
+**Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md Known limits, T-48-20-05). **Reasoned from source
+only — not reproduced; no test covers it.** **Filed by operator decision 2026-09-23:** defer to a later
+phase rather than accept it inside 48-20.
+
+**Defect:** after 48-20, `resume` refuses while a recorded monitor or agent pid is alive, and liveness is
+pid-only (Option A). If an unrelated process reuses a recorded pid, resume keeps refusing, and no DevFlow
+verb clears a recorded pid while keeping the phase's work: after `recover --clean`, plain `start` refuses
+while the phase's worktree or branch exists (parallel.rs:24-51, git.rs:157-172), and `start --force`
+recreates them from the base, discarding the work. 48-19's `start` refusal has the same shape: it names
+`recover --clean` then `devflow start` without warning that only `--force` gets through, and `--force`
+loses the work. Low probability: the reused pid must be live at the moment of resume. The refusal fails
+closed (nothing launched or written).
+
+**Overlap:** Phase 50 (Addressable Monitor Liveness) answers monitor liveness from a socket, not a pid,
+which removes the monitor-pid half. The agent pid file stays pid-only; this item is the agent half plus
+the missing work-preserving repair.
+
+**Fix shape (not decided):** identity for the recorded agent pid (e.g. process start time from
+`/proc/<pid>/stat`, or a pidfd), and/or a recovery path that clears recorded pids while keeping the
+worktree and branch so `resume` can proceed; correct the 48-19/48-20 refusal texts to match.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test: a recorded agent pid reused by an
+unrelated live process, where the fix lets the phase resume without losing its work.
+
+### Phase 999.142: Hints Prescribe `devflow resume` Where the Live-Run Guard Refuses It (BACKLOG)
+
+**Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md "Hint inventory", H1-H10); the fix-shape half
+of 999.140 the promotion did not cover (48-REVIEW.md WR-04). **Operator decision 2026-09-23:** option (b),
+file for later instead of folding into 48-20. **Depends on 48-20 landing.**
+
+**Defect:** after 48-20, `resume` refuses while a recorded monitor or agent is live, but production hints
+still tell the operator to run `devflow resume` in some of those states. Lasting: `status`
+(`Liveness::describe` "stuck — needs devflow resume", `recovery_hints`) and doctor `check_dead_monitor`
+for a dead monitor with a live agent; doctor `check_dead_agent` for a live monitor; `cleanup`'s
+halted-via-until message for a stop-marked live run (999.138) and its live-phase refusal; doctor
+`check_gate_pending_without_gate` and `no_waiter_repair` (gate approve/reject, gate sweep, stop, doctor)
+when a stale gate request carries into a relaunched live run. Transient (until the printing monitor
+exits): the park message, the cron hints and the "resume manually" rate-limit gate reason. Line numbers
+and firing conditions for each site at 6d31299 are in the 48-20 inventory. H3-H5 are reasoned from
+source, not reproduced.
+
+**Fix shape (not decided):** report a distinct state (an orphaned agent, or a live run holding no lock)
+and name the repair that works there, as the 48-19/48-20 refusal text does, instead of prescribing
+`resume`.
+
+**Acceptance:** not decided; set at promotion. Needs a test per lasting site: the hint never names
+`devflow resume` in a state where `resume` refuses, with a control that still names it for a dead leftover.
+
+### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-05); cache count verified
+by the orchestrator the same day.
+
+**Defect:** e2e tests whose `start` proceeds (start_lock_e2e phases 91, 92, 97, 98 at least) do not isolate
+`HOME`, so every run registers a `/tmp/.tmp*` root in the operator's real `~/.cache/devflow/roots`, and
+the background monitors those `start` calls launch are never reaped by the test. Measured 2026-09-23:
+14,796 entries, 14,767 of them `/tmp/.tmp*` test roots, newest written 07:54 by this session's runs.
+Violates TEST-01's environment-isolation rule (`HOME`/`XDG_*` must point at scratch paths).
+
+**Fix shape (not decided):** set `HOME` (and `XDG_CACHE_HOME`) per child `Command` in the e2e helpers;
+own launched monitors so a test can reap them; one-off cleanup of the polluted cache (operator decision —
+it is the operator's real cache).
+
+**Acceptance:** not decided; set at promotion. Needs a test that fails when a spawned `devflow` child
+writes outside its tempdir `HOME`.
+
+### Phase 999.140: `resume` Launches With No Live-Run Check (PROMOTED — Phase 48 gap closure)
+
+**Promoted 2026-09-23 by operator decision:** Phase 48 re-verification (`1590100`) reproduced a second monitor and agent launched by `resume` beside live ones at `d5376fa`; the operator chose to close criterion 2 with a Phase 48 gap plan for `resume` (reuse the 48-19 live-run refusal under the lock, test first). 999.139 stays in the backlog. The "should hints stop suggesting `resume`" half is split out to 999.142, and the recycled-pid cost on `resume` to 999.143 (operator decisions 2026-09-23).
+
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-04). **Reasoned from
+source only — not reproduced.**
+
+**Defect:** 48-19 made `start` refuse a phase whose recorded monitor or agent pid is alive; `resume`
+(`pipeline_launch.rs` resume path) launches with no equivalent check. `status` suggests `devflow resume`
+whenever the monitor is dead, even while the agent is alive — a state the refusal's own "SIGTERM the
+monitor first" advice creates on the default Claude launch between the two signals. Same class as
+48-19 (a second writer over a live run), sibling site not covered.
+
+**Fix shape (not decided):** reuse `refuse_start_over_a_live_run` (or a shared helper) in `resume` under
+the lock; decide whether `status` should stop suggesting `resume` while the agent pid is live.
+
+**Acceptance:** not decided; set at promotion. Needs a failing e2e test: `resume` against a live agent pid.
+
+### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-03). **Reproduced
+2026-09-23 by the Phase 48 re-verification** (HEAD `5eb3a61`): corrupt state + dead agent + live stand-in
+monitor → `start --force` exited 0, overwrote the state and launched a second agent. `resume` is not
+affected (its own `load_state` fails before launch). No test covers the branch (48-20 review WR-01: a
+skip-on-load-error mutant survives all `start_lock_e2e` tests).
+
+**Operator ruling 2026-09-23:** outside Phase 48 criterion 2 — the hole needs a dead agent beside a live
+monitor, the agent-exit → `advance` window already deferred as 999.136. Phase 48 passes without it.
+
+**Defect:** `refuse_start_over_a_live_run` (commands.rs) reads `monitor_pid` only from a state that loads.
+When the state file exists but does not parse or cannot be read, only the agent pid file is checked, so a
+live monitor is invisible and `start` proceeds over it. This path is not on the operator-approved list
+(no-state carve-out, recycled-pid false refusal, 999.136).
+
+**Fix shape (not decided — behaviour change, needs an operator ruling):** refuse when a state file exists
+but will not load (fail closed, pointing at `recover --clean`), or recover the monitor pid another way.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test with a corrupt state file and a live
+recorded monitor.
+
+### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (BACKLOG)
+
+**Found:** 2026-09-22 by the Phase 48 gap planner while wording 48-19's refusal message.
+**Reasoned from source only — not reproduced.**
+
+**Defect:** with no open gate and no per-phase lock holder — the window while a Legacy agent is running
+and its monitor waits on it — `devflow stop --phase N` prints "no lock held for phase N — nothing is
+running `advance()`", signals nothing, and only sets `stopped=true` in the state. No production code acts
+on that flag: `advance` (`pipeline_launch.rs`) and `devflow-core` never read it; its only production
+readers are `resume` (which clears it) and doctor/cleanup (which report it). So `stop` in that window
+leaves the agent and monitor running, and the next stage launches anyway — an operator-facing command
+that reports success without stopping anything (the 999.133 class).
+
+**Relation:** 48-19's refusal message is worded around this limit (it tells the operator `stop` "would
+only mark the state stopped" in that window and names the pids to signal instead). 999.136 is the
+adjacent lock-free window between agent exit and `advance` taking the lock.
+
+**Fix shape (not decided):** either `advance` honours `stopped=true` at the next stage boundary, or `stop`
+signals the recorded monitor (SIGTERM to the Legacy monitor also ends its agent —
+`sigterm_to_monitor_also_kills_the_agent`), or both; `stop` must not claim a stop it did not perform.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test that runs `stop` against a live
+lock-free run first.
+
+### Phase 999.137: Recover Sweep Does Not Reach Every Artifact It Resets (BACKLOG)
+
+**Found:** 2026-09-22, external review of the Phase 48 review-fix diff (`69c3ada..4d119fb`; codex,
+agy and DeepSeek lanes). Records: `.planning/reviews/48-code-review-2026-09-22/review-fix-round/`.
+**Verified against source by reading; the DeepSeek and agy lanes reproduced R-2 in scratch copies.**
+
+The operator split these out of Phase 48 (option 1, 2026-09-22): Phase 48 fixes the honest-reporting
+and exit-code findings (R-1, R-3..R-6); these three concern how far the sweep reaches, and leave only
+inert leftovers.
+
+- **R-2 — corrupt cron records are unreachable by the sweep, silently.** `ship::list_cron_instructions`
+  skips any `cron-instructions*.json` it cannot parse, and `recover::clean_report` deletes only records
+  that listing returns, so a corrupt per-phase or legacy record survives `recover --clean` with no
+  warning (`--phase N` does remove it). `write_cron_instructions` writes non-atomically, so a crash
+  mid-write produces exactly such a file.
+- **R-7 — a phase with only an orphaned state temp is never swept.** `workflow::state_file_phases`
+  matches `state-NN.json` only, so `.state-NN.json.<pid>.<seq>.tmp` with no state file is never
+  reached by the sweep; `clear_state` would remove it but is never called for that phase.
+- **R-8 — `Gates::phases_on_disk` accepts any `NN-*` name in the gates directory as a phase.** A
+  non-gate file makes the orphan sweep take and release that phase's lock needlessly (and create its
+  coordination inode). No non-gate file is deleted: `Gates::cleanup` removes only the canonical names.
+
+**Fix shape (not decided):** name-based complements for cron records and state temps, reported like
+the unparsable-state case; restrict `phases_on_disk` to the canonical gate/response/ack/temp names.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.136: Recover Sweep Deletes a Live Run Between Agent Exit and Advance (BACKLOG)
+
+**Found:** 2026-09-22, Phase 48 scoped code review (`48-REVIEW.md` WR-05, reviewed at `2070a65`).
+**Reasoned from code only — not reproduced.**
+
+**Defect:** `recover::clean_report` treats a phase as stale when `started_at` is older than 24 h and
+the agent-pid file names no live process (`is_stale_state`). `started_at` is written only by
+`State::new`, so any phase that has sat on a long gate is permanently "old" and only the agent pid
+protects it. In the Legacy flow no lock is held between the agent exiting (`wait $apid` returns) and
+the monitor tail's `devflow advance` acquiring the phase lock. A sweep landing in that window sees a
+dead agent and an old `started_at`, takes the free lock, and deletes the live run's state and — since
+`854bbce` — its gate files; `advance` then fails on missing state. `state.monitor_pid` is never
+consulted, and the staleness decision uses the pre-lock `list_states` snapshot without re-checking
+once the lock is held. `inspect_state` has the same blind spot.
+
+**Why backlog, not Phase 48:** it predates Phase 48 (Phase 48 only widened what the sweep deletes);
+the operator split it out when choosing to fix WR-01..WR-04 inside the phase (2026-09-22).
+
+**Fix shape (reviewer's suggestion, not decided):** after taking the phase lock, reload the state and
+re-run the staleness checks; treat an identity-checked live `state.monitor_pid` as not stale; give
+`inspect_state` the same monitor check.
+
+**Acceptance:** not decided; set at promotion. Needs a failing test that holds the agent-exited /
+advance-not-yet-locked window open before any fix.
+
+### Phase 999.135: Probe Descendant Survives the Group Kill Under Full-Gate Load (BACKLOG)
+
+**Found:** 2026-09-22, in a full `scripts/check-in-container.sh all` at `1d93895`:
+`agents::opencode::tests::spawn_with_timeout_kills_a_hung_child` failed with `the timed-out probe's
+sleep descendant must be dead: pid 11529` — the stub's `sleep` was still alive 2 s after
+`spawn_with_timeout` SIGKILLed the probe's process group. **Not root-caused**; the open session is
+`.planning/debug/probe-sleep-survives-group-kill.md` (`/gsd-debug continue probe-sleep-survives-group-kill`).
+
+**Rate, and why the regime matters:** 1 of 5 full-gate runs that day, against 0 of 70 bare
+`cargo test -p devflow-core --lib` container runs (30 + a 40-run campaign at `e683f89`). The bare loop
+cannot distinguish "gone" from "load-gated", so its green runs are not evidence the containment is
+sound. A full gate (fmt + clippy + build, then 830 parallel tests on `taskset -c 0,1`) is a far heavier
+load than the loop.
+
+**Leading hypothesis (UNTESTED, zero supporting measurements):** the SIGKILL reached the group and the
+containment is correct, but the dying `sleep` was not scheduled to process it within the 2-second poll;
+until it runs, `/proc/<pid>/status` reads `State: R`, which `agent_running` correctly calls alive. If a
+dump confirms that, the defect is the assertion measuring scheduler latency, and the fix is a redesign
+of the check — **not** widening the window.
+
+**Diagnostics are already in place (`e683f89`).** On failure the three probe-containment tests dump the
+survivor's Name/State/PPid/pgid/starttime/cmdline before and after the poll, the stub's recorded pid,
+what remains of the probe's process group, the probe error, and which kill path ran (group kill reached,
+or the ESRCH leader-only fallback). Seven candidate causes have distinct signatures, tabulated in the
+session file. The dump is test-only: in non-test builds the closure is never invoked. A negative control
+(`probe_proc_snapshot_separates_a_live_process_from_a_reaped_one`) keeps a future snapshot from silently
+reading `GONE` for everything.
+
+**Fix shape:** not decided — the cause is unknown. Next step is evidence, not a patch: read the dump
+from the next natural full-gate failure, or force it with ~15 repeated full-gate runs (~1 h).
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (BACKLOG)
+
+**Found:** 2026-09-22, while debugging the Legacy monitor's lost-TERM flake
+(`.planning/debug/resolved/monitor-sigterm-orphans-agent.md`). The operator decided to backlog it and
+close that session on the Legacy fix.
+
+The `PipeOwning` monitor is the re-exec'd `__monitor` subcommand, used whenever the Claude stream-json
+launch is enabled. Unlike the Legacy `sh` monitor, it installs no signal handler — confirmed at
+`3ca90b6`: no `sigaction`, `libc::signal`, `signal_hook` or equivalent appears in
+`crates/devflow-core/src/monitor.rs` or `crates/devflow-cli/src/main.rs` — and it spawns the agent with
+`.process_group(0)` (monitor.rs:961), putting it in its own process group. A TERM delivered to the
+monitor therefore kills the monitor by default and never reaches the agent, which is left orphaned.
+
+Unlike the Legacy defect this is not a race: with no handler it happens every time. The debugger's probe
+saw the monitor exit 143 with the agent still alive 3 s later; its control, a TERM sent straight to the
+agent, killed it.
+
+**Reachability:** none of DevFlow's own senders TERM a monitor — `stop` signals the per-phase lock
+holder, and the idle-timeout path signals the agent's own group. It takes a TERM from outside DevFlow:
+an operator's `kill`, or a host or container shutdown.
+
+**Fix shape:** not decided. The shape to consider is a TERM/INT handler in `__monitor` that forwards to
+the agent's process group and then exits, matching what the Legacy script's trap now guarantees.
+
+**Acceptance:** not decided; set at promotion. A fix needs a failing test first: TERM the `__monitor`
+process and require the agent to be gone, with a control proving the test can observe the agent dying.
+
+### Phase 999.133: Commands Report Success After a Failed or No-Op Action (BACKLOG)
+
+**Found:** 2026-09-22, the codex + agy review of Phase 48's code-review fixes. The operator decided to
+backlog these instances as one entry for the class. Phase 48 itself fixed two instances in
+`recover --clean` (`9a33c70`, `d36936e`). All three below predate Phase 48, and each was confirmed by
+reading the source at `854bbce`:
+
+- **`abort` (codex C-2, agy C-7).** `pipeline_gate::abort` (`crates/devflow-cli/src/pipeline_gate.rs`)
+  prints "workflow aborted for phase N" before doing any cleanup. It then discards the errors from
+  `Gates::cleanup` and `workflow::clear_state` (`let _ =`), emits `workflow_aborted` and returns `Ok(())`.
+  If the state cannot be removed, the run is reported and recorded as aborted while its state stays on
+  disk. codex reproduced this with the state path made a directory. The code dates from `33f7962`
+  (2026-07-22). abort sits on the gate-resolution path, so a fix needs its own tests.
+- **`devflow cleanup` (agy C-6).** `commands::cleanup` counts only successful removals. When every
+  worktree removal fails, it prints the per-worktree warning, then "no worktrees to clean up", and
+  exits 0.
+- **`devflow recover --phase N` inspection (agy S-1; agy marked it suspected, confirmed from source).**
+  Without `--clean`, when phase N has no state but other phases do, the phase filter skips every entry,
+  so the command prints nothing and exits 0.
+
+**Fix shape:** not decided. Each command should report only what it established, and exit non-zero
+when the action it was asked for did not happen.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.132: Gate List and Status Disagree After an Unwaited Ship Answer (BACKLOG)
+
+**Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision to track all five Phase 48 deferrals here. After a Ship-gate answer with nothing waiting,
+`devflow gate list` reports "no open gates" while `devflow status` still says a gate is pending.
+Recorded as cosmetic: D-05's message already names `devflow ship --phase N`. Not re-verified at
+filing time.
+
+**Fix shape:** not decided.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.131: Convert the Remaining Test Environment Mutations (BACKLOG)
+
+**Found:** Phase 48 D-09/D-10 (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision. TEST-01 converted only the tests that replace `PATH`; the other process-global
+environment mutations in tests stayed, each under an explicit `#[expect(clippy::disallowed_methods)]`,
+and `ENV_MUTEX` still serialises them. Line counts from `rg` at `395feb4` (a line census, not a
+per-test one): 21 `expect(clippy::disallowed_methods` attributes across 7 files, 48 lines calling
+`env::set_var`/`env::remove_var`, 123 `ENV_MUTEX` references. The discussion estimated ~40
+mutations.
+
+**Fix shape (from 48-CONTEXT):** convert them, either to a child process or by passing values
+directly, then delete `ENV_MUTEX`.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.130: Split-Lock State-Handling Overhaul (BACKLOG)
+
+**Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision. Phase 48 made state writes survivable with unique temp files, first-answer-wins gate
+publishing and the per-phase lock, not by restructuring state handling. The deferred design has
+five parts:
+- a short OS lock (`flock`) around every state write;
+- an `update_state(root, phase, |s| …)` API, with `State` consumed by value across blocking calls;
+- a launcher-to-monitor ownership token handoff;
+- gate-waiter registration;
+- fsync of the file and its directory.
+
+Parked for Phase 50, which rebuilds the monitor supervisor.
+
+**Stale gate answers (folded in 2026-09-22, Phase 48 code review finding B).** Gate answers are not
+bound to a gate incarnation. `Gates::write_gate` rewrites only the request, and `Gates::poll_response`
+takes any response file on its first read. So an answer left on disk decides the next gate at the same
+phase and stage without a new decision. Two sources, both confirmed from source:
+- a waiter killed within the ≤60 s poll backoff after an answer is written, followed by `resume`, which
+  relaunches without clearing it (pinned by `resume_relaunches_without_consuming_a_pending_gate_answer`
+  and its control);
+- a late `Gates::respond`, which has no re-check after its hard-link publish, racing a
+  consume-and-cleanup.
+
+The 2026-09-22 security re-audit added two related paths:
+- the check-to-write window in the three CLI answer writers (`gate_respond`, `gate sweep`, `stop`), where
+  a waiter that dies after the holder check still gets an answer;
+- `start`, which only warns when it cannot delete a leftover gate file, so that answer survives into the
+  fresh run.
+
+Both are recorded in `48-SECURITY.md` as AR-48-04 and in the T-48-12-05 caveat.
+
+48-CONTEXT D-05 calls this hazard closed by (3)+(4); it is only partly closed. The operator decided to
+record it as a Phase 48 limit and to fix it through this item's gate-waiter registration. A plain
+"clear leftovers when a gate opens" fix would break the intended Supervise re-scan rejection reuse
+(`rejecting_the_rescan_gate_records_nothing_and_falls_through`). Evidence:
+`.planning/reviews/48-code-review-2026-09-22/VERIFIED.md`.
+
+**Revisit when (from 48-CONTEXT):**
+- Phase 49's live run, or any run, records a concurrent state write or an `advance_failed` refusal;
+- Phase 50's discussion reworks the monitor-to-`advance` handoff;
+- a new state writer appears that cannot take the per-phase lock.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.129: Ship Finalization-Retry Gate Recovery Is Unverified (BACKLOG)
+
+**Found:** Phase 48 D-05 (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
+decision. Nobody has verified whether `devflow ship --phase N`, or anything else, consumes an answer
+at the Ship finalization-retry gate when nothing is waiting. D-05 names `ship` as the repair and
+relies on its ack guard to refuse. The 2026-09-22 Nyquist test
+`pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer` covers only a
+Code stage-failure gate; Validate and Ship finalization-retry gates have no equivalent test.
+
+**Fix shape:** not decided. Reproduce first: an answered finalization-retry gate with no live holder,
+then `devflow ship --phase N`.
+
+**Acceptance:** not decided; set at promotion.
+
+### Phase 999.128: Lock Reclaim Ignores the Holder's Start Time (BACKLOG)
+
+**Found:** Phase 48 D-05 limits and `<deferred>` (`48-CONTEXT.md`), which defer it to Phase 50's
+liveness work. Phase 50's roadmap entry does not carry it, so it is filed here. The operator decided
+on 2026-09-22 to accept it as a Phase 48 limit and track it here.
+
+Confirmed at `395feb4`: `lock::acquire_after_existing` (`crates/devflow-core/src/lock.rs`) returns
+`Contended` whenever the recorded pid is alive and never compares the recorded start time. A lock
+whose pid an unrelated process has reused (`HolderStatus::Recycled`) therefore blocks every
+lock-taking verb until that process exits. Pinned examples:
+- `recover --clean` deletes nothing (`recover::tests::clean_phase_returns_without_cleanup_for_a_recycled_pid_lock`);
+- `stop` refuses to signal the recycled pid.
+
+**Why it matters for SURV-02:** at a gate whose holder is `Recycled`, `stop`, `gate` and `doctor`
+correctly say nothing is waiting. The repair they name (`resume`, `recover --clean`, or `ship` at
+Ship) then refuses for as long as the recycled pid lives. Success criterion 3 asks for "the repair
+that works", and in this case it does not work.
+
+**Fix shape (from 48-CONTEXT):** reclaim a lock by pid plus start time, so a live pid with a different
+start time counts as stale. It must stay serialised through the existing reclaim coordination
+(`stale_reclaim_is_serialized_before_it_removes_the_lock_path`).
+
+**Acceptance (proposed at filing, not operator-reviewed):** a lock whose pid is alive with a
+different start time is reclaimed; at a `Recycled` gate, the repair `stop`/`doctor` names succeeds;
+a lock held by a live process whose start time matches is never reclaimed.
+
+### Phase 999.127: A `human-action` Gate Can Be Auto-Decided Because Another Checkpoint Is `blocking-human` (BACKLOG)
+
+**Found:** 2026-09-19, Phase 48 adversarial review finding D. The checkpoint
+auto-decision path asks whether a *phase* declares any `blocking-human`
+checkpoint, while the recorded approval set combines `blocking_human ||
+human_action`. When both declarations exist, an authorization checkpoint can
+therefore inherit the unrelated checkpoint's unattended decision path.
+
+**Fix shape:** bind auto-decision eligibility to the exact declaration that
+raised the gate, or classify `human-action` as a non-auto-decidable authority
+boundary independently of other phase declarations.
+
+**Acceptance:** a phase declaring both kinds of checkpoint parks for a human
+at its `human-action` authorization gate and emits no `checkpoint_auto_decided`
+event; the intended `blocking-human` path remains separately tested.
 
 ### Phase 999.126: A Checkpoint Added After Code Preflight Is Never Re-Scanned (PROMOTED — Phase 48, 2026-09-13)
 

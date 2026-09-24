@@ -46,7 +46,13 @@ use devflow_core::{
     agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
 };
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// `advance` waits for a post-spawn lock holder because it normally finishes
+/// in seconds; after ten chosen (not measured) minutes the holder is likely at
+/// a gate or wedged, and doctor then resume is the explicit recovery path.
+pub(crate) const ADVANCE_LOCK_WAIT: Duration = Duration::from_secs(600);
 
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
 /// and spawning the monitor. (25b, D-03: this function no longer performs
@@ -905,9 +911,14 @@ impl Drop for AutoChainGuard {
 /// sufficient only because the sole adapter routed through the pipe-owning arm
 /// (Claude) declares no extra env; see the note at `spawn_monitor`'s
 /// `PipeOwning` arm before widening it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hidden CLI dispatch supplies these independently parsed monitor arguments"
+)]
 pub(crate) fn run_monitor(
     project_root: &Path,
     phase: PhaseId,
+    stage: Option<Stage>,
     workdir: &Path,
     prompt_file: &Path,
     idle_timeout_secs: u64,
@@ -978,7 +989,7 @@ pub(crate) fn run_monitor(
     )
     .map_err(|err| CliError::Message(format!("pipe-owning monitor failed: {err}")))?;
 
-    advance(project_root, Some(phase))
+    advance_for_stage(project_root, Some(phase), stage)
 }
 
 /// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
@@ -1105,20 +1116,72 @@ fn spawn_agent_and_record(
 /// can be arbitrarily long and the gate context is truncated for the notify
 /// payload, so quoting bodies would push the actionable part — which file to
 /// look at — past the cut.
-fn rescan_gate_context(unapproved: &[&CheckpointDeclaration]) -> String {
+fn rescan_gate_context(unapproved: &[&CheckpointDeclaration], mode: Mode) -> String {
     let mut plan_files: Vec<&str> = unapproved
         .iter()
         .map(|declaration| declaration.plan_file.as_str())
         .collect();
     plan_files.sort_unstable();
     plan_files.dedup();
+    let next_step = match mode {
+        Mode::Auto => {
+            "approve, or switch this phase to Supervise for its remaining stages to repair, or abort"
+        }
+        Mode::Supervise => {
+            "approve then make a separate human Code decision, repair under Supervise, or abort"
+        }
+    };
     format!(
         "[checkpoint re-scan] {} human-only checkpoint(s) in {} were added or changed after this \
-         phase's Code preflight — a human must review them before the agent is resumed to decide \
-         them itself (approve, loop-to-code, or abort)",
+         phase's Code preflight — a human must review them before continuing ({next_step})",
         unapproved.len(),
         plan_files.join(", ")
     )
+}
+
+/// A re-scan rejection in Auto mode is not an ordinary retry. The declaration
+/// remains unapproved, so an unattended Code launch correctly refuses it;
+/// routing through `GateAction::LoopBack` would open another unattended gate
+/// with no answer. Persist the human-requested handoff before cleanup, so a
+/// subsequent `resume` is supervised and cannot race a stale response file.
+fn park_auto_rescan_repair(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    unapproved_files: &[String],
+) -> Result<(), CliError> {
+    debug_assert_eq!(state.mode, Mode::Auto);
+    state.mode = Mode::Supervise;
+    state.stopped = true;
+    state.gate_pending = false;
+    let reason = format!(
+        "checkpoint re-scan rejected in Auto mode; phase switched to Supervise for its remaining \
+         stages and parked for repair of {}",
+        unapproved_files.join(", ")
+    );
+    state.stop_reason = Some(match state.stop_reason.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+        _ => reason,
+    });
+    workflow::save_state(state)?;
+    Gates::cleanup(project_root, state.phase, stage)?;
+    events::emit(
+        project_root,
+        state.phase,
+        "checkpoint_repair_parked",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "from_mode": "auto",
+            "to_mode": "supervise",
+            "plan_files": unapproved_files,
+        }),
+    );
+    println!(
+        "checkpoint re-scan rejected in Auto mode; phase {} is now Supervise for its remaining \
+         stages and parked for repair. Review the changed plan, then run `devflow resume --phase {}`.",
+        state.phase, state.phase
+    );
+    Ok(())
 }
 
 /// The distinct plan files among `unapproved`, sorted — the actionable part of
@@ -1190,7 +1253,7 @@ pub(crate) fn relaunch_checkpoint_session(
             "session_id": session_id,
             "instruction": truncate_reason(&instruction),
             "attempt": state.checkpoint_resumes,
-            "policy": "D-03: unconditional agent auto-decide, no flag/config toggle",
+            "policy": "D-03b: Auto-only checkpoint auto-decide",
         }),
     );
 
@@ -1342,6 +1405,10 @@ pub(crate) fn handle_ambiguous_outcome(
 /// it. The combination is OR-only — see [`apply_legacy_launch_opt_out`] for why
 /// a plain `devflow resume` must not clear an opt-out the operator already
 /// chose.
+///
+/// Criterion 2's 48-20 guard refuses to resume while the recorded monitor or
+/// agent remains live. It runs under the phase lock before state is loaded or
+/// written; see [`crate::commands::refuse_resume_over_a_live_run`].
 pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
@@ -1357,6 +1424,7 @@ pub(crate) fn resume(
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
+    crate::commands::refuse_resume_over_a_live_run(project_root, phase)?;
     let mut state = workflow::load_state(project_root, phase)?;
     if let Some(requested) = agent
         && requested != state.agent
@@ -1507,7 +1575,16 @@ fn augment_unresolved_checkpoint_reason(reason: Option<String>, why: &str) -> St
 
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
 /// Invoked by the monitor process; not normally run by a human.
+#[cfg(test)]
 pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(), CliError> {
+    advance_for_stage(project_root, phase, None)
+}
+
+pub(crate) fn advance_for_stage(
+    project_root: &Path,
+    phase: Option<PhaseId>,
+    stage: Option<Stage>,
+) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor
     // (recorded at spawn time), so advance's identity never depends on a
     // shared state singleton — under `devflow parallel`, each monitor
@@ -1533,15 +1610,35 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
             }
         },
     };
+    advance_with(project_root, phase, stage, ADVANCE_LOCK_WAIT)
+}
+
+pub(crate) fn advance_with(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    lock_wait: Duration,
+) -> Result<(), CliError> {
     // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
     // advance() holds it across a gate's multi-day blocking wait, and every
     // successful run ends at a mandatory Ship gate — a project-wide lock
     // would starve `devflow parallel`'s sibling phases with no retry.
-    let _lock = match lock::acquire(project_root, phase) {
+    let _lock = match lock::acquire_blocking(project_root, phase, lock_wait) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, path: _ }) => {
+            events::emit(
+                project_root,
+                phase,
+                "advance_failed",
+                serde_json::json!({
+                    "reason": "lock wait expired",
+                    "holder_pid": pid,
+                    "waited_secs": lock_wait.as_secs_f64(),
+                }),
+            );
             return Err(CliError::Message(format!(
-                "another devflow process (pid {pid}) is already running"
+                "advance lock wait expired after {} seconds; holder pid {pid}",
+                lock_wait.as_secs_f64()
             )));
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
@@ -1549,9 +1646,35 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
     // Load under the lock: with per-phase state files keyed by the same
     // phase as the lock, there is no cross-phase TOCTOU left by
     // construction — a concurrent advance of another phase touches a
-    // different file and a duplicate advance of THIS phase is excluded by
-    // the lock itself.
+    // different file. A duplicate advance of THIS phase queues behind the
+    // lock, then stage binding below handles a launch that has moved on.
     let mut state = workflow::load_state(project_root, phase)?;
+
+    match stage {
+        Some(expected) if expected != state.stage => {
+            events::emit(
+                project_root,
+                phase,
+                "advance_failed",
+                serde_json::json!({
+                    "reason": "stage mismatch",
+                    "expected": expected.to_string(),
+                    "actual": state.stage.to_string(),
+                }),
+            );
+            return Err(CliError::Message(format!(
+                "advance stage mismatch: expected {expected}, state is {}",
+                state.stage
+            )));
+        }
+        None => events::emit(
+            project_root,
+            phase,
+            "advance_stage_unbound",
+            serde_json::json!({ "stage": state.stage.to_string() }),
+        ),
+        Some(_) => {}
+    }
 
     // Project-resolved (45-01): `evaluate_agent_result`'s Layer 2 counts
     // commits in a `{trunk}..{feature}` range, so a defaulted trunk
@@ -1625,15 +1748,17 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
         Action::GateReview => {
             // D-01/D-03/D-05 (28-03): before the ordinary per-stage failure
             // dispatch, check whether this failure is actually a confirmed
-            // human-blocking checkpoint DevFlow can resolve unattended by
-            // resuming the exact session that raised it. Evaluated IN THIS
+            // human-blocking checkpoint DevFlow can resolve unattended in
+            // Auto mode by resuming the exact session that raised it. Evaluated IN THIS
             // ORDER — load-bearing — (1) agent is Claude (D-05); (2) the
             // phase's plans statically declare a blocking-human checkpoint —
             // the PRIMARY, agent-uncontrollable gate, checked BEFORE
             // anything agent-controlled (T-28-01); (3) the capture confirms
-            // one was reported; (4) a session id is on record; (5) the
-            // resume ceiling has not been exhausted. All five true -> resume
-            // and return. Any false -> fall through to the unchanged
+            // one was reported; (4) a session id is on record; and (5) the
+            // resume ceiling has not been exhausted. A changed declaration
+            // always opens the re-scan gate. Only an unchanged, recorded set
+            // in Auto resumes without a human; Supervise falls through to a
+            // human gate. Any other false -> fall through to the unchanged
             // per-stage dispatch below.
             //
             // Steps (2) and (3) deliberately read DIFFERENT roots (999.76,
@@ -1675,7 +1800,7 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
                         let current = verify::phase_checkpoint_declarations(execution_root, phase);
                         let unapproved = state.checkpoint_approval.unapproved(&current);
                         if !unapproved.is_empty() {
-                            let context = rescan_gate_context(&unapproved);
+                            let context = rescan_gate_context(&unapproved, state.mode);
                             // The unapproved plan files, captured BEFORE the
                             // gate: `unapproved` borrows `current`, and the
                             // LoopBack arm needs these names after `&mut state`
@@ -1711,22 +1836,38 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
                                     state.gate_pending = false;
                                     state.checkpoint_approval = recorded_approval(&current);
                                     workflow::save_state(&state)?;
-                                    return relaunch_checkpoint_session(&mut state, &session_id);
+                                    if state.mode == Mode::Auto {
+                                        return relaunch_checkpoint_session(
+                                            &mut state,
+                                            &session_id,
+                                        );
+                                    }
+                                    reason = Some(augment_unresolved_checkpoint_reason(
+                                        reason,
+                                        "Supervise mode requires a human decision for the declared blocking-human checkpoint",
+                                    ));
                                 }
                                 // T-48-15-03: a rejection records NOTHING.
                                 // Widening the set here would mean the next
                                 // resume proceeded as though the human had said
-                                // yes. Fall through to the unchanged
-                                // non-auto-decide dispatch below, naming the
-                                // files they objected to in the reason it
-                                // renders.
-                                //
-                                // The response is deliberately NOT cleaned up:
-                                // the fall-through gate asks the same question
-                                // about the same stage, so it consumes the same
-                                // answer rather than re-asking a human who has
-                                // already replied.
+                                // yes. In Auto, it also cannot use the generic
+                                // loop-back: a second unattended Code preflight
+                                // correctly refuses the still-unapproved human
+                                // checkpoint. Park it for the explicitly
+                                // requested supervised repair instead.
                                 GateAction::LoopBack(_) => {
+                                    if state.mode == Mode::Auto {
+                                        return park_auto_rescan_repair(
+                                            project_root,
+                                            &mut state,
+                                            stage,
+                                            &unapproved_files,
+                                        );
+                                    }
+                                    // Supervise may use the ordinary repair
+                                    // loop: its next Code run is not
+                                    // unattended, and the unchanged response
+                                    // is the human's request to repair.
                                     reason = Some(augment_unresolved_checkpoint_reason(
                                         reason,
                                         &format!(
@@ -1742,8 +1883,13 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
                                     return abort(project_root, &state, &note);
                                 }
                             }
-                        } else {
+                        } else if state.mode == Mode::Auto {
                             return relaunch_checkpoint_session(&mut state, &session_id);
+                        } else {
+                            reason = Some(augment_unresolved_checkpoint_reason(
+                                reason,
+                                "Supervise mode requires a human decision for the declared blocking-human checkpoint",
+                            ));
                         }
                     }
                     (Some(_), false) => {
@@ -2109,6 +2255,157 @@ mod tests {
             "resume() must have spawned a monitor whose pid is recorded in state — if this \
              fails, the reap guard above is silently reaping nothing and this test has \
              stopped covering the launch path it was written to cover"
+        );
+    }
+
+    /// A phase parked at an open, already-answered Code gate: the state says
+    /// `gate_pending`, the request file is on disk, and an unconsumed response
+    /// sits beside it. Returns the (request, response) bytes as planted.
+    fn seed_code_gate_with_pending_answer(
+        root: &Path,
+        phase: PhaseId,
+        mode: Mode,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_pending = true;
+        state.stopped = true;
+        state.stop_reason = Some("stage failed; gate open".to_string());
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+
+        Gates::write_gate(
+            root,
+            phase,
+            Stage::Code,
+            "[never-silent] stage code failed — human review needed",
+        )
+        .unwrap();
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: stale answer nobody polled","responded_by":"test"}"#,
+        )
+        .unwrap();
+        (
+            std::fs::read(Gates::gate_path(root, phase, Stage::Code)).unwrap(),
+            std::fs::read(&response_path).unwrap(),
+        )
+    }
+
+    /// SURV-02 / Phase 48 criterion 3 (48-CONTEXT D-05 "verified correction"):
+    /// `resume` relaunches the saved stage and never reads a pending answer.
+    /// The gate here is a stage-failure gate, not a preflight refusal: the
+    /// relaunch's preflight PASSES (Supervise mode), so nothing re-fires the
+    /// gate, and the planted answer must survive byte-identical — not read,
+    /// not acked, not deleted.
+    ///
+    /// Scope: asserts on the state immediately after `resume()` returns. The
+    /// detached monitor it spawns is reaped at drop; what that monitor would
+    /// do with the answer later is outside this test.
+    #[test]
+    fn resume_relaunches_without_consuming_a_pending_gate_answer() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(91);
+        let (request_before, response_before) =
+            seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        // (a) the saved stage was relaunched.
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.stage,
+            Stage::Code,
+            "resume must relaunch the saved stage"
+        );
+        assert!(
+            reloaded.monitor_pid.is_some(),
+            "resume must have spawned a monitor for the saved stage"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            1,
+            "resume must launch the saved stage exactly once"
+        );
+
+        // (b) the pending answer was neither read-and-consumed nor deleted.
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        assert_eq!(
+            std::fs::read(&response_path).ok(),
+            Some(response_before),
+            "resume must leave the pending gate answer on disk byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(Gates::gate_path(root, phase, Stage::Code)).ok(),
+            Some(request_before),
+            "resume must leave the gate request untouched"
+        );
+        assert!(
+            !Gates::ack_path(root, phase, Stage::Code).exists(),
+            "an ack file means a poller consumed the answer"
+        );
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            !events.contains("\"gate_resolved\""),
+            "resume must not resolve the gate: {events}"
+        );
+    }
+
+    /// THE CONTROL for the test above: the one path 48-CONTEXT says DOES
+    /// consume a stale answer on resume — a preflight refusal. Mode::Auto at
+    /// Code with the legacy launch forced is refused by
+    /// `preflight_unattended_launch_check`, the refusal gate re-fires at the
+    /// same phase+stage, reads the planted abort answer, and `abort()` cleans
+    /// it up. Same fixture, opposite result: proves the assertions above can
+    /// observe consumption when it happens.
+    #[test]
+    fn resume_preflight_refusal_consumes_a_pending_gate_answer() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_preflight_refusal_consumes_a_pending_gate_answer";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(92);
+        seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        assert!(
+            !Gates::response_path(root, phase, Stage::Code).exists(),
+            "the preflight-refusal gate must have consumed the stale answer"
+        );
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events.contains("\"gate_resolved\""),
+            "the stale answer must have resolved the re-fired gate: {events}"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "an aborted preflight must not launch the stage"
         );
     }
 
@@ -2701,7 +2998,7 @@ mod tests {
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                advance(root, Some(phase)).unwrap();
+                advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
             });
 
             let mut seen = false;
@@ -2871,7 +3168,7 @@ mod tests {
         )
         .unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         // advance_evaluated isn't the last event once the infra gate/abort
         // path runs, so read the raw log and find it by name rather than
@@ -2896,6 +3193,115 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| event["event"] == kind)
             .collect()
+    }
+
+    #[test]
+    fn advance_waits_for_a_held_lock_then_proceeds() {
+        const NAME: &str = "pipeline_launch::tests::advance_waits_for_a_held_lock_then_proceeds";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(48);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let held = lock::acquire(root, phase).expect("test holder acquires phase lock");
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                drop(held);
+            });
+            let result = advance_with(root, phase, None, Duration::from_secs(10));
+            assert!(result.is_ok(), "advance result: {result:?}");
+        });
+    }
+
+    #[test]
+    fn advance_lock_wait_expiry_emits_advance_failed() {
+        const NAME: &str = "pipeline_launch::tests::advance_lock_wait_expiry_emits_advance_failed";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(49);
+        let _held = lock::acquire(root, phase).expect("test holder acquires phase lock");
+
+        let err = advance_with(root, phase, None, Duration::from_millis(300))
+            .expect_err("advance must time out behind a live holder");
+        assert!(err.to_string().contains("holder pid"));
+        let failed = events_of_kind(root, "advance_failed");
+        assert_eq!(failed.len(), 1, "one durable failure event: {failed:?}");
+        assert_eq!(failed[0]["phase"], 49);
+        assert_eq!(failed[0]["reason"], "lock wait expired");
+        assert!(failed[0]["holder_pid"].as_str().is_some());
+    }
+
+    #[test]
+    fn advance_refuses_when_the_saved_stage_moved_on() {
+        const NAME: &str = "pipeline_launch::tests::advance_refuses_when_the_saved_stage_moved_on";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(50);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let err = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(1))
+            .expect_err("advance must reject a stage that has moved on");
+        assert!(err.to_string().contains("stage mismatch"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        let failed = events_of_kind(root, "advance_failed");
+        assert_eq!(failed.len(), 1, "one durable refusal event: {failed:?}");
+        assert_eq!(failed[0]["reason"], "stage mismatch");
+        assert_eq!(failed[0]["expected"], "define");
+        assert_eq!(failed[0]["actual"], "code");
+    }
+
+    #[test]
+    fn advance_without_stage_proceeds_and_records_the_legacy_invocation() {
+        const NAME: &str = "pipeline_launch::tests::advance_without_stage_proceeds_and_records_the_legacy_invocation";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(51);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        advance_with(root, phase, None, Duration::from_secs(1)).unwrap();
+        assert_eq!(events_of_kind(root, "advance_stage_unbound").len(), 1);
+    }
+
+    #[test]
+    fn existing_advance_test_callers_pass_their_fixture_stage() {
+        const NAME: &str =
+            "pipeline_launch::tests::existing_advance_test_callers_pass_their_fixture_stage";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(52);
+        init_repo(root);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        advance_with(root, phase, Some(Stage::Code), Duration::from_secs(1)).unwrap();
+        assert!(events_of_kind(root, "advance_failed").is_empty());
+        assert!(events_of_kind(root, "advance_stage_unbound").is_empty());
     }
 
     /// D-04/D-07 (28-03, Task 2): a checkpoint resume records the
@@ -2932,6 +3338,10 @@ mod tests {
         assert_eq!(matches[0]["session_id"], "sess-abc-123");
         assert_eq!(matches[0]["stage"], "code");
         assert_eq!(matches[0]["attempt"], 1);
+        assert_eq!(
+            matches[0]["policy"], "D-03b: Auto-only checkpoint auto-decide",
+            "the audit event must name the policy the runtime actually applied"
+        );
     }
 
     /// D-04 (28-03, Task 2): the resume ceiling increments with saturating
@@ -3721,7 +4131,7 @@ mod tests {
 
         let phase = PhaseId::new(88);
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -3783,7 +4193,7 @@ mod tests {
         let phase = PhaseId::new(96);
         write_abort_gate_response(root, phase, Stage::Code);
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -3932,7 +4342,7 @@ mod tests {
     ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
         write_abort_gate_response(root, phase, Stage::Code);
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -4028,7 +4438,7 @@ mod tests {
 
         write_gate_response(root, phase, Stage::Code, true, None);
 
-        let first = advance(root, Some(phase));
+        let first = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_first = workflow::load_state(root, phase).ok();
         let _reap_first = reloaded_first.as_ref().map(ReapMonitorOnDrop::after_launch);
         first.unwrap();
@@ -4088,6 +4498,222 @@ mod tests {
                 .len(),
             1,
             "the pre-approval set must still leave one declaration unapproved"
+        );
+    }
+
+    /// D-03b: a Supervise operator may approve the re-scan's new declaration
+    /// set, but that approval is not permission for Claude to decide the
+    /// checkpoint. It records the set, then opens the ordinary Code gate.
+    #[test]
+    fn supervise_rescan_approval_records_but_requires_a_human_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::supervise_rescan_approval_records_but_requires_a_human_gate";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_SUPERVISE_RESCAN_ROOT";
+        let phase = PhaseId::new(111);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Supervise,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+        let expected_approval = recorded_from_body(phase, &rescan_plan_body_rewritten());
+        write_gate_response(root, phase, Stage::Code, true, None);
+
+        let writer_root = root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if workflow::load_state(&writer_root, phase)
+                    .is_ok_and(|state| state.checkpoint_approval == expected_approval)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "approval was not persisted before the human Code gate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
+        });
+
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
+        writer.join().expect("second-gate response writer");
+        result.unwrap();
+
+        workflow::load_state(root, phase)
+            .expect_err("the abort response must end the supervised run");
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "Supervise re-scan approval must never auto-decide"
+        );
+        let code_gates = events_of_kind(root, "gate_fired")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .count();
+        assert_eq!(code_gates, 2, "re-scan plus human-decision gates must fire");
+    }
+
+    /// An Auto-mode rejection cannot reuse the ordinary failure loop-back: the
+    /// next unattended Code preflight correctly refuses the still-unapproved
+    /// human-only checkpoint. Park the phase in Supervise before cleaning the
+    /// response. The bounded writer feeds an abort only if the pre-fix third
+    /// gate appears; its marker and the exact one-gate assertion below make
+    /// both directions observable rather than treating a short run as proof.
+    #[test]
+    fn auto_rescan_rejection_parks_for_supervised_repair() {
+        const NAME: &str =
+            "pipeline_launch::tests::auto_rescan_rejection_parks_for_supervised_repair";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_AUTO_RESCAN_REJECT_ROOT";
+        let phase = PhaseId::new(113);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_rewritten(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Auto,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+        let before = workflow::load_state(root, phase)
+            .unwrap()
+            .checkpoint_approval;
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        write_gate_response(
+            root,
+            phase,
+            Stage::Code,
+            false,
+            Some("the rewritten task needs supervised repair"),
+        );
+
+        let writer_root = root.to_path_buf();
+        let writer_response_path = response_path.clone();
+        let third_gate_response_written =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_third_gate_response_written =
+            std::sync::Arc::clone(&third_gate_response_written);
+        let writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let state = workflow::load_state(&writer_root, phase);
+                if state.as_ref().is_ok_and(|state| state.stopped) {
+                    return;
+                }
+                if !writer_response_path.exists() {
+                    write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
+                    writer_third_gate_response_written
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the re-scan response was not consumed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
+        writer.join().expect("third-gate negative-control writer");
+
+        let after = workflow::load_state(root, phase)
+            .expect("Auto rejection must park the phase instead of aborting it");
+        assert_eq!(after.mode, Mode::Supervise);
+        assert!(after.stopped, "the automatic run must be parked");
+        assert!(
+            after
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("switched to Supervise")),
+            "the parked reason must explain why Auto did not retry: {:?}",
+            after.stop_reason
+        );
+        assert_eq!(
+            after.checkpoint_approval, before,
+            "a rejection must not bless the changed declaration"
+        );
+        let parked_code_gates = events_of_kind(root, "gate_fired")
+            .into_iter()
+            .filter(|event| event["stage"] == "code")
+            .count();
+        assert_eq!(
+            parked_code_gates, 1,
+            "only the re-scan gate may fire before supervised resume; a second gate is the \
+             pre-fix unattended loopback, not a successful park"
+        );
+        assert!(
+            !third_gate_response_written.load(std::sync::atomic::Ordering::SeqCst),
+            "the negative-control writer must stay inert unless the old third gate appears"
+        );
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "a rejection must never relaunch Claude's checkpoint decision"
+        );
+        assert_eq!(events_of_kind(root, "checkpoint_repair_parked").len(), 1);
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists()
+                && !response_path.exists()
+                && !Gates::ack_path(root, phase, Stage::Code).exists(),
+            "parking must leave no stale gate protocol files"
+        );
+
+        resume(root, phase, None, false)
+            .expect("the parked phase must resume through the supervised path");
+        let resumed = workflow::load_state(root, phase)
+            .expect("Supervise resume must leave a live state for its monitor");
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&resumed);
+        assert_eq!(resumed.mode, Mode::Supervise);
+        assert_eq!(
+            resumed.checkpoint_approval, before,
+            "a supervised repair launch must not reinterpret the rejected declaration as approved"
+        );
+        assert!(
+            !resumed.stopped,
+            "resume clears the park only after launching the supervised continuation"
+        );
+        assert!(
+            events_of_kind(root, "stage_launched")
+                .iter()
+                .any(|event| event["stage"] == "code"),
+            "resume must actually launch the parked Code stage"
         );
     }
 
@@ -4158,7 +4784,7 @@ mod tests {
             Some("the rewritten task needs review first"),
         );
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
         result.unwrap();
@@ -4260,7 +4886,7 @@ mod tests {
             Some("abort: the agent rewrote its own gate"),
         );
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
         result.unwrap();
@@ -4447,6 +5073,54 @@ mod tests {
         );
     }
 
+    /// D-03b: the unattended exception belongs to Auto only. A user who
+    /// selected Supervise must see a planner-declared human checkpoint as a
+    /// Code gate; recording it does not authorize DevFlow to resume Claude.
+    ///
+    /// `unchanged_recorded_checkpoint_still_auto_decides` is the opposite
+    /// control: it keeps D-03's original liveness guarantee for Auto.
+    #[test]
+    fn supervise_unchanged_recorded_checkpoint_requires_human_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::supervise_unchanged_recorded_checkpoint_requires_human_gate";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_SUPERVISE_CHECKPOINT_ROOT";
+        let phase = PhaseId::new(110);
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            build_rescan_fixture(
+                root,
+                phase,
+                &rescan_plan_body_whitespace_only_edit(),
+                recorded_from_body(phase, &rescan_plan_body()),
+                Mode::Supervise,
+            );
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let (auto_decided, gate_fired) = run_rescan_advance(root.as_path(), phase);
+        assert!(
+            auto_decided.is_empty(),
+            "Supervise must not auto-decide a human checkpoint: {auto_decided:?}"
+        );
+        assert!(
+            gate_fired.iter().any(|event| event["stage"] == "code"),
+            "Supervise must open a Code gate for a human checkpoint: {gate_fired:?}"
+        );
+    }
+
     /// 999.84 / HARDEN-04 (35-02): the WORKTREE-MODE sibling of the test
     /// above, which is deliberately left byte-unchanged rather than moved
     /// under a worktree — extending it in place would have deleted the only
@@ -4532,7 +5206,7 @@ mod tests {
         state.checkpoint_approval = recorded_approval_for(&worktree, phase);
         workflow::save_state(&state).unwrap();
 
-        let result = advance(root, Some(phase));
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
@@ -4580,7 +5254,7 @@ mod tests {
         state.session_id = Some("sess-should-not-resume".to_string());
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),
@@ -4613,7 +5287,7 @@ mod tests {
         state.session_id = Some("sess-unreported".to_string());
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
         assert!(!events_of_kind(root, "gate_fired").is_empty());
@@ -4639,7 +5313,7 @@ mod tests {
         state.session_id = None;
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
         let gate_fired = events_of_kind(root, "gate_fired");
@@ -4675,7 +5349,7 @@ mod tests {
         state.checkpoint_resumes = mode::MAX_CHECKPOINT_RESUMES;
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
         let gate_fired = events_of_kind(root, "gate_fired");
@@ -4710,7 +5384,7 @@ mod tests {
         state.session_id = Some("sess-non-claude".to_string());
         workflow::save_state(&state).unwrap();
 
-        advance(root, Some(phase)).unwrap();
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
         assert!(
             events_of_kind(root, "checkpoint_auto_decided").is_empty(),

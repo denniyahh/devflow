@@ -302,6 +302,10 @@ fn gitignore_covers_all_devflow_paths() {
             agent_result::agent_pid_path(root, PhaseId::new(16)),
         ),
         (
+            "agent_result::stop_marker_path",
+            agent_result::stop_marker_path(root, PhaseId::new(16)),
+        ),
+        (
             "agent_result::history_dir",
             agent_result::history_dir(root, PhaseId::new(16)),
         ),

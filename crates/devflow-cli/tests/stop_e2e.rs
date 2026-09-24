@@ -18,7 +18,7 @@ use devflow_core::state::{AgentKind, State};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 fn devflow_bin() -> &'static str {
@@ -87,6 +87,348 @@ fn e2e_child_timeout() -> Duration {
         .and_then(|s| s.parse().ok())
         .unwrap_or(90);
     Duration::from_secs(secs)
+}
+
+fn write_live_lock(root: &Path, phase: PhaseId, child: &Child, recorded_start: u64) {
+    let lock = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(lock, format!("{}\n{recorded_start}", child.id())).unwrap();
+}
+
+fn kill_and_reap(child: &mut Child) {
+    if child.try_wait().expect("poll holder").is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[test]
+fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(103);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn holder");
+    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
+    write_live_lock(root, phase, &holder, start);
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!holder.wait().expect("reap holder").success());
+    let state = devflow_core::workflow::load_state(root, phase).unwrap();
+    assert!(state.stopped);
+    assert!(
+        state
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("devflow stop"))
+    );
+}
+
+#[test]
+fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(104);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
+    let before = std::fs::read(&state_path).unwrap();
+    let mut holder = Command::new("sh")
+        .args(["-c", "trap '' TERM; exec sleep 60"])
+        .spawn()
+        .expect("spawn TERM-ignoring holder");
+    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
+    write_live_lock(root, phase, &holder, start);
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        !output.status.success(),
+        "stop must refuse to mark state while the holder survives\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&holder.id().to_string()) && stderr.contains("not marked"));
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    kill_and_reap(&mut holder);
+}
+
+#[test]
+fn stop_never_signals_the_recorded_monitor_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(105);
+    let mut monitor = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn monitor");
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.monitor_pid = Some(monitor.id());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(output.status.success());
+    assert!(monitor.try_wait().expect("poll monitor").is_none());
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .stopped
+    );
+    kill_and_reap(&mut monitor);
+}
+
+#[test]
+fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(106);
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
+    let before = std::fs::read(&state_path).unwrap();
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn holder");
+    let wrong_start =
+        devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
+    write_live_lock(root, phase, &holder, wrong_start);
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to signal"));
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    kill_and_reap(&mut holder);
+}
+
+/// Saves a fresh state for `phase`, starts a live `sleep` as the process the
+/// lock names, and returns the state path, its bytes, and the holder.
+fn gated_phase_with_foreign_holder(
+    root: &Path,
+    phase: PhaseId,
+) -> (std::path::PathBuf, Vec<u8>, Child) {
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
+    let before = std::fs::read(&state_path).unwrap();
+    let holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn holder");
+    (state_path, before, holder)
+}
+
+/// T-48-16-03: a lock naming a recycled pid has no waiter. Ship's manual
+/// recovery exception applies only when there is no holder at all; writing an
+/// abort response for an unrelated live process would permanently poison the
+/// gate for the real recovery path.
+#[test]
+fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(108);
+    let (state_path, _before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let mut state = devflow_core::workflow::load_state(root, phase).unwrap();
+    state.stage = Stage::Ship;
+    state.gate_pending = true;
+    devflow_core::workflow::save_state(&state).unwrap();
+    let before = std::fs::read(&state_path).unwrap();
+    let wrong_start =
+        devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
+    write_live_lock(root, phase, &holder, wrong_start);
+    Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "phase state was not marked, so stop must fail; stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("is waiting on the gate") && !stderr.contains("is waiting on the gate"),
+        "a recycled pid must never be described as a waiter; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("refusing to signal") && stderr.contains("recycled"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !Gates::response_path(root, phase, Stage::Ship).exists(),
+        "a recycled Ship holder must not receive an unconsumable abort response"
+    );
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    kill_and_reap(&mut holder);
+}
+
+/// Finding B: a legacy single-line lock makes the holder's identity
+/// unconfirmable. `stop` must fail rather than return success after writing a
+/// response that no confirmed process can consume.
+#[test]
+fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(109);
+    let (state_path, _before, mut holder) = gated_phase_with_foreign_holder(root, phase);
+    let mut state = devflow_core::workflow::load_state(root, phase).unwrap();
+    state.stage = Stage::Code;
+    state.gate_pending = true;
+    devflow_core::workflow::save_state(&state).unwrap();
+    let before = std::fs::read(&state_path).unwrap();
+    let lock = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    std::fs::write(lock, holder.id().to_string()).unwrap();
+    Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stop must not report success without a confirmed response consumer; stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("is waiting on the gate"),
+        "an unconfirmable holder must not be described as a waiter; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("no confirmed live waiter")
+            && stdout.contains(&format!("devflow resume --phase {phase}")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("refusing to signal") && stderr.contains("no start time"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !Gates::response_path(root, phase, Stage::Code).exists(),
+        "an unconfirmable non-Ship holder must not receive a stale abort response"
+    );
+    assert!(holder.try_wait().expect("poll holder").is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    kill_and_reap(&mut holder);
+}
+
+/// Finding C-3: an old gate request is not evidence that the current live
+/// lock holder is polling it. `stop` must signal that holder instead of
+/// writing an abort response and reporting an unevidenced successful stop.
+#[test]
+fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(112);
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Code;
+    state.gate_pending = false;
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let mut holder = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn live non-waiting holder");
+    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
+    write_live_lock(root, phase, &holder, start);
+    Gates::write_gate(root, phase, Stage::Code, "stale request").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "stale gate must fall through to live-holder stop\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let Some(status) = holder.try_wait().expect("poll holder") else {
+        kill_and_reap(&mut holder);
+        panic!("stop must signal the live holder instead of trusting the stale gate");
+    };
+    assert!(!status.success(), "SIGTERM must end the live holder");
+    assert!(
+        !Gates::response_path(root, phase, Stage::Code).exists(),
+        "a stale gate must not receive a response"
+    );
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .stopped,
+        "the actually stopped holder must allow state to be marked"
+    );
+}
+
+/// Finding E: persisting an answer is not evidence that a process will act on
+/// it. Ship permits the response for manual `devflow ship` recovery, but its
+/// CLI confirmation must not claim that the workflow will advance while no
+/// live holder exists.
+#[test]
+fn gate_approve_without_a_live_holder_does_not_claim_advance() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(110);
+    Gates::write_gate(root, phase, Stage::Ship, "approve merge").unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["gate", "approve", &phase.to_string(), "--project"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate approve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+    assert!(
+        !stdout.contains("workflow will advance"),
+        "no-holder response must not claim an outcome: {stdout}"
+    );
+    assert!(
+        stdout.contains("no confirmed live holder will act"),
+        "no-holder response must name the evidence limit: {stdout}"
+    );
 }
 
 /// Wait for `child` to exit, `try_wait`-polling on a short interval rather
@@ -229,7 +571,9 @@ fn stop_marks_state_stopped_and_records_reason() {
     let phase = PhaseId::new(96);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
-    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Ship;
+    state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
 
     let output = Command::new(devflow_bin())
@@ -350,7 +694,9 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
     let phase = PhaseId::new(99);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
-    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.stage = Stage::Ship;
+    state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
 
     let run_stop = || {

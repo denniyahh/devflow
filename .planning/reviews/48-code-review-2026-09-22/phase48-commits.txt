@@ -1,0 +1,47 @@
+56f3466 test(hooks): pin plan linter rules and its quoting crash
+5a5a4fc test(48-02): add checkpoint parser regressions
+8f5433d feat(48-02): share checkpoint declaration parser
+51afc2f feat(48-02): ignore closed checkpoint fences
+c02c833 feat(48-02): record full checkpoint elements
+ca6792f style(48-02): format checkpoint parser tests
+1e732b7 feat(48-03): add hermetic core child test helper
+8b534d9 test(48-03): isolate Pi and OpenCode driver tests
+47425fa feat(48-04): isolate pipeline outcome PATH tests
+246ed28 feat(48-05): isolate pipeline launch PATH tests
+7a98c0a test(48-06): isolate staleness PATH fixture
+c1c4765 test(48-06): isolate remaining PATH fixtures
+9714e79 feat(48-07): gate checkpoints added after Code preflight
+c7d5971 fix(48-04): read the agent-free test root through a const
+5d55e57 feat(48-15): complete CHKPT-02's human response paths
+942c85c test(48-08): make every abort fixture structurally agent-free
+15370f7 feat(48-09): deny process-global env mutation by default
+16a057c feat(48-10): make state and gate writes collision-safe
+561f3c1 feat(48-11): bind advance to stage-aware lock waits
+c1f54a7 docs(48-17): record test isolation evidence
+c61e0fc feat(48-12): serialize start and stop state writes
+c98cfe3 feat(48-13): classify phase lock holders safely
+3e7ca3e feat(48-16): make gate recovery holder-aware
+be6e496 feat(48-14): make phase recovery lock-safe
+b8fa234 fix(48): close lock and gate review findings
+ea0ac7e fix(48): serialize stale lock reclamation
+86ecc0b fix(48): coordinate stale lock reclamation
+36e8bbb fix(48): contain escaped OpenCode probes
+681af07 fix(48): harden OpenCode probe containment
+2f596ab fix(48): preserve OpenCode probe safety
+3c90755 fix(48): stabilize probe and fixture safety
+76867df fix(48): close T-48-15-01 and T-48-16-03 security findings
+25aa87c fix(48): close T-48-15-01 Supervise path and T-48-16-02 race
+d3beb19 fix(48): record checkpoint approval only from Pending
+eb91efe test(48): require human checkpoint gate in supervise mode
+b4edf1b fix(48): gate supervised human checkpoints
+86f1091 test(48): require evidenced recovery outcomes
+877a238 fix(48): require evidence before recovery claims
+4ccf750 test(48): require live gate sweep holders
+9a7cc61 test(48): cover adversarial recovery gaps
+b69a9ab fix(48): close adversarial recovery gaps
+3aca386 fix(48): park rejected checkpoint repairs
+a128d06 fix(48): harden checkpoint recovery
+31e87f4 test(48): cover recycled Ship holder recovery
+4514ae3 test(48): prevent recovery fixture leaks
+3a7f9a8 test(phase-48): add Nyquist validation tests
+395feb4 fix(48): drop race-only recycled-holder message from stop
