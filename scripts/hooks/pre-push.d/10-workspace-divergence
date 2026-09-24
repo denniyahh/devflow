@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
 # Workspace-only pre-push drop-in: refuse a push that carries an undeclared
 # divergence from develop (see scripts/check-workspace-divergence.sh).
-exec scripts/check-workspace-divergence.sh origin/develop
+#
+# core.hooksPath here is an absolute path into the main checkout, so this runs
+# for pushes from every worktree, including develop-based PR worktrees, whose
+# own changes are exactly what the check would flag. Only a checkout that
+# carries .workspace-divergence is a workspace branch, and it runs its own copy
+# of the checker (the hook's working directory is the pushing checkout's root).
+if [ ! -f .workspace-divergence ]; then
+    exit 0
+fi
+exec ./scripts/check-workspace-divergence.sh origin/develop
