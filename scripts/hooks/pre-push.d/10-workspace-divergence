@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Workspace-only pre-push drop-in: refuse a push that carries an undeclared
+# divergence from develop (see scripts/check-workspace-divergence.sh).
+exec scripts/check-workspace-divergence.sh origin/develop

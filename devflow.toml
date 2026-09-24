@@ -1,0 +1,4 @@
+# Per-checkout DevFlow configuration for this workspace (backlog 999.110).
+# Phase worktrees fork from, and Ship merges back into, the branch that tracks
+# .planning/; scripts/cut-pr-branch.sh carries finished work to develop.
+base_branch = "workspace/denniyahh"
