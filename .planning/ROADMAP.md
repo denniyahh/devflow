@@ -658,6 +658,21 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.145: `spawn_with_timeout_kills_a_silent_same_group_descendant_after_parent_exit` Flakes in the Container Gate (BACKLOG)
+
+**Found:** 2026-09-24, pinned-container pre-push gate for the tooling-upstream PR (the PR changed no Rust source).
+Failed once; not yet reproduced. Same family as the four Phase 48 races fixed in PR #218.
+
+**Observed:** `opencode.rs:990` — "the silent same-group descendant must be dead: pid … was still running 60µs after
+spawn_with_timeout returned", with `polls: 0 x 20ms`, survivor before `State=R (running) PPid=1`, survivor after
+`GONE`, and the kill path `leader-exited-unreaped … kill(-pgid, SIGKILL) reached the group=true`. Zero polls means
+the loop's first `agent_running` call returned false and the very next returned true, microseconds apart, for a
+process already SIGKILLed — a liveness flip, not a survivor.
+
+**Fix shape (not decided):** find what makes `agent_running` report false then true for a dying process (a status
+read of an exiting task, or the assertion's check order), then pin it with a deterministic test as #218 did for the
+NotFound case. Reproduce first: loop `cargo test -p devflow-core --lib agents::opencode` under the 2-CPU container.
+
 ### Phase 999.144: No Test Pins `resume`'s Live-Run Guard Ahead of Its Early Writes (BACKLOG)
 
 **Found:** 2026-09-23 by the Phase 48 close-out checks: 48-REVIEW.md WR-02 (48-20 round), extended by the
