@@ -710,6 +710,20 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
 
+    macro_rules! enter_path_isolated_child {
+        ($name:expr, $path_dir:expr) => {
+            if !devflow_core::test_support::in_child_test($name) {
+                let path_dir = $path_dir;
+                let output =
+                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, $name,
+                );
+                return;
+            }
+        };
+    }
+
     /// `advance()` over a Ship-stage success with an approved Ship gate must run
     /// the terminal `finish_workflow` path (after-ship hooks + gate cleanup +
     /// state cleared) — the only non-spawning branch of `advance`'s orchestration
@@ -993,6 +1007,12 @@ mod tests {
     /// `merge_feature`).
     #[test]
     fn finalization_retry_gate_never_auto_approves_even_with_yes_ship_set() {
+        const NAME: &str = "pipeline_gate::tests::finalization_retry_gate_never_auto_approves_even_with_yes_ship_set";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -1123,6 +1143,11 @@ mod tests {
     /// disk awaiting a human. The common case (no collision) still asserts
     /// both phases finish independently, exactly as before.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn concurrent_ship_advances_finish_both_phases_independently() {
         let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
@@ -1242,7 +1267,7 @@ mod tests {
     /// decision.
     ///
     /// 33-04: the seeded 999.66 forward-progress baseline, the
-    /// neutralized PATH and the two branch-pinning assertions below exist
+    /// child-local neutralized PATH and the two branch-pinning assertions below exist
     /// because this test once silently left its intended path — 999.66's
     /// reset-vs-accumulate change reset the directly-seeded streak to 1, so no
     /// gate fired and the test fell through to a real agent launch while every
@@ -1250,6 +1275,12 @@ mod tests {
     /// calls the same `Gates::cleanup` that `abort()` does).
     #[test]
     fn abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response() {
+        const NAME: &str = "pipeline_gate::tests::abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -1277,26 +1308,7 @@ mod tests {
         )
         .unwrap();
 
-        {
-            let _guard = env_lock();
-
-            let neutral_path_dir = agent_free_git_only_path_dir();
-            let original_path = std::env::var_os("PATH");
-            // SAFETY: serialized under ENV_MUTEX.
-            unsafe {
-                std::env::set_var("PATH", neutral_path_dir.path());
-            }
-
-            handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
-
-            // SAFETY: still serialized under ENV_MUTEX from above.
-            unsafe {
-                match &original_path {
-                    Some(path) => std::env::set_var("PATH", path),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
         assert!(
             state.consecutive_failures >= mode::MAX_CONSECUTIVE_FAILURES,
@@ -1337,27 +1349,20 @@ mod tests {
     /// `infra_failures` to 0 alongside `consecutive_failures` — both in the
     /// in-memory `State` and the persisted `state.json` — and a subsequent
     /// infra fault after a clean transition starts counting from 1, not the
-    /// pre-transition count. PATH is neutralized under `ENV_MUTEX` (pointed
-    /// at a directory containing ONLY a `git` symlink, so
-    /// `agent_binary_available`'s PATH scan has zero possible matches) before
-    /// calling `transition()`, because this host genuinely has
-    /// `claude`/`codex`/`opencode` on PATH — without neutralizing it,
-    /// `transition()`'s downstream `launch_stage` would try to actually spawn
-    /// a real agent CLI subprocess, which this test must never do. The
+    /// pre-transition count. The test re-executes in a child with only a
+    /// `git` symlink on PATH, so `agent_binary_available` has zero possible
+    /// agent matches without mutating the parallel parent test process. The
     /// resulting `Err` from `ensure_agent_binary` is expected and ignored:
     /// the counter reset happens earlier in `transition()` and is unaffected
     /// by that downstream failure.
-    ///
-    /// 19i: PATH must NOT be pointed at an empty directory. `set_var`
-    /// mutates the whole process's environment, and Rust's default test
-    /// runner executes tests in parallel threads within that one process —
-    /// an empty PATH here previously made every OTHER concurrently running,
-    /// unguarded git-spawning test fail with `Os { NotFound }` (confirmed
-    /// live: both duplicate CI runs for the same commit hit this race).
-    /// `agent_free_git_only_path_dir` keeps `git` resolvable for every other
-    /// thread while still hiding agent CLIs from this one.
     #[test]
     fn transition_resets_infra_failures() {
+        const NAME: &str = "pipeline_gate::tests::transition_resets_infra_failures";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "abort-fixture test must run in a child with an agent-free PATH (999.80)"
+        );
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -1368,22 +1373,7 @@ mod tests {
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
         workflow::save_state(&state).unwrap();
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let _ = transition(root, &mut state, Stage::Validate);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert_eq!(
             state.infra_failures, 0,
@@ -1417,6 +1407,8 @@ mod tests {
     /// hop under test.
     #[test]
     fn repeated_code_to_validate_transition_is_idempotent_on_the_counter() {
+        const NAME: &str = "pipeline_gate::tests::repeated_code_to_validate_transition_is_idempotent_on_the_counter";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -1427,24 +1419,9 @@ mod tests {
         state.consecutive_failures = 2;
         workflow::save_state(&state).unwrap();
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let _ = transition(root, &mut state, Stage::Validate);
         state.stage = Stage::Code;
         let _ = transition(root, &mut state, Stage::Validate);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert_eq!(state.consecutive_failures, 2);
     }
@@ -1508,6 +1485,11 @@ mod tests {
     /// which is left untouched, proving the two timeouts are genuinely
     /// independent knobs.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
         let _guard = env_lock();
         let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
@@ -1768,6 +1750,9 @@ mod tests {
     /// reset a sibling phase's counter.
     #[test]
     fn consecutive_failures_are_independent_across_phases() {
+        const NAME: &str =
+            "pipeline_gate::tests::consecutive_failures_are_independent_across_phases";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
@@ -1793,22 +1778,7 @@ mod tests {
         state_b.consecutive_failures = 2;
         workflow::save_state(&state_b).unwrap();
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let _ = transition(root, &mut state_a, Stage::Validate);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let reloaded_a = workflow::load_state(root, PhaseId::new(84)).unwrap();
         let reloaded_b = workflow::load_state(root, PhaseId::new(85)).unwrap();

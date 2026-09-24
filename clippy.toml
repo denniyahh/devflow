@@ -1,0 +1,22 @@
+# D-09 (plan 48-09, TEST-01 / backlog 999.38).
+#
+# Process-global environment mutation is banned outside reasoned, test-only
+# exceptions. `cargo test` runs its tests as THREADS in one process, so a
+# mutation here is visible to every other concurrently running test and to
+# every child process any of them spawns — which is exactly how a PATH change
+# in one test made an unrelated test resolve (or fail to resolve) a binary.
+# Rust 2024 already marks these `unsafe` for the same reason.
+#
+# The alternative is per-child scoping on the spawned command itself:
+# `Command::env`, `Command::env_remove`, `Command::env_clear`. That reaches
+# the process being configured and nothing else.
+#
+# Remaining non-PATH mutations are deferred deliberately (they still hold
+# ENV_MUTEX) and each carries `#[expect(clippy::disallowed_methods, reason =
+# "...")]` on its smallest enclosing test-only item. `expect` rather than
+# `allow`: an expectation that stops being needed becomes a warning, so the
+# exception list cannot silently outlive its reason.
+disallowed-methods = [
+  { path = "std::env::set_var", reason = "process-global and racy across concurrent tests and the children they spawn; scope it to the child with Command::env instead. Test-only exceptions need a reasoned expect(clippy::disallowed_methods)." },
+  { path = "std::env::remove_var", reason = "process-global and racy across concurrent tests and the children they spawn; scope it to the child with Command::env_remove or Command::env_clear instead. Test-only exceptions need a reasoned expect(clippy::disallowed_methods)." },
+]

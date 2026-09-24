@@ -70,6 +70,7 @@ skills-lock.json
 .devflow/phase-*-stderr.log
 .devflow/phase-*-exit
 .devflow/phase-*-agent-pid
+.devflow/phase-*-monitor-stop
 .devflow/last-ship*.json
 .devflow/cron-instructions*.json
 .devflow/events.jsonl

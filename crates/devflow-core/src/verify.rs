@@ -129,11 +129,9 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
 /// caller that does this correctly is `pipeline_launch.rs`'s
 /// `Action::GateReview` arm, which resolves `state.worktree_path` first.
 pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
-    const HUMAN_BLOCKING_GATE: &str = r#"gate="blocking-human""#;
-    phase_plan_files(project_root, phase)
+    phase_checkpoint_declarations(project_root, phase)
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .any(|contents| contents.contains(HUMAN_BLOCKING_GATE))
+        .any(|declaration| declaration.blocking_human)
 }
 
 /// The two checkpoint markers GSD will not auto-approve in ANY mode, each
@@ -161,14 +159,196 @@ const HUMAN_ONLY_CHECKPOINT_MARKERS: [&str; 2] = [
 /// also satisfy.
 const TASK_ELEMENT_OPENING: &str = "<task";
 
+/// A human-only checkpoint declared by one plan task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointDeclaration {
+    /// The plan file name only, so declarations compare identically from a
+    /// worktree or the project root.
+    pub plan_file: String,
+    /// The whole task element, normalized by stripping each line's trailing
+    /// whitespace (including a CR) and joining the remaining lines with LF.
+    /// Fence delimiters and fenced content remain byte-exact otherwise.
+    pub element: String,
+    /// Whether the task has a gate that prevents every auto-approval mode.
+    pub blocking_human: bool,
+    /// Whether the task needs direct human action, such as authentication.
+    pub human_action: bool,
+}
+
+/// Parse human-only checkpoint declarations from one plan file.
+pub fn parse_checkpoint_declarations(
+    plan_file: &str,
+    contents: &str,
+) -> Vec<CheckpointDeclaration> {
+    let lines: Vec<_> = contents.lines().collect();
+    scan_checkpoint_declarations(plan_file, &lines, true)
+}
+
+/// Scan lines for declarations, skipping only content inside closed fences.
+///
+/// An unclosed fence is re-scanned without fence tracking so malformed plan
+/// text cannot hide a checkpoint declaration from unattended execution.
+fn scan_checkpoint_declarations(
+    plan_file: &str,
+    lines: &[&str],
+    track_fences: bool,
+) -> Vec<CheckpointDeclaration> {
+    let mut declarations = Vec::new();
+    let mut open_fence: Option<(usize, MarkdownFence)> = None;
+
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((_, fence)) = open_fence {
+            if fence_closes(line, fence) {
+                open_fence = None;
+            }
+            continue;
+        }
+
+        if track_fences && let Some(fence) = fence_opening(line) {
+            open_fence = Some((index, fence));
+            continue;
+        }
+
+        if let Some(declaration) = checkpoint_declaration(plan_file, lines, index) {
+            declarations.push(declaration);
+        }
+    }
+
+    if let Some((opening_index, _)) = open_fence {
+        declarations.extend(scan_checkpoint_declarations(
+            plan_file,
+            &lines[opening_index..],
+            false,
+        ));
+    }
+
+    declarations
+}
+
+fn checkpoint_declaration(
+    plan_file: &str,
+    lines: &[&str],
+    opening_index: usize,
+) -> Option<CheckpointDeclaration> {
+    let line = lines[opening_index];
+    if !task_opening_line(line) {
+        return None;
+    }
+    let blocking_human = line.contains(HUMAN_ONLY_CHECKPOINT_MARKERS[0]);
+    let human_action = line.contains(HUMAN_ONLY_CHECKPOINT_MARKERS[1]);
+    (blocking_human || human_action).then(|| CheckpointDeclaration {
+        plan_file: plan_file.to_owned(),
+        element: task_element(&lines[opening_index..]),
+        blocking_human,
+        human_action,
+    })
+}
+
+/// Return a task element through its first non-fenced closing tag, next task
+/// opening, or EOF. Fenced tags are task content rather than boundaries.
+fn task_element(lines: &[&str]) -> String {
+    let mut open_fence = None;
+    let mut end = lines.len();
+
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(fence) = open_fence {
+            if fence_closes(line, fence) {
+                open_fence = None;
+            }
+            continue;
+        }
+
+        if index > 0 && task_opening_line(line) {
+            end = index;
+            break;
+        }
+        if line.trim_start().starts_with("</task>") {
+            end = index + 1;
+            break;
+        }
+        if let Some(fence) = fence_opening(line) {
+            open_fence = Some(fence);
+        }
+    }
+
+    lines[..end]
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Clone, Copy)]
+struct MarkdownFence {
+    character: u8,
+    length: usize,
+}
+
+/// Return a fence opener when it begins at column three or earlier.
+fn fence_opening(line: &str) -> Option<MarkdownFence> {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let remainder = &line[leading_spaces..];
+    let character = *remainder.as_bytes().first()?;
+    if !matches!(character, b'`' | b'~') {
+        return None;
+    }
+    let length = remainder
+        .bytes()
+        .take_while(|byte| *byte == character)
+        .count();
+    (length >= 3).then_some(MarkdownFence { character, length })
+}
+
+/// Return whether `line` is a valid closer for `fence`.
+fn fence_closes(line: &str, fence: MarkdownFence) -> bool {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    if leading_spaces > 3 {
+        return false;
+    }
+    let remainder = &line[leading_spaces..];
+    let length = remainder
+        .bytes()
+        .take_while(|byte| *byte == fence.character)
+        .count();
+    length >= fence.length && remainder[length..].trim().is_empty()
+}
+
+/// Read all human-only checkpoint declarations in a phase's plan files.
+pub fn phase_checkpoint_declarations(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Vec<CheckpointDeclaration> {
+    phase_plan_files(project_root, phase)
+        .into_iter()
+        .filter_map(|path| {
+            let plan_file = path.file_name()?.to_string_lossy().into_owned();
+            let contents = std::fs::read_to_string(path).ok()?;
+            Some(parse_checkpoint_declarations(&plan_file, &contents))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Whether a line's first non-whitespace bytes open a task element.
+fn task_opening_line(line: &str) -> bool {
+    let Some(after_opening) = line.trim_start().strip_prefix(TASK_ELEMENT_OPENING) else {
+        return false;
+    };
+    matches!(
+        after_opening.as_bytes().first(),
+        Some(byte) if *byte == b'>' || byte.is_ascii_whitespace()
+    )
+}
+
 /// Return `true` if any plan declared for `phase` DECLARES a checkpoint task
 /// that GSD will not auto-approve in any mode.
 ///
-/// **The match is anchored to a task element's own opening tag**, and that is
-/// the whole difference between this function and
-/// [`phase_has_blocking_human_checkpoint`] above: a marker qualifies only on a
-/// line that also opens a `<task`. A plan that merely *discusses* a marker — in
-/// a findings section, in a table, in a fenced example — has not declared one.
+/// **The match is anchored to a task element's own opening tag.** A marker
+/// qualifies only on a line that opens a `<task`; a plan that merely discusses
+/// it in prose, a table, or a fenced example has not declared one.
 ///
 /// The concrete failures the anchoring prevents (F-14) were measured against
 /// this repository's own plan files, not assumed: `34-04-PLAN.md:245` and
@@ -182,18 +362,10 @@ const TASK_ELEMENT_OPENING: &str = "<task";
 /// literal, so it would not match an unanchored scan either. The finding stands;
 /// the example it cited does not.)
 ///
-/// **Known limit, pinned by `human_only_checkpoint_still_matches_a_task_tag_
-/// inside_a_fenced_example`:** the anchor is line-level and has no notion of
-/// markdown fences, so a plan documenting a COMPLETE example `<task ...>` tag
-/// inside a fenced block still matches. No plan file in this repository has that
-/// shape today.
-///
-/// **[`phase_has_blocking_human_checkpoint`] is deliberately left alone, and the
-/// pair is not an accident.** That function serves the plan-28-03 auto-decide
-/// route, where a looser, over-inclusive match fails SAFE — it routes more
-/// checkpoints to a human. Here an over-inclusive match fails toward refusing a
-/// launch. Different consequence, different predicate; widening the older one to
-/// serve both would silently change the behaviour its seven tests pin.
+/// Closed Markdown fences are excluded. If a fence remains open at EOF, its
+/// tail is re-scanned without fence tracking so malformed plan text cannot hide
+/// a declaration. Both public predicates use the same parser: at the resume
+/// call site, a blocking-human match arms the agent's auto-decide route.
 ///
 /// Returns `false` for a phase with no plan files at all. That is NOT the same
 /// fact as "plans exist and declare no such checkpoint", and a caller that needs
@@ -205,18 +377,9 @@ const TASK_ELEMENT_OPENING: &str = "<task";
 /// live on the feature branch inside the worktree and are absent from the main
 /// checkout (999.76).
 pub fn phase_has_human_only_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
-    phase_plan_files(project_root, phase)
+    phase_checkpoint_declarations(project_root, phase)
         .into_iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .any(|contents| contents.lines().any(line_declares_human_only_checkpoint))
-}
-
-/// Whether one line both opens a task element and carries a human-only marker.
-fn line_declares_human_only_checkpoint(line: &str) -> bool {
-    line.contains(TASK_ELEMENT_OPENING)
-        && HUMAN_ONLY_CHECKPOINT_MARKERS
-            .iter()
-            .any(|marker| line.contains(marker))
+        .any(|declaration| declaration.blocking_human || declaration.human_action)
 }
 
 /// Run one explicitly operator-approved external verification command.
@@ -591,22 +754,73 @@ mod tests {
         );
     }
 
-    /// The anchoring's KNOWN LIMIT, asserted rather than left to be discovered.
-    ///
-    /// The anchor is a single line: "contains a marker AND opens a task
-    /// element". It has no notion of markdown fences, so a plan that documents
-    /// a complete example `<task ...>` tag inside a fenced block DOES match, and
-    /// the phase is refused. No `*-PLAN.md` in this repository currently has that
-    /// shape — the three that carry a marker on a `<task` line are all genuine
-    /// declarations — so this is a live gap, not a live defect.
-    ///
-    /// Fence tracking was not added: it is materially more parsing than F-14
-    /// asked for, and it fails toward the SAME consequence (a false refusal) if
-    /// the fence detection is itself wrong. This test exists so the limit is
-    /// recorded as a measured property rather than rediscovered by an operator
-    /// whose overnight run refused.
     #[test]
-    fn human_only_checkpoint_still_matches_a_task_tag_inside_a_fenced_example() {
+    fn blocking_human_checkpoint_ignores_a_marker_mentioned_only_in_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\n\
+             A phase whose PLAN declares `gate=\"{HUMAN_GATE_VALUE}\"` has no mechanism \
+             for receiving an operator's answer, and the same goes for \
+             `type=\"{HUMAN_ACTION_TYPE_VALUE}\"`.\n\n\
+             ```text\n\
+             gate=\"{HUMAN_GATE_VALUE}\"\n\
+             type=\"{HUMAN_ACTION_TYPE_VALUE}\"\n\
+             ```\n\n\
+             <task type=\"auto\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(93)),
+            "a marker discussed in prose must not arm the auto-decide resume route"
+        );
+    }
+
+    #[test]
+    fn task_level_blocking_human_gate_is_human_only_on_both_predicates() {
+        let blocking_dir = tempfile::tempdir().unwrap();
+        let blocking_body = format!(
+            "---\nphase: 93\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(
+            blocking_dir.path(),
+            "93-blocking-human",
+            "93-01-PLAN.md",
+            &blocking_body,
+        );
+
+        assert!(phase_has_human_only_checkpoint(
+            blocking_dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(phase_has_blocking_human_checkpoint(
+            blocking_dir.path(),
+            PhaseId::new(93)
+        ));
+
+        let action_dir = tempfile::tempdir().unwrap();
+        let action_body = format!(
+            "---\nphase: 94\n---\n\n<task type=\"{HUMAN_ACTION_TYPE_VALUE}\" gate=\"{PLAIN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(
+            action_dir.path(),
+            "94-human-action",
+            "94-01-PLAN.md",
+            &action_body,
+        );
+
+        assert!(phase_has_human_only_checkpoint(
+            action_dir.path(),
+            PhaseId::new(94)
+        ));
+        assert!(
+            !phase_has_blocking_human_checkpoint(action_dir.path(), PhaseId::new(94)),
+            "human-action is preflight-only; it must not arm resume"
+        );
+    }
+
+    #[test]
+    fn human_only_checkpoint_ignores_a_task_tag_inside_a_closed_fence() {
         let dir = tempfile::tempdir().unwrap();
         let body = format!(
             "---\nphase: 92\n---\n\n\
@@ -619,10 +833,267 @@ mod tests {
         write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
 
         assert!(
-            phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
-            "documented limit: line-level anchoring cannot see markdown fences, \
-             so a complete example task tag reads as a declaration"
+            !phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
+            "a complete example inside a closed fence is not a declaration"
         );
+        assert!(
+            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(92)),
+            "a complete example inside a closed fence must not arm resume"
+        );
+    }
+
+    #[test]
+    fn unterminated_fence_before_a_real_task_still_declares_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\n```text\n\
+             <task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+    }
+
+    #[test]
+    fn tilde_fence_inside_backtick_fence_does_not_close_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\n```text\n~~~\n\
+             <task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n\
+             ```\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+    }
+
+    #[test]
+    fn shorter_backtick_run_does_not_close_a_longer_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\n````text\n```\n\
+             <task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n\
+             ````\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+    }
+
+    #[test]
+    fn fence_closer_with_trailing_text_does_not_close_a_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\n```text\n```still-open\n\
+             <task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n\
+             ```\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+    }
+
+    #[test]
+    fn task_opening_must_start_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 93\n---\n\nProse discusses `{TASK_ELEMENT_OPENING} \
+             type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">` inline.\n"
+        );
+        write_phase_file(dir.path(), "93-probe", "93-01-PLAN.md", &body);
+
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_declaration_element_spans_to_its_closing_tag() {
+        let closed = format!(
+            "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">  \n\
+             body with trailing spaces   \n</task>   \n"
+        );
+        assert_eq!(
+            parse_checkpoint_declarations("93-01-PLAN.md", &closed)[0].element,
+            format!(
+                "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+                 body with trailing spaces\n</task>"
+            )
+        );
+
+        let next_opening = format!(
+            "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+             unclosed body\n<task type=\"auto\">\n"
+        );
+        assert_eq!(
+            parse_checkpoint_declarations("93-01-PLAN.md", &next_opening)[0].element,
+            format!(
+                "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+                 unclosed body"
+            )
+        );
+
+        let eof = format!(
+            "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+             body through eof\n"
+        );
+        assert_eq!(
+            parse_checkpoint_declarations("93-01-PLAN.md", &eof)[0].element,
+            format!(
+                "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+                 body through eof"
+            )
+        );
+    }
+
+    #[test]
+    fn checkpoint_declaration_element_ignores_a_fenced_closing_tag() {
+        let contents = format!(
+            "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+             ```xml\n</task>\n```\nchanged task body\n</task>\n"
+        );
+        let declaration = parse_checkpoint_declarations("93-01-PLAN.md", &contents)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            declaration.element,
+            format!(
+                "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+                 ```xml\n</task>\n```\nchanged task body\n</task>"
+            )
+        );
+    }
+
+    #[test]
+    fn checkpoint_parser_matches_real_plan_fixtures() {
+        // F-3 declarations: 19-05:83, 19-11:160, 44-04:168, and 15-05:73.
+        let declarations = [
+            (
+                format!("<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n"),
+                true,
+                false,
+            ),
+            (
+                format!("<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n"),
+                true,
+                false,
+            ),
+            (
+                format!("<task type=\"checkpoint:decision\" gate=\"{HUMAN_GATE_VALUE}\">\n"),
+                true,
+                false,
+            ),
+            (
+                format!("<task type=\"{HUMAN_ACTION_TYPE_VALUE}\" gate=\"{PLAIN_GATE_VALUE}\">\n"),
+                false,
+                true,
+            ),
+        ];
+        for (fixture, blocking_human, human_action) in declarations {
+            let parsed = parse_checkpoint_declarations("fixture-PLAN.md", &fixture);
+            assert_eq!(parsed.len(), 1, "fixture must declare one task: {fixture}");
+            assert_eq!(parsed[0].blocking_human, blocking_human);
+            assert_eq!(parsed[0].human_action, human_action);
+        }
+
+        // F-3 prose mentions: 33-02:109, 34-04:245, 43-01:157, 47-03:217,
+        // and 47-05:241. Each is deliberately not a task opening.
+        let prose_mentions = [
+            format!("with `gate=\"{HUMAN_GATE_VALUE}\"` has no mechanism"),
+            format!("a PLAN declaring `gate=\"{HUMAN_GATE_VALUE}\"` lives elsewhere"),
+            format!("`gate=\"{HUMAN_GATE_VALUE}\"` has no way to receive an answer"),
+            format!("matches the literal `gate=\"{HUMAN_GATE_VALUE}\"` and nothing else"),
+            format!("a plan carrying `gate=\"{HUMAN_GATE_VALUE}\"` anywhere other than a task"),
+        ];
+        for fixture in prose_mentions {
+            assert!(
+                parse_checkpoint_declarations("fixture-PLAN.md", &fixture).is_empty(),
+                "prose mention must not declare a task: {fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_plan_declares_the_same_checkpoint() {
+        let lf = format!(
+            "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">  \n\
+             changed body   \n</task>   \n"
+        );
+        let crlf = lf.replace('\n', "\r\n");
+        let expected = format!(
+            "<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n\
+             changed body\n</task>"
+        );
+
+        let lf_declarations = parse_checkpoint_declarations("93-01-PLAN.md", &lf);
+        let crlf_declarations = parse_checkpoint_declarations("93-01-PLAN.md", &crlf);
+        assert_eq!(lf_declarations, crlf_declarations);
+        assert_eq!(lf_declarations[0].element, expected);
+    }
+
+    #[test]
+    fn phase_without_plan_files_has_no_checkpoint_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(phase_checkpoint_declarations(dir.path(), PhaseId::new(404)).is_empty());
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(404)
+        ));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(404)
+        ));
+
+        write_phase_file(
+            dir.path(),
+            "93-probe",
+            "93-01-PLAN.md",
+            "---\nphase: 93\n---\n\n<task type=\"auto\">\n</task>\n",
+        );
+        assert!(phase_checkpoint_declarations(dir.path(), PhaseId::new(93)).is_empty());
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(93)
+        ));
     }
 
     /// "No plans at all" and "plans that declare no such checkpoint" are

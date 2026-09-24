@@ -393,6 +393,118 @@ pub struct State {
     /// `.devflow/state-NN.json` or start a new run.
     #[serde(default)]
     pub legacy_claude_launch: bool,
+    /// Provenance for the human-only checkpoint set DevFlow last checked at
+    /// this phase's Code preflight (D-07, CHKPT-02 / 999.126).
+    ///
+    /// Agents write plan files during Code. Without this record, a
+    /// `blocking-human` checkpoint ADDED after preflight reaches the resume
+    /// decision's auto-decide route and no human ever sees it — the agent
+    /// self-routes into its own unattended approval.
+    ///
+    /// The three variants are three different facts and are deliberately not
+    /// collapsed into an `Option`:
+    ///
+    /// - [`CheckpointApproval::Unrecorded`] — the serde default, so a state
+    ///   file written by a binary predating this field loads here. Nobody ever
+    ///   recorded a set, so nothing is approved and every human-only
+    ///   checkpoint parks at the re-scan gate. It is NEVER written by a Code
+    ///   evaluation: an upgraded run whose first Code evaluation predates this
+    ///   binary must gate at its loop-back or relaunched evaluation too, which
+    ///   a permissive default would silently skip.
+    /// - [`CheckpointApproval::Pending`] — set by [`State::new`], so it exists
+    ///   only for state this binary created. It means "a Code evaluation of
+    ///   this run may record the set". It approves nothing on its own.
+    /// - [`CheckpointApproval::Recorded`] — the set a Code preflight (or, per
+    ///   plan 48-15, a human gate approval) actually saw. `Recorded(vec![])`
+    ///   round-trips distinct from `Unrecorded`: it means "we looked, and this
+    ///   phase declared no human-only checkpoint", which is the fact that
+    ///   makes a later addition detectable.
+    ///
+    /// Persisted rather than held in memory for the reason [`Self::yes_ship`]
+    /// gives: the resume decision that compares against this set runs in the
+    /// detached monitor's own separate `devflow advance` process, long after
+    /// the process that recorded it has exited.
+    #[serde(default)]
+    pub checkpoint_approval: CheckpointApproval,
+}
+
+/// One human-only checkpoint recorded as seen for this run.
+///
+/// Stores the declaration's own text rather than a hash: a hash would make
+/// the record unreadable in `.devflow/state-NN.json` and unexplainable in a
+/// gate message, and 48-RESEARCH rejected pulling in a hashing crate for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedCheckpoint {
+    /// The plan file name only, matching
+    /// [`crate::verify::CheckpointDeclaration::plan_file`] so a record
+    /// compares identically from a worktree or the project root.
+    pub plan_file: String,
+    /// The normalized task element, byte-for-byte as
+    /// [`crate::verify::CheckpointDeclaration::element`] produces it — so a
+    /// whitespace-only trailing edit is not a change and any other body edit
+    /// is.
+    pub element: String,
+}
+
+/// Whether, and with what, this run has recorded its human-only checkpoint
+/// set. See [`State::checkpoint_approval`] for what each variant means and
+/// why they are not an `Option`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointApproval {
+    /// No set was ever recorded — the serde default for older state files.
+    #[default]
+    Unrecorded,
+    /// This binary created the state; a Code evaluation may record the set.
+    Pending,
+    /// The set a Code evaluation saw. An empty vector is a real observation.
+    Recorded(Vec<ApprovedCheckpoint>),
+}
+
+impl CheckpointApproval {
+    /// Every human-only declaration in `current` that this approval does not
+    /// already account for.
+    ///
+    /// The comparison is a MULTISET difference keyed by
+    /// `(plan_file, element)`, not a set difference and not order-sensitive:
+    /// two plans may legitimately declare byte-identical task elements, and
+    /// recording one of them must leave the other unapproved. Each recorded
+    /// entry is therefore consumed by at most one current declaration.
+    ///
+    /// [`CheckpointApproval::Unrecorded`] and [`CheckpointApproval::Pending`]
+    /// match nothing, so every human-only declaration comes back unapproved.
+    /// Declarations that are neither `blocking_human` nor `human_action` are
+    /// not human-only and are never returned.
+    pub fn unapproved<'a>(
+        &self,
+        current: &'a [crate::verify::CheckpointDeclaration],
+    ) -> Vec<&'a crate::verify::CheckpointDeclaration> {
+        let mut unmatched: Vec<(&str, &str)> = match self {
+            CheckpointApproval::Recorded(approved) => approved
+                .iter()
+                .map(|entry| (entry.plan_file.as_str(), entry.element.as_str()))
+                .collect(),
+            CheckpointApproval::Unrecorded | CheckpointApproval::Pending => Vec::new(),
+        };
+        current
+            .iter()
+            .filter(|declaration| declaration.blocking_human || declaration.human_action)
+            .filter(|declaration| {
+                let found = unmatched.iter().position(|(plan_file, element)| {
+                    *plan_file == declaration.plan_file && *element == declaration.element
+                });
+                match found {
+                    // Consume the record so a second identical declaration
+                    // cannot be approved by the same single entry.
+                    Some(index) => {
+                        unmatched.swap_remove(index);
+                        false
+                    }
+                    None => true,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Supported coding agents.
@@ -479,6 +591,11 @@ impl State {
             base_branch: None,
             canary: None,
             legacy_claude_launch: false,
+            // Pending, not Unrecorded: this state was created by a binary
+            // that knows how to record the set, so its Code evaluation is
+            // allowed to. Only a state file from an older binary may read
+            // Unrecorded (see the field's doc comment).
+            checkpoint_approval: CheckpointApproval::Pending,
         }
     }
 }
@@ -567,6 +684,174 @@ mod tests {
         assert_eq!(back.agent, AgentKind::Codex);
         assert_eq!(back.stage, Stage::Define);
         assert_eq!(back.mode, Mode::Supervise);
+    }
+
+    /// D-07: the three `CheckpointApproval` variants are three distinct facts
+    /// across the process boundary. A state file from a binary predating the
+    /// field must read `Unrecorded` (approves nothing), state this binary
+    /// created must read `Pending`, and `Recorded(vec![])` — "we looked, and
+    /// there were none" — must survive a round trip WITHOUT collapsing into
+    /// `Unrecorded`, because that distinction is what makes a checkpoint added
+    /// later detectable at all.
+    /// 28-01's precedent, kept here too: the gate value is assembled from a
+    /// const rather than written as a bare source literal, so no source file
+    /// outside `verify.rs` contains the string the checkpoint scanner matches.
+    const HUMAN_GATE_VALUE_FOR_TEST: &str = "blocking-human";
+    const PLAIN_GATE_VALUE_FOR_TEST: &str = "blocking";
+
+    #[test]
+    fn checkpoint_approval_defaults_to_unrecorded_for_old_state_files() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert_eq!(
+            state.checkpoint_approval,
+            CheckpointApproval::Pending,
+            "State::new must yield Pending, not Unrecorded"
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("checkpoint_approval"),
+            "new state must persist its checkpoint-approval provenance"
+        );
+
+        // A state file written before this field existed.
+        let absent_json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded_absent: State = serde_json::from_str(absent_json).unwrap();
+        assert_eq!(
+            loaded_absent.checkpoint_approval,
+            CheckpointApproval::Unrecorded,
+            "a serde-absent value must default to Unrecorded, which approves nothing"
+        );
+
+        // An empty recorded set is an observation, not an absence.
+        state.checkpoint_approval = CheckpointApproval::Recorded(Vec::new());
+        let empty_json = serde_json::to_string(&state).unwrap();
+        let loaded_empty: State = serde_json::from_str(&empty_json).unwrap();
+        assert_eq!(
+            loaded_empty.checkpoint_approval,
+            CheckpointApproval::Recorded(Vec::new()),
+            "Recorded(vec![]) must round-trip distinct from Unrecorded"
+        );
+        assert_ne!(
+            loaded_empty.checkpoint_approval,
+            CheckpointApproval::Unrecorded,
+            "Recorded(vec![]) collapsing into Unrecorded would hide every later addition"
+        );
+
+        // A populated set round-trips its element text verbatim.
+        state.checkpoint_approval = CheckpointApproval::Recorded(vec![ApprovedCheckpoint {
+            plan_file: "48-07-PLAN.md".to_string(),
+            element: format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">\n  body\n</task>"),
+        }]);
+        let full_json = serde_json::to_string(&state).unwrap();
+        let loaded_full: State = serde_json::from_str(&full_json).unwrap();
+        assert_eq!(loaded_full.checkpoint_approval, state.checkpoint_approval);
+    }
+
+    /// The comparison `unapproved` implements is a multiset difference keyed
+    /// by `(plan_file, element)`. Order must not matter, a single recorded
+    /// entry must not approve two identical declarations, and neither
+    /// `Unrecorded` nor `Pending` may approve anything.
+    #[test]
+    fn unapproved_checkpoints_is_an_order_insensitive_multiset_difference() {
+        use crate::verify::CheckpointDeclaration;
+
+        let declare = |plan_file: &str, element: &str| CheckpointDeclaration {
+            plan_file: plan_file.to_string(),
+            element: element.to_string(),
+            blocking_human: true,
+            human_action: false,
+        };
+        let record = |plan_file: &str, element: &str| ApprovedCheckpoint {
+            plan_file: plan_file.to_string(),
+            element: element.to_string(),
+        };
+
+        let first = declare(
+            "a-PLAN.md",
+            &format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">one</task>"),
+        );
+        let second = declare(
+            "b-PLAN.md",
+            &format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">two</task>"),
+        );
+
+        // Order swapped between the record and the scan -> nothing unapproved.
+        let swapped = CheckpointApproval::Recorded(vec![
+            record(&second.plan_file, &second.element),
+            record(&first.plan_file, &first.element),
+        ]);
+        assert!(
+            swapped
+                .unapproved(&[first.clone(), second.clone()])
+                .is_empty(),
+            "declaration order must not affect the comparison"
+        );
+
+        // Byte-identical elements in two DIFFERENT plans count separately:
+        // recording one must leave the other unapproved.
+        let shared = &format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">same body</task>");
+        let in_a = declare("a-PLAN.md", shared);
+        let in_b = declare("b-PLAN.md", shared);
+        let one_recorded = CheckpointApproval::Recorded(vec![record("a-PLAN.md", shared)]);
+        let both_plans = [in_a.clone(), in_b.clone()];
+        let leftover = one_recorded.unapproved(&both_plans);
+        assert_eq!(
+            leftover,
+            vec![&in_b],
+            "one recorded entry must not approve two declarations"
+        );
+
+        // Duplicates WITHIN one plan are also consumed one-for-one.
+        let twice_in_a = vec![in_a.clone(), in_a.clone()];
+        assert_eq!(
+            one_recorded.unapproved(&twice_in_a).len(),
+            1,
+            "a single record must approve only one of two identical declarations"
+        );
+
+        // Recorded(vec![]) with nothing current -> nothing unapproved.
+        let empty = CheckpointApproval::Recorded(Vec::new());
+        assert!(empty.unapproved(&[]).is_empty());
+        // ...but it approves nothing that IS current.
+        assert_eq!(empty.unapproved(std::slice::from_ref(&first)), vec![&first]);
+
+        // Neither Unrecorded nor Pending approves anything.
+        assert_eq!(
+            CheckpointApproval::Unrecorded.unapproved(std::slice::from_ref(&first)),
+            vec![&first]
+        );
+        assert_eq!(
+            CheckpointApproval::Pending.unapproved(std::slice::from_ref(&first)),
+            vec![&first]
+        );
+
+        // Negative control: a declaration that is neither blocking_human nor
+        // human_action is not human-only and is never returned, so an empty
+        // result above cannot be an artifact of the filter matching nothing.
+        let ordinary = CheckpointDeclaration {
+            plan_file: "c-PLAN.md".to_string(),
+            element: format!("<task gate=\"{PLAIN_GATE_VALUE_FOR_TEST}\">auto-approvable</task>"),
+            blocking_human: false,
+            human_action: false,
+        };
+        assert!(
+            CheckpointApproval::Unrecorded
+                .unapproved(&[ordinary])
+                .is_empty(),
+            "only human-only declarations may be returned"
+        );
     }
 
     #[test]

@@ -132,6 +132,7 @@ only because a stage failed unexpectedly).
 | `lock-project` | Coarse checkout lock (held seconds, around shared-git mutations) |
 | `phase-NN-stdout` / `phase-NN-stderr.log` | Agent capture files (what `logs` tails) |
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the monitor records |
+| `phase-NN-monitor-stop` | Stop marker the `sh` monitor's TERM/INT trap writes before killing the agent, so an agent child that lost the TERM still stops before it starts; removed before each launch |
 | `gates/NN-<stage>.json` (+ `.response.json`, `.ack.json`) | Gate request / answer / receipt |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
 | `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run |
@@ -153,5 +154,6 @@ devflow status                       # idle — phase shipped, version tagged
 ```
 
 When something wedges: `devflow recover` to inspect,
-`devflow recover --clean` (stale phases only) or
+`devflow recover --clean` (stale phases, plus gate files whose phase has no
+state; exits non-zero if anything could not be removed) or
 `devflow recover --clean --phase N` to reset one phase, then re-`start`.
