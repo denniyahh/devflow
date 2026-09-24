@@ -39,3 +39,9 @@ tracing-subscriber = "0.3"
 # Default features kept on purpose: `colors` is what makes the failure a readable
 # diff, which is the whole point of D-14.
 insta = "1"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
