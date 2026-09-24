@@ -62,3 +62,11 @@ updates the maps after each plan.
    Update. Never delete `.planning/codebase/`; see the memory note on map-codebase refresh traps.
 4. Either way, afterwards confirm TESTING.md's front-matter still carries a `last_mapped_commit`, and
    that no conflict markers remain (`rg -n '^(<<<<<<<|=======|>>>>>>>)' .planning/codebase/`).
+
+## Resolution (2026-09-23)
+
+Done in `42853ec` (merge of `feature/phase-48` into `workspace/denniyahh`). `git merge-tree` reported
+TESTING.md as the only conflict. Kept the 2026-09-18 refresh (`last_mapped_commit` stamp intact) and
+re-applied 48-17's facts in `## Environment Isolation`: child-only `PATH` via `run_test_in_child`,
+`assert_child_ran_exactly_one_passing_test`, the four deferred variables, and the "remaining" D-04
+wording — each checked against `test_support.rs` at the merged HEAD. No conflict markers remain.

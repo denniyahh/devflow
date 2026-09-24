@@ -967,8 +967,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ### Pending Todos
 
-- [2026-09-19] [tooling] Merge devcontainer comment fix into phase 48 before its combined PR — [todo file](.planning/todos/pending/2026-09-18-merge-devcontainer-comment-fix-into-phase-48-before-its-comb.md)
-- [2026-09-19] [planning] Resolve the TESTING.md conflict at phase 48 merge-back — [todo file](.planning/todos/pending/2026-09-18-resolve-the-testing-md-conflict-at-phase-48-merge-back.md)
+None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos closed 2026-09-23).
 
 ### Roadmap Evolution
 

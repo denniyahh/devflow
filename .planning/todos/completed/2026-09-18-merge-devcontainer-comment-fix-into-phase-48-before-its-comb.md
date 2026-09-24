@@ -35,3 +35,10 @@ and `scripts/assert-image-parity.sh` passes with the extracted image.
    artifact.
 3. Close #216 with a comment linking the combined PR. Then delete the branch and remove the worktree
    (`git worktree remove .worktrees/chore-devcontainer-comment`).
+
+## Resolution (2026-09-23) — superseded
+
+PR #216 was merged into `develop` on its own at 2026-09-23T17:36Z (merged by the `denniyahh` account),
+so the combined-PR plan no longer applies. `24365ae` is on `develop`, the chore branch is gone locally
+and on `origin`, and its worktree is removed. The Phase 48 PR (`feature/phase-48-pr`) is cut from a
+`develop` that already contains it.
