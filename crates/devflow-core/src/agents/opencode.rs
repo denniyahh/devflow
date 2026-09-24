@@ -1030,6 +1030,17 @@ mod tests {
         command.arg("30").process_group(0);
         let mut child = command.spawn().expect("spawn the control sleep");
         let pid = child.id();
+        // Until the child execs, /proc shows this test binary's cmdline, not
+        // `sleep 30` (CI failure 2026-09-24). Wait for the exec first (25-11).
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                pid,
+                "sleep",
+                crate::test_support::EXEC_VISIBILITY_WAIT,
+                crate::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the control sleep became readable"
+        );
         let present = probe_proc_snapshot(pid);
         child.kill().expect("kill the control sleep");
         child.wait().expect("reap the control sleep");
