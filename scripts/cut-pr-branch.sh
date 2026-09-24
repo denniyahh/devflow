@@ -13,7 +13,12 @@
 # fork point. The default PR branch is feature/phase-N-pr.
 #
 # Without a phase, the branch's commits since its fork from WORKSPACE_BASE are
-# replayed.
+# replayed. WORKSPACE_BASE is the third argument, the WORKSPACE_BASE environment
+# variable, or the only local workspace/* branch.
+#
+# Paths that must never reach develop: a built-in list of agent-tool and
+# per-checkout files, plus every `only <path>` line of the source branch's
+# committed .workspace-divergence manifest (a workspace-only file).
 #
 # Examples:
 #   On branch feature/phase-48:
@@ -89,8 +94,14 @@ if [ "$PR_BRANCH" = "$CURRENT_BRANCH" ]; then
 fi
 
 # Determine the base workspace branch the current branch forked from
-WORKSPACE_BASE="${3:-workspace/denniyahh}"
-if ! git show-ref --verify --quiet "refs/heads/$WORKSPACE_BASE"; then
+WORKSPACE_BASE="${3:-${WORKSPACE_BASE:-}}"
+if [ -z "$WORKSPACE_BASE" ]; then
+    mapfile -t WORKSPACE_BRANCHES < <(git for-each-ref --format='%(refname:short)' 'refs/heads/workspace/*')
+    if [ "${#WORKSPACE_BRANCHES[@]}" -eq 1 ]; then
+        WORKSPACE_BASE="${WORKSPACE_BRANCHES[0]}"
+    fi
+fi
+if [ -z "$WORKSPACE_BASE" ] || ! git show-ref --verify --quiet "refs/heads/$WORKSPACE_BASE"; then
     WORKSPACE_BASE="$CURRENT_BRANCH"
 fi
 
@@ -103,8 +114,18 @@ fi
 echo "==> Fetching latest $BASE_BRANCH from $BASE_REMOTE..."
 git fetch "$BASE_REMOTE" "$BASE_BRANCH"
 
-# Regex of forbidden paths that must NEVER exist on PR/upstream branches
-FORBIDDEN_REGEX='^(\.agents|\.bg-shell|\.claude|\.codex|\.cursor|\.gemini|\.omx|\.opencode|AGENTS\.md|CLAUDE\.md|\.mcp\.json|skills/|skills-lock\.json|\.gsd|\.gsd-backups|\.gsd-id|\.gsd-worktrees|\.planning|\.devflow|\.worktrees|graphify-out/)'
+# Path prefixes that must NEVER exist on PR/upstream branches: agent tooling,
+# per-checkout files, and the source branch's declared workspace-only paths.
+FORBIDDEN_PATHS=(.agents .bg-shell .claude .codex .cursor .gemini .omx .opencode AGENTS.md CLAUDE.md .mcp.json skills skills-lock.json .gsd .gsd-backups .gsd-id .gsd-worktrees .planning .devflow .worktrees graphify-out devflow.toml .workspace-divergence)
+if MANIFEST="$(git show "$CURRENT_BRANCH:.workspace-divergence" 2>/dev/null)"; then
+    while read -r KIND ENTRY _; do
+        if [ "$KIND" = "only" ] && [ -n "$ENTRY" ]; then
+            FORBIDDEN_PATHS+=("$ENTRY")
+        fi
+    done <<< "$MANIFEST"
+fi
+# Each entry matches that exact path or anything under it, nothing else.
+FORBIDDEN_REGEX="^($(printf '%s\n' "${FORBIDDEN_PATHS[@]%/}" | sed 's/[][\.*^$()+?{}|]/\\&/g' | paste -sd '|' -))(/|$)"
 
 if [ -n "$PHASE" ]; then
     # Scope anchored the way GSD's execute-phase matches plan commits: the
@@ -177,10 +198,14 @@ for HASH in "${COMMIT_LIST[@]}"; do
     # Commit contains code changes; cherry-pick without auto-commit
     git cherry-pick "$HASH" --no-commit >/dev/null 2>&1 || true
 
-    # Remove forbidden files and unmerged planning paths from index.
-    # --ignore-unmatch: one pathspec that matches nothing makes git rm abort
-    # and remove none of them, which leaked mixed-commit .planning files.
-    git rm -rf --ignore-unmatch .agents .bg-shell .claude .codex .cursor .gemini .omx .opencode AGENTS.md CLAUDE.md .mcp.json skills skills-lock.json .gsd .planning .devflow .worktrees graphify-out >/dev/null 2>&1 || true
+    # Remove forbidden paths from the index by the same prefix rule the audit
+    # below uses. (A pathspec list is not a prefix match, and one pathspec that
+    # matched nothing once made git rm remove none of them, leaking
+    # mixed-commit .planning files.)
+    mapfile -t STAGED_FORBIDDEN < <(git diff --cached --name-only | grep -E "$FORBIDDEN_REGEX" || true)
+    if [ "${#STAGED_FORBIDDEN[@]}" -gt 0 ]; then
+        git rm -rf --ignore-unmatch -- "${STAGED_FORBIDDEN[@]}" >/dev/null 2>&1 || true
+    fi
 
     # Check for unmerged files left behind
     UNMERGED=$(git diff --name-only --diff-filter=U || true)
