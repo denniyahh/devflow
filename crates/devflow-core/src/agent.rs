@@ -551,6 +551,32 @@ mod tests {
     /// A reaped-pending child is dead, not running. `kill(pid, 0)` succeeds
     /// on a zombie because the pid is still allocated, so the bare POSIX
     /// check reports it alive — which is how a container with no reaping
+    /// A zombie that passes `kill(0)` and is reaped before `/proc/<pid>/status`
+    /// is read leaves a NotFound read. That pid is gone, not "cannot tell":
+    /// counting it as running made `spawn_with_timeout_kills_a_hung_child`
+    /// report a reaped `sleep` as a survivor in CI. The other arms pin that a
+    /// readable status still decides and any other read error still defers to
+    /// `kill(0)`.
+    #[test]
+    fn running_per_status_treats_a_vanished_status_file_as_not_running() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(
+            !super::running_per_status(Err(gone)),
+            "a pid whose /proc entry vanished after kill(0) has been reaped and is not running"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(
+            super::running_per_status(Err(denied)),
+            "an unreadable status that is not NotFound must keep kill(0)'s answer"
+        );
+        assert!(!super::running_per_status(Ok(
+            "Name:\tsleep\nState:\tZ (zombie)\n".into()
+        )));
+        assert!(super::running_per_status(Ok(
+            "Name:\tsleep\nState:\tS (sleeping)\n".into()
+        )));
+    }
+
     /// init can make a dead agent look permanently live.
     #[test]
     fn agent_running_is_false_for_an_unreaped_zombie() {
