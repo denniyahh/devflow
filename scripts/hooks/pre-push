@@ -201,6 +201,14 @@ if [ -n "$RELEASE_KEY" ]; then
     done
 fi
 
+# A workspace branch (Workflow B) must declare every way it differs from
+# develop in .workspace-divergence. core.hooksPath may be shared by every
+# worktree, so the check runs the pushing checkout's own copy, and only in a
+# checkout that carries the manifest; develop-based branches skip it.
+if [ -f .workspace-divergence ]; then
+    ./scripts/check-workspace-divergence.sh origin/develop
+fi
+
 # Drop-in extension point: every file in scripts/hooks/pre-push.d/ runs, in name
 # order, with this hook's arguments, and the first failure fails the hook.
 # develop ships none; a personal workspace branch adds its own checks here as
