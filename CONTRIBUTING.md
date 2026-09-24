@@ -38,12 +38,13 @@ Two things this hook does that are load-bearing:
 - [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) enforces Conventional
   Commit formats (`feat:`, `fix:`, `chore:`, etc.) on every commit subject and
   warns if the subject exceeds 72 characters, keeping git history and automated
-  changelog generation clean.
-- [`scripts/hooks/post-commit`](scripts/hooks/post-commit) warns when a commit
-  lands a plan `*-SUMMARY.md` while `.planning/STATE.md`'s authored prose still
-  describes an earlier wave. It only warns — it never edits a tracked file, so
-  it cannot break a plan's `git diff --name-only` scope fence. It delegates to a
-  prior `post-commit` the same way. Silent on commits that land no summary.
+  changelog generation clean. It also rejects a subject ending in a period.
+- `pre-commit` and `pre-push` each run any executables in
+  `scripts/hooks/pre-commit.d/` and `scripts/hooks/pre-push.d/`, in name order,
+  with the hook's arguments; the first failure fails the hook. `develop` ships
+  none. A personal workspace branch adds its own checks there as new files
+  instead of editing the shared hooks (see Workflow B). A `pre-push` drop-in
+  gets no stdin, because the hook has already read the ref list.
 
 ### Repository git policy
 
@@ -215,6 +216,7 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
    # Cuts a pristine feature/my-feature branch off origin/develop,
    # cherry-picks code commits, and strips personal/planning artifacts.
    ```
+   On a DevFlow phase branch (`feature/phase-N`) it runs in phase mode: it replays the commits scoped to that phase (`feat(N-07): ...`), wherever they were committed, onto `feature/phase-N-pr`. It ends with a fidelity report; review any path it lists as differing from your branch.
 5. Test, push, and submit the clean PR:
    ```bash
    git checkout feature/my-feature
@@ -235,6 +237,8 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
    git branch -d workspace/my-feature
    git push origin workspace/<handle>
    ```
+
+   **Keeping the two tiers apart.** The workspace branch adds files; it does not edit files that `develop` also carries, except the ones it declares. Declare workspace-only paths and deliberately modified shared files in a committed, workspace-only `.workspace-divergence` file, one per line (`only <path>` or `modified <path>`). `cut-pr-branch.sh` never replays an `only` path. Put workspace-only hook checks in `scripts/hooks/pre-commit.d/` or `scripts/hooks/pre-push.d/` rather than editing the shared hooks. A per-checkout `devflow.toml` (for example `base_branch`) is ignored on `develop`; a workspace branch that tracks `.planning/` may track its own.
 
 ## Project Structure
 

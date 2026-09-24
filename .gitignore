@@ -60,6 +60,11 @@ Thumbs.db
 .devflow/gates/
 .devflow/history/
 
+# Per-checkout DevFlow configuration (`base_branch` and other `devflow.toml`
+# keys). It names a checkout's own trunk, so develop never carries one; a
+# personal workspace branch may track its own (backlog 999.110).
+devflow.toml
+
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
 .worktrees/
 
