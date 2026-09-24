@@ -18,6 +18,13 @@ use std::sync::atomic::AtomicU64;
 
 static LOCK_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How long [`acquire_coordination_settling`] waits out a coordination hold
+/// that has no lock record behind it before reporting contention.
+const COORDINATION_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll interval for [`acquire_coordination_settling`].
+const COORDINATION_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Errors produced by lock operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -205,6 +212,31 @@ fn acquire_coordination(path: &Path) -> Result<File, LockError> {
     }
 }
 
+/// [`acquire_coordination`] for a fresh acquisition, waiting out a hold that
+/// has no public lock record behind it.
+///
+/// A live holder publishes its record right after taking coordination and
+/// keeps both until its guard drops, and the guard removes the record before
+/// it releases coordination. So a busy coordination lock with no record is a
+/// publish or a release in progress. It can also outlive a released guard: a
+/// child forked while the guard was live holds a duplicate of the
+/// coordination fd, and with it the flock, until it execs. Reporting
+/// `Contended { pid: "unknown" }` then refuses a phase nobody holds. The wait
+/// is bounded, and a record appearing ends it at once with the holder's pid.
+fn acquire_coordination_settling(path: &Path) -> Result<File, LockError> {
+    let deadline = std::time::Instant::now() + COORDINATION_SETTLE_WAIT;
+    loop {
+        match acquire_coordination(path) {
+            Err(LockError::Contended { .. })
+                if !path.exists() && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(COORDINATION_SETTLE_POLL);
+            }
+            other => return other,
+        }
+    }
+}
+
 fn acquire_after_existing(
     path: PathBuf,
     coordination: File,
@@ -248,7 +280,7 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
         )
     })?;
     crate::workflow::ensure_devflow_dir(parent)?;
-    let coordination = acquire_coordination(&path)?;
+    let coordination = acquire_coordination_settling(&path)?;
 
     match publish_lock(&path, || {})? {
         LockPublication::Published => Ok(LockGuard {
