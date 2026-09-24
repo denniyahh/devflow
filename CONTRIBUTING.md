@@ -39,6 +39,15 @@ Two things this hook does that are load-bearing:
   Commit formats (`feat:`, `fix:`, `chore:`, etc.) on every commit subject and
   warns if the subject exceeds 72 characters, keeping git history and automated
   changelog generation clean. It also rejects a subject ending in a period.
+- `pre-commit` also refuses a `crates/**` commit made outside the active
+  phase's worktree (`scripts/lint-phase-worktree.sh`; set
+  `DEVFLOW_ALLOW_OFF_WORKTREE=1` when that is intended). It does nothing
+  without a `.planning/STATE.md`. `scripts/phase-worktree.sh <N>` creates the
+  worktree from your workspace branch.
+- `pre-push` also runs `scripts/check-workspace-divergence.sh` in a checkout
+  that carries `.workspace-divergence` (Workflow B): every difference from
+  `develop` must be declared there, and every hook and top-level script must be
+  committed executable.
 - `pre-commit` and `pre-push` each run any executables in
   `scripts/hooks/pre-commit.d/` and `scripts/hooks/pre-push.d/`, in name order,
   with the hook's arguments; the first failure fails the hook. `develop` ships
