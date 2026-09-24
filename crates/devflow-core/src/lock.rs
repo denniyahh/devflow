@@ -586,6 +586,65 @@ mod tests {
         let _again = acquire(dir.path(), PhaseId::new(1)).expect("re-acquire after release");
     }
 
+    /// Hold `path`'s coordination lock through a separate open file
+    /// description, the way a child forked mid-guard keeps it until it execs.
+    fn hold_coordination_elsewhere(path: &Path) -> File {
+        fs::create_dir_all(path.parent().expect("lock path has a parent")).unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(coordination_path(path))
+            .unwrap();
+        held.try_lock().expect("hold coordination");
+        held
+    }
+
+    /// CI failure of `dropping_guard_releases_lock`: a child forked by another
+    /// test thread while a guard was live kept a duplicate of the coordination
+    /// fd, so the flock outlived the guard. With the public lock path already
+    /// removed, `acquire` reported `Contended { pid: "unknown" }` for a phase
+    /// nobody holds. A coordination hold with no lock record behind it is a
+    /// release in progress, and `acquire` must wait it out.
+    #[test]
+    fn acquire_waits_out_a_coordination_hold_left_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_path(dir.path(), PhaseId::new(1));
+        let held = hold_coordination_elsewhere(&path);
+        assert!(!path.exists(), "the public lock path must already be gone");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        let acquired = acquire(dir.path(), PhaseId::new(1));
+        releaser.join().unwrap();
+        assert!(
+            acquired.is_ok(),
+            "a coordination hold with no lock record must be waited out, got {acquired:?}"
+        );
+    }
+
+    /// Control for the wait above: a coordination hold that never ends is
+    /// still refused, and within a bounded time.
+    #[test]
+    fn acquire_still_refuses_a_coordination_hold_that_does_not_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_path(dir.path(), PhaseId::new(1));
+        let _held = hold_coordination_elsewhere(&path);
+        let started = std::time::Instant::now();
+        let refused = acquire(dir.path(), PhaseId::new(1));
+        assert!(
+            matches!(refused, Err(LockError::Contended { .. })),
+            "a hold that never ends must still be contended, got {refused:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn holder_is_none_without_lock_file() {
         let dir = tempfile::tempdir().unwrap();
