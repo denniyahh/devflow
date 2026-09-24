@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Sync shared codebase changes from develop into the current personal workspace branch
-# without wiping out tracked personal agent configurations, skills, or planning files.
+# using true git merge to maintain graph ancestry without wiping out tracked personal
+# agent configurations, skills, or planning files.
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -24,31 +25,15 @@ BASE_BRANCH="${2:-develop}"
 echo "==> Fetching latest $BASE_BRANCH from $BASE_REMOTE..."
 git fetch "$BASE_REMOTE" "$BASE_BRANCH"
 if git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
-    git fetch "$BASE_REMOTE" "$BASE_BRANCH":"$BASE_BRANCH" --quiet || true
+    if ! git worktree list 2>/dev/null | grep -q "\[$BASE_BRANCH\]"; then
+        git fetch "$BASE_REMOTE" "$BASE_BRANCH":"$BASE_BRANCH" --quiet 2>/dev/null || true
+    fi
 fi
 
-echo "==> Syncing project code into $CURRENT_BRANCH..."
-git checkout "$BASE_REMOTE/$BASE_BRANCH" -- \
-    crates/ \
-    Cargo.toml \
-    Cargo.lock \
-    .github/ \
-    scripts/ \
-    docs/ \
-    doc-check-allowlist.toml \
-    rust-toolchain.toml \
-    .devcontainer/ \
-    .gitignore \
-    .gitconfig \
-    README.md \
-    CONTRIBUTING.md \
-    ARCHITECTURE.md \
-    CHANGELOG.md \
-    CODE_OF_CONDUCT.md \
-    LICENSE \
-    LICENSE-APACHE \
-    SECURITY.md \
-    DEPENDENCIES.md \
-    OPERATIONS.md
-
-echo "==> Workspace sync complete on $CURRENT_BRANCH. Changes staged for review/commit."
+echo "==> Merging $BASE_REMOTE/$BASE_BRANCH into $CURRENT_BRANCH..."
+if git merge-base --is-ancestor "$BASE_REMOTE/$BASE_BRANCH" "$CURRENT_BRANCH"; then
+    echo "==> $CURRENT_BRANCH is already up to date with $BASE_REMOTE/$BASE_BRANCH."
+else
+    git merge "$BASE_REMOTE/$BASE_BRANCH" -m "chore: sync $BASE_BRANCH into $CURRENT_BRANCH"
+    echo "==> Successfully merged $BASE_REMOTE/$BASE_BRANCH into $CURRENT_BRANCH."
+fi
