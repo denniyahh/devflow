@@ -434,3 +434,110 @@ fn staged_deleted_plan_is_skipped() {
     let out = run_staged(root);
     assert_staged_zero_scan(&out);
 }
+
+/// Scan `contents` saved as `file_name` in a fresh scratch directory.
+///
+/// The rules below are exercised with inline plans instead of committed fixtures:
+/// a committed `*PLAN.md` fixture that violates a rule is refused by the
+/// pre-commit hook, which runs this same scanner over every staged plan.
+fn run_inline(file_name: &str, contents: &str) -> Output {
+    let dir = tempfile::tempdir().expect("create scratch directory for an inline plan");
+    let path = dir.path().join(file_name);
+    fs::write(&path, contents)
+        .unwrap_or_else(|err| panic!("write inline plan {}: {err}", path.display()));
+    run(&[path.as_path()])
+}
+
+/// A crash inside the scanner's awk program must never read as a refusal. An
+/// apostrophe in one of its comments once closed the program's shell quoting, so
+/// gawk aborted with "unterminated regexp" and every plan was refused without a
+/// report naming any file.
+fn assert_no_scanner_crash(file_name: &str, text: &str) {
+    assert!(
+        !text.contains("awk:"),
+        "the scanner crashed while scanning {file_name} instead of evaluating its \
+         rules.\n--- output ---\n{text}"
+    );
+}
+
+fn assert_inline_blocked(file_name: &str, contents: &str, expected_text: &str) {
+    let out = run_inline(file_name, contents);
+    let text = combined(&out);
+    assert_no_scanner_crash(file_name, &text);
+    assert!(
+        !out.status.success(),
+        "{file_name} must be REFUSED by the scanner, but it exited 0.\n--- output ---\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains(file_name) && line.contains(expected_text)),
+        "the refusal for {file_name} must print one line naming BOTH the file and \
+         {expected_text:?}.\n--- output ---\n{text}"
+    );
+}
+
+fn assert_inline_accepted(file_name: &str, contents: &str) {
+    let out = run_inline(file_name, contents);
+    let text = combined(&out);
+    assert_no_scanner_crash(file_name, &text);
+    assert!(
+        out.status.success(),
+        "{file_name} is a legitimate plan and must be ACCEPTED, but the scanner exited \
+         {:?}.\n--- output ---\n{text}",
+        out.status.code()
+    );
+}
+
+/// `rg -c` prints nothing and exits 1 when nothing matches, so piping it into
+/// `rg '^0$'` can never observe the zero it claims to check.
+#[test]
+fn rg_count_piped_to_zero_match_is_blocked() {
+    assert_inline_blocked(
+        "rg-count-zero-PLAN.md",
+        "<verify>\n  <automated>rg -c needle src/lib.rs | rg '^0$'</automated>\n</verify>\n",
+        "rg -c ... | rg '^0$' trap",
+    );
+}
+
+/// `devflow` is binary-only, so `cargo test -p devflow --lib` selects no target
+/// and verifies nothing.
+#[test]
+fn devflow_lib_target_is_blocked() {
+    assert_inline_blocked(
+        "devflow-lib-PLAN.md",
+        "<verify>\n  <automated>cargo test -p devflow --lib stop::tests::x</automated>\n</verify>\n",
+        "cargo test -p devflow --lib verifies nothing",
+    );
+}
+
+/// Negative control for the `--lib` rule: `devflow-core` has a library target,
+/// and its package name merely starts with `devflow`.
+#[test]
+fn devflow_core_lib_target_is_accepted() {
+    assert_inline_accepted(
+        "devflow-core-lib-PLAN.md",
+        "<verify>\n  <automated>cargo test -p devflow-core --lib verify::tests::parser -- --exact</automated>\n</verify>\n",
+    );
+}
+
+/// A bare name after `--exact` matches no test inside a module, and
+/// `cargo test` still exits 0.
+#[test]
+fn bare_test_name_after_exact_is_blocked() {
+    assert_inline_blocked(
+        "exact-bare-name-PLAN.md",
+        "<verify>\n  <automated>cargo test -p devflow-core --lib -- --exact holder_status</automated>\n</verify>\n",
+        "cargo test --exact bare-name trap",
+    );
+}
+
+/// Negative control for the bare-name rule: a libtest flag after `--exact` is
+/// not a test name. The rule once read `--nocapture` as one and refused
+/// correct plans.
+#[test]
+fn libtest_flag_after_exact_is_accepted() {
+    assert_inline_accepted(
+        "exact-then-flag-PLAN.md",
+        "<verify>\n  <automated>cargo test -p devflow --bin devflow lock::tests::holder_status -- --exact --nocapture</automated>\n</verify>\n",
+    );
+}
