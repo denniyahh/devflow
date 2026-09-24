@@ -658,6 +658,29 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.144: No Test Pins `resume`'s Live-Run Guard Ahead of Its Early Writes (BACKLOG)
+
+**Found:** 2026-09-23 by the Phase 48 close-out checks: 48-REVIEW.md WR-02 (48-20 round), extended by the
+48-SECURITY.md round-8 audit. **Mutation-tested on a scratch copy; the shipped code is correctly placed.**
+**Filed by operator decision 2026-09-23:** not critical for Phase 48, backlog.
+
+**Defect (test gap, not a live bug):** `pipeline_launch::resume` calls `refuse_resume_over_a_live_run` right
+after taking the lock and before `load_state` (lock → guard → load, verified at `a3a0506`). Two writes follow
+before `launch_stage`: the `--agent` handoff save and `repair_leaked_auto_chain_flag`, which rewrites and
+commits `.planning/config.json`. No standing test would catch the guard moving below them. With the guard
+after the auto-chain repair, both `start_lock_e2e` resume refusal arms still pass (audit mutant M3). With it
+just before `launch_stage`, only the stopped-agent arm fails. The only check that pins the order is the
+one-off structural gate inside 48-20-PLAN.md Task 2 (negative-controlled: moved or removed guard → rejected),
+which no test, script or CI step runs. A misplaced guard would still refuse the second agent, but only after
+changing a live run's config, handoff state and git HEAD.
+
+**Fix shape:** a `start_lock_e2e` arm that plants the auto-chain flag, runs `resume --agent <other>` over a
+live recorded run, and asserts `.planning/config.json` bytes, git HEAD and the events log unchanged. Or make the
+48-20 placement check a standing test.
+
+**Acceptance:** the new arm fails against the M3 mutant (guard after the auto-chain repair) and against a
+guard placed just before `launch_stage`, and passes at HEAD.
+
 ### Phase 999.143: A Recycled Recorded Pid Leaves `resume` No Work-Preserving Way Out (BACKLOG)
 
 **Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md Known limits, T-48-20-05). **Reasoned from source
