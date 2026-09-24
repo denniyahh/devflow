@@ -855,6 +855,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 48]: Child marker value is the exact module-qualified test name, and the guard requires a non-vacuous exact-test result.
 - [Phase 48]: Driver fixtures supply PATH and configuration only through the spawned child Command.
 - [Phase 48]: close: re-verification after 48-20 (executed by codex) passed 7/7; the operator ruled 2026-09-23 that 999.139 on `start` (corrupt state + dead agent + live monitor, reproduced live) is outside criterion 2, being 999.136's agent-exit → `advance` window. 48-20 review: 0 critical / 4 warnings (test-coverage and duplication), not fixed at close.
+- [Phase 48]: close (PR #218): fixed 4 timing races that made the devflow-core suite flake in CI — lock coordination flock inherited by a forked child (bounded settle wait in `acquire`), `agent_running` counting a pid reaped mid-check as alive (NotFound now means gone), and two probe tests racing exec / the group kill. Operator chose fix-before-merge 2026-09-23. Evidence: 3/25 flaky full-suite runs before, 0/50 after; workspace 1451/0; fixed by hand (post-verification PR fixes, same shape as the phase's earlier review fixes), not via /gsd-quick.
 
 ## Roadmap Evolution
 

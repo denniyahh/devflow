@@ -815,7 +815,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create stub dir");
         let stub = dir.path().join("opencode");
         let escape = dir.path().join("opencode.setpgid.py");
-        let script = "#!/bin/sh\npython3 \"$0.setpgid.py\" \"$0.setpgid-status\" &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nexit 0\n";
+        let script = "#!/bin/sh\npython3 \"$0.setpgid.py\" \"$0.setpgid-status\" &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$0.pid\"\nwhile [ ! -e \"$0.setpgid-status\" ]; do :; done\nexit 0\n";
         let python = format!(
             "import os, sys, time\nstatus = sys.argv[1]\ntry:\n    os.setpgid(0, 0)\nexcept OSError as error:\n    open(status, 'w', encoding='utf-8').write(str(error.errno))\n    raise\nopen(status, 'w', encoding='utf-8').write('0')\ntime.sleep({sleep_secs})\n"
         );
@@ -1030,6 +1030,17 @@ mod tests {
         command.arg("30").process_group(0);
         let mut child = command.spawn().expect("spawn the control sleep");
         let pid = child.id();
+        // Until the child execs, /proc shows this test binary's cmdline, not
+        // `sleep 30` (CI failure 2026-09-24). Wait for the exec first (25-11).
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                pid,
+                "sleep",
+                crate::test_support::EXEC_VISIBILITY_WAIT,
+                crate::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the control sleep became readable"
+        );
         let present = probe_proc_snapshot(pid);
         child.kill().expect("kill the control sleep");
         child.wait().expect("reap the control sleep");

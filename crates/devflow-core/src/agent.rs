@@ -42,20 +42,31 @@ pub fn agent_running(pid: u32) -> bool {
     if signed <= 0 || unsafe { libc::kill(signed, 0) } != 0 {
         return false;
     }
-    !is_zombie(pid)
+    running_per_status(std::fs::read_to_string(format!("/proc/{pid}/status")))
+}
+
+/// Classify a pid that `kill(0)` has just reported as existing, from the read
+/// of its `/proc/<pid>/status`.
+///
+/// A zombie is not running. A NotFound read means the pid was reaped between
+/// `kill(0)` and the read, so it is gone. Any other unreadable status is
+/// "cannot tell", so `kill(0)`'s answer stands rather than an invented one.
+fn running_per_status(status: std::io::Result<String>) -> bool {
+    match status {
+        Ok(status) => !status_is_zombie(&status),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Whether `pid` has exited but not yet been reaped — `State: Z` in
-/// `/proc/<pid>/status`.
-///
-/// Returns `false` when the status file cannot be read: an unreadable
-/// `/proc` entry means "cannot tell", and the caller has already established
-/// via `kill(0)` that the pid exists, so claiming zombie-hood here would
-/// invent information.
+/// `/proc/<pid>/status`. Returns `false` when the status file cannot be read.
+#[cfg(test)]
 fn is_zombie(pid: u32) -> bool {
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return false;
-    };
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .is_ok_and(|status| status_is_zombie(&status))
+}
+
+fn status_is_zombie(status: &str) -> bool {
     status
         .lines()
         .find(|line| line.starts_with("State:"))
@@ -542,6 +553,32 @@ mod tests {
     /// A reaped-pending child is dead, not running. `kill(pid, 0)` succeeds
     /// on a zombie because the pid is still allocated, so the bare POSIX
     /// check reports it alive — which is how a container with no reaping
+    /// A zombie that passes `kill(0)` and is reaped before `/proc/<pid>/status`
+    /// is read leaves a NotFound read. That pid is gone, not "cannot tell":
+    /// counting it as running made `spawn_with_timeout_kills_a_hung_child`
+    /// report a reaped `sleep` as a survivor in CI. The other arms pin that a
+    /// readable status still decides and any other read error still defers to
+    /// `kill(0)`.
+    #[test]
+    fn running_per_status_treats_a_vanished_status_file_as_not_running() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(
+            !super::running_per_status(Err(gone)),
+            "a pid whose /proc entry vanished after kill(0) has been reaped and is not running"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(
+            super::running_per_status(Err(denied)),
+            "an unreadable status that is not NotFound must keep kill(0)'s answer"
+        );
+        assert!(!super::running_per_status(Ok(
+            "Name:\tsleep\nState:\tZ (zombie)\n".into()
+        )));
+        assert!(super::running_per_status(Ok(
+            "Name:\tsleep\nState:\tS (sleeping)\n".into()
+        )));
+    }
+
     /// init can make a dead agent look permanently live.
     #[test]
     fn agent_running_is_false_for_an_unreaped_zombie() {
