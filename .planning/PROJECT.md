@@ -392,7 +392,7 @@ version is still derived automatically from conventional-commit classification a
   above a last-line `DEVFLOW_RESULT`, with the result parser unchanged. Guarded by `insta`
   baselines run under `INSTA_UPDATE=no` with `INSTA_FORCE_UPDATE` cleared. Verified 39/39 with one
   operator-accepted override (three later gate-detector review fixes) — Phase 47, milestone
-  v3.0.0; not yet merged to `develop`. **Closure limits:** DECN-03 closes for claude alone (the
+  v3.0.0; merged to `develop` via PR #213. **Closure limits:** DECN-03 closes for claude alone (the
   resume route is gated on `AgentKind::Claude`), and which instruction a model actually follows is
   not settled by source — that behavioural arm resolves against Phase 49's live run under
   `47-PHASE49-OBSERVATION.md`'s evidence standard.
@@ -406,8 +406,8 @@ version is still derived automatically from conventional-commit classification a
   pinned both ways. Preflight and resume share one fence-aware checkpoint parser, and a human-only
   checkpoint added after Code's preflight parks at a human gate. Process-global `PATH` mutation moved
   into child processes, with a clippy `disallowed-methods` ban on new `set_var`/`remove_var`.
-  Verified 7/7 on 2026-09-23 after gap closures 48-18..48-20 — Phase 48, milestone v3.0.0; not yet
-  merged to `develop`. **Closure limits:** the agent-exit → `advance` lock-free window (999.136),
+  Verified 7/7 on 2026-09-23 after gap closures 48-18..48-20 — Phase 48, milestone v3.0.0; merged
+  to `develop` via PR #218 on 2026-09-24, with four CI timing-race fixes. **Closure limits:** the agent-exit → `advance` lock-free window (999.136),
   a state file that will not load hiding a live monitor from `start` (999.139, reproduced; ruled
   outside the criterion by the operator), `stop` in a lock-free run (999.138) and a recycled pid
   falsely refusing `resume` (999.143) stay backlog; SURV-01's field arm is observed, not settled,

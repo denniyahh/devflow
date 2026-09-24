@@ -61,7 +61,7 @@ stale; it was restored from `9411158` on 2026-09-13. Do not reintroduce the bold
 
 **Phase 48 — Survivable State Writes and Honest Gate Recovery is complete** (20/20 plans including gap
 closures 48-18..48-20; verification passed 7/7 on 2026-09-23 after the operator ruled 999.139 on
-`start` outside criterion 2) on `feature/phase-48`, **not yet merged to `develop`**. Phase 49 is next. Milestone **v3.0.0 — Unattended Run Survivability** was
+`start` outside criterion 2) and **merged to `develop` via PR #218** (`1bf88b4`, 2026-09-24) after four CI timing-race fixes. Phase 49 is next. Milestone **v3.0.0 — Unattended Run Survivability** was
 declared 2026-09-03 and its roadmap created the same day: 6 phases (46-51), 5 waves, 10/10
 requirements mapped. Phase 46 is complete (9/9 plans, verification passed, merged via PR #208).
 Phase 47 is complete (7/7 plans) and integrated: merged to `develop` via PR #213 and into
@@ -93,7 +93,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-23)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), not yet planned. Phase 48 is complete on `feature/phase-48` (verification passed 7/7) and not yet merged to `develop`. Phases 46 and 47 are complete and integrated; 47's
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), not yet planned. Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
 verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
@@ -112,8 +112,8 @@ verification reads `stale` (see `## Active Phase`).
   runs the harness inside `cargo test`. Record an override; do not restore the file.
 - **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
 - **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- Phase 48 is complete on `feature/phase-48` (verification passed 7/7, 2026-09-23): merge it to
-  `develop` by PR, then `/gsd-discuss-phase 49`. The 48-20 code review's 4 warnings (test coverage
+- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Next: `/gsd-discuss-phase 49`.
+  Separate follow-up PR: the plan-linter P1 commits `5c18bc3`, `b9ee940`, `56f3466` (kept out of #218). The 48-20 code review's 4 warnings (test coverage
   and duplication, `48-REVIEW.md`) were left unfixed at close.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
   `base_branch` must be configured before the live `--mode auto` run is possible.
@@ -961,7 +961,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Operator Next Steps
 
 - See `## Operator Next Steps` near the top of this file. Phase 47 is integrated and the Phase 48
-  worktree exists; Phase 48 is complete (not yet merged to `develop`) and the next command is `/gsd-discuss-phase 49`. Phase 47's verification stays
+  worktree exists; Phase 48 is complete and merged via PR #218, and the next command is `/gsd-discuss-phase 49`. Phase 47's verification stays
   `stale` by operator decision until a re-verify near milestone close.
 
 ## Accumulated Context
