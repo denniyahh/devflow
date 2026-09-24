@@ -4,7 +4,7 @@
 # CLAUDE.md specifies this sequence, and every step of it is skippable by hand
 # -- which is how phase work keeps landing on the wrong branch. The steps:
 #
-#   1. sync workspace/denniyahh with develop        (the fork point must be current)
+#   1. sync the workspace branch with develop       (the fork point must be current)
 #   2. derive the branch name from ROADMAP.md       (renumbered phases: 36 -> 35.3)
 #   3. create .worktrees/phase-N from the workspace branch, NOT develop
 #   4. verify .planning/ is actually tracked on the base
@@ -16,7 +16,16 @@
 # that rather than trusting it.
 set -euo pipefail
 
-WORKSPACE_BASE="${WORKSPACE_BASE:-workspace/denniyahh}"
+# The workspace branch: WORKSPACE_BASE, or the only local workspace/* branch.
+WORKSPACE_BASE="${WORKSPACE_BASE:-}"
+if [ -z "$WORKSPACE_BASE" ]; then
+    mapfile -t WORKSPACE_BRANCHES < <(git for-each-ref --format='%(refname:short)' 'refs/heads/workspace/*')
+    if [ "${#WORKSPACE_BRANCHES[@]}" -ne 1 ]; then
+        echo "error: found ${#WORKSPACE_BRANCHES[@]} local workspace/* branches; set WORKSPACE_BASE to the one to fork from" >&2
+        exit 2
+    fi
+    WORKSPACE_BASE="${WORKSPACE_BRANCHES[0]}"
+fi
 
 usage() { echo "usage: $0 <phase-number> [--no-sync]" >&2; exit 2; }
 

@@ -1,13 +1,9 @@
-//! Workspace-only gate for the phase-worktree guard's test harness.
+//! Gate for the phase-worktree guard's test harness.
 //!
 //! `scripts/test-phase-worktree-guard.sh` exercises `scripts/lint-phase-worktree.sh`
-//! in both directions. Both scripts are personal tooling on `workspace/denniyahh`
-//! and never reach `develop`, so the harness cannot be wired into
-//! `scripts/check.sh`: `develop` shares that script and does not have the harness.
-//! Running it from this test makes every `cargo test --workspace` on a branch that
-//! carries the harness fail when the harness does, `scripts/check.sh test` and the
-//! pre-push container gate included, without touching a shared file. This file
-//! stays out of every `develop` PR cut for the same reason.
+//! in both directions. Running it from this test makes every
+//! `cargo test --workspace` fail when the harness does, `scripts/check.sh test`,
+//! CI and the pre-push container gate included.
 //!
 //! What a pass does NOT establish: that `scripts/hooks/pre-commit` still calls the
 //! guard, or that the harness's cases cover every way a commit can stage
