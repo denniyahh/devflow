@@ -42,20 +42,29 @@ pub fn agent_running(pid: u32) -> bool {
     if signed <= 0 || unsafe { libc::kill(signed, 0) } != 0 {
         return false;
     }
-    !is_zombie(pid)
+    running_per_status(std::fs::read_to_string(format!("/proc/{pid}/status")))
+}
+
+/// Classify a pid that `kill(0)` has just reported as existing, from the read
+/// of its `/proc/<pid>/status`.
+///
+/// A zombie is not running. When the status file cannot be read the answer is
+/// "cannot tell", so `kill(0)`'s answer stands rather than an invented one.
+fn running_per_status(status: std::io::Result<String>) -> bool {
+    match status {
+        Ok(status) => !status_is_zombie(&status),
+        Err(_) => true,
+    }
 }
 
 /// Whether `pid` has exited but not yet been reaped — `State: Z` in
-/// `/proc/<pid>/status`.
-///
-/// Returns `false` when the status file cannot be read: an unreadable
-/// `/proc` entry means "cannot tell", and the caller has already established
-/// via `kill(0)` that the pid exists, so claiming zombie-hood here would
-/// invent information.
+/// `/proc/<pid>/status`. Returns `false` when the status file cannot be read.
 fn is_zombie(pid: u32) -> bool {
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return false;
-    };
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .is_ok_and(|status| status_is_zombie(&status))
+}
+
+fn status_is_zombie(status: &str) -> bool {
     status
         .lines()
         .find(|line| line.starts_with("State:"))
