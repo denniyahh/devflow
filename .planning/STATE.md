@@ -5,11 +5,11 @@ milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
 current_plan: Not started
-status: executing
-stopped_at: Phase 49 planned — 15 plans in 10 waves, ready to execute
+status: planning
+stopped_at: Phase 49 plan review found 1 blocker and 8 warnings; awaiting the Ship container-check decision
 last_updated: "2026-09-25T13:43:25.388Z"
 last_activity: 2026-09-25
-last_activity_desc: Phase 49 plans created; ready to execute
+last_activity_desc: Phase 49 plan review found 1 blocker and 8 warnings; revision required
 state_head: 31e3937facb689062c359690db8b364e82ee9c11
 progress:
   total_phases: 6
@@ -189,12 +189,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 49 (Live Unattended Run — The Milestone's Instrument) — READY TO EXECUTE
-Plans: 15 plans in 10 waves
+Phase: 49 — Live Unattended Run — The Milestone's Instrument
+Plans: 15 drafted plans in 10 waves; revision required
 Current Plan: Not started
 Total Plans in Phase: 15
 Completed Plans: 0 of 15
-Status: Ready to execute
+Status: Plan revision required
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-25 — Phase 49 plans created; ready to execute
+Last activity: 2026-09-25 — Phase 49 plan review found 1 blocker and 8 warnings; revision required
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
