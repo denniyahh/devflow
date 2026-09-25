@@ -658,6 +658,29 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
+
+**Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
+(`.planning/audits/2026-09-24-graphify-review-triage-pr218-219.md`, finding C4). **Reproduced.**
+
+**Defect:** outside phase mode, with no explicit branch argument, the script strips the source branch's
+`workspace/` or `personal/` prefix and then runs `SLUG="${SLUG#*-}"` to drop a leading `<handle>-`
+(`scripts/cut-pr-branch.sh`, "Infer PR branch name"). The expansion cannot tell a handle from a word, so
+it removes everything up to the first hyphen: `personal/add-cache-flag` → `feature/cache-flag`,
+`workspace/denniyahh-fix-cache` → `feature/fix-cache` (correct only by accident),
+`workspace/denniyahh` → `feature/denniyahh`. Phase mode (`feature/phase-N` → `feature/phase-N-pr`) and
+an explicit first argument are unaffected, and the name is printed before anything is pushed.
+Low severity: a misnamed branch, never a wrong replay.
+
+**Fix shape (not decided):** strip only a known handle, meaning the `workspace/<handle>` the manifest or
+`WORKSPACE_BASE` resolves, or drop the handle heuristic and require the argument when the branch name
+is ambiguous.
+
+**Acceptance (proposed, not operator-reviewed):** `personal/add-cache-flag` → `feature/add-cache-flag`;
+`workspace/<handle>-fix-cache` → `feature/fix-cache`; phase mode unchanged. Pinned by a test. **No test
+exercises `cut-pr-branch.sh` today** (checked 2026-09-24: no file under `crates/` or `scripts/` except
+`check-workspace-divergence.sh` references it), so this needs the script's first harness.
+
 ### Phase 999.145: `spawn_with_timeout_kills_a_silent_same_group_descendant_after_parent_exit` Flakes in the Container Gate (BACKLOG)
 
 **Found:** 2026-09-24, pinned-container pre-push gate for the tooling-upstream PR (the PR changed no Rust source).
@@ -1076,6 +1099,13 @@ start time counts as stale. It must stay serialised through the existing reclaim
 **Acceptance (proposed at filing, not operator-reviewed):** a lock whose pid is alive with a
 different start time is reclaimed; at a `Recycled` gate, the repair `stop`/`doctor` names succeeds;
 a lock held by a live process whose start time matches is never reclaimed.
+
+**Also raised by graphify-labs on PR #218 (2026-09-24, finding B2):** "recover --clean --phase now
+refuses a contended phase instead of acting as the explicit clean escape hatch". Refusing a *live*
+holder is Phase 48 D-02's one-writer rule and is correct. The harmful case is this entry's recycled pid.
+One stale artifact goes with it: `recover_cmd`'s comment still reads "clear it regardless of staleness
+(14-CR-01's escape hatch for a wedged-but-fresh run)" (`crates/devflow-cli/src/commands.rs`, explicit-
+phase arm). A wedged live run now needs `devflow stop` first. Correct the comment with the fix.
 
 ### Phase 999.127: A `human-action` Gate Can Be Auto-Decided Because Another Checkpoint Is `blocking-human` (BACKLOG)
 
