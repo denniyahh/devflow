@@ -152,7 +152,7 @@ operator mandate.
     executed*, and criterion 2 stays unmet. That is an escalation for re-planning with the operator. It
     does not count as an attempt (D-11).
 
-- **D-08 (Operator): Post-Ship VersionBump / tag / changelog: observe, then undo.**
+- **D-08 (Operator) — Post-Ship VersionBump / tag / changelog: observe, then undo.**
   - *Verified:* `version_bump` (`hooks.rs:294-353`) writes the new version into the version file,
     commits `chore: bump version to …`, and creates an **unsigned local tag** (`git.rs:250-253`,
     `tag.gpgSign=false`). The workspace is at `version = "2.12.0"` and the last release tag is `v2.12.0`.

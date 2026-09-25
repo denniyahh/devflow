@@ -777,12 +777,12 @@ while True:
 | A7 | Placing the merit-best checkpoint option non-first is compatible with the operator's real decision | Pattern 10 | Operator may prefer a natural order; then record that positional pick cannot be excluded |
 | A8 | `gsd_run query find-phase 49.1` / `phase-plan-index 49.1` validate a decimal phase as expected | Pattern 10 | Planner verifies before relying on them |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **ND-1 / ND-2 / ND-3** (above). These need operator answers.
-2. **How does 49.1's code reach `develop`?** Presumably the normal close-out: `scripts/cut-pr-branch.sh` from `feature/phase-49.1`, a PR to develop, merge, sync. CONTEXT is silent on whether that is inside Phase 49. It determines when the workspace becomes pushable again (Pitfall 5). Recommendation: record it as a follow-up task and do not fold it in silently.
-3. **Does GSD's post-execution `update_roadmap` / `phase.complete` in the 49.1 worktree advance STATE.md unexpectedly?** Memory records that `phase.complete` can advance into 999.x. The merge would carry that into `workspace/denniyahh`. Recommendation: diff STATE.md and ROADMAP.md after the Merge hook, repair them, and log the repair as a GSD incident if needed.
-4. **The Code-stage report doc/behaviour mismatch (A3).** Candidate non-blocking 999.x per D-10.
+1. **ND-1 / ND-2 / ND-3** — RESOLVED by the 2026-09-25 operator answers above: use ND-1 Option B, observe then undo the `v3.0.0` tag/bump, and assign Phase 49.1 the TEST-02 requirement.
+2. **How does 49.1's code reach `develop`?** — RESOLVED FOR PLANNING: it remains an operator decision after the live evidence exists, captured by Phase 49 Task 49-14. The planner must not fold the normal close-out into Phase 49 or choose a route itself.
+3. **Does GSD's post-execution `update_roadmap` / `phase.complete` in the 49.1 worktree advance STATE.md unexpectedly?** — RESOLVED FOR PLANNING: Phase 49 Task 49-14 presents the captured post-Merge diff to the operator and records the chosen disposition; it does not predict or silently repair the result.
+4. **The Code-stage report doc/behaviour mismatch (A3).** — RESOLVED: it is a candidate non-blocking 999.x item under D-10, unless the run proves it blocks the chain and triggers D-10's in-phase remediation policy.
 
 ## Environment Availability
 
