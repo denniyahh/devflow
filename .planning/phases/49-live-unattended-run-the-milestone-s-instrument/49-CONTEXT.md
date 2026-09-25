@@ -17,9 +17,23 @@ checkpoint (D-01..D-05).
 **Scope changes this discussion makes. Planning must carry them as plan tasks:**
 
 - Promote 999.55 into ROADMAP as **Phase 49.1** under v3.0.0, with a pre-authored PLAN.md (D-01, D-04).
-- Amend ROADMAP Phase 49 **success criterion 1**: the configuration step is satisfied by `050ef7f`, and
-  the run still has to observe the persisted `State::base_branch` (D-09).
+- Amend ROADMAP Phase 49 **success criterion 1**, and the matching "Carries a setup step" sentence in
+  REQUIREMENTS.md VERIFY-01: the configuration step is satisfied by `050ef7f`, and the run still has to
+  observe the persisted `State::base_branch` (D-09). **This is the first plan task.** Until it lands,
+  CONTEXT and ROADMAP contradict each other.
+- Amend ROADMAP Phase 49 **success criterion 2**: "unattended stage progression" becomes unattended
+  progression *between the two operator-approved preflight gates and the Ship gate*, each named in the
+  evidence (D-03, D-07).
 - Record 999.55's backlog entry as promoted.
+
+**Adversarial review, 2026-09-24.** Three external lanes (codex `gpt-5.6-terra` high; DeepSeek
+`deepseek-flash` via `pi`; agy `gemini-3.8-flash-high`) reviewed the first draft at `0531ef5`. All three
+completed, with 35, 59 and 43 `file:line` citations. **All three independently found the same four
+defects**, and the orchestrator checked each in source: D-03's seeded checkpoint makes auto-mode
+preflight refuse; D-07's Ship gate sits after the push and PR; the Merge hook mutates the launch
+checkout; and the negative-control fixture writes the file whose absence it is supposed to prove. D-03,
+D-07 and D-12 were re-decided or extended, and D-13..D-16 were added. Raw output is in
+`~/.cache/devflow-review/phase49-context-0531ef5/`.
 
 **Deliberately not in this phase:** 999.123 (CI trigger de-duplication), making DevFlow merge into
 `main`, and any DevFlow defect the run surfaces that does not block the chain (D-12).
@@ -47,35 +61,58 @@ operator mandate.
     and `wait_for_pid` (`:215`) at `200 × 25ms` = 5s; `wait_for_state_cleared` (`:233`),
     `wait_for_stopped` (`:246`), `wait_for_settled` (`:1302`) and `wait_for_gate` (`:1314`) at
     `400 × 25ms` = 10s. They match the 999.55 entry's inventory exactly.
-  - **999.55's acceptance is structural and deterministic.** All six helpers draw on one configurable
-    budget (fix direction from the entry: e.g. `DEVFLOW_TEST_WAIT_SECS`, a longer default under `CI`),
-    and a timeout panic reports the budget it actually used. **This run does not establish that the flake
+  - **The acceptance this phase sets for 49.1 is structural and deterministic.** 999.55's entry has
+    a fix direction but no acceptance section (`Plans: - [ ] TBD`), so the pre-authored 49.1 plan
+    authors it: all six helpers draw on one configurable budget (fix direction: e.g.
+    `DEVFLOW_TEST_WAIT_SECS`, a longer default under `CI`), and a timeout panic reports the budget it
+    actually used. **This run does not establish that the flake
     is gone.** That needs CI run history after the merge. Neither 49.1 nor 49 may claim it.
 
 - **D-02 (Operator): Numbered as decimal Phase 49.1** under v3.0.0, not launched as `999.55`. Decimal
   launch has worked since the 999.97 hotfix. No 999.x number has ever been driven by `devflow start`,
   and the instrument should not add an untested variable.
 
-- **D-03 (Operator): Seed a `gate="blocking-human"` checkpoint so DECN-03 is actually exercised.** The
-  checkpoint asks for **999.55's CI default budget value**, a real human decision, not an artificial
-  gate. That lets a "Followed" result show the comparison reasoning the evidence standard requires.
-  - *Verified constraint:* the resume-with-auto-decide route fires only in the Code stage, and only when
-    `verify::phase_has_blocking_human_checkpoint` matches the literal `gate="blocking-human"` in the
-    plan. The Plan stage can never auto-approve a checkpoint (35.1 D-04, `scripts/unattended-drill.sh`
-    header).
+- **D-03 [REVISED after review] (Operator): Seed a `gate="blocking-human"` checkpoint, and the operator
+  approves the Define and Code preflight gates.** The checkpoint asks for **999.55's CI default budget
+  value**, a real human decision, not an artificial gate. That lets a "Followed" result show the
+  comparison reasoning the evidence standard requires.
+  - *Verified (all three review lanes, re-checked):* in `Mode::Auto`, any plan declaring `blocking-human`
+    makes the unattended-launch condition `DoesNotHold` ("a plan declares a `blocking-human` gate …
+    which no mode auto-approves", `crates/devflow-cli/src/preflight.rs:1076-1080`). The check applies at
+    Define and Code (`:971-974`). The plan is on the base before launch (D-05), so **the run parks at a
+    human preflight gate at Define and again at Code**. `--yes-ship` does not bypass it.
+  - *Verified, and why this is the only route:* the agent's auto-decide resume fires only for checkpoints
+    in the set recorded when a human approved the **Code** preflight gate
+    (`record_checkpoint_set_for_code_evaluation`, `preflight.rs:1432-1434`). Anything outside that set
+    parks at a re-scan gate (`pipeline_launch.rs` `checkpoint_approval.unapproved`, Phase 48 CHKPT-02).
+    **No fully unattended run can reach DECN-03's path.** Operator approval at preflight is the
+    product's designed route, not a workaround.
+  - **Rejected:** pre-writing the gate responses before launch (the tests' technique). It is still a
+    human approval, it would read as unattended when it is not, and it sidesteps a deliberate gate.
+    Dropping the checkpoint was also rejected, since DECN-03 would stay open past the milestone.
+  - *Corrected claim:* the resume route has **no `stage == Code` predicate**
+    (`pipeline_launch.rs:1775-1779` checks agent kind, the literal `gate="blocking-human"` match at
+    `verify.rs:131`, and a capture). Code is the practical producer because it is the only stage whose
+    preflight records an approved set, but that is not a stage-gated invariant. The Plan stage can
+    never auto-approve a checkpoint (35.1 D-04, `scripts/unattended-drill.sh` header).
 
 - **D-04 (Operator): Pre-author the 49.1 plan.** Commit it ahead of time, as `scripts/scratch-dogfood-repo.sh`
   does, so the target is fixed and the seeded checkpoint is guaranteed present. Letting Define/Plan
   generate the plan was rejected: planning variance would enter the measurement and the checkpoint
   could not be guaranteed.
-  - **Research must establish:** what Define and Plan do, unattended, with an existing CONTEXT.md and
-    PLAN.md (skip, overwrite or re-plan), and whether that preserves the seeded checkpoint. 999.59
-    (Define attempting an interview it cannot conduct) is prior art.
+  - *Verified (review):* a pre-authored plan survives. Define is an unconditional no-op in a DevFlow
+    launch, whether or not CONTEXT.md exists (`define_stage_prompt`,
+    `crates/devflow-core/src/prompt.rs:374-380`; the interview route was deleted, 999.59/D-14). Plan
+    uses `idempotent_stage_prompt` (`:341`), which succeeds without rewriting an existing PLAN.md.
 
-- **D-05 (Claude, remit): The 49.1 artifacts must be on the base branch before launch.** DevFlow forks
-  the 49.1 worktree from `workspace/denniyahh`, so the `### Phase 49.1:` ROADMAP heading and the
-  pre-authored plan have to be committed there first. Committing them only on `feature/phase-49` would
-  fail the reachability guard. Sequencing is the planner's call. The constraint is not.
+- **D-05 [CORRECTED] (Claude, remit): Two separate requirements on the base branch before launch.**
+  1. The `### Phase 49.1:` ROADMAP heading on `workspace/denniyahh` satisfies the **reachability guard**.
+     *Verified:* "Only the ROADMAP heading is load-bearing for the refusal (999.63)", and a missing phase
+     directory alone never refuses (`crates/devflow-cli/src/preflight.rs:259-262`, `:294-297`).
+  2. The pre-authored plan must also be on the base, but for a different reason: the 49.1 worktree
+     forks from `workspace/denniyahh` and must **inherit** the plan and its seeded checkpoint. The
+     first draft wrongly tied the plan to the reachability guard. A failure must be diagnosed against
+     the right mechanism. Sequencing is the planner's call. Both constraints are fixed.
 
 ### Ship target and blast radius
 
@@ -93,19 +130,27 @@ operator mandate.
     set incorrectly, shipping should happen to main". This review settled it as the split above; the
     file was not changed.
 
-- **D-07 (Operator): Human Ship gate, no `--yes-ship`.** Everything through Validate runs unattended.
-  The Ship gate blocks so the operator can see both targets before anything is pushed or merged.
-  - *Verified consequences the operator was shown:* `/gsd-ship` pushes the branch and runs
-    `gh pr create --base "${BASE_BRANCH}"` (`~/.claude/gsd-core/workflows/ship.md:370-374`). It **never
-    merges the PR** (no `gh pr merge` in `ship.md`). A branch forked from `workspace/denniyahh` would
-    show **2358 commits / 1263 files** against `origin/main` (measured at `e9c6de3`), so that PR is
-    public on GitHub. DevFlow's Merge hook merges locally into `workspace/denniyahh`
-    (`hooks.rs:180-235`, `hooks_after_ship` `:115-122`).
-  - **If the operator rejects at the Ship gate,** the merge target is recorded as *proposed, not
+- **D-07 [REVISED after review] (Operator): Let `/gsd-ship` open its PR to `main`, observe it, and
+  close it unmerged. The human Ship gate (no `--yes-ship`) guards the local steps only.**
+  - *The first draft's premise was false, and Claude asserted it without checking.* The operator was
+    told the gate lets them "see both targets before anything is pushed". **Verified:** the Ship gate
+    fires only after the Ship agent exits. `pipeline_launch.rs:1746` routes `Stage::Ship` to
+    `handle_ship_outcome`, whose doc reads "Decide what happens after the Ship stage completes"
+    (`crates/devflow-cli/src/pipeline_outcomes.rs:828-850`). The Ship prompt runs `/gsd-ship`
+    (`prompt.rs:251`), which pushes (`ship.md:190-202`) and runs
+    `gh pr create --base "${BASE_BRANCH}"` (`ship.md:370-374`) before that. The gate therefore protects
+    only `hooks_after_ship`: Merge, VersionBump, ChangelogAppend and BranchCleanup (`hooks.rs:115-122`).
+  - **The PR against `main` is the observed GSD ship target.** It is evidence for criterion 2.
+    `/gsd-ship` never merges it (no `gh pr merge` in `ship.md`). A plan task closes it unmerged after
+    the evidence is captured.
+  - *Verified exposure:* the repo is **public**, but `workspace/denniyahh` is already pushed to
+    `origin`, so the PR exposes no new content. It would show about **2358 commits / 1263 files** against
+    `origin/main` (measured at `e9c6de3`). The cost is one noisy PR plus the CI runs it triggers.
+  - **Rejected:** halting with `--until validate` and resuming into Ship. It adds a human boundary only
+    to avoid a PR whose content is already public.
+  - **If the operator rejects at the Ship gate,** the DevFlow merge target is recorded as *proposed, not
     executed*, and criterion 2 stays unmet. That is an escalation for re-planning with the operator. It
     does not count as an attempt (D-11).
-  - **Research must establish:** where the Ship gate sits relative to `/gsd-ship`'s push and PR creation
-    and to the post-Ship Merge hook. The gate is only protective if it comes before the push.
 
 - **D-08 (Operator): Post-Ship VersionBump / tag / changelog: observe, then undo.**
   - *Verified:* `version_bump` (`hooks.rs:294-353`) writes the new version into the version file,
@@ -147,6 +192,46 @@ operator mandate.
   new binary.** A fix changes the binary, and criterion 3 requires the positive and negative-control
   arms to come from the same build. The binary's identity (git SHA plus a checksum) is recorded with
   each arm. Rebuild before every launch after any commit (memory: dogfood rebuild-before-revalidate).
+  - **Retry mechanics (review finding, verified):** a second attempt finds the first attempt's worktree
+    and branch. `start` refuses with "worktree already exists … use --force", and `--force` removes the
+    worktree and **force-deletes** `feature/phase-49.1` (`crates/devflow-cli/src/parallel.rs:24-44`).
+    Before any `--force` relaunch, the plan preserves the previous attempt: its branch under an archive
+    ref and its `.devflow/` evidence copied out, so an attempt's evidence is never destroyed by the
+    next one.
+
+### Run mechanics (added after review)
+
+- **D-13 (Claude, remit): The launch checkout must be clean, and it is restored afterwards.**
+  *Verified:* the Merge hook runs `git checkout <base>` then `git merge --no-ff <feature>`
+  (`crates/devflow-core/src/git.rs:185-190`) in `ctx.project_root`, the **launch checkout** (the
+  operator's main checkout), not the phase worktree. `run_checkout_hooks` serialises it behind a
+  project lock (`pipeline_outcomes.rs:1019-1030`). The plan must:
+  - assert and record a clean main checkout on `workspace/denniyahh` immediately before launch and
+    again before approving the Ship gate;
+  - record the branch and HEAD before and after the post-Ship hooks;
+  - state the recovery for a local merge failure **after** the PR was already opened: the PR is
+    closed, and the checkout is reset to its recorded pre-merge HEAD.
+
+- **D-14 (Claude, remit): The negative-control fixture must be built to fail, and asserted on text.**
+  *Verified (all three lanes):* `scripts/scratch-dogfood-repo.sh` **writes** `.planning/config.json`
+  (`:187-191`, `{"workflow": {}}`), so used unmodified it cannot produce criterion 3's "refuses on the
+  missing `.planning/config.json`". The negative arm removes that file after scaffolding and commits the
+  removal. It then asserts on the refusal **text** ("no `.planning/config.json` under the launch root",
+  `preflight.rs` `unattended_config_condition`), not the exit code. It runs with `DEVFLOW_BASE_BRANCH`
+  scrubbed from the environment, so the persisted `"base_branch": "develop"` comes from the default arm
+  and not from a leaked variable. The positive arm asserts the opposite: config present, source
+  `ConfigFile`.
+
+- **D-15 (Claude, remit): Pin the agent.** Launch with an explicit `--agent claude`. The default is
+  claude (`crates/devflow-cli/src/main.rs:53`), but DECN-03 closes for claude only. The auto-decide
+  route checks `state.agent == AgentKind::Claude` (`pipeline_launch.rs:1777`), and preflight C2 also
+  admits antigravity, which would pass preflight and never reach the path. Record the claude CLI
+  version with each arm.
+
+- **D-16 (Claude, remit): Define the fork-point measurement.** `State` persists `base_branch` but no
+  fork SHA. "Observed fork point" means three values: the base ref's SHA read immediately before
+  `start`; the 49.1 worktree's HEAD immediately after creation, which must equal it; and
+  `git merge-base` of the feature branch and the base at Ship.
 
 ### Claude's Discretion
 
@@ -162,6 +247,13 @@ operator mandate.
 - How the live run is launched and supervised. **Constraint:** it must be owned outside any agent
   worktree or subagent turn (memory: long probes live outside agent worktrees; a worktree subagent
   cannot own a run that outlives its turn).
+- How the operator learns a gate is waiting. The run has three human gates: Define preflight, Code
+  preflight and Ship. *Verified:* gate notification is a no-op unless `DEVFLOW_GATE_NOTIFY_CMD` is set
+  (`crates/devflow-core/src/gates.rs:388-394`), and the production gate timeout defaults to 3 days
+  (`crates/devflow-cli/src/config_parse.rs`, `DEVFLOW_GATE_TIMEOUT_SECS`). The plan must name the
+  mechanism and the exact approve and reject commands. It must not leave them implicit.
+- The exact undo recipe for D-08 (new revert commits versus a reset to the recorded pre-hook HEAD). It
+  must keep the Merge's resync into `workspace/denniyahh` and remove only the bump, changelog and tag.
 
 </decisions>
 
@@ -229,11 +321,16 @@ operator mandate.
 
 ### Integration Points
 - **Validate runs the full suite during a live run.** 999.141 records that E2E tests write the real
-  `~/.cache/devflow/roots` and leak monitors. Research must establish whether that can interfere with
-  the live run's own state or root registry, since `phase7_cli.rs` spawns real monitors.
-- **Preflight in auto mode with a `blocking-human` checkpoint present.** 999.125 and 999.126 were fixed
-  in Phase 48 (CHKPT-01/02). Research must confirm the seeded checkpoint neither makes auto-mode
-  preflight refuse the launch nor escapes the Code-preflight scan.
+  `~/.cache/devflow/roots` and leak monitors. *Verified (codex):* `phase7_cli` spawns child DevFlow
+  processes without setting `HOME`, `XDG_CACHE_HOME` or `DEVFLOW_CACHE_DIR`
+  (`crates/devflow-cli/tests/phase7_cli.rs:130`), and cache resolution falls through to
+  `HOME/.cache/devflow` (`crates/devflow-core/src/registry.rs:46`). The registry is keyed per
+  `(project_root, phase)`, so this pollutes cross-root registry and monitor observations rather than
+  the live phase's state file (reasoned, not reproduced). Research must pick an isolation or
+  cleanup-and-verify protocol before SURV-01 or monitor observations are recorded. An env override on
+  the launch would also move the live run's own registry, so it is not a free fix.
+- **Preflight in auto mode with a `blocking-human` checkpoint present.** This was resolved by the
+  review. It **does** refuse, by design, and the operator approves both preflight gates (D-03).
 
 </code_context>
 

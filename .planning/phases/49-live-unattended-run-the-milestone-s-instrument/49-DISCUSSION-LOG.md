@@ -138,6 +138,35 @@ Restatement confirmed, with the verified consequence shown (gsd-ship opens but n
 
 ---
 
+## Post-review re-decisions (adversarial review of CONTEXT at `0531ef5`)
+
+Three lanes (codex, DeepSeek `deepseek-flash` via pi, agy) completed with 35/59/43 citations; all three
+independently found the same four defects, each checked in source by the orchestrator. Raw output:
+`~/.cache/devflow-review/phase49-context-0531ef5/`.
+
+**Seeded checkpoint:** auto-mode preflight refuses any plan declaring `blocking-human`
+(`preflight.rs:1076-1080`), and auto-decide only fires for a set a human approved at Code preflight.
+
+| Option | Description | Selected |
+|--------|-------------|----------|
+| Keep it; approve at preflight (Recommended) | Operator approves Define and Code preflight gates; then unattended | ✓ |
+| Drop it; fully unattended | DECN-03 recorded "never exercised" | |
+| Pre-seed gate responses | Pre-written approval; sidesteps a deliberate gate | |
+
+**Ship:** the Ship gate fires after `/gsd-ship` pushes and opens the PR (`pipeline_launch.rs:1746`).
+Claude had told the operator the gate prevents the push; that was asserted without checking and was
+wrong. Repo is public, but `workspace/denniyahh` is already on `origin`.
+
+| Option | Description | Selected |
+|--------|-------------|----------|
+| Let it open the PR, close after (Recommended) | PR to main is the observed ship target; closed unmerged | ✓ |
+| Halt before Ship, then resume | `--until validate`, inspect, `devflow resume` | |
+
+Claude (remit) additions from the review: D-13 clean launch checkout + restore, D-14 negative-control
+fixture removes config.json and asserts on text, D-15 `--agent claude`, D-16 fork-point measurement,
+D-12 retry preserves the prior attempt before `--force`; D-05 corrected (heading alone satisfies the
+reachability guard).
+
 ## Claude's Discretion
 
 - Evidence-capture layout; SURV-01 detection method; negative-control scratch repo location; launch and

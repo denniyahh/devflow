@@ -112,7 +112,7 @@ verification reads `stale` (see `## Active Phase`).
   runs the harness inside `cargo test`. Record an override; do not restore the file.
 - **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
 - **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); adversarial review of it pending, then `/gsd-plan-phase 49`.
+- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); adversarially reviewed and revised the same day (D-03/D-07 re-decided); next `/gsd-plan-phase 49`.
   Separate follow-up PR: the plan-linter P1 commits `5c18bc3`, `b9ee940`, `56f3466` (kept out of #218). The 48-20 code review's 4 warnings (test coverage
   and duplication, `48-REVIEW.md`) were left unfixed at close.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
@@ -961,7 +961,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Operator Next Steps
 
 - See `## Operator Next Steps` near the top of this file. Phase 47 is integrated and the Phase 48
-  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 context is gathered; the next command is `/gsd-plan-phase 49` after the CONTEXT review. Phase 47's verification stays
+  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 context is gathered; it was adversarially reviewed and revised; the next command is `/gsd-plan-phase 49`. Phase 47's verification stays
   `stale` by operator decision until a re-verify near milestone close.
 
 ## Accumulated Context
