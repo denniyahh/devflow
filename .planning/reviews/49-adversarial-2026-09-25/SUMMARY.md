@@ -4,15 +4,17 @@
 
 **Reviewed commit:** `0cf90204a6cc16d4112dd6f9ef15e8cb25af85c2`
 
-**Verdict:** BLOCK EXECUTION — resolve the confirmed critical/high findings before a live run.
+**Verdict at reviewed commit:** BLOCK EXECUTION — resolve the confirmed critical/high findings before a live run.
+The subsequent working-tree revision has not received an independent checker or adversarial re-review.
 
 ## Lanes
 
 - **Codex:** completed at high effort; raw report: `codex.md`.
-- **Antigravity:** authenticated but produced no report body; `antigravity.md` is retained as failed-lane evidence.
+- **Antigravity:** its report body arrived after this summary was first written; `antigravity.md` now contains five findings.
 - **Claude:** not run. The external-runtime request was rejected because sending internal planning documents to Claude was a new destination not covered by the approved Codex/Antigravity review scope.
 
-This is a single completed adversarial lane, not multi-model convergence.
+This is two completed adversarial lanes, not a convergence verdict: the plan revision that followed them has not had
+an independent second pass.
 
 ## Actionable Findings
 
@@ -32,6 +34,11 @@ This is a single completed adversarial lane, not multi-model convergence.
 14. **Medium — mutable phase-worktree tools judge evidence while watcher tools are immutable copies under the attempt directory.**
 
 See `codex.md` for evidence and non-binding remediation hints.
+
+Antigravity also flagged retry cleanup, narrow secret patterns, the Ship pre-push container-hook accommodation,
+evidence/verdict consistency, and backlog-number collisions. The subsequent plan revision assigns these to
+49-08, 49-16, the explicit 49-15 limits, the 49-15 verdict gate, and the 49-15 numbering rule respectively. These
+are plan changes, not evidence that the live commands work; see `antigravity.md` for the original findings.
 
 ## Limits
 

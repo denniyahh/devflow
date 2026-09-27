@@ -276,7 +276,7 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: 15 plans in 10 waves
+**Plans**: 18 plans in 11 waves
 
 **Wave 1**
 
@@ -286,10 +286,12 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
 - [ ] 49-04-PLAN.md *(no plan dependencies)* — `surv-watch.py`: SURV-01 writer attribution through inotify
 - [ ] 49-05-PLAN.md *(no plan dependencies)* — `undo-ship-hooks.sh`: guarded D-08 undo of bump, changelog and `v3.0.0`
 - [ ] 49-06-PLAN.md *(no plan dependencies)* — `ship-accommodations.sh`: ND-1 apply / record-secure / revert
+- [ ] 49-16-PLAN.md *(no plan dependencies)* — `secret-guard.sh`: one credential scan for the PR body and the committed evidence, plus the evidence sanitiser
 
 **Wave 2**
 
 - [ ] 49-07-PLAN.md *(depends on 49-02)* — `negctl.sh`: the criterion-3 negative arm, rehearsed on a real build
+- [ ] 49-17-PLAN.md *(depends on 49-01)* — ND-4 `code_review_depth_overrides: []` in config.json; 999.58 marked resolved; backlog entry to remove the override after #4633
 
 **Wave 3**
 
@@ -297,7 +299,7 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
 
 **Wave 4**
 
-- [ ] 49-09-PLAN.md *(depends on 49-01, 49-02, 49-03, 49-04, 49-05, 49-06, 49-07, 49-08)* — 49.1 plan checks, landing hop onto `workspace/denniyahh` (D-05), pre-launch check
+- [ ] 49-09-PLAN.md *(depends on 49-01, 49-02, 49-03, 49-04, 49-05, 49-06, 49-07, 49-08, 49-16, 49-17)* — 49.1 plan checks, landing hop onto `workspace/denniyahh` (D-05), pre-launch check
 
 **Wave 5**
 
@@ -317,11 +319,31 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
 
 **Wave 9**
 
-- [ ] 49-14-PLAN.md *(depends on 49-13)* — operator decisions on the two open items
+- [ ] 49-14-PLAN.md *(depends on 49-13)* — operator decisions: open item 2, and keep/delete of `origin/feature/phase-49.1`
 
 **Wave 10**
 
-- [ ] 49-15-PLAN.md *(depends on 49-14)* — `49-LIVE-RUN.md`, sanitised evidence, traceability
+- [ ] 49-18-PLAN.md *(depends on 49-14)* — 49.1 close-out to `develop` by the operator's `closeout-pr-now` route; workspace synced and pushed
+
+**Wave 11**
+
+- [ ] 49-15-PLAN.md *(depends on 49-18)* — `49-LIVE-RUN.md`, sanitised evidence, traceability
+
+**Post-completion integration gate:** After Phase 49 goal verification, `phase.complete` and the post-completion
+transition have written their final `.planning/` artifacts on `feature/phase-49`, merge that branch into
+`workspace/denniyahh` in the clean main checkout. First record whether `feature/phase-49` is already an ancestor and
+whether the final `49-LIVE-RUN.md` blob is present on the workspace; an absent blob is the negative control for the
+later presence and byte comparison. If either is already present, record why instead of treating a zero-change merge
+as proof of import.
+Resolve any `STATE.md` or `ROADMAP.md` conflict from the actual Phase 49 and 49.1 records; retain both phases' evidence
+and log any hand repair of GSD output. Then run `scripts/sync-workspace.sh` from `workspace/denniyahh`, check
+`scripts/check-workspace-divergence.sh origin/develop`, and push the workspace branch with its normal hooks. Require
+`feature/phase-49` to be an ancestor of the local and remote workspace refs and compare the Phase 49 planning paths
+there before calling the phase integrated. The final `49-LIVE-RUN.md` blob must match exactly on both branches;
+`STATE.md` and `ROADMAP.md` must be checked for both 49 and 49.1 rather than byte-compared, since the two branches
+recorded different events. `sync-workspace.sh` merges `develop` into the workspace; it does not import
+the Phase 49 worktree's planning commits by itself. If verification or `phase.complete` writes more planning commits
+after an earlier landing hop, repeat this final merge-back and check rather than treating the hop as final.
 
 ### Phase 50: Addressable Monitor Liveness
 
