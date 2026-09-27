@@ -5,16 +5,16 @@ milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
 current_plan: Not started
-status: planning
-stopped_at: Phase 49 adversarial review found 1 critical, 8 high and 5 medium plan hazards; revision required
-last_updated: "2026-09-25T19:16:36.551Z"
-last_activity: 2026-09-25
-last_activity_desc: Phase 49 adversarial review found blocking plan hazards; revision required
-state_head: 8760677c6e1aa41d6e33ca8171c77d45f5cdb8e4
+status: executing
+stopped_at: Phase 49 planned — 18 plans in 11 waves, revised after two adversarial review rounds and committed (a913495); ready to execute
+last_updated: "2026-09-27T21:48:54.705Z"
+last_activity: 2026-09-27
+last_activity_desc: Phase 49 plans revised after two adversarial review rounds and committed; ready to execute
+state_head: a913495c88834156ba7d50d1e244e0a3a7030510
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 51
+  total_plans: 54
   completed_plans: 36
   percent: 50
 ---
@@ -68,7 +68,7 @@ Phase 47 is complete (7/7 plans) and integrated: merged to `develop` via PR #213
 `workspace/denniyahh`. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
 `stale`: `.planning/ROADMAP.md` is one of its 48 covered files, and `phase.complete`'s own write in
 `4bb9504` changed it (the covered digest recomputed with that file reverted to `3fa9206` matches the
-recorded one). Phases 49-51 remain unplanned.
+recorded one). Phase 49 is planned (18 plans, 11 waves); Phases 50-51 remain unplanned.
 
 **The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
 survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
@@ -93,7 +93,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-23)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), not yet planned. Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), planned (18 plans) and ready to execute. Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
 verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
@@ -112,7 +112,7 @@ verification reads `stale` (see `## Active Phase`).
   runs the harness inside `cargo test`. Record an override; do not restore the file.
 - **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
 - **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); adversarially reviewed and revised the same day (D-03/D-07 re-decided); next `/gsd-plan-phase 49`.
+- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); planned 2026-09-25, revised after adversarial reviews on 2026-09-26 and 2026-09-27 (`49-REVIEWS.md`), committed `a913495`; next `/gsd-execute-phase 49` — preparatory waves 1-4, then the operator-owned live launch at 49-10. After Phase 49 verification and transition, the orchestrating session owns the ROADMAP post-completion gate: merge `feature/phase-49` into `workspace/denniyahh`, run `scripts/sync-workspace.sh`, verify the divergence check and the pushed ref.
   Separate follow-up PR: the plan-linter P1 commits `5c18bc3`, `b9ee940`, `56f3466` (kept out of #218). The 48-20 code review's 4 warnings (test coverage
   and duplication, `48-REVIEW.md`) were left unfixed at close.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
@@ -189,12 +189,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 49 — Live Unattended Run — The Milestone's Instrument
-Plans: 15 drafted plans in 10 waves; adversarial revision required
+Phase: 49 (Live Unattended Run — The Milestone's Instrument) — READY TO EXECUTE
+Plans: 18 plans in 11 waves; revised after the 2026-09-26 and 2026-09-27 adversarial reviews and committed (a913495)
 Current Plan: Not started
-Total Plans in Phase: 15
-Completed Plans: 0 of 15
-Status: Plan revision required
+Total Plans in Phase: 18
+Completed Plans: 0 of 18
+Status: Ready to execute
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-25 — Phase 49 adversarial review found blocking plan hazards; revision required
+Last activity: 2026-09-27 — Phase 49 plans revised after two adversarial review rounds and committed; ready to execute
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
@@ -954,14 +954,14 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-09-25T00:14:44.328Z
-**Stopped at:** Phase 49 context gathered
-**Resume file:** .planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-CONTEXT.md
+**Last session:** 2026-09-27
+**Stopped at:** Phase 49 plans revised and committed (a913495); ready to execute
+**Resume file:** None
 
 ## Operator Next Steps
 
 - See `## Operator Next Steps` near the top of this file. Phase 47 is integrated and the Phase 48
-  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 context is gathered; it was adversarially reviewed and revised; the next command is `/gsd-plan-phase 49`. Phase 47's verification stays
+  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 is planned (18 plans), reviewed twice and committed; the next command is `/gsd-execute-phase 49`. Phase 47's verification stays
   `stale` by operator decision until a re-verify near milestone close.
 
 ## Accumulated Context
