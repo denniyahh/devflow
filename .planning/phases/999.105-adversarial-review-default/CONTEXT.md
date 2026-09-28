@@ -39,7 +39,7 @@ default, gated part of the phase lifecycle — not an operator's ad-hoc step.
 ## Scope (to be decided in discuss-phase)
 
 - **Trigger:** discuss:post (CONTEXT) and plan:post (PLAN) — a gate before execute.
-- **Reviewers:** the `adversarial-review` skill (`~/.agents/skills/adversarial-review/`), defaulting
+- **Reviewers:** the `external-review` skill (`~/.agents/skills/external-review/`, `--lens adversarial`), defaulting
   to a diverse 2-3 reviewer set (e.g. claude/codex/antigravity).
 - **Feedback loop:** findings land in `REVIEWS.md` / `reviews/` and feed `gsd-plan-phase --reviews`
   (or a devflow-native equivalent); blocking findings gate execute.
@@ -48,8 +48,8 @@ default, gated part of the phase lifecycle — not an operator's ad-hoc step.
 
 ## References
 
-- `~/.agents/skills/adversarial-review/SKILL.md` — the reusable review procedure (model/effort
-  selection, review-root/CWD discipline, citation verification, consolidation).
+- `~/.agents/skills/external-review/SKILL.md` — the reusable review procedure (model/effort
+  selection, multi-lens architecture, review-root/CWD discipline, citation verification, consolidation).
 - `.planning/reviews/plan/SUMMARY.md` (Phase 36 worktree) — the concrete findings that motivated
   this item.
 - Upstream GSD-core GitHub issues (`@opengsd/gsd-core`) — if the promotion is wired as GSD
