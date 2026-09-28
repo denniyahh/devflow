@@ -7,10 +7,10 @@ current_phase_name: Live Unattended Run — The Milestone's Instrument
 current_plan: Not started
 status: executing
 stopped_at: Phase 49 planned — 18 plans in 11 waves, revised after two adversarial review rounds and committed (a913495); ready to execute
-last_updated: "2026-09-27T21:48:54.705Z"
+last_updated: "2026-09-28T19:10:45.199Z"
 last_activity: 2026-09-27
 last_activity_desc: Phase 49 plans revised after two adversarial review rounds and committed; ready to execute
-state_head: a913495c88834156ba7d50d1e244e0a3a7030510
+state_head: 2b12d84f0acf942bac293b26adc023bf5622b834
 progress:
   total_phases: 6
   completed_phases: 3
@@ -974,3 +974,4 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 
 - Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in
 - 999.97 filed and hotfixed (2026-08-07), no phase cycle: `devflow start --phase 35.1` was rejected by clap (`invalid digit found in string`) — the phase identifier was `u32` at 182 sites and `prompt.rs` globbed it as `{phase:02}`, so decimal phases could not be launched at all. Briefly filed as Phase 37 via `phase.add` and then withdrawn on the operator's call to fix it directly. Recording the tool defect while it is fresh: `phase.add` again placed the new entry at the document's last `---` (inside archived 999.25 prose, outside the active milestone window) and wrote neither the phase-table nor the Progress-table row.
+- Phase 49 edited: edited fields: goal, success_criteria (criterion 1), execution note — Phase 49 re-scoped to a disposable GSD project with one operator checkpoint per attempt (operator, 2026-09-28)

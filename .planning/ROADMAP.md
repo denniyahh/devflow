@@ -247,18 +247,20 @@ before Phase 49's live unattended run measures the chain.
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
-**Goal**: A real `devflow start --mode auto` run on this repository is recorded end to end against a
-configured base — fork point, preflight, unattended progression, and Ship merge target — so the
+**Goal**: A real `devflow start --mode auto` run against a disposable GSD project is recorded end to end
+against a configured base — fork point, preflight, unattended progression, and Ship merge target — so the
 milestone's earlier fixes are measured on a live chain rather than asserted from unit evidence.
 **Depends on**: Phases 46, 47, 48
 **Sequencing note**: Deliberate, not incidental. This run is the measuring instrument for the whole
 milestone; landing it before the wave-1/2 fixes would measure the defects rather than the chain.
+**Execution note**: The operator starts each attempt and answers any gates DevFlow raises; Phase 49's own
+execution pauses once for this, and the attempt is judged afterwards from recorded evidence.
 **Requirements**: VERIFY-01
 **Success Criteria** (what must be TRUE):
 
-  1. **Setup step, inside this phase, not a precondition:** this repository has no committed
-     `devflow.toml`, so a `base_branch` is configured here first. The run's persisted
-     `State::base_branch` then reads that configured value rather than the `develop` default.
+  1. **Setup step, inside this phase, not a precondition:** the disposable project commits a
+     `devflow.toml` with a non-default `base_branch`, and the run's persisted
+     `State::base_branch` reads that configured value rather than the `develop` default.
   2. The run is recorded fork point through Ship merge target: an observed fork point on the
      configured base, `unattended_config_condition = Holds`, unattended stage progression, and an
      observed Ship merge target. **The Ship merge target has never been observed at all** — this
