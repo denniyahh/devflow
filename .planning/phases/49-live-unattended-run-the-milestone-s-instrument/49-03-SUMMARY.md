@@ -104,9 +104,9 @@ status: complete
 
 ## Accomplishments
 
-- `snapshot-hook.sh [--no-notify] <launch> <root>` refuses unless `DEVFLOW_GATE_PHASE=1`, the stage matches `^[a-z]+$` and `.devflow/gates/01-<stage>.json` exists. Under `flock -w 30` it copies the contract's files into `gates/<seq>-<stage>/devflow/` and writes `git.txt` (8 keys, ABSENT for unreadable values), `env.txt`, `context.txt` (`printf '%s'` only) and a sorted `MANIFEST.sha256`. It then appends one `jq -c` ledger line. It always exits 0 and logs its own failures.
+- `snapshot-hook.sh [--no-notify] <launch> <root>` refuses unless `DEVFLOW_GATE_PHASE=1`, the stage matches `^[a-z]+$` and the launch dir holds that stage's phase-1 gate file (01-<stage>.json under .devflow/gates). Under `flock -w 30` it copies the contract's files into `gates/<seq>-<stage>/devflow/` and writes `git.txt` (8 keys, ABSENT for unreadable values), `env.txt`, `context.txt` (`printf '%s'` only) and a sorted `MANIFEST.sha256`. It then appends one `jq -c` ledger line. It always exits 0 and logs its own failures.
 - `collect-attempt.sh --attempt N` refuses while `state-01.json` exists (unless `--allow-state`). It prints `already collected` over a finished collection and builds in `collected.tmp`. It derives `outcome` from a `workflow_shipped` event for phase 1, enforces the stop-note rules and writes `verdict.json` atomically.
-- `tools/EVIDENCE-LAYOUT.md` is published: the contract copied verbatim, which later plans read.
+- `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/EVIDENCE-LAYOUT.md` is published: the contract copied verbatim, which later plans read.
 
 ## TDD Gate Compliance
 
@@ -195,3 +195,9 @@ None. No external service configuration required.
 ---
 *Phase: 49-live-unattended-run-the-milestone-s-instrument*
 *Completed: 2026-09-29*
+
+## Self-Check: PASSED
+
+- FOUND: tools/EVIDENCE-LAYOUT.md, tools/snapshot-hook.sh, tools/collect-attempt.sh, 49-03-SUMMARY.md (all under the phase dir)
+- FOUND commits: 0989321, 3dd5fad, 774b183, 088f92f, c36b5c1
+- Both task selftests re-run at 088f92f: 6 of 6 and 11 of 11 cases ok
