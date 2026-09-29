@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 4
+open_count: 5
 waived_count: 2
 fixed_count: 10
-total_count: 16
-last_updated: 2026-09-07T01:00:39.341Z
+total_count: 17
+last_updated: 2026-09-29T19:39:11.821Z
 ---
 
 # Broken Windows Ledger
@@ -31,6 +31,7 @@ last_updated: 2026-09-07T01:00:39.341Z
 | 14 | 46 | deviation | scripts/lint-plan-bashisms.sh | 89 | EXIT-trap cleanup callback has a scoped ShellCheck SC2329 suppression. | fixed |  | 2026-09-07T01:00:07.457Z | 2026-09-07T01:00:38.874Z |
 | 15 | 46 | deviation | crates/devflow-cli/tests/plan_bashism_scanner.rs | 400 | Rename status assertion uses direct slice membership to satisfy workspace Clippy. | fixed |  | 2026-09-07T01:00:07.688Z | 2026-09-07T01:00:39.114Z |
 | 16 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-09-PLAN.md |  | Verification regex reran with rg -e because this Ripgrep treats -E as an encoding flag. | fixed |  | 2026-09-07T01:00:07.933Z | 2026-09-07T01:00:39.341Z |
+| 17 | 49 | stub | scripts/scratch-dogfood-repo.sh | 79 | The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook) | open |  | 2026-09-29T19:39:11.821Z |  |
 
 ````json
 [
@@ -225,6 +226,19 @@ last_updated: 2026-09-07T01:00:39.341Z
     "reason": "",
     "recorded_at": "2026-09-07T01:00:07.933Z",
     "resolved_at": "2026-09-07T01:00:39.341Z"
+  },
+  {
+    "id": 17,
+    "kind": "stub",
+    "phase": "49",
+    "file": "scripts/scratch-dogfood-repo.sh",
+    "line": 79,
+    "description": "The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook)",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-29T19:39:11.821Z",
+    "resolved_at": null,
+    "milestone": "v3.0.0"
   }
 ]
 ````
