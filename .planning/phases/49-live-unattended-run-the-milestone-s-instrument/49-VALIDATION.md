@@ -32,7 +32,7 @@ created: "2026-09-28"
 - **After every task commit:** Run the touched tool's `--selftest` plus `shellcheck` / `ruff`
 - **After every plan wave:** Run every tool selftest
 - **Before `/gsd-verify-work`:** Full suite must be green
-- **Max feedback latency:** 30 seconds
+- **Max feedback latency:** 30 seconds for the faked selftests. Four gates run longer by design against real inputs: 49-05 Task 3 (real captures; `timeout 120`), 49-06 Task 3 (a `cargo test` that can exceed 30 s on a cold `target/`; no explicit bound, reason in its acceptance criteria), 49-07 Task 3 (real negative arm; `timeout 300`) and 49-09 Task 1 (real `prepare`, `timeout 900`, and the real auth probe, `timeout 300`). *(Note added in plan-phase revision, 2026-09-29, after checker iteration 3.)*
 
 ---
 
@@ -43,6 +43,8 @@ created: "2026-09-28"
 | 49-01-01 | 01 | 1 | REQ-{XX} | T-49-01 / — | {expected secure behavior or "N/A"} | unit | `{command}` | ✅ / ❌ W0 | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+
+*The row above is the template placeholder. `/gsd-validate-phase` fills this map from the executed plans (`status: draft` until then); plan-phase does not hand-fill it. Each plan's `<verify>` block is the per-task command in the meantime. (Note added in plan-phase revision, 2026-09-29.)*
 
 ---
 
