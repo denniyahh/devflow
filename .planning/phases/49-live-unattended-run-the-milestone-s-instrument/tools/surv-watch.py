@@ -86,6 +86,7 @@ CLOSING_SENTENCE = (
     "This is one observation of one run; "
     "it establishes nothing about SURV-01's guarantee either way."
 )
+SAW_NOTHING = "saw nothing: no state-file writes were observed in this log"
 
 
 # --------------------------------------------------------------------------
@@ -275,6 +276,9 @@ class Observation:
     writers: set[int] = field(default_factory=set)
     temp_writes: int = 0
     overlaps: list[Overlap] = field(default_factory=list)
+    # (overflow mono_ns, next record's mono_ns or None at end of log)
+    void_windows: list[tuple[int, int | None]] = field(default_factory=list)
+    stopped: bool = False
 
 
 def _load_records(log: Path) -> list[dict[str, Any]]:
@@ -293,7 +297,10 @@ def _load_records(log: Path) -> list[dict[str, Any]]:
 
 def observe(records: list[dict[str, Any]]) -> Observation:
     """Walk records in queue order; a window is open from a temp's create to its rename or delete."""
-    seen = Observation()
+    seen = Observation(
+        void_windows=_void_windows(records),
+        stopped=any(record["kind"] == "stopped" for record in records),
+    )
     open_windows: set[tuple[int, int]] = set()
     for record in records:
         kind = record["kind"]
@@ -316,18 +323,48 @@ def observe(records: list[dict[str, Any]]) -> Observation:
     return seen
 
 
+def _void_windows(records: list[dict[str, Any]]) -> list[tuple[int, int | None]]:
+    """A queue overflow drops events: blind from the overflow to the next record."""
+    windows: list[tuple[int, int | None]] = []
+    opened: int | None = None
+    for record in records:
+        if opened is not None:
+            windows.append((opened, int(record["mono_ns"])))
+            opened = None
+        if record["kind"] == "overflow":
+            opened = int(record["mono_ns"])
+    if opened is not None:
+        windows.append((opened, None))
+    return windows
+
+
 def render(seen: Observation) -> str:
     lines = [
         f"surv-watch analysis of {WATCH_LOG}",
         f"writers={len(seen.writers)}",
         f"temp_writes={seen.temp_writes}",
         f"interleaved_windows={len(seen.overlaps)}",
+        f"overflow_windows={len(seen.void_windows)}",
+        f"stop_marker={'present' if seen.stopped else 'absent'}",
     ]
+    if seen.temp_writes == 0:
+        lines.append(SAW_NOTHING)
     lines.extend(
         f"overlap pid={o.holder_pid} seq={o.holder_seq} with pid={o.creator_pid} "
         f"seq={o.creator_seq} at mono_ns={o.mono_ns}"
         for o in seen.overlaps
     )
+    lines.extend(
+        f"void window from mono_ns={start} to "
+        f"{'end of log' if end is None else f'mono_ns={end}'}"
+        " (queue overflow: events inside it were dropped and are not in the log)"
+        for start, end in seen.void_windows
+    )
+    if not seen.stopped:
+        lines.append(
+            "stop marker absent: the watcher did not record a clean stop, "
+            "so the log may end before the run did"
+        )
     lines.append(CLOSING_SENTENCE)
     return "\n".join(lines) + "\n"
 
@@ -346,8 +383,12 @@ def _atomic_publish(text: str, dest: Path) -> None:
 
 def analyze(out_dir: Path) -> int:
     """Publish out_dir/analysis.txt from out_dir/watch.jsonl."""
+    log = out_dir / WATCH_LOG
+    if not log.is_file():
+        print(f"{WATCH_LOG} ABSENT: {log}", file=sys.stderr)
+        return 2
     try:
-        records = _load_records(out_dir / WATCH_LOG)
+        records = _load_records(log)
     except AnalysisError as error:
         print(error, file=sys.stderr)
         return 2
