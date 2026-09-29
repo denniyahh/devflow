@@ -113,7 +113,9 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       `"base_branch": "develop"`) and correctly refused on the missing `.planning/config.json`.
       **The positive arm is wholly unverified** — nothing has run with `base_branch` set to a
       planning branch, and the Ship merge target has never been observed at all.
-      **Carries a setup step:** this repository has no committed `devflow.toml`.
+      **Carries a setup step:** the disposable project commits a `devflow.toml` with a non-default
+      `base_branch`, and the run's persisted `State::base_branch` must read that configured value
+      rather than the `develop` default (ROADMAP Phase 49 criterion 1, amended in `968b713`).
 
 ### Supervision (SUPV)
 
