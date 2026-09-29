@@ -497,14 +497,21 @@ esac
 DEST="${DEST:-${TMPDIR:-/tmp}/devflow-dogfood-scratch-$$}"
 
 # T-23-01 (Tampering, high, mitigate): refuse any destination inside this
-# checkout — resolve both to absolute paths and compare prefixes.
+# checkout — resolve both to absolute paths and compare prefixes. Widened as in
+# `unattended-drill.sh` (T-49-02-01): in a linked worktree `--show-toplevel` is
+# the worktree, not the primary checkout, and a scaffold landing in the primary
+# checkout is the 999.37 class of accident even when this runs from a worktree.
+GIT_COMMON_DIR="$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)"
+MAIN_CHECKOUT="$(dirname "$GIT_COMMON_DIR")"
 DEST_ABS="$(realpath -m -- "$DEST")"
-if [ "$DEST_ABS" = "$REPO_ROOT" ] || case "$DEST_ABS" in "$REPO_ROOT"/*) true ;; *) false ;; esac; then
-    echo "ERROR: refusing to scaffold inside this checkout ($REPO_ROOT)." >&2
-    echo "       Requested destination: $DEST_ABS" >&2
-    echo "       Pick a destination outside the checkout (e.g. under \$TMPDIR or ~)." >&2
-    exit 1
-fi
+for forbidden in "$REPO_ROOT" "$MAIN_CHECKOUT"; do
+    if [ "$DEST_ABS" = "$forbidden" ] || case "$DEST_ABS" in "$forbidden"/*) true ;; *) false ;; esac; then
+        echo "ERROR: refusing to scaffold inside this checkout ($forbidden)." >&2
+        echo "       Requested destination: $DEST_ABS" >&2
+        echo "       Pick a destination outside the checkout (e.g. under \$TMPDIR or ~)." >&2
+        exit 1
+    fi
+done
 
 if [ -e "$DEST_ABS" ]; then
     echo "ERROR: destination already exists: $DEST_ABS" >&2
