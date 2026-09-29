@@ -278,7 +278,37 @@ execution pauses once for this, and the attempt is judged afterwards from record
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: TBD
+**Plans**: 12 plans (6 waves); 49-11 is the single operator checkpoint for the live attempt
+
+**Wave 1**
+
+- [ ] 49-01-PLAN.md *(no plan dependencies)* — restate VERIFY-01's setup step, name the by-design Define and Code gates in criterion 2, retire the superseded decimal payload plan
+- [ ] 49-02-PLAN.md *(no plan dependencies)* — tracer: scaffold `--live-payload` integration topology with `--check` and `--selftest`; default mode byte-identical
+- [ ] 49-03-PLAN.md *(no plan dependencies)* — evidence layout contract, gate snapshot hook, post-run collector with a derived verdict
+- [ ] 49-04-PLAN.md *(no plan dependencies)* — SURV-01 inotify watcher and honest overlap analysis
+- [ ] 49-05-PLAN.md *(no plan dependencies)* — evidence sanitizer and committed-evidence scanner
+
+**Wave 2**
+
+- [ ] 49-06-PLAN.md *(depends on 49-02)* — payload plan with the seeded blocking-human decision, RED test, validation map, full pre-launch check
+- [ ] 49-07-PLAN.md *(depends on 49-02, 49-03)* — negative-arm driver and `--arm negative` checker, proven against the real binary
+
+**Wave 3**
+
+- [ ] 49-08-PLAN.md *(depends on 49-03, 49-07)* — `--arm positive`, `--pair` and the attempt gate
+- [ ] 49-09-PLAN.md *(depends on 49-03, 49-04, 49-06, 49-07)* — attempt launcher: prepare (rebuild, pin, scaffold) and start (private-repo checks, units, notify hook)
+
+**Wave 4**
+
+- [ ] 49-10-PLAN.md *(depends on 49-08, 49-09)* — operator runbook and host requirements
+
+**Wave 5**
+
+- [ ] 49-11-PLAN.md *(depends on 49-10)* — live attempt: one `checkpoint:human-action`, closed only by the attempt gate
+
+**Wave 6**
+
+- [ ] 49-12-PLAN.md *(depends on 49-01, 49-04, 49-05, 49-11)* — sanitized evidence, VERIFY-01 verdict, DECN-03 and SURV-01 records, backlog disposition
 
 **Post-completion integration gate:** After Phase 49 goal verification, `phase.complete` and the post-completion
 transition have written their final `.planning/` artifacts on `feature/phase-49`, merge that branch into
