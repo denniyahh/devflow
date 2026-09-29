@@ -484,9 +484,8 @@ def _refusal_problem(
     refusals = [
         line for line in result.stderr.splitlines() if line.startswith("refused: ")
     ]
-    missing = [n for n in needles if not any(n in line for line in refusals)]
-    if missing:
-        return f"no refusal line names {missing}"
+    if not any(all(needle in line for needle in needles) for line in refusals):
+        return f"no one refusal line names all of {list(needles)}"
     if dest.exists():
         return "destination exists after a refusal"
     return ""
@@ -668,16 +667,95 @@ CASES: tuple[tuple[str, Case], ...] = (
 RealCase = Callable[[Path, Path], str]
 
 
+# Never names the directory: it lives under the operator's home.
+REAL_ABSENT = "ABSENT: no *-stdout capture directly under the capture directory"
+
+
+def _real_captures(captures: Path) -> list[Path]:
+    """Every regular ``*-stdout`` file directly under ``captures`` (links excluded)."""
+    if not captures.is_dir():
+        return []
+    return sorted(
+        path
+        for path in captures.glob("*-stdout")
+        if path.is_file() and not path.is_symlink()
+    )
+
+
+def _refusal_names(result: subprocess.CompletedProcess[str]) -> list[str]:
+    """``<file>: <pattern>`` from refusal lines: capture file names and pattern names only."""
+    return [
+        line.removeprefix("refused: ")
+        for line in result.stderr.splitlines()
+        if line.startswith("refused: ")
+    ]
+
+
 def _case_real_publish(captures: Path, scratch: Path) -> str:
-    return "ABSENT: not implemented"
+    files = _real_captures(captures)
+    if not files:
+        return REAL_ABSENT
+    src = scratch / "src"
+    src.mkdir()
+    for file in files:
+        shutil.copyfile(file, src / file.name)  # a regular-file copy, never a link
+    dest = scratch / "dest"
+    result = _run("sanitize", str(src), str(dest))  # the host's real --home/--user
+    if result.returncode != 0:
+        return f"sanitize exited {result.returncode}: {_refusal_names(result)}"
+    clean = _run("scan", str(dest))
+    if clean.returncode != 0:
+        found = [line.rsplit(": ", 1)[-1] for line in clean.stdout.splitlines()]
+        return f"scan <dest> exited {clean.returncode}: {sorted(set(found))}"
+    # A second, independent count: plain substrings, no pattern boundaries.
+    spellings = home_spellings(Path.home())
+    spellings += escaped_spellings(spellings, getpass.getuser())
+    outputs = sorted(dest.iterdir())
+    left = sum(
+        spelling in out.read_text(encoding="utf-8")
+        for out in outputs
+        for spelling in spellings
+    )
+    if len(outputs) != len(files):
+        return f"{len(outputs)} outputs for {len(files)} captures"
+    if left:
+        return f"{left} home spelling(s) remain in the output"
+    size = sum(file.stat().st_size for file in files)
+    print(f"  info real sample: files={len(files)} bytes={size}")
+    return ""
 
 
 def _case_real_legacy_trips(captures: Path, scratch: Path) -> str:
-    return "ABSENT: not implemented"
+    files = _real_captures(captures)
+    if not files:
+        return REAL_ABSENT
+    hit = sum(
+        bool(LEGACY_30C_NAMED_ASSIGNMENT.search(file.read_text(encoding="utf-8")))
+        for file in files
+    )
+    print(f"  info legacy 30c raw pattern: files_hit={hit} of {len(files)}")
+    if not hit:
+        return "no capture trips 30c's raw pattern; the sample exercises nothing"
+    return ""
 
 
 def _case_real_planted_credential(captures: Path, scratch: Path) -> str:
-    return "ABSENT: not implemented"
+    files = _real_captures(captures)
+    if not files:
+        return REAL_ABSENT
+    largest = max(files, key=lambda path: (path.stat().st_size, path.name))
+    data = largest.read_bytes()
+    if not data.endswith(b"\n"):
+        data += b"\n"
+    value = _planted_credential_value()
+    src = scratch / "src"
+    src.mkdir()
+    (src / largest.name).write_bytes(data + _credential_line(value).encode("utf-8"))
+    dest = scratch / "dest"
+    result = _run("sanitize", str(src), str(dest))
+    if value in result.stdout + result.stderr:
+        return "output contains the planted value"
+    return _refusal_problem(result, dest, largest.name, "credential_named_assignment")
 
 
 REAL_CASES: tuple[tuple[str, RealCase], ...] = (
