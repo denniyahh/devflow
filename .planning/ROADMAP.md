@@ -263,8 +263,13 @@ execution pauses once for this, and the attempt is judged afterwards from record
      `State::base_branch` reads that configured value rather than the `develop` default.
   2. The run is recorded fork point through Ship merge target: an observed fork point on the
      configured base, `unattended_config_condition = Holds`, unattended stage progression, and an
-     observed Ship merge target. **The Ship merge target has never been observed at all** — this
-     criterion is the first observation of it, not a re-confirmation.
+     observed Ship merge target. Progression is unattended apart from the two preflight gates the
+     run parks at by design: Define and Code, each approved by the operator, because the payload
+     plan seeds a `blocking-human` checkpoint that no mode auto-approves (D-22). The Ship gate still
+     fires but is answered by `--yes-ship`, attributed in the gate ledger, and does not wait (D-23).
+     Any further gate is recorded as a deviation with its cause (R-6). **The Ship merge target has
+     never been observed at all** — this criterion is the first observation of it, not a
+     re-confirmation.
   3. The negative-control arm still holds when re-run against **this phase's binary**, not inherited
      from the 2026-09-03 capture: an unconfigured scratch repo forks from `develop` (persisted
      `"base_branch": "develop"`) and refuses on the missing `.planning/config.json`. Both arms must
@@ -316,15 +321,15 @@ transition have written their final `.planning/` artifacts on `feature/phase-49`
 whether the final `49-LIVE-RUN.md` blob is present on the workspace; an absent blob is the negative control for the
 later presence and byte comparison. If either is already present, record why instead of treating a zero-change merge
 as proof of import.
-Resolve any `STATE.md` or `ROADMAP.md` conflict from the actual Phase 49 and 49.1 records; retain both phases' evidence
-and log any hand repair of GSD output. Then run `scripts/sync-workspace.sh` from `workspace/denniyahh`, check
+Resolve any `STATE.md` or `ROADMAP.md` conflict from the actual Phase 49 records and log any hand repair of GSD
+output. Then run `scripts/sync-workspace.sh` from `workspace/denniyahh`, check
 `scripts/check-workspace-divergence.sh origin/develop`, and push the workspace branch with its normal hooks. Require
 `feature/phase-49` to be an ancestor of the local and remote workspace refs and compare the Phase 49 planning paths
 there before calling the phase integrated. The final `49-LIVE-RUN.md` blob must match exactly on both branches;
-`STATE.md` and `ROADMAP.md` must be checked for both 49 and 49.1 rather than byte-compared, since the two branches
+`STATE.md` and `ROADMAP.md` must be checked for Phase 49 rather than byte-compared, since the two branches
 recorded different events. `sync-workspace.sh` merges `develop` into the workspace; it does not import
 the Phase 49 worktree's planning commits by itself. If verification or `phase.complete` writes more planning commits
-after an earlier landing hop, repeat this final merge-back and check rather than treating the hop as final.
+after this merge-back, repeat the merge-back and check rather than treating the first one as final.
 
 ### Phase 50: Addressable Monitor Liveness
 
