@@ -1,6 +1,6 @@
 # Phase 49: Live Unattended Run — The Milestone's Instrument - Context
 
-**Gathered:** 2026-09-24 · **Updated:** 2026-09-28 (re-scope)
+**Gathered:** 2026-09-24 · **Updated:** 2026-09-28 (re-scope; post-review corrections R-1…R-10)
 **Status:** Ready for planning
 
 <domain>
@@ -51,8 +51,8 @@ a Claude entry as an operator mandate.
   live run: same binary, `--mode auto`, real agent, real GSD, real gates, real Ship. Only the target is
   disposable, which removes the production side effects (a public PR to `main`, a merge into
   `workspace/denniyahh`, the `v3.0.0` bump and tag) and every guard they required.
-- **D-18 (Operator): Each attempt is one `checkpoint:human-action`, judged afterwards.** The operator starts
-  the attempt and answers the gates DevFlow raises; Phase 49's own execution pauses once for this. An
+- **D-18 (Operator): Each attempt is one human-action checkpoint, judged afterwards.** (`checkpoint:human-action`.) The
+  operator starts the attempt and answers the gates DevFlow raises; Phase 49's own execution pauses once for this. An
   interrupted session re-asks the same question, which is harmless. No GSD plan tracks the run gate by gate.
 - **D-19 (Operator principle): Operate within GSD's current confines.** No workaround that makes GSD behave
   differently: no `status: halted` used as a failure marker, no wrapper plans re-running summarized plans, no
@@ -67,7 +67,7 @@ a Claude entry as an operator mandate.
   Validate stage runs, so Code and Validate do real work and can pass. Build it by extending
   `scripts/scratch-dogfood-repo.sh`, keeping its blast-radius guards (repo created outside any checkout,
   absolute-path-prefix refusal, repo-local git identity only). Use the smallest toolchain already on the host;
-  research confirms what the Validate stage runs in such a project.
+  research confirms what the Validate stage runs in such a project. *Corrected: see R-9.*
 - **D-03 (Operator, re-confirmed; payload adapted by delegation): Seed one `gate="blocking-human"`
   checkpoint** in the payload plan. It asks for a value with no answer derivable from the code (the analogue
   of the original "CI default budget value"), so a "Followed" result can show the comparison reasoning
@@ -82,22 +82,24 @@ a Claude entry as an operator mandate.
   *Verified:* Define is a no-op in a DevFlow launch and Plan keeps an existing PLAN.md
   (`crates/devflow-core/src/prompt.rs:374-380`, `:341`).
 - **D-21: The payload must not classify as a MAJOR bump.** DevFlow's MAJOR-bump gate opens at Ship preflight
-  and **cannot be auto-approved** (`crates/devflow-cli/src/preflight.rs:724-760`: it takes no `yes_ship`
+  and **cannot be auto-approved** (`crates/devflow-cli/src/preflight.rs:793-848`: it takes no `yes_ship`
   handling). Research confirms what the classifier reads (the comment says the commit range); the scaffold
-  and the payload plan make the bump MINOR or PATCH.
+  and the payload plan make the bump MINOR or PATCH. *Corrected: see R-8.*
 
 ### Gates (Claude, delegated, 2026-09-28)
 
-- **D-22: Exactly two human gates per attempt: Define preflight and Code preflight.** They follow from D-03
+- **D-22: Exactly two human gates per attempt — Define preflight and Code preflight.** They follow from D-03
   with D-04: at Define, "no plans yet" is deferred to Code (`preflight.rs:1068-1072`), but a pre-authored plan
   is already present, so Define gates too. The Define approval is a formality (it confirms the seeded
-  checkpoint is intentional); the Code approval records the auto-decide set DECN-03 needs.
+  checkpoint is intentional); the Code approval records the auto-decide set DECN-03 needs. *Happy path
+  only: see R-6.*
 - **D-23: Launch with `--yes-ship`. This changes the operator's D-07 (human Ship gate).** `--yes-ship`
   auto-approves the Ship gate once, with attribution (`crates/devflow-cli/src/pipeline_outcomes.rs:839`),
   and Phase 23 introduced it for exactly this purpose. D-07's gate existed to protect the real repository's
   local merge, bump and tag; a throwaway repository has nothing to protect, and criterion 2's merge target is
   observed from the run's events (`merge_result`). D-07's verified finding stands: the Ship gate fires only
   after `/gsd-ship` has pushed and opened the PR (`pipeline_outcomes.rs:828-850`, `ship.md:190-202,370-374`).
+  *Corrected: "once" and the `merge_result` observation are wrong; see R-2 and R-3.*
 - **Rejected:** zero gates (reverses D-03's reason, "DECN-03 would stay open past the milestone"); one gate
   through an agent-written plan (reverses D-04's reason).
 
@@ -109,12 +111,13 @@ a Claude entry as an operator mandate.
   their own account (an outward-facing action stays operator-owned); research confirms the `gh` auth scope
   needed. — **Reversibility:** one-way — deleting a throwaway repository destroys its branch and PR history,
   so all evidence must be captured locally first and the operator performs the deletion after Phase 49
-  verification.
+  verification. *Other outward effects: see R-10.*
 - **D-06 (Operator, adapted by delegation): Keep the two-base split inside the disposable project.**
   `devflow.toml` sets a non-default `base_branch` (for example `integration`), which satisfies amended
   criterion 1; GSD's ship and PR target stays the repository's `main` (`origin/HEAD`). This mirrors DevFlow's
   production topology, and `validate_base_branch` refuses `main` as a base by design
-  (`crates/devflow-core/src/config.rs:351`).
+  (`crates/devflow-core/src/config.rs:351`). *Corrected: GSD's PR base is not read from `origin/HEAD`
+  first, and `integration` must exist locally; see R-5.*
 - **D-25: The negative-control arm stays a local, unconfigured scratch repository** with no remote: it refuses
   at preflight before anything could be pushed. D-14 applies unchanged.
 - **D-26: Evidence committed to this repository is sanitized; the throwaway PR is private.** The evidence
@@ -129,12 +132,13 @@ a Claude entry as an operator mandate.
 - **D-27: A stopped attempt is answered at the checkpoint, and GSD's normal resume does the rest.** The
   operator replies `stopped: <what happened>`; the checkpoint plan fails its gate and writes no SUMMARY; a
   plain `/gsd-execute-phase 49` re-presents the checkpoint for the next attempt (GSD resume,
-  `execute-phase.md:1453-1457`). No halt marks, no wrapper plans.
+  `execute-phase.md:1453-1457`). No halt marks, no wrapper plans. **Mechanism corrected by R-1**: GSD has no
+  `stopped:` reply; the intent above is unchanged.
 - **D-28: The fix vehicle for a blocking DevFlow defect.** `/gsd-quick` for a contained fix; an inserted
   decimal phase (`/gsd-phase --insert 49 …`) when the fix needs a design decision or crosses crates. The
   operator confirms the vehicle at the stop. Fixes go through DevFlow's normal tests and pre-push gate on its
   own branches, and the binary is rebuilt before the next attempt (D-12). A cause inside the payload is fixed
-  in the disposable project's pre-authored plan, not in DevFlow.
+  in the disposable project's pre-authored plan, not in DevFlow. *The phase-worktree guard applies: see R-4.*
 
 ### Carried unchanged (Claude, remit — from 2026-09-24)
 
@@ -151,18 +155,90 @@ a Claude entry as an operator mandate.
   before `start`; the payload worktree's HEAD just after creation (must equal it); and `git merge-base` of the
   feature branch and the base at Ship.
 
+### Post-review corrections (Claude, delegated, 2026-09-28 — adversarial review of `066251f`)
+
+Source: `.planning/reviews/49-adversarial-2026-09-28-context/SUMMARY.md`. Three external lanes reviewed the
+decisions, and every finding was re-verified against source. These correct the mechanism or the evidence
+behind delegated decisions. No operator decision changes. Where a decision above and this block disagree,
+this block wins. The operator approved applying them before planning.
+
+- **R-1 (D-27 mechanism).** GSD has no `stopped:` reply.
+  - A `checkpoint:human-action` resumes on `"done"`. A failing `<verify>` makes GSD inform the operator and
+    wait (`execute-plan.md:346-348`).
+  - Any other reply spawns a continuation agent, and the loop runs until the plan completes or the user stops
+    (`execute-phase.md:1066-1073`). An unresolvable checkpoint offers "Abort phase execution?"
+    (`execute-phase.md:1451`).
+  - Resume restarts the first plan without a SUMMARY at its Task 1 (`execute-phase.md:327,1455`).
+  - A plan that has commits but no SUMMARY is an illegal partial state (`execute-plan.md:16-20`).
+
+  Therefore the live-attempt plan holds exactly one task, the `checkpoint:human-action`, and makes no commit
+  before the operator's `done`. Its `<verify>` reads the attempt's evidence record, never the reply text. To
+  stop an attempt, the operator records the stop in that evidence and stops execution without answering
+  `done`. The plan keeps no SUMMARY and no commits, and the next `/gsd-execute-phase 49` restarts it at
+  Task 1, which is the checkpoint.
+- **R-2 (D-23 and criterion 2 evidence).** `merge_result` carries only `merged` and `branch`
+  (`crates/devflow-core/src/hooks.rs:201-202,213-214,231-232`); the target appears only in a log line. The
+  Ship merge target is observed from git in the launch checkout, using the merge on `integration` and
+  `git merge-base --is-ancestor`, read together with the persisted `State::base_branch`. `merge_result` only
+  shows that a merge happened.
+- **R-3 (D-23 scope).** `--yes-ship` is never cleared: non-test code only ever sets `state.yes_ship = true`.
+  It therefore auto-approves every routine Ship gate in the run, not just one. It cannot answer the
+  MAJOR-bump gate or a terminal-hook retry gate.
+- **R-4 (D-28 vehicle).** While `feature/phase-49` has a worktree, the pre-commit guard refuses staged
+  `crates/*` on any other branch (`scripts/lint-phase-worktree.sh:93-112`). A `/gsd-quick` fix on its own
+  branch needs `DEVFLOW_ALLOW_OFF_WORKTREE=1` (`:23,40`), never `--no-verify`. An inserted decimal phase may
+  also move `current_phase`, which the guard reads (unverified). The operator still confirms the vehicle at
+  the stop.
+- **R-5 (D-06 topology).**
+  - GSD's PR base is `gsd_run query git.base-branch` (`ship.md:46,373`). It reads the `git.base_branch`
+    config key first and falls back to `origin/HEAD`. The scaffold sets it to `main` explicitly.
+  - `integration` must be a local branch at `start` (`crates/devflow-cli/src/commands.rs:405`) and must carry
+    the payload phase (`:456`).
+  - Pushing `integration` is optional; DevFlow fails open for a local-only base
+    (`crates/devflow-cli/src/preflight.rs:556-574`).
+- **R-6 (D-22 count).** "Exactly two" is the happy path. A preflight failure, the Validate failure ceiling, a
+  terminal-hook failure or a MAJOR classification each add a gate. A Validate→Code loop-back likely adds a
+  Code gate too, because the checkpoint condition ignores prior approval (`preflight.rs:1067-1083`; reasoned).
+  The judging plan records any extra gate as a deviation, with its cause.
+- **R-7 (evidence collection, Claude's Discretion).** The auto-decide resume opens no gate
+  (`crates/devflow-cli/src/pipeline_launch.rs:1886-1887`), so no gate-open snapshot sees DECN-03's resumed
+  turn.
+  - Gate snapshots keep the state around each gate.
+  - The resumed turn is collected after the run from `.devflow/history/phase-<N>/` and the Claude transcript.
+    Set `capture_retention = 64`; the default is 12 (`crates/devflow-core/src/config.rs:36`).
+  - No timed runbook step is needed.
+- **R-8 (D-21 citation).** The MAJOR-bump gate is `preflight_major_bump_check`
+  (`crates/devflow-cli/src/preflight.rs:793-848`). The classifier is in `crates/devflow-core/src/version.rs`.
+  With no tags, it classifies all reachable non-merge history, and only `type!:` or a `BREAKING CHANGE:`
+  footer yields MAJOR.
+- **R-9 (D-20 Validate).** DevFlow runs no tests at Validate. The stage prompts `/gsd-validate-phase`
+  (`crates/devflow-core/src/prompt.rs:283-321`), so "Validate does real work" means GSD's validation of the
+  payload's own test.
+  - The Validate→Ship `DocsUpdate` hook runs `cargo doc`, which fails soft in a non-Rust project
+    (`crates/devflow-core/src/hooks.rs:100-104,237-253`).
+  - The payload declares no `external_verify`, because external probes run at every stage and would fail
+    Define and Plan.
+- **R-10 (D-24 outward effects).** Before any deletion, an attempt:
+  - pushes the feature branch;
+  - opens a PR;
+  - pushes a ship-note commit;
+  - may push an empty CI commit (`ship.md:190-202,370-374,487-521`).
+
+  GitHub notifications and Actions usage follow. The runbook records these effects and the `gh` account and
+  scopes, and it removes DevFlow's per-project registry entry under `~/.cache/devflow`.
+
 ### Superseded by the 2026-09-28 re-scope
 
 Full text in git history (`2b12d84:…/49-CONTEXT.md`).
 
-- **D-01** (999.55 as the payload) → replaced by D-20. 999.55 stays in the backlog.
-- **D-02** (payload numbered Phase 49.1) → moot: the payload phase lives in the disposable project.
-- **D-05** (payload plan and ROADMAP heading on `workspace/denniyahh` before launch) → moot.
-- **D-07** (human Ship gate, PR to `main` closed unmerged) → replaced by D-23 and D-24.
-- **D-08** (observe, then undo the version bump, changelog and tag) → moot: they are observed and discarded
+- D-01 (999.55 as the payload) → replaced by D-20. 999.55 stays in the backlog.
+- D-02 (payload numbered Phase 49.1) → moot: the payload phase lives in the disposable project.
+- D-05 (payload plan and ROADMAP heading on `workspace/denniyahh` before launch) → moot.
+- D-07 (human Ship gate, PR to `main` closed unmerged) → replaced by D-23 and D-24.
+- D-08 (observe, then undo the version bump, changelog and tag) → moot: they are observed and discarded
   with the throwaway repository.
-- **D-09** (criterion 1 satisfied by `050ef7f`) → replaced by amended criterion 1 (`968b713`).
-- **D-13** (this repository's main checkout clean and restored) → moot: the run never touches it; the
+- D-09 (criterion 1 satisfied by `050ef7f`) → replaced by amended criterion 1 (`968b713`).
+- D-13 (this repository's main checkout clean and restored) → moot: the run never touches it; the
   disposable project's launch checkout is created fresh per attempt.
 
 ### Claude's Discretion
@@ -171,7 +247,8 @@ Full text in git history (`2b12d84:…/49-CONTEXT.md`).
   sufficient for `47-PHASE49-OBSERVATION.md`'s Followed / Not followed / Void classification, recording which
   turn carried which rule (`CODE_STAGE_POLICY` in turn 1, `checkpoint_auto_decide_prompt` in the resumed turn).
   The gate watcher's snapshot at each gate open should capture everything DECN-03 needs; research confirms,
-  because a capture that must happen while the run is parked is otherwise a timed runbook step.
+  because a capture that must happen while the run is parked is otherwise a timed runbook step. *Answered:
+  a gate snapshot cannot see the resumed turn; see R-7.*
 - **SURV-01 detection method.** Recorded as an observation either way; "no interleaving observed" must not be
   written up as confirming anything.
 - **Runbook form and supervision.** Owned outside any agent worktree or subagent turn (memory: long probes live
@@ -219,7 +296,11 @@ Full text in git history (`2b12d84:…/49-CONTEXT.md`).
 
 ### DevFlow behaviour the run exercises
 - `crates/devflow-cli/src/preflight.rs` — unattended-launch check stages (`:963-972`), plan-condition logic
-  (`:1060-1085`), auto-decide set recording (`:1432-1434`), MAJOR-bump gate (`:724-814`).
+  (`:1060-1085`), auto-decide set recording (`:1432-1434`), MAJOR-bump gate (`:793-848`).
+- `crates/devflow-core/src/version.rs` — the bump classifier the MAJOR-bump gate reads (R-8).
+- `scripts/lint-phase-worktree.sh` — the phase-worktree commit guard and its escape hatch (R-4).
+- `.planning/reviews/49-adversarial-2026-09-28-context/SUMMARY.md` — the review behind R-1…R-10, with
+  every finding re-verified and the rejected ones listed.
 - `crates/devflow-cli/src/pipeline_outcomes.rs` — Ship outcome handling (`:828-850`), `--yes-ship`
   auto-approval (`:839`).
 - `crates/devflow-core/src/config.rs` — `base_branch` doc, `validate_base_branch` (`:341-351`).

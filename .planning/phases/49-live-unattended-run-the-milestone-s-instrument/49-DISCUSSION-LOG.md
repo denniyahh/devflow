@@ -226,3 +226,30 @@ protecting this repository's local merge, bump and tag, which a throwaway reposi
 
 - 999.55 is no longer the payload; it stays in the backlog as its own future phase.
 - GSD re-run / resume / loop support: the operator is taking a proposal to the GSD maintainers outside DevFlow.
+
+---
+
+## Post-review corrections (adversarial review of CONTEXT at `066251f`)
+
+**Date:** 2026-09-28, during `/gsd-plan-phase 49`, before the planner ran.
+
+Three lanes completed and none dropped: agy (`gemini-3.8-flash-high`), codex (`gpt-5.6-terra`) and DeepSeek
+(`deepseek-flash` via pi). The orchestrator re-checked every finding in source. Ten were confirmed and three
+rejected. The record is in `.planning/reviews/49-adversarial-2026-09-28-context/SUMMARY.md`.
+
+| Option | Description | Selected |
+|--------|-------------|----------|
+| Correct CONTEXT, continue | Dated R-1…R-10 block plus inline pointers, as the 09-24 round did; then planning continues | ✓ |
+| Re-run discuss-phase | Stop plan-phase; the operator revises the decisions in a new discuss session | |
+| Leave CONTEXT as is | Corrections live only in RESEARCH.md and the review record | |
+
+**User's choice:** Correct CONTEXT, continue.
+**Notes:**
+- Every correction touches a Claude-delegated decision (D-06, D-20…D-24, D-27, D-28, Claude's Discretion). No
+  operator-original decision changed.
+- D-27 keeps its intent. Its mechanism changed (R-1): GSD has no `stopped:` reply, so the live-attempt plan
+  holds only the checkpoint, and a stopped attempt ends with the operator stopping execution without `done`.
+- Formatting only: nine decision bullets that GSD's `parseDecisions` could not read were reformatted, with no
+  change of wording in any decision. They were D-18 and D-22 (a second colon inside the bold lead) and the
+  seven superseded entries (a bare `**D-NN**` lead). With them unfixed, the blocking decision-coverage gate
+  would have reported `could-not-parse`.
