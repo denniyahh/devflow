@@ -513,6 +513,147 @@ def _judge_unchanged(
     return CaseResult(name, True)
 
 
+TEMP_100 = ".state-01.json.100.1.tmp"
+TEMP_200 = ".state-01.json.200.1.tmp"
+
+
+def _rec(mono_ns: int, kind: str, name: str = "") -> dict[str, object]:
+    return {
+        "mono_ns": mono_ns,
+        "wall": "",
+        "kind": kind,
+        "dir": "/synthetic/.devflow",
+        "name": name,
+        "cookie": 0,
+    }
+
+
+def _synthetic_analysis(
+    out_dir: Path, records: list[dict[str, object]]
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    out_dir.mkdir()
+    text = "".join(json.dumps(record) + "\n" for record in records)
+    (out_dir / WATCH_LOG).write_text(text, encoding="utf-8")
+    return _run_analyze(out_dir), _analysis_lines(out_dir)
+
+
+def _fields_wrong(lines: list[str], expected: dict[str, str]) -> str:
+    """Each field must sit alone on exactly one line with the expected value."""
+    for key, value in expected.items():
+        keyed = [line for line in lines if line.startswith(f"{key}=")]
+        if keyed != [f"{key}={value}"]:
+            return f"{key} lines {keyed!r}, want [{key}={value!r}]"
+    return ""
+
+
+def _case_sequential(scratch: Path) -> CaseResult:
+    name = "analyze: sequential writer not flagged"
+    result, lines = _synthetic_analysis(
+        scratch / "sequential",
+        [
+            _rec(1, "watch_added"),
+            _rec(10, "create", TEMP_100),
+            _rec(11, "moved_from", TEMP_100),
+            _rec(11, "moved_to", "state-01.json"),
+            _rec(20, "create", TEMP_200),
+            _rec(21, "moved_from", TEMP_200),
+            _rec(21, "moved_to", "state-01.json"),
+            _rec(30, "stopped", "stop file"),
+        ],
+    )
+    if result.returncode != 0:
+        return CaseResult(name, False, f"analyze exit {result.returncode}")
+    wrong = _fields_wrong(
+        lines, {"writers": "2", "temp_writes": "2", "interleaved_windows": "0"}
+    )
+    words = _verdict_words(lines)
+    if wrong or words:
+        return CaseResult(name, False, wrong or f"verdict words {words}")
+    return CaseResult(name, True)
+
+
+def _case_overflow(scratch: Path) -> CaseResult:
+    name = "analyze: overflow recorded as a void window"
+    result, lines = _synthetic_analysis(
+        scratch / "overflow",
+        [
+            _rec(1, "watch_added"),
+            _rec(10, "create", TEMP_100),
+            _rec(11, "moved_from", TEMP_100),
+            _rec(500, "overflow"),
+            _rec(600, "create", TEMP_200),
+            _rec(601, "moved_from", TEMP_200),
+            _rec(700, "stopped", "SIGTERM"),
+        ],
+    )
+    if result.returncode != 0:
+        return CaseResult(name, False, f"analyze exit {result.returncode}")
+    wrong = _fields_wrong(lines, {"overflow_windows": "1"})
+    voids = [line for line in lines if line.startswith("void window")]
+    if wrong or len(voids) != 1:
+        return CaseResult(name, False, wrong or f"void window lines {voids!r}")
+    return CaseResult(name, True)
+
+
+def _case_missing_stop(scratch: Path) -> CaseResult:
+    """Paired control: the same log with a stopped record must say present."""
+    name = "analyze: missing stop marker recorded"
+    writes = [
+        _rec(1, "watch_added"),
+        _rec(10, "create", TEMP_100),
+        _rec(11, "moved_from", TEMP_100),
+    ]
+    _, lines = _synthetic_analysis(scratch / "no-stop", writes)
+    wrong = _fields_wrong(lines, {"stop_marker": "absent"})
+    if wrong:
+        return CaseResult(name, False, wrong)
+    _, lines = _synthetic_analysis(
+        scratch / "with-stop", [*writes, _rec(20, "stopped", "SIGTERM")]
+    )
+    wrong = _fields_wrong(lines, {"stop_marker": "present"})
+    if wrong:
+        return CaseResult(name, False, f"control with a stopped record: {wrong}")
+    return CaseResult(name, True)
+
+
+def _case_empty(scratch: Path) -> CaseResult:
+    name = "analyze: empty log reports saw nothing without a verdict"
+    result, lines = _synthetic_analysis(scratch / "empty", [])
+    if result.returncode != 0:
+        return CaseResult(name, False, f"analyze exit {result.returncode}")
+    saw_nothing = [line for line in lines if line.startswith("saw nothing")]
+    if len(saw_nothing) != 1:
+        return CaseResult(name, False, f"saw nothing lines {saw_nothing!r}")
+    wrong = _fields_wrong(
+        lines,
+        {
+            "writers": "0",
+            "temp_writes": "0",
+            "interleaved_windows": "0",
+            "overflow_windows": "0",
+            "stop_marker": "absent",
+        },
+    )
+    words = _verdict_words(lines)
+    if wrong or words:
+        return CaseResult(name, False, wrong or f"verdict words {words}")
+    return CaseResult(name, True)
+
+
+def _case_missing_log(scratch: Path) -> CaseResult:
+    name = "control: missing watch log refused"
+    out_dir = scratch / "no-log"
+    out_dir.mkdir()
+    result = _run_analyze(out_dir)
+    if result.returncode == 0:
+        return CaseResult(name, False, "analyze exited 0 without watch.jsonl")
+    if "watch.jsonl ABSENT" not in result.stderr:
+        return CaseResult(name, False, f"stderr {result.stderr.strip()!r}")
+    if (out_dir / ANALYSIS).exists():
+        return CaseResult(name, False, "analysis.txt was written")
+    return CaseResult(name, True)
+
+
 def selftest() -> int:
     """Run every case; print ok/FAIL lines and the SELFTEST summary line."""
     scratch = Path(tempfile.mkdtemp(prefix="surv-watch-selftest-"))
@@ -520,6 +661,14 @@ def selftest() -> int:
     try:
         (scratch / "live").mkdir()
         results.extend(_live_run(scratch / "live"))
+        for case in (
+            _case_sequential,
+            _case_overflow,
+            _case_missing_stop,
+            _case_empty,
+            _case_missing_log,
+        ):
+            results.append(case(scratch))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     for result in results:
