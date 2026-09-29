@@ -6,7 +6,7 @@ slug: "live-unattended-run-the-milestone-s-instrument"
 status: draft
 nyquist_compliant: false
 wave_0_complete: false
-created: "2026-09-25"
+created: "2026-09-28"
 ---
 
 # Phase 49 — Validation Strategy
@@ -19,20 +19,20 @@ created: "2026-09-25"
 
 | Property | Value |
 |----------|-------|
-| **Framework** | cargo test (49.1 structure); bash + jq evidence assertions (Phase 49) |
-| **Config file** | none — Wave 0 creates `.planning/phases/49-…/tools/` |
-| **Quick run command** | `cargo test -p devflow --test phase7_cli`; `bash .planning/phases/49-*/tools/check-evidence.sh "$EV"` |
-| **Full suite command** | `scripts/check.sh all` (container: `scripts/check-in-container.sh all`) |
-| **Estimated runtime** | ~49 seconds |
+| **Framework** | Script selftests (`--selftest` printing `  ok   <case>` lines and `SELFTEST passed=N failed=M`), `bash -n` + `shellcheck`, `ruff check` / `ruff format --check`, `python3 -m py_compile`; Rust suites only if a defect fix touches `crates/` |
+| **Config file** | none — each tool carries its own fixtures in temp dirs |
+| **Quick run command** | `bash <tool> --selftest` / `python3 <tool> --selftest` |
+| **Full suite command** | every tool selftest + `bash scripts/scratch-dogfood-repo.sh --selftest`; if `crates/` changed: `cargo test -p devflow-core --lib && cargo test -p devflow --bin devflow && scripts/check.sh all` |
+| **Estimated runtime** | ~30 seconds per tool selftest |
 
 ---
 
 ## Sampling Rate
 
-- **After every task commit:** Run the touched evidence tool's self-test (its negative control)
-- **After every plan wave:** Run `scripts/check.sh all`
+- **After every task commit:** Run the touched tool's `--selftest` plus `shellcheck` / `ruff`
+- **After every plan wave:** Run every tool selftest
 - **Before `/gsd-verify-work`:** Full suite must be green
-- **Max feedback latency:** 49 seconds
+- **Max feedback latency:** 30 seconds
 
 ---
 
@@ -48,12 +48,9 @@ created: "2026-09-25"
 
 ## Wave 0 Requirements
 
-- [ ] `tools/snapshot.sh` — read-only `.devflow/` + git facts per gate
-- [ ] `tools/gate-watch.sh` — poll, notify, ledger (planted-gate test)
-- [ ] `tools/surv-watch.py` — `--selftest` two-writer / one-writer controls
-- [ ] `tools/negctl.sh` — negative-control arm (refusal text asserted)
-- [ ] `tools/undo-ship-hooks.sh` — D-08 undo with refusing guards (scratch-repo test)
-- [ ] `tools/check-evidence.sh` — criteria 1-3 assertions
+- [ ] `scripts/scratch-dogfood-repo.sh --selftest` (new) — covers the setup step
+- [ ] Evidence tools (snapshot hook, attempt collector, negative-control driver, evidence checker, SURV watcher, sanitizer) — each with positive and negative selftest cases
+- [ ] Every PLAN `<automated>` block that uses bash-only syntax wrapped in `bash -c '…'` (pre-commit enforced)
 
 *If none: "Existing infrastructure covers all phase requirements."*
 
@@ -63,8 +60,8 @@ created: "2026-09-25"
 
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
-| DECN-03 Followed / Not followed / Void / not-exercised | VERIFY-01 c4 | classification is a judgement over the resumed-session capture (47-PHASE49-OBSERVATION.md) | `jq 'select(.event=="checkpoint_auto_decided")'` over events + transcript review |
-| Operator approvals at Define, Code, major-bump/Ship gates | VERIFY-01 c2 | human gates by design (D-03, D-07) | approve/reject commands named in the plan |
+| Live attempt (criteria 1-5 evidence produced) | VERIFY-01 | a real `devflow start --mode auto` run with operator-answered Define and Code gates (D-18, D-22) | the single `checkpoint:human-action` plan and its runbook; `<verify>` reads the attempt evidence record (R-1) |
+| DECN-03 Followed / Not followed / Void / not exercised | VERIFY-01 c4 | classification is a judgement over the resumed-session capture (`47-PHASE49-OBSERVATION.md`) | collected after the run from `.devflow/history/` and the Claude transcript (R-7) |
 
 *If none: "All phase behaviors have automated verification."*
 
@@ -76,7 +73,7 @@ created: "2026-09-25"
 - [ ] Sampling continuity: no 3 consecutive tasks without automated verify
 - [ ] Wave 0 covers all MISSING references
 - [ ] No watch-mode flags
-- [ ] Feedback latency < 49s
+- [ ] Feedback latency < 30s
 - [ ] `nyquist_compliant: true` set in frontmatter
 
 **Approval:** {pending / approved YYYY-MM-DD}
