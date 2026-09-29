@@ -149,3 +149,7 @@ None.
 ---
 *Phase: 49-live-unattended-run-the-milestone-s-instrument*
 *Completed: 2026-09-29*
+
+## Self-Check: PASSED
+
+Commits 7e60721, 6fbe022, a21ac87, ccbe6f7 resolve; SUMMARY exists; `git diff c0dd679 HEAD -- .planning/STATE.md` is empty.
