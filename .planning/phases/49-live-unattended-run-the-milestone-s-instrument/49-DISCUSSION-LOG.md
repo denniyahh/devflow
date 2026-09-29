@@ -265,3 +265,5 @@ rejected. The record is in `.planning/reviews/49-adversarial-2026-09-28-context/
 | Revision loop reached its 3-iteration cap with 1 warning open (the auth-failure diagnosis omitted the settings.json `env` source) | Guidance + one retry / Force proceed / Abandon | Guidance + one retry |
 | At the D-11 cap (three stopped attempts), how does the phase end? | Mark as failed: 49-11 closes on `verdict=cap_reached`, 49-12 writes "VERIFY-01: not met" / Checkpoint never closes, operator decides by hand | Mark as failed |
 | Does a run whose DevFlow monitor dies count as a spent attempt, with `devflow resume` excluded? | Agree / Disagree | Agreed |
+| How to fix the plan-set review findings (`45476bc`) | `--reviews` replan / Targeted revision now / Execute as is | Targeted revision now |
+| 49-09 real auth probe and 49-07 real negative arm (real HOME and registry) during autonomous execution | Isolate 49-07, gate 49-09 / Keep both autonomous / Gate both | Keep both autonomous |
