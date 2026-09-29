@@ -26,31 +26,189 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SELF = Path(__file__).resolve()
 TEST_HOME = "/var/home/tester"
 TEST_USER = "tester"
 
+HOME_TOKEN = "~"
+ESCAPED_HOME_TOKEN = "-HOME"
+EMAIL_TOKEN = "<email>"
+
+# Token shapes copied unchanged from 30c-monitor-env-harness.py:584-588.
+PREFIX_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("openai_key_prefix", re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")),
+    ("github_token_prefix", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{8,}")),
+    ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]{8,}={0,2}")),
+)
+
+# The lookbehinds anchor each match at the start of its character run, so a
+# long run (a base64 blob in a capture) costs linear time, not quadratic.
+UUID_PATTERN = re.compile(
+    r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}(?![0-9A-Fa-f])"
+)
+EMAIL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}"
+    r"(?![A-Za-z0-9-])"
+)
+
+
+# --------------------------------------------------------------------------- redaction
+
+
+def home_spellings(home: Path) -> tuple[str, ...]:
+    """The home path, its realpath and the /home <-> /var/home twin of each (30c:607-630)."""
+    direct = {str(home), os.path.realpath(home)}
+    candidates = direct | {_twin(spelling) for spelling in direct}
+    candidates -= {"", "/"}
+    return tuple(sorted(candidates, key=len, reverse=True))
+
+
+def _twin(spelling: str) -> str:
+    """Fedora Atomic exposes one home under both /home and /var/home."""
+    if spelling.startswith("/var/home/"):
+        return spelling.replace("/var/home/", "/home/", 1)
+    if spelling.startswith("/home/"):
+        return spelling.replace("/home/", "/var/home/", 1)
+    return spelling
+
+
+def escaped_spellings(spellings: tuple[str, ...], user: str) -> tuple[str, ...]:
+    """Claude-projects escaped forms: every non-alphanumeric becomes ``-``."""
+    escaped = {re.sub(r"[^A-Za-z0-9]", "-", spelling) for spelling in spellings}
+    if user:
+        escaped |= {f"-var-home-{user}", f"-home-{user}"}
+    return tuple(sorted(escaped, key=len, reverse=True))
+
+
+def _alternation(literals: tuple[str, ...], boundary: str) -> re.Pattern[str]:
+    return re.compile(
+        "(?:" + "|".join(map(re.escape, literals)) + ")" + f"(?![{boundary}])"
+    )
+
+
+@dataclass
+class Redactor:
+    """Everything the sanitizer replaces, resolved once per run."""
+
+    home_pattern: re.Pattern[str]
+    escaped_pattern: re.Pattern[str]
+    pseudonyms: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def build(cls, home: Path, user: str) -> Redactor:
+        spellings = home_spellings(home)
+        if not spellings:
+            raise ValueError("home resolves to no redactable spelling")
+        return cls(
+            home_pattern=_alternation(spellings, "A-Za-z0-9_-"),
+            escaped_pattern=_alternation(
+                escaped_spellings(spellings, user), "A-Za-z0-9_"
+            ),
+        )
+
+    def _pseudonym(self, match: re.Match[str]) -> str:
+        """``uuid-<n>`` by first appearance; equal ids (any case) map to equal pseudonyms."""
+        key = match.group().lower()
+        if key not in self.pseudonyms:
+            self.pseudonyms[key] = f"uuid-{len(self.pseudonyms) + 1}"
+        return self.pseudonyms[key]
+
+    def redact(self, text: str) -> str:
+        text = self.home_pattern.sub(HOME_TOKEN, text)
+        text = self.escaped_pattern.sub(ESCAPED_HOME_TOKEN, text)
+        text = EMAIL_PATTERN.sub(EMAIL_TOKEN, text)
+        return UUID_PATTERN.sub(self._pseudonym, text)
+
+    def findings(self, text: str) -> list[str]:
+        """Pattern NAMES that match ``text``. Never returns a matched value (30c:694-710)."""
+        found = [
+            name
+            for name, pattern in (
+                ("home_path", self.home_pattern),
+                ("home_path_escaped", self.escaped_pattern),
+                ("email_address", EMAIL_PATTERN),
+                *PREFIX_PATTERNS,
+            )
+            if pattern.search(text)
+        ]
+        return found
+
+
+# --------------------------------------------------------------------------- walk
+
+
+def _walk(root: Path) -> Iterator[Path]:
+    """Every entry under ``root`` in sorted path order, never following a symlink."""
+    for entry in sorted(root.iterdir()):
+        yield entry
+        if entry.is_dir() and not entry.is_symlink():
+            yield from _walk(entry)
+
+
+def _refuse(lines: list[str]) -> int:
+    for line in lines:
+        print(f"refused: {line}", file=sys.stderr)
+    return 1
+
 
 # --------------------------------------------------------------------------- sanitize / scan
 
 
-def sanitize(src: Path, dest: Path, home: Path, user: str) -> int:
-    """Stub: copies verbatim."""
-    shutil.copytree(src, dest)
+def sanitize(src: Path, dest: Path, redactor: Redactor) -> int:
+    """Publish a redacted copy of ``src`` at ``dest``, or publish nothing."""
+    # (redacted relative path, redacted text or None for a directory)
+    staged: list[tuple[Path, str | None]] = []
+    for entry in _walk(src):
+        rel = entry.relative_to(src)
+        out_rel = Path(*(redactor.redact(part) for part in rel.parts))
+        if entry.is_dir():
+            staged.append((out_rel, None))
+        else:
+            text = entry.read_bytes().decode("utf-8")
+            staged.append((out_rel, redactor.redact(text)))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{dest.name}.publish-", dir=dest.parent))
+    try:
+        problems: list[str] = []
+        for out_rel, text in staged:
+            target = tmp / out_rel
+            if text is None:
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            with target.open("xb") as handle:
+                handle.write(text.encode("utf-8"))
+            problems += [f"{out_rel}: {name}" for name in redactor.findings(text)]
+        if problems:
+            return _refuse(problems)
+        tmp.rename(dest)
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp)
     return 0
 
 
-def scan(paths: list[Path], home: Path, user: str) -> int:
-    """Stub: reports nothing."""
-    return 0
+def scan(paths: list[Path], redactor: Redactor) -> int:
+    """Print ``<file>: <pattern>`` per finding; exit 1 if there is any."""
+    problems: list[str] = []
+    for path in paths:
+        files = [path] if path.is_file() else [p for p in _walk(path) if p.is_file()]
+        for file in files:
+            text = file.read_bytes().decode("utf-8")
+            problems += [f"{file}: {name}" for name in redactor.findings(text)]
+    for line in problems:
+        print(line)
+    return 1 if problems else 0
 
 
 # --------------------------------------------------------------------------- selftest
@@ -231,11 +389,10 @@ def main(argv: list[str] | None = None) -> int:
         return selftest()
     if args.command is None:
         parser.error("a subcommand or --selftest is required")
-    home = args.home or Path.home()
-    user = args.user or getpass.getuser()
+    redactor = Redactor.build(args.home or Path.home(), args.user or getpass.getuser())
     if args.command == "sanitize":
-        return sanitize(args.src, args.dest, home, user)
-    return scan(args.paths, home, user)
+        return sanitize(args.src, args.dest, redactor)
+    return scan(args.paths, redactor)
 
 
 if __name__ == "__main__":
