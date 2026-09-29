@@ -125,7 +125,215 @@ note() { echo "[snapshot-hook] $*"; }
 # Hook mode.
 # ---------------------------------------------------------------------------
 
+# Where DevFlow puts the payload phase's worktree and branch (EVIDENCE-LAYOUT).
+PAYLOAD_WORKTREE_REL=".worktrees/phase-01"
+PAYLOAD_BRANCH="feature/phase-01"
+LEDGER_LOCK_WAIT_SECS=30
+NOTIFY_SEND_TIMEOUT_SECS=10
+
+# hook_log <root> <message>: append one timestamped line to
+# <root>/hook-errors.log, or to stderr when the root is unusable. Never fails.
+hook_log() {
+    local root="$1" msg="$2" stamp
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ 2> /dev/null || echo unknown-time)"
+    if [ -n "$root" ] && [ -d "$root" ] \
+        && printf '%s %s\n' "$stamp" "$msg" >> "$root/hook-errors.log" 2> /dev/null; then
+        return 0
+    fi
+    printf 'snapshot-hook: %s %s\n' "$stamp" "$msg" >&2 || true
+    return 0
+}
+
+# Inside take_snapshot (a `set -e` subshell): report and leave the subshell.
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+# git_value <cmd…>: the command's output, or the literal ABSENT when it fails or
+# prints nothing. An unreadable value is never an empty string or a false.
+git_value() {
+    local out
+    if out="$("$@" 2> /dev/null)" && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    else
+        printf 'ABSENT\n'
+    fi
+}
+
+# copy_devflow <launch>/.devflow <dest>: the files the contract names, as they
+# are at the instant the gate opened.
+copy_devflow() {
+    local src="$1" dst="$2" f
+    mkdir -p "$dst/gates"
+    for f in state-01.json events.jsonl phase-01-stdout; do
+        if [ -f "$src/$f" ]; then
+            cp -p "$src/$f" "$dst/$f"
+        fi
+    done
+    for f in "$src"/gates/01-*.json; do
+        if [ -f "$f" ]; then
+            cp -p "$f" "$dst/gates/"
+        fi
+    done
+    if [ -d "$src/history/phase-01" ]; then
+        mkdir -p "$dst/history"
+        cp -a "$src/history/phase-01" "$dst/history/phase-01"
+    fi
+}
+
+# write_git_txt <launch> <copied state file>: the eight git.txt keys.
+write_git_txt() {
+    local launch="$1" state="$2" wt="$1/$PAYLOAD_WORKTREE_REL"
+    local base="ABSENT" wt_ok=false status
+    if [ -f "$state" ]; then
+        base="$(jq -r '(.base_branch // "ABSENT") | tostring' "$state" 2> /dev/null || echo ABSENT)"
+    fi
+    # A linked worktree has a `.git` file; without this guard `git -C` on a plain
+    # directory would silently answer for the launch repository instead.
+    if [ -e "$wt/.git" ]; then
+        wt_ok=true
+    fi
+    printf 'base_branch=%s\n' "$(printf '%s' "$base" | tr '\n' ' ')"
+    if [ "$base" != "ABSENT" ] && [[ "$base" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+        printf 'base_head=%s\n' "$(git_value git -C "$launch" rev-parse --verify -q "refs/heads/$base^{commit}")"
+    else
+        printf 'base_head=ABSENT\n'
+    fi
+    printf 'main_head=%s\n' "$(git_value git -C "$launch" rev-parse --verify -q 'refs/heads/main^{commit}')"
+    if [ "$wt_ok" = true ]; then
+        printf 'worktree_head=%s\n' "$(git_value git -C "$wt" rev-parse --verify -q 'HEAD^{commit}')"
+    else
+        printf 'worktree_head=ABSENT\n'
+    fi
+    printf 'feature_head=%s\n' \
+        "$(git_value git -C "$launch" rev-parse --verify -q "refs/heads/$PAYLOAD_BRANCH^{commit}")"
+    if [ "$base" != "ABSENT" ] && [[ "$base" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+        printf 'merge_base=%s\n' \
+            "$(git_value git -C "$launch" merge-base "refs/heads/$PAYLOAD_BRANCH" "refs/heads/$base")"
+    else
+        printf 'merge_base=ABSENT\n'
+    fi
+    if [ "$wt_ok" = true ] && status="$(git -C "$wt" status --porcelain 2> /dev/null)"; then
+        if [ -z "$status" ]; then
+            printf 'worktree_status_lines=0\n'
+        else
+            printf 'worktree_status_lines=%s\n' "$(printf '%s\n' "$status" | wc -l)"
+        fi
+    else
+        printf 'worktree_status_lines=ABSENT\n'
+    fi
+    if [ "$wt_ok" = true ] && status="$(git -C "$wt" status --porcelain -- .planning/config.json 2> /dev/null)"; then
+        if [ -z "$status" ]; then
+            printf 'config_json_status=clean\n'
+        else
+            printf 'config_json_status=%s\n' "$(printf '%s\n' "$status" | head -1)"
+        fi
+    else
+        printf 'config_json_status=ABSENT\n'
+    fi
+}
+
+# write_manifest <dir>: sha256 of every file under <dir>, relative paths, sorted.
+write_manifest() {
+    local dir="$1"
+    (
+        cd "$dir"
+        find . -type f ! -path ./MANIFEST.sha256 ! -path ./MANIFEST.sha256.tmp -printf '%P\n' \
+            | LC_ALL=C sort | xargs -d '\n' -r sha256sum --
+    ) > "$dir/MANIFEST.sha256.tmp"
+    mv "$dir/MANIFEST.sha256.tmp" "$dir/MANIFEST.sha256"
+}
+
+# take_snapshot <launch> <root>: runs in a `set -e` subshell; prints the seq on
+# success, a reason on stderr and a non-zero exit on refusal or failure.
+take_snapshot() {
+    local launch="$1" root="$2"
+    local phase="${DEVFLOW_GATE_PHASE-}" stage="${DEVFLOW_GATE_STAGE-}"
+    local non_silent="${DEVFLOW_NON_SILENT_GATE:-ABSENT}"
+    [ -d "$launch" ] || fail "launch dir not found: $launch"
+    [ "$phase" = "1" ] || fail "refused: gate phase ${phase:-<unset>} is not the payload phase 1; nothing copied"
+    [[ "$stage" =~ ^[a-z]+$ ]] || fail "refused: gate stage '$stage' is not a lower-case stage name; nothing copied"
+    [ -f "$launch/.devflow/gates/01-$stage.json" ] \
+        || fail "refused: no gate file $launch/.devflow/gates/01-$stage.json; nothing copied"
+    p49_unset_git_local_env
+    launch="$(cd "$launch" && pwd)"
+    root="$(cd "$root" && pwd)"
+    mkdir -p "$root/gates"
+
+    exec 9>> "$root/ledger.lock"
+    flock -w "$LEDGER_LOCK_WAIT_SECS" 9 || fail "could not lock $root/ledger.lock within ${LEDGER_LOCK_WAIT_SECS}s"
+    local ledger="$root/ledger.jsonl" count=0 n seq dir tmp manifest_sha line
+    if [ -f "$ledger" ]; then
+        count="$(wc -l < "$ledger")"
+    fi
+    n=$((count + 1))
+    seq="$(printf '%03d' "$n")"
+    dir="$root/gates/$seq-$stage"
+    [ ! -e "$dir" ] || fail "snapshot directory already exists without a ledger line: $dir"
+    tmp="$root/gates/.tmp-$seq-$stage.$BASHPID"
+    rm -rf "$tmp"
+    mkdir -p "$tmp"
+    copy_devflow "$launch/.devflow" "$tmp/devflow"
+    write_git_txt "$launch" "$tmp/devflow/state-01.json" > "$tmp/git.txt"
+    printf 'phase=%s\nstage=%s\nnon_silent=%s\n' "$phase" "$stage" "$non_silent" > "$tmp/env.txt"
+    # Data only: the context is agent-influenced text and is never run.
+    printf '%s' "${DEVFLOW_GATE_CONTEXT-}" > "$tmp/context.txt"
+    write_manifest "$tmp"
+    mv "$tmp" "$dir"
+    manifest_sha="$(sha256sum "$dir/MANIFEST.sha256" | cut -d' ' -f1)"
+    line="$(jq -c -n --argjson seq "$n" --arg stage "$stage" --arg phase "$phase" \
+        --arg non_silent "$non_silent" --arg dir "$dir" --arg manifest_sha256 "$manifest_sha" \
+        --argjson t "$(date +%s)" \
+        '{seq: $seq, stage: $stage, phase: $phase, non_silent: $non_silent, dir: $dir,
+          manifest_sha256: $manifest_sha256, t: $t}')"
+    printf '%s\n' "$line" >> "$ledger"
+    printf '%s\n' "$seq"
+}
+
 hook_main() {
+    local notify=true launch root errf seq rc line logged=false
+    if [ "${1:-}" = "--no-notify" ]; then
+        notify=false
+        shift
+    fi
+    if [ "$#" -ne 2 ]; then
+        hook_log "" "usage: snapshot-hook.sh [--no-notify] <launch_dir> <snapshot_root> (got $# arguments)"
+        return 0
+    fi
+    launch="$1"
+    root="$2"
+    if ! mkdir -p "$root" 2> /dev/null; then
+        hook_log "" "snapshot root unusable: $root"
+        return 0
+    fi
+    if ! errf="$(mktemp 2> /dev/null)"; then
+        hook_log "$root" "mktemp failed; no snapshot taken"
+        return 0
+    fi
+    # errexit is re-enabled inside the substitution and must not be inherited
+    # as "ignored" from a caller's `if`/`||`, so this runs as a plain command.
+    set +e
+    seq="$(
+        set -e
+        take_snapshot "$launch" "$root" 2> "$errf"
+    )"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        while IFS= read -r line; do
+            hook_log "$root" "$line"
+            logged=true
+        done < "$errf"
+        if [ "$logged" = false ]; then
+            hook_log "$root" "snapshot failed with exit $rc and no message"
+        fi
+    fi
+    rm -f "$errf"
+    if [ "$rc" -eq 0 ] && [ "$notify" = true ]; then
+        timeout "$NOTIFY_SEND_TIMEOUT_SECS" notify-send "DevFlow gate: phase 1 ${DEVFLOW_GATE_STAGE-}" \
+            "snapshot $seq" > /dev/null 2>&1 || true
+    fi
     return 0
 }
 
@@ -328,6 +536,8 @@ case "${1:-}" in
         run_selftest
         ;;
     *)
+        # Hook mode never fails DevFlow's gate: whatever happens, exit 0.
+        trap 'exit 0' EXIT
         hook_main "$@"
         exit 0
         ;;
