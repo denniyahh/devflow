@@ -267,3 +267,5 @@ rejected. The record is in `.planning/reviews/49-adversarial-2026-09-28-context/
 | Does a run whose DevFlow monitor dies count as a spent attempt, with `devflow resume` excluded? | Agree / Disagree | Agreed |
 | How to fix the plan-set review findings (`45476bc`) | `--reviews` replan / Targeted revision now / Execute as is | Targeted revision now |
 | 49-09 real auth probe and 49-07 real negative arm (real HOME and registry) during autonomous execution | Isolate 49-07, gate 49-09 / Keep both autonomous / Gate both | Keep both autonomous |
+| Fix the three warnings in 49-12 T2's gate (checker on `9c95525`) | Fix all three / W2+W3 only / Proceed | Fix all three (`45f2763`) |
+| 49-03 collector for an attempt that never launched (no `.devflow/`) | Fix + final check / Proceed as is | Proceed as is (the general ABSENT rule at 49-03:26 applies; watch for it during execution) |
