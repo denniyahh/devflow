@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import shutil
@@ -325,12 +326,205 @@ def _case_scan_output(scratch: Path) -> str:
     return ""
 
 
+# Secret-shaped test values are assembled at runtime from fragments so that no
+# credential-shaped literal ever exists in this file (the gitleaks hook scans it).
+
+
+def _planted_github_token() -> str:
+    return "gh" + "p_" + ("A1b2" + "C3d4") * 4 + "E5f6"
+
+
+def _planted_credential_value() -> str:
+    """24 letters and digits: the credential value shape D-26 names."""
+    return ("q7" + "Zx" + "4m") * 4
+
+
+def _refusal_problem(
+    result: subprocess.CompletedProcess[str], dest: Path, *needles: str
+) -> str:
+    """ "" when ``result`` is a deliberate refusal naming every needle and nothing was published."""
+    if result.returncode == 0:
+        return "exited 0"
+    if "Traceback" in result.stderr:
+        return "crashed instead of refusing"
+    refusals = [
+        line for line in result.stderr.splitlines() if line.startswith("refused: ")
+    ]
+    missing = [n for n in needles if not any(n in line for line in refusals)]
+    if missing:
+        return f"no refusal line names {missing}"
+    if dest.exists():
+        return "destination exists after a refusal"
+    return ""
+
+
+def _case_symlink(scratch: Path) -> str:
+    src = _plant(scratch / "src", {"a.txt": "x\n"})
+    (src / "link").symlink_to("a.txt")
+    dest = scratch / "dest"
+    return _refusal_problem(_sanitize_planted(src, dest), dest, "link", "symlink")
+
+
+def _case_surviving_secret(scratch: Path) -> str:
+    token = _planted_github_token()
+    src = _plant(scratch / "src", {"a.txt": f"token {token}\n"})
+    dest = scratch / "dest"
+    result = _sanitize_planted(src, dest)
+    if token in result.stdout + result.stderr:
+        return "output contains the planted value"
+    return _refusal_problem(result, dest, "a.txt", "github_token_prefix")
+
+
+def _case_existing_dest(scratch: Path) -> str:
+    src = _plant(scratch / "src", {"a.txt": "x\n"})
+    dest = _plant(scratch / "dest", {"marker.txt": "keep\n"})
+    result = _sanitize_planted(src, dest)
+    if result.returncode == 0:
+        return "exited 0"
+    if "Traceback" in result.stderr or "refused: " not in result.stderr:
+        return "no deliberate refusal"
+    if sorted(p.name for p in dest.iterdir()) != ["marker.txt"]:
+        return "destination contents changed"
+    if (dest / "marker.txt").read_text(encoding="utf-8") != "keep\n":
+        return "marker changed"
+    return ""
+
+
+def _case_non_utf8(scratch: Path) -> str:
+    src = _plant(scratch / "src", {"bad.bin": b"ok\xff\n"})
+    dest = scratch / "dest"
+    return _refusal_problem(_sanitize_planted(src, dest), dest, "bad.bin")
+
+
+def _case_bare_username(scratch: Path) -> str:
+    text = f"owner={TEST_USER} repo={TEST_USER}/p49-live-attempt-1 by {TEST_USER}\n"
+    src = _plant(scratch / "src", {"a.txt": text})
+    result = _sanitize_planted(src, scratch / "dest")
+    if result.returncode != 0:
+        return f"sanitize exited {result.returncode}"
+    got = (scratch / "dest" / "a.txt").read_text(encoding="utf-8")
+    return "" if got == text else f"output {got!r}, want {text!r}"
+
+
+def _case_email(scratch: Path) -> str:
+    src = _plant(scratch / "src", {"a.txt": "contact someone@example.com now\n"})
+    result = _sanitize_planted(src, scratch / "dest")
+    if result.returncode != 0:
+        return f"sanitize exited {result.returncode}"
+    got = (scratch / "dest" / "a.txt").read_text(encoding="utf-8")
+    want = f"contact {EMAIL_TOKEN} now\n"
+    return "" if got == want else f"output {got!r}, want {want!r}"
+
+
+# 30c's raw-text named-assignment pattern (30c-monitor-env-harness.py:588-600),
+# kept ONLY as a selftest reference: the cases that must prove their sample
+# exercises the false-positive class this tool's decoded scan avoids.
+LEGACY_30C_NAMED_ASSIGNMENT = re.compile(
+    r"""["']?[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*["']?\s*[:=]\s*"""
+    r"""(?!["']?<redacted:)"""
+    r"""(?!["']?[0-9.]+(?:["'\s,}\]]|$))"""
+    r"""["']?[^\s"',}\]]{6,}""",
+    re.IGNORECASE,
+)
+
+
+def _stream_json(*events: object) -> str:
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def _usage() -> dict[str, int]:
+    return {
+        "input_tokens": 1234,
+        "output_tokens": 567,
+        "cache_read_input_tokens": 1234567,
+        "cache_creation_input_tokens": 89012,
+    }
+
+
+def _case_usage_counters(scratch: Path) -> str:
+    plan_text = (
+        "estimate:\n  raw_tokens: 30000\n  tokens: 60000\n  tasks: 3\n"
+        "key_links:\n  - from: tools/x.py\nkey: value_token\nsecrets: none\n"
+    )
+    json_text = '{"raw_tokens": 30000,\n "tokens": 60000}\nnext line\n'
+    capture = _stream_json(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": plan_text}],
+                "usage": _usage(),
+            },
+        },
+        {
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": json_text}]},
+        },
+        {"type": "result", "usage": _usage(), "total_cost_usd": 0.5},
+    )
+    if not LEGACY_30C_NAMED_ASSIGNMENT.search(capture):
+        return "30c's raw pattern does not hit the sample; it exercises nothing"
+    src = _plant(scratch / "src", {"0-stdout": capture})
+    result = _sanitize_planted(src, scratch / "dest")
+    if result.returncode != 0:
+        return f"sanitize exited {result.returncode}"
+    clean = _scan_planted(scratch / "dest")
+    return "" if clean.returncode == 0 else f"scan <dest> exited {clean.returncode}"
+
+
+def _credential_line(value: str) -> str:
+    return _stream_json(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": f'export API_KEY="{value}"\nnext\n',
+                    }
+                ]
+            },
+        }
+    )
+
+
+def _case_escaped_credential(scratch: Path) -> str:
+    value = _planted_credential_value()
+    cases = (
+        ("a", {"a.jsonl": _credential_line(value)}, "credential_named_assignment"),
+        ("b", {"b.json": json.dumps({"api_key": value})}, "credential_named_field"),
+    )
+    for label, files, pattern in cases:
+        src = _plant(scratch / f"src-{label}", files)
+        dest = scratch / f"dest-{label}"
+        result = _sanitize_planted(src, dest)
+        if value in result.stdout + result.stderr:
+            return f"{pattern}: output contains the planted value"
+        problem = _refusal_problem(result, dest, next(iter(files)), pattern)
+        if problem:
+            return f"{pattern}: {problem}"
+    return ""
+
+
 Case = Callable[[Path], str]
 CASES: tuple[tuple[str, Case], ...] = (
     ("sanitize: home paths in both spellings redacted", _case_home_paths),
     ("sanitize: escaped claude project paths redacted", _case_escaped_paths),
     ("sanitize: session ids pseudonymized consistently", _case_session_ids),
     ("scan: sanitized output passes the secret scan", _case_scan_output),
+    ("control: symlink in source refused", _case_symlink),
+    ("control: surviving secret refused and nothing published", _case_surviving_secret),
+    ("control: existing destination never overwritten", _case_existing_dest),
+    ("control: non-UTF-8 file refused", _case_non_utf8),
+    ("sanitize: bare username kept", _case_bare_username),
+    ("sanitize: email address redacted", _case_email),
+    (
+        "sanitize: stream-json usage counters and key names publish",
+        _case_usage_counters,
+    ),
+    (
+        "control: escaped credential inside a JSON string refused",
+        _case_escaped_credential,
+    ),
 )
 
 
