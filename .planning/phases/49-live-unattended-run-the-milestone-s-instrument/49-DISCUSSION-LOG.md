@@ -263,3 +263,5 @@ rejected. The record is in `.planning/reviews/49-adversarial-2026-09-28-context/
 | 49-01's planner-authored text: the REQUIREMENTS VERIFY-01 closing sentence, ROADMAP criterion 2, and the post-completion integration gate paragraph | Approve as written / Approve with edits / Gate it in 49-01 | Approve as written |
 | Commit `agent-env-names.txt` (the nested agent's environment variable names, no values) in 49-12's evidence (D-26) | Keep it local / Commit it | Keep it local |
 | Revision loop reached its 3-iteration cap with 1 warning open (the auth-failure diagnosis omitted the settings.json `env` source) | Guidance + one retry / Force proceed / Abandon | Guidance + one retry |
+| At the D-11 cap (three stopped attempts), how does the phase end? | Mark as failed: 49-11 closes on `verdict=cap_reached`, 49-12 writes "VERIFY-01: not met" / Checkpoint never closes, operator decides by hand | Mark as failed |
+| Does a run whose DevFlow monitor dies count as a spent attempt, with `devflow resume` excluded? | Agree / Disagree | Agreed |
