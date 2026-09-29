@@ -32,7 +32,7 @@ created: "2026-09-28"
 - **After every task commit:** Run the touched tool's `--selftest` plus `shellcheck` / `ruff`
 - **After every plan wave:** Run every tool selftest
 - **Before `/gsd-verify-work`:** Full suite must be green
-- **Max feedback latency:** 30 seconds for the faked selftests. Four gates run longer by design against real inputs: 49-05 Task 3 (real captures; `timeout 120`), 49-06 Task 3 (a `cargo test` that can exceed 30 s on a cold `target/`; no explicit bound, reason in its acceptance criteria), 49-07 Task 3 (real negative arm; `timeout 300`) and 49-09 Task 1 (real `prepare`, `timeout 900`, and the real auth probe, `timeout 300`). *(Note added in plan-phase revision, 2026-09-29, after checker iteration 3.)*
+- **Max feedback latency:** 30 seconds for the faked selftests. Four gates run longer by design against real inputs: 49-05 Task 3 (real captures; `timeout 120`), 49-06 Task 3 (a `cargo test` that can exceed 30 s on a cold `target/`; no explicit bound, reason in its acceptance criteria), 49-07 Task 3 (real negative arm; `timeout 300`) and 49-09 Task 1 (real `prepare`, `timeout 900`, and the real auth probe, `timeout 300`). *(Note added in plan-phase revision, 2026-09-29, after checker iteration 2.)*
 
 ---
 
