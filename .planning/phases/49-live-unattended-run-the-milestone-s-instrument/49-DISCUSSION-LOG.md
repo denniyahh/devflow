@@ -253,3 +253,13 @@ rejected. The record is in `.planning/reviews/49-adversarial-2026-09-28-context/
   change of wording in any decision. They were D-18 and D-22 (a second colon inside the bold lead) and the
   seven superseded entries (a bare `**D-NN**` lead). With them unfixed, the blocking decision-coverage gate
   would have reported `could-not-parse`.
+
+---
+
+## Operator decisions during plan-phase (2026-09-29)
+
+| Question | Options | Selected |
+|----------|---------|----------|
+| 49-01's planner-authored text: the REQUIREMENTS VERIFY-01 closing sentence, ROADMAP criterion 2, and the post-completion integration gate paragraph | Approve as written / Approve with edits / Gate it in 49-01 | Approve as written |
+| Commit `agent-env-names.txt` (the nested agent's environment variable names, no values) in 49-12's evidence (D-26) | Keep it local / Commit it | Keep it local |
+| Revision loop reached its 3-iteration cap with 1 warning open (the auth-failure diagnosis omitted the settings.json `env` source) | Guidance + one retry / Force proceed / Abandon | Guidance + one retry |
