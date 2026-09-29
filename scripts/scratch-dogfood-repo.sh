@@ -255,6 +255,124 @@ st_control_head_on_main() {
     case_ok "$name"
 }
 
+# The negative arm's fixture (D-14/D-25) is pinned by content: tree hashes
+# carry no timestamps, so they are deterministic where commit SHAs are not.
+# Measured at bc73b1b and re-measured at aaad4b9; one appended byte to
+# config.json gives 8ffe954e… instead.
+DEFAULT_TREE=f6120b337cb9b37d658c6111b7ac14694338dc56
+
+st_default_tree() {
+    local name="default mode: tree hash unchanged"
+    local dflt="$ST_TMP/dflt" rc=0 dev main_tree
+    bash "$SELF" "$dflt" >"$ST_TMP/dflt.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case_fail "$name" "default scaffold exited $rc: $(tail -n 1 "$ST_TMP/dflt.log")"
+        return
+    fi
+    dev="$(git -C "$dflt" rev-parse -q --verify 'develop^{tree}' 2>/dev/null || echo ABSENT)"
+    main_tree="$(git -C "$dflt" rev-parse -q --verify 'main^{tree}' 2>/dev/null || echo ABSENT)"
+    if [ "$dev" != "$DEFAULT_TREE" ] || [ "$main_tree" != "$DEFAULT_TREE" ]; then
+        case_fail "$name" "develop^{tree}=$dev main^{tree}=$main_tree, want $DEFAULT_TREE"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_default_branches() {
+    local name="default mode: develop checked out with only main and develop"
+    local dflt="$ST_TMP/dflt" head refs
+    if [ ! -d "$dflt/.git" ]; then
+        case_fail "$name" "precondition: no default scaffold at $dflt"
+        return
+    fi
+    head="$(git -C "$dflt" symbolic-ref -q HEAD 2>/dev/null || true)"
+    refs="$(git -C "$dflt" for-each-ref --format='%(refname)' refs/heads | tr '\n' ' ')"
+    if [ "$head" != refs/heads/develop ]; then
+        case_fail "$name" "HEAD is '${head:-unreadable}', want refs/heads/develop"
+        return
+    fi
+    if [ "$refs" != "refs/heads/develop refs/heads/main " ]; then
+        case_fail "$name" "local branches are '$refs', want exactly develop and main"
+        return
+    fi
+    case_ok "$name"
+}
+
+# st_guard_probe <name> <root>: scaffolding <root>/.p49-guard-probe-<pid> must
+# be refused for the right reason and leave nothing behind. If the guard fails
+# to refuse, remove exactly the probe path it created, and only after proving
+# it is that path: directly under <root>, carrying the probe name, and absent
+# before this case ran.
+st_guard_probe() {
+    local name="$1" root="$2"
+    local probe_name=".p49-guard-probe-$$"
+    local probe="$root/$probe_name" rc=0
+    if [ -z "$root" ] || [ ! -d "$root" ]; then
+        case_fail "$name" "precondition: root '$root' is not a directory"
+        return
+    fi
+    if [ -e "$probe" ]; then
+        case_fail "$name" "precondition: probe path already exists: $probe"
+        return
+    fi
+    bash "$SELF" "$probe" >"$ST_TMP/probe.out" 2>"$ST_TMP/probe.err" || rc=$?
+    if [ -e "$probe" ]; then
+        if [ "$(dirname -- "$probe")" = "$root" ] && [ "$(basename -- "$probe")" = "$probe_name" ]; then
+            rm -rf -- "$probe"
+        fi
+        case_fail "$name" "the scaffold was not refused (exit $rc) and created $probe; removed it"
+        return
+    fi
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "exit 0 without creating the probe; the refusal did not happen"
+        return
+    fi
+    if [ "$(st_count 'refusing to scaffold inside this checkout' "$ST_TMP/probe.err")" -lt 1 ]; then
+        case_fail "$name" "exit $rc but stderr lacks 'refusing to scaffold inside this checkout'"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_control_existing_dest() {
+    local name="control: refuses an existing destination"
+    local existing="$ST_TMP/existing" rc=0
+    mkdir "$existing"
+    if [ -n "$(find "$existing" -mindepth 1 -print -quit)" ]; then
+        case_fail "$name" "precondition: $existing is not empty"
+        return
+    fi
+    bash "$SELF" "$existing" >"$ST_TMP/existing.out" 2>"$ST_TMP/existing.err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "an existing destination was accepted (exit 0)"
+        return
+    fi
+    if [ "$(st_count 'destination already exists' "$ST_TMP/existing.err")" -lt 1 ]; then
+        case_fail "$name" "exit $rc but stderr lacks 'destination already exists'"
+        return
+    fi
+    if [ -n "$(find "$existing" -mindepth 1 -print -quit)" ]; then
+        case_fail "$name" "refused, but $existing is no longer empty"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_control_unknown_option() {
+    local name="control: unknown option refused"
+    local rc=0
+    bash "$SELF" --no-such-flag >"$ST_TMP/unknown.out" 2>"$ST_TMP/unknown.err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "--no-such-flag was accepted (exit 0)"
+        return
+    fi
+    if [ "$(st_count 'unknown option: --no-such-flag' "$ST_TMP/unknown.err")" -ne 1 ]; then
+        case_fail "$name" "exit $rc but stderr lacks 'unknown option: --no-such-flag'"
+        return
+    fi
+    case_ok "$name"
+}
+
 run_selftest() {
     # Hermetic: the host checkout's git environment and global/system config
     # (signing, hooks, excludes) may not leak into the scratch repositories.
@@ -269,6 +387,16 @@ run_selftest() {
     st_live_check_passes
     st_control_compact_config
     st_control_head_on_main
+    st_default_tree
+    st_default_branches
+    st_guard_probe "control: refuses a destination inside this checkout" "$REPO_ROOT"
+    # The main checkout, computed here independently of the guard's own
+    # variables: the parent of the absolute common git dir. From a linked
+    # worktree it differs from $REPO_ROOT, which is the gap this control covers.
+    st_guard_probe "control: refuses a destination inside the main checkout" \
+        "$(dirname -- "$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)")"
+    st_control_existing_dest
+    st_control_unknown_option
 
     echo "SELFTEST passed=$N_PASS failed=$N_FAIL"
     [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
