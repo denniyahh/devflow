@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
-current_plan: Not started
+current_plan: 6
 status: executing
-stopped_at: Phase 49 planned — 12 plans in 6 waves (76c21ca)
-last_updated: "2026-09-29T12:19:42.436Z"
+stopped_at: Phase 49 wave 1 complete (49-01..49-05) — wave 2 next
+last_updated: "2026-09-29T19:23:30.158Z"
 last_activity: 2026-09-29
-last_activity_desc: Phase 49 replanned for the disposable-project re-scope — 12 plans in 6 waves, plan checker passed (76c21ca)
-state_head: 76c21ca7844543ec92ea301b80c1c34b9c481ca7
+last_activity_desc: Phase 49 wave 1 complete — 5 of 12 plans (49-01..49-05)
+state_head: c0dd6796d2c644a299c51349478c93b633731486
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 48
-  completed_plans: 36
+  completed_plans: 41
   percent: 50
 ---
 
@@ -93,7 +93,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-23)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), re-scoped 2026-09-28 to a disposable GSD project with one operator checkpoint per attempt; context corrected after adversarial review and replanned (12 plans, 6 waves), ready to execute. Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), re-scoped 2026-09-28 to a disposable GSD project with one operator checkpoint per attempt; executing (12 plans, 6 waves). Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
 verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
@@ -189,12 +189,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 49 (Live Unattended Run — The Milestone's Instrument) — READY TO EXECUTE
+Phase: 49 (Live Unattended Run — The Milestone's Instrument) — EXECUTING
 Plans: 12 plans in 6 waves (49-11 is the single live-attempt checkpoint); plan checker passed 2026-09-29
-Current Plan: Not started
+Current Plan: 6
 Total Plans in Phase: 12
-Completed Plans: 0 of 12
-Status: Ready to execute
+Completed Plans: 5 of 12
+Status: Executing Phase 49
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-29 — Phase 49 replanned: 12 plans in 6 waves, plan checker passed (76c21ca)
+Last activity: 2026-09-29 — Phase 49 wave 1 complete: 49-01..49-05 (docs re-scope, live-payload scaffold, capture tools, SURV-01 watcher, sanitizer)
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 

@@ -283,15 +283,15 @@ execution pauses once for this, and the attempt is judged afterwards from record
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: 12 plans (6 waves); 49-11 is the single operator checkpoint for the live attempt
+**Plans**: 5/12 plans executed (6 waves); 49-11 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
-- [ ] 49-01-PLAN.md *(no plan dependencies)* — restate VERIFY-01's setup step, name the by-design Define and Code gates in criterion 2, retire the superseded decimal payload plan
-- [ ] 49-02-PLAN.md *(no plan dependencies)* — tracer: scaffold `--live-payload` integration topology with `--check` and `--selftest`; default mode byte-identical
-- [ ] 49-03-PLAN.md *(no plan dependencies)* — evidence layout contract, gate snapshot hook, post-run collector with a derived verdict
-- [ ] 49-04-PLAN.md *(no plan dependencies)* — SURV-01 inotify watcher and honest overlap analysis
-- [ ] 49-05-PLAN.md *(no plan dependencies)* — evidence sanitizer and committed-evidence scanner
+- [x] 49-01-PLAN.md *(no plan dependencies)* — restate VERIFY-01's setup step, name the by-design Define and Code gates in criterion 2, retire the superseded decimal payload plan
+- [x] 49-02-PLAN.md *(no plan dependencies)* — tracer: scaffold `--live-payload` integration topology with `--check` and `--selftest`; default mode byte-identical
+- [x] 49-03-PLAN.md *(no plan dependencies)* — evidence layout contract, gate snapshot hook, post-run collector with a derived verdict
+- [x] 49-04-PLAN.md *(no plan dependencies)* — SURV-01 inotify watcher and honest overlap analysis
+- [x] 49-05-PLAN.md *(no plan dependencies)* — evidence sanitizer and committed-evidence scanner
 
 **Wave 2**
 
@@ -540,7 +540,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
-| 49 | — | Not started | — |
+| 49 | 5/12 | In Progress|  |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
 
