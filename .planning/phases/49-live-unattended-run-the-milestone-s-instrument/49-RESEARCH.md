@@ -340,7 +340,7 @@ Flow for `devflow start --phase 1 --agent claude --mode auto --yes-ship <launch>
 | BranchCleanup | `git branch -d feature/phase-01` — fails because the branch is checked out in the worktree; the hook only warns (Reasoned) and returns Ok | hooks.rs:131-151 |
 | Pushes by the hooks | None found: no production call site of `GitFlow::push`/`delete_remote_branch` (Reasoned from a grep with a positive control that matched another `.push(branch` call) — `integration`'s merge, the tag and the changelog stay local | git.rs:309-326 |
 
-**Observing the merge target (criterion 2):** `merge_result`+`hook_run` events; `git rev-parse integration` before/after; `git log -1 --format=%P integration` (two parents, second = feature tip); `git merge-base --is-ancestor feature/phase-01 integration`; `main` unchanged locally and on origin; the PR's `baseRefName` is `main` (`gh pr view --json baseRefName,headRefName,state`). The two targets differ by design (D-06).
+**Observing the merge target (criterion 2):** `merge_result`+`hook_run` events; `git rev-parse integration` before/after; the merge commit located in `integration`'s history, not `integration`'s tip — `git rev-list --first-parent --merges <fork-point base_sha>..integration` yields exactly one merge, and `git log -1 --format=%P <that merge>` has two parents, the second = the feature tip recorded in the Ship gate snapshot (*corrected 2026-09-28, plan-check:* the tip-parent read recommended here before was wrong, because VersionBump tags and ChangelogAppend then commits `CHANGELOG.md` on `integration` after the merge, per the row above and `hooks.rs:115-122`, `:286`, `git.rs:185-190`, so a correct run's tip is a single-parent commit; adopted by 49-03's collector and 49-08's `positive: merged into integration`); `git merge-base --is-ancestor feature/phase-01 integration` (supporting only: BranchCleanup may delete the ref, A4); `main` unchanged locally and on origin; the PR's `baseRefName` is `main` (`gh pr view --json baseRefName,headRefName,state`). The two targets differ by design (D-06).
 
 ### D-14 — Negative-control refusal text (verbatim, Verified)
 
@@ -662,11 +662,14 @@ test "$(jq -r .base_branch "$SNAP/state-01.json")" = develop
 | A6 | GSD's verifier returns `passed` (not `human_needed`) for a phase containing an agent-resolved blocking-human decision | Pitfall 2 | Ship blocks → third gate; record as a finding, fix in the payload |
 | A7 | The illustrative option values (30/120/300 s) | Pattern 1 | None — any values work; the test accepts the offered set |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Does a Ship loop-back or Validate `gaps` still count toward D-22's "exactly two human gates"?** — What we know: those paths add a never-silent gate. Recommendation: the checker reports gate count and cause; the judging plan treats an extra gate as a recorded deviation, and D-11 counts only runs that end without reaching Ship.
+   **RESOLVED — recommendation adopted:** 49-08's `--arm positive` prints `NOTE gate_census` and one `NOTE deviation` line per gate beyond Define, Code and Ship, which never count as failures (R-6), and its `--attempt-gate` reaches `cap_reached` only from three attempts that ended stopped (D-11); 49-10's runbook records each unexpected gate in `deviations.txt`; 49-12 lists every deviation with its cause.
 2. **Where the tools live.** `.planning/phases/49-…/tools/` (superseded precedent) keeps them out of `develop` (cut-pr-branch filters `.planning/`); the scaffold extension in `scripts/` does reach `develop`. Recommendation: keep that split; the scaffold change must leave default output byte-identical (its existing callers include the negative arm).
+   **RESOLVED — recommendation adopted:** the tools live under `.planning/phases/49-…/tools/` (49-03, 49-04, 49-05, 49-07, 49-08, 49-09); the scaffold extension stays in `scripts/scratch-dogfood-repo.sh` (49-02, 49-06), and 49-02 Task 2 keeps its default mode byte-identical.
 3. **DECN-03 "Followed" needs the comparison reasoning in the final message.** If the resumed turn resolves the decision but writes terse reasoning, the classifier needs a rule for "partially followed." Recommendation: record verbatim and classify by the three-way standard only; flag borderline cases for the operator rather than inventing a fourth class (the "path not exercised" outcome is separate and allowed by criterion 4).
+   **RESOLVED — recommendation adopted:** 49-12 classifies by the three-way standard plus Path not exercised, quotes the reasoning and flags borderline cases for the operator, and adds no fourth class.
 
 ## Environment Availability
 
