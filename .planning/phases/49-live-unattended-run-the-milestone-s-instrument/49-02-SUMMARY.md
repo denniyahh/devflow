@@ -200,3 +200,9 @@ None.
 ---
 *Phase: 49-live-unattended-run-the-milestone-s-instrument*
 *Completed: 2026-09-29*
+
+## Self-Check: PASSED
+
+- Commits 26f0a5e, 7c50843, b29ab0a, 16287c2, 79f22e4 exist; e395235 (pre-amend) is not in history.
+- `scripts/scratch-dogfood-repo.sh` exists, index mode 100755; `--selftest` re-run: `SELFTEST passed=10 failed=0`.
+- Plan commits touch only the script, this SUMMARY and `.planning/WINDOWS.md`; STATE.md and ROADMAP.md untouched by any commit.
