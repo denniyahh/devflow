@@ -278,58 +278,7 @@ execution pauses once for this, and the attempt is judged afterwards from record
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: 18 plans in 11 waves
-
-**Wave 1**
-
-- [ ] 49-01-PLAN.md *(no plan dependencies)* — criteria 1-2 amended (D-09, D-03/D-07), Phase 49.1 promoted with TEST-02
-- [ ] 49-02-PLAN.md *(no plan dependencies)* — `check-evidence.sh`: criteria 1-3, fork-point triple, gate order
-- [ ] 49-03-PLAN.md *(no plan dependencies)* — `snapshot.sh` + `gate-watch.sh`: read-only gate evidence and notification
-- [ ] 49-04-PLAN.md *(no plan dependencies)* — `surv-watch.py`: SURV-01 writer attribution through inotify
-- [ ] 49-05-PLAN.md *(no plan dependencies)* — `undo-ship-hooks.sh`: guarded D-08 undo of bump, changelog and `v3.0.0`
-- [ ] 49-06-PLAN.md *(no plan dependencies)* — `ship-accommodations.sh`: ND-1 apply / record-secure / revert
-- [ ] 49-16-PLAN.md *(no plan dependencies)* — `secret-guard.sh`: one credential scan for the PR body and the committed evidence, plus the evidence sanitiser
-
-**Wave 2**
-
-- [ ] 49-07-PLAN.md *(depends on 49-02)* — `negctl.sh`: the criterion-3 negative arm, rehearsed on a real build
-- [ ] 49-17-PLAN.md *(depends on 49-01)* — ND-4 `code_review_depth_overrides: []` in config.json; 999.58 marked resolved; backlog entry to remove the override after #4633
-
-**Wave 3**
-
-- [ ] 49-08-PLAN.md *(depends on 49-03, 49-04, 49-07)* — `launch-attempt.sh`, `gate.sh`, `archive-attempt.sh`
-
-**Wave 4**
-
-- [ ] 49-09-PLAN.md *(depends on 49-01, 49-02, 49-03, 49-04, 49-05, 49-06, 49-07, 49-08, 49-16, 49-17)* — 49.1 plan checks, landing hop onto `workspace/denniyahh` (D-05), pre-launch check
-
-**Wave 5**
-
-- [ ] 49-10-PLAN.md *(depends on 49-09)* — live: operator launches attempt 1; Define gate (criteria 1 and 3)
-
-**Wave 6**
-
-- [ ] 49-11-PLAN.md *(depends on 49-10)* — live: Code gate; DECN-03 evidence capture
-
-**Wave 7**
-
-- [ ] 49-12-PLAN.md *(depends on 49-11)* — live: Ship-preflight gate, ND-1 accommodations, PR to `main`
-
-**Wave 8**
-
-- [ ] 49-13-PLAN.md *(depends on 49-12)* — live: Ship gate, merge target observed, D-08 undo, PR closed, accommodations reverted
-
-**Wave 9**
-
-- [ ] 49-14-PLAN.md *(depends on 49-13)* — operator decisions: open item 2, and keep/delete of `origin/feature/phase-49.1`
-
-**Wave 10**
-
-- [ ] 49-18-PLAN.md *(depends on 49-14)* — 49.1 close-out to `develop` by the operator's `closeout-pr-now` route; workspace synced and pushed
-
-**Wave 11**
-
-- [ ] 49-15-PLAN.md *(depends on 49-18)* — `49-LIVE-RUN.md`, sanitised evidence, traceability
+**Plans**: TBD
 
 **Post-completion integration gate:** After Phase 49 goal verification, `phase.complete` and the post-completion
 transition have written their final `.planning/` artifacts on `feature/phase-49`, merge that branch into
