@@ -13,9 +13,11 @@ SUBCOMMANDS
     scan <path>... [--home PATH] [--user NAME]
         Exits non-zero if any file holds a secret-shaped string or an unredacted
         home spelling. Prints file and pattern NAME only, never a matched value.
-    --selftest
+    --selftest [--real-captures DIR]
         Runs the cases below against planted values (``/var/home/tester``,
-        ``tester``), independent of the host.
+        ``tester``), independent of the host. With ``--real-captures DIR`` it also
+        proves the publish on every ``*-stdout`` DevFlow stage capture directly under
+        DIR (copied into a temp dir; content is never printed).
 
 ``--home`` and ``--user`` default to ``Path.home()`` and the login name.
 
@@ -660,6 +662,37 @@ CASES: tuple[tuple[str, Case], ...] = (
 )
 
 
+# Real-capture cases (--real-captures DIR): run only when asked, so the plain
+# selftest stays host-independent. Each gets the capture directory and a scratch
+# directory; none ever prints capture content.
+RealCase = Callable[[Path, Path], str]
+
+
+def _case_real_publish(captures: Path, scratch: Path) -> str:
+    return "ABSENT: not implemented"
+
+
+def _case_real_legacy_trips(captures: Path, scratch: Path) -> str:
+    return "ABSENT: not implemented"
+
+
+def _case_real_planted_credential(captures: Path, scratch: Path) -> str:
+    return "ABSENT: not implemented"
+
+
+REAL_CASES: tuple[tuple[str, RealCase], ...] = (
+    ("real: every capture in the sample publishes and scans clean", _case_real_publish),
+    (
+        "control: the real sample trips the legacy 30c raw named-assignment pattern",
+        _case_real_legacy_trips,
+    ),
+    (
+        "control: a credential planted in a real capture is refused",
+        _case_real_planted_credential,
+    ),
+)
+
+
 def _run_case(case: Case, scratch: Path) -> str:
     """A crashing case is a failing case, never a crashed selftest."""
     try:
@@ -668,12 +701,18 @@ def _run_case(case: Case, scratch: Path) -> str:
         return f"case raised {type(exc).__name__}"
 
 
-def selftest() -> int:
+def selftest(real_captures: Path | None = None) -> int:
     """Run every case in its own scratch dir; print ok/FAIL lines and the SELFTEST line."""
+    cases: list[tuple[str, Case]] = list(CASES)
+    if real_captures is not None:
+        cases += [
+            (name, lambda scratch, case=case: case(real_captures, scratch))
+            for name, case in REAL_CASES
+        ]
     reasons: list[tuple[str, str]] = []
     root = Path(tempfile.mkdtemp(prefix="sanitize-evidence-selftest-"))
     try:
-        for index, (name, case) in enumerate(CASES):
+        for index, (name, case) in enumerate(cases):
             scratch = root / f"case-{index:02d}"
             scratch.mkdir()
             reasons.append((name, _run_case(case, scratch)))
@@ -693,6 +732,7 @@ def selftest() -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sanitize-evidence.py")
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--real-captures", type=Path, default=None)
     commands = parser.add_subparsers(dest="command")
     for command in ("sanitize", "scan"):
         sub = commands.add_parser(command)
@@ -712,7 +752,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         if args.command is not None:
             parser.error("--selftest takes no subcommand")
-        return selftest()
+        return selftest(args.real_captures)
+    if args.real_captures is not None:
+        parser.error("--real-captures is a --selftest option")
     if args.command is None:
         parser.error("a subcommand or --selftest is required")
     redactor = Redactor.build(args.home or Path.home(), args.user or getpass.getuser())
