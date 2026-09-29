@@ -65,8 +65,294 @@ usage() {
 # Collection.
 # ---------------------------------------------------------------------------
 
+# Where DevFlow puts the payload phase's worktree and branch (EVIDENCE-LAYOUT).
+PAYLOAD_WORKTREE_REL=".worktrees/phase-01"
+PAYLOAD_BRANCH="feature/phase-01"
+BASE_BRANCH="integration"
+GH_TIMEOUT_SECS=60
+EVIDENCE_TIMEOUT_SECS=120
+
+# Unset every repository-local git variable (GIT_DIR, GIT_WORK_TREE, …) so a
+# git call can only see the repository its -C path names. Git owns the list.
+unset_git_local_env() {
+    local vars
+    vars="$(git rev-parse --local-env-vars 2> /dev/null)" || return 0
+    [ -n "$vars" ] || return 0
+    local -a names
+    mapfile -t names <<< "$vars"
+    unset "${names[@]}"
+}
+
+# git_value <cmd…>: the command's output, or the literal ABSENT when it fails or
+# prints nothing. An unreadable value is never an empty string or a false.
+git_value() {
+    local out
+    if out="$("$@" 2> /dev/null)" && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    else
+        printf 'ABSENT\n'
+    fi
+}
+
+# Claude Code names a project directory after the working directory with every
+# non-alphanumeric character replaced by `-`.
+escape_project_path() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# session_candidates <path>: the path as given, its realpath, and the other
+# home spelling of each (Fedora Atomic exposes both /home and /var/home).
+session_candidates() {
+    local given="$1" real p
+    real="$(realpath -m -- "$given" 2> /dev/null || printf '%s' "$given")"
+    for p in "$given" "$real"; do
+        printf '%s\n' "$p"
+        case "$p" in
+            /var/home/*) printf '/home/%s\n' "${p#/var/home/}" ;;
+            /home/*) printf '/var/home/%s\n' "${p#/home/}" ;;
+        esac
+    done | awk '!seen[$0]++'
+}
+
+# collect_captures <collected devflow dir> <absent.txt>: every capture a
+# `capture_archived` event names must be in the collected history.
+collect_captures() {
+    local dv="$1" absent="$2" stamp
+    if [ ! -f "$dv/events.jsonl" ]; then
+        printf 'events.jsonl ABSENT: %s\n' "$dv/events.jsonl" >> "$absent"
+        return 0
+    fi
+    while IFS= read -r stamp; do
+        if [ "$stamp" = "ABSENT" ]; then
+            printf 'capture_archived stamp ABSENT: an event carries no stamp\n' >> "$absent"
+        elif [[ ! "$stamp" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            printf 'capture_archived stamp ABSENT: an event carries an unusable stamp\n' >> "$absent"
+        elif [ ! -f "$dv/history/phase-01/$stamp-stdout" ]; then
+            printf 'capture %s-stdout ABSENT: named by a capture_archived event, not in history/phase-01 (retention eviction?)\n' \
+                "$stamp" >> "$absent"
+        fi
+    done < <(jq -r -R 'fromjson? | select(type == "object" and .event == "capture_archived" and .phase == 1)
+        | (.stamp // "ABSENT") | tostring' "$dv/events.jsonl")
+}
+
+# collect_sessions <claude projects dir> <worktree path> <dest> <absent.txt>
+collect_sessions() {
+    local projects="$1" wt="$2" dest="$3" absent="$4" p name tried="" found=false
+    while IFS= read -r p; do
+        name="$(escape_project_path "$p")"
+        tried="$tried $name"
+        if [ -d "$projects/$name" ] && [ ! -e "$dest/$name" ]; then
+            mkdir -p "$dest"
+            cp -a "$projects/$name" "$dest/$name"
+            found=true
+        fi
+    done < <(session_candidates "$wt")
+    if [ "$found" = false ]; then
+        printf 'sessions ABSENT: no Claude project directory under %s for %s (tried:%s)\n' \
+            "$projects" "$wt" "$tried" >> "$absent"
+    fi
+}
+
+# write_collected_git <launch> <fork-base.txt> <absent.txt>: git.txt on stdout.
+# R-2: the Ship merge is located in `integration`'s first-parent history since
+# the fork-point base, never read from the tip. DevFlow's terminal batch
+# (hooks.rs:115-122) merges (git.rs:185-190), tags, then commits CHANGELOG.md
+# on `integration` (hooks.rs:286), so a correct run's tip has one parent.
+write_collected_git() {
+    local launch="$1" fork_base="$2" absent="$3"
+    local base_sha="ABSENT" merges count merge="ABSENT" parents="ABSENT" feature tags
+    printf 'integration_head=%s\n' \
+        "$(git_value git -C "$launch" rev-parse --verify -q "refs/heads/$BASE_BRANCH^{commit}")"
+    if [ -f "$fork_base" ]; then
+        base_sha="$(sed -n 's/^base_sha=//p' "$fork_base" | head -1)"
+    fi
+    if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        printf 'integration_merge_count=ABSENT\n'
+        printf 'integration_merge ABSENT: no usable base_sha in %s\n' "$fork_base" >> "$absent"
+    elif ! merges="$(git -C "$launch" rev-list --first-parent --merges \
+        "$base_sha..refs/heads/$BASE_BRANCH" 2> /dev/null)"; then
+        printf 'integration_merge_count=ABSENT\n'
+        printf 'integration_merge ABSENT: git rev-list over %s..%s failed\n' "$base_sha" "$BASE_BRANCH" >> "$absent"
+    else
+        if [ -z "$merges" ]; then
+            count=0
+        else
+            count="$(printf '%s\n' "$merges" | wc -l)"
+        fi
+        printf 'integration_merge_count=%s\n' "$count"
+        if [ "$count" -eq 1 ]; then
+            merge="$merges"
+            parents="$(git_value git -C "$launch" log -1 --format=%P "$merge")"
+        else
+            printf 'integration_merge ABSENT: %s first-parent merges on %s since base_sha %s, want exactly 1\n' \
+                "$count" "$BASE_BRANCH" "$base_sha" >> "$absent"
+        fi
+    fi
+    printf 'integration_merge=%s\n' "$merge"
+    printf 'integration_merge_parents=%s\n' "$parents"
+    printf 'main_head=%s\n' "$(git_value git -C "$launch" rev-parse --verify -q 'refs/heads/main^{commit}')"
+    feature="$(git_value git -C "$launch" rev-parse --verify -q "refs/heads/$PAYLOAD_BRANCH^{commit}")"
+    printf 'feature_head=%s\n' "$feature"
+    # Supporting only: BranchCleanup may delete the feature ref (RESEARCH A4).
+    if [ "$feature" = "ABSENT" ]; then
+        printf 'feature_is_ancestor_of_integration=ABSENT\n'
+    else
+        local rc=0
+        git -C "$launch" merge-base --is-ancestor "refs/heads/$PAYLOAD_BRANCH" "refs/heads/$BASE_BRANCH" \
+            2> /dev/null || rc=$?
+        case "$rc" in
+            0) printf 'feature_is_ancestor_of_integration=yes\n' ;;
+            1) printf 'feature_is_ancestor_of_integration=no\n' ;;
+            *) printf 'feature_is_ancestor_of_integration=ABSENT\n' ;;
+        esac
+    fi
+    # Space-separated; empty means the repository has no tags.
+    if tags="$(git -C "$launch" for-each-ref --format='%(refname:short)' refs/tags 2> /dev/null)"; then
+        printf 'tags=%s\n' "$(printf '%s' "$tags" | tr '\n' ' ')"
+    else
+        printf 'tags=ABSENT\n'
+    fi
+}
+
+# collect_pr <launch> <dest pr.json> <absent.txt>: the only GitHub call.
+collect_pr() {
+    local launch="$1" dest="$2" absent="$3" rc=0
+    (cd "$launch" && timeout "$GH_TIMEOUT_SECS" gh pr view "$PAYLOAD_BRANCH" \
+        --json baseRefName,headRefName,state,url,number) > "$dest.tmp" 2> /dev/null || rc=$?
+    if [ "$rc" -eq 0 ] && jq -e 'type == "object"' "$dest.tmp" > /dev/null 2>&1; then
+        mv "$dest.tmp" "$dest"
+    else
+        rm -f "$dest.tmp"
+        printf 'pr.json ABSENT: gh pr view %s failed or printed no JSON object (exit %s)\n' \
+            "$PAYLOAD_BRANCH" "$rc" >> "$absent"
+    fi
+}
+
+# collect_evidence <bin> <launch> <dest evidence.json> <absent.txt>
+collect_evidence() {
+    local bin="$1" launch="$2" dest="$3" absent="$4" rc=0
+    timeout "$EVIDENCE_TIMEOUT_SECS" "$bin" evidence --phase 1 --json --root "$launch" \
+        > "$dest.tmp" 2> /dev/null || rc=$?
+    if [ "$rc" -eq 0 ] && jq -e '.' "$dest.tmp" > /dev/null 2>&1; then
+        mv "$dest.tmp" "$dest"
+    else
+        rm -f "$dest.tmp"
+        printf 'evidence.json ABSENT: %s evidence --phase 1 --json failed (exit %s)\n' "$bin" "$rc" >> "$absent"
+    fi
+}
+
+# write_manifest <dir>: sha256 of every file under <dir>, relative paths, sorted.
+write_manifest() {
+    local dir="$1"
+    (
+        cd "$dir"
+        find . -type f ! -path ./MANIFEST.sha256 ! -path ./MANIFEST.sha256.tmp -printf '%P\n' \
+            | LC_ALL=C sort | xargs -d '\n' -r sha256sum --
+    ) > "$dir/MANIFEST.sha256.tmp"
+    mv "$dir/MANIFEST.sha256.tmp" "$dir/MANIFEST.sha256"
+}
+
+# shipped_in <events.jsonl>: `true` iff DevFlow recorded `workflow_shipped` for
+# phase 1 (pipeline_gate.rs, finish_workflow — its only emitter). Unparseable
+# lines are skipped, not fatal.
+shipped_in() {
+    local events="$1"
+    if [ -f "$events" ] && jq -e -n -R '[inputs | fromjson? | select(type == "object"
+            and .event == "workflow_shipped" and .phase == 1)] | length > 0' "$events" > /dev/null 2>&1; then
+        printf 'true\n'
+    else
+        printf 'false\n'
+    fi
+}
+
 collect_main() {
-    return 0
+    local attempt="" home="" stop_note="" allow_state=false projects="" fake_cmds=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --attempt) attempt="${2:-}"; shift ;;
+            --home) home="${2:-}"; shift ;;
+            --stop-note) stop_note="${2:-}"; shift ;;
+            --allow-state) allow_state=true ;;
+            --claude-projects) projects="${2:-}"; shift ;;
+            --fake-cmds) fake_cmds="${2:-}"; shift ;;
+            *) die "unknown argument: $1 (see --help)" ;;
+        esac
+        shift
+    done
+    [[ "$attempt" =~ ^[1-9]$ ]] || die "--attempt must be one digit 1-9 (got '${attempt}')"
+    local p49="${home:-$HOME/.cache/devflow-phase49}"
+    projects="${projects:-$HOME/.claude/projects}"
+    if [ -n "$fake_cmds" ]; then
+        [ -d "$fake_cmds" ] || die "--fake-cmds is not a directory: $fake_cmds"
+        PATH="$fake_cmds:$PATH"
+        export PATH
+    fi
+    unset_git_local_env
+
+    local ev="$p49/attempt-$attempt"
+    [ -f "$ev/attempt.json" ] || die "attempt.json ABSENT: $ev/attempt.json"
+    local launch bin
+    launch="$(jq -r '.launch // empty' "$ev/attempt.json" 2> /dev/null)" || die "attempt.json unreadable: $ev/attempt.json"
+    bin="$(jq -r '.bin // empty' "$ev/attempt.json" 2> /dev/null)" || die "attempt.json unreadable: $ev/attempt.json"
+    [ -n "$launch" ] || die "attempt.json names no launch: $ev/attempt.json"
+    [ -n "$bin" ] || die "attempt.json names no bin: $ev/attempt.json"
+    [ -d "$launch" ] || die "launch dir not found: $launch"
+
+    local state_present=false
+    if [ -e "$launch/.devflow/state-01.json" ]; then
+        [ "$allow_state" = true ] \
+            || die "run still live or parked: $launch/.devflow/state-01.json exists (--allow-state collects anyway)"
+        state_present=true
+    fi
+    if [ -f "$ev/collected/DONE" ]; then
+        note "already collected: $ev/collected (nothing written)"
+        return 0
+    fi
+    [ ! -e "$ev/collected" ] || die "incomplete collection at $ev/collected (no DONE); move it aside first"
+
+    local tmp="$ev/collected.tmp" absent
+    rm -rf "$tmp"
+    mkdir -p "$tmp"
+    absent="$tmp/absent.txt"
+    : > "$absent"
+    if [ -d "$launch/.devflow" ]; then
+        cp -a "$launch/.devflow" "$tmp/devflow"
+    else
+        printf 'devflow ABSENT: %s\n' "$launch/.devflow" >> "$absent"
+    fi
+    collect_captures "$tmp/devflow" "$absent"
+    collect_sessions "$projects" "$launch/$PAYLOAD_WORKTREE_REL" "$tmp/sessions" "$absent"
+    write_collected_git "$launch" "$ev/prelaunch/fork-base.txt" "$absent" > "$tmp/git.txt"
+    collect_pr "$launch" "$tmp/pr.json" "$absent"
+    collect_evidence "$bin" "$launch" "$tmp/evidence.json" "$absent"
+    write_manifest "$tmp"
+    : > "$tmp/DONE"
+
+    # The outcome comes from the collected events alone; the note rules only
+    # accept or refuse it.
+    local shipped outcome note_json
+    shipped="$(shipped_in "$tmp/devflow/events.jsonl")"
+    if [ "$shipped" = true ]; then
+        outcome=shipped
+        if [ -n "$stop_note" ]; then
+            rm -rf "$tmp"
+            die "shipped attempt cannot carry a stop note (a workflow_shipped event for phase 1 is in the events)"
+        fi
+        note_json=null
+    else
+        outcome=stopped
+        if [ -z "$stop_note" ]; then
+            rm -rf "$tmp"
+            die "stop note required: no workflow_shipped event for phase 1 in the events (pass --stop-note TEXT)"
+        fi
+        note_json="$(jq -n --arg note "$stop_note" '$note')"
+    fi
+    jq -n --argjson attempt "$attempt" --arg outcome "$outcome" --argjson workflow_shipped "$shipped" \
+        --argjson stop_note "$note_json" --argjson state_present "$state_present" \
+        '{attempt: $attempt, outcome: $outcome, workflow_shipped: $workflow_shipped,
+          stop_note: $stop_note, state_present: $state_present}' > "$ev/verdict.json.tmp"
+    mv "$ev/verdict.json.tmp" "$ev/verdict.json"
+    mv "$tmp" "$ev/collected"
+    note "collected attempt $attempt: outcome=$outcome, $(grep -c '' "$ev/collected/absent.txt" || true) ABSENT item(s)"
+    note "verdict: $ev/verdict.json"
 }
 
 # ---------------------------------------------------------------------------
@@ -227,7 +513,7 @@ st_c4_sessions() {
     local c1="$ST_HOME/attempt-1/collected" a2="$ST_HOME/attempt-2/collected/absent.txt" got
     [ -f "$c1/sessions/$A1_SESSION/session.jsonl" ] \
         || { ST_WHY="collected/sessions/$A1_SESSION/session.jsonl missing"; return 1; }
-    grep -qF "$A2_SESSION" "$a2" 2> /dev/null \
+    grep -qF -e "$A2_SESSION" "$a2" 2> /dev/null \
         || { ST_WHY="attempt 2's absent.txt does not name $A2_SESSION"; return 1; }
     # Pinned from a real Claude Code project directory on this host.
     got="$(escape_project_path "/var/home/u/Github/devflow/.worktrees/phase-49" 2> /dev/null || echo ABSENT)"
@@ -318,7 +604,7 @@ st_c10_merge() {
     [ -f "$g" ] || { ST_WHY="no collected/git.txt"; return 1; }
     # The fixture must put the merge behind the tip, or this case cannot tell a
     # history lookup from a read of the tip's parents.
-    tip_parents="$(git -C "$launch" log -1 --format=%P refs/heads/integration | wc -w)"
+    tip_parents="$(git -C "$launch" cat-file -p refs/heads/integration | grep -c "^parent " || true)"
     [ "$tip_parents" -eq 1 ] || { ST_WHY="fixture tip has $tip_parents parents, want the single-parent CHANGELOG commit"; return 1; }
     feature="$(git -C "$launch/.worktrees/phase-01" rev-parse HEAD)"
     [ "$(st_kv "$g" integration_merge_count)" = "1" ] \
@@ -398,6 +684,8 @@ run_selftest() {
     st_attempt 2
     local l2="$ST_HOME/attempt-2/project"
     st_event "$l2" capture_archived "{\"stage\":\"code\",\"to_stage\":\"code\",\"stamp\":\"$STAMP_EVICTED\"}"
+    # Another phase's `workflow_shipped` must not make phase 1 read as shipped.
+    st_event "$l2" workflow_shipped '{"phase":2,"stage":"ship"}'
     st_terminal_batch "$l2" no-merge
     rm -f "$l2/.devflow/state-01.json"
     A2_SESSION="$(st_escaped "$(realpath "$l2/.worktrees/phase-01")")"
