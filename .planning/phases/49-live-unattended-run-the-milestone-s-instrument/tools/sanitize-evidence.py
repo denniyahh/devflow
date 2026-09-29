@@ -53,6 +53,25 @@ PREFIX_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]{8,}={0,2}")),
 )
 
+# D-26: a named credential is a name holding one of these words bound to a
+# credential-SHAPED value: 20+ characters of [A-Za-z0-9_+/=.-] with at least one
+# letter and one digit. A usage counter, a placeholder or a short word is not.
+CREDENTIAL_WORDS = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
+_VALUE_SHAPE = (
+    r"(?=[A-Za-z0-9_+/=.-]*[A-Za-z])(?=[A-Za-z0-9_+/=.-]*[0-9])[A-Za-z0-9_+/=.-]{20,}"
+)
+CREDENTIAL_VALUE = re.compile(_VALUE_SHAPE)
+NAMED_ASSIGNMENT = re.compile(
+    # 30c's name part, anchored at the start of the identifier (linear time)
+    r"(?<![A-Za-z0-9_])(?=[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))[A-Za-z0-9_]+"
+    r"""["']?\s*[:=]\s*["']?""" + _VALUE_SHAPE,
+    re.IGNORECASE,
+)
+STRING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    *PREFIX_PATTERNS,
+    ("credential_named_assignment", NAMED_ASSIGNMENT),
+)
+
 # The lookbehinds anchor each match at the start of its character run, so a
 # long run (a base64 blob in a capture) costs linear time, not quadratic.
 UUID_PATTERN = re.compile(
@@ -132,18 +151,79 @@ class Redactor:
         return UUID_PATTERN.sub(self._pseudonym, text)
 
     def findings(self, text: str) -> list[str]:
-        """Pattern NAMES that match ``text``. Never returns a matched value (30c:694-710)."""
+        """Pattern NAMES that match ``text``. Never returns a matched value (30c:694-710).
+
+        Leftover home spellings and emails are looked for in the raw text and in every
+        JSON-decoded string (an escaped spelling is still a spelling); credentials in the
+        decoded strings only (``credential_findings``).
+        """
+        decoded = decode(text)
         found = [
             name
             for name, pattern in (
                 ("home_path", self.home_pattern),
                 ("home_path_escaped", self.escaped_pattern),
                 ("email_address", EMAIL_PATTERN),
-                *PREFIX_PATTERNS,
             )
-            if pattern.search(text)
+            if pattern.search(text) or any(map(pattern.search, decoded.strings))
         ]
-        return found
+        return found + credential_findings(decoded)
+
+
+# --------------------------------------------------------------------------- JSON-decoded scan
+
+
+@dataclass
+class Decoded:
+    """Every string a file holds once JSON is decoded, plus every string-valued field."""
+
+    strings: list[str] = field(default_factory=list)
+    fields: list[tuple[str, str]] = field(default_factory=list)
+
+
+def decode(text: str) -> Decoded:
+    """Parse the whole file as JSON; failing that, each line; a line that is not JSON
+    is kept as plain text. Credential patterns never see raw JSON, where an escaped
+    quote or newline would hide an assignment or fake one."""
+    decoded = Decoded()
+    documents: list[object] = []
+    try:
+        documents.append(json.loads(text))
+    except (ValueError, RecursionError):
+        for line in text.splitlines():
+            try:
+                documents.append(json.loads(line))
+            except (ValueError, RecursionError):
+                decoded.strings.append(line)
+    stack = documents[::-1]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            decoded.strings.append(node)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                decoded.strings.append(key)
+                if isinstance(value, str):
+                    decoded.fields.append((key, value))
+            stack.extend(reversed(list(node.values())))
+        elif isinstance(node, list):
+            stack.extend(reversed(node))
+    return decoded
+
+
+def credential_findings(decoded: Decoded) -> list[str]:
+    """Credential pattern NAMES found in the decoded strings and fields."""
+    found = [
+        name
+        for name, pattern in STRING_PATTERNS
+        if any(map(pattern.search, decoded.strings))
+    ]
+    if any(
+        CREDENTIAL_WORDS.search(key) and CREDENTIAL_VALUE.fullmatch(value)
+        for key, value in decoded.fields
+    ):
+        found.append("credential_named_field")
+    return found
 
 
 # --------------------------------------------------------------------------- walk
@@ -166,47 +246,99 @@ def _refuse(lines: list[str]) -> int:
 # --------------------------------------------------------------------------- sanitize / scan
 
 
-def sanitize(src: Path, dest: Path, redactor: Redactor) -> int:
-    """Publish a redacted copy of ``src`` at ``dest``, or publish nothing."""
-    # (redacted relative path, redacted text or None for a directory)
-    staged: list[tuple[Path, str | None]] = []
+@dataclass
+class Staged:
+    """One output entry: redacted relative path, source text (None = directory)."""
+
+    out_rel: Path
+    text: str | None
+
+
+def _read_source(src: Path, redactor: Redactor) -> tuple[list[Staged], list[str]]:
+    """Walk ``src``; stage every entry or name why it cannot be vouched for."""
+    staged: list[Staged] = []
+    problems: list[str] = []
+    claimed: set[Path] = set()
     for entry in _walk(src):
         rel = entry.relative_to(src)
         out_rel = Path(*(redactor.redact(part) for part in rel.parts))
-        if entry.is_dir():
-            staged.append((out_rel, None))
+        if out_rel in claimed:
+            problems.append(f"{rel}: name_collision")
+        claimed.add(out_rel)
+        if entry.is_symlink():
+            problems.append(f"{rel}: symlink")
+        elif entry.is_dir():
+            staged.append(Staged(out_rel, None))
+        elif not entry.is_file():
+            problems.append(f"{rel}: not_regular_file")
         else:
-            text = entry.read_bytes().decode("utf-8")
-            staged.append((out_rel, redactor.redact(text)))
+            try:
+                text = entry.read_bytes().decode("utf-8")
+            except UnicodeDecodeError:
+                problems.append(f"{rel}: not_utf8")
+                continue
+            # A credential is never redacted and published: it is an incident.
+            problems += [f"{rel}: {name}" for name in credential_findings(decode(text))]
+            staged.append(Staged(out_rel, text))
+    return staged, problems
+
+
+def sanitize(src: Path, dest: Path, redactor: Redactor) -> int:
+    """Publish a redacted copy of ``src`` at ``dest``, or publish nothing."""
+    if dest.exists() or dest.is_symlink():
+        return _refuse([f"{dest.name}: destination_exists"])
+    if src.is_symlink() or not src.is_dir():
+        return _refuse([f"{src.name}: source_not_a_directory"])
+    staged, problems = _read_source(src, redactor)
+    if problems:
+        return _refuse(problems)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=f".{dest.name}.publish-", dir=dest.parent))
     try:
-        problems: list[str] = []
-        for out_rel, text in staged:
-            target = tmp / out_rel
-            if text is None:
+        for item in staged:
+            target = tmp / item.out_rel
+            if item.text is None:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
+            redacted = redactor.redact(item.text)
             with target.open("xb") as handle:
-                handle.write(text.encode("utf-8"))
-            problems += [f"{out_rel}: {name}" for name in redactor.findings(text)]
+                handle.write(redacted.encode("utf-8"))
+            problems += [f"{item.out_rel}: {n}" for n in redactor.findings(redacted)]
         if problems:
             return _refuse(problems)
-        tmp.rename(dest)
+        try:
+            tmp.rename(dest)
+        except OSError:
+            return _refuse([f"{dest.name}: destination_exists"])
     finally:
         if tmp.exists():
             shutil.rmtree(tmp)
     return 0
 
 
+def _scan_file(file: Path, redactor: Redactor) -> list[str]:
+    if file.is_symlink():
+        return ["symlink"]
+    try:
+        text = file.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        return ["not_utf8"]
+    return redactor.findings(text)
+
+
 def scan(paths: list[Path], redactor: Redactor) -> int:
     """Print ``<file>: <pattern>`` per finding; exit 1 if there is any."""
     problems: list[str] = []
     for path in paths:
-        files = [path] if path.is_file() else [p for p in _walk(path) if p.is_file()]
+        if path.is_symlink() or path.is_file():
+            files = [path]
+        elif path.is_dir():
+            files = [p for p in _walk(path) if p.is_symlink() or not p.is_dir()]
+        else:
+            problems.append(f"{path}: missing")
+            continue
         for file in files:
-            text = file.read_bytes().decode("utf-8")
-            problems += [f"{file}: {name}" for name in redactor.findings(text)]
+            problems += [f"{file}: {name}" for name in _scan_file(file, redactor)]
     for line in problems:
         print(line)
     return 1 if problems else 0
