@@ -94,6 +94,61 @@ exit 3
             ok=ok and 'base_sha='+git('rev-parse','integration',at=ev/'project') in (ev/'prelaunch/fork-base.txt').read_text()
             ok=ok and json.loads((ev/'prelaunch/repo.json').read_text())['visibility']=='PRIVATE'
     report('start: both units launched with the notify hook and the pinned binary',bool(ok))
+    import shutil
+    def no_units(): return not (root/'units.log').read_text().strip()
+    def reject(name,command,reason,**kw):
+        (root/'units.log').write_text('')
+        result=invoke(command,**kw)
+        report(name,result.returncode!=0 and reason in result.stdout+result.stderr and no_units())
+    # Copy a prepared project; the fake operator step only uses local bare Git.
+    baseline=root/'baseline';shutil.copytree(home,baseline)
+    def restore():
+        shutil.rmtree(home);shutil.copytree(baseline,home)
+        (root/'units.log').write_text('')
+    # Clear the relaunch sentinel in each clone, without changing tracked files.
+    (baseline/'attempt-1/start.stdout').unlink()
+    gh=fakes/'gh';gh_default=gh.read_text();claude=fakes/'claude';claude_default=claude.read_text()
+    gh.write_text(gh_default.replace('PRIVATE','PUBLIC'))
+    restore();reject('control: public repository refused','start','not private')
+    gh.write_text(gh_default)
+    own=git('remote','get-url','origin',at=pathlib.Path(source))
+    own=re.sub(r'^.*github.com[:/]','',own);own=re.sub(r'\.git$','',own)
+    gh.write_text(gh_default.replace('tester/p49-live-attempt-1',own))
+    restore();reject('control: repository matching this devflow checkout refused','start','this DevFlow repository')
+    gh.write_text(gh_default)
+    restore();git('commit','--allow-empty','-qm','chore: unpushed base',at=ev/'project')
+    reject('control: unpushed integration refused','start','integration not pushed')
+    gh.write_text(gh_default.replace("'repo'","'gist'"))
+    restore();reject('control: token without repo scope refused','start','repo scope')
+    gh.write_text(gh_default)
+    restore();claude.write_text(claude_default.replace('"is_error":false','"is_error":true').replace('P49_AUTH_OK','authentication failed')+'exit 1\n')
+    result=invoke('start');log=(root/'units.log').read_text();record=(ev/'prelaunch/auth-probe.txt').read_text()
+    report('control: failed auth probe refuses start and launches no run unit',result.returncode!=0 and 'auth probe failed' in result.stderr and 'p49-a1-authprobe' in log and 'p49-a1-surv' not in log and 'p49-a1-start' not in log and 'is_error=true' in record and 'reply_ok=no' in record)
+    # The failing response must not report a successful authentication reply.
+    claude.write_text(claude_default.split("printf '{\"type\":\"result\"")[0])
+    restore();result=invoke('probe-auth');record=(ev/'prelaunch/auth-probe.txt').read_text()
+    report('control: probe output without a result line is ABSENT, not a pass',result.returncode!=0 and 'auth probe failed' in result.stderr and 'is_error=ABSENT' in record and 'reply_ok=no' in record)
+    claude.write_text(claude_default)
+    restore();(home/'attempt-2').mkdir();shutil.copy(ev/'attempt.json',home/'attempt-2/attempt.json')
+    reject('control: attempt number mismatch refused','start','attempt number mismatch',number=2)
+    restore();result=invoke('start');assert result.returncode==0,result.stderr
+    reject('control: relaunch of the same attempt refused','start','already launched')
+    (repo/'crates/probe.rs').write_text('// changed\n')
+    reject('control: dirty build tree refused','prepare','dirty build tree',h=root/'dirty-home')
+    git('checkout','--','crates/probe.rs')
+    restore();reject('control: attempt without a verdict blocks the next prepare','prepare','collect it first',number=2)
+    cap=root/'cap'
+    for n in [1,2,3]:
+        a=cap/f'attempt-{n}';a.mkdir(parents=True)
+        (a/'verdict.json').write_text(json.dumps({'outcome':'stopped','stop_note':'fixture stop'}))
+    reject('control: cap of three stopped attempts refuses prepare','prepare','D-11',number=4,h=cap)
+    restore()
+    def inventory():return {str(p.relative_to(ev)):hashlib.sha256(p.read_bytes()).hexdigest() for p in ev.rglob('*') if p.is_file()}
+    before=inventory();result=invoke('status')
+    report('status: read-only report names both units',result.returncode==0 and 'p49-a1-start' in result.stdout and 'p49-a1-surv' in result.stdout and before==inventory())
+    (repo/'notes.txt').write_text('untracked fixture\n')
+    h=root/'notes-home';result=invoke('prepare',h=h)
+    report('control: dirt outside crates is recorded, not refused',result.returncode==0 and 'build_dirty=true' in (h/'attempt-1/identity.txt').read_text())
 print(f'SELFTEST passed={passed} failed={failed}')
 sys.exit(bool(failed) or not passed)
 PY
