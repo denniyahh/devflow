@@ -1,0 +1,79 @@
+Warning: Unknown toolsets: moa, rl
+Review complete. Findings below are source-level (every line re-read with a second parser after I noticed my shell's output filter mangling some `rg` results); nothing here was reproduced against the real binary.
+
+```
+CONFIRMED BLOCKERS
+  None. I could not construct a path from this snapshot in which honest adherence to
+  49-RUNBOOK.md produces a false 'shipped', leaks a credential, deletes out of scope, or
+  fails to launch. A launch failure is not proof of absence, so the paths I checked and the
+  ones I could not check are listed at the end; treat "no blocker found" as bounded by that.
+```
+
+CONFIRMED WARNINGS
+
+W1. A run-unit launch failure permanently burns the attempt, and the procedure then records it as a *death* -- consuming one of D-11's three stopped attempts.
+   - tools/launch-attempt.sh:307 creates `$EV/start.stdout` BEFORE the run unit is launched at :309-311, and :279 refuses any later `start` because that file now exists (`already launched`).
+   - prepare for that attempt is refused (tools/launch-attempt.sh:204), and the next `prepare` requires a `verdict.json` for it (tools/launch-attempt.sh:212 `collect it first: attempt-$n has no verdict`).
+   - The runbook documents only one start failure (49-RUNBOOK.md:84-86, the auth probe). For a failure at :309-311 the operator's only route to attempt N+1 is a stop verdict, and the dead-run path (49-RUNBOOK.md:218-246) accepts a run whose unit never existed: no gate waiting, no `workflow_shipped`, nothing in the unit -- all three hold trivially. That is one of three stopped attempts (49-RUNBOOK.md:244-246), for a launch that spent no agent quota.
+   - Failure condition (derived from documented systemd behaviour, not executed here -- systemd use is outside this review's bounds): `systemd-run --user --unit p49-aN-start -p RemainAfterExit=yes -- true` leaves that unit loaded; the subsequent `start` fails at :309 with "Unit already exists", runs no agent, and leaves the attempt unusable.
+   - Aggravating: the runbook's §4 confirmation step is `launch-attempt.sh status` (49-RUNBOOK.md:81), and that subcommand swallows `is-active`'s non-zero exit (`|| true`, tools/launch-attempt.sh:318-320) and itself exits 0 -- so "the unit was never created" and "the unit ran and exited" print the same shape of line. The discriminators (`$EV/start.stderr` absent, `systemctl --user status` reporting no such unit) are never named; :227 runs the status command but :230-232 only tells the operator what a *live* monitor looks like.
+
+W2. The evidence contract's third unit name is never recorded, and that unit has no documented cleanup.
+   - tools/EVIDENCE-LAYOUT.md:19 requires `units.txt` to hold `negctl=p49-a<N>-negctl`.
+   - tools/launch-attempt.sh:239 writes `start=`, `surv=`, `authprobe=` -- the string `negctl` does not occur anywhere in launch-attempt.sh (checked), so the unit name exists only as a default inside the negative-arm driver (tools/negctl.sh:185).
+   - The unit's only unload path is negctl.sh's EXIT trap (tools/negctl.sh:223-227), which does not run on SIGKILL or terminal death; the runbook's cleanup resets only `-start` and `-surv` (49-RUNBOOK.md:293-294) and never mentions `units.txt` or the negctl unit (checked: neither string appears in 49-RUNBOOK.md).
+   - Reproducer: after a normal Prepare+negative arm, `cat $EV/units.txt` shows `authprobe=p49-a1-authprobe` (no negctl line); kill negctl.sh during its gate wait, then `systemctl --user list-units 'p49-a*'` shows a leftover `p49-a1-negctl` no documented step removes.
+
+W3. Three fields the contract guarantees are never produced by the pinned-binary tools.
+   - `created_at` is required in `attempt.json` (tools/EVIDENCE-LAYOUT.md:15) but the writer omits it (tools/launch-attempt.sh:236-238 writes attempt/bin/bin_sha256/build_commit/launch/base_branch only). The only `created_at` in tools/ is a selftest fixture (tools/collect-attempt.sh:421-422).
+   - `identity.txt` is required to carry `claude_version`, `gh_version`, `gsd_version`, `python3_version`, `git_version` (tools/EVIDENCE-LAYOUT.md:16); the writer emits three keys (tools/launch-attempt.sh:232). No tool reads any of them (checked across tools/), so a downstream reader -- 49-12's sanitized commit, or 49-08:267's stated mitigation that `attempt.json`/`identity.txt`/`verdict.json` travel together -- records ABSENT for exactly the per-arm tool versions D-15/CONTEXT:153 requires ("record the claude CLI version with each arm").
+   - Effect is documentation-vs-artifact only; nothing in the checker keys on them. Confirmed by reading both writers and grepping every consumer.
+
+W4. Snapshot integrity is produced and never consumed, and one contract enum admits a value the hook can write.
+   - Each snapshot gets `MANIFEST.sha256` and a ledger `manifest_sha256` (tools/snapshot-hook.sh:282-289) and EVIDENCE-LAYOUT.md:21 defines both. No check path verifies either: `manifest_sha256` appears only in snapshot-hook.sh itself (its own selftest asserts it), and check-evidence.sh's only manifest verification is of `collected/` (tools/check-evidence.sh:268-275). A tampered gate snapshot passes the attempt gate.
+   - `non_silent` is contracted as `0|1` (tools/EVIDENCE-LAYOUT.md:21) but the hook writes `ABSENT` when DevFlow does not export `DEVFLOW_NON_SILENT_GATE` (tools/snapshot-hook.sh:253 and :279). The hook's selftest always sets the variable (tools/snapshot-hook.sh:372) and asserts `1 define 1 0` (:398-405), so that control cannot detect the ABSENT case. Whether the real DevFlow always exports it is unverifiable here (gates.rs absent).
+   - Same class: `config_json_status` and `worktree_status_lines` are written (tools/snapshot-hook.sh:217-234) and no consumer reads them.
+
+W5. The SURV-01 artifact the contract names is never produced by any runbook step, and the watcher's positive control is tautological.
+   - tools/EVIDENCE-LAYOUT.md:23 lists `$EV/surv/analysis.txt` (from surv-watch.py). It is written only by `analyze` (tools/surv-watch.py:384-397). Neither `analyze` nor `surv-watch` occurs anywhere in 49-RUNBOOK.md: the runbook stops the unit (49-RUNBOOK.md:157, :237) and never analyses its log. An operator following the runbook end to end produces `watch.jsonl` and no analysis.
+   - The watcher's whole observation is a regex over a filename convention (`^\.state-01\.json\.(\d+)\.(\d+)\.tmp$`, tools/surv-watch.py:66-70, documented as coming from `crates/devflow-core/src/workflow.rs` -- absent from this snapshot), and its positive control hand-writes precisely that shape (tools/surv-watch.py:485-487 plants `.state-01.json.100.1.tmp`). A control that encodes the assumption cannot falsify it; a naming change in workflow.rs would yield "saw nothing" rather than a visible failure.
+
+W6. The gate-timeout magnitude the runbook gives the operator is contradicted inside the crate it cites.
+   - 49-RUNBOOK.md:115-116 "Gates wait three days by default"; 49-CONTEXT.md:256-257 "the production gate timeout defaults to 3 days".
+   - crates/devflow-cli/src/pipeline_gate.rs:1131 "7-day production default (`DEVFLOW_GATE_TIMEOUT_SECS`)", :1140, :1155; preflight.rs:1363 "7-day gate timeout"; pipeline_gate.rs:1484 "multi-day production default".
+   - crates/devflow-cli/src/main.rs:461-463 asserts the sweep age is "three days, held equal to `DEVFLOW_GATE_TIMEOUT_SECS` so a sweep cannot reap a gate a live monitor is still polling" -- the safety argument for `gate sweep`, which 49-RUNBOOK.md:295 uses.
+   - The constants live in `config_parse.rs`, absent from this snapshot, so which side is right is unproven; at least one in-tree claim is wrong, and the runbook repeats one of them verbatim to the operator it tells not to mistake that timeout for progress. A 3-vs-7-day error changes how long a parked gate sits before an operator notices.
+
+W7. `verdict=not_ready` is reachable from an attempt that genuinely SHIPPED, and the documented remedy does not fit it.
+   - check-evidence.sh:281-287 requires all three arms and a non-zero `CHECK` for a shipped verdict; :407 requires `collected/pr.json`, which is simply absent whenever the collector's single GitHub call fails or prints non-JSON (tools/collect-attempt.sh:218-226 writes an `absent.txt` line and does not fail the collection).
+   - The collector refuses to re-collect once `collected/DONE` exists (tools/collect-attempt.sh:305-308, prints `already collected` and exits 0); the escape (`move it aside first`) exists only inside the tool's die text at :309, never in the runbook.
+   - The runbook's only not_ready branch is written for a stopped attempt (49-RUNBOOK.md:184-187, "If the attempt stopped below the cap ... fix it and resume"). Applied to a shipped run with a transient `gh` failure it tells the operator to spend another scheduled attempt, because the failed collection can never be revisited: the attempt gate always evaluates `current-attempt` (tools/check-evidence.sh:262-266).
+   - Net effect: a real Ship can be recorded as an unaccepted attempt whose evidence is never re-judged.
+
+SUSPECTED
+
+S1. The dead-run confirmation is weaker than DevFlow's own liveness predicate (hardening, not a live defect).
+   - 49-RUNBOOK.md:230 accepts death when the recorded PID "must not be a live `__monitor` naming this project and phase 1". DevFlow's own refusal names a SECOND monitor shape and also inspects the agent: commands.rs:2522-2526 ("either a `__monitor` process with this project's path and `--phase {phase}` in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` with `--phase {phase}`") and commands.rs:2473-2481 (live = live monitor OR live agent, via `agent_pid_from_file`).
+   - I believe the legacy shape is unreachable in this run (launch-attempt.sh:201 exports only PATH/HOME/notify to the unit; :309-311 passes no `--legacy-claude-launch`; main.rs:111-112 is the only other trigger), which is why this is suspected rather than confirmed. The agent half is covered only by prose (:231-232) plus `systemctl --user status` (:227), whose reliability for a `RemainAfterExit=yes` + `KillMode=process` unit I could not establish offline.
+   - Related, confirmed but minor: `MONITOR=$(jq -er '.monitor_pid | select(type == "number")' ...)` (:225) silently yields an empty string on a null field (jq `-e` exits 1; an interactive shell continues), and `ps -p ""` (:226) merely errors -- no guard.
+
+S2. The sanitizer publishes all-or-nothing on UTF-8 decodability of the whole collected tree.
+   - tools/sanitize-evidence.py:277-285 fails the publish on any non-UTF-8 file, and :295-296 returns before writing anything; the only rename is :312. One file in the tree is DevFlow's raw stage byte-capture: `phase-01-stdout` is copied into every snapshot (tools/snapshot-hook.sh:169) and is listed in the contract (tools/EVIDENCE-LAYOUT.md:21).
+   - Condition: a single truncated multibyte sequence anywhere in the collected evidence (a stage capture cut mid-character) refuses the entire publish, and EVIDENCE-LAYOUT.md documents no fallback. I did not run a real capture through it, so I cannot show this occurs -- only that the refusal is total rather than per-file, and that the sanitizer's `--real-captures` mode (tools/sanitize-evidence.py:674-742) exists precisely because real captures are expected input.
+
+LIMITS
+
+- Files cited by the reviewed material but absent from this snapshot, so unverified: `devflow-core/src/gates.rs` (the notify contract -- env var names and synchronous `sh -c` invocation, cited as gates.rs:388-424 by tools/snapshot-hook.sh:14; also the `abort` keyword rule cited as gates.rs:73-83 by 49-10-PLAN.md:79), `config_parse.rs` (W6's constants; also `gate_max_unattended_age_secs()`, commands.rs:1519/:5628), `pipeline_outcomes.rs` (the literal `responded_by == "--yes-ship"` that check-evidence.sh:387 keys on), `workflow.rs` (the state-temp naming S/W5 rest on), `agents.rs` (whether Claude's Define is headless-safe -- commands.rs:468-478 refuses a non-headless Define with no CONTEXT.md, and the live payload writes none), `monitor.rs` (who writes `monitor_pid`), plus `version.rs`, `ship.rs`, `git.rs`, `worktree.rs`, `events.rs`, `pipeline_launch.rs`, `parallel.rs`, `lock.rs`.
+- Selftests I actually ran, all exit 0, logs under /home/denniyahh/.hermes/cache/scratch/: snapshot-hook 6/6, collect-attempt 11/11, check-evidence 34/34, negctl 8/8. What that establishes: their own fixtures, and that each discrimination control has both directions asserted (check-evidence.sh:139-156, :209-217). What it does not: anything about the real binary -- every generator is a fake (`devflow` fakes at negctl.sh:46-67 and check-evidence.sh:120; fakes shadow `systemd-run`/`systemctl`/`gh`/`claude`/`cargo`), and negctl's headline case is a fake that creates the worktree and opens the Define gate itself (negctl.sh:57-63), so "define gate did not open" and the worktree-head read at :246-248 are never exercised against the real preflight-to-gate path.
+- Not run: `launch-attempt.sh --selftest`. It needs an `origin` remote on the snapshot repo (launch-attempt.sh:115-118) and, more decisively, its `prepare` runs the payload scaffold's `--check` (:233-235), which shells out to `node $HOME/.claude/gsd-core/bin/gsd-tools.cjs` (scripts/scratch-dogfood-repo.sh:419-420) -- outside the "explicit fakes and temporary directories" bound. So the prepare/start/status path, including W1, is read-only verified.
+- Snapshot mutation: I ran `git init` (no commits, no signing) in the disposable snapshot so negctl.sh's `git rev-parse --show-toplevel` (negctl.sh:6) would resolve. No other mutation.
+- Deliberately not relabelled: the `cap_reached` provenance gap (49-08-PLAN.md:267, deferred) and the `KillMode=process` stray-monitor gap (49-10-PLAN.md:327, deferred). The 3-day gate default (W6) is a separate contradiction inside the crate the runbook cites, not a re-run of either.
+
+PATHS CHECKED WITH NO FINDING (so the negative result is scoped, not implied)
+
+- Every CLI verb/flag the runbook uses resolves: gate list/show/approve/reject/sweep (main.rs:386-491), status (:261-265), evidence (:366-380) against 49-RUNBOOK.md:119-129, :138-139, :175, :197-212, :295; `--stage X --project P` resolves correctly through resolve_gate_target (commands.rs:47-78).
+- The approve precondition the runbook states (49-RUNBOOK.md:133) is real and enforced (commands.rs:1415-1425).
+- The negative arm can reach a Define gate: a preflight refusal writes the gate, fires the notify hook and blocks (preflight.rs:1395-1403, pipeline_gate.rs:369-400); the worktree and `state.worktree_path` exist before that point (commands.rs:525-532, :578-587), which is what negctl.sh:246-248 and snapshot-hook.sh:194-208 need; the base defaults to `develop` (no devflow.toml in the default scaffold -- checked: the payload's `cat >` target list contains devflow.toml only in live-payload mode), and the no-remote currency check fails open (preflight.rs:556-574).
+- Fork-point/gate-order/merge/PR/binary-pair coherence is genuinely enforced (check-evidence.sh:329-437), and the arms-disagree control (check-evidence.sh:433-437) makes an empty comparison impossible.
+- Destruction scope: no wildcard or unverified-target delete anywhere in the tools (launch-attempt.sh:204, :240, :247; negctl.sh:189, :208; collect-attempt.sh:305-314; snapshot-hook.sh:273-283); `gate sweep --root` is project-scoped with `--reap-strays` off (main.rs:459-490, 49-RUNBOOK.md:295); `gh repo delete` is fed from the attempt's own `repo.json` (49-RUNBOOK.md:306-309) which the launcher re-derives and re-checks for PRIVATE before use (launch-attempt.sh:287-292).
+- Credential hygiene on the auth path: names-only capture (launch-attempt.sh:171), derived-only record (:254-274), raw scratch removed (:246-247), with a value-leak control asserted over the whole attempt tree (:79-81).
