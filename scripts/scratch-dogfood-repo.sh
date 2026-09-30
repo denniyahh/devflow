@@ -373,6 +373,43 @@ st_control_unknown_option() {
     case_ok "$name"
 }
 
+st_payload_tests() {
+    local plan="$ST_TMP/lp/.planning/phases/01-retry-budget/01-01-PLAN.md"
+    local copy="$ST_TMP/reference" line rc=0
+    line="$(rg -m1 '^<task ' "$plan" 2>/dev/null || true)"
+    if [ "$line" = '<task type="checkpoint:decision" gate="blocking-human">' ]; then
+        case_ok "live payload: plan opens with the blocking-human decision task"
+    else
+        case_fail "live payload: plan opens with the blocking-human decision task" "first task absent or wrong"
+    fi
+    mkdir "$copy"
+    git -C "$ST_TMP/lp" archive HEAD | tar -xf - -C "$copy"
+    (cd "$copy" && python3 -B -m unittest discover -s tests -v) >"$ST_TMP/red.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && rg -q "No module named 'probe'" "$ST_TMP/red.log"; then
+        case_ok "live payload: RED test fails before the implementation"
+    else
+        case_fail "live payload: RED test fails before the implementation" "missing-module failure absent"
+    fi
+    mkdir "$copy/probe"
+    touch "$copy/probe/__init__.py"
+    printf 'DEFAULT_RETRY_BUDGET_SECS = 120\ndef deadline_after(start_secs):\n    return start_secs + DEFAULT_RETRY_BUDGET_SECS\n' >"$copy/probe/budget.py"
+    rc=0
+    (cd "$copy" && python3 -B -m unittest discover -s tests -v) >"$ST_TMP/green.log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && rg -q '^Ran 2 tests' "$ST_TMP/green.log" && rg -qx 'OK' "$ST_TMP/green.log"; then
+        case_ok "live payload: test passes with a reference implementation"
+    else
+        case_fail "live payload: test passes with a reference implementation" "two passing tests absent"
+    fi
+    sed -i 's/ = 120/ = 60/' "$copy/probe/budget.py"
+    rc=0
+    (cd "$copy" && python3 -B -m unittest discover -s tests -v) >"$ST_TMP/invalid.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && rg -q 'AssertionError: 60 not found' "$ST_TMP/invalid.log"; then
+        case_ok "control: test fails with a budget outside the offered set"
+    else
+        case_fail "control: test fails with a budget outside the offered set" "invalid-budget assertion absent"
+    fi
+}
+
 run_selftest() {
     # Hermetic: the host checkout's git environment and global/system config
     # (signing, hooks, excludes) may not leak into the scratch repositories.
@@ -397,6 +434,7 @@ run_selftest() {
         "$(dirname -- "$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)")"
     st_control_existing_dest
     st_control_unknown_option
+    st_payload_tests
 
     echo "SELFTEST passed=$N_PASS failed=$N_FAIL"
     [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
