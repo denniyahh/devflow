@@ -283,7 +283,7 @@ execution pauses once for this, and the attempt is judged afterwards from record
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: 5/12 plans executed (6 waves); 49-11 is the single operator checkpoint for the live attempt
+**Plans**: 6/12 plans executed (6 waves); 49-11 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
@@ -295,7 +295,7 @@ execution pauses once for this, and the attempt is judged afterwards from record
 
 **Wave 2**
 
-- [ ] 49-06-PLAN.md *(depends on 49-02)* — payload plan with the seeded blocking-human decision, RED test, validation map, full pre-launch check
+- [x] 49-06-PLAN.md *(depends on 49-02)* — payload plan with the seeded blocking-human decision, RED test, validation map, full pre-launch check
 - [ ] 49-07-PLAN.md *(depends on 49-02, 49-03)* — negative-arm driver and `--arm negative` checker, proven against the real binary
 
 **Wave 3**
@@ -540,7 +540,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
-| 49 | 5/12 | In Progress|  |
+| 49 | 6/12 | In Progress|  |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
 

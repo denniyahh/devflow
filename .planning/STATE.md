@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
-current_plan: 6
+current_plan: 7
 status: executing
-stopped_at: Phase 49 wave 1 complete (49-01..49-05) — wave 2 next
-last_updated: "2026-09-29T19:23:30.158Z"
-last_activity: 2026-09-29
-last_activity_desc: Phase 49 wave 1 complete — 5 of 12 plans (49-01..49-05)
-state_head: c0dd6796d2c644a299c51349478c93b633731486
+stopped_at: Completed 49-06; wave 2 plan 49-07 next
+last_updated: "2026-09-30T14:00:11.367Z"
+last_activity: 2026-09-30
+last_activity_desc: Phase 49 plan 49-06 complete; 6 of 12 plans
+state_head: e3b2a1ce44ce5896a6d7bd6d7ac624cdefdbb8fc
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 48
-  completed_plans: 41
+  completed_plans: 42
   percent: 50
 ---
 
@@ -191,9 +191,9 @@ change earns 2.0.
 
 Phase: 49 (Live Unattended Run — The Milestone's Instrument) — EXECUTING
 Plans: 12 plans in 6 waves (49-11 is the single live-attempt checkpoint); plan checker passed 2026-09-29
-Current Plan: 6
+Current Plan: 7
 Total Plans in Phase: 12
-Completed Plans: 5 of 12
+Completed Plans: 6 of 12
 Status: Executing Phase 49
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-29 — Phase 49 wave 1 complete: 49-01..49-05 (docs re-scope, live-payload scaffold, capture tools, SURV-01 watcher, sanitizer)
+Last activity: 2026-09-30 — Phase 49 plan 49-06 complete; 6 of 12 plans
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
@@ -954,9 +954,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-09-28T20:05:14.461Z
-**Stopped at:** Phase 49 context gathered
-**Resume file:** .planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-CONTEXT.md
+**Last session:** 2026-09-30T13:59:08.673Z
+**Stopped at:** Completed 49-06; wave 2 plan 49-07 next
+**Resume file:** None
 
 ## Operator Next Steps
 
