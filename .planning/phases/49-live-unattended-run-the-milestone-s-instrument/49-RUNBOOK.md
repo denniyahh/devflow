@@ -155,6 +155,15 @@ After the run ended, stop the observer:
 
 ```bash
 systemctl --user stop "p49-a$N-surv"
+python3 "$T/surv-watch.py" analyze "$EV/surv"
+```
+
+Read analysis.txt without inferring interleaving from absence of observations. After confirming
+workflow_shipped and no monitor/agent remains, release the retained exited unit:
+
+```bash
+systemctl --user stop "p49-a$N-start"
+systemctl --user reset-failed "p49-a$N-start"
 ```
 
 For a shipped run:
@@ -174,6 +183,27 @@ If state remains after a dead run, use the death-confirmation procedure below in
 ```bash
 bash "$T/check-evidence.sh" --attempt-gate "$P49"
 ```
+
+If the verdict says shipped but the attempt gate says not_ready (for example, a transient GitHub
+lookup omitted collected/pr.json), do not label that run stopped or immediately spend another
+attempt. Preserve the entire collection and verdict, diagnose the exact checker reason and retry
+only the collection from the same ended project. Choose a fresh archive suffix:
+
+```bash
+STAMP=$(date +%s)
+if [ -e "$EV/collected.before-$STAMP" ] || [ -e "$EV/verdict.before-$STAMP.json" ]; then
+  printf 'Archive suffix already exists; choose a fresh STAMP and stop here\n'
+else
+  mv "$EV/collected" "$EV/collected.before-$STAMP" &&
+  mv "$EV/verdict.json" "$EV/verdict.before-$STAMP.json" &&
+  bash "$T/collect-attempt.sh" --attempt "$N" &&
+  bash "$T/check-evidence.sh" --attempt-gate "$P49"
+fi
+```
+
+Preserve both versions and record why collection was repeated. The collector otherwise returns
+already collected at DONE. Do not rewrite collected files to satisfy a manifest or overwrite old
+evidence; a genuine criterion failure still requires diagnosis and the existing fix/stop decision.
 
 ## 8. Close the checkpoint or stop the attempt
 
@@ -217,33 +247,59 @@ count a live or parked run as stopped merely because a response was written.
 
 ## If the run dies without reaching Ship
 
-Confirm all three: no workflow_shipped, no waiting gate, and no surviving monitor or agent for
-this project. A quiet terminal does not prove death. Read the stored monitor_pid and inspect it:
+Confirm no workflow_shipped, no live waiter, and no surviving monitor/agent for this project.
+A gate FILE remaining on disk is not proof of a live parked run: a dead waiter can leave a stale
+Define/Code gate which gate reject refuses to answer. Do not delete or answer that stale gate to
+make collection work. Preserve it in the evidence and use the confirmed-dead path below.
+
+Inspect the stored monitor record, preserving NULL versus ABSENT versus an actual PID:
 
 ```bash
 "$BIN" gate list "$EV/project"
-MONITOR=$(jq -er '.monitor_pid | select(type == "number")' "$EV/project/.devflow/state-01.json")
-ps -ww -o pid=,lstart=,args= -p "$MONITOR"
+"$BIN" doctor --json "$EV/project" > "$EV/death-doctor.json"
+MONITOR_RECORD=$(jq -er '
+  if (has("monitor_pid") | not) then "ABSENT"
+  elif .monitor_pid == null then "NULL"
+  elif (.monitor_pid | type) == "number" and .monitor_pid >= 1 and (.monitor_pid | floor) == .monitor_pid then (.monitor_pid | tostring)
+  else error("invalid monitor_pid") end' "$EV/project/.devflow/state-01.json")
+case "$MONITOR_RECORD" in
+  NULL|ABSENT) printf 'No recorded monitor PID: %s; liveness remains unknown until process checks\n' "$MONITOR_RECORD" ;;
+  *) ps -ww -o pid=,lstart=,args= -p "$MONITOR_RECORD" ;;
+esac
 systemctl --user status "p49-a$N-start"
+systemctl --user show "p49-a$N-start" -p MainPID -p ControlGroup
 ```
 
-The listed PID must not be a live `__monitor` naming this project and phase 1. Check start-unit
-processes, including its agent; if any remain, do not use the dead-run collection path. Treat missing
-or malformed state as missing evidence to diagnose, not zero PID or death. If no gate is waiting,
-no workflow_shipped exists and no process survives in the run unit, record the death:
+NULL is valid before monitor spawn; it is not malformed state and never proves death by itself.
+ABSENT is distinct missing evidence. Invalid JSON or PID types require diagnosis. Check the unit's
+cgroup processes and the recorded `.devflow/phase-01-agent-pid` file, if present; inspect any numeric
+PID's full argv and start time. A monitor can be either __monitor naming this project/phase or an
+sh -c wrapper naming this project's phase-01 files and ending with advance --phase 1. Do not infer
+absence from only one spelling. Do not signal an unrelated/recycled PID or a parentless agent on
+PID alone. Doctor is read-only; its no-waiter finding can distinguish a stale gate from a live one.
+If it cannot establish waiter absence, or any monitor/agent remains or cannot be identified safely,
+stop and diagnose; never collect over a live or unconfirmable run.
+
+Only after positively confirming all run processes are gone, no waiter remains and no shipped
+event exists, a remaining gate file is stale evidence, not a parked run. Record and collect it:
 
 ```bash
-printf '%s\n' "attempt $N died: record observed events, PID identity and unit state" >> "$EV/deviations.txt"
+printf '%s\n' "attempt $N died: record events, PID identities, cgroup emptiness and any stale gate" >> "$EV/deviations.txt"
 systemctl --user stop "p49-a$N-surv"
-bash "$T/collect-attempt.sh" --attempt "$N" --allow-state --stop-note "died: describe confirmed failure"
+python3 "$T/surv-watch.py" analyze "$EV/surv"
+systemctl --user stop "p49-a$N-start"
+systemctl --user reset-failed "p49-a$N-start"
+bash "$T/collect-attempt.sh" --attempt "$N" --allow-state --stop-note "died: describe confirmed failure and stale gate if any"
 bash "$T/check-evidence.sh" --attempt-gate "$P49"
 ```
 
-Never pass --allow-state while the monitor or agent is alive or a gate is parked. This option is
-needed only because stale state normally makes the collector refuse. It writes the stopped verdict
-that the next prepare requires. A dead run ends this attempt without Ship and consumes a stopped
-attempt under D-10/D-11. Do not resume DevFlow inside the attempt: resumed progression is no longer
-the unattended progression criterion 2 measures. Follow section 8 instead.
+Never pass --allow-state while a waiter, monitor or agent is alive or unconfirmable. A stale gate
+with verified no waiter does not forbid this confirmed-dead collection. Preserve stale state and
+gate files for the collector. This writes the stopped verdict the next prepare requires. A dead run
+ends the attempt without Ship; do not resume DevFlow inside it and call that unattended progression.
+RemainAfterExit can show active (exited) after the program ended; unit activity alone proves neither
+life nor death. KillMode=process can leave descendants; stopping a unit is not a process-reaping
+proof. That process-model limitation is the explicit 49-10 plan deferral, not silently fixed here.
 
 ## Fix vehicle for a blocking defect
 
@@ -290,10 +346,15 @@ and verified the sanitized evidence. Repository deletion destroys its branch/PR 
 Stop/reset only this attempt's units, and restrict gate sweep to this project:
 
 ```bash
-systemctl --user stop "p49-a$N-start" "p49-a$N-surv"
-systemctl --user reset-failed "p49-a$N-start" "p49-a$N-surv"
+systemctl --user stop "p49-a$N-start" "p49-a$N-surv" "p49-a$N-negctl"
+systemctl --user reset-failed "p49-a$N-start" "p49-a$N-surv" "p49-a$N-negctl"
 "$BIN" gate sweep --root "$EV/project"
 ```
+
+The named units are recorded in units.txt; the authprobe is transient and self-collects. Confirm
+no monitor or agent survives before removing records. Gate sweep only addresses aged gates with
+a live waiter: it may legitimately be a no-op here and does not remove stale gate files or registry
+entries. The final verified local-directory removal clears this attempt's archived stale files.
 
 Successful Ship or abort normally deregisters itself. If a stale registration remains under
 `~/.cache/devflow/roots/`, inspect JSON project_root and phase, and remove only the exact file whose

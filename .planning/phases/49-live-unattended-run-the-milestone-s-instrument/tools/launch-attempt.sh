@@ -239,13 +239,23 @@ prepare() {
         install -m 0555 "$repo/target/debug/devflow" "$binary"
     fi
     printf 'build_commit=%s\nbuild_dirty=%s\nbin_sha256=%s\n' "$(git -C "$repo" rev-parse HEAD)" "$dirty" "$sha" >"$ev/identity.txt"
+    local version
+    version="$(timeout 10 claude --version)" || die 'Claude version unavailable'
+    printf 'claude_version=%s\n' "${version%%$'\n'*}" >>"$ev/identity.txt"
+    version="$(timeout 10 gh --version)" || die 'GitHub CLI version unavailable'
+    printf 'gh_version=%s\n' "${version%%$'\n'*}" >>"$ev/identity.txt"
+    version="$(timeout 10 node "$HOME/.claude/gsd-core/bin/gsd-tools.cjs" runtime-identity --raw | jq -er '.version | select(type == "string" and length > 0)')" || die 'GSD version unavailable'
+    printf 'gsd_version=%s\n' "$version" >>"$ev/identity.txt"
+    version="$(python3 --version)"; printf 'python3_version=%s\n' "$version" >>"$ev/identity.txt"
+    version="$(git --version)"; printf 'git_version=%s\n' "$version" >>"$ev/identity.txt"
     bash "$scaffold" --live-payload "$project"
     bash "$scaffold" --check "$project" >"$ev/prelaunch/check.txt" || die 'payload check failed'
     tail -1 "$ev/prelaunch/check.txt" | rg -qx 'CHECK passed=[1-9][0-9]* failed=0' || die 'payload CHECK line ABSENT'
     jq -n --argjson attempt "$attempt" --arg bin "$binary" --arg bin_sha256 "$sha" --arg launch "$project" \
         --arg build_commit "$(git -C "$repo" rev-parse HEAD)" \
-        '{attempt:$attempt,bin:$bin,bin_sha256:$bin_sha256,build_commit:$build_commit,launch:$launch,base_branch:"integration"}' >"$ev/attempt.json"
-    printf 'start=p49-a%s-start\nsurv=p49-a%s-surv\nauthprobe=p49-a%s-authprobe\n' "$attempt" "$attempt" "$attempt" >"$ev/units.txt"
+        --argjson created_at "$(date +%s)" \
+        '{attempt:$attempt,bin:$bin,bin_sha256:$bin_sha256,build_commit:$build_commit,launch:$launch,base_branch:"integration",created_at:$created_at}' >"$ev/attempt.json"
+    printf 'start=p49-a%s-start\nsurv=p49-a%s-surv\nnegctl=p49-a%s-negctl\nauthprobe=p49-a%s-authprobe\n' "$attempt" "$attempt" "$attempt" "$attempt" >"$ev/units.txt"
     printf '%s\n' "$attempt" >"$home/current-attempt.tmp"; mv "$home/current-attempt.tmp" "$home/current-attempt"
     echo "Prepared attempt $attempt. Next: run the negative arm; create the private repository and push main/integration; then start."
 }
