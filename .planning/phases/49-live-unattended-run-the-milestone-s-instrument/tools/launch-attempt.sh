@@ -234,7 +234,8 @@ prepare() {
     bash "$scaffold" --check "$project" >"$ev/prelaunch/check.txt" || die 'payload check failed'
     tail -1 "$ev/prelaunch/check.txt" | rg -qx 'CHECK passed=[1-9][0-9]* failed=0' || die 'payload CHECK line ABSENT'
     jq -n --argjson attempt "$attempt" --arg bin "$binary" --arg bin_sha256 "$sha" --arg launch "$project" \
-        '{attempt:$attempt,bin:$bin,bin_sha256:$bin_sha256,launch:$launch,base_branch:"integration"}' >"$ev/attempt.json"
+        --arg build_commit "$(git -C "$repo" rev-parse HEAD)" \
+        '{attempt:$attempt,bin:$bin,bin_sha256:$bin_sha256,build_commit:$build_commit,launch:$launch,base_branch:"integration"}' >"$ev/attempt.json"
     printf 'start=p49-a%s-start\nsurv=p49-a%s-surv\nauthprobe=p49-a%s-authprobe\n' "$attempt" "$attempt" "$attempt" >"$ev/units.txt"
     printf '%s\n' "$attempt" >"$home/current-attempt.tmp"; mv "$home/current-attempt.tmp" "$home/current-attempt"
     echo "Prepared attempt $attempt. Next: run the negative arm; create the private repository and push main/integration; then start."
