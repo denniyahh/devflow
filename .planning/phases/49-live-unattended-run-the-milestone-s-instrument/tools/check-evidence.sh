@@ -200,12 +200,61 @@ with tempfile.TemporaryDirectory() as tmp:
             ok=result.returncode==0 and f'CHECK passed={3 if pair else 11} failed=0' in result.stdout
             if mutation=='extra': ok=ok and 'NOTE deviation: gate validate' in result.stdout
         report(name,ok)
+    def manifest(directory):
+        lines=[]
+        for path in sorted(directory.rglob('*')):
+            if path.is_file() and path.name not in ['MANIFEST.sha256','DONE']:
+                lines.append(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+str(path.relative_to(directory))+'\n')
+        (directory/'MANIFEST.sha256').write_text(''.join(lines))
+    attempt_cases=[
+        ('attempt gate: shipped attempt passes','good','shipped attempt=1'),
+        ('control: shipped verdict without workflow_shipped is not ready','disagree','not_ready'),
+        ('control: shipped attempt failing a criterion is not ready','criterion','not_ready'),
+        ('control: missing verdict is not ready','missing','not_ready'),
+        ('control: manifest mismatch is not ready','manifest','not_ready'),
+        ('control: one stopped attempt is not ready','one','not_ready'),
+        ('attempt gate: three stopped attempts reach the cap','three','cap_reached stopped_attempts=3'),
+        ('control: a stopped attempt without a note does not count','note','not_ready')]
+    for i,(name,mutation,expected) in enumerate(attempt_cases):
+        h=root/f'attempt-control-{i}'
+        shutil.copytree(home,h)
+        a=h/'attempt-1'; c=a/'collected'
+        eventfile=c/'devflow/events.jsonl'
+        if mutation in ['disagree','one','three','note']:
+            rows=[json.loads(line) for line in eventfile.read_text().splitlines()]
+            eventfile.write_text(''.join(json.dumps(e)+'\n' for e in rows if e['event']!='workflow_shipped'))
+            manifest(c)
+        if mutation=='missing': (a/'verdict.json').unlink()
+        elif mutation=='manifest':
+            with (c/'git.txt').open('a') as f:f.write('tampered\n')
+        elif mutation=='criterion':
+            ledger=[json.loads(line) for line in (a/'ledger.jsonl').read_text().splitlines()]
+            p=a/'gates'/pathlib.Path(ledger[-1]['dir']).name/'git.txt'
+            p.write_text(p.read_text().replace('merge_base='+base_sha,'merge_base='+'d'*40))
+        elif mutation in ['one','three','note']:
+            verdict=json.loads((a/'verdict.json').read_text())
+            verdict.update(outcome='stopped',workflow_shipped=False,stop_note='fixture stop')
+            (a/'verdict.json').write_text(json.dumps(verdict))
+            if mutation!='one':
+                for n in [2,3]:
+                    shutil.copytree(a,h/f'attempt-{n}')
+                    v=dict(verdict,attempt=n)
+                    if mutation=='note' and n==2: v['stop_note']=''
+                    (h/f'attempt-{n}/verdict.json').write_text(json.dumps(v))
+                (h/'current-attempt').write_text('3\n')
+        result=subprocess.run(['bash',script,'--attempt-gate',str(h)],capture_output=True,text=True,timeout=30)
+        success=mutation in ['good','three']
+        ok=(result.returncode==0)==success and 'ATTEMPT_GATE verdict='+expected in result.stdout
+        reason={'disagree':'disagreement','criterion':'fork point is one value','missing':'ABSENT','manifest':'manifest','one':'1 of 3','note':'2 of 3'}
+        if mutation in reason:ok=ok and reason[mutation] in result.stdout
+        report(name,ok)
 print(f'SELFTEST passed={passed} failed={failed}')
 sys.exit(bool(failed) or not passed)
 PY
 }
 
 if [ "${1:-}" = --selftest ] && [ "$#" -eq 1 ]; then selftest; exit; fi
+if [ "${1:-}" = --attempt-gate ]; then exit 1; fi
 if [ "${1:-}" = --pair ] && [ "$#" -eq 2 ]; then set -- --arm pair "$2"; fi
 if [ "$#" -ne 3 ] || [ "$1" != --arm ] || { [ "$2" != negative ] && [ "$2" != positive ] && [ "$2" != pair ]; }; then
     echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
