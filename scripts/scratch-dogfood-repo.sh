@@ -497,6 +497,33 @@ check_config() {
     fi
 }
 
+check_payload() {
+    local dest="$1" plan="$1/.planning/phases/01-retry-budget/01-01-PLAN.md" line tmp rc=0
+    if [ -f "$plan" ]; then
+        case_ok "phase directory holds the payload plan"
+    else
+        case_fail "phase directory holds the payload plan" "payload plan absent"
+    fi
+    line="$(rg -m1 '^<task ' "$plan" 2>/dev/null || true)"
+    if [ "$line" = '<task type="checkpoint:decision" gate="blocking-human">' ]; then
+        case_ok "plan opens with the blocking-human decision task"
+    else
+        case_fail "plan opens with the blocking-human decision task" "first task absent or wrong"
+    fi
+    tmp="$(mktemp -d)"
+    if git -C "$dest" archive -o "$tmp/payload.tar" HEAD && tar -xf "$tmp/payload.tar" -C "$tmp"; then
+        (cd "$tmp" && python3 -B -m unittest discover -s tests -v) >"$tmp/test.log" 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ] && rg -q "No module named 'probe'" "$tmp/test.log"; then
+            case_ok "RED test fails before the implementation"
+        else
+            case_fail "RED test fails before the implementation" "missing-module test failure absent"
+        fi
+    else
+        case_fail "RED test fails before the implementation" "cannot archive payload"
+    fi
+    rm -rf -- "$tmp"
+}
+
 run_check() {
     local dest="$1" head status
     head="$(git -C "$dest" symbolic-ref -q HEAD 2>/dev/null || true)"
@@ -517,6 +544,7 @@ run_check() {
     check_exact_line "devflow.toml sets capture_retention 64" "$dest/devflow.toml" 'capture_retention = 64'
     check_config "$dest/.planning/config.json"
     check_exact_line "roadmap has the phase 1 heading" "$dest/.planning/ROADMAP.md" '### Phase 1: Retry budget constant'
+    check_payload "$dest"
     echo "CHECK passed=$N_PASS failed=$N_FAIL"
     [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
 }
@@ -581,7 +609,170 @@ scaffold_live_payload() {
     git -C "$DEST_ABS" config commit.gpgsign false
     git -C "$DEST_ABS" config tag.gpgsign false
 
-    mkdir -p "$DEST_ABS/.planning"
+    mkdir -p "$DEST_ABS/.planning/phases/01-retry-budget" "$DEST_ABS/tests"
+
+    cat > "$DEST_ABS/.planning/PROJECT.md" <<'EOF'
+# Retry Budget Probe
+
+## What This Is
+
+A small, disposable Python project with one module, `probe.budget`. It exists for one run and is deleted afterwards.
+
+## Core Value
+
+The module's retry budget is a deliberate choice among offered values, and its deadline helper is tested.
+
+## Requirements
+
+### Active
+
+- BUDGET-01: choose the default retry budget and implement the deadline helper.
+EOF
+
+    cat > "$DEST_ABS/.planning/REQUIREMENTS.md" <<'EOF'
+# Requirements
+
+## v1 Requirements
+
+- [ ] **BUDGET-01**: `probe.budget` defines `DEFAULT_RETRY_BUDGET_SECS`, chosen from 30, 120 or 300, and
+  `deadline_after(start_secs)` returns `start_secs + DEFAULT_RETRY_BUDGET_SECS`.
+
+## Traceability
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| BUDGET-01 | Phase 1 | Pending |
+EOF
+
+    cat > "$DEST_ABS/.planning/STATE.md" <<'EOF'
+---
+gsd_state_version: 1.0
+current_phase: 1
+current_phase_name: Retry budget constant
+status: planned
+---
+
+# Retry Budget Probe — Project State
+
+## Current Position
+
+Phase: 1
+Plan: 01-01
+Status: Planned
+EOF
+
+    cat > "$DEST_ABS/tests/test_budget.py" <<'EOF'
+import unittest
+
+from probe.budget import DEFAULT_RETRY_BUDGET_SECS, deadline_after
+
+OFFERED_BUDGETS = (30, 120, 300)
+
+
+class RetryBudgetTest(unittest.TestCase):
+    def test_budget_is_one_of_the_offered_values(self) -> None:
+        self.assertIsInstance(DEFAULT_RETRY_BUDGET_SECS, int)
+        self.assertIn(DEFAULT_RETRY_BUDGET_SECS, OFFERED_BUDGETS)
+
+    def test_deadline_adds_the_budget_to_the_start(self) -> None:
+        self.assertEqual(deadline_after(10.0), 10.0 + DEFAULT_RETRY_BUDGET_SECS)
+
+
+if __name__ == "__main__":
+    unittest.main()
+EOF
+
+    cat > "$DEST_ABS/.planning/phases/01-retry-budget/01-01-PLAN.md" <<'EOF'
+---
+phase: 01-retry-budget
+plan: 01
+type: execute
+wave: 1
+depends_on: []
+files_modified:
+  - probe/__init__.py
+  - probe/budget.py
+autonomous: false
+requirements: [BUDGET-01]
+
+must_haves:
+  truths:
+    - "`python3 -m unittest discover -s tests -v` passes"
+    - "`probe.budget.DEFAULT_RETRY_BUDGET_SECS` is one of 30, 120 or 300"
+  artifacts:
+    - path: probe/budget.py
+      provides: "DEFAULT_RETRY_BUDGET_SECS and deadline_after"
+---
+
+<objective>
+Choose the probe's default retry budget from three offered values, then implement `probe/budget.py` so the existing
+test in `tests/test_budget.py` passes.
+</objective>
+
+<tasks>
+
+<task type="checkpoint:decision" gate="blocking-human">
+  <name>Task 1: Choose the default retry budget</name>
+  <decision>Which value should `probe.budget.DEFAULT_RETRY_BUDGET_SECS` hold, in seconds?</decision>
+  <context>
+The probe retries calls to an upstream service until the budget runs out. The upstream's documented failover
+completes within 90 seconds; a budget shorter than that turns every failover into a hard failure. The on-call pager
+escalates a stalled job after 4 minutes, so a budget longer than 240 seconds lets a dead upstream page someone before
+the probe reports its own failure. A longer budget also holds a worker slot for longer.
+  </context>
+  <options>
+    <option id="budget-30">
+      <name>30 seconds</name>
+      <pros>Fails fast and frees worker slots quickly.</pros>
+      <cons>Shorter than the 90-second failover window, so every failover becomes a hard failure.</cons>
+    </option>
+    <option id="budget-120">
+      <name>120 seconds</name>
+      <pros>Covers the 90-second failover window and reports before the 4-minute page.</pros>
+      <cons>Holds a worker slot for up to two minutes per stalled call.</cons>
+    </option>
+    <option id="budget-300">
+      <name>300 seconds</name>
+      <pros>Survives even a slow failover with margin.</pros>
+      <cons>Longer than the 4-minute pager threshold, so a dead upstream pages someone first.</cons>
+    </option>
+  </options>
+  <resume-signal>Select: budget-30, budget-120, or budget-300</resume-signal>
+</task>
+
+<task type="auto">
+  <name>Task 2: Implement probe/budget.py with the chosen budget</name>
+  <files>probe/__init__.py, probe/budget.py</files>
+  <action>
+Create an empty `probe/__init__.py`. Create `probe/budget.py` defining `DEFAULT_RETRY_BUDGET_SECS: int` set to the
+value chosen in Task 1, and `deadline_after(start_secs: float) -> float` returning
+`start_secs + DEFAULT_RETRY_BUDGET_SECS`. Do not edit `tests/test_budget.py`.
+  </action>
+  <verify>
+    <automated>python3 -m unittest discover -s tests -v</automated>
+  </verify>
+  <acceptance_criteria>
+    - `python3 -m unittest discover -s tests -v` exits 0 and reports `Ran 2 tests` and `OK`
+    - `DEFAULT_RETRY_BUDGET_SECS` equals the option chosen in Task 1
+  </acceptance_criteria>
+  <done>The module holds the chosen budget and the existing test passes.</done>
+</task>
+
+</tasks>
+
+<verification>
+`python3 -m unittest discover -s tests -v` passes.
+</verification>
+
+<success_criteria>
+- `DEFAULT_RETRY_BUDGET_SECS` is one of 30, 120 or 300 and `deadline_after` adds it to a start time.
+</success_criteria>
+
+<output>
+Create `.planning/phases/01-retry-budget/01-01-SUMMARY.md` when done.
+</output>
+EOF
+
 
     cat > "$DEST_ABS/.gitignore" <<'EOF'
 .devflow/
