@@ -132,12 +132,81 @@ with tempfile.TemporaryDirectory() as tmp:
     ok = result.returncode == 0 and 'CHECK passed=11 failed=0' in result.stdout
     print(('  ok   ' if ok else '  FAIL ')+'positive arm passes'+('' if ok else ' — complete captured fixture rejected'))
     passed += int(ok); failed += int(not ok)
+    def report(name, ok):
+        global passed, failed
+        print(('  ok   ' if ok else '  FAIL ')+name+('' if ok else ' — expected discrimination absent'))
+        passed += int(ok); failed += int(not ok)
+    positive_cases = [
+        ('control: moved base refuses','base','fork point is one value'),
+        ('control: reordered gates refuse','order','gates fired in order define, code, ship'),
+        ('control: merge onto main instead of integration refuses','merge','merged into integration'),
+        ('control: absent ship snapshot refuses with ABSENT','ship','fork point is one value'),
+        ('control: operator-answered ship gate refuses','answer','ship gate answered by --yes-ship'),
+        ('positive: extra gate is a deviation not a failure','extra',None),
+        ('pair passes','pair',None),
+        ('control: differing binary sha refuses the pair','binary','same binary in both arms'),
+        ('control: arms agreeing on base_branch refuses the pair','agree','arms disagree on base_branch'),
+        ('control: differing build commit refuses the pair','commit','same build commit in both arms'),
+        ('control: positive note absent refuses','note','base-branch note names devflow.toml'),
+        ('control: positive config condition absent refuses','holds','config condition holds'),
+        ('control: positive base_branch develop refuses','branch','base_branch is integration'),
+        ('control: positive main changed refuses','main','main untouched locally'),
+        ('control: PR targets integration refuses','pr','PR targets main from the feature branch'),
+        ('control: positive shipped event absent refuses','shipped','shipped'),
+        ('control: merge_result false refuses','result','merge_result records a merge')]
+    for i,(name,mutation,expected) in enumerate(positive_cases):
+        copy=root/f'positive-control-{i}'
+        shutil.copytree(ev,copy)
+        ledger=[json.loads(line) for line in (copy/'ledger.jsonl').read_text().splitlines()]
+        define=copy/'gates'/pathlib.Path(ledger[0]['dir']).name
+        ship=copy/'gates'/pathlib.Path(ledger[-1]['dir']).name
+        eventfile=copy/'collected/devflow/events.jsonl'
+        rows=[json.loads(line) for line in eventfile.read_text().splitlines()]
+        if mutation=='base':
+            p=ship/'git.txt'; p.write_text(p.read_text().replace(f'merge_base={base_sha}', 'merge_base='+'d'*40))
+        elif mutation=='order':
+            ids=[i for i,e in enumerate(rows) if e['event']=='gate_fired' and e['stage'] in ['define','code']]
+            rows[ids[0]],rows[ids[1]]=rows[ids[1]],rows[ids[0]]
+        elif mutation=='merge':
+            p=copy/'collected/git.txt';text=p.read_text()
+            text=text.replace('integration_merge_count=1','integration_merge_count=0').replace('main_head='+main_sha,'main_head='+'d'*40)
+            p.write_text(text)
+        elif mutation=='ship': shutil.rmtree(ship)
+        elif mutation=='answer':
+            next(e for e in rows if e['event']=='gate_resolved' and e['stage']=='ship')['responded_by']='tester'
+        elif mutation=='extra': rows.insert(-1,{'event':'gate_fired','stage':'validate','phase':1})
+        elif mutation=='binary': (copy/'negctl/bin_sha256').write_text('d'*64+'\n')
+        elif mutation=='agree': (define/'devflow/state-01.json').write_text('{"base_branch":"develop"}')
+        elif mutation=='commit':
+            p=copy/'negctl/events.jsonl'; p.write_text(p.read_text().replace(build_commit,'d'*40))
+        elif mutation in ['note','holds']:
+            p=copy/'start.stdout';p.write_text('\n'.join(line for line in p.read_text().splitlines() if ('note:' if mutation=='note' else '[holds]') not in line)+'\n')
+        elif mutation=='branch': (define/'devflow/state-01.json').write_text('{"base_branch":"develop"}')
+        elif mutation=='main':
+            p=copy/'collected/git.txt';p.write_text(p.read_text().replace('main_head='+main_sha,'main_head='+'d'*40))
+        elif mutation=='pr': (copy/'collected/pr.json').write_text('{"baseRefName":"integration","headRefName":"feature/phase-01"}')
+        elif mutation=='shipped': rows=[e for e in rows if e['event']!='workflow_shipped']
+        elif mutation=='result': next(e for e in rows if e['event']=='merge_result')['merged']=False
+        eventfile.write_text(''.join(json.dumps(e)+'\n' for e in rows))
+        pair=mutation in ['pair','binary','agree','commit']
+        args=['--pair',str(copy)] if pair else ['--arm','positive',str(copy)]
+        result=subprocess.run(['bash',script,*args],capture_output=True,text=True,timeout=20)
+        if expected:
+            ok=result.returncode!=0 and f'  FAIL {"pair" if pair else "positive"}: {expected}' in result.stdout
+            if mutation=='merge': ok=ok and '  FAIL positive: main untouched locally' in result.stdout
+            if mutation=='ship': ok=ok and 'ABSENT' in result.stdout
+            if mutation=='base': ok=ok and f'base_sha={base_sha}' in result.stdout and f'define_head={base_sha}' in result.stdout and 'ship_merge_base='+'d'*40 in result.stdout
+        else:
+            ok=result.returncode==0 and f'CHECK passed={3 if pair else 11} failed=0' in result.stdout
+            if mutation=='extra': ok=ok and 'NOTE deviation: gate validate' in result.stdout
+        report(name,ok)
 print(f'SELFTEST passed={passed} failed={failed}')
 sys.exit(bool(failed) or not passed)
 PY
 }
 
 if [ "${1:-}" = --selftest ] && [ "$#" -eq 1 ]; then selftest; exit; fi
+if [ "${1:-}" = --pair ]; then exit 1; fi
 if [ "$#" -ne 3 ] || [ "$1" != --arm ] || { [ "$2" != negative ] && [ "$2" != positive ]; }; then
     echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
     exit 2
