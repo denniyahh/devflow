@@ -181,7 +181,7 @@ st_live_topology() {
 st_live_check_passes() {
     local name="live payload: check passes"
     local rc=0 last
-    bash "$SELF" --check "$ST_TMP/lp" >"$ST_TMP/check.out" 2>&1 || rc=$?
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$ST_TMP/lp" >"$ST_TMP/check.out" 2>&1 || rc=$?
     last="$(tail -n 1 "$ST_TMP/check.out")"
     if [ "$rc" -ne 0 ]; then
         case_fail "$name" "--check exited $rc, last line '${last:-<empty>}'"
@@ -212,7 +212,7 @@ st_control_compact_config() {
         case_fail "$name" "precondition: the copy's config.json still equals jq --indent 2 of itself"
         return
     fi
-    bash "$SELF" --check "$copy" >"$ST_TMP/compact.out" 2>&1 || rc=$?
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$copy" >"$ST_TMP/compact.out" 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
         case_fail "$name" "--check accepted a compact config.json (exit 0)"
         return
@@ -243,7 +243,7 @@ st_control_head_on_main() {
         case_fail "$name" "precondition: HEAD is '${head:-unreadable}', want refs/heads/main"
         return
     fi
-    bash "$SELF" --check "$copy" >"$ST_TMP/onmain.out" 2>&1 || rc=$?
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$copy" >"$ST_TMP/onmain.out" 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
         case_fail "$name" "--check accepted HEAD on main (exit 0)"
         return
@@ -410,6 +410,88 @@ st_payload_tests() {
     fi
 }
 
+# A missing/malformed hook list must fail rather than read as zero hooks.
+hook_count() {
+    local dest="$1" point="$2" caps="$3" json
+    [ -f "$GSD_TOOLS" ] || return 1
+    json="$(cd "$dest" && timeout 20 node "$GSD_TOOLS" loop render-hooks "$point" --raw)" || return 1
+    printf '%s\n' "$json" | jq -er --argjson caps "$caps" '
+        if (.activeHooks | type) != "array" or
+            any(.activeHooks[]; (.capId | type) != "string") then
+            error("activeHooks/capId absent or malformed")
+        else [.activeHooks[] | .capId as $id | select($caps | index($id))] | length end'
+}
+
+st_hook_controls() {
+    local copy="$ST_TMP/hooks" security nyquist wave rc=0
+    security="$(hook_count "$ST_TMP/lp" ship:pre '["security"]')" || rc=1
+    nyquist="$(hook_count "$ST_TMP/lp" verify:post '["nyquist"]')" || rc=1
+    wave="$(hook_count "$ST_TMP/lp" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$security" -eq 0 ] && [ "$nyquist" -gt 0 ] && [ "$wave" -eq 0 ]; then
+        case_ok "live payload: GSD resolves the gates as configured"
+    else
+        case_fail "live payload: GSD resolves the gates as configured" "probe failed or unexpected hook counts"
+    fi
+    cp -a "$ST_TMP/lp" "$copy"
+    printf '{"workflow": {}}\n' >"$copy/.planning/config.json"
+    rc=0
+    security="$(hook_count "$copy" ship:pre '["security"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$security" -gt 0 ]; then
+        case_ok "control: bare config activates the security ship gate"
+    else
+        case_fail "control: bare config activates the security ship gate" "security hook not observed"
+    fi
+    # Independently exercise the wave probe's opposite result too.
+    rc=0
+    wave="$(hook_count "$copy" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$wave" -gt 0 ]; then
+        case_ok "control: bare config activates the ui or drift wave gate"
+    else
+        case_fail "control: bare config activates the ui or drift wave gate" "wave hooks not observed"
+    fi
+    jq '.workflow.nyquist_validation = false' "$ST_TMP/lp/.planning/config.json" >"$copy/.planning/config.json"
+    rc=0
+    nyquist="$(hook_count "$copy" verify:post '["nyquist"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$nyquist" -eq 0 ]; then
+        case_ok "control: nyquist off removes the nyquist hook"
+    else
+        case_fail "control: nyquist off removes the nyquist hook" "nyquist hook still present or probe failed"
+    fi
+}
+
+st_check_mutation() {
+    local kind="$1" check="$2" name="$3" copy="$ST_TMP/mutation-$1" rc=0
+    if [ "$kind" = ancestor ]; then
+        mkdir "$ST_TMP/cargo-parent"
+        touch "$ST_TMP/cargo-parent/Cargo.toml"
+        copy="$ST_TMP/cargo-parent/payload"
+    fi
+    cp -a "$ST_TMP/lp" "$copy"
+    case "$kind" in
+        breaking) git -C "$copy" commit -q --allow-empty -m 'feat!: drop the old helper' ;;
+        footer) git -C "$copy" commit -q --allow-empty -m 'feat: adjust helper' -m 'BREAKING CHANGE: remove helper' ;;
+        external)
+            sed -i '/^type: execute/a external_verify: true' "$copy/.planning/phases/01-retry-budget/01-01-PLAN.md"
+            git -C "$copy" commit -q -am 'chore: add external verification control'
+            ;;
+        tag) git -C "$copy" tag v0.1.0 ;;
+        indent)
+            jq --indent 4 . "$copy/.planning/config.json" >"$ST_TMP/four.json"
+            mv "$ST_TMP/four.json" "$copy/.planning/config.json"
+            git -C "$copy" commit -q -am 'chore: reindent config control'
+            ;;
+        ancestor) [ -f "$ST_TMP/cargo-parent/Cargo.toml" ] || die 'ancestor control absent' ;;
+        *) die "unknown mutation: $kind" ;;
+    esac
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$copy" >"$ST_TMP/$kind.out" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$(st_count "  FAIL $check" "$ST_TMP/$kind.out")" -eq 1 ] &&
+        [ "$(st_count '  FAIL ' "$ST_TMP/$kind.out")" -eq 1 ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "mutation not refused solely for $check (exit $rc)"
+    fi
+}
+
 run_selftest() {
     # Hermetic: the host checkout's git environment and global/system config
     # (signing, hooks, excludes) may not leak into the scratch repositories.
@@ -435,6 +517,12 @@ run_selftest() {
     st_control_existing_dest
     st_control_unknown_option
     st_payload_tests
+    st_hook_controls
+    st_check_mutation breaking "no breaking commit on integration" "control: check refuses a breaking commit"
+    st_check_mutation external "no plan declares external_verify" "control: check refuses an external_verify line"
+    st_check_mutation ancestor "no ancestor Cargo.toml" "control: check refuses an ancestor Cargo.toml"
+    st_check_mutation footer "no breaking commit on integration" "control: check refuses a breaking footer"
+    st_check_mutation tag "no tags" "control: check refuses a tag"
 
     echo "SELFTEST passed=$N_PASS failed=$N_FAIL"
     [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
