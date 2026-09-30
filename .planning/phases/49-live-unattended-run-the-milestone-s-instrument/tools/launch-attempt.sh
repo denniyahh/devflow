@@ -104,6 +104,7 @@ exit 3
     baseline=root/'baseline';shutil.copytree(home,baseline)
     def restore():
         shutil.rmtree(home);shutil.copytree(baseline,home)
+        git('fetch',str(ev/'project'),'+main:main','+integration:integration',at=bare)
         (root/'units.log').write_text('')
     # Clear the relaunch sentinel in each clone, without changing tracked files.
     (baseline/'attempt-1/start.stdout').unlink()
@@ -296,6 +297,8 @@ start() {
     printf '%s\n' "$auth" | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' | rg 'Logged in to|Token scopes:' >"$ev/prelaunch/gh-auth.txt" || die 'gh auth fields ABSENT'
     rg 'Token scopes:' "$ev/prelaunch/gh-auth.txt" | rg -q "(^|[' ,])repo([', ]|$)" || die 'repo scope required'
     probe_auth
+    base_sha="$(git -C "$project" rev-parse integration)"
+    main_sha="$(git -C "$project" rev-parse main)"
     printf 'base_sha=%s\nmain_sha=%s\n' "$base_sha" "$main_sha" >"$ev/prelaunch/fork-base.txt"
     mkdir -p "$ev/surv";set_unit_env
     timeout 20 systemd-run --user --unit "p49-a$attempt-surv" --setenv="PATH=$PATH" --setenv="HOME=$HOME" -- \
