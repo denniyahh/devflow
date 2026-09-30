@@ -138,14 +138,15 @@ PY
 }
 
 if [ "${1:-}" = --selftest ] && [ "$#" -eq 1 ]; then selftest; exit; fi
-if [ "${1:-}" = --arm ] && [ "${2:-}" = positive ]; then exit 1; fi
-if [ "$#" -ne 3 ] || [ "$1" != --arm ] || [ "$2" != negative ]; then
+if [ "$#" -ne 3 ] || [ "$1" != --arm ] || { [ "$2" != negative ] && [ "$2" != positive ]; }; then
     echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
     exit 2
 fi
-python3 - "$3" <<'PY'
+python3 - "$2" "$3" <<'PY'
 import json, pathlib, re, sys
-root = pathlib.Path(sys.argv[1]) / 'negctl'
+mode = sys.argv[1]
+root = pathlib.Path(sys.argv[2])
+if mode == 'negative': root = root / 'negctl'
 refusal = '  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live'
 passed = failed = 0
 
@@ -156,18 +157,22 @@ def check(name, fn):
     except (OSError, ValueError, KeyError, TypeError, IndexError) as e:
         failed += 1
         absent = isinstance(e, (OSError, KeyError, IndexError))
-        print(f'  FAIL negative: {name} — {"ABSENT " if absent else ""}{e}')
+        print(f'  FAIL {mode}: {name} — {"ABSENT " if absent else ""}{e}')
     else:
         passed += 1
-        print(f'  ok   negative: {name}')
+        print(f'  ok   {mode}: {name}')
 
-def snapshot():
+def snapshot(stage='define', last=False):
     entries = [json.loads(line) for line in (root / 'ledger.jsonl').read_text().splitlines()]
-    entry = next((e for e in entries if e['stage'] == 'define'), None)
-    if entry is None: raise KeyError('define snapshot')
-    name = pathlib.Path(entry['dir']).name
-    if not re.fullmatch(r'[0-9]{3,}-define', name): raise ValueError('invalid snapshot basename')
-    return root / 'gates' / name
+    matches=[]
+    for entry in entries:
+        name=pathlib.Path(entry['dir']).name
+        if not re.fullmatch(r'[0-9]{3,}-[a-z]+',name): raise ValueError('invalid snapshot basename')
+        directory=root/'gates'/name
+        if not directory.is_dir(): raise FileNotFoundError(str(directory))
+        if entry['stage']==stage: matches.append(directory)
+    if not matches: raise KeyError(stage+' snapshot')
+    return matches[-1] if last else matches[0]
 
 def fork():
     fields = dict(line.split('=', 1) for line in (snapshot() / 'git.txt').read_text().splitlines() if '=' in line)
@@ -181,11 +186,79 @@ def aborted():
     if not gates: raise KeyError('gate_fired')
     return any(e['event'] == 'workflow_aborted' and str(e['phase']) == '1' for e in events[max(gates) + 1:])
 
-check('DOES NOT HOLD line present', lambda: refusal in (root / 'start.stdout').read_text().splitlines())
-check('no base-branch note', lambda: 'note: base branch is' not in (root / 'start.stdout').read_text())
-check('base_branch is develop', lambda: json.loads((snapshot() / 'devflow/state-01.json').read_text())['base_branch'] == 'develop')
-check('forked from the recorded develop', fork)
-check('aborted after the gate', aborted)
+def fields(path):
+    return dict(line.split('=',1) for line in path.read_text().splitlines() if '=' in line)
+
+def sha(value):
+    if not isinstance(value,str) or not re.fullmatch('[0-9a-f]{40,64}',value):
+        raise ValueError('invalid or ABSENT SHA')
+    return value
+
+def event_rows():
+    return [json.loads(line) for line in (root/'collected/devflow/events.jsonl').read_text().splitlines()]
+
+def phase_events(kind):
+    return [(i,e) for i,e in enumerate(event_rows()) if e['event']==kind and str(e['phase'])=='1']
+
+def fork_point():
+    values = [sha(fields(root/'prelaunch/fork-base.txt')['base_sha']),
+              sha(fields(snapshot()/'git.txt')['worktree_head']),
+              sha(fields(snapshot('ship')/'git.txt')['merge_base'])]
+    print('NOTE fork_point base_sha={} define_head={} ship_merge_base={}'.format(*values))
+    return len(set(values))==1
+
+def gate_order():
+    gates=phase_events('gate_fired')
+    positions=[next((i for i,e in gates if e['stage']==stage),None) for stage in ['define','code','ship']]
+    if any(i is None for i in positions): raise KeyError('required gate')
+    merges=[i for i,e in phase_events('merge_result') if e['merged'] is True]
+    return bool(merges) and positions[0]<positions[1]<positions[2]<merges[0]
+
+def answers():
+    resolved=phase_events('gate_resolved')
+    for stage in ['define','code','ship']:
+        entry=next((e for _,e in resolved if e['stage']==stage),None)
+        if entry is None: raise KeyError(stage+' gate_resolved')
+        if (entry['responded_by']=='--yes-ship') != (stage=='ship'): return False
+    return True
+
+def merged():
+    git=fields(root/'collected/git.txt')
+    parents=git['integration_merge_parents'].split()
+    feature=sha(fields(snapshot('ship',last=True)/'git.txt')['feature_head'])
+    return (git['integration_merge_count']=='1' and len(parents)==2 and
+            sha(parents[1])==feature and sha(git['integration_head'])!=sha(fields(root/'prelaunch/fork-base.txt')['base_sha']))
+
+def positive_checks():
+    check('base_branch is integration',lambda:json.loads((snapshot()/'devflow/state-01.json').read_text())['base_branch']=='integration')
+    check('base-branch note names devflow.toml',lambda:'note: base branch is `integration` (from devflow.toml (base_branch))' in (root/'start.stdout').read_text())
+    check('config condition holds',lambda:'  [holds] GSD config can hold the chain flag' in (root/'start.stdout').read_text().splitlines())
+    check('fork point is one value',fork_point)
+    check('gates fired in order define, code, ship',gate_order)
+    check('ship gate answered by --yes-ship',answers)
+    check('shipped',lambda:bool(phase_events('workflow_shipped')))
+    check('merged into integration',merged)
+    check('main untouched locally',lambda:sha(fields(root/'collected/git.txt')['main_head'])==sha(fields(root/'prelaunch/fork-base.txt')['main_sha']))
+    check('PR targets main from the feature branch',lambda:json.loads((root/'collected/pr.json').read_text())['baseRefName']=='main' and json.loads((root/'collected/pr.json').read_text())['headRefName']=='feature/phase-01')
+    check('merge_result records a merge',lambda:any(e['merged'] is True for _,e in phase_events('merge_result')))
+    try:
+        gates=phase_events('gate_fired')
+        print(f'NOTE gate_census count={len(gates)} stages='+','.join(e['stage'] for _,e in gates))
+        for _,e in gates:
+            unexpected=e['stage'] not in ['define','code','ship']
+            print(f'NOTE gate {e["stage"]} unexpected={str(unexpected).lower()}')
+            if unexpected: print(f'NOTE deviation: gate {e["stage"]} unexpected=true')
+    except (OSError,ValueError,KeyError,TypeError) as e:
+        print(f'NOTE gate_census ABSENT {e}')
+
+if mode == 'positive':
+    positive_checks()
+else:
+    check('DOES NOT HOLD line present', lambda: refusal in (root / 'start.stdout').read_text().splitlines())
+    check('no base-branch note', lambda: 'note: base branch is' not in (root / 'start.stdout').read_text())
+    check('base_branch is develop', lambda: json.loads((snapshot() / 'devflow/state-01.json').read_text())['base_branch'] == 'develop')
+    check('forked from the recorded develop', fork)
+    check('aborted after the gate', aborted)
 print(f'CHECK passed={passed} failed={failed}')
 sys.exit(bool(failed) or not passed)
 PY
