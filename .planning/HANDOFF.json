@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-09-30T15:18:31.047428+00:00",
+  "timestamp": "2026-09-30T16:15:51.687060+00:00",
   "phase": "49",
   "phase_name": "Live Unattended Run — The Milestone's Instrument",
   "phase_dir": ".planning/phases/49-live-unattended-run-the-milestone-s-instrument",
@@ -14,35 +14,35 @@
       "name": "Prepare/probe/start tracer and real authentication gate",
       "status": "in_progress",
       "commit": "cba140c",
-      "progress": "Code committed; real prepare passed; real auth probe failed. Task 1 is incomplete."
+      "progress": "Code committed; real preparation previously passed; real authentication still blocked because selected API-key sources are empty. Fork capture corrected in 59be29f; 17 fake controls pass."
     },
     {
       "id": 2,
       "name": "Launcher refusal and isolation controls",
       "status": "done",
       "commit": "c568940",
-      "progress": "16 selftest cases and Task-2 gate pass."
+      "progress": "17 launcher controls and Task-2 gate pass; pinned Clippy passed."
     }
   ],
   "remaining_tasks": [
     {
       "id": 1,
-      "name": "Resolve authorized auth route, rerun real gate, then correct and test post-probe fork SHA capture before live start",
+      "name": "Obtain existing nonempty API-key location, wire authorized API route, rerun real prepare/auth gate",
       "status": "blocked"
     }
   ],
   "blockers": [
     {
-      "description": "Real Claude auth probe failed: probe_exit=1, is_error=true, reply_ok=no, auth_source=none. Operator credential-route decision required.",
+      "description": "API-key route authorized, but key values are empty in Claude settings and systemd environment. Await existing key location.",
       "type": "human_action",
-      "workaround": "None authorized; do not change credentials/settings/manager environment or fake the probe."
+      "workaround": "Do not substitute login, invent a key, print secrets, or bypass real authentication."
     }
   ],
   "async_jobs": [],
   "human_actions_pending": [
     {
-      "action": "Choose the credential route for the nested agent: existing Claude login or API/provider configuration.",
-      "context": "49-09 explicitly requires stopping on real-probe failure before changing auth routing.",
+      "action": "Provide the local file path or secret-manager entry containing the existing nonempty Claude API key; do not paste the key into chat.",
+      "context": "API-key route was explicitly authorized; configured sources contain empty values.",
       "blocking": true
     }
   ],
@@ -51,9 +51,14 @@
       "decision": "Preserve the auth failure and leave 49-09 without SUMMARY",
       "rationale": "Actual Task-1 gate is red; fake test success does not close it.",
       "phase": "49"
+    },
+    {
+      "decision": "Operator chose existing Claude API key on 2026-09-30",
+      "rationale": "Explicit user instruction: use my claude API key.",
+      "phase": "49"
     }
   ],
   "uncommitted_files": [],
-  "next_action": "Read 49-09-AUTH-BLOCKER.md, obtain the explicit credential-route choice, then resume the existing partial plan. Do not redispatch/recreate its production work.",
-  "context_notes": "Measured clean at checkpoint base 218d7580e4545db0b74c2c121b3a429fbc3e8170. 49-08 is complete; 8/12 plans have summaries. The two handoff files are committed after this snapshot. No live positive attempt was launched. Temporary gate home removed; only safe derived/name diagnostics retained in /tmp. No async-job directory/manifests were found. Pending launcher inspection finding: read base/main SHAs again after auth before recording fork-base; add mutation control. Manual STATE insertion error repaired and logged."
+  "next_action": "Use the provided key location to configure only the authorized API route privately, then rerun the real auth gate. If still missing, request its location, not a new credential-route choice.",
+  "context_notes": "Clean before handoff update. 8/12 plans complete; 49-09 has no SUMMARY. API-key route choice settled; actual key source empty. Fork regression fixed and all 17 fake tests plus Task-2 gate and pinned Clippy pass. No real auth retry or positive launch with the empty key. Only key location remains open."
 }
