@@ -254,10 +254,56 @@ PY
 }
 
 if [ "${1:-}" = --selftest ] && [ "$#" -eq 1 ]; then selftest; exit; fi
-if [ "${1:-}" = --attempt-gate ]; then exit 1; fi
+attempt_gate() {
+    python3 - "$SELF" "$1" <<'PY'
+import json, pathlib, re, subprocess, sys
+script=sys.argv[1]; home=pathlib.Path(sys.argv[2]); number='ABSENT'
+try:
+    number=(home/'current-attempt').read_text().strip()
+    if not re.fullmatch('[1-9]',number): raise ValueError('current-attempt must be one digit 1-9')
+    attempt=home/f'attempt-{number}'; collected=attempt/'collected'
+    if not (collected/'DONE').is_file(): raise FileNotFoundError('collected/DONE')
+    verdict=json.loads((attempt/'verdict.json').read_text())
+    # Refuse paths outside the collected tree before asking sha256sum to read.
+    lines=(collected/'MANIFEST.sha256').read_text().splitlines()
+    if not lines: raise ValueError('manifest empty')
+    for line in lines:
+        if not re.fullmatch(r'[0-9a-f]{64} [ *].+',line): raise ValueError('manifest malformed')
+        path=pathlib.Path(line[66:])
+        if path.is_absolute() or '..' in path.parts: raise ValueError('manifest path outside collection')
+    result=subprocess.run(['sha256sum','--quiet','-c','MANIFEST.sha256'],cwd=collected,capture_output=True,text=True,timeout=30)
+    if result.returncode!=0: raise ValueError('manifest mismatch')
+    rows=[json.loads(line) for line in (collected/'devflow/events.jsonl').read_text().splitlines()]
+    shipped=any(e['event']=='workflow_shipped' and str(e['phase'])=='1' for e in rows)
+    if verdict['outcome'] not in ['shipped','stopped'] or (verdict['outcome']=='shipped')!=shipped or verdict['workflow_shipped'] is not shipped:
+        raise ValueError('verdict/events disagreement')
+    if shipped:
+        for args in [['--arm','positive'],['--arm','negative'],['--pair']]:
+            result=subprocess.run(['bash',script,*args,str(attempt)],capture_output=True,text=True,timeout=30)
+            print(result.stdout,end='')
+            if result.returncode!=0 or not re.search(r'^CHECK passed=[1-9][0-9]* failed=0$',result.stdout,re.M):
+                failures=[line for line in result.stdout.splitlines() if line.startswith('  FAIL ')]
+                raise ValueError('; '.join(failures) or 'arm check failed or CHECK absent')
+        print(f'ATTEMPT_GATE verdict=shipped attempt={number}')
+    else:
+        stopped=0
+        for path in home.glob('attempt-*/verdict.json'):
+            value=json.loads(path.read_text())
+            if value['outcome']=='stopped' and isinstance(value['stop_note'],str) and value['stop_note'].strip(): stopped+=1
+        if stopped<3: raise ValueError(f'{stopped} of 3 stopped attempts have a note')
+        print(f'ATTEMPT_GATE verdict=cap_reached stopped_attempts={stopped}')
+except (OSError,ValueError,KeyError,TypeError,subprocess.TimeoutExpired) as e:
+    absent='ABSENT ' if isinstance(e,(OSError,KeyError)) else ''
+    reason=str(e).replace('\n',' ')
+    print(f'ATTEMPT_GATE verdict=not_ready attempt={number} reason={absent}{reason}')
+    sys.exit(1)
+PY
+}
+
+if [ "${1:-}" = --attempt-gate ] && [ "$#" -eq 2 ]; then attempt_gate "$2"; exit; fi
 if [ "${1:-}" = --pair ] && [ "$#" -eq 2 ]; then set -- --arm pair "$2"; fi
 if [ "$#" -ne 3 ] || [ "$1" != --arm ] || { [ "$2" != negative ] && [ "$2" != positive ] && [ "$2" != pair ]; }; then
-    echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
+    echo 'usage: check-evidence.sh --arm positive|negative <EV> | --pair <EV> | --attempt-gate <P49> | --selftest' >&2
     exit 2
 fi
 python3 - "$2" "$3" <<'PY'
