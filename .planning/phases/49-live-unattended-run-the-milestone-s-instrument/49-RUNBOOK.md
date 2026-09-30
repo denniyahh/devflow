@@ -185,3 +185,142 @@ On `verdict=not_ready`, do not reply done. If the attempt stopped below the cap,
 execute-phase session, confirm the fix vehicle described below, fix it and resume with
 `/gsd-execute-phase 49`. The checkpoint plan has no SUMMARY or commits and restarts at its single
 human task for the next attempt. Do not alter GSD state to simulate closure.
+
+## If a gate you did not expect opens
+
+Every gate beyond Define and Code is a deviation to record in `$EV/deviations.txt`, including a
+review loop-back, MAJOR-bump or terminal-hook retry. Inspect it before choosing approve or abort;
+record the observed stage, context and your reason first. The launch authorization does not answer
+a MAJOR-bump or terminal-hook retry gate. Never fabricate an approval response file.
+
+```bash
+"$BIN" gate list "$EV/project"
+STAGE=validate
+"$BIN" gate show 1 --stage "$STAGE" "$EV/project"
+printf '%s\n' "attempt $N: unexpected $STAGE gate; record actual context and decision" >> "$EV/deviations.txt"
+```
+
+Replace STAGE with the observed stage. If you choose approval after recording the deviation:
+
+```bash
+"$BIN" gate approve 1 --stage "$STAGE" --note "attempt $N: deviation recorded; describe approval reason" --project "$EV/project"
+```
+
+To abort, use an actual reason; the `abort:` substring distinguishes termination from loop-back:
+
+```bash
+"$BIN" gate reject 1 --stage "$STAGE" --note "abort: describe observed blocking defect" --project "$EV/project"
+```
+
+Wait for workflow_aborted/state removal, then collect the stopped attempt using section 7. Do not
+count a live or parked run as stopped merely because a response was written.
+
+## If the run dies without reaching Ship
+
+Confirm all three: no workflow_shipped, no waiting gate, and no surviving monitor or agent for
+this project. A quiet terminal does not prove death. Read the stored monitor_pid and inspect it:
+
+```bash
+"$BIN" gate list "$EV/project"
+MONITOR=$(jq -er '.monitor_pid | select(type == "number")' "$EV/project/.devflow/state-01.json")
+ps -ww -o pid=,lstart=,args= -p "$MONITOR"
+systemctl --user status "p49-a$N-start"
+```
+
+The listed PID must not be a live `__monitor` naming this project and phase 1. Check start-unit
+processes, including its agent; if any remain, do not use the dead-run collection path. Treat missing
+or malformed state as missing evidence to diagnose, not zero PID or death. If no gate is waiting,
+no workflow_shipped exists and no process survives in the run unit, record the death:
+
+```bash
+printf '%s\n' "attempt $N died: record observed events, PID identity and unit state" >> "$EV/deviations.txt"
+systemctl --user stop "p49-a$N-surv"
+bash "$T/collect-attempt.sh" --attempt "$N" --allow-state --stop-note "died: describe confirmed failure"
+bash "$T/check-evidence.sh" --attempt-gate "$P49"
+```
+
+Never pass --allow-state while the monitor or agent is alive or a gate is parked. This option is
+needed only because stale state normally makes the collector refuse. It writes the stopped verdict
+that the next prepare requires. A dead run ends this attempt without Ship and consumes a stopped
+attempt under D-10/D-11. Do not resume DevFlow inside the attempt: resumed progression is no longer
+the unattended progression criterion 2 measures. Follow section 8 instead.
+
+## Fix vehicle for a blocking defect
+
+Confirm the vehicle at the stop. A payload problem is fixed in scripts/scratch-dogfood-repo.sh on
+feature/phase-49, with a fresh payload next time. A contained DevFlow defect uses `/gsd-quick` on its
+own branch and normal tests/pre-push gates. While the phase worktree exists, use the repository's
+explicit off-worktree contract `DEVFLOW_ALLOW_OFF_WORKTREE=1` for a fix-branch crates commit; it
+is not permission to bypass hooks. A cross-crate fix or design decision becomes a decimal phase
+through `/gsd-phase --insert 49`.
+
+The default rebuild uses this phase's tree. A fix on another branch therefore needs an explicit
+clean fix checkout; verify the fix is present before creating an attempt. Set FIX and FIX_COMMIT to
+the actual absolute checkout and full fix SHA:
+
+```bash
+FIX=/absolute/path/to/fix-checkout
+FIX_COMMIT=actual-full-fix-commit
+W=$(git -C "$T" rev-parse --show-toplevel)
+git -C "$FIX" merge-base --is-ancestor "$FIX_COMMIT" HEAD
+git -C "$FIX" status --porcelain
+bash "$T/launch-attempt.sh" prepare --attempt "$N" --repo "$FIX" --scaffold "$W/scripts/scratch-dogfood-repo.sh"
+jq -er .build_commit "$EV/attempt.json"
+git -C "$FIX" rev-parse HEAD
+```
+
+The ancestry check must exit 0, the fix tree must be clean and the final two SHAs must match.
+Preparing an old binary creates an attempt on the wrong code; do this check first, not after an
+attempt fails. The explicit scaffold is needed because the fix branch need not carry this phase's
+payload changes. A payload-only fix in the phase branch needs neither alternate flag.
+
+## Outward effects of an attempt
+
+The Ship agent pushes feature/phase-01, opens a PR to main, pushes a ship-note commit, and may push
+an empty CI commit. GitHub notifications and Actions usage follow. The pinned binary then merges
+locally into integration, tags and appends a changelog. Record the GitHub account/scopes already
+captured in `$EV/prelaunch/gh-auth.txt`; every retry uses its own private repository and evidence.
+API usage is billed through the credential source selected by Claude; the auth probe does not prove
+which account owns the credential.
+
+## Cleanup (only after Phase 49 verification)
+
+Do not delete either local or GitHub records until Phase 49 verification and until 49-12 has committed
+and verified the sanitized evidence. Repository deletion destroys its branch/PR history permanently.
+Stop/reset only this attempt's units, and restrict gate sweep to this project:
+
+```bash
+systemctl --user stop "p49-a$N-start" "p49-a$N-surv"
+systemctl --user reset-failed "p49-a$N-start" "p49-a$N-surv"
+"$BIN" gate sweep --root "$EV/project"
+```
+
+Successful Ship or abort normally deregisters itself. If a stale registration remains under
+`~/.cache/devflow/roots/`, inspect JSON project_root and phase, and remove only the exact file whose
+root equals `$EV/project` and whose phase is 1. Honor DEVFLOW_CACHE_DIR/XDG_CACHE_HOME if the recorded
+unit used a different cache location; never sweep arbitrary files or other projects.
+
+For the outward cleanup, check the recorded owner/name and obtain the deletion scope only now:
+
+```bash
+REPO=$(jq -er '.nameWithOwner | select(type == "string" and length > 0)' "$EV/prelaunch/repo.json")
+gh auth refresh -s delete_repo
+gh repo view "$REPO" --json nameWithOwner,visibility
+gh repo delete "$REPO" --yes
+```
+
+Finally remove only this exact local attempt directory after confirming N, the absolute EV path,
+its attempt.json identity, the stopped units, and the committed sanitized evidence. Preserve other
+attempts and the pinned binaries until their records are no longer needed; never remove by wildcard.
+The private API-key file is configuration, not attempt evidence, and is not part of this cleanup.
+
+## What an attempt does not establish
+
+One attempt is one sample, not a reliability guarantee. It exercises Claude alone, so DECN-03 closes
+for Claude only. An unobserved interleaving establishes nothing about SURV-01. A green attempt gate
+proves criteria 1–3 for this binary/payload/base; it cannot generalize to other agents or bases.
+
+A delivery canary refusal after Define cannot be probed before launch: it runs only on the first
+stream launch. Record it as an environment finding or a DevFlow defect; the attempt ends without
+Ship and consumes one of the three stopped attempts. The authentication probe proves authentication
+at its own timestamp, not for the whole run. Three stops produce cap_reached with VERIFY-01 unmet.

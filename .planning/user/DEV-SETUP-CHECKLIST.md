@@ -53,6 +53,12 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   `gh auth refresh -h github.com -s admin:ssh_signing_key` only when listing or uploading signing keys.
   Agents merge PRs to `develop` through this token, so GitHub records those merges as `denniyahh`.
 
+- [ ] **[PHASE 49, one-off]** Host requirements for the live-run runbook: `systemd-run --user`
+  with user manager `running` or `degraded`, `python3` (stdlib only), `jq`, `flock`, `timeout`,
+  `sha256sum`, optional `notify-send`, and `shellcheck` / `ruff` for tool checks. GitHub `repo`
+  scope is required for creation/pushes. Request `delete_repo` only at cleanup, using
+  `gh auth refresh -s delete_repo`, after Phase 49 verification and committed sanitized evidence.
+
 ## 2. GitHub repository settings (not files — verify via `gh api`, not by reading the repo)
 
 - [ ] **[PROJECT]** Default branch: `main`.
