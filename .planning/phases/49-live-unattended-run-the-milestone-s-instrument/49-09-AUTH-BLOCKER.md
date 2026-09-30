@@ -83,3 +83,11 @@ Clippy passed. These fake checks do not establish real authentication or positiv
 No auth configuration was changed and no new real authentication attempt was made with the empty
 key. No positive live attempt was launched. After the key location arrives, wire only the authorized
 API route securely, rerun the real gate, then close the incomplete 49-09 plan if it actually passes.
+
+## Resolved — real API-key probe passed, 2026-09-30
+
+The operator saved the private key and reported done. A supported Claude user apiKeyHelper now reads
+the owner-only file; the empty settings API-key env entry was removed while all other settings were
+preserved. The final real gate on e49ec61 passed with auth_source=apiKeyHelper, probe_exit=0,
+is_error=false and reply_ok=yes. See 49-09-SUMMARY.md for proof and limits. The old missing-key
+handoff is consumed; no key or fingerprint was printed or committed.
