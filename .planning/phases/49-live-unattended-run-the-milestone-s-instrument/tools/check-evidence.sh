@@ -63,12 +63,82 @@ with tempfile.TemporaryDirectory() as tmp:
         print(('  ok   ' if ok else '  FAIL ') + name + ('' if ok else ' — checker did not discriminate'))
         passed += int(ok)
         failed += int(not ok)
+    # Capture a planted complete run with the real hook and collector.
+    import os, hashlib
+    tools = pathlib.Path(script).parent
+    home = root / 'positive-home'
+    ev = home / 'attempt-1'
+    launch = ev / 'project'
+    launch.mkdir(parents=True)
+    fixture_env = os.environ.copy()
+    for key in subprocess.check_output(['git', 'rev-parse', '--local-env-vars'], text=True).splitlines():
+        fixture_env.pop(key, None)
+    fixture_env.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+    def run(*args, cwd=None, env=None):
+        return subprocess.check_output(args, cwd=cwd, env=env or fixture_env, stderr=subprocess.PIPE, text=True, timeout=30).strip()
+    def git(*args, cwd=launch): return run('git', '-C', str(cwd), *args)
+    git('init', '-q'); git('symbolic-ref', 'HEAD', 'refs/heads/main')
+    git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@localhost')
+    (launch / '.gitignore').write_text('.devflow/\n.worktrees/\n')
+    git('add', '.gitignore'); git('commit', '-qm', 'chore: seed fixture')
+    main_sha = git('rev-parse', 'HEAD')
+    git('checkout', '-qb', 'integration')
+    (launch / 'devflow.toml').write_text('base_branch = "integration"\n')
+    git('add', 'devflow.toml'); git('commit', '-qm', 'chore: configure base')
+    base_sha = git('rev-parse', 'HEAD')
+    (ev / 'prelaunch').mkdir()
+    (ev / 'prelaunch/fork-base.txt').write_text(f'base_sha={base_sha}\nmain_sha={main_sha}\n')
+    (ev / 'start.stdout').write_text('note: base branch is `integration` (from devflow.toml (base_branch))\n  [holds] GSD config can hold the chain flag\n')
+    wt = launch / '.worktrees/phase-01'
+    git('worktree', 'add', '-qb', 'feature/phase-01', str(wt), 'integration')
+    dev = launch / '.devflow'
+    (dev / 'gates').mkdir(parents=True)
+    build_commit = 'c' * 40
+    recorded = [{'event':'workflow_started', 'phase':1, 'commit':build_commit}]
+    def events_write():
+        (dev / 'events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in recorded))
+    for stage in ['define','code','ship']:
+        if stage != 'define':
+            (wt / f'{stage}.txt').write_text(stage+'\n')
+            git('add', f'{stage}.txt', cwd=wt); git('commit', '-qm', f'feat: {stage}', cwd=wt)
+        (dev / 'state-01.json').write_text(json.dumps({'phase':1,'stage':stage,'base_branch':'integration'}))
+        (dev / f'gates/01-{stage}.json').write_text(json.dumps({'phase':1,'stage':stage}))
+        recorded.append({'event':'gate_fired','phase':1,'stage':stage}); events_write()
+        env = dict(fixture_env, DEVFLOW_GATE_PHASE='1', DEVFLOW_GATE_STAGE=stage, DEVFLOW_GATE_CONTEXT='fixture', DEVFLOW_NON_SILENT_GATE='1')
+        run('bash', str(tools / 'snapshot-hook.sh'), '--no-notify', str(launch), str(ev), env=env)
+        recorded.append({'event':'gate_resolved','phase':1,'stage':stage,'responded_by':'--yes-ship' if stage == 'ship' else 'tester'})
+    git('merge', '--no-ff', 'feature/phase-01', '-m', 'feat: merge fixture')
+    recorded.append({'event':'merge_result','phase':1,'merged':True})
+    git('tag', 'v0.1.0')
+    (launch / 'CHANGELOG.md').write_text('Version 0.1.0\n')
+    git('add', 'CHANGELOG.md'); git('commit', '-qm', 'docs: add changelog entry for 0.1.0')
+    assert len(git('rev-list', '--parents', '-n1', 'HEAD').split()) == 2
+    subprocess.run(['git','-C',str(launch),'branch','-d','feature/phase-01'],env=fixture_env,capture_output=True)
+    recorded.append({'event':'workflow_shipped','phase':1}); events_write()
+    (dev / 'state-01.json').unlink()
+    fakes = root / 'positive-fakes'; fakes.mkdir()
+    binary = fakes / 'devflow'; binary.write_text('#!/bin/sh\nprintf "{}\\n"\n'); binary.chmod(0o755)
+    gh = fakes / 'gh'
+    gh.write_text('#!/bin/sh\nprintf \'{"baseRefName":"main","headRefName":"feature/phase-01","state":"OPEN","url":"x","number":1}\\n\'\n'); gh.chmod(0o755)
+    binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+    (ev / 'attempt.json').write_text(json.dumps({'attempt':1,'launch':str(launch),'bin':str(binary),'bin_sha256':binary_sha}))
+    run('bash',str(tools / 'collect-attempt.sh'),'--attempt','1','--home',str(home),'--fake-cmds',str(fakes),'--claude-projects',str(root / 'no-sessions'))
+    shutil.copytree(root / 'original-renamed/negctl', ev / 'negctl')
+    (ev / 'negctl/bin_sha256').write_text(binary_sha+'\n')
+    with (ev / 'negctl/events.jsonl').open('a') as f:
+        f.write(json.dumps({'event':'workflow_started','phase':1,'commit':build_commit})+'\n')
+    (home / 'current-attempt').write_text('1\n')
+    result = subprocess.run(['bash',script,'--arm','positive',str(ev)],capture_output=True,text=True,timeout=20)
+    ok = result.returncode == 0 and 'CHECK passed=11 failed=0' in result.stdout
+    print(('  ok   ' if ok else '  FAIL ')+'positive arm passes'+('' if ok else ' — complete captured fixture rejected'))
+    passed += int(ok); failed += int(not ok)
 print(f'SELFTEST passed={passed} failed={failed}')
 sys.exit(bool(failed) or not passed)
 PY
 }
 
 if [ "${1:-}" = --selftest ] && [ "$#" -eq 1 ]; then selftest; exit; fi
+if [ "${1:-}" = --arm ] && [ "${2:-}" = positive ]; then exit 1; fi
 if [ "$#" -ne 3 ] || [ "$1" != --arm ] || [ "$2" != negative ]; then
     echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
     exit 2
