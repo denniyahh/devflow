@@ -42,10 +42,12 @@ done
 if [ "$wait" = true ]; then cd "$directory"; env "${vars[@]}" "$@"; fi
 ''',
     'claude':'''#!/bin/sh
+if [ "${1:-}" = --version ]; then printf 'Claude Code fixture-version\\n'; exit 0; fi
 printf '{"type":"system","subtype":"init","apiKeySource":"ANTHROPIC_API_KEY"}\\n'
 printf '{"type":"result","is_error":false,"result":"P49_AUTH_OK"}\\n'
 ''',
     'gh':'''#!/bin/sh
+if [ "${1:-}" = --version ]; then printf 'gh version fixture-version\\n'; exit 0; fi
 if [ "$1" = repo ]; then printf '{"nameWithOwner":"tester/p49-live-attempt-1","visibility":"PRIVATE"}\\n'; else printf "Logged in to github.com account tester\\nToken scopes: 'gist', 'read:org', 'repo'\\n"; fi
 ''',
     'systemctl':'''#!/bin/sh
@@ -70,6 +72,13 @@ exit 3
             hashlib.sha256(b.read_bytes()).hexdigest()==a['bin_sha256'] and b.stat().st_mode&0o777==0o555 and
             'build_dirty=false' in (ev/'identity.txt').read_text() and
             re.search(r'^CHECK passed=[1-9][0-9]* failed=0$',(ev/'prelaunch/check.txt').read_text(),re.M) and (home/'current-attempt').read_text().strip()=='1')
+    if ok:
+        identity=dict(line.split('=',1) for line in (ev/'identity.txt').read_text().splitlines())
+        units=dict(line.split('=',1) for line in (ev/'units.txt').read_text().splitlines())
+        ok=('created_at' in a and type(a['created_at']) is int and a['created_at']>0 and
+            all(name in identity and bool(identity[name]) for name in ['claude_version','gh_version','gsd_version','python3_version','git_version']) and
+            identity['claude_version']=='Claude Code fixture-version' and identity['gh_version']=='gh version fixture-version' and
+            'negctl' in units and units['negctl']=='p49-a1-negctl')
     report('prepare: builds, pins, scaffolds and records the attempt',bool(ok))
     result=invoke('probe-auth');ok=False
     if result.returncode==0 and (ev/'prelaunch/auth-probe.txt').is_file():
