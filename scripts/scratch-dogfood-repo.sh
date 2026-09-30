@@ -47,9 +47,14 @@
 # own test (R-9), which plan 49-06 adds with the phase directory. Nothing is
 # launched and nothing is pushed.
 #
+# Pretty-form bridge: jq --indent 2 reproduces DevFlow's REAL_SHAPE fixture;
+# the Rust writer test pins that fixture's round trip. The payload uses only
+# objects, strings and booleans. Special-character string escaping absent
+# from both fixtures is not covered; the payload has no such strings.
+#
 # WHAT `--check` DOES NOT ESTABLISH: it proves the layout and config values
-# above, read-only. It does NOT prove that DevFlow's preflight or GSD's
-# config resolution will accept the run; only a real launch exercises those.
+# above and the installed GSD's hook resolution, read-only. It does NOT prove
+# DevFlow's live preflight, agent behavior, gate recovery or Ship completion.
 #
 # Usage:
 #   scripts/scratch-dogfood-repo.sh [destination]
@@ -490,6 +495,15 @@ st_check_mutation() {
     fi
 }
 
+extract_real_shape() {
+    awk '
+        /const REAL_SHAPE: &str = r#"/ {sub(/^.*r#"/, ""); active=1}
+        active && /^"#;/ {found=1; exit}
+        active {print}
+        END {if (!found) exit 1}
+    ' "$REPO_ROOT/crates/devflow-core/src/gsd_config.rs"
+}
+
 st_config_bridge() {
     local fixture="$ST_TMP/real-shape.json" cfg="$ST_TMP/lp/.planning/config.json" count rc=0
     extract_real_shape >"$fixture" || rc=1
@@ -498,6 +512,7 @@ st_config_bridge() {
     else
         case_fail "bridge: jq renders REAL_SHAPE byte-identically" "REAL_SHAPE ABSENT or rendering differs"
     fi
+    rc=0
     count="$(jq -er '[paths(type == "number" or type == "array")] | length' "$cfg")" || rc=1
     if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
         case_ok "live payload: config.json has no arrays or numbers"
@@ -598,6 +613,11 @@ check_config() {
         case_ok "config.json keys resolve as required"
     else
         case_fail "config.json keys resolve as required" "got $keys, want $want"
+    fi
+    if jq -e '[paths(type == "number" or type == "array")] | length == 0' "$cfg" >/dev/null 2>&1; then
+        case_ok "config.json has no arrays or numbers"
+    else
+        case_fail "config.json has no arrays or numbers" "unsupported shape or unreadable JSON"
     fi
 }
 
