@@ -129,6 +129,16 @@ exit 3
     restore();result=invoke('probe-auth');record=(ev/'prelaunch/auth-probe.txt').read_text()
     report('control: probe output without a result line is ABSENT, not a pass',result.returncode!=0 and 'auth probe failed' in result.stderr and 'is_error=ABSENT' in record and 'reply_ok=no' in record)
     claude.write_text(claude_default)
+    restore()
+    before=git('rev-parse','integration',at=ev/'project')
+    mutate='if [ -n "${P49_MUTATE_PROJECT:-}" ]; then git -C "$P49_MUTATE_PROJECT" commit --allow-empty -qm "chore: base changes during auth"; git --git-dir="$P49_MUTATE_REMOTE" fetch -q "$P49_MUTATE_PROJECT" integration:integration; fi\n'
+    claude.write_text(claude_default.replace("#!/bin/sh\n", "#!/bin/sh\n"+mutate))
+    env['P49_MUTATE_PROJECT']=str(ev/'project');env['P49_MUTATE_REMOTE']=str(bare)
+    result=invoke('start')
+    after=git('rev-parse','integration',at=ev/'project')
+    observed=dict(line.split('=',1) for line in (ev/'prelaunch/fork-base.txt').read_text().splitlines())['base_sha']
+    report('start: fork point read after authentication',result.returncode==0 and before!=after and observed==after)
+    del env['P49_MUTATE_PROJECT'];del env['P49_MUTATE_REMOTE'];claude.write_text(claude_default)
     restore();(home/'attempt-2').mkdir();shutil.copy(ev/'attempt.json',home/'attempt-2/attempt.json')
     reject('control: attempt number mismatch refused','start','attempt number mismatch',number=2)
     restore();result=invoke('start');assert result.returncode==0,result.stderr
