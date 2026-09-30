@@ -6,11 +6,11 @@ current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
 current_plan: 9
 status: executing
-stopped_at: 49-09 Task 1 auth gate failed; await explicit credential-route decision; no summary yet
-last_updated: "2026-09-30T15:16:24.743Z"
+stopped_at: 49-09 API-key route confirmed; await nonempty key location before real auth rerun
+last_updated: "2026-09-30T16:14:07.644Z"
 last_activity: 2026-09-30
-last_activity_desc: 49-08 complete; 49-09 real prepare passed, authentication failed; operator credential decision pending
-state_head: c568940ecdfb6526af22e34a0920a5bb255b1241
+last_activity_desc: API-key route authorized; key source empty; fork capture fixed and 17 fake launcher controls pass
+state_head: 59be29f8a3d2c589fe2d8eaafcbb2cfa5999c4a8
 progress:
   total_phases: 6
   completed_phases: 3
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-30 — 49-08 complete; 49-09 real prepare passed, authentication failed; operator credential decision pending
+Last activity: 2026-09-30 — API-key route authorized; key source empty; fork capture fixed and 17 fake launcher controls pass
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
@@ -716,7 +716,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
     `deferred-items.md` records it RESOLVED by the child-process migration (46-06, 46-07), and
     `46-VERIFICATION.md` re-ran the failing test 4/4 green under a real `taskset -c 0,1`. The stale
     bullet was still making `smart-entry` report `situation: blocked`.
-- 49-09 real auth probe failed (probe_exit=1, is_error=true, auth_source=none); operator must choose the nested-agent credential route. See 49-09-AUTH-BLOCKER.md.
+- 49-09 API-key route authorized; ANTHROPIC_API_KEY values are empty in Claude settings and the user manager. Await the nonempty key location; real authentication remains unverified.
 
 ## Decisions
 
@@ -955,8 +955,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-09-30T15:16:24.478Z
-**Stopped at:** 49-09 Task 1 auth gate failed; await explicit credential-route decision; no summary yet
+**Last session:** 2026-09-30T16:14:07.410Z
+**Stopped at:** 49-09 API-key route confirmed; await nonempty key location before real auth rerun
 **Resume file:** .planning/phases/49-live-unattended-run-the-milestone-s-instrument/.continue-here.md
 
 ## Operator Next Steps

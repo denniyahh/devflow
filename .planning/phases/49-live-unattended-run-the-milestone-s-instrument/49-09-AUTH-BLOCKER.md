@@ -40,7 +40,7 @@ names were retained in /tmp/49-09-diag.Jx0knZ; the console gate report is /tmp/4
 Task-2 report /tmp/49-09-gate2.log. Temporary paths may disappear after reboot; this document preserves
 all decisive facts. No credential values or raw agent captures enter this repository.
 
-## Pending operator decision
+## Original operator decision (answered 2026-09-30)
 
 Which credential route should the nested agent use: the existing Claude login or an API/provider
 configuration? Do not select one, edit settings or import/clear manager variables until answered.
@@ -60,3 +60,26 @@ The gate command was extended only to preserve the two safe diagnostic files bef
 temporary home; production behavior and the plan artifact were unchanged. It used process-local
 session-bus variables to reach the existing UID-1000 manager. No credentials, settings or manager
 configuration were changed.
+
+## Update — API-key route authorized, 2026-09-30
+
+The operator answered "use my claude API key". That credential-route choice is settled; do not
+ask it again. The outstanding input is the location of the existing nonempty key, requested
+without asking the operator to paste a secret into chat.
+
+Private value checks found that ANTHROPIC_API_KEY is a string with an empty value in
+~/.claude/settings.json. Structured D-Bus Manager.Environment confirmed that ANTHROPIC_API_KEY
+and ANTHROPIC_TOKEN are present but empty in the user manager. This distinguishes empty values
+from absent fields and from JSON null. No secret value or fingerprint was printed or recorded.
+No key reference was found in the standard Bash/Fish/Zsh/profile/environment snippets inspected;
+that limited search does not establish that no key exists elsewhere.
+
+The independent fork timing issue is fixed: RED commit 623b280 caught a base moved and locally
+published during the auth probe; fix 59be29f re-reads base/main after authentication. The regression
+fixture also resets its local bare origin on each restore. The full launcher selftest now has
+17 passed, 0 failed; Task-2 gate_rc=0; Bash syntax, ShellCheck and pinned-container workspace/all-target
+Clippy passed. These fake checks do not establish real authentication or positive live readiness.
+
+No auth configuration was changed and no new real authentication attempt was made with the empty
+key. No positive live attempt was launched. After the key location arrives, wire only the authorized
+API route securely, rerun the real gate, then close the incomplete 49-09 plan if it actually passes.
