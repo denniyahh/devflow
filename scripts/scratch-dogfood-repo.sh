@@ -75,7 +75,6 @@ MODE=default
 DEST=""
 HAVE_DEST=false
 CHECK_DEST=""
-# shellcheck disable=SC2034  # consumed by the payload's GSD-resolution probes (49-06)
 GSD_TOOLS="$HOME/.claude/gsd-core/bin/gsd-tools.cjs"
 
 set_mode() {
@@ -96,7 +95,6 @@ while [ $# -gt 0 ]; do
         --gsd-tools)
             shift
             [ $# -gt 0 ] || die "--gsd-tools needs a path"
-            # shellcheck disable=SC2034  # consumed by the payload's GSD-resolution probes (49-06)
             GSD_TOOLS="$1"
             ;;
         -h | --help)
@@ -612,6 +610,82 @@ check_payload() {
     rm -rf -- "$tmp"
 }
 
+check_prelaunch() {
+    local dest="$1" phase="$1/.planning/phases/01-retry-budget" tmp ancestor count rc message broken=false
+    # shellcheck disable=SC2016 # Markdown command backticks are literal data.
+    check_exact_line "validation map covers BUDGET-01" "$phase/01-VALIDATION.md" \
+        '| 01-01-02 | 01 | 1 | BUDGET-01 | — | N/A | unit | `python3 -m unittest discover -s tests -v` | ✅ | ⬜ pending |'
+    tmp="$(mktemp -d)"
+    if [ ! -f "$phase/01-01-PLAN.md" ]; then
+        case_fail "no plan declares external_verify" "payload plan absent"
+    else
+        rc=0
+        rg -n 'external_verify' "$dest/.planning/phases" -g '*PLAN.md' >"$tmp/external" 2>"$tmp/external.err" || rc=$?
+        if [ "$rc" -eq 1 ]; then
+            case_ok "no plan declares external_verify"
+        else
+            case_fail "no plan declares external_verify" "declaration found or scan failed (exit $rc)"
+        fi
+    fi
+    if git -C "$dest" log --no-merges integration --format='%B%x00' >"$tmp/commits"; then
+        while IFS= read -r -d '' message; do
+            # Git adds record-separating newlines after each NUL.
+            while [[ "$message" = $'\n'* ]]; do message="${message#$'\n'}"; done
+            if printf '%s\n' "${message%%$'\n'*}" | rg -q '^[a-z]+(\([^)]*\))?!:' ||
+                printf '%s\n' "$message" | rg -q '^BREAKING[ -]CHANGE:'; then
+                broken=true
+            fi
+        done <"$tmp/commits"
+        if [ "$broken" = false ] && [ -s "$tmp/commits" ]; then
+            case_ok "no breaking commit on integration"
+        else
+            case_fail "no breaking commit on integration" "marker found or empty history"
+        fi
+    else
+        case_fail "no breaking commit on integration" "history unreadable"
+    fi
+    if git -C "$dest" tag --list >"$tmp/tags" && [ ! -s "$tmp/tags" ]; then
+        case_ok "no tags"
+    else
+        case_fail "no tags" "tag present or tag list unreadable"
+    fi
+    ancestor="$(realpath -e -- "$dest")" || ancestor=""
+    broken=false
+    if [ -z "$ancestor" ]; then broken=true; fi
+    while [ -n "$ancestor" ]; do
+        if [ -e "$ancestor/Cargo.toml" ]; then broken=true; fi
+        [ "$ancestor" != / ] || break
+        ancestor="$(dirname -- "$ancestor")"
+    done
+    if [ "$broken" = false ]; then
+        case_ok "no ancestor Cargo.toml"
+    else
+        case_fail "no ancestor Cargo.toml" "Cargo.toml present or destination unreadable"
+    fi
+    rc=0
+    count="$(hook_count "$dest" ship:pre '["security"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        case_ok "gsd: ship:pre has no security gate"
+    else
+        case_fail "gsd: ship:pre has no security gate" "security hook present or probe unreadable"
+    fi
+    rc=0
+    count="$(hook_count "$dest" verify:post '["nyquist"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -gt 0 ]; then
+        case_ok "gsd: verify:post runs nyquist"
+    else
+        case_fail "gsd: verify:post runs nyquist" "nyquist hook absent or probe unreadable"
+    fi
+    rc=0
+    count="$(hook_count "$dest" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        case_ok "gsd: execute:wave:post has no ui or drift gate"
+    else
+        case_fail "gsd: execute:wave:post has no ui or drift gate" "wave gate present or probe unreadable"
+    fi
+    rm -rf -- "$tmp"
+}
+
 run_check() {
     local dest="$1" head status
     head="$(git -C "$dest" symbolic-ref -q HEAD 2>/dev/null || true)"
@@ -633,6 +707,7 @@ run_check() {
     check_config "$dest/.planning/config.json"
     check_exact_line "roadmap has the phase 1 heading" "$dest/.planning/ROADMAP.md" '### Phase 1: Retry budget constant'
     check_payload "$dest"
+    check_prelaunch "$dest"
     echo "CHECK passed=$N_PASS failed=$N_FAIL"
     [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
 }
@@ -926,6 +1001,75 @@ computes a retry deadline from a start time.
 
 - [ ] 01-01-PLAN.md — choose the retry budget, then implement the module the existing test exercises
 EOF
+
+    cat > "$DEST_ABS/.planning/phases/01-retry-budget/01-VALIDATION.md" <<'EOF_VALIDATION'
+---
+phase: "01"
+slug: "retry-budget"
+status: draft
+nyquist_compliant: false
+wave_0_complete: true
+created: "2026-09-28"
+---
+
+# Phase 01 — Validation Strategy
+
+> Per-phase validation contract for feedback sampling during execution.
+
+---
+
+## Test Infrastructure
+
+| Property | Value |
+|----------|-------|
+| **Framework** | unittest (Python 3 standard library) |
+| **Config file** | none |
+| **Quick run command** | `python3 -m unittest discover -s tests -v` |
+| **Full suite command** | `python3 -m unittest discover -s tests -v` |
+| **Estimated runtime** | ~1 second |
+
+---
+
+## Sampling Rate
+
+- **After every task commit:** Run `python3 -m unittest discover -s tests -v`
+- **After every plan wave:** Run `python3 -m unittest discover -s tests -v`
+- **Before `/gsd-verify-work`:** Full suite must be green
+- **Max feedback latency:** 1 second
+
+---
+
+## Per-Task Verification Map
+
+| Task ID | Plan | Wave | Requirement | ANCHOR | TIER | Test Type | Automated Command | File Exists | Status |
+|---------|------|------|-------------|--------|------|-----------|-------------------|-------------|--------|
+| 01-01-02 | 01 | 1 | BUDGET-01 | — | N/A | unit | `python3 -m unittest discover -s tests -v` | ✅ | ⬜ pending |
+
+---
+
+## Wave 0 Requirements
+
+Existing infrastructure covers all phase requirements.
+
+---
+
+## Manual-Only Verifications
+
+All phase behaviors have automated verification.
+
+---
+
+## Validation Sign-Off
+
+- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
+- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
+- [ ] Wave 0 covers all MISSING references
+- [ ] No watch-mode flags
+- [ ] Feedback latency < 1s
+- [ ] `nyquist_compliant: true` set in frontmatter
+
+**Approval:** pending
+EOF_VALIDATION
 
     # R-8: non-breaking `chore:` messages and no tags, so the MAJOR-bump
     # classifier has nothing to fire on (D-21).
