@@ -206,8 +206,8 @@ PY
 }
 
 if [ "${1:-}" = --selftest ] && [ "$#" -eq 1 ]; then selftest; exit; fi
-if [ "${1:-}" = --pair ]; then exit 1; fi
-if [ "$#" -ne 3 ] || [ "$1" != --arm ] || { [ "$2" != negative ] && [ "$2" != positive ]; }; then
+if [ "${1:-}" = --pair ] && [ "$#" -eq 2 ]; then set -- --arm pair "$2"; fi
+if [ "$#" -ne 3 ] || [ "$1" != --arm ] || { [ "$2" != negative ] && [ "$2" != positive ] && [ "$2" != pair ]; }; then
     echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
     exit 2
 fi
@@ -231,13 +231,14 @@ def check(name, fn):
         passed += 1
         print(f'  ok   {mode}: {name}')
 
-def snapshot(stage='define', last=False):
-    entries = [json.loads(line) for line in (root / 'ledger.jsonl').read_text().splitlines()]
+def snapshot(stage='define', last=False, armroot=None):
+    armroot = root if armroot is None else armroot
+    entries = [json.loads(line) for line in (armroot / 'ledger.jsonl').read_text().splitlines()]
     matches=[]
     for entry in entries:
         name=pathlib.Path(entry['dir']).name
         if not re.fullmatch(r'[0-9]{3,}-[a-z]+',name): raise ValueError('invalid snapshot basename')
-        directory=root/'gates'/name
+        directory=armroot/'gates'/name
         if not directory.is_dir(): raise FileNotFoundError(str(directory))
         if entry['stage']==stage: matches.append(directory)
     if not matches: raise KeyError(stage+' snapshot')
@@ -320,8 +321,35 @@ def positive_checks():
     except (OSError,ValueError,KeyError,TypeError) as e:
         print(f'NOTE gate_census ABSENT {e}')
 
+def binary_pair():
+    expected=json.loads((root/'attempt.json').read_text())['bin_sha256']
+    if not isinstance(expected,str) or not re.fullmatch('[0-9a-f]{64}',expected): raise ValueError('invalid binary sha256')
+    return (root/'negctl/bin_sha256').read_text().strip()==expected
+
+def build_commit(path):
+    rows=[json.loads(line) for line in path.read_text().splitlines()]
+    commits=[e['commit'] for e in rows if e['event']=='workflow_started' and str(e['phase'])=='1']
+    if not commits: raise KeyError('workflow_started commit')
+    return sha(commits[0])
+
+def branch_at(armroot):
+    return json.loads((snapshot(armroot=armroot)/'devflow/state-01.json').read_text())['base_branch']
+
+def branches_differ():
+    positive=branch_at(root);negative=branch_at(root/'negctl')
+    if not isinstance(positive,str) or not isinstance(negative,str) or positive==negative:
+        raise ValueError('measurement broken: discriminating base_branch absent or arms agree')
+    return True
+
+def pair_checks():
+    check('same binary in both arms',binary_pair)
+    check('same build commit in both arms',lambda:build_commit(root/'collected/devflow/events.jsonl')==build_commit(root/'negctl/events.jsonl'))
+    check('arms disagree on base_branch',branches_differ)
+
 if mode == 'positive':
     positive_checks()
+elif mode == 'pair':
+    pair_checks()
 else:
     check('DOES NOT HOLD line present', lambda: refusal in (root / 'start.stdout').read_text().splitlines())
     check('no base-branch note', lambda: 'note: base branch is' not in (root / 'start.stdout').read_text())
