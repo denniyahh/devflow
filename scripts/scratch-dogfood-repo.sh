@@ -490,6 +490,23 @@ st_check_mutation() {
     fi
 }
 
+st_config_bridge() {
+    local fixture="$ST_TMP/real-shape.json" cfg="$ST_TMP/lp/.planning/config.json" count rc=0
+    extract_real_shape >"$fixture" || rc=1
+    if [ "$rc" -eq 0 ] && [ -s "$fixture" ] && cmp -s "$fixture" <(jq --indent 2 . "$fixture"); then
+        case_ok "bridge: jq renders REAL_SHAPE byte-identically"
+    else
+        case_fail "bridge: jq renders REAL_SHAPE byte-identically" "REAL_SHAPE ABSENT or rendering differs"
+    fi
+    count="$(jq -er '[paths(type == "number" or type == "array")] | length' "$cfg")" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        case_ok "live payload: config.json has no arrays or numbers"
+    else
+        case_fail "live payload: config.json has no arrays or numbers" "unsupported config shape"
+    fi
+    st_check_mutation indent "config.json is in pretty form" "control: a four-space config fails the pretty-form check"
+}
+
 run_selftest() {
     # Hermetic: the host checkout's git environment and global/system config
     # (signing, hooks, excludes) may not leak into the scratch repositories.
@@ -516,6 +533,7 @@ run_selftest() {
     st_control_unknown_option
     st_payload_tests
     st_hook_controls
+    st_config_bridge
     st_check_mutation breaking "no breaking commit on integration" "control: check refuses a breaking commit"
     st_check_mutation external "no plan declares external_verify" "control: check refuses an external_verify line"
     st_check_mutation ancestor "no ancestor Cargo.toml" "control: check refuses an ancestor Cargo.toml"
