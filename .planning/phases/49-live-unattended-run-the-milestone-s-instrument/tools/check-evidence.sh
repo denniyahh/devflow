@@ -73,5 +73,49 @@ if [ "$#" -ne 3 ] || [ "$1" != --arm ] || [ "$2" != negative ]; then
     echo 'usage: check-evidence.sh --arm negative <EV> | --selftest' >&2
     exit 2
 fi
-# RED stub: does not inspect evidence yet.
-exit 0
+python3 - "$3" <<'PY'
+import json, pathlib, re, sys
+root = pathlib.Path(sys.argv[1]) / 'negctl'
+refusal = '  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live'
+passed = failed = 0
+
+def check(name, fn):
+    global passed, failed
+    try:
+        if not fn(): raise ValueError('recorded value disagrees')
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as e:
+        failed += 1
+        absent = isinstance(e, (OSError, KeyError, IndexError))
+        print(f'  FAIL negative: {name} — {"ABSENT " if absent else ""}{e}')
+    else:
+        passed += 1
+        print(f'  ok   negative: {name}')
+
+def snapshot():
+    entries = [json.loads(line) for line in (root / 'ledger.jsonl').read_text().splitlines()]
+    entry = next((e for e in entries if e['stage'] == 'define'), None)
+    if entry is None: raise KeyError('define snapshot')
+    name = pathlib.Path(entry['dir']).name
+    if not re.fullmatch(r'[0-9]{3,}-define', name): raise ValueError('invalid snapshot basename')
+    return root / 'gates' / name
+
+def fork():
+    fields = dict(line.split('=', 1) for line in (snapshot() / 'git.txt').read_text().splitlines() if '=' in line)
+    expected = (root / 'develop.sha').read_text().strip()
+    if not re.fullmatch('[0-9a-f]{40,64}', expected): raise ValueError('invalid develop SHA')
+    return fields['worktree_head'] == expected
+
+def aborted():
+    events = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+    gates = [i for i, e in enumerate(events) if e['event'] == 'gate_fired' and str(e['phase']) == '1']
+    if not gates: raise KeyError('gate_fired')
+    return any(e['event'] == 'workflow_aborted' and str(e['phase']) == '1' for e in events[max(gates) + 1:])
+
+check('DOES NOT HOLD line present', lambda: refusal in (root / 'start.stdout').read_text().splitlines())
+check('no base-branch note', lambda: 'note: base branch is' not in (root / 'start.stdout').read_text())
+check('base_branch is develop', lambda: json.loads((snapshot() / 'devflow/state-01.json').read_text())['base_branch'] == 'develop')
+check('forked from the recorded develop', fork)
+check('aborted after the gate', aborted)
+print(f'CHECK passed={passed} failed={failed}')
+sys.exit(bool(failed) or not passed)
+PY

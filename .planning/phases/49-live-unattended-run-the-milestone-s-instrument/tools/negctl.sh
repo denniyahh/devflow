@@ -37,7 +37,7 @@ printf '%s %s\n' "$cmd" "$unit" >>"$FAKE_ROOT/ctl"
 if [ -f "$FAKE_ROOT/$unit.pid" ]; then pid="$(cat "$FAKE_ROOT/$unit.pid")"; else pid=0; fi
 case "$cmd" in
     is-active)
-        if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then echo active; else echo inactive; exit 3; fi ;;
+        if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null && ! rg -q "^State:.*Z" "/proc/$pid/status"; then echo active; else echo inactive; exit 3; fi ;;
     stop) if [ "$pid" -gt 0 ]; then kill "$pid" 2>/dev/null || true; fi ;;
     reset-failed) ;;
     *) exit 2 ;;
@@ -85,5 +85,98 @@ FAKE
 }
 
 if [ "${1:-}" = --selftest ]; then selftest; exit; fi
-# RED stub: no launch or evidence.
-exit 0
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+attempt="" home="$HOME/.cache/devflow-phase49" bin="" unit="" scaffold="$ROOT/scripts/scratch-dogfood-repo.sh"
+gate_timeout=120 exit_timeout=60 fixture=false fake_cmds=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --attempt|--home|--bin|--unit|--scaffold|--gate-timeout|--exit-timeout|--fake-cmds)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"
+            case "$1" in
+                --attempt) attempt="$2" ;; --home) home="$2" ;; --bin) bin="$2" ;;
+                --unit) unit="$2" ;; --scaffold) scaffold="$2" ;; --gate-timeout) gate_timeout="$2" ;;
+                --exit-timeout) exit_timeout="$2" ;; --fake-cmds) fake_cmds="$2" ;;
+            esac
+            shift ;;
+        --fixture-only) fixture=true ;;
+        *) die "unknown option: $1" ;;
+    esac
+    shift
+done
+[[ "$attempt" =~ ^[1-9][0-9]*$ ]] || die '--attempt must be a positive integer'
+[[ "$gate_timeout" =~ ^[1-9][0-9]*$ ]] && [[ "$exit_timeout" =~ ^[1-9][0-9]*$ ]] || die 'timeouts must be positive integers'
+unit="${unit:-p49-a$attempt-negctl}"
+[[ "$unit" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'invalid unit name'
+ev="$(realpath -m -- "$home")/attempt-$attempt"
+neg="$ev/negctl"
+[ ! -e "$neg" ] || die "already exists: $neg"
+if [ -f "$ev/attempt.json" ]; then
+    recorded_bin="$(jq -er '.bin | select(type == "string" and length > 0)' "$ev/attempt.json")" || die 'attempt.json bin ABSENT'
+    if [ -n "$bin" ] && [ "$bin" != "$recorded_bin" ]; then die 'binary path mismatch with attempt.json'; fi
+    bin="$recorded_bin"
+fi
+[ -n "$bin" ] && [ -x "$bin" ] || die 'executable --bin or attempt.json bin required'
+bin="$(realpath -e -- "$bin")"
+sha="$(sha256sum "$bin" | cut -d ' ' -f1)"
+if [ -f "$ev/attempt.json" ]; then
+    expected="$(jq -er '.bin_sha256 | select(type == "string" and length > 0)' "$ev/attempt.json")" || die 'attempt.json bin_sha256 ABSENT'
+    [ "$sha" = "$expected" ] || die 'sha256 mismatch with attempt.json'
+fi
+[ -f "$scaffold" ] || die 'scaffold ABSENT'
+if [ -n "$fake_cmds" ]; then
+    fake_cmds="$(realpath -e -- "$fake_cmds")"
+    [ -x "$fake_cmds/systemd-run" ] && [ -x "$fake_cmds/systemctl" ] || die 'fake commands ABSENT'
+    export PATH="$fake_cmds:$PATH"
+fi
+mkdir -p "$neg"
+printf '%s\n' "$sha" >"$neg/bin_sha256"
+repo="$neg/repo"
+env GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=tag.gpgsign GIT_CONFIG_VALUE_1=false bash "$scaffold" "$repo"
+git -C "$repo" config commit.gpgsign false
+git -C "$repo" config tag.gpgsign false
+git -C "$repo" cat-file -e develop:.planning/config.json || die 'precondition: develop config.json ABSENT'
+git -C "$repo" rm -q .planning/config.json
+git -C "$repo" commit -q -m 'chore: remove config.json for negative control'
+if git -C "$repo" cat-file -e develop:.planning/config.json 2>/dev/null; then die 'config removal failed'; fi
+git -C "$repo" rev-parse 'develop^{commit}' >"$neg/develop.sha"
+if [ "$fixture" = true ]; then exit 0; fi
+state="$(timeout 10 systemctl --user is-active "$unit" 2>/dev/null || true)"
+case "$state" in active|activating|deactivating|reloading) die "unit already exists: $unit ($state)" ;; esac
+cleanup() {
+    timeout 15 systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    timeout 15 systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+# Quote paths as shell arguments because the notify contract is a command string.
+printf -v notify 'timeout 60 bash %q --no-notify %q %q' "$T/snapshot-hook.sh" "$repo" "$neg"
+
+# shellcheck disable=SC2016 # Expanded by the launched sh, not this shell.
+timeout 20 systemd-run --user --unit "$unit" --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+    --setenv="DEVFLOW_GATE_NOTIFY_CMD=$notify" -- \
+    sh -c 'exec env -u DEVFLOW_BASE_BRANCH "$0" start --phase 1 --agent claude --mode auto "$1" >"$2/start.stdout" 2>"$2/start.stderr"' \
+    "$bin" "$repo" "$neg"
+deadline=$((SECONDS + gate_timeout))
+dir=""
+while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -f "$neg/ledger.jsonl" ]; then
+        dir="$(jq -rs '[.[] | select(.stage == "define")][0].dir // empty' "$neg/ledger.jsonl")" || die 'ledger malformed'
+        [ -z "$dir" ] || break
+    fi
+    sleep 0.2
+done
+[ -n "$dir" ] && [ -f "$dir/git.txt" ] || die 'define gate did not open'
+head="$(sed -n 's/^worktree_head=//p' "$dir/git.txt")"
+[[ "$head" =~ ^[0-9a-f]{40,64}$ ]] || die 'worktree head ABSENT'
+printf '%s\n' "$head" >"$neg/worktree-head.sha"
+timeout 30 "$bin" gate reject 1 --stage define --note 'abort: negative control complete' --project "$repo"
+deadline=$((SECONDS + exit_timeout))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    state="$(timeout 10 systemctl --user is-active "$unit" 2>/dev/null || true)"
+    case "$state" in inactive|failed|unknown) break ;; esac
+    sleep 0.2
+done
+case "$state" in inactive|failed|unknown) ;; *) die 'unit did not exit after abort' ;; esac
+[ -f "$repo/.devflow/events.jsonl" ] || die 'events ABSENT'
+cp "$repo/.devflow/events.jsonl" "$neg/events.jsonl"
+bash "$T/check-evidence.sh" --arm negative "$ev"
