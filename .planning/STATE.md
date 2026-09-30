@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
-current_plan: 10
-status: executing
-stopped_at: 49-09 complete; 49-10 runbook next; live attempt remains operator-owned
-last_updated: "2026-09-30T16:30:29.545Z"
+current_plan: 11
+status: Executing Phase 49 — awaiting operator live attempt
+stopped_at: 49-10 complete; 49-11 blocking-human live attempt awaits operator; no 49-11 work or commits
+last_updated: "2026-09-30T17:43:27.287Z"
 last_activity: 2026-09-30
-last_activity_desc: Wave 3 complete; 49-09 real API-key authentication passed; 9 of 12 plans
-state_head: 784a214f5f9beafe483b7d046fa427ec56345080
+last_activity_desc: API-key probe and two-lane runbook recheck passed; 10 of 12 plans; operator checkpoint next
+state_head: 98b97de60d7bc851165655fdc7141487c3570dd2
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 48
-  completed_plans: 45
+  completed_plans: 46
   percent: 50
 ---
 
@@ -191,10 +191,10 @@ change earns 2.0.
 
 Phase: 49 (Live Unattended Run — The Milestone's Instrument) — EXECUTING
 Plans: 12 plans in 6 waves (49-11 is the single live-attempt checkpoint); plan checker passed 2026-09-29
-Current Plan: 10
+Current Plan: 11
 Total Plans in Phase: 12
-Completed Plans: 9 of 12
-Status: Executing Phase 49
+Completed Plans: 10 of 12
+Status: Executing Phase 49 — awaiting operator live attempt
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-30 — Wave 3 complete; 49-09 real API-key authentication passed; 9 of 12 plans
+Last activity: 2026-09-30 — API-key probe and two-lane runbook recheck passed; 10 of 12 plans; operator checkpoint next
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
@@ -954,8 +954,8 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-09-30T16:30:29.256Z
-**Stopped at:** 49-09 complete; 49-10 runbook next; live attempt remains operator-owned
+**Last session:** 2026-09-30T17:43:27.004Z
+**Stopped at:** 49-10 complete; 49-11 blocking-human live attempt awaits operator; no 49-11 work or commits
 **Resume file:** None
 
 ## Operator Next Steps

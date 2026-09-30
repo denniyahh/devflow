@@ -283,7 +283,7 @@ execution pauses once for this, and the attempt is judged afterwards from record
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: 9/12 plans executed (6 waves); 49-11 is the single operator checkpoint for the live attempt
+**Plans**: 10/12 plans executed (6 waves); 49-11 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
@@ -305,7 +305,7 @@ execution pauses once for this, and the attempt is judged afterwards from record
 
 **Wave 4**
 
-- [ ] 49-10-PLAN.md *(depends on 49-08, 49-09)* — operator runbook and host requirements
+- [x] 49-10-PLAN.md *(depends on 49-08, 49-09)* — operator runbook and host requirements
 
 **Wave 5**
 
@@ -540,7 +540,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
-| 49 | 9/12 | In Progress|  |
+| 49 | 10/12 | In Progress|  |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
 
