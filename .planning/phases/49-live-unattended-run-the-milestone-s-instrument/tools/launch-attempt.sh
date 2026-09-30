@@ -99,5 +99,155 @@ sys.exit(bool(failed) or not passed)
 PY
 }
 if [ "${1:-}" = --selftest ]; then selftest; exit; fi
-# RED stub: emits no records and launches nothing.
-exit 0
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# Runs only inside the auth unit; raw output never leaves its scratch directory.
+if [ "${1:-}" = __auth-probe-inner ] && [ "$#" -eq 2 ]; then
+    compgen -e | LC_ALL=C sort >"$2/env-names"
+    rc=0
+    timeout 180 claude -p 'Reply with exactly P49_AUTH_OK and nothing else.' --tools '' \
+        --no-session-persistence --output-format stream-json --verbose >"$2/claude.jsonl" 2>/dev/null || rc=$?
+    printf '%s\n' "$rc" >"$2/claude.exit"
+    exit 0
+fi
+command="${1:-}"; [ "$#" -gt 0 ] || die 'subcommand required'; shift
+attempt="" home="$HOME/.cache/devflow-phase49" repo="$ROOT" scaffold="" fake_cmds=""
+while [ "$#" -gt 0 ]; do
+    [ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"
+    case "$1" in
+        --attempt) attempt="$2" ;; --home) home="$2" ;; --repo) repo="$2" ;;
+        --scaffold) scaffold="$2" ;; --fake-cmds) fake_cmds="$2" ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift 2
+done
+[[ "$attempt" =~ ^[1-9]$ ]] || die '--attempt must be one digit 1-9'
+home="$(realpath -m -- "$home")"; repo="$(realpath -e -- "$repo")"
+ev="$home/attempt-$attempt"; project="$ev/project"
+scaffold="${scaffold:-$repo/scripts/scratch-dogfood-repo.sh}"
+if [ -n "$fake_cmds" ]; then
+    fake_cmds="$(realpath -e -- "$fake_cmds")"
+    [ -x "$fake_cmds/claude" ] && [ -x "$fake_cmds/systemd-run" ] || die 'fake claude and systemd-run required'
+    export PATH="$fake_cmds:$PATH"
+fi
+require_attempt() { [ -f "$ev/attempt.json" ] || die 'attempt.json ABSENT'; }
+set_unit_env() {
+    printf -v notify 'timeout 60 bash %q %q %q' "$T/snapshot-hook.sh" "$project" "$ev"
+    UNIT_ENV=("--setenv=PATH=$PATH" "--setenv=HOME=$HOME" "--setenv=DEVFLOW_GATE_NOTIFY_CMD=$notify")
+}
+prepare() {
+    [ ! -e "$ev" ] || die "attempt already exists: $ev"
+    local highest=0 stopped=0 dir n outcome dirty sha binary status
+    shopt -s nullglob
+    for dir in "$home"/attempt-*; do
+        [ -d "$dir" ] || continue
+        n="${dir##*/attempt-}"
+        [[ "$n" =~ ^[1-9]$ ]] || die 'invalid earlier attempt directory'
+        [ "$n" -le "$highest" ] || highest="$n"
+        [ -f "$dir/verdict.json" ] || die "collect it first: attempt-$n has no verdict"
+        outcome="$(jq -er '.outcome | select(. == "stopped" or . == "shipped")' "$dir/verdict.json")" || die 'earlier verdict malformed'
+        jq -e 'has("stop_note")' "$dir/verdict.json" >/dev/null || die 'earlier verdict stop_note ABSENT'
+        if [ "$outcome" = stopped ] && jq -e '.stop_note | type == "string" and length > 0' "$dir/verdict.json" >/dev/null; then stopped=$((stopped+1)); fi
+    done
+    [ "$stopped" -lt 3 ] || die 'D-11: cap of three stopped attempts reached'
+    [ "$attempt" -eq "$((highest+1))" ] || die 'attempt must follow the highest existing attempt'
+    status="$(git -C "$repo" status --porcelain -- crates Cargo.toml Cargo.lock)"
+    [ -z "$status" ] || die 'dirty build tree: crates or Cargo files changed'
+    dirty=false; [ -z "$(git -C "$repo" status --porcelain)" ] || dirty=true
+    (cd "$repo" && timeout 900 cargo build -p devflow --locked)
+    binary="$repo/target/debug/devflow"; [ -x "$binary" ] || die 'build binary ABSENT'
+    sha="$(sha256sum "$binary" | cut -d ' ' -f1)"
+    mkdir -p "$home/bin" "$ev/prelaunch"
+    binary="$home/bin/devflow-${sha:0:12}"
+    if [ -e "$binary" ]; then
+        [ "$(sha256sum "$binary" | cut -d ' ' -f1)" = "$sha" ] || die 'pinned binary sha256 mismatch'
+    else
+        install -m 0555 "$repo/target/debug/devflow" "$binary"
+    fi
+    printf 'build_commit=%s\nbuild_dirty=%s\nbin_sha256=%s\n' "$(git -C "$repo" rev-parse HEAD)" "$dirty" "$sha" >"$ev/identity.txt"
+    bash "$scaffold" --live-payload "$project"
+    bash "$scaffold" --check "$project" >"$ev/prelaunch/check.txt" || die 'payload check failed'
+    tail -1 "$ev/prelaunch/check.txt" | rg -qx 'CHECK passed=[1-9][0-9]* failed=0' || die 'payload CHECK line ABSENT'
+    jq -n --argjson attempt "$attempt" --arg bin "$binary" --arg bin_sha256 "$sha" --arg launch "$project" \
+        '{attempt:$attempt,bin:$bin,bin_sha256:$bin_sha256,launch:$launch,base_branch:"integration"}' >"$ev/attempt.json"
+    printf 'start=p49-a%s-start\nsurv=p49-a%s-surv\nauthprobe=p49-a%s-authprobe\n' "$attempt" "$attempt" "$attempt" >"$ev/units.txt"
+    printf '%s\n' "$attempt" >"$home/current-attempt.tmp"; mv "$home/current-attempt.tmp" "$home/current-attempt"
+    echo "Prepared attempt $attempt. Next: run the negative arm; create the private repository and push main/integration; then start."
+}
+probe_auth() (
+    require_attempt
+    local scratch unit="p49-a$attempt-authprobe" rc=0
+    scratch="$(mktemp -d "$ev/prelaunch/authprobe.XXXXXX")"
+    trap 'rm -rf -- "$scratch"' EXIT
+    set_unit_env
+    timeout 210 systemd-run --user --unit "$unit" --wait --collect --quiet --working-directory="$scratch" \
+        "${UNIT_ENV[@]}" -- bash "$SELF" __auth-probe-inner "$scratch" >/dev/null 2>&1 || rc=$?
+    [ -f "$scratch/env-names" ] || die 'auth probe failed: env-names ABSENT'
+    if rg -q -v '^[A-Za-z_][A-Za-z0-9_]*$' "$scratch/env-names"; then die 'auth probe failed: invalid environment name'; fi
+    cp "$scratch/env-names" "$ev/prelaunch/agent-env-names.txt"
+    python3 - "$scratch" "$ev/prelaunch/auth-probe.txt" "$unit" "$rc" <<'PY'
+import json,pathlib,re,sys,time
+scratch=pathlib.Path(sys.argv[1]);source='ABSENT';is_error='ABSENT';reply='no';exit_code='ABSENT'
+if (scratch/'claude.exit').is_file():exit_code=(scratch/'claude.exit').read_text().strip()
+if (scratch/'claude.jsonl').is_file():
+    for line in (scratch/'claude.jsonl').read_text().splitlines():
+        try:obj=json.loads(line)
+        except ValueError:continue
+        if not isinstance(obj,dict) or 'type' not in obj:continue
+        if obj['type']=='system' and obj.get('subtype')=='init' and source=='ABSENT':
+            if 'apiKeySource' in obj and isinstance(obj['apiKeySource'],str) and re.fullmatch('[A-Za-z0-9_-]+',obj['apiKeySource']):source=obj['apiKeySource']
+        if obj['type']=='result':
+            is_error=str(obj['is_error']).lower() if 'is_error' in obj and isinstance(obj['is_error'],bool) else 'ABSENT'
+            reply='yes' if 'result' in obj and isinstance(obj['result'],str) and 'P49_AUTH_OK' in obj['result'] else 'no'
+record=f'unit={sys.argv[3]}\nprobe_exit={exit_code}\nis_error={is_error}\nreply_ok={reply}\nauth_source={source}\nprobe_timeout_secs=180\nmeasured_at={int(time.time())}\n'
+pathlib.Path(sys.argv[2]).write_text(record)
+if sys.argv[4]!='0' or exit_code!='0' or is_error!='false' or reply!='yes':
+    print(f'auth probe failed: probe_exit={exit_code} is_error={is_error} reply_ok={reply}',file=sys.stderr)
+    sys.exit(1)
+print(f'Auth probe passed: probe_exit={exit_code} is_error={is_error} reply_ok={reply} auth_source={source}')
+PY
+)
+start() {
+    require_attempt
+    [ -f "$home/current-attempt" ] && [ "$(cat "$home/current-attempt")" = "$attempt" ] || die 'attempt number mismatch'
+    [ ! -e "$ev/start.stdout" ] || die 'already launched'
+    bash "$scaffold" --check "$project" >"$ev/prelaunch/check-start.txt" || die 'payload check failed'
+    local bin expected actual origin own repo_name remote main_sha base_sha auth
+    bin="$(jq -er '.bin | select(type == "string" and length > 0)' "$ev/attempt.json")" || die 'bin ABSENT'
+    expected="$(jq -er '.bin_sha256 | select(type == "string" and length > 0)' "$ev/attempt.json")" || die 'bin_sha256 ABSENT'
+    actual="$(sha256sum "$bin" | cut -d ' ' -f1)"; [ "$actual" = "$expected" ] || die 'binary sha256 mismatch'
+    origin="$(git -C "$project" remote get-url origin)" || die 'origin ABSENT'
+    [ -n "$origin" ] || die 'origin ABSENT'
+    (cd "$project" && timeout 30 gh repo view --json nameWithOwner,visibility) >"$ev/prelaunch/repo.json"
+    jq -e '.visibility == "PRIVATE"' "$ev/prelaunch/repo.json" >/dev/null || die 'repository not private'
+    repo_name="$(jq -er '.nameWithOwner | select(type == "string" and length > 0)' "$ev/prelaunch/repo.json")" || die 'repository name ABSENT'
+    own="$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)"
+    own="$(printf '%s\n' "$own" | sed -E 's@^.*github.com[:/]@@; s@\.git$@@')"
+    [ "$repo_name" != "$own" ] || die 'refusing this DevFlow repository'
+    remote="$(timeout 30 git -C "$project" ls-remote origin refs/heads/main refs/heads/integration)" || die 'remote heads unreadable'
+    main_sha="$(git -C "$project" rev-parse main)";base_sha="$(git -C "$project" rev-parse integration)"
+    printf '%s\n' "$remote" | rg -qx "${main_sha}[[:space:]]+refs/heads/main" || die 'main not pushed'
+    printf '%s\n' "$remote" | rg -qx "${base_sha}[[:space:]]+refs/heads/integration" || die 'integration not pushed'
+    auth="$(timeout 30 gh auth status 2>&1)" || die 'gh auth status failed'
+    printf '%s\n' "$auth" | sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' | rg 'Logged in to|Token scopes:' >"$ev/prelaunch/gh-auth.txt" || die 'gh auth fields ABSENT'
+    rg 'Token scopes:' "$ev/prelaunch/gh-auth.txt" | rg -q "(^|[' ,])repo([', ]|$)" || die 'repo scope required'
+    probe_auth
+    printf 'base_sha=%s\nmain_sha=%s\n' "$base_sha" "$main_sha" >"$ev/prelaunch/fork-base.txt"
+    mkdir -p "$ev/surv";set_unit_env
+    timeout 20 systemd-run --user --unit "p49-a$attempt-surv" --setenv="PATH=$PATH" --setenv="HOME=$HOME" -- \
+        python3 "$T/surv-watch.py" watch "$project" "$ev/surv"
+    : >"$ev/start.stdout"
+    # shellcheck disable=SC2016 # Expanded by the launched sh, not this shell.
+    timeout 20 systemd-run --user --unit "p49-a$attempt-start" -p RemainAfterExit=yes -p KillMode=process \
+        "${UNIT_ENV[@]}" -- sh -c 'exec "$0" start --phase 1 --agent claude --mode auto --yes-ship "$1" >"$2/start.stdout" 2>"$2/start.stderr"' \
+        "$bin" "$project" "$ev"
+}
+case "$command" in
+    prepare) prepare ;; probe-auth) probe_auth ;; start) start ;;
+    status)
+        require_attempt
+        for unit in "p49-a$attempt-start" "p49-a$attempt-surv"; do
+            state="$(timeout 10 systemctl --user is-active "$unit" 2>/dev/null || true)"
+            printf '%s %s\n' "$unit" "${state:-ABSENT}"
+        done ;;
+    *) die "unknown subcommand: $command" ;;
+esac
