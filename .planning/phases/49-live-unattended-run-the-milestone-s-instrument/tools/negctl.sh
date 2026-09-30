@@ -80,6 +80,83 @@ FAKE
         echo '  FAIL negctl: fake arm end to end passes the negative-arm check — evidence absent or rejected'
         failed=$((failed + 1))
     fi
+    # Task-2 controls assert text and preconditions, never a bare exit code.
+    st_report() {
+        if [ "$1" -eq 0 ]; then
+            printf '  ok   %s\n' "$2"; passed=$((passed + 1))
+        else
+            printf '  FAIL %s — control failed\n' "$2"; failed=$((failed + 1))
+        fi
+    }
+    local why=0 fixture="$tmp/fixture" before after
+    env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false \
+        bash "$ROOT/scripts/scratch-dogfood-repo.sh" "$tmp/default" >"$tmp/default.log" 2>&1
+    git -C "$tmp/default" cat-file -e develop:.planning/config.json || why=1
+    st_report "$why" 'control: unmodified scaffold still tracks config.json on develop'
+    before="$(wc -l <"$tmp/argv")"
+    rc=0
+    bash "$SELF" --attempt 1 --home "$fixture" --bin "$tmp/fakes/devflow" --fake-cmds "$tmp/fakes" \
+        --fixture-only >"$tmp/fixture.log" 2>&1 || rc=$?
+    why=0
+    [ "$rc" -eq 0 ] || why=1
+    if git -C "$fixture/attempt-1/negctl/repo" cat-file -e develop:.planning/config.json 2>/dev/null; then why=1; fi
+    after="$(wc -l <"$tmp/argv")"
+    [ "$before" = "$after" ] || why=1
+    st_report "$why" 'negctl: fixture-only removes config.json on develop and launches nothing'
+    before="$(git -C "$fixture/attempt-1/negctl/repo" rev-parse HEAD)"
+    rc=0
+    bash "$SELF" --attempt 1 --home "$fixture" --bin "$tmp/fakes/devflow" --fixture-only >"$tmp/existing.log" 2>&1 || rc=$?
+    why=0
+    [ "$rc" -ne 0 ] && rg -q 'already exists' "$tmp/existing.log" &&
+        [ "$before" = "$(git -C "$fixture/attempt-1/negctl/repo" rev-parse HEAD)" ] || why=1
+    st_report "$why" 'control: existing negctl dir refused'
+    mkdir -p "$tmp/mismatch/attempt-1"
+    jq -n --arg bin "$tmp/fakes/devflow" '{bin:$bin,bin_sha256:"wrong"}' >"$tmp/mismatch/attempt-1/attempt.json"
+    rc=0
+    bash "$SELF" --attempt 1 --home "$tmp/mismatch" --fixture-only >"$tmp/mismatch.log" 2>&1 || rc=$?
+    why=0
+    [ "$rc" -ne 0 ] && rg -q 'sha256 mismatch' "$tmp/mismatch.log" &&
+        [ ! -e "$tmp/mismatch/attempt-1/negctl" ] || why=1
+    st_report "$why" 'control: bin sha mismatch with attempt.json refused'
+    why=0
+    [ "$(rg --count-matches '^--setenv=' "$tmp/argv")" -eq 3 ] &&
+        ! rg -q '^--setenv=DEVFLOW_BASE_BRANCH=' "$tmp/argv" &&
+        rg -q 'env -u DEVFLOW_BASE_BRANCH' "$tmp/argv" &&
+        rg -q '^--setenv=DEVFLOW_GATE_NOTIFY_CMD=.*attempt-1/negctl$' "$tmp/argv" || why=1
+    st_report "$why" 'negctl: unit env scrubs DEVFLOW_BASE_BRANCH and routes the hook to negctl'
+    rc=0
+    FAKE_NEVER=true bash "$SELF" --attempt 1 --home "$tmp/never" --bin "$tmp/fakes/devflow" \
+        --unit p49-test-never --fake-cmds "$tmp/fakes" --gate-timeout 3 --exit-timeout 2 >"$tmp/never.log" 2>&1 || rc=$?
+    why=0
+    [ "$rc" -ne 0 ] && rg -q 'define gate did not open' "$tmp/never.log" &&
+        [ "$(tail -2 "$tmp/ctl")" = $'stop p49-test-never\nreset-failed p49-test-never' ] || why=1
+    st_report "$why" 'negctl: unit stopped and reset when the gate never opens'
+    cat >"$tmp/failing-signer" <<'SIGNER'
+#!/usr/bin/env bash
+printf 'called\n' >>"$FAKE_ROOT/signer.log"
+exit 1
+SIGNER
+    chmod +x "$tmp/failing-signer"
+    git config --file "$tmp/global" commit.gpgsign true
+    git config --file "$tmp/global" tag.gpgsign true
+    git config --file "$tmp/global" gpg.format openpgp
+    git config --file "$tmp/global" gpg.program "$tmp/failing-signer"
+    git config --file "$tmp/global" user.name 'Control Signer'
+    git config --file "$tmp/global" user.email control@localhost
+    git init -q "$tmp/sign-control"
+    rc=0
+    GIT_CONFIG_GLOBAL="$tmp/global" git -C "$tmp/sign-control" commit -q --allow-empty -m 'chore: signer control' >"$tmp/sign-control.log" 2>&1 || rc=$?
+    why=0
+    [ "$rc" -ne 0 ] && [ -s "$tmp/signer.log" ] || why=1
+    before="$(wc -l <"$tmp/signer.log")"
+    rc=0
+    GIT_CONFIG_GLOBAL="$tmp/global" bash "$SELF" --attempt 1 --home "$tmp/signed" --bin "$tmp/fakes/devflow" \
+        --fixture-only >"$tmp/signed.log" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && [ "$before" = "$(wc -l <"$tmp/signer.log")" ] || why=1
+    git -C "$tmp/signed/attempt-1/negctl/repo" log --format=%H develop | while IFS= read -r commit; do
+        if git -C "$tmp/signed/attempt-1/negctl/repo" cat-file commit "$commit" | rg -q '^gpgsig '; then exit 1; fi
+    done || why=1
+    st_report "$why" 'negctl: no commit invokes host signing'
     echo "SELFTEST passed=$passed failed=$failed"
     [ "$failed" -eq 0 ] && [ "$passed" -gt 0 ]
 }
