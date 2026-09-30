@@ -66,7 +66,7 @@ exit 3
     result=invoke('prepare');ok=False
     if result.returncode==0 and (ev/'attempt.json').is_file():
         a=json.loads((ev/'attempt.json').read_text());b=pathlib.Path(a['bin'])
-        ok=(a['attempt']==1 and a['launch']==str(ev/'project') and a['base_branch']=='integration' and b.parent==home/'bin' and
+        ok=('build_commit' in a and a['build_commit']==git('rev-parse','HEAD') and a['attempt']==1 and a['launch']==str(ev/'project') and a['base_branch']=='integration' and b.parent==home/'bin' and
             hashlib.sha256(b.read_bytes()).hexdigest()==a['bin_sha256'] and b.stat().st_mode&0o777==0o555 and
             'build_dirty=false' in (ev/'identity.txt').read_text() and
             re.search(r'^CHECK passed=[1-9][0-9]* failed=0$',(ev/'prelaunch/check.txt').read_text(),re.M) and (home/'current-attempt').read_text().strip()=='1')
