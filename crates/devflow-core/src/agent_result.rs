@@ -727,26 +727,58 @@ fn json_strings_report_human_gate(value: &serde_json::Value) -> bool {
 ///
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
-fn text_reports_human_gate(text: &str) -> bool {
-    text.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        let line = strip_leading_markup(&lower);
-        let Some(after_label) = line.strip_prefix("gate") else {
-            return false;
-        };
-        let after_label = after_label.trim_start_matches(['*', ' ', '`']);
-        if let Some(rest) = after_label.strip_prefix(':') {
-            let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
-            let value_token: String = value_region
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-            if value_token == HUMAN_GATE_VALUE {
-                return true;
-            }
+/// Match a physical line whose first word, after any list, ordinal or blockquote
+/// markup ([`strip_leading_markup`]), is a case-insensitive `gate` label with value
+/// [`HUMAN_GATE_VALUE`].
+fn line_reports_human_gate(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let line = strip_leading_markup(&lower);
+    let Some(after_label) = line.strip_prefix("gate") else {
+        return false;
+    };
+    let after_label = after_label.trim_start_matches(['*', ' ', '`']);
+    if let Some(rest) = after_label.strip_prefix(':') {
+        let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
+        let value_token: String = value_region
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if value_token == HUMAN_GATE_VALUE {
+            return true;
         }
-        false
-    })
+    }
+    false
+}
+
+/// Detect when an agent halts at a human checkpoint and reports that failure
+/// via an embedded [`DEVFLOW_RESULT`] marker with [`HUMAN_GATE_VALUE`].
+///
+/// In multi-agent or subagent workflows (such as GSD spawning `gsd-executor`),
+/// the subagent halts at the checkpoint and the orchestrating agent emits a
+/// terminal failure marker describing the halt (e.g. `halted at Task 1, a
+/// blocking-human decision checkpoint`). Scanning the structured marker reason
+/// allows DevFlow to trigger auto-decide resume rather than falling through to
+/// an ordinary stage failure gate.
+fn marker_reports_human_gate(text: &str) -> bool {
+    let Some(result) = parse_marker_lines(text) else {
+        return false;
+    };
+    if result.status != AgentStatus::Failed {
+        return false;
+    }
+    let Some(reason) = result.reason else {
+        return false;
+    };
+    let lower = reason.to_ascii_lowercase();
+    lower.contains(HUMAN_GATE_VALUE)
+        && (lower.contains("checkpoint") || lower.contains("gate") || lower.contains("halted"))
+}
+
+fn text_reports_human_gate(text: &str) -> bool {
+    if text.lines().any(line_reports_human_gate) {
+        return true;
+    }
+    marker_reports_human_gate(text)
 }
 
 /// Strip the markdown a relayed declaration line can carry before its label:
@@ -4160,6 +4192,49 @@ mod tests {
     fn blocking_human_checkpoint_reported_false_for_code_spanned_plain_blocking() {
         let stdout = "## Checkpoint: Decision\n\n**Gate:** `blocking`\n";
         assert!(!blocking_human_checkpoint_reported(stdout));
+    }
+
+    /// Live Attempt 1 (2026-10-07) regression: when Claude spawns a subagent
+    /// (e.g. `gsd-executor`), the subagent's `Gate: blocking-human` declaration
+    /// arrives inside a tool result, and the orchestrator summarizes the halt
+    /// in prose with a terminal `DEVFLOW_RESULT` marker whose `reason` explains
+    /// the blocking-human checkpoint. DevFlow must recognize this structured
+    /// marker so auto-decide resume is triggered.
+    #[test]
+    fn blocking_human_checkpoint_reported_detects_marker_reason_checkpoint() {
+        let reason = "Phase 01 plan 01-01 halted at Task 1, a blocking-human decision checkpoint (choose DEFAULT_RETRY_BUDGET_SECS: budget-30/120/300).";
+        let inner = format!(
+            "Phase 1 stopped at Task 1.\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"{reason}\"}}"
+        );
+        let escaped_inner = inner.replace('\n', "\\n").replace('"', "\\\"");
+        let stream = format!(
+            "{}\n{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"{escaped_inner}\",\"session_id\":\"sess-p49-a1\"}}\n",
+            V3_INIT_EVENT
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&stream),
+            "marker reason stating a blocking-human checkpoint halt must be recognized in a stream capture"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&inner),
+            "marker reason must also be recognized in plain text"
+        );
+    }
+
+    /// Negative control: a failed marker without a blocking-human checkpoint
+    /// reason must NOT report a human gate.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_ordinary_marker_failure() {
+        let stdout = "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}\n";
+        assert!(!blocking_human_checkpoint_reported(stdout));
+
+        let plain_gate = "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"halted at Task 1, a blocking checkpoint\"}\n";
+        assert!(!blocking_human_checkpoint_reported(plain_gate));
+
+        let success = format!(
+            "DEVFLOW_RESULT: {{\"status\": \"success\", \"reason\": \"handled {HUMAN_GATE_VALUE} checkpoint\"}}\n"
+        );
+        assert!(!blocking_human_checkpoint_reported(&success));
     }
 
     #[test]
