@@ -426,6 +426,10 @@ pub struct State {
     /// the process that recorded it has exited.
     #[serde(default)]
     pub checkpoint_approval: CheckpointApproval,
+    /// Operator-configured gate notify hook command, persisted from DEVFLOW_GATE_NOTIFY_CMD
+    /// across monitor spawns and rate-limit resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_notify_cmd: Option<String>,
 }
 
 /// One human-only checkpoint recorded as seen for this run.
@@ -596,6 +600,7 @@ impl State {
             // allowed to. Only a state file from an older binary may read
             // Unrecorded (see the field's doc comment).
             checkpoint_approval: CheckpointApproval::Pending,
+            gate_notify_cmd: std::env::var("DEVFLOW_GATE_NOTIFY_CMD").ok().filter(|s| !s.is_empty()),
         }
     }
 }

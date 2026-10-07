@@ -273,8 +273,10 @@ fn ship_stage_prompt(phase: PhaseId, review_angles: &[String]) -> String {
         \n\
         DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"review: <short summary of the Critical findings>\"}}\n\
         \n\
-        - If `REVIEW.md` has NO Critical-severity findings: run `{ship}` and \
-        report the outcome via the normal completion protocol below.\n\
+        - If `REVIEW.md` has NO Critical-severity findings: run `{ship}`. \
+        When creating the pull request, target base branch `main` (the \
+        repository trunk), while DevFlow merges into integration locally. \
+        Report the outcome via the normal completion protocol below.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -567,8 +569,9 @@ fn workflow_ship_prompt(phase: PhaseId, review_angles: &[String], workflow_root:
         Critical findings>\"}}\n\
         \n\
         - If REVIEW.md has NO Critical-severity findings: read and follow the GSD workflow file \
-        at {workflow_root}/ship.md for phase {phase} and report the outcome via the normal \
-        completion protocol below.\n\
+        at {workflow_root}/ship.md for phase {phase}. When creating the pull request, target \
+        base branch `main` (the repository trunk), while DevFlow merges into integration locally. \
+        Report the outcome via the normal completion protocol below.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -747,6 +750,15 @@ mod tests {
             "Ship prompt must define the review: ReviewFailed reason convention"
         );
         assert!(prompt.contains("DEVFLOW_RESULT"));
+    }
+
+    #[test]
+    fn ship_prompt_instructs_pr_targeting_main() {
+        let prompt = stage_prompt(Stage::Ship, PhaseId::new(13));
+        assert!(
+            prompt.contains("target base branch `main`"),
+            "Ship prompt must explicitly instruct targeting base branch main for the PR"
+        );
     }
 
     #[test]
