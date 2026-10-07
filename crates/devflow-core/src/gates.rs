@@ -386,10 +386,23 @@ impl Gates {
 /// active [`crate::mode::Mode`] would not normally gate (e.g. a Define/Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
 pub fn fire_gate_notify(phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
+    fire_gate_notify_with_fallback(phase, stage, context, unexpected, None);
+}
+
+/// Fire the operator-configured gate notify hook, checking `DEVFLOW_GATE_NOTIFY_CMD`
+/// first and falling back to `fallback_cmd` if the environment variable is unset or empty.
+pub fn fire_gate_notify_with_fallback(
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    unexpected: bool,
+    fallback_cmd: Option<&str>,
+) {
     let cmd = match std::env::var("DEVFLOW_GATE_NOTIFY_CMD") {
-        Ok(cmd) if !cmd.is_empty() => cmd,
-        _ => return,
+        Ok(cmd) if !cmd.is_empty() => Some(cmd),
+        _ => fallback_cmd.filter(|s| !s.is_empty()).map(ToString::to_string),
     };
+    let Some(cmd) = cmd else { return };
     run_notify_command(&cmd, phase, stage, context, unexpected);
 }
 
@@ -927,5 +940,25 @@ mod tests {
         }
         // Must return normally without touching the filesystem or panicking.
         fire_gate_notify(PhaseId::new(11), Stage::Ship, "ctx", false);
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
+    fn notify_hook_fallback_runs_when_env_unset() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("DEVFLOW_GATE_NOTIFY_CMD");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel");
+        let cmd = format!("touch {}", sentinel.display());
+        fire_gate_notify_with_fallback(
+            PhaseId::new(11),
+            Stage::Ship,
+            "ctx",
+            false,
+            Some(&cmd),
+        );
+        assert!(sentinel.exists());
     }
 }

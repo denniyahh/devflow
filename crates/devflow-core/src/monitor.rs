@@ -431,7 +431,8 @@ fn spawn_monitor_inner(
         // comment gives: `hermetic_command` does its `env_remove`s at
         // construction and `.envs(...)` runs after, so deliberate
         // configuration survives while inherited pollution does not.
-        let child = hermetic_command(&binary, workdir_path)
+        let mut child_cmd = hermetic_command(&binary, workdir_path);
+        child_cmd
             .args(pipe_owning_monitor_args(
                 project_root,
                 state,
@@ -441,7 +442,13 @@ fn spawn_monitor_inner(
             ))
             .arg(program)
             .args(args)
-            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+        if let Some(notify_cmd) = &state.gate_notify_cmd {
+            child_cmd.env("DEVFLOW_GATE_NOTIFY_CMD", notify_cmd);
+        }
+
+        let child = child_cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -551,7 +558,8 @@ fn spawn_monitor_inner(
     // deliberately sets one of these variables still wins. Deliberate
     // configuration survives; inherited pollution does not. That is what
     // keeps Codex's unsigned-commit override (`GIT_CONFIG_*`) working.
-    let child = hermetic_command("sh", workdir_path)
+    let mut child_cmd = hermetic_command("sh", workdir_path);
+    child_cmd
         .arg("-c")
         .arg(&script)
         .arg("sh")
@@ -559,7 +567,13 @@ fn spawn_monitor_inner(
         .args(args)
         // Adapter-scoped env (e.g. Codex's unsigned-commit override) rides
         // the whole monitor chain: sh → agent → its git children (13-06).
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    if let Some(notify_cmd) = &state.gate_notify_cmd {
+        child_cmd.env("DEVFLOW_GATE_NOTIFY_CMD", notify_cmd);
+    }
+
+    let child = child_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
