@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 49
 current_phase_name: Live Unattended Run — The Milestone's Instrument
-current_plan: 11
-status: Executing Phase 49 — awaiting operator live attempt
-stopped_at: 49-10 complete; 49-11 blocking-human live attempt awaits operator; no 49-11 work or commits
-last_updated: "2026-09-30T17:43:27.287Z"
-last_activity: 2026-09-30
-last_activity_desc: API-key probe and two-lane runbook recheck passed; 10 of 12 plans; operator checkpoint next
-state_head: 98b97de60d7bc851165655fdc7141487c3570dd2
+current_plan: 12
+status: executing
+stopped_at: Completed 49-11-PLAN.md (attempt 3 shipped, gate_rc=0); 49-12 evidence judgment next
+last_updated: "2026-10-08T00:19:09.310Z"
+last_activity: 2026-10-08
+last_activity_desc: 49-11 closed — live attempt 3 passed the attempt gate (verdict=shipped); 11 of 12 plans; 49-12 evidence judgment next
+state_head: 812e2bfaed565de0a152afd4aa0f43e07e7f3e4f
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 48
-  completed_plans: 46
+  completed_plans: 47
   percent: 50
 ---
 
@@ -191,10 +191,10 @@ change earns 2.0.
 
 Phase: 49 (Live Unattended Run — The Milestone's Instrument) — EXECUTING
 Plans: 12 plans in 6 waves (49-11 is the single live-attempt checkpoint); plan checker passed 2026-09-29
-Current Plan: 11
+Current Plan: 12
 Total Plans in Phase: 12
-Completed Plans: 10 of 12
-Status: Executing Phase 49 — awaiting operator live attempt
+Completed Plans: 11 of 12
+Status: Ready to execute
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -204,7 +204,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-30 — API-key probe and two-lane runbook recheck passed; 10 of 12 plans; operator checkpoint next
+Last activity: 2026-10-08 — 49-11 closed: live attempt 3 passed the attempt gate (verdict=shipped); 11 of 12 plans; 49-12 evidence judgment next
 
 Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
@@ -856,6 +856,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 48]: Driver fixtures supply PATH and configuration only through the spawned child Command.
 - [Phase 48]: close: re-verification after 48-20 (executed by codex) passed 7/7; the operator ruled 2026-09-23 that 999.139 on `start` (corrupt state + dead agent + live monitor, reproduced live) is outside criterion 2, being 999.136's agent-exit → `advance` window. 48-20 review: 0 critical / 4 warnings (test-coverage and duplication), not fixed at close.
 - [Phase 48]: close (PR #218): fixed 4 timing races that made the devflow-core suite flake in CI — lock coordination flock inherited by a forked child (bounded settle wait in `acquire`), `agent_running` counting a pid reaped mid-check as alive (NotFound now means gone), and two probe tests racing exec / the group kill. Operator chose fix-before-merge 2026-09-23. Evidence: 3/25 flaky full-suite runs before, 0/50 after; workspace 1451/0; fixed by hand (post-verification PR fixes, same shape as the phase's earlier review fixes), not via /gsd-quick.
+- [Phase 49]: 49-11 closed on attempt-gate verdict=shipped attempt=3 (not the reply); attempt 3 ran a fix-branch binary (084625c) not yet on feature/phase-49; why attempt 3 followed attempt 2's shipped verdict is unrecorded — open for 49-12
 
 ## Roadmap Evolution
 
@@ -951,11 +952,12 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 48 P02 | 10min | 3 tasks | 1 files |
 | Phase 48 P03 | 12m | 2 tasks | 3 files |
 | Phase 48 P20 | 16m | 2 tasks | 4 files |
+| Phase 49 P11 | 6h operator | 1 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-09-30T17:43:27.004Z
-**Stopped at:** 49-10 complete; 49-11 blocking-human live attempt awaits operator; no 49-11 work or commits
+**Last session:** 2026-10-08T00:19:09.013Z
+**Stopped at:** Completed 49-11-PLAN.md (attempt 3 shipped, gate_rc=0); 49-12 evidence judgment next
 **Resume file:** None
 
 ## Operator Next Steps

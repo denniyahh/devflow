@@ -1,5 +1,5 @@
 {
-  "stale_since_commit": "98b97de",
-  "summaries_landed": [".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-10-SUMMARY.md"],
-  "state_status_at_detection": "executing"
+  "stale_since_commit": "812e2bf",
+  "summaries_landed": [".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-11-SUMMARY.md"],
+  "state_status_at_detection": "Executing Phase 49 — awaiting operator live attempt"
 }
