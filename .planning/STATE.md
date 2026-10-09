@@ -2,21 +2,21 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: 49
-current_phase_name: Live Unattended Run — The Milestone's Instrument
-current_plan: 12
-status: verifying
-stopped_at: Completed 49-12-PLAN.md
-last_updated: "2026-10-09T01:17:11.989Z"
+current_phase: "49.1"
+current_phase_name: Declared Checkpoint Detection
+current_plan: Not started
+status: planning
+stopped_at: Phase 49 complete, ready to plan Phase 49.1
+last_updated: "2026-10-09T21:47:53.901Z"
 last_activity: 2026-10-09
-last_activity_desc: 49-12 closed — 49-LIVE-RUN.md written (VERIFY-01 met on attempt 3, DECN-03 Followed); 12 of 12 plans; phase verification next
-state_head: 557484109e833e3e67f940b13cc60f3ab5d8d268
+last_activity_desc: Phase 49 complete, transitioned to Phase 49.1
+state_head: 05a07021e67f66c3e8aaab2b1c9ab0afec18fe8a
 progress:
   total_phases: 7
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 48
   completed_plans: 48
-  percent: 43
+  percent: 57
 ---
 
 # DevFlow — Project State
@@ -189,12 +189,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 49 (Live Unattended Run — The Milestone's Instrument) — EXECUTING
-Plans: 12 plans in 6 waves (49-11 is the single live-attempt checkpoint); plan checker passed 2026-09-29
-Current Plan: 12
-Total Plans in Phase: 12
-Completed Plans: 12 of 12
-Status: Phase complete — ready for verification
+Phase: 49.1 — Declared Checkpoint Detection
+Plans: none yet — Phase 49.1 is inserted (CR-01 declared checkpoint detection); next step `/gsd-discuss-phase 49.1`
+Current Plan: Not started
+Total Plans in Phase: 0
+Completed Plans: 0 of 0
+Status: Ready to plan
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -204,9 +204,9 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-10-09 — 49-12 closed: 49-LIVE-RUN.md written (VERIFY-01 met on attempt 3, DECN-03 Followed), evidence committed sanitized, 999.147-999.150 filed; 12 of 12 plans; phase verification next
+Last activity: 2026-10-09 — Phase 49 complete, transitioned to Phase 49.1
 
-Progress: [████░░░░░░] 43% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
+Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted 2026-10-09. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
@@ -961,7 +961,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Session
 
 **Last session:** 2026-10-09T00:48:44.074Z
-**Stopped at:** Completed 49-12-PLAN.md
+**Stopped at:** Phase 49 complete, ready to plan Phase 49.1
 **Resume file:** None
 
 ## Operator Next Steps

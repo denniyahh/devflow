@@ -28,7 +28,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
-| 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
+| 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
@@ -283,7 +283,7 @@ execution pauses once for this, and the attempt is judged afterwards from record
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: 12/12 plans executed (6 waves); 49-11 is the single operator checkpoint for the live attempt
+**Plans**: 12/12 plans complete (6 waves); 49-11 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 

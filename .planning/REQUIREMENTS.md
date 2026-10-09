@@ -104,7 +104,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Live Verification (VERIFY)
 
-- [ ] **VERIFY-01**: A real `devflow start --mode auto` run is recorded end to end against a
+- [x] **VERIFY-01**: A real `devflow start --mode auto` run is recorded end to end against a
       configured base — fork point, `unattended_config_condition = Holds`, unattended progression,
       and the Ship merge target — with a negative control that an unconfigured repo still forks
       from `develop`.
@@ -201,7 +201,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | CHKPT-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
-| VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Pending |
+| VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Complete |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Pending |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
