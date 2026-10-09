@@ -429,6 +429,12 @@ pub(crate) fn run_gate_with_timeout(
     match Gates::poll_response(project_root, state.phase, stage, timeout_secs) {
         Some(response) => {
             state.gate_pending = false;
+            // WR-10 (49-REVIEW.md): the operator may have edited the run's
+            // notify command on disk while this gate waited; keep that edit
+            // rather than overwriting it with the copy loaded before the wait.
+            if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
+                state.gate_notify_cmd = on_disk.gate_notify_cmd;
+            }
             workflow::save_state(state)?;
             Gates::ack(project_root, state.phase, stage)?;
             let action = GateAction::from_response(&response);
@@ -1796,6 +1802,61 @@ mod tests {
         assert_eq!(
             reloaded_b.consecutive_failures, 2,
             "an untouched sibling phase's counter must be unaffected"
+        );
+    }
+
+    /// WR-10 (49-REVIEW.md): an edit to the run's notify command made on disk
+    /// while a gate waits survives the gate's resolution save.
+    #[test]
+    fn gate_resolution_keeps_a_notify_cmd_edited_during_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(23);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let root_owned = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let mut state = workflow::load_state(&root_owned, phase).unwrap();
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None).unwrap();
+            state.gate_notify_cmd
+        });
+        let gate_path = Gates::gate_path(root, phase, Stage::Code);
+        for _ in 0..500 {
+            if gate_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gate_path.exists(), "the gate must be written");
+
+        let mut on_disk = workflow::load_state(root, phase).unwrap();
+        on_disk.gate_notify_cmd = Some(": edited".to_string());
+        workflow::save_state(&on_disk).unwrap();
+        Gates::respond(
+            root,
+            phase,
+            Stage::Code,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+
+        let in_memory = handle.join().unwrap();
+        assert_eq!(in_memory.as_deref(), Some(": edited"));
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .gate_notify_cmd
+                .as_deref(),
+            Some(": edited"),
+            "the resolution save must not overwrite the on-disk edit"
         );
     }
 }

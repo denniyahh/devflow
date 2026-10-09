@@ -426,12 +426,13 @@ pub struct State {
     /// the process that recorded it has exited.
     #[serde(default)]
     pub checkpoint_approval: CheckpointApproval,
-    /// Operator-configured gate notify hook command, captured from
-    /// `DEVFLOW_GATE_NOTIFY_CMD` by `devflow start` (never by [`State::new`],
-    /// so constructing a state never reads the environment) and persisted
-    /// across monitor spawns and rate-limit resumes. A set environment
-    /// variable still takes precedence; see
-    /// [`crate::gates::resolve_gate_notify_cmd`].
+    /// Operator-configured gate notify hook command: the one place a run's
+    /// command lives. `devflow start`, `resume` and `advance` apply
+    /// `DEVFLOW_GATE_NOTIFY_CMD` to it (unset keeps, empty clears, set
+    /// replaces; [`crate::gates::persisted_notify_cmd_after_env`]); never
+    /// [`State::new`], so constructing a state never reads the environment.
+    /// The detached monitor chain does not carry the variable and reads this
+    /// field at each gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_notify_cmd: Option<String>,
 }
