@@ -400,7 +400,9 @@ pub fn fire_gate_notify_with_fallback(
 ) {
     let cmd = match std::env::var("DEVFLOW_GATE_NOTIFY_CMD") {
         Ok(cmd) if !cmd.is_empty() => Some(cmd),
-        _ => fallback_cmd.filter(|s| !s.is_empty()).map(ToString::to_string),
+        _ => fallback_cmd
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string),
     };
     let Some(cmd) = cmd else { return };
     run_notify_command(&cmd, phase, stage, context, unexpected);
@@ -952,13 +954,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel");
         let cmd = format!("touch {}", sentinel.display());
-        fire_gate_notify_with_fallback(
-            PhaseId::new(11),
-            Stage::Ship,
-            "ctx",
-            false,
-            Some(&cmd),
-        );
+        fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Ship, "ctx", false, Some(&cmd));
         assert!(sentinel.exists());
     }
 }
