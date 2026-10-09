@@ -233,6 +233,23 @@ fn gsd_command_for(stage: Stage, phase: PhaseId) -> String {
     stage.gsd_command().replace("{N}", &phase.to_string())
 }
 
+/// The Ship stage's pull-request base instruction, shared by both renderers.
+///
+/// The PR targets the configured trunk ([`crate::config::MAIN`]), not the
+/// base branch DevFlow merges the phase into locally. The instruction is
+/// explicit because GSD's own `git.base_branch` setting alone did not steer the
+/// PR: in Phase 49 attempt 2 it was set to `main` and the PR still targeted the
+/// local merge base. No branch name other than the trunk appears here, so no
+/// project is told about a branch it does not have (49-REVIEW.md WR-03).
+fn ship_pr_base_instruction() -> String {
+    format!(
+        "When creating the pull request, target base branch `{main}` (the \
+        repository trunk), not the base branch DevFlow merges this phase into \
+        locally.",
+        main = crate::config::MAIN
+    )
+}
+
 /// The Ship stage's dedicated prompt.
 ///
 /// Headless-safety rationale: `/gsd-ship`'s own `optional_review` step is an
@@ -247,6 +264,7 @@ fn gsd_command_for(stage: Stage, phase: PhaseId) -> String {
 /// ReviewFailed contract that `handle_ship_failure` matches (trimmed,
 /// case-folded) to loop back to Code with `AuditFix`.
 fn ship_stage_prompt(phase: PhaseId, review_angles: &[String]) -> String {
+    let pr_base = ship_pr_base_instruction();
     let code_review = format!("/gsd-code-review {phase}");
     let ship = format!("/gsd-ship {phase}");
     let review_angles = review_angles
@@ -274,9 +292,7 @@ fn ship_stage_prompt(phase: PhaseId, review_angles: &[String]) -> String {
         DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"review: <short summary of the Critical findings>\"}}\n\
         \n\
         - If `REVIEW.md` has NO Critical-severity findings: run `{ship}`. \
-        When creating the pull request, target base branch `main` (the \
-        repository trunk), while DevFlow merges into integration locally. \
-        Report the outcome via the normal completion protocol below.\n\
+        {pr_base} Report the outcome via the normal completion protocol below.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -543,6 +559,7 @@ fn workflow_validate_prompt(phase: PhaseId, workflow_root: &str) -> String {
 }
 
 fn workflow_ship_prompt(phase: PhaseId, review_angles: &[String], workflow_root: &str) -> String {
+    let pr_base = ship_pr_base_instruction();
     let review_angles = review_angles
         .iter()
         .map(|angle| format!("- {angle}"))
@@ -569,8 +586,7 @@ fn workflow_ship_prompt(phase: PhaseId, review_angles: &[String], workflow_root:
         Critical findings>\"}}\n\
         \n\
         - If REVIEW.md has NO Critical-severity findings: read and follow the GSD workflow file \
-        at {workflow_root}/ship.md for phase {phase}. When creating the pull request, target \
-        base branch `main` (the repository trunk), while DevFlow merges into integration locally. \
+        at {workflow_root}/ship.md for phase {phase}. {pr_base} \
         Report the outcome via the normal completion protocol below.\n\
         \n\
         {COMPLETION_PROTOCOL}"
@@ -759,6 +775,28 @@ mod tests {
             prompt.contains("target base branch `main`"),
             "Ship prompt must explicitly instruct targeting base branch main for the PR"
         );
+    }
+
+    /// WR-03 (49-REVIEW.md): both Ship renderers name the configured trunk
+    /// and never a fixture branch name such as the phase-49 scratch repo's
+    /// `integration`.
+    #[test]
+    fn ship_prompts_name_the_configured_trunk_and_no_fixture_branch() {
+        let intent = StageIntent::for_stage(Stage::Ship, PhaseId::new(13));
+        let expected = format!("target base branch `{}`", crate::config::MAIN);
+        for prompt in [
+            render_claude_style(&intent),
+            render_workflow_style(&intent, "/gsd/workflows"),
+        ] {
+            assert!(
+                prompt.contains(&expected),
+                "Ship prompt must target the configured trunk: {prompt}"
+            );
+            assert!(
+                !prompt.contains("integration"),
+                "Ship prompt must not name a fixture branch: {prompt}"
+            );
+        }
     }
 
     #[test]
