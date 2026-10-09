@@ -780,6 +780,39 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.151: `probe_rejects_a_setpgid_pipe_holder_before_parent_exit` Fails Intermittently in the Full Suite (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 regression gate. **Not reproduced on demand.**
+
+**Defect:** `agents::opencode::tests::probe_rejects_a_setpgid_pipe_holder_before_parent_exit` failed once in five
+full-workspace `cargo test` runs on `feature/phase-49` with the panic "the attempted group-escape process must be
+reaped". It passed 8/8 run alone and 3/3 in the full `devflow-core` lib suite. Phase 49 does not touch `opencode.rs`, so
+this is pre-existing, and load-dependent timing is the likely trigger (inferred, not checked). Five runs give a rough
+failure rate only.
+
+**Fix shape (not decided):** reproduce under load (for example `cargo test` with `--test-threads` above the core
+count, repeated), then make the reap wait on a condition instead of on timing.
+
+### Phase 999.152: Phase 49 Live-Run Tooling Robustness Findings, to Fix Before the Tools Are Reused (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 deep code review (`49-REVIEW.md` WR-04, WR-05, WR-06, IN-03, IN-04, IN-05).
+
+**Defect:** six robustness gaps in `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/`:
+- WR-04: `sanitize-evidence.py` passes AWS keys, Slack webhooks, PEM private keys and JWTs.
+- WR-05: `launch-attempt.sh start` wedges the attempt and orphans the watcher if the run unit fails to launch.
+- WR-06: `surv-watch.py analyze` counts dead writers' orphaned temp files as interleaving.
+- IN-03: a kill between `mv` and the ledger append in `snapshot-hook.sh` wedges every later snapshot.
+- IN-04: `launch-attempt.sh prepare` pins `target/debug/devflow` regardless of the configured target dir.
+- IN-05: `collect-attempt.sh` publishes `verdict.json` before the collection directory.
+
+**Phase 49's evidence is not affected (checked 2026-10-09):** the 249 committed evidence files match none of the
+credential shapes WR-04 misses (`rg` exit 1; a planted four-value control matched 4/4) and `gitleaks dir` reports no
+leaks. WR-06 can only inflate the interleaving count, and all three attempts report `interleaved_windows=0`. All three
+attempts have `collected/DONE` (IN-05). The run units launched in every attempt (WR-05).
+
+**Fix shape (not decided):** per-finding fixes are in `49-REVIEW.md`. Fix before the tools run again, for example in a
+Phase 49.1 live run.
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
