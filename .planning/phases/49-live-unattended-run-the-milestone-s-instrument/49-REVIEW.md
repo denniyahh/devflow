@@ -1,123 +1,180 @@
 ---
 phase: 49-live-unattended-run-the-milestone-s-instrument
-reviewed: 2026-10-09T19:10:00Z
+reviewed: 2026-10-09T18:25:54Z
 depth: deep
-files_reviewed: 5
+files_reviewed: 8
 files_reviewed_list:
-  - crates/devflow-core/src/monitor.rs
-  - crates/devflow-core/src/canary.rs
   - crates/devflow-core/src/gates.rs
-  - crates/devflow-core/src/prompt.rs
+  - crates/devflow-core/src/state.rs
+  - crates/devflow-cli/src/commands.rs
+  - crates/devflow-cli/src/pipeline_launch.rs
+  - crates/devflow-cli/src/pipeline_gate.rs
   - crates/devflow-cli/tests/gate_notify_persist_e2e.rs
+  - OPERATIONS.md
+  - docs/guides/configuration.md
 findings:
-  critical: 1
-  warning: 1
-  info: 1
-  total: 3
+  critical: 0
+  warning: 3
+  info: 2
+  total: 5
 status: issues_found
 ---
 
-# Phase 49: Code Review Report (incremental re-review of 9e78c83)
+# Phase 49: Code Review Report (final incremental re-review of b3f7fdf)
 
-**Reviewed:** 2026-10-09T19:10:00Z
+**Reviewed:** 2026-10-09T18:25:54Z
 **Depth:** deep
-**Files Reviewed:** 5
+**Files Reviewed:** 8
 **Status:** issues_found
 
 ## Summary
 
-Scope: `git diff 798874f HEAD` over the five listed files. The only code commit in that range is 9e78c83. Call chains were traced into `commands.rs::start` (the only writer of `gate_notify_cmd`), `pipeline_launch.rs::resume` and `run_monitor`, `pipeline_gate.rs::run_gate_with_timeout`, `staleness.rs`, and `git.rs::hermetic_command`.
+Scope: `git diff 23c0449 HEAD` over the eight listed files. The only code commit in that range is b3f7fdf. I traced the call chains into the following:
 
-New IDs continue from the prior review: CR-03, WR-10 and IN-09. No prior ID is reused.
+- `run_monitor` → `advance_for_stage` → `advance_with`, the chain's in-process advance.
+- `refuse_resume_over_a_live_run` and the phase lock that `resume` takes.
+- `finish_workflow_with_gate_timeout`'s retry loop.
+- `staleness.rs::enforce_build_staleness`, the second gate-fire site.
+- `workflow::load_state` and `save_state`.
+- The rate-limit cron command in `ship.rs`.
 
-**Main finding:** the commit makes the persisted `gate_notify_cmd` the only source for every gate in the detached chain. That value is written only by `devflow start`. Setting `DEVFLOW_GATE_NOTIFY_CMD` at `devflow resume` or `devflow advance` is now silently ignored by the chain, and Auto-mode gates fire in the chain. This applies to a run started without the variable and to a run whose state file predates the field. Before 9e78c83, and before Phase 49, the chain inherited the variable. That is CR-03.
+The design is taken as decided. The state file is the one source of the command. `start`, `resume` and `advance` apply the variable to it. The chain never carries the variable. Each gate re-reads the field before its resolution save.
+
+New IDs continue from the prior highest: WR-11 to WR-13, IN-10 and IN-11. No ID is reused. There are no new Critical findings.
 
 **Do the fixes close their findings?**
 
 | Prior finding | Verdict | Basis |
 |---|---|---|
-| WR-07 chain freezes the command | **Closed as specified, with two new defects** | Both monitor spawns (monitor.rs:459, :582), the pipe-owning agent (:993) and the canary (canary.rs:374) now remove the variable. Grep shows only two production fire sites, `pipeline_gate.rs:400` and `staleness.rs:467`. Both pass `state.gate_notify_cmd`, so no gate in the chain lost a command that the state holds. The fix exposes CR-03: the chain no longer sees a command that is only in the env. The fix's documented escape hatch (edit the state file while the run is in flight) is reverted by a parked gate's save (WR-10). The e2e the prior review asked for (edit the state between two chain gates) was not added. |
-| WR-08 wiring points untested | **Closed by narrowing the claim** (the fix option the prior review allowed) | Mutation run on a `git archive` snapshot of HEAD, `cargo test -p devflow --test gate_notify_persist_e2e`. Baseline: 7/7 pass. Removing the legacy strip (monitor.rs:582) fails `agent_via_legacy_monitor_never_receives_the_notify_variable`. Removing the canary strip (canary.rs:374) fails `agent_via_default_launch_canary_never_receives_the_notify_variable`. Both controls discriminate. Removing the pipe `__monitor` strip (monitor.rs:459) fails **nothing**, and neither does removing the pipe agent strip (:993). The header now names both as uncovered, so the claim is accurate. Residual risk: the default production arm's WR-07 fix is the unpinned site, so reverting it re-freezes the chain with every test green. The prior review's cheap fix still applies: assert `(GATE_NOTIFY_CMD_ENV, None)` in `get_envs()` of the built `__monitor` `Command`. |
-| WR-09 test that cannot fail | Closed | It was replaced by `advance_gate_prefers_a_set_variable_over_the_persisted_command`. That test asserts the override ran and the persisted command did not, so reversing precedence or running both fails it. The removed "nothing configured" case is still covered by `resolve_gate_notify_cmd(None, None)`. |
-| IN-07 "configured trunk" wording | Closed | No "configured trunk" text is left in prompt.rs. The doc and the test name now say "the trunk, `config::MAIN`". |
-| IN-08 non-UTF-8 run lossily | Closed | `to_str()` returning `None` now falls through to the fallback. At `start`, the fallback is `None`, so nothing mangled is persisted. A unit case was added (gates.rs:975-980). The core `gates::` and `monitor::tests::strip` tests pass (28). |
+| CR-03: the variable set at `resume`/`advance` never reaches the chain | **Closed in code. One arm has no test (WR-13).** | `resume` (pipeline_launch.rs:1431) and `advance_with` (:1658) apply `apply_notify_env` straight after `load_state`, under the lock. `resume` saves at :1511, or at :1465 on a handoff, before `launch_stage` spawns anything. `start` (commands.rs:346) still starts from a fresh state, so its behaviour is unchanged. Each chain `advance` runs in a `__monitor` or `sh` process, and 9e78c83 strips the variable from both, so the chain keeps the persisted value. Gaps: the unset-keeps arm of `resume` is pinned by no test (WR-13), and the docs' route for a *running* phase does not work (WR-11). |
+| WR-10: an edit made while a gate is parked is reverted when the gate is answered | **Closed for the wait window. Not closed for the other windows (WR-12).** | pipeline_gate.rs:435-437 re-reads the field before the resolution save. Mutation control: deleting that assignment fails `pipeline_gate::tests::gate_resolution_keeps_a_notify_cmd_edited_during_the_wait` at :1852. The test edits the file only after the gate file exists. The entry save (:370) comes before `write_gate` (:371), so the test cannot race the entry save. |
+| IN-09: the e2e leaks the detached chain when it fails | **Closed** | `MarkedReaper` is created right after the `approve` assertion, not before it as the prior fix said. That is equivalent, because no detached chain exists until `approve` succeeds; before that, the foreground `start` is reaped by `ReapOnDrop`. `resume_with` creates its reaper before it spawns. After all the runs below, including two failing mutant runs, a scan of every readable `/proc/*/environ` found no process carrying `DEVFLOW_NOTIFY_E2E_MARKER` and no `sleep` processes. |
 
-**What the checks do not establish:**
+**Test runs.** All runs used a `git archive HEAD` snapshot in scratch (`diff -rq crates` against the worktree came back empty) with `DEVFLOW_GATE_NOTIFY_CMD` unset.
 
-- The mutation runs prove only which e2e tests notice a missing strip. They do not exercise a gate firing inside a real chain. No live chain run was done.
-- CR-03 and WR-10 are established by reading the code, not by running them. The basis:
-  - `gate_notify_cmd` has exactly one writer (`rg` over `crates/`: commands.rs:346).
-  - `resume` (pipeline_launch.rs:1412) loads state and never touches the field.
-  - `run_gate_with_timeout` calls `save_state(state)` with the in-memory struct after the poll returns (pipeline_gate.rs:429-432).
-- After the runs, no `sleep 60` or snapshot-target processes were left (`pgrep`).
+- Baseline:
+  - `cargo test -p devflow --test gate_notify_persist_e2e`: 9 passed.
+  - The WR-10 unit test: 1 passed.
+  - `persisted_notify_cmd_follows_the_environment_rule`: 1 passed.
+- Mutants:
+  - Resume mutant (pipeline_launch.rs:1431 → `apply_notify_env(None)`): **all 9 e2e and 19 resume-filtered `--bin devflow` tests still pass**.
+  - Control, the same mutation at :1658 (advance): fails `advance_gate_runs_the_persisted_command_when_the_variable_is_unset` at e2e:303.
+  - Control, the WR-10 assignment removed: fails the WR-10 unit test.
 
-## Critical Issues
+**What these checks do not establish:**
 
-### CR-03: A notify command set at `resume`/`advance` never reaches the detached chain, so unattended gates go silent for runs whose state holds no command
-
-**File:** `crates/devflow-core/src/monitor.rs:284-294`, `:459`, `:582`; `crates/devflow-cli/src/commands.rs:346-349` (sole writer); `crates/devflow-cli/src/pipeline_launch.rs:1412` (`resume`, never writes the field)
-
-**Issue:** After 9e78c83, each chain process resolves the command as `resolve_gate_notify_cmd(None, state.gate_notify_cmd)`. That field is written only by `devflow start`. Since the chain is where Auto-mode gates fire, the chain fires nothing whenever the state holds no command, whatever the environment of the command that launched the chain. Concrete paths:
-
-1. **Run started without the variable, exported later.** An operator exports the variable and runs `devflow resume`. The README's route after a gate timeout is "it just needs a `devflow resume`". The resume's own foreground gates fire. Every later chain gate is silent.
-2. **Run whose state predates the field.** The field is `#[serde(default)]`, so a run started by any binary before af38901 loads it as `None`. The staleness gate itself tells the operator to "rebuild and reinstall the binary before resuming". After that rebuild-and-resume, the chain is silent even though the variable is exported in every shell.
-3. **`devflow advance` run by hand with the variable set.** The foreground gate fires the env command, and the chain this invocation spawns does not. One command now produces two different hook behaviours.
-
-At 798874f and before Phase 49, `hermetic_command` (git.rs:87-94) did not scrub the variable, so the chain inherited it in all three cases. This is a regression of the never-silent guarantee (WR-11) that the hook exists for. It also contradicts OPERATIONS.md:92 ("Set `DEVFLOW_GATE_NOTIFY_CMD` ...; it runs on every gate"), docs/guides/configuration.md:35, and state.rs:432-434 ("A set environment variable still takes precedence"), none of which changed.
-
-The commit also changes how an empty variable behaves. `DEVFLOW_GATE_NOTIFY_CMD=` at `resume` no longer disables the chain's hook.
-
-**Fix:** Keep the state as the chain's single source, but have every foreground entry that launches a chain fold its own env into the state, with the same three-state rule `start` uses. Unset keeps the persisted value, set replaces it, and empty clears it:
-
-```rust
-// shared helper, called by start (replacing commands.rs:346-349), resume and
-// advance before their first save_state / spawn_monitor:
-pub fn fold_notify_env_into(state: &mut State) {
-    let env = std::env::var_os(GATE_NOTIFY_CMD_ENV);
-    if env.is_some() {
-        // set (incl. empty = disable) overrides; non-UTF-8 counts as unset per IN-08
-        if let Some(Some(v)) = env.as_deref().map(std::ffi::OsStr::to_str) {
-            state.gate_notify_cmd = (!v.is_empty()).then(|| v.to_owned());
-        }
-    }
-}
-```
-
-Add an e2e per entry point. It creates a state with `gate_notify_cmd: None`, runs `resume` with `DEVFLOW_GATE_NOTIFY_CMD=touch <sentinel>`, and asserts the persisted field afterwards. As a control, the same run with the variable unset must leave the field `None`. Update OPERATIONS.md, configuration.md and the `State::gate_notify_cmd` doc to say that `start`/`resume`/`advance` capture the variable and that the chain does not read it.
+- No live chain gate was fired. WR-11 and WR-12 come from reading the code, at the lines cited.
+- The leak scan was done right after the runs and is a single sample. Not finding a leaked process is weak evidence that the reaper works. It does not show that the reaper's own race (it lists `/proc` and then kills) cannot leak.
 
 ## Warnings
 
-### WR-10: Editing `gate_notify_cmd` while a gate is parked is silently reverted when the gate is answered
+### WR-11: OPERATIONS.md says `devflow resume` changes a running phase's hook, but `resume` refuses every live run
 
-**File:** `crates/devflow-core/src/monitor.rs:284-290` (the claim); `crates/devflow-cli/src/pipeline_gate.rs:368-370`, `:429-432`
+**File:** `OPERATIONS.md:108-110`; `crates/devflow-cli/src/pipeline_launch.rs:1418-1427`; `crates/devflow-cli/src/commands.rs:2470-2491`
 
-**Issue:** The new doc comment says that editing `gate_notify_cmd` in the state file "changes or disables the hook for a run in flight". This is the replacement for the env escape hatch that WR-07 removed, and there is no verb for it. However, `run_gate_with_timeout` holds a `&mut State` loaded before the gate fired. It saves the gate, blocks in `Gates::poll_response` for up to `DEVFLOW_GATE_TIMEOUT_SECS` (3 days by default), and then calls `workflow::save_state(state)` with that whole in-memory struct (:431-432). The operator is most likely to edit the field right after a hook fired, because they just saw it misbehave or leak. That is exactly while the process is parked. An edit to `""` or to a new command is overwritten when the operator answers the gate, and every later chain gate fires the old command again. Nothing reports that the edit was lost.
+**Issue:** The new text reads: "To change the hook of a running phase, export the new value and run `devflow resume`". For a running phase, `resume` always fails:
 
-**Fix:** Before the post-poll `save_state`, re-read `gate_notify_cmd` from disk and carry it into the in-memory state:
+- **Parked at a gate.** The parked process holds the per-phase lock for the whole wait (`advance_with` keeps `_lock` across `run_gate_with_timeout`). `resume` uses the non-blocking `lock::acquire`, so it gets `Contended` and fails with "another devflow process (pid N) is already running".
+- **Agent running.** `refuse_resume_over_a_live_run` refuses whenever the recorded monitor or agent pid is alive, and prints "refusing to resume; nothing was written".
 
-```rust
-Some(response) => {
-    if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
-        state.gate_notify_cmd = on_disk.gate_notify_cmd;
-    }
-    state.gate_pending = false;
-    workflow::save_state(state)?;
+The `resume` route works only once nothing is alive: after a gate timeout, a stop, or a rate-limit pause. The refusal is loud, so nothing is lost silently. But the documented primary route fails every time it is used as described. The only advice the refusal offers for getting past it, `devflow stop`, ends the run. For a live run, the only working route is the state-file edit, and WR-12 limits that too.
+
+**Fix:** Scope the sentence to what the code does:
+
+```markdown
+To change the hook of a phase with no live process (after a gate timeout,
+`devflow stop`, or a rate-limit pause), export the new value (or set it
+empty) and run `devflow resume`. While a run is live, `resume` refuses;
+edit `gate_notify_cmd` in the state file instead — an edit made while a gate
+is waiting is kept.
 ```
 
-Better: provide a `devflow gate notify --phase N <cmd|--off>` verb that edits under the phase lock, and document it instead of hand-editing. Pin the fix with a test that parks a gate, rewrites the field on disk, answers the gate, and asserts the field survives. As a control, the same run without the rewrite keeps the original value.
+### WR-12: The gate's entry save still reverts an on-disk edit, and the gate fires the copy loaded when `advance` started
+
+**File:** `crates/devflow-cli/src/pipeline_gate.rs:368-370` (entry save), `:400-406` (fire), `:233-266` (the retry loop in `finish_workflow_with_gate_timeout`); `crates/devflow-cli/src/pipeline_launch.rs:1654` (load), `:1725` (intermediate save); claims in `crates/devflow-core/src/state.rs:434-435` and `crates/devflow-core/src/monitor.rs:285-288`
+
+**Issue:** b3f7fdf re-reads the field only at the resolution save. Every other `save_state(state)` in a chain process writes the copy that `advance_with` loaded at :1654. That includes the gate's own entry save at :370 (`state.gate_pending = true; save_state(state)`). The notify then fires from that same copy (:404).
+
+An edit made between the process's `load_state` and the entry save is therefore overwritten, and the gate fires the old command. The resolution re-read then finds the overwritten value and keeps it. Nothing reports that the edit was lost.
+
+In the common Code-gate path, the window is short: `evaluate_agent_result`, the session-id save at :1725, then the gate. The longest window is the Ship finalization retry:
+
+1. The operator answers the "[finalization failed]" gate.
+2. `run_checkout_hooks` re-runs Merge, VersionBump, ChangelogAppend and BranchCleanup. This includes waiting up to `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` (120s) for the checkout lock.
+3. The next retry gate's entry save clobbers any edit made during step 2.
+
+Two docs overstate the behaviour:
+
+- monitor.rs:285-288 says each chain gate "resolves the command from the run's state file at the moment it fires".
+- state.rs:434-435 says the chain "reads this field at each gate".
+
+Both are false for edits made in this window. OPERATIONS.md:110 promises only "an edit made while a gate is waiting is kept", so the user-facing doc is accurate. The fix covers one instance and leaves the class open.
+
+**Fix:** Make the file authoritative at gate entry too. A plain entry re-read would discard the variable that a foreground `advance` applied in memory but has not saved yet. So persist the applied value first, then re-read the raw field at entry exactly as at resolution:
+
+```rust
+// pipeline_launch.rs, advance_with — after the stage-binding match (so a
+// mismatch still writes nothing), persist what apply_notify_env produced:
+workflow::save_state(&state)?;
+
+// pipeline_gate.rs, run_gate_with_timeout — before the entry save and the fire:
+if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
+    state.gate_notify_cmd = on_disk.gate_notify_cmd;
+}
+state.gate_pending = true;
+workflow::save_state(state)?;
+```
+
+Extend the WR-10 test with a second arm. Seed the file with `A` and keep `A` in memory, write `B` to disk before calling `run_gate_with_timeout`, and assert that the fired command (sentinel) and the saved field are both `B`. Also correct the monitor.rs and state.rs doc comments to say "the value on disk when the gate is entered and when it is resolved".
+
+### WR-13: Nothing fails if `resume` clears the saved command when the variable is unset, and that is the rate-limit cron path
+
+**File:** `crates/devflow-cli/src/pipeline_launch.rs:1431`; `crates/devflow-cli/tests/gate_notify_persist_e2e.rs:367-423`
+
+**Issue:** The two new `resume_*` e2e tests cover set-replaces and empty-clears. The `resume_with` helper cannot express unset-keeps. It polls until the saved value differs from `"old"`, and panics if `resume` exits first. So the arm most often taken in production has no e2e test. That arm is the Hermes cron `cd {project} && devflow resume --phase N` (ship.rs:299), run after a rate limit from a scheduler environment that usually lacks the variable.
+
+Mutation-verified: replacing :1431 with `apply_notify_env(None)` (drop the persisted value) leaves all 9 e2e tests and all 19 `resume`-filtered `--bin devflow` unit tests passing. Under that mutant, every rate-limit resume silently disables the chain's notifications. That is CR-03's original failure, reached through a different door. The same mutation at the `advance` site (:1658) is caught by `advance_gate_runs_the_persisted_command_when_the_variable_is_unset`. The gap is therefore specific to `resume`. The unit test of `persisted_notify_cmd_after_env` does not cover it, because the mutation is at the call site. The prior CR-03 fix text asked for this exact control ("the same run with the variable unset must leave the field").
+
+**Fix:** Add an unset arm that waits for `resume` to finish its relaunch rather than for a change:
+
+```rust
+#[test]
+fn resume_without_the_variable_keeps_the_persisted_command() {
+    // same fixture as resume_with, NotifyEnv::Unset; wait until the
+    // resume child exits successfully (legacy launch returns after
+    // spawning the monitor), then:
+    assert_eq!(persisted_cmd(root, phase).as_deref(), Some("old"));
+}
+```
 
 ## Info
 
-### IN-09: The new chain-environment e2e leaks the detached chain when it fails
+### IN-10: The WR-10 re-read silently discards an edit that left the state file unparseable
 
-**File:** `crates/devflow-cli/tests/gate_notify_persist_e2e.rs:384-420`
+**File:** `crates/devflow-cli/src/pipeline_gate.rs:435-438`
 
-**Issue:** `agent_environment_after_define` kills the marked processes only on its success path. If `assert!(approve.status.success())` (:391) or the 20-second wait assertion (:405-408) panics, the detached monitor, the fake agent and its `sleep 60` survive the test. `ReapOnDrop` reaps only the foreground `start`. The leak is bounded (sleep 60, gate timeout 30s), but it appears exactly when the test is diagnosing a regression. A later run's `/proc` scan with a different marker is unaffected, so this does not cause cross-test interference.
+**Issue:** `if let Ok(on_disk) = workflow::load_state(...)` falls back to the in-memory copy without saying so, and the next line writes that copy over the file. The only documented route is a hand edit of JSON. A typo is therefore the most likely way for the re-read to fail, and when it does, the operator's change and the file are both silently replaced with the pre-wait value. `load_state` returns `Err` on any serde failure (workflow.rs:266).
 
-**Fix:** Move the kill loop into a guard whose `Drop` runs `devflow stop` and kills `marked_processes(&marker)`. Create the guard before the approve call.
+**Fix:** On `Err`, log a warning and emit an event that names the reason, so the operator knows the edit was not applied:
+
+```rust
+match workflow::load_state(project_root, state.phase) {
+    Ok(on_disk) => state.gate_notify_cmd = on_disk.gate_notify_cmd,
+    Err(err) => warn!(phase = %state.phase, "state re-read failed ({err}); \
+        an on-disk gate_notify_cmd edit was not applied and the file is being rewritten"),
+}
+```
+
+### IN-11: The docs say a rate-limit resume ignores the shell environment, but that resume applies its scheduler's environment
+
+**File:** `OPERATIONS.md:104-106`; `crates/devflow-core/src/ship.rs:299`
+
+**Issue:** "gates fired by the detached monitor, including after a rate-limit resume, use it without your shell's environment." The rate-limit resume is a `devflow resume` run by the Hermes cron. Under the decided rule, that resume applies whatever `DEVFLOW_GATE_NOTIFY_CMD` the scheduler's environment carries. A Hermes daemon started from a shell that exports a different hook replaces the run's saved command, and one that has the variable set to empty clears it. The design is correct; the sentence implies that no environment takes part.
+
+**Fix:** Append to that paragraph: "The rate-limit auto-resume is itself a `devflow resume`, so the variable in the scheduler's environment, if set, applies the same way."
 
 ---
 
-_Reviewed: 2026-10-09T19:10:00Z_
+_Reviewed: 2026-10-09T18:25:54Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_
