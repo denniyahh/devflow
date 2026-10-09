@@ -1,7 +1,7 @@
 ---
 phase: 49-live-unattended-run-the-milestone-s-instrument
-verified: 2026-10-09T01:30:00Z
-status: human_needed
+verified: 2026-10-09T18:35:21Z
+status: passed
 score: 5/5 must-haves verified
 covered_files:
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-01-PLAN.md"
@@ -28,20 +28,27 @@ covered_files:
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-11-SUMMARY.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-12-PLAN.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-12-SUMMARY.md"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-COVERAGE.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-LIVE-RUN.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-REVIEW-DISPOSITION.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-REVIEW.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-RUNBOOK.md"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-SECURITY.md"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-UAT.md"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-VALIDATION.md"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/attempt.json"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/collected/devflow/events.jsonl"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/collected/devflow/history/phase-01/1791411642266144275-0-stdout"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/collected/devflow/history/phase-01/1791412108556407377-0-stdout"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/collected/git.txt"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/collected/pr.json"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/gates/001-define/devflow/state-01.json"
-  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/gates/003-ship/git.txt"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/gates/002-code/devflow/state-01.json"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/gates/003-ship/devflow/state-01.json"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/identity.txt"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/ledger.jsonl"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/negctl/bin_sha256"
-  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/negctl/events.jsonl"
+  - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/negctl/gates/001-define/devflow/state-01.json"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/negctl/start.stdout"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/prelaunch/fork-base.txt"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-evidence/attempt-3/start.stdout"
@@ -55,30 +62,32 @@ covered_files:
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/sanitize-evidence.py"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/snapshot-hook.sh"
   - ".planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/surv-watch.py"
+  - "crates/devflow-cli/src/commands.rs"
   - "crates/devflow-cli/src/pipeline_gate.rs"
+  - "crates/devflow-cli/src/pipeline_launch.rs"
   - "crates/devflow-cli/src/staleness.rs"
+  - "crates/devflow-cli/tests/gate_notify_persist_e2e.rs"
   - "crates/devflow-core/src/agent_result.rs"
+  - "crates/devflow-core/src/canary.rs"
   - "crates/devflow-core/src/gates.rs"
   - "crates/devflow-core/src/monitor.rs"
   - "crates/devflow-core/src/prompt.rs"
   - "crates/devflow-core/src/state.rs"
   - "scripts/scratch-dogfood-repo.sh"
-covered_digest: "v3:sha256:68ac3ae1080cc1746a43bed4e7d52307fb621e0f098f808134366deaaebd22fe"
+covered_digest: "v3:sha256:7a2820098f10f6a58030f0fb07b77e9d55946b2b3c5255369b178a150e821bd4"
 behavior_unverified: 0
 overrides_applied: 0
-human_verification:
-  - test: "Decide WR-03 before the post-completion merge-back: the Ship prompt (prompt.rs ship_stage_prompt and workflow_ship_prompt, from 084625c, now on feature/phase-49 via bbfe6df) tells EVERY project's agent to target PR base `main` 'while DevFlow merges into integration locally'. `integration` is this phase's scratch-repo branch name."
-    expected: "Operator chooses: fix (interpolate config::MAIN and the resolved base) before merge-back to workspace/develop, or explicitly defer with a backlog entry. 49-REVIEW-DISPOSITION.md currently records WR-03 as `open`, which is neither."
-    why_human: "Scope/release decision. It also limits criterion 2: attempt 3's PR-to-main observation measures the agent obeying a hard-coded literal, not DevFlow resolving a PR base."
-  - test: "Correct or annotate 49-LIVE-RUN.md lines 15-16, 240 and 249-251, which state the fix commits e3f9ddd/084625c are NOT on feature/phase-49."
-    expected: "Since bbfe6df (2026-10-09) both are ancestors of HEAD (git merge-base --is-ancestor exit 0 for each); the only code delta from 084625c to HEAD is the rustfmt commit 5574841 (gates.rs, state.rs line splits). The record should say so before the post-completion gate byte-compares the 'final' 49-LIVE-RUN.md blob."
-    why_human: "Editing the phase record is outside the verifier's remit. 49-LIVE-RUN.md is in covered_files, so editing it marks this verification stale and needs a re-verify."
-  - test: "Acknowledge the judgment-tier prohibitions (49-03, 49-04/49-12, 49-09, 49-10, 49-11). The LLM-judge verdict for each is in the report's 'Prohibitions' table and found no violation."
-    expected: "Operator accepts or rejects each verdict. One wording conflict needs a ruling: 49-09 says 'No Phase 49 tool answers a DevFlow gate', but negctl.sh:249 runs `gate reject` on the negative arm's own Define gate, as 49-07's must-have requires."
-    why_human: "Judgment-tier prohibitions are non-authoritative without a human ruling (ADR-550 D4)."
-  - test: "Carried from 49-LIVE-RUN.md, still undecided: does attempt 2's quota pause plus operator-scheduled resume count as 'unattended', and does attempt 2 count toward the D-11 cap?"
-    expected: "Operator rules, or explicitly drops it. It does NOT gate VERIFY-01: the verdict rests on attempt 3, whose events contain 0 rate-limit/cron-resume/advance_failed/workflow_aborted events. The same search finds 3 in attempt 2, so the search can find them."
-    why_human: "Policy ruling that no file records."
+re_verification:
+  previous_status: human_needed
+  previous_score: 5/5
+  gaps_closed:
+    - "WR-03 decided: fixed in c5d7d46; HEAD's Ship prompts carry no `integration` literal and a test pins both renderers"
+    - "49-LIVE-RUN.md annotated in 0978563 for the bbfe6df fix-branch merge"
+    - "Judgment-tier prohibitions ruled (UAT item 3: agent ruling at the operator's request, recorded)"
+    - "Attempt 2 quota-pause question ruled moot in 0978563 (UAT item 4)"
+    - "49-LIVE-RUN.md 'formatting only' statement (raised by this pass at 18:32Z) corrected in db18578: line 16 lists c5d7d46, af38901, 53d7d25, 9e78c83, b3f7fdf and separates code-identical observations from the two test-only surfaces; line 250 points to it"
+  gaps_remaining: []
+  regressions: []
 ---
 
 # Phase 49: Live Unattended Run — Verification Report
@@ -86,109 +95,144 @@ human_verification:
 **Phase Goal:** Record a real `devflow start --mode auto` run against a disposable GSD project end to end, against a
 configured base: fork point, preflight, unattended progression and Ship merge target. The milestone's earlier fixes are
 then measured on a live chain, not asserted from unit evidence.
-**Verified:** 2026-10-09
-**Status:** human_needed
-**Re-verification:** No. This is the initial verification; no earlier VERIFICATION.md existed.
+**Verified:** 2026-10-09T18:35:21Z
+**Status:** passed
+**Re-verification:** Yes. The previous report (status human_needed, no `gaps:`) was stale. All four of its human items
+are closed in 49-UAT.md, each with a recorded resolution.
 
 ## Goal Achievement
 
-Bottom line: the live record exists and holds up under independent reads of the committed evidence, the raw evidence
-and the live GitHub state. All five roadmap success criteria are VERIFIED for **one run (attempt 3) of one binary**
-(`e8cf0077946f…`, built from `084625c`). Status is `human_needed`, not `passed`, for two reasons. First, the phase merged
-a production prompt change tuned to its own fixture (WR-03). Second, the phase record now states something false about
-where that code lives. Both need an operator decision.
+Bottom line: the live record still holds. The committed evidence is unchanged since the last report (no commit touches
+`49-evidence/` after cb1bc48), and every criterion re-checks clean against it, the raw attempt gate and live GitHub.
+**However, the run measured the binary built from `084625c`, and HEAD is no longer that code.** 49-LIVE-RUN.md now
+says so (db18578, re-checked below). No human item remains.
+
+### What attempt 3 does and does not establish about HEAD
+
+`git diff --stat 084625c HEAD -- crates` gives 9 files, +855/-29 (5574841 rustfmt, c5d7d46, af38901, 53d7d25, 9e78c83,
+b3f7fdf). Split by criterion:
+
+- **Code byte-identical to the attempt-3 binary, apart from rustfmt:** base-branch resolution and persistence,
+  preflight / `unattended_config_condition`, fork point, gate firing and `--yes-ship` resolution, the local merge into
+  the base, and the CR-01 checkpoint detector (`agent_result.rs` has no diff since 084625c). Criteria 1, 3, 4 and 5,
+  and the DevFlow-owned half of 2, therefore carry to HEAD **by code identity**. That is an inference from the diff, not
+  a re-measurement.
+- **Changed since the run, never exercised live:**
+  1. **Ship PR instruction (c5d7d46).** Attempt 3's agent read "target base branch `main` … while DevFlow merges into
+     integration locally". HEAD's prompt reads "target base branch `main` (the repository trunk), not the base branch
+     DevFlow merges this phase into locally". So the PR-to-`main` observation in criterion 2 was produced by a different
+     prompt text. Whether HEAD's wording steers the agent the same way has not been measured. It has unit tests only
+     (`ship_prompts_name_the_trunk_and_no_fixture_branch` and `ship_prompt_instructs_pr_targeting_main`, both passing).
+  2. **Gate notify delivery (af38901, 9e78c83, b3f7fdf).** At 084625c, `State::new` captured `DEVFLOW_GATE_NOTIFY_CMD`
+     and the monitor exported it into the chain. At HEAD, `start`, `resume` and `advance` apply the variable to
+     `state.gate_notify_cmd`, every spawn strips it (`strip_notify_env`), and gates resolve it from the state file. Gate
+     snapshots are the evidence mechanism behind criteria 1 and 2, and attempt 3 took them through the **old** path.
+     At HEAD the path has 9 passing e2e tests plus unit tests. It has no live run. WR-12, WR-13 and IN-10 (deferred to
+     999.154) record known residual gaps in it, including WR-13's rate-limit cron path, which is the path that cost
+     attempt 2 its Ship snapshot.
+- **Changed, not on attempt 3's path:** the WR-10 re-read before a gate's resolution save in `pipeline_gate.rs`. That
+  path is reached only when the on-disk notify command is edited mid-gate.
+
+Net: VERIFY-01 is met for the 084625c binary. For HEAD it is met on every DevFlow-owned observation through unchanged
+code. The two changed surfaces, the agent-facing PR instruction and notify-hook delivery, rest on tests alone. Phase
+49.1 will replace the checkpoint detector, so after 49.1 the auto-decide path is also unmeasured live unless 49.1
+re-runs live.
 
 ### Observable Truths (ROADMAP success criteria, the contract)
 
-| # | Truth | Status | Evidence (checked this session) | What it does NOT establish |
-|---|-------|--------|---------------------------------|----------------------------|
-| 1 | Disposable project commits `devflow.toml` with a non-default `base_branch`; persisted `State::base_branch` reads it | ✓ VERIFIED | `state-01.json` in all three attempt-3 gate snapshots (define, code, ship): `base_branch=integration`. `start.stdout`: `note: base branch is \`integration\` (from devflow.toml (base_branch))`. The negative arm's state reads `develop`, so the field discriminates. | Covers one value (`integration`) only. Does not show the default is used when `devflow.toml` exists without the key. |
-| 2 | Recorded fork point through Ship merge target: one fork point, `unattended_config_condition = Holds`, unattended progression apart from the Define and Code gates, Ship gate answered by `--yes-ship`, Ship merge target observed | ✓ VERIFIED | **Holds:** `[holds] GSD config can hold the chain flag` in `start.stdout`. That line is printed by `unattended_config_condition()` (preflight.rs:990, :1167). The separate `[DOES NOT HOLD] no plan declares a human-only checkpoint` line is the D-22 seeded checkpoint, by design. **Fork point:** `fork-base.txt` base_sha = Define snapshot worktree_head = Ship snapshot merge_base = `0f16ce6a…`. **Gates:** events give define gate → operator approve (`responded_by: denniyahh`, `via: cli`), code gate → operator approve, ship gate → `responded_by: "--yes-ship"` resolved in the same second (1791412415). No other `gate_fired`. Attempt 3 has 0 rate-limit, relaunch, `advance_failed` or `workflow_aborted` events and no `resume.stdout`. **Merge target:** `collected/git.txt` has one first-parent merge `311271e` into `integration` with parents (fork point, feature_head `f142d99`); `main` is unmoved (`2451b5e` before and after). **PR:** live `gh pr view 1 --repo denniyahh/p49-live-attempt-3` returns base `main`, head `feature/phase-01`, OPEN. On the live PR branch, `probe/budget.py` reads `DEFAULT_RETRY_BUDGET_SECS: int = 120`; the file is absent on `main`. | **The PR-to-`main` result is produced by a literal in the prompt (WR-03).** 084625c added "target base branch `main` … while DevFlow merges into integration locally" to every project's Ship prompt. Attempt 2, which ran before that commit, opened its PR against `integration` (confirmed live). The PR base therefore shows the agent obeying the literal; it does not show DevFlow working out the base. The DevFlow-owned target, the local merge into `integration`, is a genuine observation. `responded_by: denniyahh` is the OS user, and negctl's scripted reject records the same value, so it does not by itself prove a human typed the approvals. Unattended progression is shown for one run, with Define and Plan as short pre-baked stages (8 s and 6 s, real claude launches that returned `success`). |
-| 3 | Negative arm re-run with this phase's binary: unconfigured repo forks from `develop` and refuses on missing `.planning/config.json`; both arms from one binary | ✓ VERIFIED | `negctl/bin_sha256` equals `attempt.json` `bin_sha256` (`e8cf0077…`). Both `workflow_started` events record commit `084625c`. `negctl/start.stdout` has the verbatim `[DOES NOT HOLD] GSD config can hold the chain flag — no \`.planning/config.json\` …` line and no base-branch note. The snapshot's `base_branch=develop`. `develop.sha` = `worktree-head.sha` = `96e8ec1…`. Events: gate_fired define → reject → `workflow_aborted`. | "Refuses" here means the auto-mode preflight parks at a gate that the control then aborts. It is not a hard exit. Shows one unconfigured repo shape only. |
-| 4 | DECN-03 answered against this run, or the run records that the path was not exercised | ✓ VERIFIED | 49-LIVE-RUN.md records exactly one outcome, **Followed**. Attempt 3 has exactly 1 `checkpoint_auto_decided` event (counted). The turn-1 capture and the resumed capture both carry `session_id uuid-2`. Both verbatim quotes appear exactly once in the resumed capture `1791412108556407377-0-stdout` (`rg -c -F` = 1 each). A `transition code→validate` follows with no intervening gate. budget-120 confirmed on the live PR branch. The turn-1 capture ends in a real report of the seeded `checkpoint:decision gate=blocking-human`, with "no code was written". | One model (claude 2.1.292) and one sample. The record itself says the run cannot separate recency from compliance. "Which turn carried which rule" rests on the **uncommitted** transcript (999.150). The comparison was already written in turn 1. |
-| 5 | SURV-01 field question recorded without overclaiming | ✓ VERIFIED | `surv/analysis.txt`: writers=7, temp_writes=34, interleaved_windows=0, overflow_windows=0, stop_marker=present, plus the verbatim "establishes nothing" sentence. 49-LIVE-RUN.md copies these values, lists blind spots (watch gap before `watch_added`) and states that this neither confirms nor weakens Phase 48. | One watcher run. The watch gap means early writes before `watch_added` are unobserved. WR-06 (analyze can flag dead writers' orphaned temp files) is a false-positive risk, not a false-negative one, so it does not undercut `0` here. |
+| # | Truth | Status | Evidence (re-checked this session) | What it does NOT establish |
+|---|-------|--------|------------------------------------|----------------------------|
+| 1 | Disposable project commits `devflow.toml` with non-default `base_branch`; persisted `State::base_branch` reads it | ✓ VERIFIED | `state-01.json` in all three attempt-3 gate snapshots reads `base_branch` = `integration`. `start.stdout:1`: `note: base branch is \`integration\` (from devflow.toml (base_branch))`. The negative arm's `negctl/gates/001-define/devflow/state-01.json` reads `develop`, so the field discriminates. | One value. Does not show the default when `devflow.toml` exists without the key. |
+| 2 | Fork point through Ship merge target: Holds, unattended apart from Define/Code, Ship by `--yes-ship`, merge target observed | ✓ VERIFIED | `start.stdout:5` `[holds] GSD config can hold the chain flag`. Events: exactly 3 `gate_fired` (define, code, ship). Define/Code resolved by `denniyahh`; Ship resolved by `--yes-ship` in the same second (1791412415). 0 `advance_failed`/`workflow_aborted`. `git.txt`: `integration_merge_count=1`, merge `311271e` with parents fork point `0f16ce6…` and `feature_head` `f142d99…`; `main_head` `2451b5e` unmoved. Live `gh pr view 1 --repo denniyahh/p49-live-attempt-3`: base `main`, head `feature/phase-01`, OPEN. Negative control: attempt-2's live PR base is `integration`. | PR base came from the 084625c prompt literal, not HEAD's wording (see above). `responded_by: denniyahh` is the OS user, so it does not by itself prove a human typed the approvals. One run. |
+| 3 | Negative arm re-run with this phase's binary; both arms from one binary | ✓ VERIFIED | `negctl/bin_sha256` = `attempt.json` `bin_sha256` = `e8cf0077946f…`. The pinned binary `~/.cache/devflow-phase49/bin/devflow-e8cf0077946f` hashes to the same prefix. `identity.txt` records `build_commit=084625c…` with `build_dirty=false`. `negctl/start.stdout:6` has the `[DOES NOT HOLD] … no \`.planning/config.json\`` line. Checker: negative 5/0, pair 3/0. | Same binary as each other, not as HEAD. "Refuses" means the run parks at a gate that the control aborts; it is not a hard exit. |
+| 4 | DECN-03 answered or recorded not exercised | ✓ VERIFIED | Exactly 1 `checkpoint_auto_decided`. Turn-1 and resumed captures both carry only `session_id` `uuid-2`. Both verbatim quotes are found exactly once in `1791412108556407377-0-stdout` (`rg -c -F` = 1 each). 49-LIVE-RUN.md records the single outcome **Followed**. | One model (claude 2.1.292), one sample. Cannot separate recency from compliance. The turn-placement claim rests on the uncommitted transcript (999.150). |
+| 5 | SURV-01 recorded without overclaiming | ✓ VERIFIED | `surv/analysis.txt`: writers=7, temp_writes=34, interleaved_windows=0, overflow_windows=0, stop_marker=present, plus the "establishes nothing" sentence. 49-LIVE-RUN.md copies these values and names the watch gap. | One watcher run; writes before `watch_added` are unobserved. |
 
-**Score:** 5/5 truths verified (0 present, behavior-unverified). These are behavioral observations of a live run, not
-symbol presence: the run is the behavior.
+**Score:** 5/5 truths verified (0 present, behavior-unverified). The run is the behavior, but it was measured on 084625c;
+see the HEAD scope section above.
 
-**Not evaluated here: the post-completion integration gate.** The ROADMAP schedules it *after* goal verification and
-`phase.complete` (merge-back into `workspace/denniyahh`, sync, divergence check, push, then the 49-LIVE-RUN.md blob
-compare). It cannot be verified now and is not counted in the score. It stays an orchestrator obligation.
+**Not evaluated here: the post-completion integration gate.** It runs after verification and `phase.complete`
+(merge-back into `workspace/denniyahh`, sync, divergence check, push, blob compare of 49-LIVE-RUN.md). It remains an
+orchestrator obligation. The 49-LIVE-RUN.md blob it compares is now the db18578 version.
 
-### Plan must-haves (spot-checked, additive to the contract)
+### Previous human items: closure check
+
+| Prior item | Closure claimed | Verified |
+|---|---|---|
+| WR-03 | fixed, c5d7d46 | Yes. `rg integration crates/devflow-core/src/prompt.rs` hits only the test's own doc comment and assertion. Both renderers call `ship_pr_base_instruction()`, which interpolates `config::MAIN` (`"main"`). The new test asserts `!prompt.contains("integration")`, which 084625c's production text (prompt.rs:278, :573 there) would fail. The test passes at HEAD. |
+| LIVE-RUN.md branch-location statements | 0978563, then db18578 | 0978563's annotation went stale ("formatting only"). db18578 corrected lines 16 and 250 and changed only that file. Line 16 names exactly the five post-merge crate commits that `git log 084625c..HEAD -- crates` shows besides rustfmt. It names the two changed surfaces (PR-base wording, notify via state file) as test-only and the rest as carrying by code identity, which matches this report's diff reading. The sanitizer scan on the edited file gives rc=0. Minor imprecision, not a defect: it says the notify command is "stripped from the monitor chain and agents" and omits the canary, which is also stripped. |
+| Judgment-tier prohibitions | UAT item 3 | Ruled by the agent at the operator's explicit request ("Why can't you answer these for me?"). The ruling is recorded in UAT. The operator's later "proceeded without contesting" is not itself an acceptance; the request to rule is the delegation. |
+| Attempt 2 unattended / D-11 | moot, 0978563 | Annotation present at the three places it was undecided. The ruling is sound: attempt 2 fails the positive arm (8/3 re-run here), so the verdict does not rest on it. |
+
+### Plan must-haves (regression re-run, additive to the contract)
 
 | Plan | Check | Result |
 |------|-------|--------|
-| 49-01 | VERIFY-01 closing sentence (`criterion 1, amended in`); criterion 2 names Define and Code; no tracked file under `49.1-configurable-test-wait-budget/`; `roadmap.analyze` exit 0 | all hold (0 tracked files; analyze rc=0, 7 phases) |
-| 49-02/49-06 | `scripts/scratch-dogfood-repo.sh --selftest` | rc=0, `SELFTEST passed=26 failed=0` |
+| 49-01 | `criterion 1, amended in` in REQUIREMENTS.md; no tracked `49.1-configurable-test-wait-budget/` files; `roadmap.analyze` | hold; rc=0 |
+| 49-02/06 | `scripts/scratch-dogfood-repo.sh --selftest` | 26/0 |
 | 49-03 | snapshot-hook / collect-attempt selftests | 6/0, 11/0 |
-| 49-04 | surv-watch selftest | 7/0 |
-| 49-05 | sanitize-evidence selftest; `scan` over committed `49-evidence/` and 49-LIVE-RUN.md | 12/0; scan rc=0 on both; **negative control:** planted `ghp_` token → rc=1 |
-| 49-07/49-08 | check-evidence selftest; arms over committed copies | 34/0. Attempt 3 positive 11/0, negative 5/0, pair 3/0. **Negative controls:** attempt 1 positive rc=1 (4/7), attempt 2 positive rc=1 (8/3), so the checker can fail |
-| 49-08/49-11 | `--attempt-gate ~/.cache/devflow-phase49` (read-only; source read first) | rc=0, `ATTEMPT_GATE verdict=shipped attempt=3`, including `sha256sum -c` of the raw collected manifest |
-| 49-09 | launch-attempt selftest; `prelaunch/repo.json` | 17/0; `denniyahh/p49-live-attempt-3` `PRIVATE` |
-| 49-10 | runbook contains `--attempt-gate`; DEV-SETUP-CHECKLIST contains `delete_repo`; no `--no-verify`/hooksPath bypass in runbook | hold |
-| 49-12 | backlog 999.147–150 exist in ROADMAP; cleanup listed as pending | hold |
-| fix commits | 21 named tests from e3f9ddd/084625c (`blocking_human_checkpoint_reported_*`, `ship_prompt_instructs_pr_targeting_main`, `notify_hook_fallback_runs_when_env_unset`) | `21 passed; 0 failed` |
+| 49-04 | surv-watch `--selftest` | 7/0 |
+| 49-05 | sanitize-evidence `--selftest`; `scan` over `49-evidence/` and 49-LIVE-RUN.md | 12/0; rc=0 both; **negative control:** a planted `ghp_` token makes `scan` exit rc=1 |
+| 49-07/08 | check-evidence selftest; arms over the committed copies | 34/0. Attempt 3: positive 11/0, negative 5/0, pair 3/0. **Negative controls:** attempt 1 positive rc=1 (4/7), attempt 2 positive rc=1 (8/3) |
+| 49-08/11 | `--attempt-gate ~/.cache/devflow-phase49` (source read first; it only reads and runs `sha256sum -c`) | rc=0, `ATTEMPT_GATE verdict=shipped attempt=3` |
+| 49-09 | launch-attempt selftest; attempt repos | 17/0; `p49-live-attempt-1` PRIVATE (read live) |
+| 49-12 | backlog 999.147–154 and Phase 49.1 present in ROADMAP | hold |
 
-Not established by these: the selftests prove the cases they plant. The sanitizer scan passing does **not** cover the
-AWS, Slack, PEM or JWT shapes WR-04 says it misses. A separate `rg` for those shapes over the committed evidence found 0
-hits, with a planted AKIA control found.
+### Code since the previous report (HEAD)
 
-### Prohibitions (judgment tier, non-authoritative LLM-judge verdicts; see human_verification item 3)
+| Check | Result |
+|---|---|
+| Named fix/review tests (`ship_prompt*`, `blocking_human_checkpoint_reported*`, notify resolver/persist, `strip_notify_env`, `gate_notify_cmd` round-trip) | 34 passed, 0 failed |
+| `pipeline_gate::tests::gate_resolution_keeps_a_notify_cmd_edited_during_the_wait` | 1 passed |
+| `cargo test -p devflow --test gate_notify_persist_e2e` | 9 passed, 0 failed |
+| `cargo test -p devflow-core --lib` (full) | 861 passed, 0 failed |
+| `cargo test -p devflow --bin devflow` (full) | 409 passed, 0 failed |
+| `cargo fmt --all -- --check` | rc=0 (CR-02 holds) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | rc=0 |
 
-| Source | Statement (short) | Verdict | Basis |
-|--------|-------------------|---------|-------|
-| 49-03 | No capture tool creates, deletes or pushes to a GitHub repo; the collector only runs `gh pr view` | no violation found | tools call only `gh repo view`, `gh auth status`, `gh pr view`; no `git push` in tools |
-| 49-04/49-12 | No SURV-01 confirmation wording; no bare auto-decide event as a DECN-03 result | no violation found | SURV wording negated; Followed rests on session-matched quotes and progression |
-| 49-09/49-11 | No tool touches a GitHub repo; run never targets this repo | no violation found | repo.json = throwaway PRIVATE repo |
-| 49-09/49-11 | No tool answers or pre-writes a gate response; Define and Code answered by operator, Ship only by `--yes-ship` | no violation in the live run; **wording conflict** | launch-attempt.sh has no gate verbs. negctl.sh:249 `gate reject`s its own control gate, which 49-07 requires |
-| 49-10 | Runbook never instructs a hook bypass or pre-written responses | no violation found | grep found none |
+What these runs do not cover: the integration tests under `crates/*/tests/` other than `gate_notify_persist_e2e` were
+not run, and neither were `scripts/check.sh all` or the container gate. `feature/phase-49` has no remote ref, so no
+pre-push gate has run on HEAD either.
 
 ### Requirements Coverage
 
 | Requirement | Source Plans | Status | Evidence |
 |-------------|--------------|--------|----------|
-| VERIFY-01 | all 12 plans declare it | ✓ SATISFIED (for attempt 3's binary) | Criteria 1-3 above; negative arm re-run with the same binary. REQUIREMENTS.md still shows Pending, which is correct: `phase.complete` owns that flip. |
+| VERIFY-01 | all 12 plans | ✓ SATISFIED (084625c binary; for HEAD, see the scope section) | Criteria 1-3 above. REQUIREMENTS.md still shows Pending, which is correct: `phase.complete` owns that flip. |
 
-No orphaned requirement IDs: REQUIREMENTS.md maps only VERIFY-01 to Phase 49.
+`BUDGET-01` appears only inside 49-06-PLAN.md's quoted payload plan (the throwaway project's own requirement). It is not
+a Phase 49 requirement. No orphaned IDs: REQUIREMENTS.md maps only VERIFY-01 to Phase 49.
 
-### CR-01 assessment (deferred to Phase 49.1)
+### Review, security and validation state
 
-- **Attempt 3 depended on the CR-01 path.** The turn-1 `DEVFLOW_RESULT` reason contains `checkpoint:decision`,
-  `gate=blocking-human` and `checkpoint`. It was recognised by the prose heuristic e3f9ddd introduced, and attempt 1
-  stopped precisely because recognition was missing then.
-- **The detection was a true positive.** It matched the payload's seeded checkpoint (Plan 01-01 Task 1), the agent wrote
-  no code first, there is exactly 1 auto-decide event, and Validate succeeded afterwards with no spurious second resume.
-  CR-01's false-positive class did not fire in this run, so it does not invalidate criteria 2 or 4.
-- **What this does not establish:** that the shipped detector is sound. CR-01's probe shows it auto-resumes ordinary
-  failures. Phase 49.1 will replace this exact detector, so after 49.1 the live chain's auto-decide path is unmeasured
-  unless 49.1 re-runs live.
+- 49-REVIEW-DISPOSITION.md: `open: 0` of 27. CR-01 deferred to Phase 49.1, which exists in the ROADMAP. Deferred items
+  have backlog homes 999.151–154, all present.
+- 49-SECURITY.md: `status: verified`, `threats_open: 0`.
+- 49-VALIDATION.md: `status: validated`, `nyquist_compliant: false`, with 3 manual-only rows (the live attempt, the real
+  negctl launch, the real prepare/auth probe). This is the expected shape for a live-run phase and does not block.
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| crates/devflow-core/src/prompt.rs | ship prompts (from 084625c) | Fixture branch name `integration` and literal `main` hard-coded into every project's Ship prompt (WR-03, disposition `open`) | ⚠️ Warning | Wrong instruction for default and other-base projects once merged downstream; limits criterion 2's PR-base observation |
-| 49-LIVE-RUN.md | 15-16, 240, 249-251 | States fix commits are not on feature/phase-49; false since bbfe6df | ⚠️ Warning | Record inaccuracy ahead of the blob-compare in the post-completion gate |
-| crates/devflow-core/src/agent_result.rs | 762-782 | CR-01 prose heuristic | ⚠️ Warning (deferred to 49.1 by operator) | See CR-01 assessment |
-| 49-evidence/attempt-3 | two `phase-01-stdout` files | Invalid JSON from sanitizer redaction (999.147) | ℹ️ Info | Not cited by any criterion; filed |
+| crates/devflow-core/src/agent_result.rs | CR-01 heuristic | Deferred to 49.1 by the operator | ⚠️ Warning (deferred) | Unchanged since the last report |
+| 49-evidence/attempt-3 | two `phase-01-stdout` | Invalid JSON from sanitizer redaction (999.147) | ℹ️ Info | Not cited by any criterion |
 
-No TBD/FIXME/XXX debt markers in modified files. The only match is the `mktemp` template `XXXXXX` in launch-attempt.sh:265.
+The lines added to crate files since the previous report contain no TBD/FIXME/XXX/TODO/HACK/`todo!`/`unimplemented!`.
+
+### Human Verification Required
+
+None. The only item this pass raised, the 49-LIVE-RUN.md "formatting only" statement, was corrected in db18578 under
+the operator's low-impact delegation and is re-checked above. The prior four UAT items are closed in 49-UAT.md. The
+judgment-tier prohibitions were ruled at the operator's request and recorded as resolved there.
 
 ### Gaps Summary
 
-No must-have truth FAILED. The phase delivered what its goal states: a live, end-to-end, base-configured run recorded
-from fork point to Ship merge target, a same-binary negative arm, and honest DECN-03 and SURV-01 records. The committed
-copy carries its own proof.
-
-Strength of the result: one shipped run, the third of three, on claude 2.1.292, one payload, one base topology. It bounds
-nothing about reliability.
-
-Weakest link: the Ship PR-base half of criterion 2. It became observable only after a production-prompt literal tuned to
-this fixture (WR-03) was added mid-checkpoint and then merged onto this branch.
+No must-have truth FAILED, and the previous report had no `gaps:`. The phase delivered its goal for the binary it ran.
+The record now states its own scope at HEAD. Strength of the result is unchanged: one shipped run, the third of
+three, on claude 2.1.292, one payload, one base topology. It sets no bound on reliability.
 
 ---
 
-_Verified: 2026-10-09_
+_Verified: 2026-10-09T18:35:21Z_
 _Verifier: Claude (gsd-verifier)_
