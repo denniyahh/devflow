@@ -600,7 +600,9 @@ impl State {
             // allowed to. Only a state file from an older binary may read
             // Unrecorded (see the field's doc comment).
             checkpoint_approval: CheckpointApproval::Pending,
-            gate_notify_cmd: std::env::var("DEVFLOW_GATE_NOTIFY_CMD").ok().filter(|s| !s.is_empty()),
+            gate_notify_cmd: std::env::var("DEVFLOW_GATE_NOTIFY_CMD")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }
