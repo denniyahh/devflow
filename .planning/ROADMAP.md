@@ -828,6 +828,28 @@ child a private `DEVFLOW_CACHE_DIR` (as `gate_notify_persist_e2e` does) or route
 Add a guard test that fails when a suite run grows the real cache. Pruning the existing entries is a separate operator
 choice.
 
+### Phase 999.154: Gate Notify Command — Remaining Gaps After the Phase 49 State-File Design (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 final re-review of `b3f7fdf` (`49-REVIEW.md` WR-12, WR-13, IN-10). Phase 49 made the
+run's state file the single source of the gate notify command (operator decision 2026-10-09) and stopped fixing after
+that review round.
+
+**Defects:**
+- WR-12: the gate's entry save (`pipeline_gate.rs`, `run_gate_with_timeout`) writes the state copy `advance` loaded
+  when it started, and the hook fires from that copy. An on-disk edit made between that load and the gate opening is
+  reverted and the old command runs. The longest window is the Ship finalization retry loop (up to about 120 s of
+  checkout-lock wait). Doc comments at `monitor.rs` (`strip_notify_env`) and `state.rs` (`gate_notify_cmd`) overstate
+  what the WR-10 fix covers; OPERATIONS.md states the limit.
+- WR-13: no test fails if `resume` drops the saved command when the variable is unset (mutating its
+  `apply_notify_env` call to `apply_notify_env(None)` passes every test). That is the arm a scheduled rate-limit resume
+  takes.
+- IN-10: if a hand edit leaves the state file unparseable, the WR-10 re-read silently keeps the old copy and rewrites
+  the file; it should warn.
+
+**Fix shape (from the review, not decided):** save right after `advance` applies the variable, re-read the raw field at
+gate entry as well as at resolution, warn on an unparseable re-read, and add a `resume` arm with the variable unset
+that asserts the saved command is kept.
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219

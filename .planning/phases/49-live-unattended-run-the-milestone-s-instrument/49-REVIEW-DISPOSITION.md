@@ -5,23 +5,23 @@ titles: json
 findings:
   - id: WR-11
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "OPERATIONS.md says `devflow resume` changes a running phase's hook, but `resume` refuses every live run"
   - id: WR-12
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "The gate's entry save still reverts an on-disk edit, and the gate fires the copy loaded when `advance` started"
   - id: WR-13
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "Nothing fails if `resume` clears the saved command when the variable is unset, and that is the rate-limit cron path"
   - id: IN-10
     severity: info
-    disposition: open
+    disposition: deferred
     title: "The WR-10 re-read silently discards an edit that left the state file unparseable"
   - id: IN-11
     severity: info
-    disposition: open
+    disposition: fixed
     title: "The docs say a rate-limit resume ignores the shell environment, but that resume applies its scheduler's environment"
   - id: CR-03
     severity: critical
@@ -111,7 +111,7 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 5
+open: 0
 total: 27
 recorded: 2026-10-09T18:27:12.528Z
 ---
@@ -120,11 +120,11 @@ recorded: 2026-10-09T18:27:12.528Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-11 | warning | open | - |
-| WR-12 | warning | open | - |
-| WR-13 | warning | open | - |
-| IN-10 | info | open | - |
-| IN-11 | info | open | - |
+| WR-11 | warning | fixed | OPERATIONS.md: resume changes the hook only for a stopped run; live runs are changed by editing the state file |
+| WR-12 | warning | deferred | backlog 999.154; fix rounds stopped after the third review per operator guidance; OPERATIONS.md states the limit |
+| WR-13 | warning | deferred | backlog 999.154 (resume arm with the variable unset) |
+| IN-10 | info | deferred | backlog 999.154 |
+| IN-11 | info | fixed | OPERATIONS.md: a scheduled rate-limit resume is a devflow resume, so the scheduler variable applies |
 | CR-03 | critical | fixed | b3f7fdf start/resume/advance apply one rule to the saved command (operator chose the state file as the single source, 2026-10-09); resume and advance e2e arms (not in the current review) |
 | WR-10 | warning | fixed | b3f7fdf gate re-reads gate_notify_cmd from disk before its resolution save; in-process test, revert fails it (not in the current review) |
 | IN-09 | info | fixed | b3f7fdf MarkedReaper kills marked processes on drop (not in the current review) |
