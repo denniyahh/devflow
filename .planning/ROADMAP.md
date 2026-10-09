@@ -813,7 +813,10 @@ attempts have `collected/DONE` (IN-05). The run units launched in every attempt 
 **Fix shape (not decided):** per-finding fixes are in `49-REVIEW.md`. Fix before the tools run again, for example in a
 Phase 49.1 live run.
 
-### Phase 999.153: The Test Suite Registers Temp-Dir Roots in the Developer's Real `~/.cache/devflow` (BACKLOG)
+### Phase 999.153: The Test Suite Registers Temp-Dir Roots in the Developer's Real `~/.cache/devflow` (DUPLICATE of 999.141)
+
+**Duplicate, 2026-10-09:** this repeats 999.141 (filed 2026-09-23), which was missed when this entry was
+written. The findings below are kept as fresh evidence that 999.141 is still unfixed; track the work there.
 
 **Found:** 2026-10-09, Phase 49 close-out cleanup. **Reproduced.**
 
@@ -825,8 +828,7 @@ entries make `gate sweep` and other root scans walk thousands of dead roots. Whi
 
 **Fix shape (not decided):** find the leaking tests by diffing the cache across per-binary runs, then give each spawned
 child a private `DEVFLOW_CACHE_DIR` (as `gate_notify_persist_e2e` does) or route library tests through `*_in(cache_dir)`.
-Add a guard test that fails when a suite run grows the real cache. Pruning the existing entries is a separate operator
-choice.
+Add a guard test that fails when a suite run grows the real cache. Pruning the existing entries: done 2026-10-09, see 999.141.
 
 ### Phase 999.154: Gate Notify Command — Remaining Gaps After the Phase 49 State-File Design (BACKLOG)
 
@@ -978,6 +980,13 @@ it is the operator's real cache).
 
 **Acceptance:** not decided; set at promotion. Needs a test that fails when a spawned `devflow` child
 writes outside its tempdir `HOME`.
+
+**Still unfixed 2026-10-09:** re-found as 999.153 (now marked duplicate), with 15,755 entries, 15,632 of them
+naming deleted roots. **Cache cleaned 2026-10-09** by the agent during Phase 49 housekeeping, by running
+`devflow gate sweep --dry-run`, which prunes entries whose root no longer exists (`registry::prune_missing`):
+15,755 → 123 entries, matching an independent count of 123 entries whose root still exists. Backup of the
+full directory: `~/.cache/devflow-roots-backup-2026-10-09.tgz` (restore: `tar xzf` it inside `~/.cache/devflow`).
+The leak itself is not fixed, so the cache will refill on the next full test run.
 
 ### Phase 999.140: `resume` Launches With No Live-Run Check (PROMOTED — Phase 48 gap closure)
 
