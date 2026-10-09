@@ -342,11 +342,8 @@ pub(crate) fn start(
     // this one (monitor chain, rate-limit resume), on the same "before the
     // first `save_state`" idiom. Captured here rather than in `State::new`
     // so constructing a state never reads the environment (49-REVIEW.md
-    // WR-01). An empty value persists nothing.
-    state.gate_notify_cmd = devflow_core::gates::resolve_gate_notify_cmd(
-        std::env::var_os(devflow_core::gates::GATE_NOTIFY_CMD_ENV).as_deref(),
-        None,
-    );
+    // WR-01); `resume` and `advance` apply the same rule (CR-03).
+    state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
 
     // D-11's opt-out (31-04), combined on the same shape and for the same
     // reasons as `yes_ship` directly above: OR-ed with an environment override

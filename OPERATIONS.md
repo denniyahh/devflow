@@ -101,6 +101,16 @@ Env provided to the hook: `DEVFLOW_GATE_PHASE`, `DEVFLOW_GATE_STAGE`,
 `DEVFLOW_GATE_CONTEXT`, `DEVFLOW_NON_SILENT_GATE` (`1` when the gate exists
 only because a stage failed unexpectedly).
 
+The command is saved in the run's state file (`gate_notify_cmd` in
+`.devflow/state-NN.json`), so gates fired by the detached monitor, including
+after a rate-limit resume, use it without your shell's environment.
+`devflow start`, `resume` and `advance` update the saved command from the
+variable: unset keeps it, a new value replaces it, and an empty value
+(`DEVFLOW_GATE_NOTIFY_CMD= devflow resume …`) turns notification off for the
+run. To change the hook of a running phase, export the new value and run
+`devflow resume`, or edit `gate_notify_cmd` in the state file; an edit made
+while a gate is waiting is kept. The coding agent never receives the variable.
+
 ## Environment variables
 
 | Variable | Default | Purpose |

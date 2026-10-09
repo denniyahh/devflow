@@ -413,6 +413,31 @@ pub fn fire_gate_notify_with_fallback(
 /// The environment variable that configures the gate notify hook.
 pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
 
+/// Apply the operator's `DEVFLOW_GATE_NOTIFY_CMD` to a run's persisted notify
+/// command. `devflow start`, `resume` and `advance` all call this, so the
+/// state file is the one place a run's command lives (49-REVIEW.md CR-03):
+/// - unset (or not valid UTF-8): keep the persisted command;
+/// - set and empty: clear it, disabling notification for the run;
+/// - set and non-empty: replace it.
+///
+/// The detached monitor chain never carries the variable, so an `advance` it
+/// runs keeps whatever the state file holds.
+pub fn persisted_notify_cmd_after_env(
+    persisted: Option<String>,
+    env: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    match env.map(|value| value.to_str()) {
+        Some(Some("")) => None,
+        Some(Some(value)) => Some(value.to_owned()),
+        Some(None) | None => persisted,
+    }
+}
+
+/// [`persisted_notify_cmd_after_env`] applied to this process's environment.
+pub fn apply_notify_env(persisted: Option<String>) -> Option<String> {
+    persisted_notify_cmd_after_env(persisted, std::env::var_os(GATE_NOTIFY_CMD_ENV).as_deref())
+}
+
 /// Resolve the gate notify command from the environment value and a run's
 /// persisted command (49-REVIEW.md WR-01).
 ///
@@ -950,6 +975,34 @@ mod tests {
         );
         run_notify_command(&cmd_expected, PhaseId::new(11), Stage::Ship, "ctx", false);
         assert_eq!(std::fs::read_to_string(&sentinel_expected).unwrap(), "0");
+    }
+
+    /// CR-03 (49-REVIEW.md): one persistence rule for start, resume, advance.
+    #[test]
+    fn persisted_notify_cmd_follows_the_environment_rule() {
+        use std::ffi::OsStr;
+        let saved = || Some("saved".to_string());
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), None).as_deref(),
+            Some("saved")
+        );
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), Some(OsStr::new(""))),
+            None
+        );
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), Some(OsStr::new("new"))).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            persisted_notify_cmd_after_env(None, Some(OsStr::new("new"))).as_deref(),
+            Some("new")
+        );
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), Some(OsStr::from_bytes(b"\xff"))).as_deref(),
+            Some("saved")
+        );
     }
 
     /// WR-01 (49-REVIEW.md): set-and-empty disables even when a command is
