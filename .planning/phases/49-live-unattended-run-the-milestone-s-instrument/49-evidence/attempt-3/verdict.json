@@ -1,0 +1,7 @@
+{
+  "attempt": 3,
+  "outcome": "shipped",
+  "workflow_shipped": true,
+  "stop_note": null,
+  "state_present": false
+}

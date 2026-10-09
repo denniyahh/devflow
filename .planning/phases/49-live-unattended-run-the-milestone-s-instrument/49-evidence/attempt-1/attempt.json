@@ -1,0 +1,9 @@
+{
+  "attempt": 1,
+  "bin": "~/.cache/devflow-phase49/bin/devflow-de922c3968ba",
+  "bin_sha256": "de922c3968ba113341c573d351c0ddcd9ba8ac092b02d66dfe9ffe2db87001df",
+  "build_commit": "2d28e3f1ade00deeb2532f563b5a5b3fbb8274f9",
+  "launch": "~/.cache/devflow-phase49/attempt-1/project",
+  "base_branch": "integration",
+  "created_at": 1791390803
+}

@@ -1,0 +1,4 @@
+start=p49-a2-start
+surv=p49-a2-surv
+negctl=p49-a2-negctl
+authprobe=p49-a2-authprobe

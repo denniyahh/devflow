@@ -1,0 +1,7 @@
+{
+  "attempt": 1,
+  "outcome": "stopped",
+  "workflow_shipped": false,
+  "stop_note": "aborted: checkpoint reported in subagent handback was not recognized by top-level result scanner, failing to trigger auto-decide resume",
+  "state_present": false
+}

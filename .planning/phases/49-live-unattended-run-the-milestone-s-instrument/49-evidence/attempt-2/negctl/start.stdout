@@ -1,0 +1,12 @@
+warning: could not fetch `origin develop` — comparing `develop` against whatever `origin/develop` currently resolves to locally, which may be stale
+warning: could not determine whether `develop` is current with `origin/develop` — proceeding without a currency check (fail-open, per this module's fail-open-where-blind contract)
+created worktree: ~/.cache/devflow-phase49/attempt-2/negctl/repo/.worktrees/phase-01 (branch feature/phase-01)
+warning: build provenance staleness check did not confirm a fresh build for stage define — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)
+unattended-launch prerequisites — phase 1, stage define, mode auto:
+  [DOES NOT HOLD] GSD config can hold the chain flag — no `.planning/config.json` under the launch root — nowhere for the chain flag to live
+  [holds] Code would launch on the pipe-owning arm
+  [holds] no plan declares a human-only checkpoint
+gate written: .devflow/gates/01-define.json — awaiting response
+workflow aborted for phase 1: abort: negative control complete
+started phase 1 in auto mode at 1791399378 — monitor will auto-advance
+  watch live: devflow logs -f --phase 1

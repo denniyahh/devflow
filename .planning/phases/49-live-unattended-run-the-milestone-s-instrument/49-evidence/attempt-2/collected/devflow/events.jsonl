@@ -1,0 +1,48 @@
+{"v":1,"ts":1791399441,"phase":1,"event":"workflow_started","agent":"claude","mode":"auto","worktree":"~/.cache/devflow-phase49/attempt-2/project/.worktrees/phase-01","version":"2.12.0","commit":"e3f9ddd8ce54bb1c3eb278d686a6ed1e4c00c717","dirty":"false","exe_path":"devflow-d44f9ed1e7d0"}
+{"v":1,"ts":1791399441,"phase":1,"event":"gate_fired","stage":"define","unexpected":true,"context":"[never-silent] preflight failed for stage define: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1791399441,"phase":1,"event":"notify_fired","stage":"define","unexpected":true}
+{"v":1,"ts":1791399449,"phase":1,"event":"gate_response_written","stage":"define","approved":true,"via":"cli"}
+{"v":1,"ts":1791399456,"phase":1,"event":"gate_resolved","stage":"define","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1791399464,"phase":1,"event":"claude_delivery_canary_confirmed","stage":"define","token_prefix":"DEVFLOW_DELIVERY_CANARY_","cli_version":"2.1.292 (Claude Code)","reason":null}
+{"v":1,"ts":1791399464,"phase":1,"event":"stage_launched","stage":"define","agent":"claude","monitor_pid":2711855}
+{"v":1,"ts":1791399473,"phase":1,"event":"advance_evaluated","stage":"define","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791399473,"phase":1,"event":"transition","from":"define","to":"plan"}
+{"v":1,"ts":1791399473,"phase":1,"event":"capture_archived","stage":"define","to_stage":"plan","stamp":"1791399473961031605-0"}
+{"v":1,"ts":1791399473,"phase":1,"event":"stage_launched","stage":"plan","agent":"claude","monitor_pid":2712966}
+{"v":1,"ts":1791399480,"phase":1,"event":"advance_evaluated","stage":"plan","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791399480,"phase":1,"event":"transition","from":"plan","to":"code"}
+{"v":1,"ts":1791399480,"phase":1,"event":"gate_fired","stage":"code","unexpected":true,"context":"[never-silent] preflight failed for stage code: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1791399480,"phase":1,"event":"notify_fired","stage":"code","unexpected":true}
+{"v":1,"ts":1791399555,"phase":1,"event":"gate_response_written","stage":"code","approved":true,"via":"cli"}
+{"v":1,"ts":1791399603,"phase":1,"event":"gate_resolved","stage":"code","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1791399603,"phase":1,"event":"capture_archived","stage":"code","to_stage":"code","stamp":"1791399603906115219-0"}
+{"v":1,"ts":1791399603,"phase":1,"event":"stage_launched","stage":"code","agent":"claude","monitor_pid":2718208}
+{"v":1,"ts":1791399762,"phase":1,"event":"advance_evaluated","stage":"code","status":"failed","verdict":null,"decided_by_layer":1,"reason":"Phase 01 plan 01-01 Task 1 is a checkpoint:decision with gate=blocking-human (choose DEFAULT_RETRY_BUDGET_SECS: budget-30/budget-120/budget-300). This run was not a DevFlow resume to resolve that gate, so it was reported rather than self-resolved. No code was w… [truncated; full output in .devflow/]"}
+{"v":1,"ts":1791399762,"phase":1,"event":"checkpoint_auto_decided","stage":"code","session_id":"uuid-7","instruction":"This is phase 1 of a headless DevFlow run. You previously stopped at a blocking-human gate, but no human operator is available to answer it — this run is unattended, and none is coming. DevFlow resumed you specifically to resolve that gate: resolve it yourself,… [truncated; full output in .devflow/]","attempt":1,"policy":"D-03b: Auto-only checkpoint auto-decide"}
+{"v":1,"ts":1791399762,"phase":1,"event":"capture_archived","stage":"code","to_stage":"code","stamp":"1791399762556553571-0"}
+{"v":1,"ts":1791399762,"phase":1,"event":"stage_launched","stage":"code","agent":"claude","monitor_pid":2731150}
+{"v":1,"ts":1791400172,"phase":1,"event":"advance_evaluated","stage":"code","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791400172,"phase":1,"event":"transition","from":"code","to":"validate"}
+{"v":1,"ts":1791400172,"phase":1,"event":"capture_archived","stage":"code","to_stage":"validate","stamp":"1791400172930567987-0"}
+{"v":1,"ts":1791400172,"phase":1,"event":"stage_launched","stage":"validate","agent":"claude","monitor_pid":2766486}
+{"v":1,"ts":1791400255,"phase":1,"event":"advance_evaluated","stage":"validate","status":"success","verdict":"pass","decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791400255,"phase":1,"event":"hook_run","hook":"DocsUpdate","ok":true}
+{"v":1,"ts":1791400255,"phase":1,"event":"transition","from":"validate","to":"ship"}
+{"v":1,"ts":1791400255,"phase":1,"event":"capture_archived","stage":"validate","to_stage":"ship","stamp":"1791400255509671518-0"}
+{"v":1,"ts":1791400255,"phase":1,"event":"stage_launched","stage":"ship","agent":"claude","monitor_pid":2770424}
+{"v":1,"ts":1791400812,"phase":1,"event":"advance_evaluated","stage":"ship","status":"ratelimited","verdict":null,"decided_by_layer":1,"reason":"rate limited until 1791408600"}
+{"v":1,"ts":1791400812,"phase":1,"event":"rate_limit_resume_scheduled","stage":"ship","retry_after":"1791408600","infra_failures":1}
+{"v":1,"ts":1791408678,"phase":1,"event":"capture_archived","stage":"ship","to_stage":"ship","stamp":"1791408678899986668-0"}
+{"v":1,"ts":1791408678,"phase":1,"event":"cron_instructions_consumed","trigger":"resume_consumed","path_kind":"per-phase"}
+{"v":1,"ts":1791408678,"phase":1,"event":"stage_launched","stage":"ship","agent":"claude","monitor_pid":3056462}
+{"v":1,"ts":1791409439,"phase":1,"event":"advance_evaluated","stage":"ship","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791409439,"phase":1,"event":"gate_fired","stage":"ship","unexpected":false,"context":"Ship complete — approve merge?"}
+{"v":1,"ts":1791409439,"phase":1,"event":"notify_fired","stage":"ship","unexpected":false}
+{"v":1,"ts":1791409439,"phase":1,"event":"gate_resolved","stage":"ship","approved":true,"action":"advance","responded_by":"--yes-ship"}
+{"v":1,"ts":1791409440,"phase":1,"event":"merge_result","merged":true,"branch":"feature/phase-01"}
+{"v":1,"ts":1791409440,"phase":1,"event":"hook_run","hook":"Merge","ok":true}
+{"v":1,"ts":1791409440,"phase":1,"event":"hook_run","hook":"VersionBump","ok":true}
+{"v":1,"ts":1791409440,"phase":1,"event":"hook_run","hook":"ChangelogAppend","ok":true}
+{"v":1,"ts":1791409440,"phase":1,"event":"hook_run","hook":"BranchCleanup","ok":true}
+{"v":1,"ts":1791409440,"phase":1,"event":"workflow_shipped","stage":"ship"}
+{"v":1,"ts":1791409440,"phase":1,"event":"workflow_finished"}

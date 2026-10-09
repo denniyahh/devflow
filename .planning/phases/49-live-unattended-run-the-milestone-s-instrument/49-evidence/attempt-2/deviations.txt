@@ -1,0 +1,1 @@
+attempt 2: paused at stage ship due to Anthropic 5-hour rolling session limit (resets 17:30 EDT / 21:30 UTC); scheduled resume after quota reset per operator Option 2 choice
