@@ -5,27 +5,27 @@ titles: json
 findings:
   - id: WR-07
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "The detached monitor chain freezes the notify command, so an in-flight run's hook cannot be disabled or rotated (regression for the chain)"
   - id: WR-08
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Two of the four wiring points still fail no test when reverted, contrary to the e2e file's claim"
   - id: WR-09
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "`advance_gate_runs_nothing_without_a_persisted_command` cannot fail"
   - id: IN-06
     severity: info
-    disposition: open
+    disposition: skipped
     title: "The `State::new` purity assertion only fails when the developer's shell exports the variable"
   - id: IN-07
     severity: info
-    disposition: open
+    disposition: fixed
     title: "\"Configured trunk\" wording names a hard-coded constant"
   - id: IN-08
     severity: info
-    disposition: open
+    disposition: fixed
     title: "Non-UTF-8 env values are now run (and persisted) lossily instead of treated as unset"
   - id: CR-01
     severity: critical
@@ -79,7 +79,7 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 6
+open: 0
 total: 19
 recorded: 2026-10-09T17:55:49.924Z
 ---
@@ -88,15 +88,15 @@ recorded: 2026-10-09T17:55:49.924Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-07 | warning | open | - |
-| WR-08 | warning | open | - |
-| WR-09 | warning | open | - |
-| IN-06 | info | open | - |
-| IN-07 | info | open | - |
-| IN-08 | info | open | - |
+| WR-07 | warning | fixed | 9e78c83 strips DEVFLOW_GATE_NOTIFY_CMD from both monitor spawns, the pipe-owning agent and the canary; e2e reads agent environ via /proc |
+| WR-08 | warning | fixed | 9e78c83 header names what is not covered (pipe __monitor re-exec and its agent spawn, staleness.rs call site); revert controls: legacy/canary/precedence caught |
+| WR-09 | warning | fixed | 9e78c83 replaced with advance_gate_prefers_a_set_variable_over_the_persisted_command |
+| IN-06 | info | skipped | assertion is correct but only discriminates when the developer exports the variable; left as documentation of the contract |
+| IN-07 | info | fixed | 9e78c83 wording: the trunk is config::MAIN, a constant |
+| IN-08 | info | fixed | 9e78c83 non-UTF-8 value counts as unset again, with a resolver test case |
 | CR-01 | critical | deferred | routed to inserted Phase 49.1 (Declared Checkpoint Detection), operator decision 2026-10-09 (not in the current review) |
 | CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 (not in the current review) |
-| WR-01 | warning | fixed | af38901 fix(gates): three-state env, start-time capture, one precedence (not in the current review) |
+| WR-01 | warning | fixed | af38901 fix(gates): three-state env, start-time capture, one precedence; chain precedence corrected in 9e78c83 (WR-07); part (d), the state file holding a command DevFlow runs, remains by design and is recorded in 49-SECURITY.md (not in the current review) |
 | WR-02 | warning | fixed | af38901 tests for resolver, monitor precedence, state round-trip, start/advance e2e; workflow Ship prompt test in c5d7d46 (not in the current review) |
 | WR-03 | warning | fixed | c5d7d46 fix(prompt): name the configured trunk in the Ship PR instruction (not in the current review) |
 | WR-04 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); committed evidence re-scanned clean 2026-10-09 (not in the current review) |
