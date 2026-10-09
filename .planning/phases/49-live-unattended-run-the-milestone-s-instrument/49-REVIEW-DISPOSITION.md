@@ -21,7 +21,7 @@ findings:
     title: "Nothing fails if the notify-persistence wiring is reverted; the workflow Ship prompt change is untested"
   - id: WR-03
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Ship prompt hard-codes `main` and a fixture-flavoured branch name for every project"
   - id: WR-04
     severity: warning
@@ -55,7 +55,7 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 4
+open: 3
 total: 13
 recorded: 2026-10-09T01:02:22.981Z
 ---
@@ -68,7 +68,7 @@ recorded: 2026-10-09T01:02:22.981Z
 | CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 |
 | WR-01 | warning | open | - |
 | WR-02 | warning | open | - |
-| WR-03 | warning | open | - |
+| WR-03 | warning | fixed | c5d7d46 fix(prompt): name the configured trunk in the Ship PR instruction |
 | WR-04 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); committed evidence re-scanned clean 2026-10-09 |
 | WR-05 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); no effect on the three recorded attempts |
 | WR-06 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); false-positive only, all attempts report interleaved_windows=0 |
