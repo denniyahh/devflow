@@ -141,9 +141,107 @@ Deviations across the attempts (R-6), each with its cause as recorded in that at
 
 ## DECN-03 (criterion 4)
 
+Read from the closing attempt's committed copy, `49-evidence/attempt-3/`. Paths are relative to it, and session ids are
+the sanitizer's pseudonyms. The evidence standard and classes come from `47-PHASE49-OBSERVATION.md`.
+
+- `auto_decided_events=1`. This counts the `checkpoint_auto_decided` events for phase 1 in
+  `collected/devflow/events.jsonl`. The one event is at ts 1791411642 (2026-10-07T22:20:42Z), `stage` `code`,
+  `session_id` `uuid-2`, `attempt` 1, `policy` `D-03b: Auto-only checkpoint auto-decide`.
+- `code_turn1_capture=collected/devflow/history/phase-01/1791411642266144275-0-stdout`. This is the capture named by the
+  first `capture_archived` event after the auto-decision (stamp `1791411642266144275-0`). It is a stream-json log of 48
+  documents, all `session_id` `uuid-2`. It ends with `DEVFLOW_RESULT: {"status": "failed", ...}`, which reports the
+  `blocking-human` `checkpoint:decision` instead of resolving it, with the reason "This run was not a DevFlow resume
+  targeted at that gate, so it is human-only and was not self-resolved". The same message already says "Merit analysis
+  favors budget-120 (only option within the 90s failover and 240s pager bounds), pending human selection."
+- `resumed_capture=collected/devflow/history/phase-01/1791412108556407377-0-stdout`. It is one JSON document of
+  `type` `result`, with a string `result` and `session_id` `uuid-2`. It was archived when Code went on to Validate (ts
+  1791412108).
+- `session_shared=yes`. The turn-1 capture and the resumed capture both carry `uuid-2`, the session id of the event.
+- `progressed_past_gate=yes`. A `transition` from `code` to `validate` for phase 1 follows the auto-decision at ts
+  1791412108. No `gate_fired` and no second `checkpoint_auto_decided` lies between them.
+- `chosen_option=budget-120`. `git -C ~/.cache/devflow-phase49/attempt-3/project show integration:probe/budget.py` reads
+  `DEFAULT_RETRY_BUDGET_SECS: int = 120`. This read is from the raw checkout, which is not committed. budget-120 is the
+  favoured option. The first-listed option, `budget-30`, was not chosen.
+
+**Which turn carried which rule (the recency position `47-PHASE49-OBSERVATION.md` asks for):**
+- `CODE_STAGE_POLICY` was in Code turn 1. `checkpoint_auto_decide_prompt` was in the resumed turn, the latest turn of the
+  same session.
+- The committed captures do not echo the prompts: they are stream-json output with no replayed user messages. The
+  committed evidence of the resumed turn's prompt is the event's `instruction` field in `collected/devflow/events.jsonl`,
+  which DevFlow truncates. It reads "…You previously stopped at a blocking-human gate, but no human operator is
+  available to answer it — this run is unattended, and none is coming. DevFlow resumed you specifically to resolve that
+  gate…".
+- The placement of both rules was read from the local transcript, which is not committed (`collected/sessions/`, the
+  raw session of the event). The user turn at 2026-10-07T22:19:55Z holds the `CODE_STAGE_POLICY` text ("Unattended
+  decision checkpoints"). The user turn at 22:20:46Z holds the auto-decide prompt.
+- Both texts state the same gate condition through `GATE_RESOLUTION_RULE`. Turn 1 reported the gate, and the resumed
+  turn resolved it. That is what each text asks for in its own turn, so this run cannot separate a recency effect from
+  plain compliance.
+
+decn03_resolution_quote: I chose a 120-second retry budget to resolve the blocking-human decision checkpoint and resumed the plan from there.
+decn03_reasoning_quote: 120 is also the only value that doesn't defeat one of the plan's two stated purposes.
+
+**DECN-03 outcome: Followed**
+
+The event fired, the resumed capture in the event's session carries the concrete resolution and the comparison
+reasoning (a three-option table against the 90-second and 240-second limits), and the run went on past the gate to
+Validate. Scope limit (D-15): this closes DECN-03 for claude alone, on claude 2.1.292. The resume route exists only for
+claude, so no other adapter reached the co-resident prompt.
+
+Flagged for the operator, without reclassifying:
+- The comparison was already written in turn 1, before the auto-decide prompt arrived. The resumed turn acted on a
+  merit analysis that `CODE_STAGE_POLICY`'s turn had produced.
+- The resumed turn says it "didn't independently check the 90 and 240 second figures; the choice depends on them being
+  right".
+- The resumed turn reports that the payload's existing test accepts any of the three offered values, so the test suite
+  would not catch a switch to 30 or 300.
+
 ## SURV-01 (criterion 5)
 
+From the committed `49-evidence/attempt-3/surv/analysis.txt`. That file was derived from the committed `surv/watch.jsonl`
+by `surv-watch.py analyze` (see "The record").
+
+- `writers=7`
+- `temp_writes=34`
+- `interleaved_windows=0`
+- `overflow_windows=0`
+- `stop_marker=present`
+- `advance_failed_events=0`. This counts the `advance_failed` events in `collected/devflow/events.jsonl`.
+
+**Blind spots:**
+- **Void windows:** none listed. `analysis.txt` has no `void window` line, so the watcher recorded no queue overflow.
+- **Watch gap:**
+  - The first record is `watch_added` at 2026-10-07T22:17:53.014Z. By then `.devflow/` already existed: the watcher's
+    `initial` listing shows `.gitignore`, `.lock-01.coord` and `lock-01`, with no `state-01.json` and no state temp
+    file.
+  - `.devflow/`'s creation is therefore not in the log, and the gap between that creation and `watch_added` is not
+    measured. `workflow_started` is at ts 1791411473 (22:17:53Z, one-second resolution).
+- **Stop:** the watch ended with a `stopped` record (`SIGTERM`) at 22:34:27Z, after `workflow_finished` at ts 1791412415
+  (22:33:35Z).
+- **Other attempts:** the watcher in attempts 1 and 2 also reports `interleaved_windows=0` (their committed
+  `surv/analysis.txt`). They are separate runs and are not pooled here.
+
+This is one observation of one run; it establishes nothing about SURV-01's guarantee either way.
+
+As the REQUIREMENTS.md SURV-01 note says, a run with no observed interleaving confirms nothing and must not be written up
+as if it did. Seven writer processes wrote state temp files here, and the watcher saw no two of them open at once. That
+is a record of this run's timing, nothing more. Phase 48's test with its single-writer negative control remains the
+acceptance evidence for SURV-01, and this run does not add to it or weaken it.
+
 ## What this run does not establish
+
+- **One sample.** One gated success (attempt 3), after one stopped attempt and one attempt whose evidence fails the
+  positive arm. It sets no bound on how often an unattended run succeeds.
+- **One agent.** claude 2.1.292 only. No other adapter reaches the resume route, so DECN-03 says nothing about them.
+- **One payload and one base topology.** One single-plan payload (a retry-budget choice with a seeded `blocking-human`
+  checkpoint), and one `integration` base with a PR to `main`. A different plan shape, more phases or another base
+  layout lie outside this run.
+- **A DevFlow built from a fix branch, not a release.** Attempt 3 ran `084625c` from
+  `fix/49-checkpoint-subagent-detection`. That commit is not on `feature/phase-49`, and no release carries it.
+- **Recorded tool versions only.** GSD 1.16.0, gh 2.102.0, git 2.55.0, Python 3.14.8, claude 2.1.292
+  (`identity.txt`). Other versions were not exercised.
+- **Whether attempt 2 counts as unattended.** Its quota pause and operator-scheduled resume are recorded as a deviation.
+  Whether that counts as unattended under D-11/D-28 is undecided.
 
 ## Gap disposition
 
