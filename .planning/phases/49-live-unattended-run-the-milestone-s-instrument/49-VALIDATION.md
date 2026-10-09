@@ -3,9 +3,9 @@ phase: "49"
 slug: "live-unattended-run-the-milestone-s-instrument"
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
+status: validated
 nyquist_compliant: false
-wave_0_complete: false
+wave_0_complete: true
 created: "2026-09-28"
 ---
 
@@ -40,11 +40,39 @@ created: "2026-09-28"
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 49-01-01 | 01 | 1 | REQ-{XX} | T-49-01 / — | {expected secure behavior or "N/A"} | unit | `{command}` | ✅ / ❌ W0 | ⬜ pending |
+| 49-01-01 | 01 | 1 | VERIFY-01 | see 49-01-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 |
+| 49-01-02 | 01 | 1 | VERIFY-01 | see 49-01-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green (stale slice) — gate_rc=1 only because its `### Phase 49:`→`### Phase 50:` slice now includes inserted Phase 49.1; bounded at `### Phase 49.1:` the section has 5 criteria and 0 `49.1`/`landing hop` mentions (2026-10-09) |
+| 49-01-03 | 01 | 1 | VERIFY-01 | see 49-01-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | absent by design (task deletes it) | ✅ green — gate_rc=0 (asserts the plan file is gone) |
+| 49-02-01 | 02 | 1 | VERIFY-01 | see 49-02-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 CHECK passed=20 failed=0; SELFTEST passed=26 failed=0 |
+| 49-02-02 | 02 | 1 | VERIFY-01 | see 49-02-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=26 failed=0 |
+| 49-03-01 | 03 | 1 | VERIFY-01 | see 49-03-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=6 failed=0 |
+| 49-03-02 | 03 | 1 | VERIFY-01 | see 49-03-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=11 failed=0 |
+| 49-04-01 | 04 | 1 | VERIFY-01 | see 49-04-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 after removing a stray gitignored `tools/__pycache__` left by the 2026-10-07 run (2026-10-09) |
+| 49-04-02 | 04 | 1 | VERIFY-01 | see 49-04-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=7 failed=0 |
+| 49-05-01 | 05 | 1 | VERIFY-01 | see 49-05-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=12 failed=0 |
+| 49-05-02 | 05 | 1 | VERIFY-01 | see 49-05-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=12 failed=0 |
+| 49-05-03 | 05 | 1 | VERIFY-01 | see 49-05-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=15 failed=0 |
+| 49-06-01 | 06 | 2 | VERIFY-01 | see 49-06-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=26 failed=0 |
+| 49-06-02 | 06 | 2 | VERIFY-01 | see 49-06-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 CHECK passed=20 failed=0; SELFTEST passed=26 failed=0 |
+| 49-06-03 | 06 | 2 | VERIFY-01 | see 49-06-PLAN threat model | — | selftest+cargo test+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=26 failed=0; one_passed=1 |
+| 49-07-01 | 07 | 2 | VERIFY-01 | see 49-07-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=34 failed=0; SELFTEST passed=8 failed=0 |
+| 49-07-02 | 07 | 2 | VERIFY-01 | see 49-07-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=34 failed=0; SELFTEST passed=8 failed=0 |
+| 49-07-03 | 07 | 2 | VERIFY-01 | see 49-07-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | manual-only — not run: launches real devflow binary under a systemd --user unit (safety rule) |
+| 49-08-01 | 08 | 3 | VERIFY-01 | see 49-08-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=34 failed=0 |
+| 49-08-02 | 08 | 3 | VERIFY-01 | see 49-08-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=34 failed=0 |
+| 49-08-03 | 08 | 3 | VERIFY-01 | see 49-08-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=34 failed=0 |
+| 49-09-01 | 09 | 3 | VERIFY-01 | see 49-09-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | manual-only — not run: real prepare + probe-auth launches claude auth probe via systemd; selftest portion covered by 49-09-02 (17/0) |
+| 49-09-02 | 09 | 3 | VERIFY-01 | see 49-09-PLAN threat model | — | selftest+lint | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 SELFTEST passed=17 failed=0 |
+| 49-10-01 | 10 | 4 | VERIFY-01 | see 49-10-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 |
+| 49-10-02 | 10 | 4 | VERIFY-01 | see 49-10-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 |
+| 49-11-01 | 11 | 5 | VERIFY-01 | see 49-11-PLAN threat model | — | manual checkpoint | plan `<verify>` `<automated>` | n/a | manual-only — not run: blocking-human live attempt checkpoint; its read-only attempt-gate re-run inside 49-12-01 gave verdict=shipped |
+| 49-12-01 | 12 | 6 | VERIFY-01 | see 49-12-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 CHECK passed=11 failed=0; CHECK passed=3 failed=0; CHECK passed=5 failed=0; attempt_gate_verdict=shipped |
+| 49-12-02 | 12 | 6 | VERIFY-01 | see 49-12-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 |
+| 49-12-03 | 12 | 6 | VERIFY-01 | see 49-12-PLAN threat model | — | doc/text gate | plan `<verify>` `<automated>` | ✅ | ✅ green — gate_rc=0 |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
-*The row above is the template placeholder. `/gsd-validate-phase` fills this map from the executed plans (`status: draft` until then); plan-phase does not hand-fill it. Each plan's `<verify>` block is the per-task command in the meantime. (Note added in plan-phase revision, 2026-09-29.)*
+*Filled by `/gsd-validate-phase` on 2026-10-09. Every command was run from a scratch-safe copy with its mktemp dir replaced by a scratch dir and no `rm -rf`; nothing else in the command changed. Text/doc gates show required text is present, not that it is correct.*
 
 ---
 
@@ -63,6 +91,8 @@ created: "2026-09-28"
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
 | Live attempt (criteria 1-5 evidence produced) | VERIFY-01 | a real `devflow start --mode auto` run with operator-answered Define and Code gates (D-18, D-22) | the single `checkpoint:human-action` plan and its runbook; `<verify>` reads the attempt evidence record (R-1) |
+| Attempt negative-control launch (49-07-03) | VERIFY-01 c3 | launches the real devflow binary under a systemd --user unit | the runbook's negctl step; its outcome is checked by `check-evidence.sh --arm negative` (5/0 on attempt 3) |
+| Attempt prepare + auth probe (49-09-01) | VERIFY-01 | real `prepare` plus a claude auth probe through systemd | runbook §prepare; the selftest portion runs in 49-09-02 (17/0) |
 | DECN-03 Followed / Not followed / Void / not exercised | VERIFY-01 c4 | classification is a judgement over the resumed-session capture (`47-PHASE49-OBSERVATION.md`) | collected after the run from `.devflow/history/` and the Claude transcript (R-7) |
 
 *If none: "All phase behaviors have automated verification."*
@@ -79,3 +109,12 @@ created: "2026-09-28"
 - [ ] `nyquist_compliant: true` set in frontmatter
 
 **Approval:** {pending / approved YYYY-MM-DD}
+
+## Validation Audit 2026-10-09
+
+| Metric | Count |
+|---|---|
+| Gaps found | 2 |
+| Resolved | 2 |
+| Escalated | 0 |
+| Manual-only | 3 |
