@@ -369,7 +369,10 @@ fn run_stream_canary(
     // terminal's process group and die with a Ctrl-C like any other
     // foreground child. Group isolation would leave a canary running with
     // nothing left to reap it.
-    let mut child = hermetic_command(program, workdir)
+    let mut canary_cmd = hermetic_command(program, workdir);
+    // No agent process needs the gate notify command (49-REVIEW.md WR-07).
+    monitor::strip_notify_env(&mut canary_cmd);
+    let mut child = canary_cmd
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -1,10 +1,21 @@
-//! 49-REVIEW.md WR-01/WR-02: the persisted gate notify command, pinned at the
-//! CLI boundary so reverting any piece of its wiring fails a test.
+//! 49-REVIEW.md WR-01/WR-02/WR-07: the persisted gate notify command, pinned
+//! at the CLI boundary.
 //!
 //! - `start_*` arms: `devflow start` captures `DEVFLOW_GATE_NOTIFY_CMD` into the
 //!   state file, and an empty value captures nothing.
 //! - `advance_*` arms: a gate fired by `devflow advance` runs the persisted
-//!   command when the variable is unset, and an empty variable disables it.
+//!   command when the variable is unset, an empty variable disables it, and a
+//!   set variable overrides it.
+//! - `agent_*` arms: the coding agent never receives the variable. The legacy
+//!   arm reaches the agent through the detached `sh` monitor, so it also shows
+//!   that chain does not carry it; the default (pipe-owning) arm reaches the
+//!   first agent process `start` launches, which is the delivery canary.
+//!
+//! Not covered here: the pipe-owning `__monitor` re-exec and its agent spawn
+//! (reached only after the canary, which this fixture's agent never answers)
+//! and the build-staleness gate's
+//! call site (`staleness.rs`), which only fires against a stale self-dogfood
+//! build.
 //!
 //! The variable is set or removed on each spawned child only (TEST-01), so the
 //! developer's own shell hook never reaches these runs.
@@ -174,6 +185,16 @@ fn spawn_parked_start(
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
 ) -> ReapOnDrop {
+    spawn_parked_start_with(root, phase, fake_bin, notify, true)
+}
+
+fn spawn_parked_start_with(
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &FakeBin,
+    notify: NotifyEnv<'_>,
+    legacy_launch: bool,
+) -> ReapOnDrop {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
     let mut command = Command::new(devflow_bin());
@@ -187,12 +208,13 @@ fn spawn_parked_start(
             "--mode",
             "auto",
             "--no-worktree",
-            "--legacy-claude-launch",
         ])
+        .args(legacy_launch.then_some("--legacy-claude-launch"))
         .arg(root)
         .current_dir(root)
         .env("PATH", path)
-        .env("DEVFLOW_GATE_TIMEOUT_SECS", "30");
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
+        .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);
     let cache = isolated_cache(&mut command);
     let mut start = ReapOnDrop(command.spawn().expect("spawn foreground start"), cache);
@@ -281,19 +303,29 @@ fn advance_gate_runs_the_persisted_command_when_the_variable_is_unset() {
 }
 
 #[test]
-fn advance_gate_runs_nothing_without_a_persisted_command() {
+fn advance_gate_prefers_a_set_variable_over_the_persisted_command() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
     init_advance_repo(root, phase);
     let sentinel_dir = tempfile::tempdir().unwrap();
+    let persisted = sentinel_dir.path().join("persisted");
+    let overriding = sentinel_dir.path().join("override");
+    let persisted_cmd = format!("touch {}", persisted.display());
+    let override_cmd = format!("touch {}", overriding.display());
 
-    let _advance = spawn_parked_advance(root, phase, None, NotifyEnv::Unset);
+    let _advance = spawn_parked_advance(
+        root,
+        phase,
+        Some(&persisted_cmd),
+        NotifyEnv::Set(&override_cmd),
+    );
     wait_for_notify_fired(root);
 
+    assert!(overriding.exists(), "the set variable must run");
     assert!(
-        fs::read_dir(sentinel_dir.path()).unwrap().next().is_none(),
-        "no notify command is configured, so nothing may run"
+        !persisted.exists(),
+        "the persisted command must not also run"
     );
 }
 
@@ -314,4 +346,115 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
         !sentinel.exists(),
         "an empty DEVFLOW_GATE_NOTIFY_CMD must disable the persisted command"
     );
+}
+
+/// Set on every spawned `start` to the fixture root, so the processes that
+/// test launched can be found (and reaped) by their environment.
+const TEST_MARKER_ENV: &str = "DEVFLOW_NOTIFY_E2E_MARKER";
+
+/// Every live process whose environment carries `marker`, with its argv and
+/// environment entries.
+fn marked_processes(marker: &str) -> Vec<(u32, String, Vec<String>)> {
+    let wanted = format!("{TEST_MARKER_ENV}={marker}");
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").expect("read /proc").flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(environ) = fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        let entries: Vec<String> = environ
+            .split(|byte| *byte == 0)
+            .map(|item| String::from_utf8_lossy(item).into_owned())
+            .collect();
+        if entries.contains(&wanted) {
+            let argv = fs::read(entry.path().join("cmdline"))
+                .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
+                .unwrap_or_default();
+            found.push((pid, argv, entries));
+        }
+    }
+    found
+}
+
+/// Approve the parked Define gate, wait for the monitor chain to launch the
+/// fake agent, and return the agent's environment from `/proc`. Every marked
+/// process is killed before returning.
+fn agent_environment_after_define(root: &Path, phase: PhaseId, fake_bin: &FakeBin) -> Vec<String> {
+    let approve = Command::new(devflow_bin())
+        .args(["gate", "approve", &phase.to_string(), "define"])
+        .arg(root)
+        .output()
+        .expect("run gate approve");
+    assert!(
+        approve.status.success(),
+        "approve failed: {}",
+        String::from_utf8_lossy(&approve.stderr)
+    );
+    let marker = root.to_string_lossy().into_owned();
+    let agent = fake_bin.path.join("claude").to_string_lossy().into_owned();
+    let waited = Instant::now();
+    let environment = loop {
+        if let Some((_, _, entries)) = marked_processes(&marker)
+            .into_iter()
+            .find(|(_, argv, _)| argv.contains(&agent))
+        {
+            break entries;
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(20),
+            "timed out waiting for the monitor chain to launch the agent"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output();
+    for (pid, _, _) in marked_processes(&marker) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    environment
+}
+
+fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(96);
+    init_start_repo(root, phase);
+    let fake_bin = fake_bin_dir();
+    let _start = spawn_parked_start_with(
+        root,
+        phase,
+        &fake_bin,
+        NotifyEnv::Set("touch /nonexistent/notify-sentinel"),
+        legacy_launch,
+    );
+
+    let environment = agent_environment_after_define(root, phase, &fake_bin);
+
+    // Control: a variable set on `start` the same way does reach the agent,
+    // so an absent entry below means stripped, not unread.
+    assert!(
+        environment
+            .iter()
+            .any(|entry| entry == "DEVFLOW_GATE_TIMEOUT_SECS=30"),
+        "control variable missing from the agent environment"
+    );
+    let prefix = format!("{GATE_NOTIFY_CMD_ENV}=");
+    assert!(
+        !environment.iter().any(|entry| entry.starts_with(&prefix)),
+        "the agent must not carry {GATE_NOTIFY_CMD_ENV}"
+    );
+}
+
+#[test]
+fn agent_via_legacy_monitor_never_receives_the_notify_variable() {
+    assert_chain_has_no_notify_variable(true);
+}
+
+#[test]
+fn agent_via_default_launch_canary_never_receives_the_notify_variable() {
+    assert_chain_has_no_notify_variable(false);
 }
