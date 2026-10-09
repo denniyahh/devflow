@@ -397,7 +397,13 @@ pub(crate) fn run_gate_with_timeout(
             "context": context,
         }),
     );
-    gates::fire_gate_notify(state.phase, stage, context, unexpected);
+    gates::fire_gate_notify_with_fallback(
+        state.phase,
+        stage,
+        context,
+        unexpected,
+        state.gate_notify_cmd.as_deref(),
+    );
     events::emit(
         project_root,
         state.phase,
