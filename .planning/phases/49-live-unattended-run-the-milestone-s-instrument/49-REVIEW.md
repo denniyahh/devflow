@@ -1,214 +1,118 @@
 ---
 phase: 49-live-unattended-run-the-milestone-s-instrument
-reviewed: 2026-10-09T00:59:54Z
+reviewed: 2026-10-09T17:53:52Z
 depth: deep
-files_reviewed: 15
+files_reviewed: 6
 files_reviewed_list:
-  - crates/devflow-core/src/agent_result.rs
+  - crates/devflow-cli/src/commands.rs
+  - crates/devflow-cli/tests/gate_notify_persist_e2e.rs
   - crates/devflow-core/src/gates.rs
   - crates/devflow-core/src/monitor.rs
   - crates/devflow-core/src/prompt.rs
   - crates/devflow-core/src/state.rs
-  - crates/devflow-cli/src/pipeline_gate.rs
-  - crates/devflow-cli/src/staleness.rs
-  - scripts/scratch-dogfood-repo.sh
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/check-evidence.sh
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/collect-attempt.sh
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/launch-attempt.sh
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/negctl.sh
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/snapshot-hook.sh
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/sanitize-evidence.py
-  - .planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/surv-watch.py
 findings:
-  critical: 2
-  warning: 6
-  info: 5
-  total: 13
+  critical: 0
+  warning: 3
+  info: 3
+  total: 6
 status: issues_found
 ---
 
-# Phase 49: Code Review Report
+# Phase 49: Code Review Report (incremental re-review)
 
-**Reviewed:** 2026-10-09T00:59:54Z
+**Reviewed:** 2026-10-09T17:53:52Z
 **Depth:** deep
-**Files Reviewed:** 15
+**Files Reviewed:** 6
 **Status:** issues_found
 
 ## Summary
 
-Scope: the two merged crate fixes (`git diff 2d28e3f bbfe6df -- crates`: e3f9ddd checkpoint-in-marker detection, 084625c persisted notify command + Ship PR target) traced into their consumers (`pipeline_launch.rs` GateReview arm, `relaunch_checkpoint_session`, `fire_gate_notify` call sites, monitor spawn), plus the phase-49 scripts and tools as they stand.
+This is an incremental re-review of `git diff df0c4ad HEAD` over the six listed files: commits c5d7d46 (WR-03), af38901 (WR-01, WR-02, IN-02) and 53d7d25 (e2e cache isolation). Call chains were traced into `pipeline_gate.rs`, `staleness.rs`, `git.rs::hermetic_command` and the monitor's `advance` tail.
 
-Two blocking problems:
+New finding IDs continue from the prior review (WR-07 onward, IN-06 onward). The disposition gate drops a recorded decision when an ID is reused, so reusing WR-01..WR-03 would have erased their `fixed` rows.
 
-1. **e3f9ddd adds a free-text substring heuristic to the trigger for checkpoint auto-decide.** The module's own contract says D-02 rejected that kind of predicate. A probe build (a scratch copy of HEAD with extra tests, not committed) confirmed that ordinary failure reasons route into an Auto-mode checkpoint resume. One example is the prose the auto-decide prompt itself asks the agent to write.
-2. **The merged crate commits fail `cargo fmt --check`** (gates.rs, state.rs). That breaks `scripts/check.sh all` and the pre-push container gate. Neither commit is on any remote yet.
+**Do the fixes close their findings?**
 
-On the specific focus questions:
+| Prior finding | Verdict | Basis |
+|---|---|---|
+| CR-02 (fmt) | Closed | `cargo fmt --all -- --check -l` exits 0 at HEAD. `cargo clippy --workspace --all-targets -- -D warnings` is clean on a `git archive` snapshot of HEAD. |
+| WR-01 (a) empty disables | **Partially closed** | Closed for foreground processes. Not closed for the detached monitor chain, where it is now worse than before the fix (WR-07). |
+| WR-01 (b) one precedence | **Partially closed** | The foreground and the *first* monitor spawn now agree. Every later process in the chain resolves from an inherited env value, so it never re-reads the persisted state (WR-07). |
+| WR-01 (c) constructor reads env | Closed | `State::new` sets `None` (state.rs:607). The only capture is in `start` (commands.rs:346). The test that claims to pin this depends on the environment (IN-06). |
+| WR-01 (d) state file is executable input | Not addressed | No change. Recorded as `fixed` with WR-01 as a whole. |
+| WR-02 revert-sensitivity | **Partially closed** | Mutation probe on a HEAD snapshot (full `cargo test --workspace --no-fail-fast`). Reverting the `pipeline_gate.rs` fallback fails `advance_gate_runs_the_persisted_command_when_the_variable_is_unset`; this is the positive control and it discriminates. Removing **both** monitor injection calls fails no new test. Reverting the `staleness.rs` fallback to `None` fails no new test. The e2e file header claims "reverting any piece of its wiring fails a test" (WR-08). One of the five new e2e tests cannot fail (WR-09). |
+| WR-03 hard-coded `main`/`integration` | Closed | The literal `integration` is gone, and `main` is interpolated from `config::MAIN`. Both renderers are asserted by `ship_prompts_name_the_configured_trunk_and_no_fixture_branch`. Wording nit in IN-07. |
+| IN-02 | Closed (by documentation) | Kept as public API, which is reasonable for a published `devflow-core`. The doc now says it ignores the persisted command. |
 
-- **Serde back-compat of `gate_notify_cmd`.** Correct by construction. It has `#[serde(default)]` plus `skip_serializing_if = "Option::is_none"`, and `State` has no `deny_unknown_fields`. Old state files deserialize to `None`, and older binaries ignore the new key. No test pins this. Verified by reading the code, not by a test.
-- **Revert-sensitivity.** The new agent_result tests fail if e3f9ddd is reverted, because the positive case has no `Gate:` line and only the marker path matches it. Reverting the state/monitor/pipeline_gate/staleness half of 084625c fails **no** test (WR-02).
-- **What passed.** `cargo clippy --workspace --all-targets -- -D warnings` passed on a clean HEAD snapshot. The targeted lib tests passed (20/20). Neither shows that the heuristic is correct, only that it compiles and that the cases its author chose pass.
+**What the checks do not establish:**
 
-Known tool defects 999.147–999.150 were not re-reported: sanitizer email redaction vs JSON escapes, collected `.gitignore *`, the checker hiding a repeated gate, and DECN-03 turn placement read from uncommitted transcripts.
-
-## Critical Issues
-
-### CR-01: Marker-reason substring heuristic auto-resumes ordinary failures as blocking-human checkpoints
-
-**File:** `crates/devflow-core/src/agent_result.rs:762-782` (consumed at `crates/devflow-cli/src/pipeline_launch.rs:1777-1893`)
-**Issue:** `marker_reports_human_gate` returns true for any `failed` DEVFLOW_RESULT whose free-text `reason` contains the substring `blocking-human` and any one of `checkpoint`, `gate` or `halted`. `gate` is also a substring of ordinary words such as "investigate", "delegate", "aggregate" and "gateway". The check is wired into `text_reports_human_gate`, so it runs for every top-level stream `result`, for every decoded JSON string in a non-stream capture, and for every plain line. The GateReview arm then auto-resumes the session with `checkpoint_auto_decide_prompt` ("You previously stopped at a blocking-human gate … resolve it yourself") for **any stage**, including Validate, instead of taking the per-stage failure path. It does this up to `MAX_CHECKPOINT_RESUMES` (3) times, emits a `checkpoint_auto_decided` audit event for a checkpoint that was never reached, and only then gates with a misleading "resume ceiling exhausted" reason.
-
-Probe results (scratch copy of HEAD with extra `#[test]`s, run through `blocking_human_checkpoint_reported`):
-
-| Failed-marker reason | Detected as checkpoint |
-|---|---|
-| `Resolved the blocking-human gate by choosing budget-120; cargo test then failed` | **true** |
-| `no blocking-human checkpoint was reached; tests failed` | **true** |
-| `verification failed: SUMMARY does not record the blocking-human decision; investigate` | **true** (only via "investi**gate**") |
-| `cargo test failed in integration suite` (control) | false |
-| `halted at a blocking human checkpoint (Task 1)` | false (a false negative, which is the safe direction) |
-
-The first row is exactly the prose `checkpoint_auto_decide_prompt` (`prompt.rs:616-628`) tells the agent to write: "refer to the gate you resolved in plain prose". The prompt's design note (`prompt.rs:602-608`) relies on prose like `Resolved gate: blocking-human` **not** being detected. After one auto-decide, any later unrelated failure that mentions the resolved gate re-triggers auto-decide. The code also contradicts the function's own documented contract at `agent_result.rs:638-642`: "deliberately does NOT widen into a general 'does this look like a checkpoint' heuristic (D-02 rejected that class of predicate)".
-
-`claude_stream_reports_human_gate` (`agent_result.rs:1564-1571`) uses `.any` over **all** top-level results. An earlier turn's failed marker therefore still counts after the session moved on; the probe confirmed this. The new heuristic widens that exposure.
-
-The static `phase_has_blocking_human_checkpoint` guard does not bound this. It is true for the whole phase whenever any plan declares such a task, and that is exactly when agents are primed by `CODE_STAGE_POLICY` to write "blocking-human" in their reasons.
-
-**Fix:** Replace the prose heuristic with a structured, agent-declared field, and accept it only from the final top-level result. For example, extend the marker schema and the completion protocol:
-```rust
-// AgentResult: add `#[serde(default)] pub checkpoint: Option<String>`
-// COMPLETION_PROTOCOL: "If you stopped at a blocking-human checkpoint, emit
-//   DEVFLOW_RESULT: {\"status\":\"failed\",\"checkpoint\":\"blocking-human\",\"reason\":\"...\"}"
-fn marker_reports_human_gate(text: &str) -> bool {
-    parse_marker_lines(text).is_some_and(|r| {
-        r.status == AgentStatus::Failed && r.checkpoint.as_deref() == Some(HUMAN_GATE_VALUE)
-    })
-}
-```
-If a structured field is not acceptable, at minimum require an anchored token at the start of `reason` (e.g. `reason.starts_with("checkpoint: blocking-human")`), drop the bare `gate` and `halted` alternatives, and add regression tests for the three false-positive rows above. Update the `blocking_human_checkpoint_reported` doc comment and the `prompt.rs:602-608` note so they no longer claim prose is never matched.
-
-### CR-02: Merged fix commits fail `cargo fmt --check` and block the push gate
-
-**File:** `crates/devflow-core/src/gates.rs:402` and `:955-961`, `crates/devflow-core/src/state.rs:603`
-**Issue:** `cargo fmt --all -- --check -l` on HEAD lists `gates.rs` and `state.rs`, with 3 diff hunks. `scripts/check.sh all` runs `cargo fmt --check` first (`scripts/check.sh:31-32`), and so does the pre-push container gate. Commit 084625c introduced both files' diffs. `git branch -r --contains 084625c` is empty, so the fixes have not been through the gate yet. The branch cannot be pushed as it stands.
-**Fix:**
-```bash
-cargo fmt --all && cargo fmt --all -- --check && git commit -am "style(49): rustfmt the notify-fallback fix"
-```
+- The baseline full-workspace run in the scratch snapshot had 7 pre-existing failures in `plan_bashism_scanner.rs`. They appear identically in every mutant run, so they are an artifact of the snapshot rather than of these changes. Mutant verdicts were read as "failures beyond those 7".
+- The WR-07 behaviour is established by reading the code: `hermetic_command` does not scrub the variable (git.rs:87-94), and the shape of the `advance` tail. No live chain run was done.
+- Prior deferred findings (CR-01, WR-04..WR-06, IN-01, IN-03..IN-05) are outside this diff and are not re-reported.
 
 ## Warnings
 
-### WR-01: Persisted notify command has inconsistent precedence and cannot be disabled for an in-flight run
+### WR-07: The detached monitor chain freezes the notify command, so an in-flight run's hook cannot be disabled or rotated (regression for the chain)
 
-**File:** `crates/devflow-core/src/gates.rs:394-407`, `crates/devflow-core/src/monitor.rs:447-449,572-574`, `crates/devflow-core/src/state.rs:429-432,603`
-**Issue:**
-- **(a) An empty env var no longer disables notification.** `fire_gate_notify_with_fallback` treats an empty `DEVFLOW_GATE_NOTIFY_CMD` the same as an unset one and falls back to the persisted command. Before this change, an empty value was the documented way to disable notification (`gates.rs:383`). Now the only way to stop or rotate a bad hook for a running phase is to hand-edit `.devflow/state-NN.json`.
-- **(b) Precedence differs between the foreground and the monitor chain.** In-process, the env var wins over the state value. But `spawn_monitor_inner` calls `.env("DEVFLOW_GATE_NOTIFY_CMD", state value)` *after* `.envs(...)`, so the state value overrides whatever the operator's environment now holds. Every `devflow advance` the monitor runs, which is where Auto-mode gates fire, uses the stale persisted command even after the operator exports a corrected one.
-- **(c) The constructor reads the environment.** `State::new` reads the process environment, so every test that calls `State::new` (dozens across both crates, including `tests/*.rs` e2e binaries) silently captures whatever hook the developer's shell exports.
-- **(d) The state file is now an executable input.** `.devflow/state-NN.json` used to hold data only. It now holds a shell string that DevFlow runs via `sh -c`, and that string may embed webhook tokens.
+**File:** `crates/devflow-core/src/monitor.rs:284-306`, `:471`, `:594`; `crates/devflow-core/src/gates.rs:424-433`; `crates/devflow-core/src/git.rs:87-94`
+**Issue:** Precedence is now "a set env var always wins over the persisted value". The first monitor spawn either injects the persisted value or inherits the operator's value. `hermetic_command` scrubs only git variables, so `DEVFLOW_GATE_NOTIFY_CMD` is then **set** in the monitor and in everything it runs. That includes the `devflow advance` tail, which fires the chain's gates, and the next `spawn_monitor_inner`. There `persisted_notify_cmd_for_child(Some(_), _)` returns `None` and the value is inherited again.
 
-**Fix:** Capture the value at `devflow start` in `commands.rs` (the only production `State::new` caller), not in the constructor. Give the env var three states, so that set-and-empty disables:
+From the first spawn on, every process in the chain resolves the frozen env value, and `state.gate_notify_cmd` is never consulted again:
+- An operator who exports `DEVFLOW_GATE_NOTIFY_CMD=` in their own shell affects only foreground commands. The detached chain is where Auto-mode gates fire.
+- Hand-editing `.devflow/state-NN.json`, to `""` or to a new command, has **no** effect on the chain.
+
+Before af38901, `spawn_monitor_inner` unconditionally re-applied `.env(state value)`. A state edit therefore took effect at the next stage's monitor, and an edit to `""` disabled it via the empty-env fallback. That escape hatch was the one the prior WR-01(a) named, and it is now gone. The only way left to silence a bad or leaking hook is to kill the chain.
+
+The injection is also redundant for DevFlow's own gates. Both production fire sites (`pipeline_gate.rs:400-406`, `staleness.rs:467-473`) already pass `state.gate_notify_cmd` as the fallback, and every chain process loads state from disk. Its only other effect is to place the command, which may embed a webhook token, into the coding agent's environment even when the launching shell did not export it.
+
+The doc comment at monitor.rs:288 ("The chain therefore resolves the same command the foreground does") is true only until the persisted value changes or the operator's env differs.
+**Fix:** Make the persisted state the chain's single source. Strip the variable from the detached child and delete the injection helpers:
 ```rust
-let cmd = match std::env::var_os("DEVFLOW_GATE_NOTIFY_CMD") {
-    Some(v) if v.is_empty() => None,                    // explicit disable
-    Some(v) => Some(v.to_string_lossy().into_owned()),  // operator override
-    None => fallback_cmd.filter(|s| !s.is_empty()).map(str::to_owned),
-};
+// spawn_monitor_inner, both arms, after `.envs(...)`:
+child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
+// every chain process then resolves via fire_gate_notify_with_fallback(.., state.gate_notify_cmd)
+// with the env unset -> the CURRENT persisted value, re-read at each gate.
 ```
-In `monitor.rs`, inject the persisted value only when the parent's env var is absent (`std::env::var_os(..).is_none()`), so that both paths use the same precedence.
+`start` already folds the operator's env, including set-and-empty, into the persisted value, so nothing is lost. Add an e2e that edits the state file between two chain gates and asserts that the second gate uses the edited value, with a control that leaves it unedited. If the env should still be able to override within the chain, document that the chain is deliberately frozen and provide a verb to rotate the hook. Do not leave state edits silently ineffective.
 
-### WR-02: Nothing fails if the notify-persistence wiring is reverted; the workflow Ship prompt change is untested
+### WR-08: Two of the four wiring points still fail no test when reverted, contrary to the e2e file's claim
 
-**File:** `crates/devflow-core/src/state.rs:603`, `crates/devflow-core/src/monitor.rs:447,572`, `crates/devflow-cli/src/pipeline_gate.rs:400-406`, `crates/devflow-cli/src/staleness.rs:467-473`, `crates/devflow-core/src/prompt.rs:571-574`
-**Issue:** `gate_notify_cmd` appears only in production code; `rg` finds no test that references it. The only new notify test (`gates.rs:946-963`) calls the helper directly with an explicit `Some(&cmd)`. Reverting any of the following leaves the suite green:
-- the `State::new` capture
-- either monitor `.env` injection
-- the two call sites switching to the fallback variant
+**File:** `crates/devflow-cli/tests/gate_notify_persist_e2e.rs:1-2`; `crates/devflow-core/src/monitor.rs:471,594`; `crates/devflow-cli/src/staleness.rs:467-473`
+**Issue:** The file header says it pins the persisted command "so reverting any piece of its wiring fails a test", and the disposition marks WR-02 `fixed` on that basis. Measured on a HEAD snapshot with full `cargo test --workspace --no-fail-fast`, comparing against a baseline run and the `pipeline_gate` positive control:
+- **Mutant `monitor`** (both `inject_persisted_notify_cmd(...)` calls replaced with no-ops): no failure beyond baseline. `persisted_notify_cmd_for_child_*` tests only the pure helper, not that either spawn site calls it.
+- **Mutant `staleness`** (`state.gate_notify_cmd.as_deref()` replaced with `None` at the stale-build gate): no failure beyond baseline.
+- **Mutant `pipeline_gate`** (control): `advance_gate_runs_the_persisted_command_when_the_variable_is_unset` fails at :280, so the harness does discriminate.
 
-That is the exact live-run defect this commit claims to fix. No test round-trips the new field or loads a pre-084625c state file. Back-compat is correct by reading, but nothing pins it. `ship_prompt_instructs_pr_targeting_main` covers `ship_stage_prompt` only. The `workflow_ship_prompt` edit (`prompt.rs:571-574`) is not asserted anywhere.
-**Fix:** Add three tests:
-- `run_gate_with_timeout` with the env var removed and `state.gate_notify_cmd = Some("touch <sentinel>")`, asserting the sentinel appears. Include a negative control with `None` that asserts it does not.
-- A state.rs test that deserializes a fixture JSON without `gate_notify_cmd` (expects `None`) and round-trips `Some`.
-- A workflow-root Ship prompt test that asserts the PR-target sentence.
+**Fix:** If WR-07's fix is taken, the monitor test becomes "the chain child has the variable removed". Assert it on the spawned `Command`'s `get_envs()` (an entry of `(GATE_NOTIFY_CMD_ENV, None)`) through a small extracted builder, for both arms. For staleness, add a test that drives the `StalenessOutcome::Block` arm with the env unset and a persisted `touch <sentinel>`, asserting the sentinel exists, plus a `None` control. Until then, narrow the file header's claim to the two call paths it actually pins.
 
-### WR-03: Ship prompt hard-codes `main` and a fixture-flavoured branch name for every project
+### WR-09: `advance_gate_runs_nothing_without_a_persisted_command` cannot fail
 
-**File:** `crates/devflow-core/src/prompt.rs:276-279`, `:571-574`
-**Issue:** Every DevFlow project's Ship prompt now says "target base branch `main` … while DevFlow merges into integration locally". The literal duplicates `config::MAIN` instead of interpolating it. "integration" is the phase-49 scratch repo's branch name; in a default project the base is `develop` or a configured `base_branch`. An agent can read the bare word as a branch name. The instruction also overrides a project's own GSD `git.base_branch`. The phase-49 scaffold already sets that key to `main` for exactly this purpose (`scripts/scratch-dogfood-repo.sh:997,1020`), and the prompt text gives the agent no basis to prefer one over the other.
-**Fix:** Interpolate the constant and the resolved base:
-```rust
-format!("When creating the pull request, target base branch `{main}`; DevFlow merges the phase into `{base}` locally.",
-        main = crate::config::MAIN, base = resolved_base_branch)
-```
-State in the doc comment why the PR base overrides GSD's `git.base_branch`, or drop the override and rely on the GSD config.
-
-### WR-04: Evidence sanitizer passes AWS keys, Slack webhooks, PEM private keys and JWTs
-
-**File:** `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/sanitize-evidence.py:52-75`
-**Issue:** The docstring promises "anything that looks like a credential stops the publish", and this tool is "the only path by which attempt evidence enters the repository". The prefix list covers only `sk-`, `gh[pousr]_` and `Bearer`, and named assignments need a KEY/TOKEN/SECRET/PASSWORD name bound with `:` or `=`. A file containing an `AKIA…` key, a `hooks.slack.com/services/T…/B…/…` URL, an OpenSSH PEM private-key block (header line `BEGIN OPENSSH PRIVATE KEY` between five-dash fences) and an `eyJ…` JWT scanned **clean** (`scan` exit 0). A planted `ghp_` token in the same run was refused (exit 1), so the probe does discriminate.
-**Fix:** Add at least these patterns to `PREFIX_PATTERNS`, with planted-value selftest cases built from fragments as the existing cases are:
-```python
-("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-("slack_token_or_webhook", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}|hooks\.slack\.com/services/[A-Za-z0-9/]{20,}")),
-("private_key_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
-```
-
-### WR-05: `launch-attempt.sh start` wedges the attempt and orphans the watcher if the run unit fails to launch
-
-**File:** `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/launch-attempt.sh:323-330`
-**Issue:** The order is:
-1. start the `p49-aN-surv` unit,
-2. create the `start.stdout` relaunch sentinel,
-3. launch the run unit.
-
-If step 3's `systemd-run` fails (a timeout, or a leftover failed unit with the same name, which `negctl.sh` checks for but `start` does not), `set -e` exits. The watcher is then left running with no run to watch, and every later `start` refuses with `already launched`. The only recovery is deleting the sentinel and stopping the surv unit by hand.
-**Fix:** Check `systemctl --user is-active` for both unit names up front. Launch the run unit first, or trap a launch failure to `systemctl --user stop "p49-a$attempt-surv"` and remove `start.stdout`. Create the sentinel only after the run unit's `systemd-run` succeeds.
-
-### WR-06: `surv-watch.py analyze` reports interleaving against dead writers' orphaned temp files
-
-**File:** `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/surv-watch.py:298-323`
-**Issue:** A state temp window opens on `create` or `initial` and closes only on `moved_from` or `delete`. In two cases the window never closes:
-- A writer killed between `create_new` and `rename` (SIGKILL on the monitor, which the leaked-process history makes plausible).
-- A stale `.state-01.json.<pid>.<seq>.tmp` present when the watch attaches (`initial`).
-
-Every later create by another pid is then counted as an `overlap`, which inflates `interleaved_windows`. That answers SURV-01's question ("two processes held an open write at the same time") with a false positive. The tool states it is observation-only, but the count it prints is wrong.
-**Fix:** Do not let `initial` records open windows; record them as `stale_at_attach`. Report windows that never close as `unclosed` in a separate field, and do not count them in `interleaved_windows`. Optionally record the creator pid's liveness from `/proc/<pid>` at create time, so a dead holder is visible in the analysis.
+**File:** `crates/devflow-cli/tests/gate_notify_persist_e2e.rs:283-298`
+**Issue:** `sentinel_dir` is created and then never referenced by any command: `persisted` is `None` and the env is removed. Nothing in any code path could write into a fresh, unnamed temp directory, so the assertion holds by construction, whatever the notify resolution does. `notify_fired` is emitted unconditionally after the fire call (pipeline_gate.rs:407-412), so the wait also succeeds whether or not a hook ran. The test reads as a negative control but controls nothing. The real negative arm is `advance_gate_with_an_empty_variable_skips_the_persisted_command`.
+**Fix:** Give the test a command that would leave evidence if a stale source leaked through. For example, write `touch <sentinel>` into a source that must be ignored: a pre-existing state field from a previous run that `--force` must not carry, or the parent's own env with only the child's env removed. Then assert the sentinel is absent. Otherwise delete the test rather than keep a test that is green by construction.
 
 ## Info
 
-### IN-01: Merged and stale doc comments around the checkpoint matcher
+### IN-06: The `State::new` purity assertion only fails when the developer's shell exports the variable
 
-**File:** `crates/devflow-core/src/agent_result.rs:604-615,708-732,777`
-**Issue:** The original doc comment of `text_reports_human_gate` (`:708-729`) now sits directly above a second summary paragraph, and both attach to `line_reports_human_gate`. `text_reports_human_gate` (`:777`) has no doc comment at all. The `HUMAN_GATE_VALUE` doc still points readers to "[`text_reports_human_gate`]'s trim set", which now lives in `line_reports_human_gate`.
-**Fix:** Move the long block back onto `line_reports_human_gate` without the duplicate summary. Document `text_reports_human_gate` as "line declaration OR marker" and update the cross-references.
+**File:** `crates/devflow-core/src/state.rs:1366-1369`
+**Issue:** `assert_eq!(state.gate_notify_cmd, None, "State::new must not capture a command")` detects a revert to the env-reading constructor only if `DEVFLOW_GATE_NOTIFY_CMD` is set in the test process. In CI and in the scratch run it is unset, so the revert passes. The guarantee holds today by reading `State::new`, not because this assertion enforces it.
+**Fix:** Run the assertion in a child process with the variable set, for example via the cli crate's `run_test_in_child` pattern or a tiny integration test that spawns with `.env(GATE_NOTIFY_CMD_ENV, "x")`. Alternatively, drop the claim from the test's message.
 
-### IN-02: `fire_gate_notify` has no production callers left
+### IN-07: "Configured trunk" wording names a hard-coded constant
 
-**File:** `crates/devflow-core/src/gates.rs:381-390`
-**Issue:** Both production call sites now use `fire_gate_notify_with_fallback`, and `fire_gate_notify` is referenced only by `gates.rs:942` (a test). A future caller that picks the shorter name silently loses the persisted fallback.
-**Fix:** Remove it and point the test at the fallback variant with `None`, or mark it `#[cfg(test)]`.
+**File:** `crates/devflow-core/src/prompt.rs:236-251`, `:784`
+**Issue:** The doc comment and the test name say "configured trunk", but `config::MAIN` is `pub const MAIN: &str = "main"` (config.rs:39), and no setting can change it. A reader may look for a config key that does not exist. A repository whose trunk is `master` would be told to target a nonexistent `main`. That assumption is project-wide (git-flow uses the same constant), so it is not new here, but the wording hides it.
+**Fix:** Say "the fixed production branch ([`crate::config::MAIN`])" in the doc and the test name.
 
-### IN-03: A kill between `mv` and the ledger append wedges every later snapshot
+### IN-08: Non-UTF-8 env values are now run (and persisted) lossily instead of treated as unset
 
-**File:** `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/snapshot-hook.sh:266-290`
-**Issue:** `seq` is derived from the ledger line count. If `timeout 60` or a crash lands after `mv "$tmp" "$dir"` (`:283`) but before the ledger append (`:290`), every later gate computes the same `seq` and fails "snapshot directory already exists without a ledger line". The window is milliseconds wide.
-**Fix:** Derive `seq` from `max(ledger count, highest existing gates/NNN-*) + 1`, or append the ledger line before the `mv` and mark it pending.
-
-### IN-04: `prepare` pins `$repo/target/debug/devflow` regardless of the configured target dir
-
-**File:** `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/launch-attempt.sh:231-232`
-**Issue:** If `CARGO_TARGET_DIR` or `build.target-dir` is set, the build lands elsewhere. A stale `target/debug/devflow` would then be pinned while `identity.txt` records `build_commit=HEAD`. Neither is set on this host today; checked with `env` and `~/.cargo/config.toml`.
-**Fix:** Take the binary path from `cargo build --message-format=json-render-diagnostics` (the `executable` field), or from `cargo metadata --format-version 1 | jq -r .target_directory`.
-
-### IN-05: `collect-attempt.sh` publishes `verdict.json` before the collection directory
-
-**File:** `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/collect-attempt.sh:348-353`
-**Issue:** `verdict.json` is moved into place before `collected.tmp` is renamed to `collected`. If the second `mv` fails, `launch-attempt.sh prepare` treats the attempt as judged (it gates only on `verdict.json`), even though no finished collection exists.
-**Fix:** Rename `collected.tmp` first and write `verdict.json` last, or have `prepare` also require `collected/DONE`.
+**File:** `crates/devflow-core/src/gates.rs:430`, `crates/devflow-cli/src/commands.rs:346-349`
+**Issue:** The previous code used `std::env::var`, which returns `Err(NotUnicode)`, so a non-UTF-8 value fell through to the fallback. `resolve_gate_notify_cmd` now converts the value with `to_string_lossy`. A command containing invalid bytes is executed with U+FFFD substitutions, and `start` persists that mangled string into the state file. This is an edge case, but it is a silent behaviour change.
+**Fix:** Treat `value.to_str() == None` as an error to warn about, or as unset, rather than running a different command than the operator wrote.
 
 ---
 
-_Reviewed: 2026-10-09T00:59:54Z_
+_Reviewed: 2026-10-09T17:53:52Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_
