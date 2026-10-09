@@ -5,15 +5,15 @@ titles: json
 findings:
   - id: CR-03
     severity: critical
-    disposition: open
+    disposition: fixed
     title: "A notify command set at `resume`/`advance` never reaches the detached chain, so unattended gates go silent for runs whose state holds no command"
   - id: WR-10
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Editing `gate_notify_cmd` while a gate is parked is silently reverted when the gate is answered"
   - id: IN-09
     severity: info
-    disposition: open
+    disposition: fixed
     title: "The new chain-environment e2e leaks the detached chain when it fails"
   - id: WR-07
     severity: warning
@@ -91,7 +91,7 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 3
+open: 0
 total: 22
 recorded: 2026-10-09T18:09:52.991Z
 ---
@@ -100,9 +100,9 @@ recorded: 2026-10-09T18:09:52.991Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-03 | critical | open | - |
-| WR-10 | warning | open | - |
-| IN-09 | info | open | - |
+| CR-03 | critical | fixed | b3f7fdf start/resume/advance apply one rule to the saved command (operator chose the state file as the single source, 2026-10-09); resume and advance e2e arms |
+| WR-10 | warning | fixed | b3f7fdf gate re-reads gate_notify_cmd from disk before its resolution save; in-process test, revert fails it |
+| IN-09 | info | fixed | b3f7fdf MarkedReaper kills marked processes on drop |
 | WR-07 | warning | fixed | 9e78c83 strips DEVFLOW_GATE_NOTIFY_CMD from both monitor spawns, the pipe-owning agent and the canary; e2e reads agent environ via /proc (not in the current review) |
 | WR-08 | warning | fixed | 9e78c83 header names what is not covered (pipe __monitor re-exec and its agent spawn, staleness.rs call site); revert controls: legacy/canary/precedence caught (not in the current review) |
 | WR-09 | warning | fixed | 9e78c83 replaced with advance_gate_prefers_a_set_variable_over_the_persisted_command (not in the current review) |
