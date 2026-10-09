@@ -426,8 +426,12 @@ pub struct State {
     /// the process that recorded it has exited.
     #[serde(default)]
     pub checkpoint_approval: CheckpointApproval,
-    /// Operator-configured gate notify hook command, persisted from DEVFLOW_GATE_NOTIFY_CMD
-    /// across monitor spawns and rate-limit resumes.
+    /// Operator-configured gate notify hook command, captured from
+    /// `DEVFLOW_GATE_NOTIFY_CMD` by `devflow start` (never by [`State::new`],
+    /// so constructing a state never reads the environment) and persisted
+    /// across monitor spawns and rate-limit resumes. A set environment
+    /// variable still takes precedence; see
+    /// [`crate::gates::resolve_gate_notify_cmd`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_notify_cmd: Option<String>,
 }
@@ -600,9 +604,7 @@ impl State {
             // allowed to. Only a state file from an older binary may read
             // Unrecorded (see the field's doc comment).
             checkpoint_approval: CheckpointApproval::Pending,
-            gate_notify_cmd: std::env::var("DEVFLOW_GATE_NOTIFY_CMD")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            gate_notify_cmd: None,
         }
     }
 }
@@ -1348,6 +1350,34 @@ mod tests {
         let legacy: State = serde_json::from_str(&without)
             .expect("a state predating base_branch must still deserialize");
         assert_eq!(legacy.base_branch, None);
+    }
+
+    /// WR-02 (49-REVIEW.md): `gate_notify_cmd` round-trips, a state written
+    /// before the field existed loads as `None`, and an unset value is not
+    /// written at all.
+    #[test]
+    fn gate_notify_cmd_round_trips_and_tolerates_states_predating_the_field() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert_eq!(
+            state.gate_notify_cmd, None,
+            "State::new must not capture a command"
+        );
+        let unset = serde_json::to_string(&state).unwrap();
+        assert!(!unset.contains("gate_notify_cmd"));
+        let legacy: State =
+            serde_json::from_str(&unset).expect("a state without gate_notify_cmd must deserialize");
+        assert_eq!(legacy.gate_notify_cmd, None);
+
+        state.gate_notify_cmd = Some("notify-send gate".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"gate_notify_cmd\":\"notify-send gate\""));
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.gate_notify_cmd.as_deref(), Some("notify-send gate"));
     }
 
     /// A serde-absent `yes_ship` (state written by a pre-23-09 binary) must

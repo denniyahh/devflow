@@ -281,6 +281,30 @@ pub enum MonitorLaunch {
     Legacy,
 }
 
+/// Hand a run's persisted gate notify command to the detached chain, but only
+/// when this process's environment does not set `DEVFLOW_GATE_NOTIFY_CMD`
+/// (49-REVIEW.md WR-01). A set value, including an empty one that disables
+/// notification, is inherited by the child as is. The chain therefore resolves
+/// the same command the foreground does.
+fn inject_persisted_notify_cmd(child_cmd: &mut std::process::Command, state: &State) {
+    let parent = std::env::var_os(crate::gates::GATE_NOTIFY_CMD_ENV);
+    if let Some(notify_cmd) = persisted_notify_cmd_for_child(parent.as_deref(), state) {
+        child_cmd.env(crate::gates::GATE_NOTIFY_CMD_ENV, notify_cmd);
+    }
+}
+
+/// The persisted command to inject into the detached chain, if any: only when
+/// the parent environment leaves `DEVFLOW_GATE_NOTIFY_CMD` unset.
+fn persisted_notify_cmd_for_child<'a>(
+    parent: Option<&std::ffi::OsStr>,
+    state: &'a State,
+) -> Option<&'a str> {
+    match parent {
+        Some(_) => None,
+        None => state.gate_notify_cmd.as_deref(),
+    }
+}
+
 /// Spawn a background monitor that owns the agent for the given workflow state.
 ///
 /// The monitor is a detached process that:
@@ -444,9 +468,7 @@ fn spawn_monitor_inner(
             .args(args)
             .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-        if let Some(notify_cmd) = &state.gate_notify_cmd {
-            child_cmd.env("DEVFLOW_GATE_NOTIFY_CMD", notify_cmd);
-        }
+        inject_persisted_notify_cmd(&mut child_cmd, state);
 
         let child = child_cmd
             .stdin(Stdio::null())
@@ -569,9 +591,7 @@ fn spawn_monitor_inner(
         // the whole monitor chain: sh → agent → its git children (13-06).
         .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-    if let Some(notify_cmd) = &state.gate_notify_cmd {
-        child_cmd.env("DEVFLOW_GATE_NOTIFY_CMD", notify_cmd);
-    }
+    inject_persisted_notify_cmd(&mut child_cmd, state);
 
     let child = child_cmd
         .stdin(Stdio::null())
@@ -1580,6 +1600,32 @@ mod tests {
 
         assert_eq!(args[stage + 1], "code");
         assert!(stage < separator, "stage must be parsed before child argv");
+    }
+
+    /// WR-01 (49-REVIEW.md): the detached chain injects the persisted notify
+    /// command only when the parent environment leaves the variable unset, so
+    /// an operator's override or empty-means-off reaches the chain unchanged.
+    #[test]
+    fn persisted_notify_cmd_is_injected_only_when_the_parent_env_is_unset() {
+        use std::ffi::OsStr;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_in(dir.path());
+        state.gate_notify_cmd = Some("persisted".to_string());
+
+        assert_eq!(
+            persisted_notify_cmd_for_child(None, &state),
+            Some("persisted")
+        );
+        assert_eq!(
+            persisted_notify_cmd_for_child(Some(OsStr::new("override")), &state),
+            None
+        );
+        assert_eq!(
+            persisted_notify_cmd_for_child(Some(OsStr::new("")), &state),
+            None
+        );
+        state.gate_notify_cmd = None;
+        assert_eq!(persisted_notify_cmd_for_child(None, &state), None);
     }
 
     fn state_in(root: &Path) -> State {

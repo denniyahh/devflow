@@ -385,12 +385,17 @@ impl Gates {
 /// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
 /// active [`crate::mode::Mode`] would not normally gate (e.g. a Define/Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
+///
+/// This ignores a run's persisted command (`State::gate_notify_cmd`). DevFlow's
+/// own gates call [`fire_gate_notify_with_fallback`]; this entry point stays
+/// for API compatibility (49-REVIEW.md IN-02).
 pub fn fire_gate_notify(phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
     fire_gate_notify_with_fallback(phase, stage, context, unexpected, None);
 }
 
-/// Fire the operator-configured gate notify hook, checking `DEVFLOW_GATE_NOTIFY_CMD`
-/// first and falling back to `fallback_cmd` if the environment variable is unset or empty.
+/// Fire the operator-configured gate notify hook, resolved by
+/// [`resolve_gate_notify_cmd`] from `DEVFLOW_GATE_NOTIFY_CMD` and the run's
+/// persisted `fallback_cmd`.
 pub fn fire_gate_notify_with_fallback(
     phase: PhaseId,
     stage: Stage,
@@ -398,14 +403,33 @@ pub fn fire_gate_notify_with_fallback(
     unexpected: bool,
     fallback_cmd: Option<&str>,
 ) {
-    let cmd = match std::env::var("DEVFLOW_GATE_NOTIFY_CMD") {
-        Ok(cmd) if !cmd.is_empty() => Some(cmd),
-        _ => fallback_cmd
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string),
+    let env = std::env::var_os(GATE_NOTIFY_CMD_ENV);
+    let Some(cmd) = resolve_gate_notify_cmd(env.as_deref(), fallback_cmd) else {
+        return;
     };
-    let Some(cmd) = cmd else { return };
     run_notify_command(&cmd, phase, stage, context, unexpected);
+}
+
+/// The environment variable that configures the gate notify hook.
+pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
+
+/// Resolve the gate notify command from the environment value and a run's
+/// persisted command (49-REVIEW.md WR-01).
+///
+/// The environment has three states:
+/// - set and non-empty: an operator override, used as is;
+/// - set and empty: notification explicitly disabled, even when a command is
+///   persisted;
+/// - unset: the persisted `fallback_cmd`, if it is non-empty.
+pub fn resolve_gate_notify_cmd(
+    env: Option<&std::ffi::OsStr>,
+    fallback_cmd: Option<&str>,
+) -> Option<String> {
+    match env {
+        Some(value) if value.is_empty() => None,
+        Some(value) => Some(value.to_string_lossy().into_owned()),
+        None => fallback_cmd.filter(|s| !s.is_empty()).map(str::to_owned),
+    }
 }
 
 /// Run the notify `cmd` via `sh -c`, passing gate metadata to the child as
@@ -923,6 +947,28 @@ mod tests {
         );
         run_notify_command(&cmd_expected, PhaseId::new(11), Stage::Ship, "ctx", false);
         assert_eq!(std::fs::read_to_string(&sentinel_expected).unwrap(), "0");
+    }
+
+    /// WR-01 (49-REVIEW.md): set-and-empty disables even when a command is
+    /// persisted; a set value overrides; only an unset variable falls back.
+    #[test]
+    fn notify_cmd_resolution_has_three_environment_states() {
+        use std::ffi::OsStr;
+        let persisted = Some("persisted");
+        assert_eq!(
+            resolve_gate_notify_cmd(Some(OsStr::new("")), persisted),
+            None
+        );
+        assert_eq!(
+            resolve_gate_notify_cmd(Some(OsStr::new("override")), persisted).as_deref(),
+            Some("override")
+        );
+        assert_eq!(
+            resolve_gate_notify_cmd(None, persisted).as_deref(),
+            Some("persisted")
+        );
+        assert_eq!(resolve_gate_notify_cmd(None, Some("")), None);
+        assert_eq!(resolve_gate_notify_cmd(None, None), None);
     }
 
     /// This test mutates process-global env, so it acquires `ENV_MUTEX` to
