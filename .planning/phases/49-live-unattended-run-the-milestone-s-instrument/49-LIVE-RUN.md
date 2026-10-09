@@ -13,7 +13,7 @@ This verdict rests on attempt 3. `check-evidence.sh --attempt-gate` over the raw
 checker modes in place: positive 11/0, negative 5/0, pair 3/0. It is one sample, taken after one stopped attempt and one
 attempt whose evidence fails the positive arm. The binary that shipped was built from `084625c` on
 `fix/49-checkpoint-subagent-detection`. That commit was not on `feature/phase-49` when this record was written.
-**Update 2026-10-09:** merge `bbfe6df` brought both fix commits onto `feature/phase-49`; `git merge-base --is-ancestor` confirms `e3f9ddd` and `084625c` are ancestors of the branch. The only crate change since `084625c` is rustfmt commit `5574841`. The verdict covers that binary; the branch code differs from it by formatting only.
+**Update 2026-10-09:** merge `bbfe6df` brought both fix commits onto `feature/phase-49`; `git merge-base --is-ancestor` confirms `e3f9ddd` and `084625c` are ancestors of the branch. After the merge, review fixes changed the crates again (`c5d7d46`, `af38901`, `53d7d25`, `9e78c83`, `b3f7fdf`): the Ship prompt's PR-base wording, and how the gate notify command reaches a gate (now the run's state file, stripped from the monitor chain and agents). The verdict covers the `084625c` binary. Base-branch resolution, preflight, the fork point, gate firing, `--yes-ship`, the local merge and the checkpoint detector are unchanged apart from formatting, so those observations carry to the branch by code identity; the two changed surfaces are covered by tests only, not by a live run.
 
 ## The record
 
@@ -247,7 +247,7 @@ acceptance evidence for SURV-01, and this run does not add to it or weaken it.
 
 **Blocking defects, fixed during the checkpoint (D-10).** Both fixes are on branch `fix/49-checkpoint-subagent-detection`
 and **neither is merged into `feature/phase-49`** (checked with `git merge-base --is-ancestor` against `feature/phase-49`
-on 2026-10-08). **Update 2026-10-09:** merge `bbfe6df` brought both fix commits onto `feature/phase-49`; `git merge-base --is-ancestor` confirms `e3f9ddd` and `084625c` are ancestors of the branch. The only crate change since `084625c` is rustfmt commit `5574841`. The operator chose the merge on 2026-10-09.
+on 2026-10-08). **Update 2026-10-09:** merge `bbfe6df` brought both fix commits onto `feature/phase-49`; `git merge-base --is-ancestor` confirms `e3f9ddd` and `084625c` are ancestors of the branch. The operator chose the merge on 2026-10-09. Crate changes made after it are listed under "Verdict".
 
 - `e3f9ddd`, "fix(agent_result): recognize blocking-human checkpoint in DEVFLOW_RESULT failure marker". This is the cause
   of attempt 1's stop. Attempt 2 ran a binary built from it.
