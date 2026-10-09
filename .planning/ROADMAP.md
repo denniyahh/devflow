@@ -813,6 +813,21 @@ attempts have `collected/DONE` (IN-05). The run units launched in every attempt 
 **Fix shape (not decided):** per-finding fixes are in `49-REVIEW.md`. Fix before the tools run again, for example in a
 Phase 49.1 live run.
 
+### Phase 999.153: The Test Suite Registers Temp-Dir Roots in the Developer's Real `~/.cache/devflow` (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 close-out cleanup. **Reproduced.**
+
+**Defect:** `~/.cache/devflow/roots/` held 15,363 registry files, of which 15,334 name a `/tmp/.tmp*` project root, which
+is a cargo-test temp dir. Two full `cargo test --workspace` runs on 2026-10-09 added 100 entries; an isolated run of
+`gate_notify_persist_e2e` added none. `registry.rs` resolves `DEVFLOW_CACHE_DIR`, then `XDG_CACHE_HOME`, then `HOME`, so
+any test that drives a registering code path without setting `DEVFLOW_CACHE_DIR` writes to the real cache. The leaked
+entries make `gate sweep` and other root scans walk thousands of dead roots. Which tests leak is not yet pinned down.
+
+**Fix shape (not decided):** find the leaking tests by diffing the cache across per-binary runs, then give each spawned
+child a private `DEVFLOW_CACHE_DIR` (as `gate_notify_persist_e2e` does) or route library tests through `*_in(cache_dir)`.
+Add a guard test that fails when a suite run grows the real cache. Pruning the existing entries is a separate operator
+choice.
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
