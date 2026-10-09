@@ -281,28 +281,16 @@ pub enum MonitorLaunch {
     Legacy,
 }
 
-/// Hand a run's persisted gate notify command to the detached chain, but only
-/// when this process's environment does not set `DEVFLOW_GATE_NOTIFY_CMD`
-/// (49-REVIEW.md WR-01). A set value, including an empty one that disables
-/// notification, is inherited by the child as is. The chain therefore resolves
-/// the same command the foreground does.
-fn inject_persisted_notify_cmd(child_cmd: &mut std::process::Command, state: &State) {
-    let parent = std::env::var_os(crate::gates::GATE_NOTIFY_CMD_ENV);
-    if let Some(notify_cmd) = persisted_notify_cmd_for_child(parent.as_deref(), state) {
-        child_cmd.env(crate::gates::GATE_NOTIFY_CMD_ENV, notify_cmd);
-    }
-}
-
-/// The persisted command to inject into the detached chain, if any: only when
-/// the parent environment leaves `DEVFLOW_GATE_NOTIFY_CMD` unset.
-fn persisted_notify_cmd_for_child<'a>(
-    parent: Option<&std::ffi::OsStr>,
-    state: &'a State,
-) -> Option<&'a str> {
-    match parent {
-        Some(_) => None,
-        None => state.gate_notify_cmd.as_deref(),
-    }
+/// Strip `DEVFLOW_GATE_NOTIFY_CMD` from a detached monitor chain
+/// (49-REVIEW.md WR-07). Every gate in the chain then resolves the command
+/// from the run's state file at the moment it fires, so editing
+/// `gate_notify_cmd` there changes or disables the hook for a run in flight,
+/// and the command (which may carry a webhook token) never reaches the coding
+/// agent's environment. Also applied wherever an agent process is spawned
+/// directly (the pipe-owning agent and the delivery canary). The foreground
+/// `devflow` process keeps the operator's own variable for the gates it fires.
+pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
+    child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
 }
 
 /// Spawn a background monitor that owns the agent for the given workflow state.
@@ -468,7 +456,7 @@ fn spawn_monitor_inner(
             .args(args)
             .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-        inject_persisted_notify_cmd(&mut child_cmd, state);
+        strip_notify_env(&mut child_cmd);
 
         let child = child_cmd
             .stdin(Stdio::null())
@@ -591,7 +579,7 @@ fn spawn_monitor_inner(
         // the whole monitor chain: sh → agent → its git children (13-06).
         .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
-    inject_persisted_notify_cmd(&mut child_cmd, state);
+    strip_notify_env(&mut child_cmd);
 
     let child = child_cmd
         .stdin(Stdio::null())
@@ -1000,7 +988,10 @@ pub fn run_pipe_owning_monitor(
     // to make an append-mode open safe would be an unstated coupling).
     let mut capture = std::fs::File::create(&stdout_file)?;
 
-    let mut child = hermetic_command(program, workdir)
+    let mut agent_cmd = hermetic_command(program, workdir);
+    // The coding agent never needs the gate notify command (WR-07).
+    strip_notify_env(&mut agent_cmd);
+    let mut child = agent_cmd
         .args(args)
         .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
@@ -1602,30 +1593,22 @@ mod tests {
         assert!(stage < separator, "stage must be parsed before child argv");
     }
 
-    /// WR-01 (49-REVIEW.md): the detached chain injects the persisted notify
-    /// command only when the parent environment leaves the variable unset, so
-    /// an operator's override or empty-means-off reaches the chain unchanged.
+    /// WR-07 (49-REVIEW.md): the chain's command never carries the variable.
     #[test]
-    fn persisted_notify_cmd_is_injected_only_when_the_parent_env_is_unset() {
-        use std::ffi::OsStr;
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = state_in(dir.path());
-        state.gate_notify_cmd = Some("persisted".to_string());
-
+    fn strip_notify_env_removes_the_variable_from_the_child() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env(crate::gates::GATE_NOTIFY_CMD_ENV, "touch x");
+        strip_notify_env(&mut cmd);
+        let entry = cmd
+            .get_envs()
+            .find(|(key, _)| *key == crate::gates::GATE_NOTIFY_CMD_ENV);
         assert_eq!(
-            persisted_notify_cmd_for_child(None, &state),
-            Some("persisted")
+            entry,
+            Some((
+                std::ffi::OsStr::new(crate::gates::GATE_NOTIFY_CMD_ENV),
+                None
+            ))
         );
-        assert_eq!(
-            persisted_notify_cmd_for_child(Some(OsStr::new("override")), &state),
-            None
-        );
-        assert_eq!(
-            persisted_notify_cmd_for_child(Some(OsStr::new("")), &state),
-            None
-        );
-        state.gate_notify_cmd = None;
-        assert_eq!(persisted_notify_cmd_for_child(None, &state), None);
     }
 
     fn state_in(root: &Path) -> State {

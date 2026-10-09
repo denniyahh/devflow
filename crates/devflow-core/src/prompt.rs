@@ -235,7 +235,7 @@ fn gsd_command_for(stage: Stage, phase: PhaseId) -> String {
 
 /// The Ship stage's pull-request base instruction, shared by both renderers.
 ///
-/// The PR targets the configured trunk ([`crate::config::MAIN`]), not the
+/// The PR targets the trunk, [`crate::config::MAIN`], not the
 /// base branch DevFlow merges the phase into locally. The instruction is
 /// explicit because GSD's own `git.base_branch` setting alone did not steer the
 /// PR: in Phase 49 attempt 2 it was set to `main` and the PR still targeted the
@@ -777,11 +777,11 @@ mod tests {
         );
     }
 
-    /// WR-03 (49-REVIEW.md): both Ship renderers name the configured trunk
+    /// WR-03 (49-REVIEW.md): both Ship renderers name the trunk (`config::MAIN`)
     /// and never a fixture branch name such as the phase-49 scratch repo's
     /// `integration`.
     #[test]
-    fn ship_prompts_name_the_configured_trunk_and_no_fixture_branch() {
+    fn ship_prompts_name_the_trunk_and_no_fixture_branch() {
         let intent = StageIntent::for_stage(Stage::Ship, PhaseId::new(13));
         let expected = format!("target base branch `{}`", crate::config::MAIN);
         for prompt in [
@@ -790,7 +790,7 @@ mod tests {
         ] {
             assert!(
                 prompt.contains(&expected),
-                "Ship prompt must target the configured trunk: {prompt}"
+                "Ship prompt must target the trunk: {prompt}"
             );
             assert!(
                 !prompt.contains("integration"),

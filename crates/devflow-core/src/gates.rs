@@ -421,14 +421,17 @@ pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
 /// - set and empty: notification explicitly disabled, even when a command is
 ///   persisted;
 /// - unset: the persisted `fallback_cmd`, if it is non-empty.
+///
+/// A value that is not valid UTF-8 counts as unset, as it did before this
+/// resolver existed, rather than being run with replacement characters.
 pub fn resolve_gate_notify_cmd(
     env: Option<&std::ffi::OsStr>,
     fallback_cmd: Option<&str>,
 ) -> Option<String> {
-    match env {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(value.to_string_lossy().into_owned()),
-        None => fallback_cmd.filter(|s| !s.is_empty()).map(str::to_owned),
+    match env.map(|value| value.to_str()) {
+        Some(Some("")) => None,
+        Some(Some(value)) => Some(value.to_owned()),
+        Some(None) | None => fallback_cmd.filter(|s| !s.is_empty()).map(str::to_owned),
     }
 }
 
@@ -969,6 +972,13 @@ mod tests {
         );
         assert_eq!(resolve_gate_notify_cmd(None, Some("")), None);
         assert_eq!(resolve_gate_notify_cmd(None, None), None);
+        // IN-08: non-UTF-8 counts as unset.
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = OsStr::from_bytes(b"touch \xff");
+        assert_eq!(
+            resolve_gate_notify_cmd(Some(invalid), persisted).as_deref(),
+            Some("persisted")
+        );
     }
 
     /// This test mutates process-global env, so it acquires `ENV_MUTEX` to
