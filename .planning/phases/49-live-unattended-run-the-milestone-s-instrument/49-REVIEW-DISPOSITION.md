@@ -3,6 +3,30 @@ phase: 49
 review: 49-REVIEW.md
 titles: json
 findings:
+  - id: WR-07
+    severity: warning
+    disposition: open
+    title: "The detached monitor chain freezes the notify command, so an in-flight run's hook cannot be disabled or rotated (regression for the chain)"
+  - id: WR-08
+    severity: warning
+    disposition: open
+    title: "Two of the four wiring points still fail no test when reverted, contrary to the e2e file's claim"
+  - id: WR-09
+    severity: warning
+    disposition: open
+    title: "`advance_gate_runs_nothing_without_a_persisted_command` cannot fail"
+  - id: IN-06
+    severity: info
+    disposition: open
+    title: "The `State::new` purity assertion only fails when the developer's shell exports the variable"
+  - id: IN-07
+    severity: info
+    disposition: open
+    title: "\"Configured trunk\" wording names a hard-coded constant"
+  - id: IN-08
+    severity: info
+    disposition: open
+    title: "Non-UTF-8 env values are now run (and persisted) lossily instead of treated as unset"
   - id: CR-01
     severity: critical
     disposition: deferred
@@ -55,28 +79,34 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 0
-total: 13
-recorded: 2026-10-09T01:02:22.981Z
+open: 6
+total: 19
+recorded: 2026-10-09T17:55:49.924Z
 ---
 
 # Phase 49: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-01 | critical | deferred | routed to inserted Phase 49.1 (Declared Checkpoint Detection), operator decision 2026-10-09 |
-| CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 |
-| WR-01 | warning | fixed | af38901 fix(gates): three-state env, start-time capture, one precedence |
-| WR-02 | warning | fixed | af38901 tests for resolver, monitor precedence, state round-trip, start/advance e2e; workflow Ship prompt test in c5d7d46 |
-| WR-03 | warning | fixed | c5d7d46 fix(prompt): name the configured trunk in the Ship PR instruction |
-| WR-04 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); committed evidence re-scanned clean 2026-10-09 |
-| WR-05 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); no effect on the three recorded attempts |
-| WR-06 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); false-positive only, all attempts report interleaved_windows=0 |
-| IN-01 | info | deferred | Phase 49.1 replaces the checkpoint matcher these comments describe |
-| IN-02 | info | fixed | af38901 kept for API compatibility, documented as ignoring the persisted command |
-| IN-03 | info | deferred | backlog 999.152 (phase-49 tooling robustness) |
-| IN-04 | info | deferred | backlog 999.152 (phase-49 tooling robustness) |
-| IN-05 | info | deferred | backlog 999.152 (phase-49 tooling robustness); all attempts have collected/DONE |
+| WR-07 | warning | open | - |
+| WR-08 | warning | open | - |
+| WR-09 | warning | open | - |
+| IN-06 | info | open | - |
+| IN-07 | info | open | - |
+| IN-08 | info | open | - |
+| CR-01 | critical | deferred | routed to inserted Phase 49.1 (Declared Checkpoint Detection), operator decision 2026-10-09 (not in the current review) |
+| CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 (not in the current review) |
+| WR-01 | warning | fixed | af38901 fix(gates): three-state env, start-time capture, one precedence (not in the current review) |
+| WR-02 | warning | fixed | af38901 tests for resolver, monitor precedence, state round-trip, start/advance e2e; workflow Ship prompt test in c5d7d46 (not in the current review) |
+| WR-03 | warning | fixed | c5d7d46 fix(prompt): name the configured trunk in the Ship PR instruction (not in the current review) |
+| WR-04 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); committed evidence re-scanned clean 2026-10-09 (not in the current review) |
+| WR-05 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); no effect on the three recorded attempts (not in the current review) |
+| WR-06 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); false-positive only, all attempts report interleaved_windows=0 (not in the current review) |
+| IN-01 | info | deferred | Phase 49.1 replaces the checkpoint matcher these comments describe (not in the current review) |
+| IN-02 | info | fixed | af38901 kept for API compatibility, documented as ignoring the persisted command (not in the current review) |
+| IN-03 | info | deferred | backlog 999.152 (phase-49 tooling robustness) (not in the current review) |
+| IN-04 | info | deferred | backlog 999.152 (phase-49 tooling robustness) (not in the current review) |
+| IN-05 | info | deferred | backlog 999.152 (phase-49 tooling robustness); all attempts have collected/DONE (not in the current review) |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
