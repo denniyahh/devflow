@@ -5,11 +5,11 @@ titles: json
 findings:
   - id: CR-01
     severity: critical
-    disposition: open
+    disposition: deferred
     title: "Marker-reason substring heuristic auto-resumes ordinary failures as blocking-human checkpoints"
   - id: CR-02
     severity: critical
-    disposition: open
+    disposition: fixed
     title: "Merged fix commits fail `cargo fmt --check` and block the push gate"
   - id: WR-01
     severity: warning
@@ -64,8 +64,8 @@ recorded: 2026-10-09T01:02:22.981Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-01 | critical | open | - |
-| CR-02 | critical | open | - |
+| CR-01 | critical | deferred | routed to inserted Phase 49.1 (Declared Checkpoint Detection), operator decision 2026-10-09 |
+| CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 |
 | WR-01 | warning | open | - |
 | WR-02 | warning | open | - |
 | WR-03 | warning | open | - |

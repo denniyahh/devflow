@@ -331,6 +331,16 @@ recorded different events. `sync-workspace.sh` merges `develop` into the workspa
 the Phase 49 worktree's planning commits by itself. If verification or `phase.complete` writes more planning commits
 after this merge-back, repeat the merge-back and check rather than treating the first one as final.
 
+### Phase 49.1: Declared Checkpoint Detection (INSERTED)
+
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
+**Depends on:** Phase 49
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 49.1 to break down)
+
 ### Phase 50: Addressable Monitor Liveness
 
 **Goal**: "Is this run's monitor alive?" is answerable from disk state alone without a PID, in three

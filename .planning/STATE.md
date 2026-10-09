@@ -7,16 +7,16 @@ current_phase_name: Live Unattended Run — The Milestone's Instrument
 current_plan: 12
 status: verifying
 stopped_at: Completed 49-12-PLAN.md
-last_updated: "2026-10-09T00:48:44.351Z"
+last_updated: "2026-10-09T01:17:11.989Z"
 last_activity: 2026-10-09
 last_activity_desc: 49-12 closed — 49-LIVE-RUN.md written (VERIFY-01 met on attempt 3, DECN-03 Followed); 12 of 12 plans; phase verification next
-state_head: 1a71ffe2826b60bdce4dbdfd3bfc2814643206ed
+state_head: 557484109e833e3e67f940b13cc60f3ab5d8d268
 progress:
-  total_phases: 6
+  total_phases: 7
   completed_phases: 3
   total_plans: 48
   completed_plans: 48
-  percent: 50
+  percent: 43
 ---
 
 # DevFlow — Project State
@@ -206,7 +206,7 @@ backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scann
 by the scanner's staged-only scope.
 Last activity: 2026-10-09 — 49-12 closed: 49-LIVE-RUN.md written (VERIFY-01 met on attempt 3, DECN-03 Followed), evidence committed sanitized, 999.147-999.150 filed; 12 of 12 plans; phase verification next
 
-Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
+Progress: [████░░░░░░] 43% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
 
 ## Recently Shipped
 
@@ -981,3 +981,4 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 - Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in
 - 999.97 filed and hotfixed (2026-08-07), no phase cycle: `devflow start --phase 35.1` was rejected by clap (`invalid digit found in string`) — the phase identifier was `u32` at 182 sites and `prompt.rs` globbed it as `{phase:02}`, so decimal phases could not be launched at all. Briefly filed as Phase 37 via `phase.add` and then withdrawn on the operator's call to fix it directly. Recording the tool defect while it is fresh: `phase.add` again placed the new entry at the document's last `---` (inside archived 999.25 prose, outside the active milestone window) and wrote neither the phase-table nor the Progress-table row.
 - Phase 49 edited: edited fields: goal, success_criteria (criterion 1), execution note — Phase 49 re-scoped to a disposable GSD project with one operator checkpoint per attempt (operator, 2026-09-28)
+- Phase 49.1 inserted after Phase 49: Declared checkpoint detection: replace e3f9ddd's prose heuristic (agent_result.rs marker_reports_human_gate auto-resumes any Failed reason containing blocking-human plus gate/checkpoint/halted) with an explicit checkpoint field in the DEVFLOW_RESULT marker; fixes 49-REVIEW.md CR-01; decide whether a new live attempt is needed, since Phase 49's VERIFY-01 evidence ran the heuristic binary (084625c) (URGENT)
