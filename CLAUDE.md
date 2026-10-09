@@ -5,6 +5,7 @@ Deliberately minimal. Global agent rules live in `~/.config/agents/AGENTS.md`; t
 ## Crate Topology
 - `crates/devflow-core`: Core state machine, pipeline engines, and workflow abstractions (`lib`).
 - `crates/devflow-cli`: CLI interface and driver commands (`bin: devflow`).
+- `devflow-core` is published on crates.io, so changing or removing a `pub` item or variant is a semver change. Prefer an additive change, and run `cargo semver-checks check-release -p devflow-core` before committing one.
 
 ## Canonical Verification & Test Commands
 Always run targeted package tests first, then full workspace validation:
