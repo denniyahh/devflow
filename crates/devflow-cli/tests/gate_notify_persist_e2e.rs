@@ -97,8 +97,22 @@ fn fake_bin_dir() -> FakeBin {
 }
 
 /// Owns a spawned `devflow` process so a panicking assertion never leaks a
-/// parked process for the length of its gate timeout.
-struct ReapOnDrop(Child);
+/// parked process for the length of its gate timeout, and the private cache
+/// directory it registers in (`Drop::drop` reaps the child before the field
+/// is removed).
+struct ReapOnDrop(
+    Child,
+    #[expect(dead_code, reason = "held only so the cache dir outlives the child")]
+    tempfile::TempDir,
+);
+
+/// A private `DEVFLOW_CACHE_DIR` for one spawned child, so its root
+/// registration never lands in the developer's real `~/.cache/devflow`.
+fn isolated_cache(command: &mut Command) -> tempfile::TempDir {
+    let cache = tempfile::tempdir().unwrap();
+    command.env("DEVFLOW_CACHE_DIR", cache.path());
+    cache
+}
 
 impl Drop for ReapOnDrop {
     fn drop(&mut self) {
@@ -180,7 +194,8 @@ fn spawn_parked_start(
         .env("PATH", path)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30");
     apply_notify_env(&mut command, notify);
-    let mut start = ReapOnDrop(command.spawn().expect("spawn foreground start"));
+    let cache = isolated_cache(&mut command);
+    let mut start = ReapOnDrop(command.spawn().expect("spawn foreground start"), cache);
     wait_until_parked(
         &mut start,
         &Gates::gate_path(root, phase, Stage::Define),
@@ -205,7 +220,8 @@ fn spawn_parked_advance(
         .arg(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30");
     apply_notify_env(&mut command, notify);
-    let mut advance = ReapOnDrop(command.spawn().expect("spawn foreground advance"));
+    let cache = isolated_cache(&mut command);
+    let mut advance = ReapOnDrop(command.spawn().expect("spawn foreground advance"), cache);
     wait_until_parked(
         &mut advance,
         &Gates::gate_path(root, phase, Stage::Code),
