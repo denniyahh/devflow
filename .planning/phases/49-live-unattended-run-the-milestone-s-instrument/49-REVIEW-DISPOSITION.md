@@ -3,6 +3,18 @@ phase: 49
 review: 49-REVIEW.md
 titles: json
 findings:
+  - id: CR-03
+    severity: critical
+    disposition: open
+    title: "A notify command set at `resume`/`advance` never reaches the detached chain, so unattended gates go silent for runs whose state holds no command"
+  - id: WR-10
+    severity: warning
+    disposition: open
+    title: "Editing `gate_notify_cmd` while a gate is parked is silently reverted when the gate is answered"
+  - id: IN-09
+    severity: info
+    disposition: open
+    title: "The new chain-environment e2e leaks the detached chain when it fails"
   - id: WR-07
     severity: warning
     disposition: fixed
@@ -79,21 +91,24 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 0
-total: 19
-recorded: 2026-10-09T17:55:49.924Z
+open: 3
+total: 22
+recorded: 2026-10-09T18:09:52.991Z
 ---
 
 # Phase 49: Code Review Disposition
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| WR-07 | warning | fixed | 9e78c83 strips DEVFLOW_GATE_NOTIFY_CMD from both monitor spawns, the pipe-owning agent and the canary; e2e reads agent environ via /proc |
-| WR-08 | warning | fixed | 9e78c83 header names what is not covered (pipe __monitor re-exec and its agent spawn, staleness.rs call site); revert controls: legacy/canary/precedence caught |
-| WR-09 | warning | fixed | 9e78c83 replaced with advance_gate_prefers_a_set_variable_over_the_persisted_command |
-| IN-06 | info | skipped | assertion is correct but only discriminates when the developer exports the variable; left as documentation of the contract |
-| IN-07 | info | fixed | 9e78c83 wording: the trunk is config::MAIN, a constant |
-| IN-08 | info | fixed | 9e78c83 non-UTF-8 value counts as unset again, with a resolver test case |
+| CR-03 | critical | open | - |
+| WR-10 | warning | open | - |
+| IN-09 | info | open | - |
+| WR-07 | warning | fixed | 9e78c83 strips DEVFLOW_GATE_NOTIFY_CMD from both monitor spawns, the pipe-owning agent and the canary; e2e reads agent environ via /proc (not in the current review) |
+| WR-08 | warning | fixed | 9e78c83 header names what is not covered (pipe __monitor re-exec and its agent spawn, staleness.rs call site); revert controls: legacy/canary/precedence caught (not in the current review) |
+| WR-09 | warning | fixed | 9e78c83 replaced with advance_gate_prefers_a_set_variable_over_the_persisted_command (not in the current review) |
+| IN-06 | info | skipped | assertion is correct but only discriminates when the developer exports the variable; left as documentation of the contract (not in the current review) |
+| IN-07 | info | fixed | 9e78c83 wording: the trunk is config::MAIN, a constant (not in the current review) |
+| IN-08 | info | fixed | 9e78c83 non-UTF-8 value counts as unset again, with a resolver test case (not in the current review) |
 | CR-01 | critical | deferred | routed to inserted Phase 49.1 (Declared Checkpoint Detection), operator decision 2026-10-09 (not in the current review) |
 | CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 (not in the current review) |
 | WR-01 | warning | fixed | af38901 fix(gates): three-state env, start-time capture, one precedence; chain precedence corrected in 9e78c83 (WR-07); part (d), the state file holding a command DevFlow runs, remains by design and is recorded in 49-SECURITY.md (not in the current review) |
