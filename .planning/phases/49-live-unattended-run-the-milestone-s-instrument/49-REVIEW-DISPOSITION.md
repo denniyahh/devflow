@@ -13,11 +13,11 @@ findings:
     title: "Merged fix commits fail `cargo fmt --check` and block the push gate"
   - id: WR-01
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Persisted notify command has inconsistent precedence and cannot be disabled for an in-flight run"
   - id: WR-02
     severity: warning
-    disposition: open
+    disposition: fixed
     title: "Nothing fails if the notify-persistence wiring is reverted; the workflow Ship prompt change is untested"
   - id: WR-03
     severity: warning
@@ -41,7 +41,7 @@ findings:
     title: "Merged and stale doc comments around the checkpoint matcher"
   - id: IN-02
     severity: info
-    disposition: open
+    disposition: fixed
     title: "`fire_gate_notify` has no production callers left"
   - id: IN-03
     severity: info
@@ -55,7 +55,7 @@ findings:
     severity: info
     disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 3
+open: 0
 total: 13
 recorded: 2026-10-09T01:02:22.981Z
 ---
@@ -66,14 +66,14 @@ recorded: 2026-10-09T01:02:22.981Z
 |---------|----------|-------------|--------|
 | CR-01 | critical | deferred | routed to inserted Phase 49.1 (Declared Checkpoint Detection), operator decision 2026-10-09 |
 | CR-02 | critical | fixed | 5574841 style(49): apply rustfmt — cargo fmt --check exit 0 |
-| WR-01 | warning | open | - |
-| WR-02 | warning | open | - |
+| WR-01 | warning | fixed | af38901 fix(gates): three-state env, start-time capture, one precedence |
+| WR-02 | warning | fixed | af38901 tests for resolver, monitor precedence, state round-trip, start/advance e2e; workflow Ship prompt test in c5d7d46 |
 | WR-03 | warning | fixed | c5d7d46 fix(prompt): name the configured trunk in the Ship PR instruction |
 | WR-04 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); committed evidence re-scanned clean 2026-10-09 |
 | WR-05 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); no effect on the three recorded attempts |
 | WR-06 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); false-positive only, all attempts report interleaved_windows=0 |
 | IN-01 | info | deferred | Phase 49.1 replaces the checkpoint matcher these comments describe |
-| IN-02 | info | open | - |
+| IN-02 | info | fixed | af38901 kept for API compatibility, documented as ignoring the persisted command |
 | IN-03 | info | deferred | backlog 999.152 (phase-49 tooling robustness) |
 | IN-04 | info | deferred | backlog 999.152 (phase-49 tooling robustness) |
 | IN-05 | info | deferred | backlog 999.152 (phase-49 tooling robustness); all attempts have collected/DONE |
