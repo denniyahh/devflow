@@ -245,4 +245,84 @@ acceptance evidence for SURV-01, and this run does not add to it or weaken it.
 
 ## Gap disposition
 
+**Blocking defects, fixed during the checkpoint (D-10).** Both fixes are on branch `fix/49-checkpoint-subagent-detection`
+and **neither is merged into `feature/phase-49`** (checked with `git merge-base --is-ancestor` against `feature/phase-49`
+on 2026-10-08). The code that shipped in attempt 3 is therefore not the code on this branch. Routing these commits into
+the branch is a close-out decision for the operator.
+
+- `e3f9ddd`, "fix(agent_result): recognize blocking-human checkpoint in DEVFLOW_RESULT failure marker". This is the cause
+  of attempt 1's stop. Attempt 2 ran a binary built from it.
+- `084625c`, "fix(49): persist gate notify command and instruct PR targeting main on ship". Attempt 3 ran a binary built
+  from it. In attempt 2, the run before this commit, the Ship gate fired after the rate-limit relaunch with no snapshot,
+  and the PR targeted `integration`. That this commit is what fixed both is inferred from its title and has not been
+  verified.
+
+**Non-blocking findings, each filed as a backlog entry:**
+
+- **999.147.** `sanitize-evidence.py`'s email redaction swallows a JSON escape letter, so two committed attempt-3
+  captures are invalid JSON (see "The record").
+- **999.148.** The collected evidence carries DevFlow's `.gitignore` (`*`). A plain `git add` would have committed
+  nothing under `collected/devflow/`, while this plan's on-disk gates still passed. It was worked around here by
+  excluding the file.
+- **999.149.** `check-evidence.sh` labels a repeated stage gate `unexpected=false`. Attempt 1's second Code gate printed
+  no `NOTE deviation`, and the deviation reached the record only through `deviations.txt`.
+- **999.150.** Archived stage captures do not keep each turn's prompt. DECN-03's "which turn carried which rule" rests on
+  the uncommitted transcript.
+
+**Reviewed and not filed, with the reason:**
+
+- **Attempt 2's Ship-stage rate limit.** The committed events show DevFlow handled it on its own path:
+  - `advance_evaluated` with `status` `ratelimited` and reason `rate limited until 1791408600`;
+  - `rate_limit_resume_scheduled`;
+  - `cron_instructions_consumed` with `trigger` `resume_consumed`;
+  - a Ship relaunch at ts 1791408678.
+
+  The open question is a ruling, not a defect: does the pause and resume count as unattended, and does attempt 2 count
+  toward the D-11 cap? Both are **undecided**.
+- **Positive-arm warning, all three attempts.** `warning: build provenance staleness check did not confirm a fresh
+  build for stage define — proceeding` appears in `start.stdout`. The warning itself cites D-18: only DevFlow's own
+  workspace is hard-blocked.
+- **Negative-arm warnings, all three attempts.** `warning: could not fetch \`origin develop\` …` and `warning: could not
+  determine whether \`develop\` is current with \`origin/develop\` …` appear in `negctl/start.stdout`. The scratch
+  repository has no remote, and the check is fail-open by its stated contract.
+- **Preflight gates logged as failures.** The never-silent log line reads `define failed in Auto mode`, and each
+  preflight gate event carries `unexpected: true`. Both Define and Code gates are by design (D-22: the payload seeds a
+  `blocking-human` checkpoint). The wording is misleading but not wrong about what fired. Kept here, without an entry.
+- **Attempt 1's `collected/absent.txt` items** (`integration_merge ABSENT`, `pr.json ABSENT`). These follow from its
+  stop before Ship. Attempts 2 and 3 have empty `absent.txt`.
+- **Observations the agent reported about the payload's GSD tooling, in attempt 3's resumed capture:**
+  - review scoping fell back to the whole repository;
+  - the post-wave test check detects no runner without `pyproject.toml` or a `Makefile`;
+  - `.planning/config.json` showed `_auto_chain_active: true` at the run's start.
+
+  These are agent-reported and not checked by this plan. The first two concern upstream GSD, not DevFlow.
+- **The Ship entry's `"non_silent":"0"` in attempt 3's ledger.** Recorded as an observation only (see "Gates").
+  This plan does not interpret it.
+
+There are no `hook-errors.log` files in any attempt.
+
 ## Cleanup pending (operator)
+
+Everything below is the operator's, one-way, and pending until **Phase 49 verification** has passed and this record's
+evidence is verified (49-RUNBOOK.md, "Cleanup"). None of it was performed by plan 49-12. For each attempt `N` in 1, 2, 3:
+
+1. Stop and reset this attempt's units only. `units.txt` names them:
+   `systemctl --user stop p49-a<N>-start p49-a<N>-surv p49-a<N>-negctl`, then
+   `systemctl --user reset-failed p49-a<N>-start p49-a<N>-surv p49-a<N>-negctl`.
+   The auth-probe unit `p49-a<N>-authprobe` is transient and should have self-collected; confirm it is gone. Their
+   current state was not checked by this plan. Confirm no monitor or agent process survives.
+2. Run `gate sweep` restricted to this project: `"$BIN" gate sweep --root ~/.cache/devflow-phase49/attempt-<N>/project`.
+3. Remove only the stale registry entry under `~/.cache/devflow/roots/` whose `project_root` is that attempt's
+   `project/` and whose phase is 1. Never sweep other entries.
+4. **After Phase 49 verification only.** Run `gh auth refresh -s delete_repo`, then confirm each name with
+   `gh repo view`, then delete it with `gh repo delete <nameWithOwner> --yes`. The names come from each attempt's
+   `prelaunch/repo.json`:
+   - `denniyahh/p49-live-attempt-1` (no PR was opened; `pr.json` ABSENT);
+   - `denniyahh/p49-live-attempt-2` (PR #1 OPEN, base `integration`);
+   - `denniyahh/p49-live-attempt-3` (PR #1 OPEN, base `main`).
+
+   Deleting a repository destroys its branch and PR history permanently.
+5. Last, remove each local attempt directory `~/.cache/devflow-phase49/attempt-<N>/`. It holds `project/`,
+   `negctl/repo/`, `prelaunch/agent-env-names.txt` and the full transcripts under `collected/sessions/`, none of which
+   are committed. Remove only after confirming `N`, the path, `attempt.json` and the committed sanitized copy. Never
+   remove by wildcard. The pinned binaries under `~/.cache/devflow-phase49/bin/` go once no record needs them.

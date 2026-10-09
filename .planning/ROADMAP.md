@@ -711,6 +711,65 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.147: `sanitize-evidence.py`'s Email Redaction Swallows a JSON Escape Letter and Leaves Invalid JSON (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12, while reading attempt 3's committed captures (`49-LIVE-RUN.md`, "Gap disposition").
+**Reproduced.** The raw `collected/devflow/phase-01-stdout` parses (`jq -s` exit 0). The sanitized copies in
+`49-evidence/attempt-3/collected/devflow/phase-01-stdout` and `49-evidence/attempt-3/gates/003-ship/devflow/phase-01-stdout`
+fail at one line each with `Invalid \escape`.
+
+**Defect:** a JSON-escaped `\t` sits directly before a `git@github.com:…` remote. The email pattern takes the escape's
+letter as part of the address (`tgit@github.com`), and the redaction writes `\<email>`, which is not a valid JSON
+escape. Any escape letter next to an address would do the same. Low severity: the damaged captures stay readable as text,
+and no checker input is affected. A consumer that parses them as JSON fails.
+
+**Fix shape (not decided):** redact inside decoded JSON strings and re-encode, or stop the local part from starting
+inside an escape sequence. Add a selftest case where a string holding `origin\tgit@host:x` must still parse after
+`sanitize`. Republishing Phase 49's evidence afterwards uses 49-12 Task 1's republish sequence.
+
+### Phase 999.148: Collected Evidence Carries DevFlow's `.gitignore` (`*`), So a Plain `git add` Commits None of the DevFlow Copy (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12 Task 1, before the first evidence commit. `git status --ignored` listed every
+`49-evidence/attempt-<N>/collected/devflow/` as ignored, and `git check-ignore -v` named the copied
+`collected/devflow/.gitignore` (one line: `*`). The workaround in 49-12 excluded that file at staging.
+
+**Defect:** `collect-attempt.sh` copies `<launch>/.devflow/` whole, including DevFlow's own `.gitignore`, and
+`sanitize-evidence.py` passes it through. Committed with a plain `git add`, the event log and every capture under
+`collected/devflow/` would have been left out silently. 49-12's Task 1 and Task 2 gates read the files on disk, so both
+would still have printed `gate_rc=0`.
+
+**Fix shape (not decided):** the collector or the sanitizer drops git control files (`.gitignore`, `.gitattributes`),
+and any gate that judges committed evidence compares `git ls-files` against what is on disk.
+
+### Phase 999.149: `check-evidence.sh` Labels a Repeated Stage Gate `unexpected=false`, So an Extra Code Gate Prints No Deviation (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12 Task 1. `--arm positive` over `49-evidence/attempt-1` prints
+`NOTE gate_census count=3 stages=define,code,code` and `NOTE gate code unexpected=false` twice, and no
+`NOTE deviation` line. Yet attempt 1's `deviations.txt` records the second Code gate as an unexpected failure gate.
+
+**Defect:** the census marks a gate unexpected only when its stage name is outside `define`, `code`, `ship`
+(`check-evidence.sh`, gate census block). A second gate at an expected stage is never a deviation. DevFlow's own
+`gate_fired.unexpected` field does not separate the cases either: it is `true` for the by-design preflight gates and for
+the failure gate alike. Only `context` differs (`[never-silent] preflight failed …` against `[never-silent] stage code
+failed …`). R-6 deviations of this shape reach the record only through the operator's `deviations.txt`.
+
+**Fix shape (not decided):** flag any stage whose gate count exceeds its by-design count (Define 1, Code 1, Ship 1 for
+this payload), or classify on the context prefix. Pin it with a selftest case, `define,code,code`, that must print a
+`NOTE deviation` line.
+
+### Phase 999.150: Archived Stage Captures Do Not Keep the Prompt Each Turn Received (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12 Task 2, recording DECN-03's "which turn carried which rule".
+
+**Defect:** the stream-json captures under `.devflow/history/phase-01/` hold the agent's output and no prompt text. In
+attempt 3, the `CODE_STAGE_POLICY` heading "Unattended decision checkpoints" occurs in no capture and not in the
+collected `phase-01-prompt` (a single file). The `checkpoint_auto_decided` event's `instruction` is truncated. Which
+turn carried which rule could be read only from the Claude transcript under `collected/sessions/`, which D-26 keeps out
+of the repository. DECN-03's recency record therefore rests on uncommitted evidence.
+
+**Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
+already is), so committed evidence shows which turn carried which rule.
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
