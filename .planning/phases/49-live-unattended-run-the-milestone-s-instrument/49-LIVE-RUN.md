@@ -12,8 +12,8 @@ This verdict rests on attempt 3. `check-evidence.sh --attempt-gate` over the raw
 `ATTEMPT_GATE verdict=shipped attempt=3`, and the committed, sanitized copy `49-evidence/attempt-3/` passes all three
 checker modes in place: positive 11/0, negative 5/0, pair 3/0. It is one sample, taken after one stopped attempt and one
 attempt whose evidence fails the positive arm. The binary that shipped was built from `084625c` on
-`fix/49-checkpoint-subagent-detection`, which is not merged into `feature/phase-49`. The verdict therefore covers that
-binary, not the code on this branch, until the fix branch lands (see "Gap disposition").
+`fix/49-checkpoint-subagent-detection`. That commit was not on `feature/phase-49` when this record was written.
+**Update 2026-10-09:** merge `bbfe6df` brought both fix commits onto `feature/phase-49`; `git merge-base --is-ancestor` confirms `e3f9ddd` and `084625c` are ancestors of the branch. The only crate change since `084625c` is rustfmt commit `5574841`. The verdict covers that binary; the branch code differs from it by formatting only.
 
 ## The record
 
@@ -135,7 +135,7 @@ Deviations across the attempts (R-6), each with its cause as recorded in that at
   per operator Option 2 choice`. `resume.stdout` records the Ship-stage relaunch at 2026-10-07T21:31:18Z. The Ship gate
   then fired and resolved (`collected/devflow/events.jsonl`), but no Ship snapshot was taken (`ledger.jsonl` has no Ship
   entry). Whether a quota pause with a resume counts as "unattended", and whether attempt 2 counts toward the D-11 cap,
-  is **undecided**; this record does not decide it.
+  was undecided when this record was written. **Ruled moot 2026-10-09** (by the orchestrating agent, under the operator's delegation of low-impact items): whether it was unattended changes nothing, because attempt 2 fails the positive arm and VERIFY-01 rests on attempt 3. It does not count toward the cap: D-11 counts only a run that ends without reaching Ship, and attempt 2 reached Ship. Attempt 1 is the only counted attempt.
 - **Run level: attempt 3 was run after attempt 2's evidence recorded `shipped`.** The reason is unrecorded (see
   "Attempts").
 
@@ -237,18 +237,17 @@ acceptance evidence for SURV-01, and this run does not add to it or weaken it.
   checkpoint), and one `integration` base with a PR to `main`. A different plan shape, more phases or another base
   layout lie outside this run.
 - **A DevFlow built from a fix branch, not a release.** Attempt 3 ran `084625c` from
-  `fix/49-checkpoint-subagent-detection`. That commit is not on `feature/phase-49`, and no release carries it.
+  `fix/49-checkpoint-subagent-detection`. No release carries it. (It has been on `feature/phase-49` since merge `bbfe6df`, 2026-10-09.)
 - **Recorded tool versions only.** GSD 1.16.0, gh 2.102.0, git 2.55.0, Python 3.14.8, claude 2.1.292
   (`identity.txt`). Other versions were not exercised.
 - **Whether attempt 2 counts as unattended.** Its quota pause and operator-scheduled resume are recorded as a deviation.
-  Whether that counts as unattended under D-11/D-28 is undecided.
+  Whether that counts as unattended under D-11/D-28 was left undecided. **Ruled moot 2026-10-09** (by the orchestrating agent, under the operator's delegation of low-impact items): whether it was unattended changes nothing, because attempt 2 fails the positive arm and VERIFY-01 rests on attempt 3. It does not count toward the cap: D-11 counts only a run that ends without reaching Ship, and attempt 2 reached Ship. Attempt 1 is the only counted attempt.
 
 ## Gap disposition
 
 **Blocking defects, fixed during the checkpoint (D-10).** Both fixes are on branch `fix/49-checkpoint-subagent-detection`
 and **neither is merged into `feature/phase-49`** (checked with `git merge-base --is-ancestor` against `feature/phase-49`
-on 2026-10-08). The code that shipped in attempt 3 is therefore not the code on this branch. Routing these commits into
-the branch is a close-out decision for the operator.
+on 2026-10-08). **Update 2026-10-09:** merge `bbfe6df` brought both fix commits onto `feature/phase-49`; `git merge-base --is-ancestor` confirms `e3f9ddd` and `084625c` are ancestors of the branch. The only crate change since `084625c` is rustfmt commit `5574841`. The operator chose the merge on 2026-10-09.
 
 - `e3f9ddd`, "fix(agent_result): recognize blocking-human checkpoint in DEVFLOW_RESULT failure marker". This is the cause
   of attempt 1's stop. Attempt 2 ran a binary built from it.
@@ -278,7 +277,7 @@ the branch is a close-out decision for the operator.
   - a Ship relaunch at ts 1791408678.
 
   The open question is a ruling, not a defect: does the pause and resume count as unattended, and does attempt 2 count
-  toward the D-11 cap? Both are **undecided**.
+  toward the D-11 cap? **Ruled moot 2026-10-09** (by the orchestrating agent, under the operator's delegation of low-impact items): whether it was unattended changes nothing, because attempt 2 fails the positive arm and VERIFY-01 rests on attempt 3. It does not count toward the cap: D-11 counts only a run that ends without reaching Ship, and attempt 2 reached Ship. Attempt 1 is the only counted attempt.
 - **Positive-arm warning, all three attempts.** `warning: build provenance staleness check did not confirm a fresh
   build for stage define — proceeding` appears in `start.stdout`. The warning itself cites D-18: only DevFlow's own
   workspace is hard-blocked.

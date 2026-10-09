@@ -25,19 +25,19 @@ findings:
     title: "Ship prompt hard-codes `main` and a fixture-flavoured branch name for every project"
   - id: WR-04
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "Evidence sanitizer passes AWS keys, Slack webhooks, PEM private keys and JWTs"
   - id: WR-05
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "`launch-attempt.sh start` wedges the attempt and orphans the watcher if the run unit fails to launch"
   - id: WR-06
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "`surv-watch.py analyze` reports interleaving against dead writers' orphaned temp files"
   - id: IN-01
     severity: info
-    disposition: open
+    disposition: deferred
     title: "Merged and stale doc comments around the checkpoint matcher"
   - id: IN-02
     severity: info
@@ -45,17 +45,17 @@ findings:
     title: "`fire_gate_notify` has no production callers left"
   - id: IN-03
     severity: info
-    disposition: open
+    disposition: deferred
     title: "A kill between `mv` and the ledger append wedges every later snapshot"
   - id: IN-04
     severity: info
-    disposition: open
+    disposition: deferred
     title: "`prepare` pins `$repo/target/debug/devflow` regardless of the configured target dir"
   - id: IN-05
     severity: info
-    disposition: open
+    disposition: deferred
     title: "`collect-attempt.sh` publishes `verdict.json` before the collection directory"
-open: 13
+open: 4
 total: 13
 recorded: 2026-10-09T01:02:22.981Z
 ---
@@ -69,14 +69,14 @@ recorded: 2026-10-09T01:02:22.981Z
 | WR-01 | warning | open | - |
 | WR-02 | warning | open | - |
 | WR-03 | warning | open | - |
-| WR-04 | warning | open | - |
-| WR-05 | warning | open | - |
-| WR-06 | warning | open | - |
-| IN-01 | info | open | - |
+| WR-04 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); committed evidence re-scanned clean 2026-10-09 |
+| WR-05 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); no effect on the three recorded attempts |
+| WR-06 | warning | deferred | backlog 999.152 (phase-49 tooling robustness); false-positive only, all attempts report interleaved_windows=0 |
+| IN-01 | info | deferred | Phase 49.1 replaces the checkpoint matcher these comments describe |
 | IN-02 | info | open | - |
-| IN-03 | info | open | - |
-| IN-04 | info | open | - |
-| IN-05 | info | open | - |
+| IN-03 | info | deferred | backlog 999.152 (phase-49 tooling robustness) |
+| IN-04 | info | deferred | backlog 999.152 (phase-49 tooling robustness) |
+| IN-05 | info | deferred | backlog 999.152 (phase-49 tooling robustness); all attempts have collected/DONE |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
