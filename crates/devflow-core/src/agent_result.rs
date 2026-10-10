@@ -646,14 +646,14 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
 ///
 /// The VALUE is what this constant holds. The surrounding markdown — bold
 /// label, and a **code span around the value** — is handled by
-/// [`text_reports_human_gate`]'s trim set, not by this constant.
+/// [`line_reports_human_gate`]'s trim set, not by this constant.
 ///
 /// The code span is the part RESEARCH.md did not predict. Its § "Architecture
 /// Patterns / Pattern 2" derived the literal by reading the *emitting* source
 /// (`gsd-executor.md:356`, `execute-phase.md:1053`) and predicted a bare
 /// `**Gate:** blocking-human`. The real relay renders the value as a code
 /// span, which defeated the original matcher entirely — see
-/// [`text_reports_human_gate`] for that failure and its fix. Lesson worth
+/// [`line_reports_human_gate`] for that failure and its fix. Lesson worth
 /// keeping: the emitting source told us the value, not the rendering.
 const HUMAN_GATE_VALUE: &str = "blocking-human";
 
@@ -740,11 +740,7 @@ fn capture_reports_human_gate(stdout: &str) -> bool {
     for line in stdout.lines().rev() {
         let outcome = match serde_json::from_str::<serde_json::Value>(line.trim()) {
             Ok(value) if value.is_object() || value.is_array() => {
-                if json_strings_report_human_gate(&value) {
-                    StatedOutcome::Checkpoint
-                } else {
-                    StatedOutcome::Silent
-                }
+                json_strings_stated_outcome(&value)
             }
             _ => latest_stated_outcome(line),
         };
@@ -757,21 +753,43 @@ fn capture_reports_human_gate(stdout: &str) -> bool {
     false
 }
 
-/// Match every string value inside a decoded JSON document.
-fn json_strings_report_human_gate(value: &serde_json::Value) -> bool {
+/// The stated outcome of a decoded JSON document: each string value is read
+/// with [`latest_stated_outcome`]. A document's values have no order a reader
+/// can rely on, so when its strings disagree the safe outcome wins: any
+/// ordinary outcome makes the document [`StatedOutcome::Other`], and only
+/// otherwise does a checkpoint make it [`StatedOutcome::Checkpoint`].
+///
+/// This replaces matching only `Gate:` lines inside the strings, which skipped
+/// a later ordinary-failure marker and let an earlier gate line win (round-3
+/// external review of the CR-01 fix, 2026-10-10).
+fn json_strings_stated_outcome(value: &serde_json::Value) -> StatedOutcome {
+    let combine = |left: StatedOutcome, right: StatedOutcome| match (left, right) {
+        (StatedOutcome::Other, _) | (_, StatedOutcome::Other) => StatedOutcome::Other,
+        (StatedOutcome::Checkpoint, _) | (_, StatedOutcome::Checkpoint) => {
+            StatedOutcome::Checkpoint
+        }
+        _ => StatedOutcome::Silent,
+    };
     match value {
-        serde_json::Value::String(text) => text_reports_human_gate(text),
-        serde_json::Value::Array(items) => items.iter().any(json_strings_report_human_gate),
-        serde_json::Value::Object(fields) => fields.values().any(json_strings_report_human_gate),
-        _ => false,
+        serde_json::Value::String(text) => latest_stated_outcome(text),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(json_strings_stated_outcome)
+            .fold(StatedOutcome::Silent, combine),
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .map(json_strings_stated_outcome)
+            .fold(StatedOutcome::Silent, combine),
+        _ => StatedOutcome::Silent,
     }
 }
 
-/// Core matcher over text already in its final form: a physical line of a
-/// non-JSON capture, a decoded JSON string ([`capture_reports_human_gate`]), or
-/// an envelope's unescaped `result` ([`blocking_human_checkpoint_reported`]).
-/// It never decodes escapes itself. Scans only
-/// for a line whose first word, after any list, ordinal or blockquote markup
+/// Core matcher over one line of text already in its final form: a physical
+/// line of a non-JSON capture, or a line of a decoded JSON string
+/// ([`capture_reports_human_gate`]) or of an envelope's unescaped `result`
+/// ([`blocking_human_checkpoint_reported`]), each reached through
+/// [`latest_stated_outcome`]. It never decodes escapes itself. Matches only
+/// a line whose first word, after any list, ordinal or blockquote markup
 /// ([`strip_leading_markup`]), is a case-insensitive `gate` label, tolerating
 /// surrounding markdown emphasis (`*`), code-span backticks (`` ` ``), and
 /// whitespace up to the following `:`, then compares the VALUE token
@@ -789,11 +807,6 @@ fn json_strings_report_human_gate(value: &serde_json::Value) -> bool {
 ///
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
-fn text_reports_human_gate(text: &str) -> bool {
-    text.lines().any(line_reports_human_gate)
-}
-
-/// One physical line of [`text_reports_human_gate`].
 fn line_reports_human_gate(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     let line = strip_leading_markup(&lower);
@@ -1571,8 +1584,8 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 
 /// Whether any AGENT-AUTHORED text in a Claude stream capture declares a
 /// human-blocking gate. The stream-capture half of
-/// [`blocking_human_checkpoint_reported`]; the pure matcher it delegates to,
-/// [`text_reports_human_gate`], is unchanged.
+/// [`blocking_human_checkpoint_reported`]; each eligible text is read with
+/// [`latest_stated_outcome`].
 ///
 /// **Why this exists (review constraint 3).** Scanning raw stdout is safe under
 /// the single-document envelope, because the only place gate text can appear
@@ -1615,9 +1628,10 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 /// outcome wins** (operator decision 2026-10-10). The first event, counting
 /// back from the end, that either declares the gate or carries a
 /// `DEVFLOW_RESULT` marker decides: a declaration means a checkpoint, a marker
-/// without one means the stage ended on that outcome instead. A declaration
-/// and a marker in the same message are one report, so the declaration wins
-/// within a message. Events with neither, such as task-notification wake-up
+/// without one means the stage ended on that outcome instead. Within a
+/// message the same rule applies line by line: a marker after a declaration
+/// outranks it, and a declaration after a marker outranks the marker. Events
+/// with neither, such as task-notification wake-up
 /// turns, are skipped, so a gate declared in turn N followed by silent turns
 /// N+1/N+2 (the turn shape the v3 capture archives) is still reported, which
 /// is what the earlier scan-everything rule existed to protect.
@@ -3942,19 +3956,19 @@ mod tests {
             "## CHECKPOINT REACHED\n\n**Type:** decision\n**Gate:** `{HUMAN_GATE_VALUE}`\n**Plan:** 30-05\n"
         );
         let labelled = format!("{resume}\n{declaration}");
-        assert!(text_reports_human_gate(&labelled));
+        assert!(labelled.lines().any(line_reports_human_gate));
         assert!(blocking_human_checkpoint_reported(&envelope(&labelled)));
 
         assert!(
             resume.contains("gate-declaration line"),
             "the resume prompt must tell the agent not to copy the gate-declaration line"
         );
-        assert!(!text_reports_human_gate(&resume));
+        assert!(!resume.lines().any(line_reports_human_gate));
         assert!(!blocking_human_checkpoint_reported(&envelope(&resume)));
 
         let prose = "Resolved gate: blocking-human using the recorded evidence.";
         assert!(
-            !text_reports_human_gate(prose),
+            !prose.lines().any(line_reports_human_gate),
             "only a Gate-labeled line may report a checkpoint"
         );
         assert!(
@@ -4257,7 +4271,7 @@ mod tests {
     /// through DevFlow's own monitor). The value arrives as a markdown CODE
     /// SPAN, not the bare token RESEARCH.md predicted.
     ///
-    /// Before the backtick was added to `text_reports_human_gate`'s trim set
+    /// Before the backtick was added to the gate matcher's trim set
     /// this returned `false`: the leading backtick survived the trim, so the
     /// value `take_while` terminated at once and yielded an empty token. A
     /// real checkpoint was therefore never recognized, and the run fell
@@ -4728,6 +4742,52 @@ mod tests {
         let failure_then_gate =
             "DEVFLOW_RESULT: {\"status\": \"failed\"}\n**Gate:** `blocking-human`\n";
         assert!(blocking_human_checkpoint_reported(failure_then_gate));
+    }
+
+    /// Round-3 review: a JSON line in a capture that is not classified as a
+    /// Claude stream (two noise lines demote it to plain text) must follow
+    /// the same rule. Only `Gate:` lines were matched inside its strings, so
+    /// an earlier gate outranked a later ordinary failure.
+    #[test]
+    fn blocking_human_checkpoint_reported_reads_json_lines_by_the_same_rule() {
+        let result_line = |text: &str| {
+            serde_json::json!({"type": "result", "result": text, "session_id": "current"})
+                .to_string()
+        };
+        let init = r#"{"type":"system","subtype":"init","session_id":"current"}"#;
+        let noisy = |text: &str| format!("{init}\nprogress-1\nprogress-2\n{}\n", result_line(text));
+        let gate = "**Gate:** `blocking-human`";
+        let plain_failure =
+            "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}";
+        let declared =
+            "DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\"}";
+
+        assert!(!blocking_human_checkpoint_reported(&noisy(&format!(
+            "{gate}\n{plain_failure}"
+        ))));
+        assert!(
+            blocking_human_checkpoint_reported(&noisy(gate)),
+            "control: a gate alone still counts"
+        );
+        assert!(blocking_human_checkpoint_reported(&noisy(declared)));
+
+        let plain_gate_then_json_failure = format!(
+            "[info] claude starting\n{gate}\n{}\n",
+            result_line(plain_failure)
+        );
+        assert!(!blocking_human_checkpoint_reported(
+            &plain_gate_then_json_failure
+        ));
+        let plain_gate_then_silent_json = format!("[info] claude starting\n{gate}\n{init}\n");
+        assert!(blocking_human_checkpoint_reported(
+            &plain_gate_then_silent_json
+        ));
+
+        let disagreeing_fields = serde_json::json!({"a": gate, "b": plain_failure}).to_string();
+        assert!(
+            !blocking_human_checkpoint_reported(&format!("noise\n{disagreeing_fields}\n")),
+            "fields of one document have no order, so the ordinary outcome wins"
+        );
     }
 
     /// R5: an absent checkpoint is not written when a result is serialized,

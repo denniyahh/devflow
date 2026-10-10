@@ -645,7 +645,7 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 ///
 /// The resume wording tells the agent to name the resolved gate in prose rather
 /// than copy the checkpoint's declaration line. A failed resume capture is
-/// re-read by `agent_result::text_reports_human_gate`, so a copied declaration
+/// re-read by `agent_result::latest_stated_outcome`, so a copied declaration
 /// line could read as a new checkpoint. A checkpoint is reported only by a
 /// `**Gate:**`-labeled line with no marker after it, or by a final
 /// `DEVFLOW_RESULT` that declares `"checkpoint": "blocking-human"`

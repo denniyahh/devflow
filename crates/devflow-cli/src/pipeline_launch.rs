@@ -5380,6 +5380,75 @@ mod tests {
         );
     }
 
+    /// The capture route alone confirms a Code checkpoint: a plain failure
+    /// marker, then a `Gate:` line as the latest stated outcome. The evaluated
+    /// result declares nothing, so only the capture scan can relaunch here
+    /// (round-3 external review: every positive test also declared the field,
+    /// so dropping the capture route left the suite green).
+    #[test]
+    fn advance_with_declared_checkpoint_and_gate_line_only_relaunches_and_records() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_declared_checkpoint_and_gate_line_only_relaunches_and_records";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_TEST_ROOT";
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+
+            let phase = PhaseId::new(191);
+            write_declared_checkpoint_plan(root, phase);
+            std::fs::create_dir_all(root.join(".devflow")).unwrap();
+            std::fs::write(
+                agent_result::stdout_path(root, phase),
+                format!(
+                    "DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"checkpoint pending\"}}\n## CHECKPOINT REACHED\n\n**Gate:** {HUMAN_GATE_VALUE_FOR_TEST}\n"
+                ),
+            )
+            .unwrap();
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Code;
+            state.session_id = Some("sess-gate-line-only".to_string());
+            state.checkpoint_approval = recorded_approval_for(root, phase);
+            workflow::save_state(&state).unwrap();
+
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+        let phase = PhaseId::new(191);
+        // Unused on the relaunch route; if detection regresses, the
+        // fall-through gate reads it and returns instead of blocking forever.
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
+        result.unwrap();
+
+        let auto_decided = events_of_kind(root, "checkpoint_auto_decided");
+        assert_eq!(
+            auto_decided.len(),
+            1,
+            "a gate line as the latest stated outcome must auto-decide exactly once: {auto_decided:?}"
+        );
+        assert_eq!(auto_decided[0]["session_id"], "sess-gate-line-only");
+    }
+
     /// 49-REVIEW CR-01 at the pipeline: a failure whose reason only describes
     /// a blocking-human halt takes the ordinary gate, even in a phase that
     /// declares such a checkpoint.
