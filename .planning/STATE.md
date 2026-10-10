@@ -2,21 +2,21 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: "49.1"
-current_phase_name: Declared Checkpoint Detection
+current_phase: "50"
+current_phase_name: Addressable Monitor Liveness
 current_plan: Not started
 status: planning
-stopped_at: Phase 49 complete, ready to plan Phase 49.1
-last_updated: "2026-10-09T21:47:53.901Z"
+stopped_at: Phase 49 complete, ready to discuss Phase 50
+last_updated: "2026-10-10T01:03:12.376Z"
 last_activity: 2026-10-09
-last_activity_desc: Phase 49 complete, transitioned to Phase 49.1
-state_head: 05a07021e67f66c3e8aaab2b1c9ab0afec18fe8a
+last_activity_desc: Phase 49.1 removed; CR-01 fix moves to a fix branch, Phase 50 next
+state_head: 40259eccd264cf02465fc3e1c901353f62ba6cca
 progress:
-  total_phases: 7
+  total_phases: 6
   completed_phases: 4
   total_plans: 48
   completed_plans: 48
-  percent: 57
+  percent: 67
 ---
 
 # DevFlow — Project State
@@ -98,6 +98,12 @@ verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
 
+- **Plan to the 3.0.0 release (operator decisions 2026-10-09):**
+  1. The declared-checkpoint fix (formerly Phase 49.1, 49-REVIEW CR-01) is done outside GSD, on a fix branch from
+     `develop` with an external adversarial review as the gate. Phase 49.1 was removed with `phase.remove`.
+  2. Phase 50 runs as a DevFlow dogfood run, after the fix merges and DevFlow is reinstalled from `develop`. Ship is
+     blocked during the run, and close-out is done by hand with `scripts/cut-pr-branch.sh`.
+  3. Release 3.0.0 after Phase 50. Then prune the backlog, then Phase 51 as a minor release (3.1.0).
 - Phase 47's `stale` verification is **left stale by operator decision (2026-09-13)** — re-verifying
   now would hold only until the next ROADMAP.md write. Re-run the verifier once near milestone
   close, when ROADMAP.md stops changing. Until then `roadmap.analyze` counts 47 as `partial` and
@@ -189,8 +195,8 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 49.1 — Declared Checkpoint Detection
-Plans: none yet — Phase 49.1 is inserted (CR-01 declared checkpoint detection); next step `/gsd-discuss-phase 49.1`
+Phase: 50 — Addressable Monitor Liveness
+Plans: none yet — next step `/gsd-discuss-phase 50`, after the declared-checkpoint fix (formerly Phase 49.1, removed 2026-10-09 by operator decision) merges to `develop` on a fix branch
 Current Plan: Not started
 Total Plans in Phase: 0
 Completed Plans: 0 of 0
@@ -204,9 +210,9 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-10-09 — Phase 49 complete, transitioned to Phase 49.1
+Last activity: 2026-10-09 — Phase 49 complete; Phase 49.1 removed (fix branch instead), Phase 50 next
 
-Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted 2026-10-09. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
+Progress: [███████░░░] 67% (4 of 6 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted and removed 2026-10-09. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
@@ -961,7 +967,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Session
 
 **Last session:** 2026-10-09T00:48:44.074Z
-**Stopped at:** Phase 49 complete, ready to plan Phase 49.1
+**Stopped at:** Phase 49 complete, ready to discuss Phase 50
 **Resume file:** None
 
 ## Operator Next Steps

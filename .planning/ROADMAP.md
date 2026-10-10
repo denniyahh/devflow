@@ -331,16 +331,6 @@ recorded different events. `sync-workspace.sh` merges `develop` into the workspa
 the Phase 49 worktree's planning commits by itself. If verification or `phase.complete` writes more planning commits
 after this merge-back, repeat the merge-back and check rather than treating the first one as final.
 
-### Phase 49.1: Declared Checkpoint Detection (INSERTED)
-
-**Goal:** [Urgent work - to be planned]
-**Requirements**: TBD
-**Depends on:** Phase 49
-**Plans:** 0 plans
-
-Plans:
-- [ ] TBD (run /gsd-plan-phase 49.1 to break down)
-
 ### Phase 50: Addressable Monitor Liveness
 
 **Goal**: "Is this run's monitor alive?" is answerable from disk state alone without a PID, in three
@@ -810,8 +800,7 @@ credential shapes WR-04 misses (`rg` exit 1; a planted four-value control matche
 leaks. WR-06 can only inflate the interleaving count, and all three attempts report `interleaved_windows=0`. All three
 attempts have `collected/DONE` (IN-05). The run units launched in every attempt (WR-05).
 
-**Fix shape (not decided):** per-finding fixes are in `49-REVIEW.md`. Fix before the tools run again, for example in a
-Phase 49.1 live run.
+**Fix shape (not decided):** per-finding fixes are in `49-REVIEW.md`. Fix before the tools run again.
 
 ### Phase 999.153: The Test Suite Registers Temp-Dir Roots in the Developer's Real `~/.cache/devflow` (DUPLICATE of 999.141)
 
