@@ -1627,6 +1627,7 @@ mod tests {
             summary: None,
             verdict: Some(Verdict::Pass),
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert_eq!(outcome, ValidateOutcome::Passed);
@@ -1691,6 +1692,7 @@ mod tests {
             summary: None,
             verdict: Some(Verdict::Gaps),
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
@@ -1743,6 +1745,7 @@ mod tests {
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
@@ -1794,6 +1797,7 @@ mod tests {
                 summary: None,
                 verdict: Some(Verdict::Pass),
                 decided_by_layer: Some(0),
+                checkpoint: None,
             };
             assert_eq!(
                 classify_validate_outcome(&result),
@@ -1845,6 +1849,7 @@ mod tests {
             summary: None,
             verdict,
             decided_by_layer: if layer0 { Some(0) } else { Some(1) },
+            checkpoint: None,
         }
     }
 
@@ -4673,6 +4678,7 @@ mod tests {
             summary: None,
             verdict: Some(Verdict::Gaps),
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));

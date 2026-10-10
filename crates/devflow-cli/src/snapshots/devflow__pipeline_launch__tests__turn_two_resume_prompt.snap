@@ -14,4 +14,8 @@ If something prevents completion:
 
 DEVFLOW_RESULT: {"status": "failed", "reason": "specific explanation"}
 
+If you stopped at a blocking-human gate that you are reporting rather than resolving, declare it with the checkpoint field:
+
+DEVFLOW_RESULT: {"status": "failed", "checkpoint": "blocking-human", "reason": "which gate stopped you and the decision it needs"}
+
 Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.

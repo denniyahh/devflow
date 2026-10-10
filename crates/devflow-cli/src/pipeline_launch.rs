@@ -1760,8 +1760,11 @@ pub(crate) fn advance_with(
             // ORDER — load-bearing — (1) agent is Claude (D-05); (2) the
             // phase's plans statically declare a blocking-human checkpoint —
             // the PRIMARY, agent-uncontrollable gate, checked BEFORE
-            // anything agent-controlled (T-28-01); (3) the capture confirms
-            // one was reported; (4) a session id is on record; and (5) the
+            // anything agent-controlled (T-28-01); (3) the agent reported
+            // one, either by declaring `"checkpoint": "blocking-human"` on the
+            // stage's final DEVFLOW_RESULT marker or by a `Gate:` declaration
+            // line in the capture — never by the wording of a failure reason
+            // (49-REVIEW CR-01); (4) a session id is on record; and (5) the
             // resume ceiling has not been exhausted. A changed declaration
             // always opens the re-scan gate. Only an unchanged, recorded set
             // in Auto resumes without a human; Supervise falls through to a
@@ -1783,7 +1786,8 @@ pub(crate) fn advance_with(
             let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
             let checkpoint_confirmed = state.agent == AgentKind::Claude
                 && verify::phase_has_blocking_human_checkpoint(execution_root, phase)
-                && agent_result::checkpoint_reported_in_capture(project_root, phase);
+                && (result.declares_blocking_human_checkpoint()
+                    || agent_result::checkpoint_reported_in_capture(project_root, phase));
             if checkpoint_confirmed {
                 let ceiling_ok = state.checkpoint_resumes < mode::MAX_CHECKPOINT_RESUMES;
                 match (&state.session_id, ceiling_ok) {
@@ -4050,6 +4054,29 @@ mod tests {
         .unwrap();
     }
 
+    /// A capture whose only checkpoint signal is the declared marker field
+    /// (49-REVIEW CR-01): no `Gate:` line anywhere, just
+    /// `"checkpoint": "blocking-human"` on the final `DEVFLOW_RESULT`.
+    fn write_marker_declared_checkpoint_capture(root: &Path, phase: PhaseId) {
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let stdout = format!(
+            "Plan 01 stopped at Task 1.\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"checkpoint\": \"{HUMAN_GATE_VALUE_FOR_TEST}\", \"reason\": \"Task 1 needs a decision\"}}\n"
+        );
+        std::fs::write(agent_result::stdout_path(root, phase), stdout).unwrap();
+    }
+
+    /// Live Attempt 1's real failure (2026-10-07): the reason describes a
+    /// blocking-human halt in prose but declares nothing. The reverted prose
+    /// heuristic auto-resumed this; it must now take the ordinary gate.
+    fn write_prose_only_checkpoint_capture(root: &Path, phase: PhaseId) {
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"Phase 01 plan 01-01 halted at Task 1, a blocking-human decision checkpoint\"}\n",
+        )
+        .unwrap();
+    }
+
     /// Pre-write a rejected gate response so `run_gate`'s poll (invoked by
     /// the fall-through path's `handle_stage_failure`) returns immediately
     /// instead of blocking — mirrors
@@ -5276,6 +5303,99 @@ mod tests {
 
     /// Declared, but the capture does not confirm it — an ordinary failure
     /// in a phase that happens to declare a checkpoint elsewhere.
+    /// The declared marker field alone confirms the checkpoint: same route and
+    /// audit trail as a reported `Gate:` line (49-REVIEW CR-01).
+    #[test]
+    fn advance_with_declared_checkpoint_and_marker_field_relaunches_and_records() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_declared_checkpoint_and_marker_field_relaunches_and_records";
+        const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_TEST_ROOT";
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            init_repo(root);
+
+            let phase = PhaseId::new(186);
+            write_declared_checkpoint_plan(root, phase);
+            write_marker_declared_checkpoint_capture(root, phase);
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Code;
+            state.session_id = Some("sess-marker-field".to_string());
+            state.checkpoint_approval = recorded_approval_for(root, phase);
+            workflow::save_state(&state).unwrap();
+
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(ROOT_ENV, root.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os(ROOT_ENV)
+                .expect("child test must receive its parent-built fixture root"),
+        );
+        let root = root.as_path();
+        let phase = PhaseId::new(186);
+        // Unused on the relaunch route; if detection regresses, the
+        // fall-through gate reads it and returns instead of blocking forever,
+        // so the assertions below fail rather than hang.
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
+        result.unwrap();
+
+        let auto_decided = events_of_kind(root, "checkpoint_auto_decided");
+        assert_eq!(
+            auto_decided.len(),
+            1,
+            "a declared marker checkpoint must auto-decide exactly once: {auto_decided:?}"
+        );
+        assert_eq!(auto_decided[0]["session_id"], "sess-marker-field");
+        let gate_fired = events_of_kind(root, "gate_fired");
+        assert!(
+            gate_fired.iter().all(|e| e["stage"] != "code"),
+            "an auto-resolved checkpoint must not also fire the generic gate: {gate_fired:?}"
+        );
+    }
+
+    /// 49-REVIEW CR-01 at the pipeline: a failure whose reason only describes
+    /// a blocking-human halt takes the ordinary gate, even in a phase that
+    /// declares such a checkpoint.
+    #[test]
+    fn advance_with_declared_checkpoint_and_prose_only_reason_falls_through() {
+        const NAME: &str = "pipeline_launch::tests::advance_with_declared_checkpoint_and_prose_only_reason_falls_through";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(187);
+        write_declared_checkpoint_plan(root, phase);
+        write_prose_only_checkpoint_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-prose-only".to_string());
+        state.checkpoint_approval = recorded_approval_for(root, phase);
+        workflow::save_state(&state).unwrap();
+
+        advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
+
+        assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
+        assert!(!events_of_kind(root, "gate_fired").is_empty());
+    }
+
     #[test]
     fn advance_with_declared_checkpoint_but_unreported_gate_falls_through() {
         const NAME: &str = "pipeline_launch::tests::advance_with_declared_checkpoint_but_unreported_gate_falls_through";

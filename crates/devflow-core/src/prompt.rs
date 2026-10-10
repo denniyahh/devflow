@@ -51,6 +51,10 @@ If something prevents completion:\n\
 \n\
 DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n\
 \n\
+If you stopped at a blocking-human gate that you are reporting rather than resolving, declare it with the checkpoint field:\n\
+\n\
+DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\", \"reason\": \"which gate stopped you and the decision it needs\"}\n\
+\n\
 Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. \
 DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
 
@@ -618,8 +622,11 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 /// The resume wording tells the agent to name the resolved gate in prose rather
 /// than copy the checkpoint's declaration line. A failed resume capture is
 /// re-read by `agent_result::text_reports_human_gate`, so a copied declaration
-/// line could read as a new checkpoint. The detector accepts only a
-/// `**Gate:**`-labeled line; the
+/// line could read as a new checkpoint. A checkpoint is reported only by a
+/// `**Gate:**`-labeled line or by a final `DEVFLOW_RESULT` that declares
+/// `"checkpoint": "blocking-human"` ([`COMPLETION_PROTOCOL`] says to use that
+/// field only for a gate being reported rather than resolved). The wording of a
+/// failure reason is never read (49-REVIEW CR-01). The
 /// `resume_prompt_does_not_read_as_a_blocking_human_checkpoint` test pins that
 /// boundary and rejects prose such as `Resolved gate: blocking-human`.
 ///
@@ -1278,6 +1285,42 @@ mod tests {
         assert_eq!(
             checkpoint_auto_decide_prompt(PhaseId::new(28)),
             checkpoint_auto_decide_prompt(PhaseId::new(28))
+        );
+    }
+
+    /// 49-REVIEW CR-01: the protocol shows agents how to declare a
+    /// blocking-human checkpoint, and the example it shows is exactly what the
+    /// parser accepts. Each marker example is parsed with the real parser, so
+    /// the prompt and `AgentResult` cannot drift apart: the checkpoint example
+    /// must declare the checkpoint, and the other two must not.
+    #[test]
+    fn completion_protocol_checkpoint_example_is_what_the_parser_accepts() {
+        let examples: Vec<&str> = COMPLETION_PROTOCOL
+            .lines()
+            .filter(|line| line.starts_with("DEVFLOW_RESULT:"))
+            .collect();
+        assert_eq!(
+            examples.len(),
+            3,
+            "success, failure and checkpoint examples: {examples:?}"
+        );
+        let declaring: Vec<&str> = examples
+            .iter()
+            .copied()
+            .filter(|line| {
+                crate::agent_result::parse_devflow_result(line)
+                    .unwrap_or_else(|| panic!("protocol example must parse: {line}"))
+                    .declares_blocking_human_checkpoint()
+            })
+            .collect();
+        assert_eq!(
+            declaring.len(),
+            1,
+            "exactly one protocol example declares the checkpoint: {examples:?}"
+        );
+        assert!(
+            COMPLETION_PROTOCOL.contains("blocking-human gate"),
+            "the protocol must say when to use the checkpoint form"
         );
     }
 
