@@ -754,10 +754,12 @@ fn capture_reports_human_gate(stdout: &str) -> bool {
 }
 
 /// The stated outcome of a decoded JSON document: each string value is read
-/// with [`latest_stated_outcome`]. A document's values have no order a reader
-/// can rely on, so when its strings disagree the safe outcome wins: any
-/// ordinary outcome makes the document [`StatedOutcome::Other`], and only
-/// otherwise does a checkpoint make it [`StatedOutcome::Checkpoint`].
+/// with [`latest_stated_outcome`]. An array is ordered, so its elements are
+/// read newest first and the first that states an outcome decides, like the
+/// lines of a text. An object's fields have no order a reader can rely on, so
+/// when they disagree the safe outcome wins: any ordinary outcome makes the
+/// object [`StatedOutcome::Other`], and only otherwise does a checkpoint make
+/// it [`StatedOutcome::Checkpoint`].
 ///
 /// This replaces matching only `Gate:` lines inside the strings, which skipped
 /// a later ordinary-failure marker and let an earlier gate line win (round-3
@@ -774,8 +776,10 @@ fn json_strings_stated_outcome(value: &serde_json::Value) -> StatedOutcome {
         serde_json::Value::String(text) => latest_stated_outcome(text),
         serde_json::Value::Array(items) => items
             .iter()
+            .rev()
             .map(json_strings_stated_outcome)
-            .fold(StatedOutcome::Silent, combine),
+            .find(|outcome| *outcome != StatedOutcome::Silent)
+            .unwrap_or(StatedOutcome::Silent),
         serde_json::Value::Object(fields) => fields
             .values()
             .map(json_strings_stated_outcome)
@@ -4762,6 +4766,12 @@ mod tests {
         let declared =
             "DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\"}";
 
+        // Round-4 review: the fixture must really take the raw-capture path,
+        // or the stream reader answers these and the JSON path goes untested.
+        assert!(
+            classify(&ParsedCapture::parse(&noisy(gate))) != CaptureKind::ClaudeStream,
+            "the noisy fixture must not be read as a Claude stream"
+        );
         assert!(!blocking_human_checkpoint_reported(&noisy(&format!(
             "{gate}\n{plain_failure}"
         ))));
@@ -4783,10 +4793,31 @@ mod tests {
             &plain_gate_then_silent_json
         ));
 
-        let disagreeing_fields = serde_json::json!({"a": gate, "b": plain_failure}).to_string();
+        for fields in [
+            serde_json::json!({"a": gate, "b": plain_failure}),
+            serde_json::json!({"a": plain_failure, "b": gate}),
+        ] {
+            assert!(
+                !blocking_human_checkpoint_reported(&format!("noise\n{fields}\n")),
+                "an object's fields have no order, so the ordinary outcome wins: {fields}"
+            );
+        }
+
+        let blocks = |first: &str, second: &str| {
+            let content = serde_json::json!({"content": [{"text": first}, {"text": second}]});
+            format!("noise\n{content}\n")
+        };
         assert!(
-            !blocking_human_checkpoint_reported(&format!("noise\n{disagreeing_fields}\n")),
-            "fields of one document have no order, so the ordinary outcome wins"
+            blocking_human_checkpoint_reported(&blocks(plain_failure, gate)),
+            "an array is ordered, so a later gate block wins"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&blocks(gate, plain_failure)),
+            "an array is ordered, so a later failure block wins"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&blocks(gate, "Silent tail.")),
+            "a silent later block is skipped"
         );
     }
 

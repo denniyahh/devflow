@@ -5447,6 +5447,17 @@ mod tests {
             "a gate line as the latest stated outcome must auto-decide exactly once: {auto_decided:?}"
         );
         assert_eq!(auto_decided[0]["session_id"], "sess-gate-line-only");
+        assert!(
+            reloaded_for_reap
+                .as_ref()
+                .is_some_and(|reloaded| reloaded.monitor_pid.is_some()),
+            "the checkpoint must relaunch the session, not only record the event"
+        );
+        let gate_fired = events_of_kind(root, "gate_fired");
+        assert!(
+            gate_fired.iter().all(|e| e["stage"] != "code"),
+            "an auto-resolved checkpoint must not also fire the generic gate: {gate_fired:?}"
+        );
     }
 
     /// 49-REVIEW CR-01 at the pipeline: a failure whose reason only describes
