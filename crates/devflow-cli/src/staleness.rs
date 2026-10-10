@@ -464,7 +464,13 @@ pub(crate) fn enforce_build_staleness(
                     ""
                 }
             );
-            gates::fire_gate_notify(state.phase, state.stage, &message, true);
+            gates::fire_gate_notify_with_fallback(
+                state.phase,
+                state.stage,
+                &message,
+                true,
+                state.gate_notify_cmd.as_deref(),
+            );
             // WR-02 (18-fix): `message` embeds `execution_root.display()` —
             // an absolute filesystem path (and, on a typical Linux/macOS
             // path, the operator's OS username). `fire_gate_notify` and the
