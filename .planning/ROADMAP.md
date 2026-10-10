@@ -841,6 +841,29 @@ that review round.
 gate entry as well as at resolution, warn on an unparseable re-read, and add a `resume` arm with the variable unset
 that asserts the saved command is kept.
 
+### Phase 999.155: A Halted Checkpoint Can Advance Past Code When the Last Turn Has No Result Marker (BACKLOG)
+
+**Found:** 2026-10-10, round-3 external review (DeepSeek lane) of the declared-checkpoint fix (PR #224). Reported with
+a probe by the reviewer; the code path was confirmed by reading `develop`, not reproduced here. Present on `develop`
+before PR #224 as well; that PR did not change it.
+
+**Defect:** the checkpoint check runs only inside the `Action::GateReview` arm of `advance_with`
+(`crates/devflow-cli/src/pipeline_launch.rs`), after `decide_action` has already chosen the action from the evaluated
+result. For a Claude stream, Layer 1 reads only the LAST top-level `result` event (`parse_claude_event_result`). If the
+agent halts at a blocking-human gate in turn N and a later turn (for example a task-notification wake-up) ends with no
+`DEVFLOW_RESULT` marker, Layer 1 returns nothing; with a clean exit and commits made before the gate, Layer 2 reports
+Success, `decide_action` returns `Advance`, and the run moves on to Validate. The capture scan, which would report the
+checkpoint (it skips silent turns), is never consulted, so the human's decision is skipped rather than auto-decided.
+Unlike a false checkpoint, this is not bounded by the resume ceiling.
+
+**Reviewer's input:** an init event, a result event ending `DEVFLOW_RESULT: {"status":"failed","checkpoint":
+"blocking-human"}`, then a result event `"Acknowledged; nothing to report."`; exit file `0`; one commit on the phase
+branch. Reported: capture scan true, Layer 1 None, Layer 2 Success.
+
+**Fix shape (from the review, not decided):** consult the capture scan for a Code stage before `decide_action`, so a
+reported checkpoint forces the gate path; or have the stream parser pick its outcome with the same latest-stated-outcome
+rule across result events instead of reading only the last one. First reproduce it with a pipeline test.
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
