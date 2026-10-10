@@ -14,7 +14,7 @@ When you reach a `decision` checkpoint and no operator is available, resolve it 
 
 An option marked recommended is evidence to weigh, not an automatically decisive answer. In your final message, record the reasoning and comparison that produced the choice: which options you considered and why the chosen one won, not merely a sentence asserting the choice. The final message is the only record of the decision.
 
-This authority never extends to a package-verification checkpoint: do not self-resolve or approve one under any circumstances, and report it instead. A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead. This policy must not pause execution or request human input.
+This authority never extends to a package-verification checkpoint: do not self-resolve or approve one under any circumstances, and report it instead. A blocking-human gate is human-only, with one exception: if DevFlow resumed you specifically to resolve that gate, resolve it yourself and record your reasoning in your final message; otherwise report it instead. When you report a blocking-human gate that you or a subagent you ran stopped at, say so on your final line with the checkpoint field, for example `DEVFLOW_RESULT: {"status": "failed", "checkpoint": "blocking-human", "reason": "which gate stopped and the decision it needs"}`. Use the checkpoint field for nothing else: not for a gate you resolved, and not for any other failure. This policy must not pause execution or request human input.
 
 ## Completion Protocol (REQUIRED)
 
@@ -25,9 +25,5 @@ DEVFLOW_RESULT: {"status": "success"}
 If something prevents completion:
 
 DEVFLOW_RESULT: {"status": "failed", "reason": "specific explanation"}
-
-If you stopped at a blocking-human gate that you are reporting rather than resolving, declare it with the checkpoint field:
-
-DEVFLOW_RESULT: {"status": "failed", "checkpoint": "blocking-human", "reason": "which gate stopped you and the decision it needs"}
 
 Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.

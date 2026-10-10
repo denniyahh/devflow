@@ -49,8 +49,14 @@ pub struct AgentResult {
     /// (49-REVIEW CR-01), which matched ordinary failures that mentioned a
     /// gate. Deserialized leniently via [`deserialize_checkpoint_lenient`]: a
     /// non-string value becomes `None` rather than failing the whole parse, so
-    /// a malformed field can never drop a valid `status` to Layer 2.
-    #[serde(default, deserialize_with = "deserialize_checkpoint_lenient")]
+    /// a malformed field can never drop a valid `status` to Layer 2. Dropped at
+    /// parse time unless the marker's own status is `failed`
+    /// ([`parse_marker_lines`]), and never serialized when absent.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub checkpoint: Option<String>,
 }
 
@@ -2145,7 +2151,15 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
         }
 
         let json_str = line[PREFIX.len()..].trim();
-        if let Ok(result) = serde_json::from_str::<AgentResult>(json_str) {
+        if let Ok(mut result) = serde_json::from_str::<AgentResult>(json_str) {
+            // A declaration belongs to the failure the agent reported. Dropped
+            // here, at the one place agent JSON becomes an AgentResult, so no
+            // later status rewrite (the exit-code reconcile turns a reported
+            // success into a failure with `..result`) can carry it onto a
+            // failure the agent never declared.
+            if result.status != AgentStatus::Failed {
+                result.checkpoint = None;
+            }
             return Some(result);
         }
     }
@@ -4293,6 +4307,34 @@ mod tests {
                 "must not declare a checkpoint: {marker}"
             );
         }
+    }
+
+    /// A success marker never carries a declaration forward. The exit-code
+    /// reconcile rewrites a reported success to a failure with `..result`, so a
+    /// `checkpoint` kept on the success would become a failed, declaring result
+    /// that the agent never reported (external review 2026-10-09).
+    #[test]
+    fn declared_checkpoint_on_a_success_marker_does_not_survive_the_exit_code_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(root, phase), "1").unwrap();
+
+        let marker = r#"DEVFLOW_RESULT: {"status": "success", "checkpoint": "blocking-human"}"#;
+        let parsed = parse_devflow_result(marker).expect("marker parses");
+        assert_eq!(
+            parsed.checkpoint, None,
+            "a success marker keeps no checkpoint"
+        );
+
+        let reconciled = reconcile_stream_success_against_exit_code(root, phase, parsed);
+        assert_eq!(
+            reconciled.status,
+            AgentStatus::Failed,
+            "exit 1 rewrites success"
+        );
+        assert!(!reconciled.declares_blocking_human_checkpoint());
     }
 
     /// A malformed `checkpoint` value is dropped, never the whole marker: the

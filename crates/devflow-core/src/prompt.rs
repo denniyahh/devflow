@@ -51,10 +51,6 @@ If something prevents completion:\n\
 \n\
 DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}\n\
 \n\
-If you stopped at a blocking-human gate that you are reporting rather than resolving, declare it with the checkpoint field:\n\
-\n\
-DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\", \"reason\": \"which gate stopped you and the decision it needs\"}\n\
-\n\
 Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. \
 DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.";
 
@@ -91,6 +87,32 @@ macro_rules! gate_resolution_rule {
 /// 2026-09-11). Do not widen it without a new decision.
 pub const GATE_RESOLUTION_RULE: &str = gate_resolution_rule!();
 
+/// How an agent reports a `blocking-human` gate it is not resolving: the
+/// `checkpoint` field on its final marker, which the pipeline reads through
+/// [`crate::agent_result::AgentResult::declares_blocking_human_checkpoint`]
+/// (49-REVIEW CR-01). It names a subagent's halt too, because under GSD the
+/// executor subagent stops and the orchestrator writes the marker.
+///
+/// It lives in [`CODE_STAGE_POLICY`] and not in [`COMPLETION_PROTOCOL`] for two
+/// reasons. Only the Code stage runs plans, so only Code may declare (the
+/// pipeline ignores the field elsewhere), and the auto-decide resume prompt,
+/// which carries only the protocol, does not re-offer it. The example sits
+/// inside a sentence, never at the start of a line, so an echoed prompt cannot
+/// parse as a declaring marker. A macro for the same `concat!` reason as
+/// [`gate_resolution_rule`].
+macro_rules! checkpoint_declaration {
+    () => {
+        "When you report a blocking-human gate that you or a subagent you ran \
+        stopped at, say so on your final line with the checkpoint field, for \
+        example `DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \
+        \"blocking-human\", \"reason\": \"which gate stopped and the decision it \
+        needs\"}`. Use the checkpoint field for nothing else: not for a gate you \
+        resolved, and not for any other failure."
+    };
+}
+#[cfg(test)]
+const CHECKPOINT_DECLARATION: &str = checkpoint_declaration!();
+
 /// Shared policy for full-execute Code prompts. This advises the agent during
 /// one-shot Code execution, while [`checkpoint_auto_decide_prompt`] is injected
 /// into a resumed session after DevFlow's own human-blocking gate finds no
@@ -126,6 +148,8 @@ of the decision.\n\
 This authority never extends to a package-verification checkpoint: do not \
 self-resolve or approve one under any circumstances, and report it instead. ",
     gate_resolution_rule!(),
+    " ",
+    checkpoint_declaration!(),
     " This policy must not pause execution or request human input."
 );
 
@@ -1288,40 +1312,73 @@ mod tests {
         );
     }
 
-    /// 49-REVIEW CR-01: the protocol shows agents how to declare a
-    /// blocking-human checkpoint, and the example it shows is exactly what the
-    /// parser accepts. Each marker example is parsed with the real parser, so
-    /// the prompt and `AgentResult` cannot drift apart: the checkpoint example
-    /// must declare the checkpoint, and the other two must not.
+    /// 49-REVIEW CR-01: the Code policy's checkpoint example is exactly what
+    /// the parser accepts as a declaration, so the prompt and `AgentResult`
+    /// cannot drift apart. The sentence is pinned verbatim, so a widening such
+    /// as "declare it on any failure" fails here.
     #[test]
-    fn completion_protocol_checkpoint_example_is_what_the_parser_accepts() {
-        let examples: Vec<&str> = COMPLETION_PROTOCOL
-            .lines()
-            .filter(|line| line.starts_with("DEVFLOW_RESULT:"))
-            .collect();
-        assert_eq!(
-            examples.len(),
-            3,
-            "success, failure and checkpoint examples: {examples:?}"
-        );
-        let declaring: Vec<&str> = examples
-            .iter()
-            .copied()
-            .filter(|line| {
-                crate::agent_result::parse_devflow_result(line)
-                    .unwrap_or_else(|| panic!("protocol example must parse: {line}"))
-                    .declares_blocking_human_checkpoint()
-            })
-            .collect();
-        assert_eq!(
-            declaring.len(),
-            1,
-            "exactly one protocol example declares the checkpoint: {examples:?}"
-        );
+    fn checkpoint_declaration_example_is_what_the_parser_accepts() {
         assert!(
-            COMPLETION_PROTOCOL.contains("blocking-human gate"),
-            "the protocol must say when to use the checkpoint form"
+            CODE_STAGE_POLICY.contains(CHECKPOINT_DECLARATION),
+            "the Code policy must carry the declaration sentence"
         );
+        assert!(CHECKPOINT_DECLARATION.starts_with(
+            "When you report a blocking-human gate that you or a subagent you ran stopped at,"
+        ));
+        assert!(CHECKPOINT_DECLARATION.ends_with(
+            "Use the checkpoint field for nothing else: not for a gate you resolved, and not for any other failure."
+        ));
+        let example = CHECKPOINT_DECLARATION
+            .split('`')
+            .find(|part| part.starts_with("DEVFLOW_RESULT:"))
+            .expect("the sentence quotes one example marker");
+        let parsed = crate::agent_result::parse_devflow_result(example)
+            .unwrap_or_else(|| panic!("the example must parse: {example}"));
+        assert!(parsed.declares_blocking_human_checkpoint(), "{example}");
+    }
+
+    /// An echoed prompt must never read as a declaring marker. Every marker
+    /// line that starts a line in a delivered prompt (the parser only reads
+    /// line-start markers) parses as a non-declaring example, for the Code
+    /// prompt that carries the policy and for the policy-carrying fix prompt.
+    #[test]
+    fn no_line_start_marker_in_a_code_prompt_declares_a_checkpoint() {
+        let prompts = [
+            stage_prompt(Stage::Code, PhaseId::new(47)),
+            fix_prompt(FixType::FullExecute, PhaseId::new(47)),
+        ];
+        for prompt in prompts {
+            assert!(prompt.contains(CHECKPOINT_DECLARATION));
+            let markers: Vec<&str> = prompt
+                .lines()
+                .filter(|line| line.starts_with("DEVFLOW_RESULT:"))
+                .collect();
+            assert!(!markers.is_empty(), "the protocol examples are present");
+            for marker in markers {
+                let parsed = crate::agent_result::parse_devflow_result(marker)
+                    .unwrap_or_else(|| panic!("protocol example must parse: {marker}"));
+                assert!(!parsed.declares_blocking_human_checkpoint(), "{marker}");
+            }
+            assert!(
+                !crate::agent_result::parse_devflow_result(&prompt)
+                    .is_some_and(|result| result.declares_blocking_human_checkpoint()),
+                "a whole echoed prompt must not parse as a declaration"
+            );
+        }
+    }
+
+    /// Only Code may declare. The resume prompt and every non-Code stage
+    /// prompt carry no checkpoint form, so a resumed agent is not re-offered
+    /// it and Define, Plan, Validate and Ship are not invited to use it.
+    #[test]
+    fn checkpoint_declaration_is_offered_only_to_the_code_stage() {
+        let resume = checkpoint_auto_decide_prompt(PhaseId::new(47));
+        assert!(!resume.contains("\"checkpoint\""), "{resume}");
+        assert!(!COMPLETION_PROTOCOL.contains("checkpoint"));
+        for stage in [Stage::Define, Stage::Plan, Stage::Validate, Stage::Ship] {
+            let prompt = stage_prompt(stage, PhaseId::new(47));
+            assert!(!prompt.contains("\"checkpoint\""), "{stage:?}: {prompt}");
+        }
     }
 
     #[test]
