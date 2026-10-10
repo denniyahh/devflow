@@ -1,0 +1,1 @@
+attempt 1: unexpected code stage failure gate; checkpoint reported in subagent handback was not recognized by top-level result scanner, failing to trigger auto-decide resume

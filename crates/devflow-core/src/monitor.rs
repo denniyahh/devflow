@@ -281,6 +281,18 @@ pub enum MonitorLaunch {
     Legacy,
 }
 
+/// Strip `DEVFLOW_GATE_NOTIFY_CMD` from a detached monitor chain
+/// (49-REVIEW.md WR-07). Every gate in the chain then resolves the command
+/// from the run's state file at the moment it fires, so editing
+/// `gate_notify_cmd` there changes or disables the hook for a run in flight,
+/// and the command (which may carry a webhook token) never reaches the coding
+/// agent's environment. Also applied wherever an agent process is spawned
+/// directly (the pipe-owning agent and the delivery canary). The foreground
+/// `devflow` process keeps the operator's own variable for the gates it fires.
+pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
+    child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
+}
+
 /// Spawn a background monitor that owns the agent for the given workflow state.
 ///
 /// The monitor is a detached process that:
@@ -431,7 +443,8 @@ fn spawn_monitor_inner(
         // comment gives: `hermetic_command` does its `env_remove`s at
         // construction and `.envs(...)` runs after, so deliberate
         // configuration survives while inherited pollution does not.
-        let child = hermetic_command(&binary, workdir_path)
+        let mut child_cmd = hermetic_command(&binary, workdir_path);
+        child_cmd
             .args(pipe_owning_monitor_args(
                 project_root,
                 state,
@@ -441,7 +454,11 @@ fn spawn_monitor_inner(
             ))
             .arg(program)
             .args(args)
-            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+        strip_notify_env(&mut child_cmd);
+
+        let child = child_cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -551,7 +568,8 @@ fn spawn_monitor_inner(
     // deliberately sets one of these variables still wins. Deliberate
     // configuration survives; inherited pollution does not. That is what
     // keeps Codex's unsigned-commit override (`GIT_CONFIG_*`) working.
-    let child = hermetic_command("sh", workdir_path)
+    let mut child_cmd = hermetic_command("sh", workdir_path);
+    child_cmd
         .arg("-c")
         .arg(&script)
         .arg("sh")
@@ -559,7 +577,11 @@ fn spawn_monitor_inner(
         .args(args)
         // Adapter-scoped env (e.g. Codex's unsigned-commit override) rides
         // the whole monitor chain: sh → agent → its git children (13-06).
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    strip_notify_env(&mut child_cmd);
+
+    let child = child_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -966,7 +988,10 @@ pub fn run_pipe_owning_monitor(
     // to make an append-mode open safe would be an unstated coupling).
     let mut capture = std::fs::File::create(&stdout_file)?;
 
-    let mut child = hermetic_command(program, workdir)
+    let mut agent_cmd = hermetic_command(program, workdir);
+    // The coding agent never needs the gate notify command (WR-07).
+    strip_notify_env(&mut agent_cmd);
+    let mut child = agent_cmd
         .args(args)
         .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
@@ -1566,6 +1591,24 @@ mod tests {
 
         assert_eq!(args[stage + 1], "code");
         assert!(stage < separator, "stage must be parsed before child argv");
+    }
+
+    /// WR-07 (49-REVIEW.md): the chain's command never carries the variable.
+    #[test]
+    fn strip_notify_env_removes_the_variable_from_the_child() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env(crate::gates::GATE_NOTIFY_CMD_ENV, "touch x");
+        strip_notify_env(&mut cmd);
+        let entry = cmd
+            .get_envs()
+            .find(|(key, _)| *key == crate::gates::GATE_NOTIFY_CMD_ENV);
+        assert_eq!(
+            entry,
+            Some((
+                std::ffi::OsStr::new(crate::gates::GATE_NOTIFY_CMD_ENV),
+                None
+            ))
+        );
     }
 
     fn state_in(root: &Path) -> State {

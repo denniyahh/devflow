@@ -2,21 +2,21 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: 49
-current_phase_name: Live Unattended Run — The Milestone's Instrument
+current_phase: "49.1"
+current_phase_name: Declared Checkpoint Detection
 current_plan: Not started
 status: planning
-stopped_at: Phase 49 context gathered
-last_updated: "2026-09-25T00:14:44.551Z"
-last_activity: 2026-09-23
-last_activity_desc: Phase 48 complete, transitioned to Phase 49
-state_head: 5ee0d296da2c3cacfb24165cb14acb6f37dca819
+stopped_at: Phase 49 complete, ready to plan Phase 49.1
+last_updated: "2026-10-09T21:47:53.901Z"
+last_activity: 2026-10-09
+last_activity_desc: Phase 49 complete, transitioned to Phase 49.1
+state_head: 05a07021e67f66c3e8aaab2b1c9ab0afec18fe8a
 progress:
-  total_phases: 6
-  completed_phases: 3
-  total_plans: 36
-  completed_plans: 36
-  percent: 50
+  total_phases: 7
+  completed_phases: 4
+  total_plans: 48
+  completed_plans: 48
+  percent: 57
 ---
 
 # DevFlow — Project State
@@ -68,7 +68,7 @@ Phase 47 is complete (7/7 plans) and integrated: merged to `develop` via PR #213
 `workspace/denniyahh`. Its verification recorded `passed` 39/39 with one operator-accepted override, and now reads
 `stale`: `.planning/ROADMAP.md` is one of its 48 covered files, and `phase.complete`'s own write in
 `4bb9504` changed it (the covered digest recomputed with that file reverted to `3fa9206` matches the
-recorded one). Phases 49-51 remain unplanned.
+recorded one). Phase 49 is planned (12 plans, 6 waves, replanned 2026-09-29 after the re-scope); Phases 50-51 remain unplanned.
 
 **The wave order is the milestone's core design, not a preference.** Correctness (46, 47) →
 survivability (48) → the live `--mode auto` run that measures them (49) → the socket-addressable
@@ -93,7 +93,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-23)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), not yet planned. Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
+**Current focus:** v3.0.0 Unattended Run Survivability — Phase 49 (Live Unattended Run — The Milestone's Instrument), re-scoped 2026-09-28 to a disposable GSD project with one operator checkpoint per attempt; executing (12 plans, 6 waves). Phase 48 is complete and merged to `develop` via PR #218 (verification passed 7/7). Phases 46 and 47 are complete and integrated; 47's
 verification reads `stale` (see `## Active Phase`).
 
 ## Operator Next Steps
@@ -112,7 +112,7 @@ verification reads `stale` (see `## Active Phase`).
   runs the harness inside `cargo test`. Record an override; do not restore the file.
 - **Retrospective review complete (2026-09-13):** `.planning/audits/2026-09-13-phase-47-retrospective.md` is CLOSED. Decisions resolved: D1 Option A (minimal-divergence workspace), D2 P1–P5 process improvements adopted (P1/P2 now, P3/P4 in Phase 48, P5 post-P1), D3 backlog items 999.125, 999.126, and 999.38 promoted now.
 - **Promoted into active roadmap (2026-09-13):** 999.125 and 999.126 (human-gate consistency between preflight and resume) scheduled into Wave 2 alongside Phase 48; 999.38 (test-suite PATH race) scheduled for test-suite isolation. Backlog items remaining unpromoted: 999.120, 999.121.
-- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); adversarially reviewed and revised the same day (D-03/D-07 re-decided); next `/gsd-plan-phase 49`.
+- Phase 48 is complete and merged to `develop` via PR #218 (2026-09-24). Phase 49 context gathered 2026-09-24 (`49-CONTEXT.md`); planned 2026-09-25 and revised after adversarial reviews (`49-REVIEWS.md`, `a913495`), then re-scoped 2026-09-28 (ROADMAP `968b713`, context `066251f`): the 18 plans were retired (`bc73b1b`) and the phase replanned 2026-09-29 as 12 plans in 6 waves (`fe5bd3a`…`76c21ca`); next `/gsd-execute-phase 49`. After Phase 49 verification and transition, the orchestrating session owns the ROADMAP post-completion gate: merge `feature/phase-49` into `workspace/denniyahh`, run `scripts/sync-workspace.sh`, verify the divergence check and the pushed ref.
   Separate follow-up PR: the plan-linter P1 commits `5c18bc3`, `b9ee940`, `56f3466` (kept out of #218). The 48-20 code review's 4 warnings (test coverage
   and duplication, `48-REVIEW.md`) were left unfixed at close.
 - Phase 49 carries a **setup step**: this repository has no committed `devflow.toml`, so a
@@ -189,8 +189,8 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 49 — Live Unattended Run — The Milestone's Instrument
-Plans: not yet planned
+Phase: 49.1 — Declared Checkpoint Detection
+Plans: none yet — Phase 49.1 is inserted (CR-01 declared checkpoint detection); next step `/gsd-discuss-phase 49.1`
 Current Plan: Not started
 Total Plans in Phase: 0
 Completed Plans: 0 of 0
@@ -204,9 +204,9 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-09-23 — Phase 48 complete, transitioned to Phase 49
+Last activity: 2026-10-09 — Phase 49 complete, transitioned to Phase 49.1
 
-Progress: [█████░░░░░] 50% (3 of 6 phases complete — `roadmap.analyze` counts 47 as partial while its verification reads `stale`)
+Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted 2026-10-09. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
@@ -856,6 +856,10 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 - [Phase 48]: Driver fixtures supply PATH and configuration only through the spawned child Command.
 - [Phase 48]: close: re-verification after 48-20 (executed by codex) passed 7/7; the operator ruled 2026-09-23 that 999.139 on `start` (corrupt state + dead agent + live monitor, reproduced live) is outside criterion 2, being 999.136's agent-exit → `advance` window. 48-20 review: 0 critical / 4 warnings (test-coverage and duplication), not fixed at close.
 - [Phase 48]: close (PR #218): fixed 4 timing races that made the devflow-core suite flake in CI — lock coordination flock inherited by a forked child (bounded settle wait in `acquire`), `agent_running` counting a pid reaped mid-check as alive (NotFound now means gone), and two probe tests racing exec / the group kill. Operator chose fix-before-merge 2026-09-23. Evidence: 3/25 flaky full-suite runs before, 0/50 after; workspace 1451/0; fixed by hand (post-verification PR fixes, same shape as the phase's earlier review fixes), not via /gsd-quick.
+- [Phase 49]: 49-11 closed on attempt-gate verdict=shipped attempt=3 (not the reply); attempt 3 ran a fix-branch binary (084625c) not yet on feature/phase-49; why attempt 3 followed attempt 2's shipped verdict is unrecorded — open for 49-12
+- [Phase 49]: 49-12: VERIFY-01 written as met on attempt 3 (attempt gate verdict=shipped; committed copy positive 11/0, negative 5/0, pair 3/0); shipped binary is from unmerged fix-branch commit 084625c
+- [Phase 49]: 49-12: DECN-03 outcome Followed (gate-derived from attempt 3 committed events/captures; claude only, D-15)
+- [Phase 49]: 49-12: attempt 2's two sanitizer-refused captures omitted whole by operator decision 2026-10-08 (option A)
 
 ## Roadmap Evolution
 
@@ -951,17 +955,19 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 | Phase 48 P02 | 10min | 3 tasks | 1 files |
 | Phase 48 P03 | 12m | 2 tasks | 3 files |
 | Phase 48 P20 | 16m | 2 tasks | 4 files |
+| Phase 49 P11 | 6h operator | 1 tasks | 1 files |
+| Phase 49 P12 | 24h 26m | 3 tasks | 255 files |
 
 ## Session
 
-**Last session:** 2026-09-25T00:14:44.328Z
-**Stopped at:** Phase 49 context gathered
-**Resume file:** .planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-CONTEXT.md
+**Last session:** 2026-10-09T00:48:44.074Z
+**Stopped at:** Phase 49 complete, ready to plan Phase 49.1
+**Resume file:** None
 
 ## Operator Next Steps
 
 - See `## Operator Next Steps` near the top of this file. Phase 47 is integrated and the Phase 48
-  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 context is gathered; it was adversarially reviewed and revised; the next command is `/gsd-plan-phase 49`. Phase 47's verification stays
+  worktree exists; Phase 48 is complete and merged via PR #218, and Phase 49 was re-scoped 2026-09-28 (disposable GSD project, one operator checkpoint per attempt) with its context updated and the phase replanned 2026-09-29 (12 plans, 6 waves); the next command is `/gsd-execute-phase 49`. Phase 47's verification stays
   `stale` by operator decision until a re-verify near milestone close.
 
 ## Accumulated Context
@@ -974,3 +980,5 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 
 - Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in
 - 999.97 filed and hotfixed (2026-08-07), no phase cycle: `devflow start --phase 35.1` was rejected by clap (`invalid digit found in string`) — the phase identifier was `u32` at 182 sites and `prompt.rs` globbed it as `{phase:02}`, so decimal phases could not be launched at all. Briefly filed as Phase 37 via `phase.add` and then withdrawn on the operator's call to fix it directly. Recording the tool defect while it is fresh: `phase.add` again placed the new entry at the document's last `---` (inside archived 999.25 prose, outside the active milestone window) and wrote neither the phase-table nor the Progress-table row.
+- Phase 49 edited: edited fields: goal, success_criteria (criterion 1), execution note — Phase 49 re-scoped to a disposable GSD project with one operator checkpoint per attempt (operator, 2026-09-28)
+- Phase 49.1 inserted after Phase 49: Declared checkpoint detection: replace e3f9ddd's prose heuristic (agent_result.rs marker_reports_human_gate auto-resumes any Failed reason containing blocking-human plus gate/checkpoint/halted) with an explicit checkpoint field in the DEVFLOW_RESULT marker; fixes 49-REVIEW.md CR-01; decide whether a new live attempt is needed, since Phase 49's VERIFY-01 evidence ran the heuristic binary (084625c) (URGENT)

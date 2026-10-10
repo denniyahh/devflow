@@ -1,0 +1,2 @@
+[2m2026-10-07T22:17:13.517437Z[0m [32m INFO[0m [2mdevflow_core::gates[0m[2m:[0m writing gate define for phase 1
+[2m2026-10-07T22:17:13.517610Z[0m [32m INFO[0m [2mdevflow::pipeline_gate[0m[2m:[0m never-silent gate: define failed in Auto mode — surfacing an unattended gate this mode would not normally fire

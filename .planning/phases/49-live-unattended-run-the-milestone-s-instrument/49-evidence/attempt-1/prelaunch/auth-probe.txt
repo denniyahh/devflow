@@ -1,0 +1,7 @@
+unit=p49-a1-authprobe
+probe_exit=0
+is_error=false
+reply_ok=yes
+auth_source=none
+probe_timeout_secs=180
+measured_at=1791390875

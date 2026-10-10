@@ -1,0 +1,8 @@
+integration_head=5e05cd904fe96f563c5ce7df165a74c4d1cbd9e0
+integration_merge_count=0
+integration_merge=ABSENT
+integration_merge_parents=ABSENT
+main_head=628743a8c5ec5e11f63e75e070647089434072d9
+feature_head=5e05cd904fe96f563c5ce7df165a74c4d1cbd9e0
+feature_is_ancestor_of_integration=yes
+tags=

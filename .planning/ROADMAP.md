@@ -28,7 +28,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
-| 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Not started |
+| 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
@@ -247,22 +247,29 @@ before Phase 49's live unattended run measures the chain.
 
 ### Phase 49: Live Unattended Run — The Milestone's Instrument
 
-**Goal**: A real `devflow start --mode auto` run on this repository is recorded end to end against a
-configured base — fork point, preflight, unattended progression, and Ship merge target — so the
+**Goal**: A real `devflow start --mode auto` run against a disposable GSD project is recorded end to end
+against a configured base — fork point, preflight, unattended progression, and Ship merge target — so the
 milestone's earlier fixes are measured on a live chain rather than asserted from unit evidence.
 **Depends on**: Phases 46, 47, 48
 **Sequencing note**: Deliberate, not incidental. This run is the measuring instrument for the whole
 milestone; landing it before the wave-1/2 fixes would measure the defects rather than the chain.
+**Execution note**: The operator starts each attempt and answers any gates DevFlow raises; Phase 49's own
+execution pauses once for this, and the attempt is judged afterwards from recorded evidence.
 **Requirements**: VERIFY-01
 **Success Criteria** (what must be TRUE):
 
-  1. **Setup step, inside this phase, not a precondition:** this repository has no committed
-     `devflow.toml`, so a `base_branch` is configured here first. The run's persisted
-     `State::base_branch` then reads that configured value rather than the `develop` default.
+  1. **Setup step, inside this phase, not a precondition:** the disposable project commits a
+     `devflow.toml` with a non-default `base_branch`, and the run's persisted
+     `State::base_branch` reads that configured value rather than the `develop` default.
   2. The run is recorded fork point through Ship merge target: an observed fork point on the
      configured base, `unattended_config_condition = Holds`, unattended stage progression, and an
-     observed Ship merge target. **The Ship merge target has never been observed at all** — this
-     criterion is the first observation of it, not a re-confirmation.
+     observed Ship merge target. Progression is unattended apart from the two preflight gates the
+     run parks at by design: Define and Code, each approved by the operator, because the payload
+     plan seeds a `blocking-human` checkpoint that no mode auto-approves (D-22). The Ship gate still
+     fires but is answered by `--yes-ship`, attributed in the gate ledger, and does not wait (D-23).
+     Any further gate is recorded as a deviation with its cause (R-6). **The Ship merge target has
+     never been observed at all** — this criterion is the first observation of it, not a
+     re-confirmation.
   3. The negative-control arm still holds when re-run against **this phase's binary**, not inherited
      from the 2026-09-03 capture: an unconfigured scratch repo forks from `develop` (persisted
      `"base_branch": "develop"`) and refuses on the missing `.planning/config.json`. Both arms must
@@ -276,7 +283,63 @@ milestone; landing it before the wave-1/2 fixes would measure the defects rather
      state write at all. A run with no observed interleaving does not weaken the Phase 48 test, and
      must not be written up as if it confirmed anything.
 
-**Plans**: TBD
+**Plans**: 12/12 plans complete (6 waves); 49-11 is the single operator checkpoint for the live attempt
+
+**Wave 1**
+
+- [x] 49-01-PLAN.md *(no plan dependencies)* — restate VERIFY-01's setup step, name the by-design Define and Code gates in criterion 2, retire the superseded decimal payload plan
+- [x] 49-02-PLAN.md *(no plan dependencies)* — tracer: scaffold `--live-payload` integration topology with `--check` and `--selftest`; default mode byte-identical
+- [x] 49-03-PLAN.md *(no plan dependencies)* — evidence layout contract, gate snapshot hook, post-run collector with a derived verdict
+- [x] 49-04-PLAN.md *(no plan dependencies)* — SURV-01 inotify watcher and honest overlap analysis
+- [x] 49-05-PLAN.md *(no plan dependencies)* — evidence sanitizer and committed-evidence scanner
+
+**Wave 2**
+
+- [x] 49-06-PLAN.md *(depends on 49-02)* — payload plan with the seeded blocking-human decision, RED test, validation map, full pre-launch check
+- [x] 49-07-PLAN.md *(depends on 49-02, 49-03)* — negative-arm driver and `--arm negative` checker, proven against the real binary
+
+**Wave 3**
+
+- [x] 49-08-PLAN.md *(depends on 49-03, 49-07)* — `--arm positive`, `--pair` and the attempt gate
+- [x] 49-09-PLAN.md *(depends on 49-03, 49-04, 49-06, 49-07)* — attempt launcher: prepare (rebuild, pin, scaffold) and start (private-repo checks, units, notify hook)
+
+**Wave 4**
+
+- [x] 49-10-PLAN.md *(depends on 49-08, 49-09)* — operator runbook and host requirements
+
+**Wave 5**
+
+- [x] 49-11-PLAN.md *(depends on 49-10)* — live attempt: one `checkpoint:human-action`, closed only by the attempt gate
+
+**Wave 6**
+
+- [x] 49-12-PLAN.md *(depends on 49-01, 49-04, 49-05, 49-11)* — sanitized evidence, VERIFY-01 verdict, DECN-03 and SURV-01 records, backlog disposition
+
+**Post-completion integration gate:** After Phase 49 goal verification, `phase.complete` and the post-completion
+transition have written their final `.planning/` artifacts on `feature/phase-49`, merge that branch into
+`workspace/denniyahh` in the clean main checkout. First record whether `feature/phase-49` is already an ancestor and
+whether the final `49-LIVE-RUN.md` blob is present on the workspace; an absent blob is the negative control for the
+later presence and byte comparison. If either is already present, record why instead of treating a zero-change merge
+as proof of import.
+Resolve any `STATE.md` or `ROADMAP.md` conflict from the actual Phase 49 records and log any hand repair of GSD
+output. Then run `scripts/sync-workspace.sh` from `workspace/denniyahh`, check
+`scripts/check-workspace-divergence.sh origin/develop`, and push the workspace branch with its normal hooks. Require
+`feature/phase-49` to be an ancestor of the local and remote workspace refs and compare the Phase 49 planning paths
+there before calling the phase integrated. The final `49-LIVE-RUN.md` blob must match exactly on both branches;
+`STATE.md` and `ROADMAP.md` must be checked for Phase 49 rather than byte-compared, since the two branches
+recorded different events. `sync-workspace.sh` merges `develop` into the workspace; it does not import
+the Phase 49 worktree's planning commits by itself. If verification or `phase.complete` writes more planning commits
+after this merge-back, repeat the merge-back and check rather than treating the first one as final.
+
+### Phase 49.1: Declared Checkpoint Detection (INSERTED)
+
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
+**Depends on:** Phase 49
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 49.1 to break down)
 
 ### Phase 50: Addressable Monitor Liveness
 
@@ -487,7 +550,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 46 | 9/9 | Complete   | 2026-09-07 |
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
-| 49 | — | Not started | — |
+| 49 | 12/12 | In Progress|  |
 | 50 | — | Not started | — |
 | 51 | — | Not started | — |
 
@@ -658,6 +721,137 @@ add new `**Linear:**` lines. The `**Linear:** [DEN-nnn]` links further down are
 historical: they record where an item was tracked at the time and are kept
 deliberately rather than rewritten.
 
+### Phase 999.147: `sanitize-evidence.py`'s Email Redaction Swallows a JSON Escape Letter and Leaves Invalid JSON (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12, while reading attempt 3's committed captures (`49-LIVE-RUN.md`, "Gap disposition").
+**Reproduced.** The raw `collected/devflow/phase-01-stdout` parses (`jq -s` exit 0). The sanitized copies in
+`49-evidence/attempt-3/collected/devflow/phase-01-stdout` and `49-evidence/attempt-3/gates/003-ship/devflow/phase-01-stdout`
+fail at one line each with `Invalid \escape`.
+
+**Defect:** a JSON-escaped `\t` sits directly before a `git@github.com:…` remote. The email pattern takes the escape's
+letter as part of the address (`tgit@github.com`), and the redaction writes `\<email>`, which is not a valid JSON
+escape. Any escape letter next to an address would do the same. Low severity: the damaged captures stay readable as text,
+and no checker input is affected. A consumer that parses them as JSON fails.
+
+**Fix shape (not decided):** redact inside decoded JSON strings and re-encode, or stop the local part from starting
+inside an escape sequence. Add a selftest case where a string holding `origin\tgit@host:x` must still parse after
+`sanitize`. Republishing Phase 49's evidence afterwards uses 49-12 Task 1's republish sequence.
+
+### Phase 999.148: Collected Evidence Carries DevFlow's `.gitignore` (`*`), So a Plain `git add` Commits None of the DevFlow Copy (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12 Task 1, before the first evidence commit. `git status --ignored` listed every
+`49-evidence/attempt-<N>/collected/devflow/` as ignored, and `git check-ignore -v` named the copied
+`collected/devflow/.gitignore` (one line: `*`). The workaround in 49-12 excluded that file at staging.
+
+**Defect:** `collect-attempt.sh` copies `<launch>/.devflow/` whole, including DevFlow's own `.gitignore`, and
+`sanitize-evidence.py` passes it through. Committed with a plain `git add`, the event log and every capture under
+`collected/devflow/` would have been left out silently. 49-12's Task 1 and Task 2 gates read the files on disk, so both
+would still have printed `gate_rc=0`.
+
+**Fix shape (not decided):** the collector or the sanitizer drops git control files (`.gitignore`, `.gitattributes`),
+and any gate that judges committed evidence compares `git ls-files` against what is on disk.
+
+### Phase 999.149: `check-evidence.sh` Labels a Repeated Stage Gate `unexpected=false`, So an Extra Code Gate Prints No Deviation (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12 Task 1. `--arm positive` over `49-evidence/attempt-1` prints
+`NOTE gate_census count=3 stages=define,code,code` and `NOTE gate code unexpected=false` twice, and no
+`NOTE deviation` line. Yet attempt 1's `deviations.txt` records the second Code gate as an unexpected failure gate.
+
+**Defect:** the census marks a gate unexpected only when its stage name is outside `define`, `code`, `ship`
+(`check-evidence.sh`, gate census block). A second gate at an expected stage is never a deviation. DevFlow's own
+`gate_fired.unexpected` field does not separate the cases either: it is `true` for the by-design preflight gates and for
+the failure gate alike. Only `context` differs (`[never-silent] preflight failed …` against `[never-silent] stage code
+failed …`). R-6 deviations of this shape reach the record only through the operator's `deviations.txt`.
+
+**Fix shape (not decided):** flag any stage whose gate count exceeds its by-design count (Define 1, Code 1, Ship 1 for
+this payload), or classify on the context prefix. Pin it with a selftest case, `define,code,code`, that must print a
+`NOTE deviation` line.
+
+### Phase 999.150: Archived Stage Captures Do Not Keep the Prompt Each Turn Received (BACKLOG)
+
+**Found:** 2026-10-08, plan 49-12 Task 2, recording DECN-03's "which turn carried which rule".
+
+**Defect:** the stream-json captures under `.devflow/history/phase-01/` hold the agent's output and no prompt text. In
+attempt 3, the `CODE_STAGE_POLICY` heading "Unattended decision checkpoints" occurs in no capture and not in the
+collected `phase-01-prompt` (a single file). The `checkpoint_auto_decided` event's `instruction` is truncated. Which
+turn carried which rule could be read only from the Claude transcript under `collected/sessions/`, which D-26 keeps out
+of the repository. DECN-03's recency record therefore rests on uncommitted evidence.
+
+**Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
+already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.151: `probe_rejects_a_setpgid_pipe_holder_before_parent_exit` Fails Intermittently in the Full Suite (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 regression gate. **Not reproduced on demand.**
+
+**Defect:** `agents::opencode::tests::probe_rejects_a_setpgid_pipe_holder_before_parent_exit` failed once in five
+full-workspace `cargo test` runs on `feature/phase-49` with the panic "the attempted group-escape process must be
+reaped". It passed 8/8 run alone and 3/3 in the full `devflow-core` lib suite. Phase 49 does not touch `opencode.rs`, so
+this is pre-existing, and load-dependent timing is the likely trigger (inferred, not checked). Five runs give a rough
+failure rate only.
+
+**Fix shape (not decided):** reproduce under load (for example `cargo test` with `--test-threads` above the core
+count, repeated), then make the reap wait on a condition instead of on timing.
+
+### Phase 999.152: Phase 49 Live-Run Tooling Robustness Findings, to Fix Before the Tools Are Reused (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 deep code review (`49-REVIEW.md` WR-04, WR-05, WR-06, IN-03, IN-04, IN-05).
+
+**Defect:** six robustness gaps in `.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/`:
+- WR-04: `sanitize-evidence.py` passes AWS keys, Slack webhooks, PEM private keys and JWTs.
+- WR-05: `launch-attempt.sh start` wedges the attempt and orphans the watcher if the run unit fails to launch.
+- WR-06: `surv-watch.py analyze` counts dead writers' orphaned temp files as interleaving.
+- IN-03: a kill between `mv` and the ledger append in `snapshot-hook.sh` wedges every later snapshot.
+- IN-04: `launch-attempt.sh prepare` pins `target/debug/devflow` regardless of the configured target dir.
+- IN-05: `collect-attempt.sh` publishes `verdict.json` before the collection directory.
+
+**Phase 49's evidence is not affected (checked 2026-10-09):** the 249 committed evidence files match none of the
+credential shapes WR-04 misses (`rg` exit 1; a planted four-value control matched 4/4) and `gitleaks dir` reports no
+leaks. WR-06 can only inflate the interleaving count, and all three attempts report `interleaved_windows=0`. All three
+attempts have `collected/DONE` (IN-05). The run units launched in every attempt (WR-05).
+
+**Fix shape (not decided):** per-finding fixes are in `49-REVIEW.md`. Fix before the tools run again, for example in a
+Phase 49.1 live run.
+
+### Phase 999.153: The Test Suite Registers Temp-Dir Roots in the Developer's Real `~/.cache/devflow` (DUPLICATE of 999.141)
+
+**Duplicate, 2026-10-09:** this repeats 999.141 (filed 2026-09-23), which was missed when this entry was
+written. The findings below are kept as fresh evidence that 999.141 is still unfixed; track the work there.
+
+**Found:** 2026-10-09, Phase 49 close-out cleanup. **Reproduced.**
+
+**Defect:** `~/.cache/devflow/roots/` held 15,363 registry files, of which 15,334 name a `/tmp/.tmp*` project root, which
+is a cargo-test temp dir. Two full `cargo test --workspace` runs on 2026-10-09 added 100 entries; an isolated run of
+`gate_notify_persist_e2e` added none. `registry.rs` resolves `DEVFLOW_CACHE_DIR`, then `XDG_CACHE_HOME`, then `HOME`, so
+any test that drives a registering code path without setting `DEVFLOW_CACHE_DIR` writes to the real cache. The leaked
+entries make `gate sweep` and other root scans walk thousands of dead roots. Which tests leak is not yet pinned down.
+
+**Fix shape (not decided):** find the leaking tests by diffing the cache across per-binary runs, then give each spawned
+child a private `DEVFLOW_CACHE_DIR` (as `gate_notify_persist_e2e` does) or route library tests through `*_in(cache_dir)`.
+Add a guard test that fails when a suite run grows the real cache. Pruning the existing entries: done 2026-10-09, see 999.141.
+
+### Phase 999.154: Gate Notify Command — Remaining Gaps After the Phase 49 State-File Design (BACKLOG)
+
+**Found:** 2026-10-09, Phase 49 final re-review of `b3f7fdf` (`49-REVIEW.md` WR-12, WR-13, IN-10). Phase 49 made the
+run's state file the single source of the gate notify command (operator decision 2026-10-09) and stopped fixing after
+that review round.
+
+**Defects:**
+- WR-12: the gate's entry save (`pipeline_gate.rs`, `run_gate_with_timeout`) writes the state copy `advance` loaded
+  when it started, and the hook fires from that copy. An on-disk edit made between that load and the gate opening is
+  reverted and the old command runs. The longest window is the Ship finalization retry loop (up to about 120 s of
+  checkout-lock wait). Doc comments at `monitor.rs` (`strip_notify_env`) and `state.rs` (`gate_notify_cmd`) overstate
+  what the WR-10 fix covers; OPERATIONS.md states the limit.
+- WR-13: no test fails if `resume` drops the saved command when the variable is unset (mutating its
+  `apply_notify_env` call to `apply_notify_env(None)` passes every test). That is the arm a scheduled rate-limit resume
+  takes.
+- IN-10: if a hand edit leaves the state file unparseable, the WR-10 re-read silently keeps the old copy and rewrites
+  the file; it should warn.
+
+**Fix shape (from the review, not decided):** save right after `advance` applies the variable, re-read the raw field at
+gate entry as well as at resolution, warn on an unparseable re-read, and add a `resume` arm with the variable unset
+that asserts the saved command is kept.
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
@@ -786,6 +980,13 @@ it is the operator's real cache).
 
 **Acceptance:** not decided; set at promotion. Needs a test that fails when a spawned `devflow` child
 writes outside its tempdir `HOME`.
+
+**Still unfixed 2026-10-09:** re-found as 999.153 (now marked duplicate), with 15,755 entries, 15,632 of them
+naming deleted roots. **Cache cleaned 2026-10-09** by the agent during Phase 49 housekeeping, by running
+`devflow gate sweep --dry-run`, which prunes entries whose root no longer exists (`registry::prune_missing`):
+15,755 → 123 entries, matching an independent count of 123 entries whose root still exists. Backup of the
+full directory: `~/.cache/devflow-roots-backup-2026-10-09.tgz` (restore: `tar xzf` it inside `~/.cache/devflow`).
+The leak itself is not fixed, so the cache will refill on the next full test run.
 
 ### Phase 999.140: `resume` Launches With No Live-Run Check (PROMOTED — Phase 48 gap closure)
 

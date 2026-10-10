@@ -412,6 +412,17 @@ version is still derived automatically from conventional-commit classification a
   outside the criterion by the operator), `stop` in a lock-free run (999.138) and a recycled pid
   falsely refusing `resume` (999.143) stay backlog; SURV-01's field arm is observed, not settled,
   in Phase 49; TEST-01's two-CPU full-suite run is a sanity check, not proof the flakes cannot recur.
+- ✓ **VERIFY-01** (999.119) — a real `devflow start --mode auto` run was recorded end to end against
+  a configured base on a throwaway GSD project and private repo: one fork point, `Holds`, unattended
+  progression apart from the operator-approved Define and Code gates, Ship answered by `--yes-ship`,
+  a local first-parent merge into the configured base, and a PR to `main`; the negative arm with
+  the same binary still forks from `develop` (attempt 3 of 3, `49-LIVE-RUN.md`). DECN-03's
+  behavioural arm was observed **Followed** for claude. Verified 5/5 on 2026-10-09 — Phase 49,
+  milestone v3.0.0. **Closure limits:** one sample of one agent, run by a binary built from
+  `084625c`; the Ship PR-base wording and the gate-notify path changed afterwards and are covered by
+  tests only; the checkpoint detector the run relied on is replaced in Phase 49.1 (CR-01), which
+  is unmeasured live unless 49.1 re-runs; notify follow-ups in backlog 999.154, tooling hardening
+  in 999.152.
 
 ### Partially delivered
 
@@ -434,8 +445,6 @@ version is still derived automatically from conventional-commit classification a
 seven of the ten (#174, #204, #206, 999.115, 999.116, 999.118, #200), plus 999.125, 999.126 and
 999.38 promoted into Phase 48; those moved to Validated.
 
-- [ ] A live `devflow start --mode auto` run is recorded fork-point through Ship merge target
-      against a configured base (999.119)
 - [ ] Monitor liveness is answerable without a PID — GONE / STALE / ALIVE (#185)
 - [ ] Token exhaustion continues the run under a fallback agent (#180)
 
@@ -604,6 +613,13 @@ delivered most of it. Major version chosen because #185 changes the monitor mech
 socket path to `state.json`, breaking state-file compatibility with 2.x on a published crate.
 Research skipped by operator decision — every item is a verified defect in this codebase with a
 known fix direction, and the #185 socket design is already spike-proven.*
+
+---
+*Last updated: 2026-10-09 after Phase 49 (Live Unattended Run) — 12/12 plans; verification passed
+5/5; VERIFY-01 moved to Validated with its closure limits. Review fixes during close-out reworked the
+gate-notify command (state file as the single source, operator decision) and removed a fixture branch
+name from the Ship prompt. Phase 49.1 inserted for the CR-01 checkpoint detector. Two of v3.0.0's
+Active items remain.*
 
 ---
 *Last updated: 2026-09-23 after Phase 48 (Survivable State Writes and Honest Gate Recovery) — 20/20

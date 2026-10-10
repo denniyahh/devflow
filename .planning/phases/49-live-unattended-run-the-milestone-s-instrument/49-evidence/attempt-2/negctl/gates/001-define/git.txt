@@ -1,0 +1,8 @@
+base_branch=develop
+base_head=3549a09fe34cf555920ed904b2c357843e4acee4
+main_head=4680fead3795990369ca03931067b4b0556b3494
+worktree_head=3549a09fe34cf555920ed904b2c357843e4acee4
+feature_head=3549a09fe34cf555920ed904b2c357843e4acee4
+merge_base=3549a09fe34cf555920ed904b2c357843e4acee4
+worktree_status_lines=0
+config_json_status=clean

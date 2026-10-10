@@ -1,0 +1,1 @@
+[never-silent] stage code failed: Phase 01 plan 01-01 halted at Task 1, a blocking-human decision checkpoint (choose DEFAULT_RETRY_BUDGET_SECS: budget-30/120/300). This run was not a DevFlow resume for that gate, so it was not self-resolved. No code was implemented or committed. Recommendation for the operator: budget-120. — human review needed (retry, loop-to-code, or abort)

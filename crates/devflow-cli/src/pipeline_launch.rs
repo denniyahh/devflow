@@ -1426,6 +1426,9 @@ pub(crate) fn resume(
     };
     crate::commands::refuse_resume_over_a_live_run(project_root, phase)?;
     let mut state = workflow::load_state(project_root, phase)?;
+    // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
+    // the chain this resume launches through the state file.
+    state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
     if let Some(requested) = agent
         && requested != state.agent
     {
@@ -1649,6 +1652,10 @@ pub(crate) fn advance_with(
     // different file. A duplicate advance of THIS phase queues behind the
     // lock, then stage binding below handles a launch that has moved on.
     let mut state = workflow::load_state(project_root, phase)?;
+    // CR-03 (49-REVIEW.md): a hand-run `advance` updates the run's notify
+    // command; the detached chain carries no variable, so its `advance`
+    // keeps the persisted one.
+    state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
 
     match stage {
         Some(expected) if expected != state.stage => {

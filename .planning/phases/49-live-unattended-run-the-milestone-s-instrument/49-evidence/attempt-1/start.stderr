@@ -1,0 +1,4 @@
+[2m2026-10-07T16:34:36.502064Z[0m [32m INFO[0m [2mdevflow_core::gates[0m[2m:[0m writing gate define for phase 1
+[2m2026-10-07T16:34:36.502320Z[0m [32m INFO[0m [2mdevflow::pipeline_gate[0m[2m:[0m never-silent gate: define failed in Auto mode — surfacing an unattended gate this mode would not normally fire
+[2m2026-10-07T16:35:03.268337Z[0m [32m INFO[0m [2mdevflow_core::monitor[0m[2m:[0m spawning monitor for phase 1: claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
+[2m2026-10-07T16:35:03.268809Z[0m [32m INFO[0m [2mdevflow_core::monitor[0m[2m:[0m pipe-owning monitor spawned with pid 2402844

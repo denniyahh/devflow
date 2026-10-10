@@ -1,0 +1,11 @@
+{
+  "phase": 1,
+  "shipped": true,
+  "workflow_finished_seen": true,
+  "finished_reason": null,
+  "stage": null,
+  "state_present": false,
+  "feature_branch_exists": true,
+  "merged_into_develop": true,
+  "has_remote": true
+}

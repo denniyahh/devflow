@@ -1,0 +1,25 @@
+{"v":1,"ts":1791390876,"phase":1,"event":"workflow_started","agent":"claude","mode":"auto","worktree":"~/.cache/devflow-phase49/attempt-1/project/.worktrees/phase-01","version":"2.12.0","commit":"2d28e3f1ade00deeb2532f563b5a5b3fbb8274f9","dirty":"false","exe_path":"devflow-de922c3968ba"}
+{"v":1,"ts":1791390876,"phase":1,"event":"gate_fired","stage":"define","unexpected":true,"context":"[never-silent] preflight failed for stage define: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1791390876,"phase":1,"event":"notify_fired","stage":"define","unexpected":true}
+{"v":1,"ts":1791390888,"phase":1,"event":"gate_response_written","stage":"define","approved":true,"via":"cli"}
+{"v":1,"ts":1791390891,"phase":1,"event":"gate_resolved","stage":"define","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1791390903,"phase":1,"event":"claude_delivery_canary_confirmed","stage":"define","token_prefix":"DEVFLOW_DELIVERY_CANARY_","cli_version":"2.1.292 (Claude Code)","reason":null}
+{"v":1,"ts":1791390903,"phase":1,"event":"stage_launched","stage":"define","agent":"claude","monitor_pid":2402844}
+{"v":1,"ts":1791390913,"phase":1,"event":"advance_evaluated","stage":"define","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791390913,"phase":1,"event":"transition","from":"define","to":"plan"}
+{"v":1,"ts":1791390913,"phase":1,"event":"capture_archived","stage":"define","to_stage":"plan","stamp":"1791390913039051669-0"}
+{"v":1,"ts":1791390913,"phase":1,"event":"stage_launched","stage":"plan","agent":"claude","monitor_pid":2403978}
+{"v":1,"ts":1791390919,"phase":1,"event":"advance_evaluated","stage":"plan","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1791390919,"phase":1,"event":"transition","from":"plan","to":"code"}
+{"v":1,"ts":1791390919,"phase":1,"event":"gate_fired","stage":"code","unexpected":true,"context":"[never-silent] preflight failed for stage code: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1791390919,"phase":1,"event":"notify_fired","stage":"code","unexpected":true}
+{"v":1,"ts":1791390932,"phase":1,"event":"gate_response_written","stage":"code","approved":true,"via":"cli"}
+{"v":1,"ts":1791390934,"phase":1,"event":"gate_resolved","stage":"code","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1791390934,"phase":1,"event":"capture_archived","stage":"code","to_stage":"code","stamp":"1791390934984374400-0"}
+{"v":1,"ts":1791390934,"phase":1,"event":"stage_launched","stage":"code","agent":"claude","monitor_pid":2405568}
+{"v":1,"ts":1791391066,"phase":1,"event":"advance_evaluated","stage":"code","status":"failed","verdict":null,"decided_by_layer":1,"reason":"Phase 01 plan 01-01 halted at Task 1, a blocking-human decision checkpoint (choose DEFAULT_RETRY_BUDGET_SECS: budget-30/120/300). This run was not a DevFlow resume for that gate, so it was not self-resolved. No code was implemented or committed. Recommendation for the operator: budget-120."}
+{"v":1,"ts":1791391066,"phase":1,"event":"gate_fired","stage":"code","unexpected":true,"context":"[never-silent] stage code failed: Phase 01 plan 01-01 halted at Task 1, a blocking-human decision checkpoint (choose DEFAULT_RETRY_BUDGET_SECS: budget-30/120/300). This run was not a DevFlow resume for that gate, so it was not self-resolved. No code was implemented or committed. Recommendation for the operator: budget-120. — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1791391066,"phase":1,"event":"notify_fired","stage":"code","unexpected":true}
+{"v":1,"ts":1791394272,"phase":1,"event":"gate_response_written","stage":"code","approved":false,"via":"cli"}
+{"v":1,"ts":1791394309,"phase":1,"event":"gate_resolved","stage":"code","approved":false,"action":"abort","responded_by":"denniyahh"}
+{"v":1,"ts":1791394309,"phase":1,"event":"workflow_aborted","reason":"abort: checkpoint reported in subagent handback was not recognized by top-level result scanner, failing to trigger auto-decide resume"}

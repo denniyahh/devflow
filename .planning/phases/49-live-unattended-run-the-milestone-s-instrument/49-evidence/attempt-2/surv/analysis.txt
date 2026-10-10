@@ -1,0 +1,7 @@
+surv-watch analysis of watch.jsonl
+writers=9
+temp_writes=39
+interleaved_windows=0
+overflow_windows=0
+stop_marker=present
+This is one observation of one run; it establishes nothing about SURV-01's guarantee either way.

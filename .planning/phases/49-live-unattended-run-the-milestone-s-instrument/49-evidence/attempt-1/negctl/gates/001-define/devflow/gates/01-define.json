@@ -1,0 +1,6 @@
+{
+  "phase": 1,
+  "stage": "define",
+  "context": "[never-silent] preflight failed for stage define: unattended launch refused (D-07) — GSD config can hold the chain flag [DOES NOT HOLD] — no `.planning/config.json` under the launch root — nowhere for the chain flag to live — human review needed (retry, loop-to-code, or abort)",
+  "timestamp": "1791390826"
+}

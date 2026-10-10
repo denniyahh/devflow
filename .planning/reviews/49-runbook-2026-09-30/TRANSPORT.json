@@ -1,0 +1,22 @@
+{
+  "reviewed_sha": "0c51f71df78b9cf517ed6c8d4ee045e2a0aabd8c",
+  "agy": {
+    "model": "gemini-3.8-flash-high",
+    "exit": 0,
+    "completed": true
+  },
+  "pi": {
+    "model": "deepseek-flash",
+    "status": "dropped",
+    "exit": 1,
+    "reason": "No DeepSeek API key in pi configuration"
+  },
+  "hermes": {
+    "model": "deepseek-flash",
+    "session": "20260930_124208_d52df9",
+    "exit": 0,
+    "completed": true
+  },
+  "approval_review": "Initial full export rejected; bounded 21-file retry approved after explicit user AGENTS authorization and public repository evidence.",
+  "credential_data_exported": false
+}

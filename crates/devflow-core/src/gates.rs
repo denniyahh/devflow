@@ -385,12 +385,79 @@ impl Gates {
 /// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
 /// active [`crate::mode::Mode`] would not normally gate (e.g. a Define/Plan/Code
 /// failure in Auto mode) — a never-silent gate per WR-11.
+///
+/// This ignores a run's persisted command (`State::gate_notify_cmd`). DevFlow's
+/// own gates call [`fire_gate_notify_with_fallback`]; this entry point stays
+/// for API compatibility (49-REVIEW.md IN-02).
 pub fn fire_gate_notify(phase: PhaseId, stage: Stage, context: &str, unexpected: bool) {
-    let cmd = match std::env::var("DEVFLOW_GATE_NOTIFY_CMD") {
-        Ok(cmd) if !cmd.is_empty() => cmd,
-        _ => return,
+    fire_gate_notify_with_fallback(phase, stage, context, unexpected, None);
+}
+
+/// Fire the operator-configured gate notify hook, resolved by
+/// [`resolve_gate_notify_cmd`] from `DEVFLOW_GATE_NOTIFY_CMD` and the run's
+/// persisted `fallback_cmd`.
+pub fn fire_gate_notify_with_fallback(
+    phase: PhaseId,
+    stage: Stage,
+    context: &str,
+    unexpected: bool,
+    fallback_cmd: Option<&str>,
+) {
+    let env = std::env::var_os(GATE_NOTIFY_CMD_ENV);
+    let Some(cmd) = resolve_gate_notify_cmd(env.as_deref(), fallback_cmd) else {
+        return;
     };
     run_notify_command(&cmd, phase, stage, context, unexpected);
+}
+
+/// The environment variable that configures the gate notify hook.
+pub const GATE_NOTIFY_CMD_ENV: &str = "DEVFLOW_GATE_NOTIFY_CMD";
+
+/// Apply the operator's `DEVFLOW_GATE_NOTIFY_CMD` to a run's persisted notify
+/// command. `devflow start`, `resume` and `advance` all call this, so the
+/// state file is the one place a run's command lives (49-REVIEW.md CR-03):
+/// - unset (or not valid UTF-8): keep the persisted command;
+/// - set and empty: clear it, disabling notification for the run;
+/// - set and non-empty: replace it.
+///
+/// The detached monitor chain never carries the variable, so an `advance` it
+/// runs keeps whatever the state file holds.
+pub fn persisted_notify_cmd_after_env(
+    persisted: Option<String>,
+    env: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    match env.map(|value| value.to_str()) {
+        Some(Some("")) => None,
+        Some(Some(value)) => Some(value.to_owned()),
+        Some(None) | None => persisted,
+    }
+}
+
+/// [`persisted_notify_cmd_after_env`] applied to this process's environment.
+pub fn apply_notify_env(persisted: Option<String>) -> Option<String> {
+    persisted_notify_cmd_after_env(persisted, std::env::var_os(GATE_NOTIFY_CMD_ENV).as_deref())
+}
+
+/// Resolve the gate notify command from the environment value and a run's
+/// persisted command (49-REVIEW.md WR-01).
+///
+/// The environment has three states:
+/// - set and non-empty: an operator override, used as is;
+/// - set and empty: notification explicitly disabled, even when a command is
+///   persisted;
+/// - unset: the persisted `fallback_cmd`, if it is non-empty.
+///
+/// A value that is not valid UTF-8 counts as unset, as it did before this
+/// resolver existed, rather than being run with replacement characters.
+pub fn resolve_gate_notify_cmd(
+    env: Option<&std::ffi::OsStr>,
+    fallback_cmd: Option<&str>,
+) -> Option<String> {
+    match env.map(|value| value.to_str()) {
+        Some(Some("")) => None,
+        Some(Some(value)) => Some(value.to_owned()),
+        Some(None) | None => fallback_cmd.filter(|s| !s.is_empty()).map(str::to_owned),
+    }
 }
 
 /// Run the notify `cmd` via `sh -c`, passing gate metadata to the child as
@@ -910,6 +977,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sentinel_expected).unwrap(), "0");
     }
 
+    /// CR-03 (49-REVIEW.md): one persistence rule for start, resume, advance.
+    #[test]
+    fn persisted_notify_cmd_follows_the_environment_rule() {
+        use std::ffi::OsStr;
+        let saved = || Some("saved".to_string());
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), None).as_deref(),
+            Some("saved")
+        );
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), Some(OsStr::new(""))),
+            None
+        );
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), Some(OsStr::new("new"))).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            persisted_notify_cmd_after_env(None, Some(OsStr::new("new"))).as_deref(),
+            Some("new")
+        );
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            persisted_notify_cmd_after_env(saved(), Some(OsStr::from_bytes(b"\xff"))).as_deref(),
+            Some("saved")
+        );
+    }
+
+    /// WR-01 (49-REVIEW.md): set-and-empty disables even when a command is
+    /// persisted; a set value overrides; only an unset variable falls back.
+    #[test]
+    fn notify_cmd_resolution_has_three_environment_states() {
+        use std::ffi::OsStr;
+        let persisted = Some("persisted");
+        assert_eq!(
+            resolve_gate_notify_cmd(Some(OsStr::new("")), persisted),
+            None
+        );
+        assert_eq!(
+            resolve_gate_notify_cmd(Some(OsStr::new("override")), persisted).as_deref(),
+            Some("override")
+        );
+        assert_eq!(
+            resolve_gate_notify_cmd(None, persisted).as_deref(),
+            Some("persisted")
+        );
+        assert_eq!(resolve_gate_notify_cmd(None, Some("")), None);
+        assert_eq!(resolve_gate_notify_cmd(None, None), None);
+        // IN-08: non-UTF-8 counts as unset.
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = OsStr::from_bytes(b"touch \xff");
+        assert_eq!(
+            resolve_gate_notify_cmd(Some(invalid), persisted).as_deref(),
+            Some("persisted")
+        );
+    }
+
     /// This test mutates process-global env, so it acquires `ENV_MUTEX` to
     /// avoid racing any other env-touching test in this module.
     #[test]
@@ -927,5 +1051,19 @@ mod tests {
         }
         // Must return normally without touching the filesystem or panicking.
         fire_gate_notify(PhaseId::new(11), Stage::Ship, "ctx", false);
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
+    fn notify_hook_fallback_runs_when_env_unset() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("DEVFLOW_GATE_NOTIFY_CMD");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel");
+        let cmd = format!("touch {}", sentinel.display());
+        fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Ship, "ctx", false, Some(&cmd));
+        assert!(sentinel.exists());
     }
 }

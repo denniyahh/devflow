@@ -178,3 +178,94 @@ reachability guard).
 - 999.123 CI trigger de-duplication — stays in backlog.
 - Making DevFlow merge into `main` — not pursued; would be its own phase.
 - Measuring 999.55's effect on the CI flake rate — needs post-merge CI history.
+
+---
+
+# Update — 2026-09-28 (re-scope to a disposable project)
+
+**Date:** 2026-09-28
+**Phase:** 49-live-unattended-run-the-milestone-s-instrument
+**Areas discussed:** Run payload, Gates & DECN-03, Throwaway GitHub repo, Blocking defects — all delegated
+
+**Why the update.** After four retry designs and four external review rounds against the 18-plan set, the
+operator decided (outside this discussion, then approved as a ROADMAP amendment in `968b713`): run against a
+disposable GSD project, and hold each live attempt as one human-action checkpoint judged afterwards. The
+operator set the principle to operate within GSD's current confines (D-17…D-19). Before the discussion, the
+operator also asked why two gates rather than one: the Define gate follows from D-03 with D-04, because
+DevFlow's Define preflight gates on a pre-authored plan but defers "no plans yet" to Code
+(`preflight.rs:1068-1072`).
+
+## Area selection
+
+| Option | Description | Selected |
+|--------|-------------|----------|
+| Run payload | Synthetic single-task phase (Phase 23a) or small realistic task; pre-authored (D-04)? | |
+| Gates & DECN-03 | Two gates (D-03 kept), one (agent-written plan), or zero (DECN-03 not exercised); Ship gate or `--yes-ship`? | |
+| Throwaway GitHub repo | Who creates it, per attempt or reused, when deleted; keep D-06's base split inside it? | |
+| Blocking defects | Fix vehicle (`/gsd-quick`, inserted decimal phase, escalate); keep the cap of 3 (D-11)? | |
+
+**User's choice:** "You decide on all" (free text) — all four areas delegated to Claude.
+**Notes:** Claude decided within the operator's standing decisions and labelled each result "Claude
+(delegated, 2026-09-28)" in CONTEXT.md. D-03, D-04, D-10 and D-11 were kept. **One operator decision was
+changed under the delegation:** D-07's human Ship gate became `--yes-ship` (D-23), because its purpose was
+protecting this repository's local merge, bump and tag, which a throwaway repository does not need.
+
+## Claude's Discretion (decisions made under the delegation)
+
+- Payload: synthetic single-task phase via an extended `scripts/scratch-dogfood-repo.sh`; seeded
+  `blocking-human` checkpoint kept; pre-authored; must not classify as MAJOR (the MAJOR gate cannot be
+  auto-approved) — D-20, D-03, D-04, D-21.
+- Gates: exactly Define and Code preflight; `--yes-ship` for Ship — D-22, D-23.
+- Repository: a fresh private GitHub repository per attempt, operator-created and operator-deleted after
+  verification; D-06's base split kept inside it; negative arm stays local; committed evidence sanitized —
+  D-24…D-26.
+- Failure handling: a stopped attempt fails its checkpoint with no SUMMARY and GSD's normal resume re-presents
+  it; fix via `/gsd-quick` or an inserted decimal phase, confirmed by the operator at the stop — D-27, D-28.
+
+## Deferred Ideas
+
+- 999.55 is no longer the payload; it stays in the backlog as its own future phase.
+- GSD re-run / resume / loop support: the operator is taking a proposal to the GSD maintainers outside DevFlow.
+
+---
+
+## Post-review corrections (adversarial review of CONTEXT at `066251f`)
+
+**Date:** 2026-09-28, during `/gsd-plan-phase 49`, before the planner ran.
+
+Three lanes completed and none dropped: agy (`gemini-3.8-flash-high`), codex (`gpt-5.6-terra`) and DeepSeek
+(`deepseek-flash` via pi). The orchestrator re-checked every finding in source. Ten were confirmed and three
+rejected. The record is in `.planning/reviews/49-adversarial-2026-09-28-context/SUMMARY.md`.
+
+| Option | Description | Selected |
+|--------|-------------|----------|
+| Correct CONTEXT, continue | Dated R-1…R-10 block plus inline pointers, as the 09-24 round did; then planning continues | ✓ |
+| Re-run discuss-phase | Stop plan-phase; the operator revises the decisions in a new discuss session | |
+| Leave CONTEXT as is | Corrections live only in RESEARCH.md and the review record | |
+
+**User's choice:** Correct CONTEXT, continue.
+**Notes:**
+- Every correction touches a Claude-delegated decision (D-06, D-20…D-24, D-27, D-28, Claude's Discretion). No
+  operator-original decision changed.
+- D-27 keeps its intent. Its mechanism changed (R-1): GSD has no `stopped:` reply, so the live-attempt plan
+  holds only the checkpoint, and a stopped attempt ends with the operator stopping execution without `done`.
+- Formatting only: nine decision bullets that GSD's `parseDecisions` could not read were reformatted, with no
+  change of wording in any decision. They were D-18 and D-22 (a second colon inside the bold lead) and the
+  seven superseded entries (a bare `**D-NN**` lead). With them unfixed, the blocking decision-coverage gate
+  would have reported `could-not-parse`.
+
+---
+
+## Operator decisions during plan-phase (2026-09-29)
+
+| Question | Options | Selected |
+|----------|---------|----------|
+| 49-01's planner-authored text: the REQUIREMENTS VERIFY-01 closing sentence, ROADMAP criterion 2, and the post-completion integration gate paragraph | Approve as written / Approve with edits / Gate it in 49-01 | Approve as written |
+| Commit `agent-env-names.txt` (the nested agent's environment variable names, no values) in 49-12's evidence (D-26) | Keep it local / Commit it | Keep it local |
+| Revision loop reached its 3-iteration cap with 1 warning open (the auth-failure diagnosis omitted the settings.json `env` source) | Guidance + one retry / Force proceed / Abandon | Guidance + one retry |
+| At the D-11 cap (three stopped attempts), how does the phase end? | Mark as failed: 49-11 closes on `verdict=cap_reached`, 49-12 writes "VERIFY-01: not met" / Checkpoint never closes, operator decides by hand | Mark as failed |
+| Does a run whose DevFlow monitor dies count as a spent attempt, with `devflow resume` excluded? | Agree / Disagree | Agreed |
+| How to fix the plan-set review findings (`45476bc`) | `--reviews` replan / Targeted revision now / Execute as is | Targeted revision now |
+| 49-09 real auth probe and 49-07 real negative arm (real HOME and registry) during autonomous execution | Isolate 49-07, gate 49-09 / Keep both autonomous / Gate both | Keep both autonomous |
+| Fix the three warnings in 49-12 T2's gate (checker on `9c95525`) | Fix all three / W2+W3 only / Proceed | Fix all three (`45f2763`) |
+| 49-03 collector for an attempt that never launched (no `.devflow/`) | Fix + final check / Proceed as is | Proceed as is (the general ABSENT rule at 49-03:26 applies; watch for it during execution) |
