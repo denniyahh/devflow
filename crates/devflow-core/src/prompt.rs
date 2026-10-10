@@ -647,9 +647,10 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
 /// than copy the checkpoint's declaration line. A failed resume capture is
 /// re-read by `agent_result::text_reports_human_gate`, so a copied declaration
 /// line could read as a new checkpoint. A checkpoint is reported only by a
-/// `**Gate:**`-labeled line or by a final `DEVFLOW_RESULT` that declares
-/// `"checkpoint": "blocking-human"` ([`COMPLETION_PROTOCOL`] says to use that
-/// field only for a gate being reported rather than resolved). The wording of a
+/// `**Gate:**`-labeled line with no marker after it, or by a final
+/// `DEVFLOW_RESULT` that declares `"checkpoint": "blocking-human"`
+/// ([`CODE_STAGE_POLICY`] offers that field only for a gate being reported
+/// rather than resolved, and this prompt does not offer it). The wording of a
 /// failure reason is never read (49-REVIEW CR-01). The
 /// `resume_prompt_does_not_read_as_a_blocking_human_checkpoint` test pins that
 /// boundary and rejects prose such as `Resolved gate: blocking-human`.
@@ -1351,7 +1352,10 @@ mod tests {
             assert!(prompt.contains(CHECKPOINT_DECLARATION));
             let markers: Vec<&str> = prompt
                 .lines()
-                .filter(|line| line.starts_with("DEVFLOW_RESULT:"))
+                .filter(|line| {
+                    line.get(.."DEVFLOW_RESULT:".len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case("DEVFLOW_RESULT:"))
+                })
                 .collect();
             assert!(!markers.is_empty(), "the protocol examples are present");
             for marker in markers {

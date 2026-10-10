@@ -684,11 +684,14 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
 /// is one declared field label with one enumerated value.
 ///
-/// The other declared form, a final `DEVFLOW_RESULT` marker carrying
-/// `"checkpoint": "blocking-human"`, is not read here. The pipeline reads it
-/// from the stage's already-evaluated result
-/// ([`AgentResult::declares_blocking_human_checkpoint`]), so it follows the
-/// same last-marker-wins rule as the stage verdict. A marker's free-text
+/// **The latest stated outcome wins** (operator decision 2026-10-10). A
+/// `DEVFLOW_RESULT` marker and a `Gate:` declaration line both state an
+/// outcome; the first found reading back from the end decides
+/// ([`latest_stated_outcome`]). A marker that declares
+/// `"checkpoint": "blocking-human"` is a checkpoint, any other marker is not,
+/// and a `Gate:` line counts only with no marker after it. The pipeline also
+/// reads the declared field from the stage's evaluated result
+/// ([`AgentResult::declares_blocking_human_checkpoint`]). A marker's free-text
 /// `reason` is never read as a checkpoint: a substring heuristic over it
 /// matched ordinary failures and was removed (49-REVIEW CR-01).
 ///
@@ -715,12 +718,10 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
     if classify(&capture) == CaptureKind::ClaudeStream {
         return claude_stream_reports_human_gate(&capture.events);
     }
-    if capture_reports_human_gate(stdout) {
-        return true;
+    if let Some(inner) = extract_json_result_text(stdout) {
+        return latest_stated_outcome(&inner) == StatedOutcome::Checkpoint;
     }
-    extract_json_result_text(stdout)
-        .as_deref()
-        .is_some_and(text_reports_human_gate)
+    capture_reports_human_gate(stdout)
 }
 
 /// The raw-capture reader behind [`blocking_human_checkpoint_reported`]'s
@@ -736,14 +737,24 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 /// only where it really is a JSON string, and only once, so a JSON string that
 /// itself quotes an escaped sample stays a sample.
 fn capture_reports_human_gate(stdout: &str) -> bool {
-    stdout.lines().any(
-        |line| match serde_json::from_str::<serde_json::Value>(line.trim()) {
+    for line in stdout.lines().rev() {
+        let outcome = match serde_json::from_str::<serde_json::Value>(line.trim()) {
             Ok(value) if value.is_object() || value.is_array() => {
-                json_strings_report_human_gate(&value)
+                if json_strings_report_human_gate(&value) {
+                    StatedOutcome::Checkpoint
+                } else {
+                    StatedOutcome::Silent
+                }
             }
-            _ => text_reports_human_gate(line),
-        },
-    )
+            _ => latest_stated_outcome(line),
+        };
+        match outcome {
+            StatedOutcome::Checkpoint => return true,
+            StatedOutcome::Other => return false,
+            StatedOutcome::Silent => {}
+        }
+    }
+    false
 }
 
 /// Match every string value inside a decoded JSON document.
@@ -779,25 +790,62 @@ fn json_strings_report_human_gate(value: &serde_json::Value) -> bool {
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
 fn text_reports_human_gate(text: &str) -> bool {
-    text.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        let line = strip_leading_markup(&lower);
-        let Some(after_label) = line.strip_prefix("gate") else {
-            return false;
-        };
-        let after_label = after_label.trim_start_matches(['*', ' ', '`']);
-        if let Some(rest) = after_label.strip_prefix(':') {
-            let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
-            let value_token: String = value_region
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-            if value_token == HUMAN_GATE_VALUE {
-                return true;
-            }
+    text.lines().any(line_reports_human_gate)
+}
+
+/// One physical line of [`text_reports_human_gate`].
+fn line_reports_human_gate(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let line = strip_leading_markup(&lower);
+    let Some(after_label) = line.strip_prefix("gate") else {
+        return false;
+    };
+    let after_label = after_label.trim_start_matches(['*', ' ', '`']);
+    if let Some(rest) = after_label.strip_prefix(':') {
+        let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
+        let value_token: String = value_region
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if value_token == HUMAN_GATE_VALUE {
+            return true;
         }
-        false
-    })
+    }
+    false
+}
+
+/// What a piece of agent text last said about how the stage ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatedOutcome {
+    /// The latest statement is a blocking-human checkpoint: a marker that
+    /// declares it, or a `Gate:` declaration line with no marker after it.
+    Checkpoint,
+    /// The latest statement is a marker that declares no checkpoint.
+    Other,
+    /// Nothing in the text states an outcome.
+    Silent,
+}
+
+/// The latest stated outcome in `text`, read line by line from the end
+/// (operator decision 2026-10-10: the latest step wins). A `DEVFLOW_RESULT`
+/// marker states an outcome, and so does a `Gate:` declaration line; the first
+/// one found, counting back from the end, decides. Unlike
+/// [`parse_marker_lines`] this reads the whole text: a long tail after a later
+/// marker must not hide it and let an earlier gate win.
+fn latest_stated_outcome(text: &str) -> StatedOutcome {
+    for line in text.lines().rev() {
+        if let Some(result) = marker_from_line(line) {
+            return if result.declares_blocking_human_checkpoint() {
+                StatedOutcome::Checkpoint
+            } else {
+                StatedOutcome::Other
+            };
+        }
+        if line_reports_human_gate(line) {
+            return StatedOutcome::Checkpoint;
+        }
+    }
+    StatedOutcome::Silent
 }
 
 /// Strip the markdown a relayed declaration line can carry before its label:
@@ -1596,11 +1644,10 @@ fn claude_stream_reports_human_gate(events: &[serde_json::Value]) -> bool {
         .filter(|event| is_top_level(event))
         .filter_map(|event| event.get("result").and_then(serde_json::Value::as_str))
     {
-        if text_reports_human_gate(text) {
-            return true;
-        }
-        if parse_marker_lines(text).is_some() {
-            return false;
+        match latest_stated_outcome(text) {
+            StatedOutcome::Checkpoint => return true,
+            StatedOutcome::Other => return false,
+            StatedOutcome::Silent => {}
         }
     }
     false
@@ -2145,7 +2192,6 @@ fn normalise_stream_marker_provenance(mut result: AgentResult) -> AgentResult {
 ///   accepted only ALL-upper or ALL-lower.
 fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     const TAIL_BUDGET_CHARS: usize = 4000;
-    const PREFIX: &str = "DEVFLOW_RESULT:";
 
     let mut budget_used = 0usize;
     for line in stdout.lines().rev() {
@@ -2157,28 +2203,34 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
         }
         budget_used += line.chars().count() + 1;
 
-        let line = strip_corruption_padding(line);
-        let Some(head) = line.get(..PREFIX.len()) else {
-            continue;
-        };
-        if !head.eq_ignore_ascii_case(PREFIX) {
-            continue;
-        }
-
-        let json_str = line[PREFIX.len()..].trim();
-        if let Ok(mut result) = serde_json::from_str::<AgentResult>(json_str) {
-            // A declaration belongs to the failure the agent reported. Dropped
-            // here, at the one place agent JSON becomes an AgentResult, so no
-            // later status rewrite (the exit-code reconcile turns a reported
-            // success into a failure with `..result`) can carry it onto a
-            // failure the agent never declared.
-            if result.status != AgentStatus::Failed {
-                result.checkpoint = None;
-            }
+        if let Some(result) = marker_from_line(line) {
             return Some(result);
         }
     }
     None
+}
+
+/// Parse one physical line as a `DEVFLOW_RESULT` marker: edge-stripped,
+/// case-insensitive prefix, JSON body. The one place agent JSON becomes an
+/// [`AgentResult`].
+fn marker_from_line(line: &str) -> Option<AgentResult> {
+    const PREFIX: &str = "DEVFLOW_RESULT:";
+
+    let line = strip_corruption_padding(line);
+    let head = line.get(..PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let json_str = line[PREFIX.len()..].trim();
+    let mut result = serde_json::from_str::<AgentResult>(json_str).ok()?;
+    // A declaration belongs to the failure the agent reported. Dropped here so
+    // no later status rewrite (the exit-code reconcile turns a reported success
+    // into a failure with `..result`) can carry it onto a failure the agent
+    // never declared.
+    if result.status != AgentStatus::Failed {
+        result.checkpoint = None;
+    }
+    Some(result)
 }
 
 /// One commit the agent made before its stream went silent (D-07, 31-02).
@@ -4623,14 +4675,74 @@ mod tests {
         assert!(blocking_human_checkpoint_reported(&capture));
     }
 
-    /// A gate declaration and a failure marker in the SAME final message are
-    /// one report: the agent stopped at the gate and said so. This is the
-    /// shape DevFlow's own checkpoint fixtures use.
+    /// Within one message the order of lines decides too. The protocol puts
+    /// the marker on the last line, so a `Gate:` line followed by a plain
+    /// failure marker is that failure; the gate counts only when nothing states
+    /// an outcome after it (operator decision 2026-10-10, second review round).
     #[test]
-    fn blocking_human_checkpoint_reported_true_when_gate_and_marker_share_the_latest_result() {
+    fn blocking_human_checkpoint_reported_false_when_a_plain_marker_follows_the_gate_in_one_message()
+     {
         let same_message = format!("{}{MARKER_FAILED}", gate_declaration_text());
-        let capture = v3_stream_capture(MARKER_FAILED, &same_message, NO_MARKER);
+        let capture = v3_stream_capture(NO_MARKER, &same_message, NO_MARKER);
+        assert!(!blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A message that ends on the gate, after any marker, reports the gate.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_the_gate_follows_the_marker_in_one_message() {
+        let same_message = format!("{MARKER_FAILED}\\n{}", gate_declaration_text());
+        let capture = v3_stream_capture(NO_MARKER, &same_message, NO_MARKER);
         assert!(blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A declared checkpoint followed by silent wake-up turns is still the
+    /// latest stated outcome, the same protection T-30-27 gives a `Gate:` line.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_for_a_declared_marker_before_silent_turns() {
+        let declared = r#"Stopped.\nDEVFLOW_RESULT: {\"status\":\"failed\",\"checkpoint\":\"blocking-human\"}"#;
+        let capture = v3_stream_capture(declared, NO_MARKER, NO_MARKER);
+        assert!(blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A later plain failure supersedes an earlier gate however much text
+    /// follows its marker. The stage-verdict parser reads only a 4000-character
+    /// tail; the outcome scan must not, or a long later turn reads as silent
+    /// and the earlier gate wins again.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_a_later_failure_is_followed_by_long_text() {
+        let long_tail = "a".repeat(5000);
+        let later = format!("{MARKER_FAILED}\\n{long_tail}");
+        let capture = v3_stream_capture(&gate_declaration_text(), NO_MARKER, &later);
+        assert!(!blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// The same latest-outcome rule for a plain-text capture: a gate line
+    /// before a plain failure marker is that failure, and a marker that
+    /// declares the checkpoint is reported without any gate line.
+    #[test]
+    fn blocking_human_checkpoint_reported_reads_a_plain_capture_newest_first() {
+        let gate_then_failure = "**Gate:** `blocking-human`\nDEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}\n";
+        assert!(!blocking_human_checkpoint_reported(gate_then_failure));
+        let declared = "Stopped.\nDEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\"}\n";
+        assert!(blocking_human_checkpoint_reported(declared));
+        let failure_then_gate =
+            "DEVFLOW_RESULT: {\"status\": \"failed\"}\n**Gate:** `blocking-human`\n";
+        assert!(blocking_human_checkpoint_reported(failure_then_gate));
+    }
+
+    /// R5: an absent checkpoint is not written when a result is serialized,
+    /// and a present one is.
+    #[test]
+    fn checkpoint_is_serialized_only_when_present() {
+        let none = parse_devflow_result(r#"DEVFLOW_RESULT: {"status": "failed"}"#).unwrap();
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("checkpoint").is_none(), "{json}");
+        let some = parse_devflow_result(
+            r#"DEVFLOW_RESULT: {"status": "failed", "checkpoint": "blocking-human"}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&some).unwrap();
+        assert_eq!(json["checkpoint"], "blocking-human");
     }
 
     /// The overcorrection guard: an echo and a genuine declaration can coexist

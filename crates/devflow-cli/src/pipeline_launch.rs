@@ -1757,15 +1757,18 @@ pub(crate) fn advance_with(
             // dispatch, check whether this failure is actually a confirmed
             // human-blocking checkpoint DevFlow can resolve unattended in
             // Auto mode by resuming the exact session that raised it. Evaluated IN THIS
-            // ORDER — load-bearing — (1) agent is Claude (D-05); (2) the
+            // ORDER — load-bearing — (1) agent is Claude (D-05) and the stage
+            // is Code, the one stage that runs plans and so the only one that
+            // can stop at a plan's checkpoint (second external review round of
+            // the CR-01 fix, 2026-10-10); (2) the
             // phase's plans statically declare a blocking-human checkpoint —
             // the PRIMARY, agent-uncontrollable gate, checked BEFORE
             // anything agent-controlled (T-28-01); (3) the agent reported
             // one, either by declaring `"checkpoint": "blocking-human"` on the
-            // stage's final DEVFLOW_RESULT marker (Code only: it is the one
-            // stage that runs plans and the only one offered the field) or by
-            // a `Gate:` declaration line in the capture — never by the wording
-            // of a failure reason (49-REVIEW CR-01); (4) a session id is on record; and (5) the
+            // stage's final DEVFLOW_RESULT marker or by a `Gate:` declaration
+            // line with no stated outcome after it — the latest statement wins
+            // (operator decision 2026-10-10) — and never by the wording of a
+            // failure reason (49-REVIEW CR-01); (4) a session id is on record; and (5) the
             // resume ceiling has not been exhausted. A changed declaration
             // always opens the re-scan gate. Only an unchanged, recorded set
             // in Auto resumes without a human; Supervise falls through to a
@@ -1786,8 +1789,9 @@ pub(crate) fn advance_with(
             let mut reason = result.reason.clone();
             let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
             let checkpoint_confirmed = state.agent == AgentKind::Claude
+                && stage == Stage::Code
                 && verify::phase_has_blocking_human_checkpoint(execution_root, phase)
-                && ((stage == Stage::Code && result.declares_blocking_human_checkpoint())
+                && (result.declares_blocking_human_checkpoint()
                     || agent_result::checkpoint_reported_in_capture(project_root, phase));
             if checkpoint_confirmed {
                 let ceiling_ok = state.checkpoint_resumes < mode::MAX_CHECKPOINT_RESUMES;
@@ -4035,10 +4039,14 @@ mod tests {
     /// marker, so `advance()`'s Layer 1 deterministically classifies the
     /// outcome as `Failed` (-> `Action::GateReview`) with no exit-code/pid
     /// file or background thread needed.
+    /// A confirmed checkpoint in the current convention: the relayed `Gate:`
+    /// block, then a final marker that declares the checkpoint. A plain
+    /// failure marker after the gate would be the latest stated outcome and
+    /// would not confirm it (operator decision 2026-10-10).
     fn write_confirmed_checkpoint_capture(root: &Path, phase: PhaseId) {
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         let stdout = format!(
-            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {HUMAN_GATE_VALUE_FOR_TEST}\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"checkpoint pending\"}}\n"
+            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {HUMAN_GATE_VALUE_FOR_TEST}\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"checkpoint\": \"{HUMAN_GATE_VALUE_FOR_TEST}\", \"reason\": \"checkpoint pending\"}}\n"
         );
         std::fs::write(agent_result::stdout_path(root, phase), stdout).unwrap();
     }
@@ -4165,6 +4173,9 @@ mod tests {
         let root = root.as_path();
 
         let phase = PhaseId::new(88);
+        // Unused on the relaunch route; if detection regresses, the
+        // fall-through gate reads it and returns instead of blocking forever.
+        write_abort_gate_response(root, phase, Stage::Code);
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
@@ -5417,6 +5428,40 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         state.session_id = Some("sess-plan-declared".to_string());
+        state.checkpoint_approval = recorded_approval_for(root, phase);
+        workflow::save_state(&state).unwrap();
+
+        advance_for_stage(root, Some(phase), Some(Stage::Plan)).unwrap();
+
+        assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
+        assert!(!events_of_kind(root, "gate_fired").is_empty());
+    }
+
+    /// The whole checkpoint route is Code-only, the `Gate:` line included: a
+    /// Plan failure whose capture declares the gate takes the ordinary gate
+    /// (second external review round, 2026-10-10).
+    #[test]
+    fn advance_with_gate_line_checkpoint_outside_code_falls_through() {
+        const NAME: &str =
+            "pipeline_launch::tests::advance_with_gate_line_checkpoint_outside_code_falls_through";
+        enter_agent_free_child!(NAME, "claude");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = PhaseId::new(190);
+        write_declared_checkpoint_plan(root, phase);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            format!("## CHECKPOINT REACHED\n\n**Gate:** {HUMAN_GATE_VALUE_FOR_TEST}\n"),
+        )
+        .unwrap();
+        write_abort_gate_response(root, phase, Stage::Plan);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.session_id = Some("sess-plan-gate-line".to_string());
         state.checkpoint_approval = recorded_approval_for(root, phase);
         workflow::save_state(&state).unwrap();
 
