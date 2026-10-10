@@ -1563,15 +1563,21 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 ///    fail independently, so a future widening of the type filter cannot
 ///    silently inherit subagent content.
 ///
-/// **ALL eligible `result` events are scanned, not only the last.** This
-/// deliberately diverges from [`last_top_level_result`]'s last-result-wins
-/// verdict semantics, and the two conventions must not be "harmonised": a
-/// verdict is a single final answer, whereas this asks whether a gate was
-/// reported ANYWHERE in the stage's output. A gate declared in turn N followed
-/// by task-notification wake-up turns N+1/N+2 — the exact turn shape the v3
-/// capture archives — would be silently dropped by last-result-only, losing a
-/// human authorization request to the generic gate. That is the
-/// opposite-direction harm, and the worse of the two.
+/// **Eligible `result` events are read newest first, and the latest stated
+/// outcome wins** (operator decision 2026-10-10). The first event, counting
+/// back from the end, that either declares the gate or carries a
+/// `DEVFLOW_RESULT` marker decides: a declaration means a checkpoint, a marker
+/// without one means the stage ended on that outcome instead. A declaration
+/// and a marker in the same message are one report, so the declaration wins
+/// within a message. Events with neither, such as task-notification wake-up
+/// turns, are skipped, so a gate declared in turn N followed by silent turns
+/// N+1/N+2 (the turn shape the v3 capture archives) is still reported, which
+/// is what the earlier scan-everything rule existed to protect.
+///
+/// What this replaces: scanning every event with `.any` let an earlier
+/// declaration outrank a later, ordinary failure, so a stage that failed for an
+/// unrelated reason was resumed and told to decide the human's gate (external
+/// review of the CR-01 fix, 2026-10-09).
 ///
 /// Text is read with a direct [`serde_json::Value::get`] chain. Never route
 /// this through [`json_scan`]/[`json_find_key`]: a recursive traversal descends
@@ -1583,12 +1589,21 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 /// the eligible text: this runs on every `devflow advance` over a capture that
 /// grows for the whole stage, and there is no reason to allocate a copy of it.
 fn claude_stream_reports_human_gate(events: &[serde_json::Value]) -> bool {
-    events
+    for text in events
         .iter()
+        .rev()
         .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("result"))
         .filter(|event| is_top_level(event))
         .filter_map(|event| event.get("result").and_then(serde_json::Value::as_str))
-        .any(text_reports_human_gate)
+    {
+        if text_reports_human_gate(text) {
+            return true;
+        }
+        if parse_marker_lines(text).is_some() {
+            return false;
+        }
+    }
+    false
 }
 
 /// The `rate_limit_info.status` values that mean the CLI DENIED the request.
@@ -4560,11 +4575,12 @@ mod tests {
         );
     }
 
-    /// **T-30-27.** Detection asks whether a gate fired ANYWHERE in the stage,
-    /// so it deliberately does NOT inherit plan 30-01's last-result-wins
-    /// verdict semantics. A gate declared in turn 1 followed by
-    /// task-notification wake-up turns — the exact turn shape the v3 capture
-    /// archives — must not be dropped in favour of the later, silent results.
+    /// **T-30-27.** A gate declared in turn 1 followed by task-notification
+    /// wake-up turns that state no outcome (the exact turn shape the v3
+    /// capture archives) must not be dropped in favour of the later, silent
+    /// results. Silent turns are skipped; only a later stated outcome
+    /// supersedes the declaration (see the `..._later_result_reports_a_plain_failure`
+    /// test).
     ///
     /// Losing a checkpoint report is the opposite-direction harm from the false
     /// positive this plan closes, and the worse of the two: it silently drops a
@@ -4574,9 +4590,47 @@ mod tests {
         let capture = v3_stream_capture(&gate_declaration_text(), NO_MARKER, NO_MARKER);
         assert!(
             blocking_human_checkpoint_reported(&capture),
-            "detection must scan every top-level `result` event, not only the \
-             last one"
+            "silent later turns must not drop an earlier gate declaration"
         );
+    }
+
+    /// The latest outcome wins (operator decision 2026-10-10, after the
+    /// external review of the CR-01 fix). A gate declared in turn 1, followed
+    /// by a later result that reports a plain failure, is that failure: the
+    /// agent's later word supersedes its earlier note, so the run stops at the
+    /// ordinary gate instead of resuming the agent to decide for the human.
+    /// Asserted through the on-disk reader the pipeline calls, too.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_a_later_result_reports_a_plain_failure() {
+        let capture = v3_stream_capture(&gate_declaration_text(), MARKER_FAILED, NO_MARKER);
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "a later plain-failure result must supersede an earlier gate declaration"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(stdout_path(dir.path(), phase), &capture).unwrap();
+        assert!(!checkpoint_reported_in_capture(dir.path(), phase));
+    }
+
+    /// The reverse order: a gate declared after the last stated failure is the
+    /// latest word, so it counts.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_a_gate_follows_the_last_failure() {
+        let capture = v3_stream_capture(MARKER_FAILED, &gate_declaration_text(), NO_MARKER);
+        assert!(blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A gate declaration and a failure marker in the SAME final message are
+    /// one report: the agent stopped at the gate and said so. This is the
+    /// shape DevFlow's own checkpoint fixtures use.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_gate_and_marker_share_the_latest_result() {
+        let same_message = format!("{}{MARKER_FAILED}", gate_declaration_text());
+        let capture = v3_stream_capture(MARKER_FAILED, &same_message, NO_MARKER);
+        assert!(blocking_human_checkpoint_reported(&capture));
     }
 
     /// The overcorrection guard: an echo and a genuine declaration can coexist
