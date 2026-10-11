@@ -13,8 +13,8 @@ an address; `MonitorLaunch::Legacy` (the detached `sh -c` script) is replaced by
 identically. The 2.x → 3.x state-file break is explicit. This is the milestone's breaking change (major version).
 
 **The operator widened the phase beyond the four liveness criteria** (D-01…D-06): the supervisor also owns teardown
-through the socket (the full DEN-58 / #185 spike design), and three backlog items are folded in. Liveness remains the
-spine; everything else hangs off the same socket.
+through the socket (the full DEN-58 / #185 spike design), and five backlog items are folded in or closed (999.128,
+999.134, 999.138, 999.139, 999.141). Liveness remains the spine; everything else hangs off the same socket.
 
 **Scope changes planning must carry as plan tasks:**
 
@@ -134,10 +134,10 @@ mandate.
   49's rig (`scripts/scratch-dogfood-repo.sh`, `49-…/tools/`): a fresh private throwaway GitHub repo per attempt,
   `--agent claude`, the seeded `blocking-human` checkpoint, and `--yes-ship`. The seeded checkpoint's auto-decide
   resume goes through `relaunch_checkpoint_session`, which hardcodes `MonitorLaunch::Legacy`
-  (`crates/devflow-cli/src/pipeline_launch.rs:1236-1281`, verified), so the run crosses both variants. *Unverified:*
-  that Phase 49's shipped attempts actually reached that relaunch; research confirms it from `49-evidence/` events.
-  If the run cannot be shown to cross the replaced `Legacy` path, the plan must cross it another way (for example a
-  non-Claude agent stage).
+  (`crates/devflow-cli/src/pipeline_launch.rs:1236-1281`, verified), so the run crosses both variants. *Verified
+  2026-10-11:* Phase 49 reached that relaunch (`checkpoint_auto_decided` at
+  `49-evidence/attempt-3/collected/devflow/events.jsonl:21`, also in attempt 2). The live run still exercises
+  `Legacy` only through a Claude resume; non-Claude parity is a test obligation (R-11).
 - **D-17 (Operator): Plus a separate fault arm on the same binary.** It ends before Ship and needs no GitHub repo.
   Steps: start a run, probe ALIVE mid-stage, `stop` through the socket (agent group gone, advance suppressed, GONE).
   Then start again and `kill -9` the monitor, which must give STALE; the explicit teardown verb reaps the group
@@ -171,6 +171,96 @@ mandate.
   and tested as such. **No macOS support is claimed**, and docs and the changelog must say "unverified on macOS".
 - **The upgrade verb's exact name and flag**, and the exact refusal texts.
 - **Plan count and wave layout**, with D-07 (test `HOME` isolation) sequenced before any sweep test.
+
+### Post-review corrections (Claude, remit, 2026-10-11 — adversarial review of `5698426`)
+
+Source: `.planning/reviews/50-adversarial-2026-10-11-context/SUMMARY.md`. Three external lanes (agy, codex, pi)
+reviewed the decisions above, and every finding was re-verified against source. These corrections fix mechanism and
+evidence; none changes an operator decision. Where a decision above and this block disagree, this block wins. One
+finding does conflict with operator decisions D-14 and D-15; it is **O-1**, pending the operator below.
+
+- **R-1 (socket ownership across stage transitions; replaces the "Socket keying" discretion).** The in-process
+  advance spawns the next stage's monitor while the current monitor is still alive and bound (`monitor.rs:480-482`;
+  `pipeline_launch.rs:979-992`, verified). Two requirements follow:
+  - **Naming.** Sockets are named per launch, not per phase. The persisted `state.json` path is the only handle.
+  - **Handoff order.** Stage N stays ALIVE through its advance and answers `shutdown` throughout. Stage N+1 binds and
+    publishes its own path to state under the per-phase lock. Only then does stage N unlink its socket and exit.
+
+  The takeover rule still holds: a launcher never unlinks a socket that answers. Binding must be atomic: bind to a
+  temporary name, then `rename`, or use an ownership file opened with `O_EXCL`. Two concurrent launchers for the
+  same phase must yield exactly one live monitor, proved by a test.
+- **R-2 (stop and signal during in-process advance; refines D-04 and D-05).** `advance_for_stage` takes the per-phase
+  lock (`pipeline_launch.rs:1629`) and may wait on a gate (`:1830`) inside the monitor process, so the spike's
+  `process::exit` on shutdown is not acceptable.
+  - The supervisor has one terminal-state owner across three phases: agent running, advancing, and waiting on a gate.
+    Shutdown and signals are delivered to it as events, through a self-pipe or a signal thread, never as work done
+    inside a signal handler.
+  - **While the agent runs:** kill the group, record 143, do not advance (D-04 as written).
+  - **While advancing:** never abandon a state write or hold the lock past exit. Stop at the next safe point, release
+    the lock, and mark the state stopped. Do not launch the next stage.
+  - **While waiting on a gate:** the existing `stop_via_gate` path answers.
+  - Required test: a deterministic interleaving test proving a stop that races natural completion never advances. Its
+    negative control proves that natural completion with no stop still advances.
+- **R-3 (`Legacy` process group).** Today the `Legacy` `sh` monitor gets no group of its own (`monitor.rs:571-588`,
+  `hermetic_command`). Its agent therefore shares a group inherited from the launching CLI, and a recorded pgid
+  could name the operator's group. The replacement must spawn the agent with `process_group(0)` in both arms, and
+  must assert `pgid == agent_pid` before recording it.
+- **R-4 (backstop when the leader is dead; refines D-04).** `process_start_time` returns `None` for a reaped pid
+  (`agent.rs:214-220`). So "the recorded start time validates" refuses exactly when the agent (the group leader) is
+  dead and its members live: failure mode F1. The validation rule has two cases:
+  - **Leader present:** validate the leader's start time.
+  - **Leader gone:** a rule that discriminates the original group from a reused pgid. Research must find it. An
+    obvious candidate, "every member started at or after the recorded agent start", does **not** discriminate,
+    because a reused group's members also start later. If research finds no sound rule, the backstop refuses for a
+    leader-gone group. It then reports the members, and the gap is documented as a residual F1 limit, never a silent
+    kill.
+
+  Tests cover leader present, leader gone, and pgid reuse after the original group emptied; the reuse case must not
+  be signalled.
+- **R-5 (`sun_path` boundary; clarifies D-01 / criterion 3).** The usable maximum is **107 bytes on Linux** (108
+  including the NUL; the spike measured first failure at 108, audit `:104`) and **103 on macOS**. Linux tests pin
+  both sides: 107 binds, 108 is refused at construction with the named error.
+- **R-6 (probe totality).** Only `ECONNREFUSED` means STALE. A missing path means GONE, and a successful connect plus
+  a ping reply means ALIVE. Every other `connect()` error (`EACCES`, `ENOTSOCK`, `EAGAIN`, an unlink race) is a
+  reported probe error, never STALE, and never triggers the backstop. The spike had a fourth `UNKNOWN` outcome
+  (`main.rs:173,199`). This does not add a fourth liveness state. Criterion 1's three states remain the only answers,
+  and a probe error is an error.
+- **R-7 (sidecar and cache root; makes D-06/D-09 implementable).** Each socket has a sidecar beside it, written
+  before the socket is published. It holds the project root, phase, pgid, agent start time, boot id and launch id.
+  The sweep, D-09's guard, and the STALE backstop when state will not load all read the sidecar. Both files live
+  under `registry::cache_dir()` (`registry.rs:53-64`), which honours `DEVFLOW_CACHE_DIR`, so the D-07 test isolation
+  covers sockets too.
+- **R-8 (reboot).** A STALE socket whose sidecar boot id differs from the current boot id is certainly dead. Remove
+  the socket and sidecar, signal nothing, and report the phase resumable. Test with a fabricated boot id: nothing is
+  signalled, and the result is GONE.
+- **R-9 (semver; supports the major version).** `pub State::monitor_pid` (`state.rs:288`) stays deserialisable,
+  because D-15 must read it from a 2.x file. Its removal from the public type is a planning decision that must be
+  named, not incidental. `pub fn spawn_monitor(...) -> Result<u32, _>` (`monitor.rs:308`) changes shape. Plans list
+  every `pub` item added, changed or removed in `devflow-core`, and run `cargo semver-checks check-release -p
+  devflow-core`. The major bump rests on the state-file contract (D-13) plus those named API changes.
+- **R-10 (fault arm coverage; refines D-17).** Beyond "kill -9 mid-stage", the fixtures and the fault arm also cover:
+  a SIGKILL while advancing (lock held); a SIGKILL between the next monitor's publish and the old monitor's unlink
+  (R-1); and a stop racing natural completion (R-2). Each live fault-arm record names the launch shape, socket path,
+  probe result, group members before and after, and whether advance ran.
+- **R-11 (`Legacy` parity across agents).** The live run pins `--agent claude` and reaches `Legacy` only through
+  the Claude checkpoint resume. Criterion 2's real cohort, the non-Claude adapters, is therefore covered by a
+  table-driven parity test. That test runs the spike's R-A…R-M responsibilities under both arms with a non-Claude
+  adapter. Its negative control proves the test can tell the arms apart.
+- **R-12 (D-09 scope).** The corrupt-state refusal goes into the shared `refuse_launch_over_a_live_run`
+  (`commands.rs:2470`), which already gates both `start` and `resume`.
+- **R-13 (acceptance completeness).**
+  - Each folded item keeps its own named failing test with a negative control: 999.128 (the repair at a `Recycled`
+    holder succeeds), 999.139 (corrupt state plus a live monitor), and 999.141 (a child writing outside its tempdir
+    `HOME` fails the test).
+  - The 2.x detection has a negative control: a 3.x state with no socket path is not reported as 2.x.
+  - D-13 versions `state.json` only. Research states whether any other persisted format a 3.x binary reads (gate
+    files, `cron-instructions*.json`, events) changes in this phase, and refuses or versions it if so.
+- **R-14 (corrections in place).** Fixed: the folded-item count (five, not three), citations (`spawn_agent_and_record`
+  at `:1007`, `spawn_monitor` at `:308`), and D-16's "unverified" Phase 49 relaunch claim (verified).
+
+**O-1 (pending operator decision — do not plan D-14/D-15 until answered).** As written, D-14 and D-15 wedge a live
+2.x run. `stop` refuses on a 2.x state, and the upgrade verb refuses while a recorded 2.x pid is alive. A recycled
+2.x `monitor_pid` wedges the phase permanently, because 2.x records no start time for it.
 
 </decisions>
 
@@ -208,7 +298,7 @@ mandate.
 ## Existing Code Insights
 
 ### Reusable Assets
-- `MonitorLaunch` and `spawn_monitor` / `spawn_monitor_inner` (`crates/devflow-core/src/monitor.rs:267,296,306`): the
+- `MonitorLaunch` and `spawn_monitor` / `spawn_monitor_inner` (`crates/devflow-core/src/monitor.rs:267,308,329`): the
   seam being replaced. The `PipeOwning` arm re-execs `current_exe()` as the hidden `__monitor` subcommand
   (`monitor.rs:342,436,603`; `crates/devflow-cli/src/main.rs:137`).
 - `run_monitor` (`crates/devflow-cli/src/pipeline_launch.rs:918`): the in-process advance the `Legacy` replacement
@@ -226,7 +316,7 @@ mandate.
 - Tests must isolate `HOME` and `XDG_*` per child process; no process-global `set_var` (D-07; TEST-01).
 
 ### Integration Points
-- `launch_stage` → `spawn_monitor` (and `spawn_agent_and_record`, `pipeline_launch.rs:992`, which saves `monitor_pid`
+- `launch_stage` → `spawn_monitor` (and `spawn_agent_and_record`, `pipeline_launch.rs:1007`, which saves `monitor_pid`
   today).
 - Liveness consumers: `status`, `cleanup`, `doctor` (`build_phase_facts`, `check_dead_monitor`), and the
   `resume`/`start` live-run guards (48-19, 48-20).

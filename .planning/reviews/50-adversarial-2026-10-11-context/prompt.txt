@@ -1,0 +1,29 @@
+You are an adversarial reviewer. You are working inside a read-only snapshot of the DevFlow repository (Rust workspace: crates/devflow-core, crates/devflow-cli; planning docs under .planning/). Do NOT modify any file. Read files and run read-only commands only.
+
+PRIMARY TARGET: .planning/phases/50-addressable-monitor-liveness/50-CONTEXT.md
+This is the decision record for Phase 50 ("Addressable Monitor Liveness"), written before planning. Planners and executors will treat it as binding. Your job is to break it before they do.
+
+Read for grounding (as needed):
+- .planning/ROADMAP.md — the "### Phase 50" entry (goal, criteria 1-4) and backlog entries 999.128, 999.130, 999.134, 999.138, 999.139, 999.141, 999.143
+- .planning/REQUIREMENTS.md — SUPV-01, SUPV-02
+- .planning/audits/2026-07-24-socket-supervisor-spike.md and .planning/spikes/socket-supervisor/main.rs — the spike the design rests on
+- .planning/phases/48-survivable-state-writes-and-honest-gate-recovery/48-CONTEXT.md and .planning/phases/49-live-unattended-run-the-milestone-s-instrument/49-CONTEXT.md — prior constraints and the live-run rig being reused
+- crates/devflow-core/src/monitor.rs, crates/devflow-core/src/state.rs, crates/devflow-core/src/lock.rs, crates/devflow-core/src/agent.rs, crates/devflow-cli/src/commands.rs, crates/devflow-cli/src/pipeline_launch.rs — the code the decisions claim to describe. Verify every file:line claim in the CONTEXT that matters to your findings.
+
+Attack the CONTEXT. Do not summarize or praise it. Find, with the exact file and line or quoted text for each:
+1. Contradictions between decisions in the CONTEXT, or between the CONTEXT and ROADMAP/REQUIREMENTS/prior CONTEXT files.
+2. Unstated assumptions that would break under real use: concurrency between the supervisor, `advance`, `stop`, `resume`, gate waiters, the per-phase lock; the socket lifecycle across stage transitions; reboot; logout; a monitor that is SIGKILLed mid-advance; two monitors for the same phase.
+3. Decisions that do not survive contact with the actual code (e.g. a cited function or line that does not do what the CONTEXT says; a variant/path that is not where the CONTEXT says).
+4. Scope leaks or scope gaps relative to SUPV-01 and the folded backlog items.
+5. Acceptance criteria that are not falsifiable or lack a negative control — especially the GONE/STALE/ALIVE fixtures, PipeOwning/Legacy parity, the 2.x detection, and the live-run proof bar.
+6. Missing failure modes: in particular the STALE pgid backstop (pgid reuse, start-time/boot-id validation, group enumeration), the sweep mapping a socket back to a root/phase without state, the 2.x upgrade verb's pid check, the schema_version semver impact on the published devflow-core crate, and the 108/104-byte sun_path constraint.
+
+Be specific and hostile. Prefer 5-10 sharp, reproducible findings with file:line citations over 20 vague ones. Label speculation explicitly as SPECULATION.
+
+Output format (markdown):
+## CONFIRMED
+- [severity: BLOCKER|MAJOR|MINOR] <finding> — evidence: <file:line or quoted text>; why it breaks; suggested correction
+## SUSPECTED
+- same shape, for findings you could not fully verify
+## CHECKED AND FOUND SOUND
+- one line per CONTEXT claim you verified as correct (so absence of findings is distinguishable from absence of checking)
