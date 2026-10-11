@@ -129,3 +129,20 @@ These were decided within Claude's remit and never put to the operator:
 - 999.130 is promoted to its own phase between 50 and 51.
 - 999.143's agent half stays in the backlog.
 - macOS verification has no host and no CI.
+
+---
+
+## Post-review: 2.x way out (2026-10-11, review finding O-1)
+
+The operator first answered "I need help to determine what the best solution is". Claude then explained:
+- what a live 2.x run does once 3.x is installed (it ends itself at its next stage boundary);
+- where it really gets stuck (a run parked at a gate, and a recycled pid);
+- that a cmdline check is safe for ruling a pid out but unsound for deciding to kill.
+
+| Option | Description | Selected |
+|--------|-------------|----------|
+| Adopt recommendation | `stop` signal-only on 2.x; self-termination at the boundary; upgrade waits using cmdline exclusion; no override | ✓ |
+| Recommendation + override | Same, plus `--assume-dead` | |
+| Finish on 2.x | Keep D-14/D-15; clear a gate-parked run with a 2.x binary | |
+
+Recorded as D-19 (amends D-14, D-15).

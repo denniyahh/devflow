@@ -117,10 +117,10 @@ mandate.
   every later field is `#[serde(default)]` (`crates/devflow-core/src/state.rs:15-34`, verified), so a 2.x file loads
   cleanly, and detection must not rely on a load failure. A 2.x state must never be reported as GONE (criterion 4).
   — **Reversibility:** one-way — the field is the published state-file contract for every later version.
-- **D-14 (Operator): Read-only verbs report; everything else refuses.** `status` and `doctor` show the phase as
+- **D-14 (Operator; amended by D-19 — `stop` is allowed on 2.x in signal-only form): Read-only verbs report; everything else refuses.** `status` and `doctor` show the phase as
   "incompatible: written by DevFlow 2.x" and never as GONE. Every verb that writes state or launches (`start`,
   `resume`, `advance`, `stop`, `ship`, gate answers, …) refuses with a named error that names the way out (D-15).
-- **D-15 (Operator): An explicit, operator-invoked upgrade verb.** For example `devflow recover --upgrade-state --phase
+- **D-15 (Operator; amended by D-19 — the pid check excludes recycled pids by cmdline): An explicit, operator-invoked upgrade verb.** For example `devflow recover --upgrade-state --phase
   N` (name is Claude's call). It refuses while the 2.x state's recorded monitor or agent pid is alive. This is the
   only place 3.x still reads a pid for liveness, and it reads a 2.x record by necessity. Otherwise it stamps
   `schema_version: 3`, keeps the worktree and branch, and leaves the phase resumable with `resume`. It never runs
@@ -177,7 +177,7 @@ mandate.
 Source: `.planning/reviews/50-adversarial-2026-10-11-context/SUMMARY.md`. Three external lanes (agy, codex, pi)
 reviewed the decisions above, and every finding was re-verified against source. These corrections fix mechanism and
 evidence; none changes an operator decision. Where a decision above and this block disagree, this block wins. One
-finding does conflict with operator decisions D-14 and D-15; it is **O-1**, pending the operator below.
+finding conflicted with operator decisions D-14 and D-15 (O-1); the operator answered it as **D-19** below.
 
 - **R-1 (socket ownership across stage transitions; replaces the "Socket keying" discretion).** The in-process
   advance spawns the next stage's monitor while the current monitor is still alive and bound (`monitor.rs:480-482`;
@@ -258,9 +258,25 @@ finding does conflict with operator decisions D-14 and D-15; it is **O-1**, pend
 - **R-14 (corrections in place).** Fixed: the folded-item count (five, not three), citations (`spawn_agent_and_record`
   at `:1007`, `spawn_monitor` at `:308`), and D-16's "unverified" Phase 49 relaunch claim (verified).
 
-**O-1 (pending operator decision — do not plan D-14/D-15 until answered).** As written, D-14 and D-15 wedge a live
-2.x run. `stop` refuses on a 2.x state, and the upgrade verb refuses while a recorded 2.x pid is alive. A recycled
-2.x `monitor_pid` wedges the phase permanently, because 2.x records no start time for it.
+- **D-19 (Operator, 2026-10-11; amends D-14 and D-15; answers review finding O-1).** As first written, D-14 and
+  D-15 wedged a live 2.x run: `stop` refused on a 2.x state, and the upgrade verb refused while a recorded 2.x pid was
+  alive. A recycled 2.x `monitor_pid` would have wedged the phase permanently, because 2.x records no start time for
+  it. The amended rules:
+  - **`stop` is allowed on a 2.x state, in signal-only form.** It answers the open gate (`stop_via_gate`), or it
+    signals the per-phase lock holder after the existing pid-plus-start-time identity check (`stop_via_lock`,
+    `commands.rs:2039-2079`). The 2.x lock file records both values. On a 2.x state, `stop` **never writes**
+    `state.json`, so 3.x never stamps or rewrites a 2.x file outside the upgrade verb. Every other writing or launching
+    verb still refuses per D-14.
+  - **A mid-stage 2.x run needs no verb.** *Verified:* the 2.x `Legacy` tail runs `advance` through the absolute
+    `current_exe()` path captured at spawn (`monitor.rs:342`). Once 3.x is installed at that path, the 3.x `advance`
+    refuses the 2.x state (D-14), and the run ends at its next stage boundary. *Reasoned, research must verify:*
+    a 2.x `PipeOwning` monitor ends the same way when it spawns its next `__monitor` through `current_exe()`. This
+    requires 3.x `__monitor` to refuse a 2.x state, so the plan must make sure it does. A test covers both shapes.
+  - **The upgrade verb waits; there is no blind override.** It refuses while any recorded 2.x pid is "plausibly
+    ours": alive, with `/proc/<pid>/cmdline` naming `devflow` or the recorded agent program. A live pid whose cmdline
+    names neither is treated as recycled, and the verb proceeds. The cmdline is used only to rule a pid *out*, never
+    as grounds to signal (999.47: a cmdline match is unsound for identity). A false "ours" only delays the upgrade.
+    Tests: a recycled-pid fixture (a live unrelated process) proceeds; a live `devflow` process refuses.
 
 </decisions>
 

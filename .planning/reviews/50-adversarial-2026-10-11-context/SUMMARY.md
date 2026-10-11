@@ -68,3 +68,13 @@ means checked this session at HEAD `5698426`.
 
 - agy: "remove `monitor_pid` and D-15 can't read it". Partly valid. Nothing in the CONTEXT decided to remove the
   field. R-9 makes keeping it readable explicit.
+
+## Resolution of O-1 (2026-10-11)
+
+The operator asked for help choosing and then adopted Claude's recommendation, recorded as **D-19** in the CONTEXT:
+- `stop` is allowed on a 2.x state in signal-only form and never writes the state.
+- A mid-stage 2.x run ends itself at its next boundary. This is verified for `Legacy` through the absolute
+  `current_exe()` tail (`monitor.rs:342`); for `PipeOwning` it is reasoned only, and research must verify it.
+- The upgrade verb rules recycled pids out by cmdline and has no blind override.
+
+Options rejected: "Recommendation + `--assume-dead` override" and "Finish on 2.x".
