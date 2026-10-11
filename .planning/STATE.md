@@ -2,15 +2,15 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: "50"
+current_phase: 50
 current_phase_name: Addressable Monitor Liveness
 current_plan: Not started
 status: planning
-stopped_at: Phase 49 complete, ready to discuss Phase 50
-last_updated: "2026-10-10T01:03:12.376Z"
+stopped_at: Phase 50 context gathered
+last_updated: "2026-10-11T00:56:59.844Z"
 last_activity: 2026-10-09
 last_activity_desc: Phase 49.1 removed; CR-01 fix moves to a fix branch, Phase 50 next
-state_head: 40259eccd264cf02465fc3e1c901353f62ba6cca
+state_head: a890232f3d6a9e2e869e1692f4f85b325f041ca8
 progress:
   total_phases: 6
   completed_phases: 4
@@ -966,9 +966,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-10-09T00:48:44.074Z
-**Stopped at:** Phase 49 complete, ready to discuss Phase 50
-**Resume file:** None
+**Last session:** 2026-10-11T00:56:59.545Z
+**Stopped at:** Phase 50 context gathered
+**Resume file:** .planning/phases/50-addressable-monitor-liveness/50-CONTEXT.md
 
 ## Operator Next Steps
 
