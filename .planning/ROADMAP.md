@@ -30,6 +30,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
+| 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | TBD | 4 (after 50) | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
 ### Phase 46: CI Load Shape and Operator Input Validation
@@ -356,11 +357,30 @@ be measuring.
      project tree, and not `$XDG_RUNTIME_DIR`, which systemd deletes at logout. A path that would
      exceed `sun_path` (108 bytes on Linux, 104 on macOS) is refused at construction with a named
      error rather than silently truncated.
-  4. The state-file break is explicit, not incidental: a 2.x `state.json` with no socket path is
-     detected and reported as incompatible, never silently misread as GONE. This is the observable
-     that justifies the major version.
+**No 2.x → 3.x migration (operator, 2026-10-12).** DevFlow has no outside users, so 3.x makes no
+promise about a `state.json` written by 2.x: it may read as GONE or fail to load, and either is
+acceptable. There is no version detection, no upgrade verb and no 2.x compatibility test. The
+former criterion 4 (detect and report a 2.x state as incompatible) is retired. This does not change
+the milestone's major-version call.
 
 **Plans**: TBD
+
+### Phase 50.1: Split-Lock State-Handling Overhaul (INSERTED)
+
+**Goal:** Every state write is serialised and durable, and a gate answer can only decide the gate it was
+written for. Promoted from backlog 999.130 by operator decision on 2026-10-10 (Phase 50 discussion,
+`50-CONTEXT.md` D-11), because its revisit trigger fired: Phase 50 moves the `Legacy` monitor's
+`advance` in-process, which reworks the monitor-to-`advance` handoff. Scope carried from 999.130:
+a short OS lock (`flock`) around every state write; an `update_state(root, phase, |s| …)` API with
+`State` consumed by value across blocking calls; a launcher-to-monitor ownership token handoff;
+gate-waiter registration (which closes the stale-gate-answer hazard, AR-48-04 and the T-48-12-05
+caveat); fsync of the file and its directory. See the 999.130 entry for evidence and constraints.
+**Requirements**: TBD (none assigned yet; set at discuss/plan)
+**Depends on:** Phase 50
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 50.1 to break down)
 
 ### Phase 51: Rate-Limit Agent Failover
 
@@ -542,6 +562,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | — | Not started | — |
+| 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -1229,6 +1250,8 @@ directly, then delete `ENV_MUTEX`.
 **Acceptance:** not decided; set at promotion.
 
 ### Phase 999.130: Split-Lock State-Handling Overhaul (BACKLOG)
+
+**Promoted 2026-10-10 to Phase 50.1** (operator decision, `50-CONTEXT.md` D-11). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
 decision. Phase 48 made state writes survivable with unique temp files, first-answer-wins gate

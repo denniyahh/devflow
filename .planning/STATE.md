@@ -7,16 +7,16 @@ current_phase_name: Addressable Monitor Liveness
 current_plan: Not started
 status: planning
 stopped_at: Phase 50 context gathered
-last_updated: "2026-10-11T00:56:59.844Z"
+last_updated: "2026-10-11T13:11:00.845Z"
 last_activity: 2026-10-09
 last_activity_desc: Phase 49.1 removed; CR-01 fix moves to a fix branch, Phase 50 next
-state_head: a890232f3d6a9e2e869e1692f4f85b325f041ca8
+state_head: 569842678701ba2ae267fcf1ef401baebc91eade
 progress:
-  total_phases: 6
+  total_phases: 7
   completed_phases: 4
   total_plans: 48
   completed_plans: 48
-  percent: 67
+  percent: 57
 ---
 
 # DevFlow — Project State
@@ -212,7 +212,7 @@ backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scann
 by the scanner's staged-only scope.
 Last activity: 2026-10-09 — Phase 49 complete; Phase 49.1 removed (fix branch instead), Phase 50 next
 
-Progress: [███████░░░] 67% (4 of 6 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted and removed 2026-10-09. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
+Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
@@ -988,3 +988,4 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 - 999.97 filed and hotfixed (2026-08-07), no phase cycle: `devflow start --phase 35.1` was rejected by clap (`invalid digit found in string`) — the phase identifier was `u32` at 182 sites and `prompt.rs` globbed it as `{phase:02}`, so decimal phases could not be launched at all. Briefly filed as Phase 37 via `phase.add` and then withdrawn on the operator's call to fix it directly. Recording the tool defect while it is fresh: `phase.add` again placed the new entry at the document's last `---` (inside archived 999.25 prose, outside the active milestone window) and wrote neither the phase-table nor the Progress-table row.
 - Phase 49 edited: edited fields: goal, success_criteria (criterion 1), execution note — Phase 49 re-scoped to a disposable GSD project with one operator checkpoint per attempt (operator, 2026-09-28)
 - Phase 49.1 inserted after Phase 49: Declared checkpoint detection: replace e3f9ddd's prose heuristic (agent_result.rs marker_reports_human_gate auto-resumes any Failed reason containing blocking-human plus gate/checkpoint/halted) with an explicit checkpoint field in the DEVFLOW_RESULT marker; fixes 49-REVIEW.md CR-01; decide whether a new live attempt is needed, since Phase 49's VERIFY-01 evidence ran the heuristic binary (084625c) (URGENT)
+- Phase 50.1 inserted after Phase 50: Split-Lock State-Handling Overhaul, promoted from backlog 999.130 (50-CONTEXT D-11)
