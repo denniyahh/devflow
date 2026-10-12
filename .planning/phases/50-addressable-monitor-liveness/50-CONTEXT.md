@@ -8,9 +8,9 @@
 
 Replace the PID-addressed monitor with a socket-addressed supervisor, so "is this run's monitor alive?" resolves to
 exactly one of GONE / STALE / ALIVE from `state.json` plus the socket at the recorded path, with no PID read on the
-answering path (SUPV-01, ROADMAP Phase 50 criteria 1–4). `MonitorLaunch::PipeOwning` (already a Rust supervisor) gains
+answering path (SUPV-01, ROADMAP Phase 50 criteria 1–3). `MonitorLaunch::PipeOwning` (already a Rust supervisor) gains
 an address; `MonitorLaunch::Legacy` (the detached `sh -c` script) is replaced by a Rust supervisor; both answer
-identically. The 2.x → 3.x state-file break is explicit. This is the milestone's breaking change (major version).
+identically. No 2.x → 3.x migration is provided (D-20). This is the milestone's breaking change (major version).
 
 **The operator widened the phase beyond the four liveness criteria** (D-01…D-06): the supervisor also owns teardown
 through the socket (the full DEN-58 / #185 spike design), and five backlog items are folded in or closed (999.128,
@@ -19,7 +19,7 @@ through the socket (the full DEN-58 / #185 spike design), and five backlog items
 **Scope changes planning must carry as plan tasks:**
 
 - Amend ROADMAP Phase 50's entry so its criteria and requirement list name what this context adds: socket teardown,
-  STALE backstop, sweep, signal handling, the 2.x upgrade verb, and the folded items 999.128, 999.134, 999.138,
+  STALE backstop, sweep, signal handling, and the folded items 999.128, 999.134, 999.138,
   999.139, 999.141. Mark those backlog entries as folded into Phase 50.
 - Update 999.143 to say the monitor-pid half is removed by Phase 50; the agent-pid half and the work-preserving
   repair stay in the backlog (D-12).
@@ -110,21 +110,14 @@ mandate.
 - **D-12 (Operator): 999.143 stays parked.** Phase 50 removes its monitor-pid half by construction. The agent-pid
   identity and the work-preserving repair stay in the backlog.
 
-### 2.x state break (Operator, 2026-10-10)
+### No 2.x migration (Operator, 2026-10-12)
 
-- **D-13 (Operator): An explicit `schema_version` field.** Every state a 3.x binary creates carries
-  `schema_version: 3`. A missing field means pre-3.0, which is incompatible. Today `State` has no version field and
-  every later field is `#[serde(default)]` (`crates/devflow-core/src/state.rs:15-34`, verified), so a 2.x file loads
-  cleanly, and detection must not rely on a load failure. A 2.x state must never be reported as GONE (criterion 4).
-  — **Reversibility:** one-way — the field is the published state-file contract for every later version.
-- **D-14 (Operator; amended by D-19 — `stop` is allowed on 2.x in signal-only form): Read-only verbs report; everything else refuses.** `status` and `doctor` show the phase as
-  "incompatible: written by DevFlow 2.x" and never as GONE. Every verb that writes state or launches (`start`,
-  `resume`, `advance`, `stop`, `ship`, gate answers, …) refuses with a named error that names the way out (D-15).
-- **D-15 (Operator; amended by D-19 — the pid check excludes recycled pids by cmdline): An explicit, operator-invoked upgrade verb.** For example `devflow recover --upgrade-state --phase
-  N` (name is Claude's call). It refuses while the 2.x state's recorded monitor or agent pid is alive. This is the
-  only place 3.x still reads a pid for liveness, and it reads a 2.x record by necessity. Otherwise it stamps
-  `schema_version: 3`, keeps the worktree and branch, and leaves the phase resumable with `resume`. It never runs
-  automatically.
+- **D-20 (Operator, 2026-10-12; retires D-13, D-14, D-15 and D-19).** DevFlow has no outside users, so Phase 50
+  builds no 2.x → 3.x migration. 3.x makes no promise about a `state.json` written by 2.x: it may read as GONE or fail
+  to load, and either is acceptable. There is no `schema_version` field, no "incompatible" report, no refusal on a 2.x
+  state, no upgrade verb and no 2.x compatibility test. ROADMAP criterion 4 is retired with it. Operational rule
+  instead of code: install a 3.x binary only while no 2.x run is live. The retired decisions and their alternatives
+  remain in `50-DISCUSSION-LOG.md` and in git history.
 
 ### Proof bar (Operator, 2026-10-10)
 
@@ -169,7 +162,6 @@ mandate.
 - **Group enumeration mechanism** for the backstop on Linux (`/proc`).
 - **macOS (Claude, remit).** It was never run here (no host, no CI). The 104-byte limit is enforced by a constant
   and tested as such. **No macOS support is claimed**, and docs and the changelog must say "unverified on macOS".
-- **The upgrade verb's exact name and flag**, and the exact refusal texts.
 - **Plan count and wave layout**, with D-07 (test `HOME` isolation) sequenced before any sweep test.
 
 ### Post-review corrections (Claude, remit, 2026-10-11 — adversarial review of `5698426`)
@@ -177,7 +169,7 @@ mandate.
 Source: `.planning/reviews/50-adversarial-2026-10-11-context/SUMMARY.md`. Three external lanes (agy, codex, pi)
 reviewed the decisions above, and every finding was re-verified against source. These corrections fix mechanism and
 evidence; none changes an operator decision. Where a decision above and this block disagree, this block wins. One
-finding conflicted with operator decisions D-14 and D-15 (O-1); the operator answered it as **D-19** below.
+finding (O-1) concerned the 2.x way out; its answer, D-19, was retired with the rest of the migration work by D-20.
 
 - **R-1 (socket ownership across stage transitions; replaces the "Socket keying" discretion).** The in-process
   advance spawns the next stage's monitor while the current monitor is still alive and bound (`monitor.rs:480-482`;
@@ -233,11 +225,11 @@ finding conflicted with operator decisions D-14 and D-15 (O-1); the operator ans
 - **R-8 (reboot).** A STALE socket whose sidecar boot id differs from the current boot id is certainly dead. Remove
   the socket and sidecar, signal nothing, and report the phase resumable. Test with a fabricated boot id: nothing is
   signalled, and the result is GONE.
-- **R-9 (semver; supports the major version).** `pub State::monitor_pid` (`state.rs:288`) stays deserialisable,
-  because D-15 must read it from a 2.x file. Its removal from the public type is a planning decision that must be
-  named, not incidental. `pub fn spawn_monitor(...) -> Result<u32, _>` (`monitor.rs:308`) changes shape. Plans list
-  every `pub` item added, changed or removed in `devflow-core`, and run `cargo semver-checks check-release -p
-  devflow-core`. The major bump rests on the state-file contract (D-13) plus those named API changes.
+- **R-9 (semver; supports the major version).** `pub State::monitor_pid` (`state.rs:288`) may be removed, since no
+  2.x file needs to be read (D-20); removing it is a planning decision that must be named, not incidental.
+  `pub fn spawn_monitor(...) -> Result<u32, _>` (`monitor.rs:308`) changes shape. Plans list every `pub` item added,
+  changed or removed in `devflow-core`, and run `cargo semver-checks check-release -p devflow-core`. The major bump
+  rests on those named API changes and the changed monitor mechanism.
 - **R-10 (fault arm coverage; refines D-17).** Beyond "kill -9 mid-stage", the fixtures and the fault arm also cover:
   a SIGKILL while advancing (lock held); a SIGKILL between the next monitor's publish and the old monitor's unlink
   (R-1); and a stop racing natural completion (R-2). Each live fault-arm record names the launch shape, socket path,
@@ -252,31 +244,8 @@ finding conflicted with operator decisions D-14 and D-15 (O-1); the operator ans
   - Each folded item keeps its own named failing test with a negative control: 999.128 (the repair at a `Recycled`
     holder succeeds), 999.139 (corrupt state plus a live monitor), and 999.141 (a child writing outside its tempdir
     `HOME` fails the test).
-  - The 2.x detection has a negative control: a 3.x state with no socket path is not reported as 2.x.
-  - D-13 versions `state.json` only. Research states whether any other persisted format a 3.x binary reads (gate
-    files, `cron-instructions*.json`, events) changes in this phase, and refuses or versions it if so.
 - **R-14 (corrections in place).** Fixed: the folded-item count (five, not three), citations (`spawn_agent_and_record`
   at `:1007`, `spawn_monitor` at `:308`), and D-16's "unverified" Phase 49 relaunch claim (verified).
-
-- **D-19 (Operator, 2026-10-11; amends D-14 and D-15; answers review finding O-1).** As first written, D-14 and
-  D-15 wedged a live 2.x run: `stop` refused on a 2.x state, and the upgrade verb refused while a recorded 2.x pid was
-  alive. A recycled 2.x `monitor_pid` would have wedged the phase permanently, because 2.x records no start time for
-  it. The amended rules:
-  - **`stop` is allowed on a 2.x state, in signal-only form.** It answers the open gate (`stop_via_gate`), or it
-    signals the per-phase lock holder after the existing pid-plus-start-time identity check (`stop_via_lock`,
-    `commands.rs:2039-2079`). The 2.x lock file records both values. On a 2.x state, `stop` **never writes**
-    `state.json`, so 3.x never stamps or rewrites a 2.x file outside the upgrade verb. Every other writing or launching
-    verb still refuses per D-14.
-  - **A mid-stage 2.x run needs no verb.** *Verified:* the 2.x `Legacy` tail runs `advance` through the absolute
-    `current_exe()` path captured at spawn (`monitor.rs:342`). Once 3.x is installed at that path, the 3.x `advance`
-    refuses the 2.x state (D-14), and the run ends at its next stage boundary. *Reasoned, research must verify:*
-    a 2.x `PipeOwning` monitor ends the same way when it spawns its next `__monitor` through `current_exe()`. This
-    requires 3.x `__monitor` to refuse a 2.x state, so the plan must make sure it does. A test covers both shapes.
-  - **The upgrade verb waits; there is no blind override.** It refuses while any recorded 2.x pid is "plausibly
-    ours": alive, with `/proc/<pid>/cmdline` naming `devflow` or the recorded agent program. A live pid whose cmdline
-    names neither is treated as recycled, and the verb proceeds. The cmdline is used only to rule a pid *out*, never
-    as grounds to signal (999.47: a cmdline match is unsound for identity). A false "ours" only delays the upgrade.
-    Tests: a recycled-pid fixture (a live unrelated process) proceeds; a live `devflow` process refuses.
 
 </decisions>
 
@@ -286,7 +255,7 @@ finding conflicted with operator decisions D-14 and D-15 (O-1); the operator ans
 **Downstream agents MUST read these before planning or implementing.**
 
 ### Requirement and scope
-- `.planning/ROADMAP.md` — Phase 50 entry (goal, sequencing note, criteria 1–4); backlog entries 999.128, 999.130,
+- `.planning/ROADMAP.md` — Phase 50 entry (goal, sequencing note, criteria 1–3, the no-migration note); backlog entries 999.128, 999.130,
   999.134, 999.138, 999.139, 999.141, 999.143
 - `.planning/REQUIREMENTS.md` — SUPV-01 (scope correction, `sun_path` binding constraint); SUPV-02 (Phase 51 depends
   on this phase; it must re-test the dependency, not assume it)
@@ -338,7 +307,7 @@ finding conflicted with operator decisions D-14 and D-15 (O-1); the operator ans
   `resume`/`start` live-run guards (48-19, 48-20).
 - `stop` (`commands.rs:1882`): `stop_via_gate`, then `stop_via_lock`. Socket shutdown is added for the ALIVE case
   (D-04).
-- `recover` (`main.rs:273`): the home for STALE teardown and the upgrade verb, unless planning picks otherwise.
+- `recover` (`main.rs:273`): the home for STALE teardown, unless planning picks otherwise.
 
 </code_context>
 
@@ -348,7 +317,7 @@ finding conflicted with operator decisions D-14 and D-15 (O-1); the operator ans
 - The operator wants the pros and cons stated before committing to the riskier design. D-04 records the arguments
   against it that were presented; planning should not lose them.
 - "Recoverable by design rather than by diagnosis" (the phase goal) is the test for every operator-facing message:
-  each GONE, STALE and incompatible report names the verb that repairs it.
+  each GONE and STALE report names the verb that repairs it.
 
 </specifics>
 

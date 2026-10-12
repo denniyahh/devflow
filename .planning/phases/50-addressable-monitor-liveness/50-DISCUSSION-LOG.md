@@ -146,3 +146,17 @@ The operator first answered "I need help to determine what the best solution is"
 | Finish on 2.x | Keep D-14/D-15; clear a gate-parked run with a 2.x binary | |
 
 Recorded as D-19 (amends D-14, D-15).
+
+---
+
+## Migration retired (2026-10-12)
+
+The operator said they do not care about 2.x → 3.x migrations, since nobody else uses DevFlow, and asked to retire
+all migration work unless it would interfere with Phase 50 or later development. Claude checked first:
+- no DevFlow process was running;
+- the only 2.x state files on the machine were inert: `trading_bot/.devflow/state-08.json` from 2026-07-19, with no
+  recorded pids, and DevFlow's own gitignored `.devflow/state-stale.json`, which is not a phase state;
+- the Phase 50 proof rig starts from a fresh throwaway repo, so it never meets a 2.x state.
+
+Recorded as D-20. It retires D-13, D-14, D-15 and D-19 and ROADMAP criterion 4. The 2.x state break, the upgrade
+verb and the O-1 tables above are kept as audit trail only.
