@@ -12,7 +12,7 @@ created: "2026-10-14"
 # Phase 50 — Validation Strategy
 
 > Per-phase validation contract for feedback sampling during execution.
-> Source: `50-RESEARCH.md` § Validation Architecture (rows V-01…V-29). Task IDs are assigned by the planner.
+> Source: `50-RESEARCH.md` § Validation Architecture (rows V-01…V-29); V-30…V-33 added from plan-checker revision round 2 (plans 50-23, 50-24). Task IDs are assigned by the planner.
 
 ---
 
@@ -72,7 +72,11 @@ A bare `--exact` name that matches nothing still exits 0, so qualify unit-test n
 | V-24 | TBD | TBD | 999.128 | — | N/A | unit | `cargo test -p devflow-core --lib lock::tests::acquire_reclaims_a_lock_whose_live_pid_has_a_different_start_time -- --exact` | ❌ W0 | ⬜ pending |
 | V-25 | TBD | TBD | 999.128 (repair) | — | a `Live` holder still refuses | unit (rewritten) | `cargo test -p devflow-core --lib recover::tests::clean_phase_returns_without_cleanup_for_a_recycled_pid_lock -- --exact` (renamed by the plan) | ✅ (flip) | ⬜ pending |
 | V-26 | TBD | TBD | 999.141 / D-07 | tests touch the real `~/.cache/devflow` | hermetic HOME | e2e | `cargo test -p devflow --test test_home_isolation a_child_writing_outside_its_tempdir_home_fails -- --exact` | ❌ W0 | ⬜ pending |
-| V-27 | TBD | TBD | R-9 | — | N/A | script gate | `cargo semver-checks check-release -p devflow-core 2>&1 \| rg '^--- failure' \| sort` compared to the plan's named list (includes 2 pre-existing failures) | n/a | ⬜ pending |
+| V-27 | 50-01 (tool), 50-08 / 50-10 / 50-11 / 50-16 (staged runs) | TBD | R-9 | — | N/A | script gate | `tools/semver-gate.sh check --through <plan>` before each breaking commit; compares `cargo semver-checks check-release -p devflow-core` lints item by item to the named-break table (2 pre-existing Phase 49 lints + this phase's named breaks) | ❌ W0 | ⬜ pending |
+| V-30 | 50-23 | TBD | WR-04 equivalent (launch failure paths) | stale record misdirects to `resume` | refused or failed launch clears `state.supervisor` | unit | `cargo test -p devflow --bin devflow pipeline_launch::tests::a_failed_monitor_spawn_clears_the_supervisor_record -- --exact` (+ `absent_canary_refuses_to_launch`, `launch_stage_inner_clears_monitor_pid_on_early_failure` extended) | ❌ W0 | ⬜ pending |
+| V-31 | 50-23 | TBD | R-1 (failed publish save) | unpublished supervisor survives | failed save shuts the new supervisor down | unit (+ control) | `cargo test -p devflow --bin devflow pipeline_launch::tests::a_failed_publish_save_shuts_the_new_supervisor_down -- --exact`; control `a_successful_publish_save_records_and_keeps_the_new_supervisor` | ❌ W0 | ⬜ pending |
+| V-32 | 50-23 | TBD | R-2 (stop before record saved) | — | a stop reaching N+1 before its record is saved is recorded | unit (+ control) | `cargo test -p devflow --bin devflow pipeline_launch::tests::a_stop_sent_straight_to_the_next_supervisor_before_its_record_is_saved_is_recorded -- --exact`; control `without_a_stop_to_the_next_supervisor_the_held_publish_hands_off` | ❌ W0 | ⬜ pending |
+| V-33 | 50-24 | TBD | publish-wait timeout | agent orphaned by a bare SIGKILL | a never-publishing `__monitor` is ended with its agent group | unit (+ control) | test `a_supervisor_that_never_publishes_is_ended_with_its_agent_group` (exact module path in 50-24) | ❌ W0 | ⬜ pending |
 | V-28 | TBD | TBD | D-16 | — | N/A | manual (live rig) | runbook | manual | ⬜ pending |
 | V-29 | TBD | TBD | D-17 / R-10 | — | N/A | manual + script | `tools/fault-arm.sh` record | ❌ W0 | ⬜ pending |
 

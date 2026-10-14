@@ -112,7 +112,7 @@ mandate.
 
 ### No 2.x migration (Operator, 2026-10-12)
 
-- **D-20 (Operator, 2026-10-12; retires D-13, D-14, D-15 and D-19).** DevFlow has no outside users, so Phase 50
+- **D-20 (Operator, 2026-10-12; retires D-13, D-14, D-15 and D-19): No 2.x migration.** DevFlow has no outside users, so Phase 50
   builds no 2.x → 3.x migration. 3.x makes no promise about a `state.json` written by 2.x: it may read as GONE or fail
   to load, and either is acceptable. There is no `schema_version` field, no "incompatible" report, no refusal on a 2.x
   state, no upgrade verb and no 2.x compatibility test. ROADMAP criterion 4 is retired with it. Operational rule

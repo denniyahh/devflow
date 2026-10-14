@@ -949,9 +949,9 @@ liveness path, and the `liveness(monitor_pid, …)` predicate.
 | A8 | `signal-hook` name and maturity | Alternatives | Not recommended; no impact unless adopted |
 | A9 | self-pipe pattern details | Pattern 1 | standard; the probes verified the parts that matter (mask, exec reset) |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **`$XDG_CACHE_HOME` vs the literal `~/.cache/devflow/`.**
+1. **(RESOLVED) `$XDG_CACHE_HOME` vs the literal `~/.cache/devflow/`.**
    - What we know: criterion 3 and D-01 say `~/.cache/devflow/`. `registry::cache_dir()` (which R-7 mandates)
      prefers `DEVFLOW_CACHE_DIR`, then `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`.
    - What's unclear: whether a set `XDG_CACHE_HOME` satisfies criterion 3. The operator's rejection was of
@@ -959,11 +959,23 @@ liveness path, and the `liveness(monitor_pid, …)` predicate.
    - Recommendation: use `cache_dir()` as R-7 says, and have the plan amend criterion 3's wording to "under
      `registry::cache_dir()` (default `~/.cache/devflow/`)". *Needs an operator answer only if the operator reads
      criterion 3 literally.*
-2. **The CI kernel and `PIDFD_SIGNAL_PROCESS_GROUP`.** Not measured. Implement the `EINVAL` fallback and make a test
+   - Resolution (Claude remit, planning 2026-10-14): use `registry::cache_dir()` as R-7 mandates. 50-01 Task (b) appends
+     to ROADMAP criterion 3 that the directory is resolved by `registry::cache_dir()` (`DEVFLOW_CACHE_DIR`, then
+     `$XDG_CACHE_HOME/devflow`, default `~/.cache/devflow/`), which keeps both of criterion 3's exclusions; 50-11 V-07
+     tests that the published path follows the cache dir. No operator answer was requested.
+2. **(RESOLVED) The CI kernel and `PIDFD_SIGNAL_PROCESS_GROUP`.** Not measured. Implement the `EINVAL` fallback and make a test
    that requires the flag skip loudly (print "skipped: kernel lacks …"), never pass silently.
-3. **Should a natural agent exit also reap leftover group members** (background processes the agent left)? This is
+   - Resolution (planning 2026-10-14): 50-09 implements the documented `killpg` fallback on `EINVAL` only, and
+     `supervisor::backstop::tests::pidfd_group_signal_is_used_when_the_kernel_supports_it` prints `skipped: kernel lacks
+     PIDFD_SIGNAL_PROCESS_GROUP` instead of passing silently. The CI kernel itself stays unmeasured until that test runs
+     in CI.
+3. **(RESOLVED) Should a natural agent exit also reap leftover group members** (background processes the agent left)? This is
    not in D-04. It would close part of 999.46 cheaply via `WNOWAIT`. Recommend leaving it out of Phase 50 unless the
    operator asks; record it in the backlog.
+   - Resolution (planning 2026-10-14): left out of Phase 50, because D-04 scopes leftover-member reaping to a stop
+     (50-07 `wait_agent` SIGKILLs leftovers only on `Stopped`). No plan files it: 50-20 Task 3 files only defects
+     found by this phase's runs, and this is a research idea, not a found defect. Filing it as a backlog idea is left
+     to the operator.
 
 ## Environment Availability
 

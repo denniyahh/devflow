@@ -29,7 +29,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
-| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Not started |
+| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Planned |
 | 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | TBD | 4 (after 50) | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
@@ -363,7 +363,83 @@ acceptable. There is no version detection, no upgrade verb and no 2.x compatibil
 former criterion 4 (detect and report a 2.x state as incompatible) is retired. This does not change
 the milestone's major-version call.
 
-**Plans**: TBD
+**Plans**: 0/24 plans complete (16 waves); 50-19 is the single operator checkpoint for the live attempt
+
+**Wave 1**
+
+- [ ] 50-01-PLAN.md *(no plan dependencies)* — single-test gate helper and staged semver gate (`tools/exact-test.sh`, `tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
+- [ ] 50-02-PLAN.md *(no plan dependencies)* — 999.141 tracer: shared hermetic test helper, V-26 with its negative control, start_lock/stop e2e migrated
+
+**Wave 2**
+
+- [ ] 50-03-PLAN.md *(depends on 50-02)* — 999.141: migrate 8 more e2e files to the hermetic helper
+- [ ] 50-04-PLAN.md *(depends on 50-01, 50-02)* — 999.128: recycled-pid lock reclaim by start time (V-24/V-25), CLI repair test
+- [ ] 50-05-PLAN.md *(depends on 50-01, 50-02)* — core socket path, sun_path bound, atomic hard-link publish, total probe, wire protocol (V-01…V-06, V-11)
+
+**Wave 3**
+
+- [ ] 50-06-PLAN.md *(depends on 50-05)* — sidecar, read-only sweep, shutdown client, `State::supervisor` (V-22)
+- [ ] 50-21-PLAN.md *(depends on 50-03)* — 999.141: migrate the last 5 e2e files to the hermetic helper
+
+**Wave 4**
+
+- [ ] 50-07-PLAN.md *(depends on 50-06)* — supervisor runtime: single terminal-state owner, self-pipe signals, control thread (V-14)
+
+**Wave 5**
+
+- [ ] 50-08-PLAN.md *(depends on 50-07)* — both launch shapes on the runtime in core (V-08, V-09, V-10, V-16)
+- [ ] 50-09-PLAN.md *(depends on 50-07)* — STALE backstop: signal only a validated live leader's group, refuse and report otherwise (V-18…V-21), mutation run
+
+**Wave 6**
+
+- [ ] 50-10-PLAN.md *(depends on 50-04, 50-08)* — `LaunchContext` and test-binary monitor entry; every `spawn_monitor` caller named; in-crate cache isolation
+
+**Wave 7**
+
+- [ ] 50-24-PLAN.md *(depends on 50-09, 50-10)* — not-ready teardown: publish wait, agent-group guard, private /proc parent-pid parse (V-33)
+
+**Wave 8**
+
+- [ ] 50-11-PLAN.md *(depends on 50-03, 50-04, 50-10, 50-21, 50-24)* — one-way switch: both shapes to `__monitor`, shell monitor deleted, e2e tracer, V-07
+
+**Wave 9**
+
+- [ ] 50-12-PLAN.md *(depends on 50-09, 50-11)* — status/cleanup/doctor on the probe; read-only orphan-socket findings naming `stop --launch <id>`
+- [ ] 50-13-PLAN.md *(depends on 50-11)* — handoff order, stop checks during advance, cancellable gate wait, stop on an unloadable state (V-13, V-15)
+
+**Wave 10**
+
+- [ ] 50-14-PLAN.md *(depends on 50-09, 50-12, 50-13)* — `devflow stop` through the socket incl. `--launch <id>` (V-17), STALE backstop path, recover refusal
+- [ ] 50-23-PLAN.md *(depends on 50-12, 50-13)* — launch failure paths: clear the record on refusal or failure, failed publish save, stop before the record is saved (V-30…V-32)
+
+**Wave 11**
+
+- [ ] 50-15-PLAN.md *(depends on 50-14)* — 999.139 start/resume guard (V-23), concurrent starts (V-12)
+
+**Wave 12**
+
+- [ ] 50-22-PLAN.md *(depends on 50-15, 50-23)* — remove every CLI use of `State::monitor_pid`
+
+**Wave 13**
+
+- [ ] 50-16-PLAN.md *(depends on 50-22)* — remove `State::monitor_pid` from core, final semver gate (V-27), container check
+
+**Wave 14**
+
+- [ ] 50-17-PLAN.md *(depends on 50-16)* — OPERATIONS, ARCHITECTURE and guides: liveness, stop, macOS caveat, D-20 install rule
+- [ ] 50-18-PLAN.md *(depends on 50-16)* — fault arm and attempt judge (same-binary rule), runbook; run the fault arm (V-29)
+
+**Wave 15**
+
+- [ ] 50-19-PLAN.md *(depends on 50-17, 50-18)* — live attempt to Ship: one `checkpoint:human-action` (V-28)
+
+**Wave 16**
+
+- [ ] 50-20-PLAN.md *(depends on 50-19)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
+
+**Cross-cutting constraints:**
+
+- Each migrated suite passes with the same test count it had before migration (50-03, 50-21)
 
 ### Phase 50.1: Split-Lock State-Handling Overhaul (INSERTED)
 
@@ -561,7 +637,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | — | Not started | — |
+| 50 | 0/24 | Planned | — |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
