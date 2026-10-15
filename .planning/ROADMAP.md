@@ -463,7 +463,7 @@ Plans:
 **Goal**: An agent that exhausts its token budget mid-stage does not end the night — the run
 continues under a configured fallback agent, in the same worktree on the same branch, with no manual
 conflict resolution.
-**Depends on**: Phase 50 — a dependency to VERIFY, not to assume.
+**Depends on**: Phase 50.1 (and through it Phase 50) — the Phase 50 (SUPV-01) dependency is one to VERIFY, not to assume.
 **Sequencing note**: `devflow resume --agent` already performs the driver substitution this needs
 (a v2.8.0 delivery that shrank #180), so whether SUPV-01's liveness answer is actually required must
 be re-tested here rather than inherited from the issue's original design.
@@ -960,6 +960,117 @@ branch. Reported: capture scan true, Layer 1 None, Layer 2 Success.
 **Fix shape (from the review, not decided):** consult the capture scan for a Code stage before `decide_action`, so a
 reported checkpoint forces the gate path; or have the stream parser pick its outcome with the same latest-stated-outcome
 rule across result events instead of reading only the last one. First reproduce it with a pipeline test.
+
+### Phase 999.156: A SIGKILL Between the Agent's Spawn and Its Sidecar Write Orphans the Agent (BACKLOG)
+
+**Found:** 2026-10-14, external adversarial review of the Phase 50 plan set (finding 3). The plans close most of it.
+This entry is the residual Phase 50 accepts as T-50-70 (`50-24-PLAN.md`). Operator accepted it on 2026-10-15.
+
+**Gap:** Phase 50's supervisor writes its sidecar (pgid, agent start time, boot id, launch id) right after spawning the
+agent. The launcher ends a never-published agent group through that sidecar. If `__monitor` is SIGKILLed after the
+agent's fork and before the sidecar's rename, nothing records the agent's identity, so nothing can safely signal it.
+The agent leads its own group and keeps running unattended, with no socket, no sidecar, and no state entry pointing at
+it. The window spans `Command::spawn`'s fork-to-exec plus a few syscalls and two small file writes.
+
+**Rejected routes (Phase 50 planning):** a child subreaper (adopted orphans become unreaped zombies that break
+`kill(-pgid, 0)` assertions in parallel tests); an agent self-record in `pre_exec` (async-signal-safe `unsafe` code);
+a parent-death signal (conflicts with D-17, which needs a killed monitor to leave the agent for the STALE backstop).
+
+**Fix shape (not decided, feasibility unverified):** tag the agent's environment with its launch id, so the launcher
+can find the agent by `/proc/<pid>/environ` and verify it without a recorded pid. This is Linux-only.
+**Revisit when:** an agent is ever observed running with no sidecar, socket, or state entry.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.157: A Natural Agent Exit Leaves the Agent's Background Processes Running (BACKLOG)
+
+**Found:** 2026-10-14, Phase 50 research, Open Question 3 (`50-RESEARCH.md`). It was a research idea, not an observed
+defect. Operator chose to file it on 2026-10-15.
+
+**Gap:** Phase 50 SIGKILLs leftover members of the agent's process group only on a stop (D-04; 50-07 `wait_agent`
+on `Stopped`). When the agent exits on its own, any background process it left in its group keeps running.
+
+**Fix shape (from research, not decided):** on a natural exit, `waitid(WNOWAIT)` keeps the zombie leader holding the
+pgid. Signal the leftover members before reaping, as the `Stopped` path already does. First decide whether any agent
+legitimately leaves a process that must outlive it.
+
+**Related:** 999.46, whose orphan populations were test-fixture monitors, not agent leftovers. Nothing so far shows
+this happens in real runs.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.158: Process Identity and Group Enumeration Do Not Work Off Linux (BACKLOG)
+
+**Found:** 2026-10-15, operator request to track Phase 50's non-Linux functional gaps.
+
+**Gap:** every identity and group check reads `/proc`, which macOS and the BSDs do not have:
+- `agent::process_start_time` (`agent.rs:214`) returns `None` off Linux, so `is_same_process` is always false.
+- Phase 50's STALE backstop gathers the group census from `/proc/*/stat` (50-09).
+- So do the not-ready teardown's child snapshot (50-24), the `setpgid` re-read (50-08), and the stray census.
+
+The plans specify Linux mechanisms only. Behaviour off Linux is unspecified and unverified. The expected result is
+fail-closed, so nothing is signalled. That means a STALE run, or an agent from a never-published launch, needs a
+manual `kill`, and `stop` cannot confirm an identity.
+
+**Fix shape (not decided):** a per-OS process-info layer, for example macOS `proc_pidinfo(PROC_PIDTBSDINFO)` for
+start time and pgid and `proc_listpids` for group enumeration. Keep the pure decision functions (50-09's
+`BackstopDecision`) OS-independent and swap only the fact-gathering.
+
+**Depends in practice on:** 999.56 (macOS CI); nothing here can be verified without a macOS runner.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.159: Reboot Detection Does Not Work Off Linux (BACKLOG)
+
+**Found:** 2026-10-15, operator request to track Phase 50's non-Linux functional gaps.
+
+**Gap:** Phase 50 reads the boot id from `/proc/sys/kernel/random/boot_id` (50-05 `read_boot_id`). R-8 relies on it:
+a STALE socket from a previous boot is certainly dead, so its files are removed and nothing is signalled. Off Linux
+there is no boot id, so that shortcut is unavailable. A stale socket left by a reboot then goes through the full
+identity path, which off Linux cannot confirm anything (999.158), so the expected result is that it is left in place
+rather than cleaned up (unverified).
+
+**Fix shape (not decided):** macOS `sysctl kern.bootsessionuuid` (or `kern.boottime`) as the boot id source behind the
+same `boot_id()` function.
+
+**Depends in practice on:** 999.56 (macOS CI).
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.160: Socket Supervision Has Never Run on macOS (BACKLOG)
+
+**Found:** 2026-10-15, operator request to track Phase 50's non-Linux functional gaps.
+
+**Gap:** Phase 50 claims no macOS support. Its docs say "unverified on macOS" (50-CONTEXT Discretion; 50-17). The
+103-byte macOS `sun_path` limit is enforced by a constant, and only that constant is tested (50-05
+`SUN_PATH_MAX_MACOS`). No macOS host or CI has bound a socket, probed GONE/STALE/ALIVE, or stopped a run.
+
+**Done when:** the Phase 50 supervisor test suite runs green on a macOS runner and the "unverified on macOS" caveat is
+removed from OPERATIONS.md.
+
+**Depends in practice on:** 999.56 (macOS CI), 999.158, 999.159.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
