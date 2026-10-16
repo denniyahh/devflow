@@ -23,6 +23,10 @@ change that should be running underneath the rest of the milestone rather than a
 2026-09-03, not to a filing taken on trust. Where `REQUIREMENTS.md` records a **Not established**
 note, the success criteria below deliberately claim no more than the evidence supports.
 
+**Before cutting 3.0.0:** run the check line in `50-LIVE-RUN.md` § "Release handoff (3.0.0)" (written by plan
+50-20) on the release branch before the release PR, and again on `origin/main` after it merges. It fails unless the
+3.0.0 changelog section says socket supervision is unverified on macOS; the same section gives the repair.
+
 | Phase | Name | Requirements | Wave | Status |
 |---|---|---|---|---|
 | 46 | CI Load Shape and Operator Input Validation | INFRA-01, VALID-01, VALID-02 | 1 | Complete    |
