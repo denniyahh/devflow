@@ -163,6 +163,17 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
     runs in the outer shell. An ordering rule ("`bash -c` appears first") accepts this.
   - `bash -c "echo ${PIPESTATUS[0]}"` — refused; double quotes open no single-quoted region and
     the outer shell expands before bash starts. Ordering accepts this too.
+- [ ] **[PATTERN]** **Command rules (2026-10-16).** The same scan splits each command in a block into
+  words, reading inside a `bash -c '...'` region too, and refuses four shapes that shipped false
+  greens or gates that failed correct work: `cargo test` (a filter matching nothing exits 0); a
+  `cargo nextest run` without `--no-tests=fail`, with a positional or `--` filter, more than one
+  `-E`/`--skip`, or a filter other than exactly `test(=path)`; `rg -c`/`--count`/`--count-matches`;
+  and `-p devflow-cli`. A quote that never closes is refused as unparsable. **This makes
+  `cargo-nextest` (§8) a requirement for executing any plan**, though CI does not install it; a
+  missing nextest fails the gate loudly. Two awks are in use: gawk on the host and **mawk 1.3.4** in
+  the pinned devcontainer image, which runs this suite in CI. Keep the awk program to what both
+  accept; on 2026-10-16 the suite ran under gawk and the same inputs were probed under mawk.
+  `CLAUDE.md` § Repo Traps lists the rules for planners and the plan checker.
 - [ ] **[PATTERN]** **Parse BLOCKS, not lines, and treat an unterminated opening tag as an error.**
   A line-based scan cannot see inside a multi-line `<automated>` block, which was the first proven
   bypass; and a parser that matches only *complete* blocks is bypassed by construction — open a
