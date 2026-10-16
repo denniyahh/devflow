@@ -367,11 +367,11 @@ acceptable. There is no version detection, no upgrade verb and no 2.x compatibil
 former criterion 4 (detect and report a 2.x state as incompatible) is retired. This does not change
 the milestone's major-version call.
 
-**Plans**: 0/24 plans complete (16 waves); 50-19 is the single operator checkpoint for the live attempt
+**Plans**: 0/25 plans complete (17 waves); 50-19 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
-- [ ] 50-01-PLAN.md *(no plan dependencies)* — single-test gate helper and staged semver gate (`tools/exact-test.sh`, `tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
+- [ ] 50-01-PLAN.md *(no plan dependencies)* — staged semver gate (`tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
 - [ ] 50-02-PLAN.md *(no plan dependencies)* — 999.141 tracer: shared hermetic test helper, V-26 with its negative control, start_lock/stop e2e migrated
 
 **Wave 2**
@@ -439,7 +439,11 @@ the milestone's major-version call.
 
 **Wave 16**
 
-- [ ] 50-20-PLAN.md *(depends on 50-19)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
+- [ ] 50-25-PLAN.md *(depends on 50-18, 50-19)* — evidence-checker modes for the published record: `--published`, `--live-run`, `--handoff`, `--defects`
+
+**Wave 17**
+
+- [ ] 50-20-PLAN.md *(depends on 50-19, 50-25)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
 
 **Cross-cutting constraints:**
 

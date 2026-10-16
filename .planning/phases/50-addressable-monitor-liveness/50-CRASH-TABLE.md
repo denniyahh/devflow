@@ -29,7 +29,7 @@ OWNERSHIP: the correct outcome cannot be stated without deciding who owns the ru
 | A5 | S never publishes, or exits first | — | L ends the child and its agent group; `MonitorError::NotReady` | V-33 | COVERED |
 | A6 | S: publish onto an existing name | a live socket holds the name | `hard_link` fails `EEXIST`; the live socket is never replaced | V-11 | COVERED |
 | A7 | L: publish wait → record save | **L dies** (SIGKILL; or SIGINT: a terminal Ctrl-C reaches only L, since S has its own group, 50-11) | **Not stated.** S and its agent run on with no record (`start`) or under the previous GONE record (`resume`). `status` reads NotLaunched, or GoneWhileActive with the hint `devflow resume`. The guard, with a loadable state, probes only `state.supervisor` (50-15), so a second `start`/`resume` launches a second supervisor and agent in the same worktree. `doctor` would list the socket (50-12: launch id not the state's) | — | **ACCEPTED, OWNERSHIP**: T-50-90 (50-15), resolved in Phase 50.1 (operator, 2026-10-16) |
-| A8 | L: record save | save fails | L shuts S down through its socket; an unconfirmed shutdown keeps the record and prints `devflow stop --phase N --launch <id>` | V-31, V-38 (written for the handoff save; whether they also exercise the first-launch save is unverified) | STATED |
+| A8 | L: record save | save fails | L shuts S down through its socket; an unconfirmed shutdown keeps the record and prints `devflow stop --phase N --launch <id>` | V-31, V-38: they test `publish_record`, which 50-23 calls from `spawn_agent_and_record` on the first launch too (`launch_stage_inner`); no end-to-end test (plan check R6C-I6) | COVERED |
 | A9 | refused or failed launch | — | `state.supervisor` cleared on the failure path only; the run reads NotLaunched | V-30 | COVERED |
 
 ## B. Agent running (S owner phase `AgentRunning`)
@@ -63,9 +63,9 @@ OWNERSHIP: the correct outcome cannot be stated without deciding who owns the ru
 | C10 | record save | save fails | N+1 shut down; an unconfirmed shutdown keeps the record and prints the `--launch` repair | V-31, V-38 | COVERED |
 | C11 | after the save, before N's unlink | S(N) SIGKILLed | state names the live N+1; N's leftover socket reads STALE with another launch id | 50-13 `a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor`; fault pointer `publish-unlink-window` | COVERED |
 | C12 | after the handed-off marking, before `finish` | signal to S(N) | not forwarded | T-50-74 | ACCEPTED |
-| C13 | after the handed-off marking | socket stop to S(N) | answered `handed_off`; `stop` retries against the state's record (N+1) | 50-06 `request_shutdown` truth; the retry has no named test | STATED |
+| C13 | after the handed-off marking | socket stop to S(N) | answered `handed_off`; `stop` retries against the state's record (N+1) | V-57 (50-14): `commands::tests::stop_retries_a_handed_off_reply_against_the_reloaded_record`; control `commands::tests::stop_gives_up_after_three_handed_off_retries_and_records_nothing` (scripted sockets, not real supervisors) | COVERED |
 | C14 | after the save, N still `Advancing` | `stop --launch <N's id>` | forwarded; stops N+1 | T-50-75 | ACCEPTED |
-| C15 | during the handoff | `resume` by the operator | lock contended → refuse; after release, the guard probes N+1 ALIVE → refuse | 50-15 guard design; V-12 covers start-vs-start only | STATED |
+| C15 | during the handoff | `resume` by the operator | lock contended → refuse; after release, the guard probes N+1 ALIVE → refuse | after release: `resume_refuses_a_phase_whose_recorded_monitor_is_alive` once 50-15 plants a real supervisor (plan check R6C-I6); the contended-lock refusal for `resume` has no named test (V-12 covers start-vs-start) | STATED |
 
 ## D. Cross-cutting
 
@@ -77,8 +77,10 @@ OWNERSHIP: the correct outcome cannot be stated without deciding who owns the ru
 
 ## Result
 
-- 37 rows: 25 COVERED, 3 STATED, 8 ACCEPTED (six in Phase 50's threat tables or backlog, two deferred to 50.1),
+- 37 rows: 27 COVERED, 1 STATED, 8 ACCEPTED (six in Phase 50's threat tables or backlog, two deferred to 50.1),
   1 GAP (D3). A7 and C4 were GAP and are accepted by operator decision (2026-10-16) for Phase 50.1 to resolve.
+  Round-6 plan check (2026-10-16): A8 and C13 moved to COVERED (C13 by a new 50-14 test pair, V-57); C15 stays
+  STATED for its contended-lock half.
 - **Trip-wire: 2 OWNERSHIP rows (A7, C4), one root cause.** In both, a supervisor is live and its record was never
   saved because the process that should save it died. With a loadable state the start/resume guard trusts the record
   alone, so the unrecorded supervisor is invisible to it, and `status` (A7) or `stop` (C4) points the operator at
