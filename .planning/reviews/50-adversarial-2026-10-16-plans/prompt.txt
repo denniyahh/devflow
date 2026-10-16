@@ -1,0 +1,22 @@
+You are an adversarial reviewer. Your working directory is a read-only git-archive snapshot of the DevFlow Rust repo (crates/devflow-core = lib, crates/devflow-cli = package `devflow`, bin `devflow`). Do NOT modify files and do NOT run cargo build/test/nextest (no compiling). Reading files and rg/sed/cat are fine.
+
+TARGET: the Phase 50 plan set in .planning/phases/50-addressable-monitor-liveness/ — 50-01..50-25-PLAN.md, 50-VALIDATION.md, 50-CRASH-TABLE.md, with 50-CONTEXT.md as the locked decisions. Also ROADMAP.md Phase 50 / 50.1 entries.
+
+WHAT JUST CHANGED: every plan's verification gates were rewritten from shell pipelines (cargo test filters, rg -c counts, a tools/exact-test.sh runner) to `cargo nextest run` named tests, Rust source-scan tests, and selftested evidence tools. The full before/after diff is REVIEW-ROUND6-DIFF.patch at the snapshot root. Plan 50-25 is new (split from 50-18). The rewrite was checked only by matching long test identifiers between old and new gates, NOT line by line.
+
+VERIFIED FACTS about the gate syntax (treat as ground truth):
+- lib/bin unit tests must be named by full module path in `-E 'test(=mod::tests::name)'`; a bare name matches nothing and nextest exits 4 with --no-tests=fail.
+- integration tests (crates/*/tests/T.rs, `--test T`) are named by the bare fn name; `T::fn` exits 4.
+- doc_check tests are `doc_check::<name>`.
+- `-E 'test(=a) | test(=b)'` exits 0 if one name is wrong, which is why one test per command is required.
+- `cargo test <filter>` exits 0 when nothing matches; `rg -c` prints nothing (not 0) on zero matches.
+- scripts/lint-plan-bashisms.sh enforces these shapes at commit time.
+
+FIND, with exact file:line and quoted text for each:
+1. DROPPED PROPERTIES: an assertion the OLD gate (diff `-` lines) checked that no NEW gate, test, or acceptance criterion still checks. This is the top priority. Check line by line, not by test name.
+2. GATES THAT FAIL CORRECT WORK: a test path that will not resolve (wrong module path for where the plan says the test lives, integration-vs-unit naming mixup, wrong --test target, wrong package, test created in a later plan than the gate that runs it), literal counts that a correct implementation would not produce, presence/absence checks on strings the plan's own instructions would not produce.
+3. GATES THAT PASS BROKEN WORK: negative controls that cannot fail, source-scan tests whose planted control does not exercise the real scan, evidence-tool verdicts that a broken run would still pass.
+4. CROSS-DOCUMENT CONTRADICTIONS: VALIDATION rows naming tests no plan creates, crash-table rows marked COVERED whose cited test does not test that row, depends_on/wave ordering where a plan uses something a not-yet-run plan creates.
+5. Anything else that would break during execution.
+
+Be specific and hostile. Prefer 8 sharp, reproducible findings with file:line to 30 vague ones. Label speculation as speculation. Output exactly two sections: `## CONFIRMED` (you verified against the files) and `## SUSPECTED`. End with `## COVERAGE` listing which plan files you actually read.

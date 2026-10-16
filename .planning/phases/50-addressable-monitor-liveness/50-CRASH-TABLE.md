@@ -44,7 +44,7 @@ OWNERSHIP: the correct outcome cannot be stated without deciding who owns the ru
 | B6 | STALE, off Linux | — | identity unprovable: refuse, print the manual repair | T-50-88; backlog 999.158 | ACCEPTED |
 | B7 | agent exits | a stop at the same moment | ordered by the owner mutex; never advances | V-14 | COVERED |
 | B8 | stop | a group member ignores SIGTERM | SIGKILLed after the leader exits | `supervisor::runtime::tests::a_term_ignoring_group_member_is_killed_after_the_leader_exits` (50-07) | COVERED |
-| B9 | running | state file corrupt; `stop` | stop finds the socket by sidecar, ends the run, exits 0, says `stopped` was not recorded | V-39 (50-14 D-09 tests) | COVERED |
+| B9 | running | state file corrupt; `stop` | stop finds the socket by sidecar, ends the run, exits 0, says `stopped` was not recorded | 50-14's `stop_ends_a_live_run_whose_state_will_not_load` (`stop_e2e`, gated in 50-14 Task 1; V-39 is the `--launch` variant) | COVERED |
 | B10 | running | state and sidecar both corrupt; `start` | the guard attributes the socket by its file name and refuses | V-36, V-37 | COVERED |
 
 ## C. Advance in S(N) (holds the per-phase lock)
