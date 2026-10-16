@@ -52,6 +52,26 @@
 # An opening tag with no closing tag is reported as a malformed block rather
 # than ignored: leaving it unhandled would be a bypass by construction.
 #
+# ---------------------------------------------------------------------------
+# COMMAND RULES. Each command in a block is split into words (quotes removed,
+# stopping at a separator or at the end of its bash -c region) and refused when
+# it has a shape that has shipped a false green or a gate that fails correct
+# work on this repository:
+#
+#   - `cargo test`: a name filter that matches nothing still exits 0. Gates run
+#     one named test as `cargo nextest run -p PKG --lib --no-tests=fail
+#     -E 'test(=module::path::name)'`, or a suite with `--test NAME`.
+#   - `cargo nextest run` without `--no-tests=fail`, with a positional or `--`
+#     filter, with more than one `-E`/`--skip`, or with a filter that is not
+#     exactly `test(=...)`: `-E 'test(=real) | test(=wrong)'` runs one test and
+#     exits 0. One test per command, chained with `&&`.
+#   - `rg -c` / `--count` / `--count-matches`: zero matches print nothing, not
+#     0, and exit 1. Count source structure in a Rust source-scan test instead.
+#   - `-p devflow-cli`: no such package; the CLI package is `devflow`.
+#
+# A command whose quote does not close before it ends is refused as
+# unparsable, for the same fail-closed reason as above.
+#
 # The regression cases live in crates/devflow-cli/tests/plan_bashism_scanner.rs,
 # which EXECUTES this script rather than reading it.
 # ---------------------------------------------------------------------------
@@ -237,22 +257,203 @@ function check_block(body, base,   rest, off, o, txt) {
         rest = substr(rest, RSTART + RLENGTH)
     }
 
-    # Trap: cargo test -p devflow --lib (devflow has no lib target)
-    if (match(body, /cargo test[^\n]*(-p[ \t]+devflow[ \t]+--lib|--lib[ \t]+-p[ \t]+devflow)/)) {
-        printf "%s:%d: cargo test -p devflow --lib verifies nothing (devflow is binary-only; use -p devflow --bin devflow)\n", fname, line_of(base + RSTART - 1)
-        violations++
-    }
+    scan_commands(body, base)
+}
 
-    # Trap: rg -c piped to rg ^0$ (no apostrophes: this comment is inside the single-quoted awk program)
-    if (match(body, /rg[ \t]+-[a-zA-Z0-9]*c[^\n|]*\|[ \t]*rg[ \t]+[\047\042]?\^0\$/)) {
-        printf "%s:%d: rg -c ... | rg %s^0$%s trap (rg -c prints nothing on zero matches and exits 1)\n", fname, line_of(base + RSTART - 1), SQ, SQ
-        violations++
-    }
+# ---- Command rules (no apostrophes anywhere below: this is inside the
+# single-quoted awk program). Each rule names a gate shape that passes on
+# broken work or fails on correct work.
 
-    # Trap: cargo test --exact with bare identifier (must be module-qualified)
-    if (match(body, /cargo test[^\n]*--exact[ \t]+[\047\042]?[A-Za-z0-9_][A-Za-z0-9_-]*[\047\042]?([ \t\n]|$)/)) {
-        printf "%s:%d: cargo test --exact bare-name trap (bare name matches nothing; use module-qualified path e.g. tests::name)\n", fname, line_of(base + RSTART - 1)
-        violations++
+function report(base, o, msg) {
+    printf "%s:%d: %s\n", fname, line_of(base + o - 1), msg
+    violations++
+}
+
+# End of the bash -c region holding offset o, or 0 when o is in none.
+function region_end(o,   n) {
+    for (n = 1; n <= nregions; n++) {
+        if (o >= rstart[n] && o <= rend[n]) return rend[n]
+    }
+    return 0
+}
+
+function is_word_start(body, o,   c) {
+    if (o == 1) return 1
+    c = substr(body, o - 1, 1)
+    return index(" \t\n(|;&!`" SQ DQ, c) > 0
+}
+
+# Split the command starting at offset o into tok[1..ntok], quotes removed. It
+# stops at an unquoted separator or redirect, or at the end of the bash -c
+# region holding o. Returns -1 when a quote does not close inside that span.
+function tokenize(body, o,   limit, c, cur, have, inq) {
+    limit = region_end(o)
+    if (limit == 0) limit = length(body)
+    delete tok
+    ntok = 0
+    cur = ""
+    have = 0
+    inq = ""
+    for (; o <= limit; o++) {
+        c = substr(body, o, 1)
+        if (inq != "") {
+            # Inside double quotes a backslash escapes a quote, a backslash, a
+            # dollar sign or a backtick, as the shell reads it.
+            if (inq == DQ && c == "\\" && index(DQ "\\$`", substr(body, o + 1, 1)) > 0) {
+                o++
+                cur = cur substr(body, o, 1)
+            } else if (c == inq) {
+                inq = ""
+            } else {
+                cur = cur c
+            }
+            continue
+        }
+        if (c == "\\" && o < limit && substr(body, o + 1, 1) != "\n") {
+            o++
+            cur = cur substr(body, o, 1)
+            have = 1
+            continue
+        }
+        if (c == SQ || c == DQ) {
+            inq = c
+            have = 1
+            continue
+        }
+        if (c == "\\" && substr(body, o + 1, 1) == "\n") {
+            o++
+            c = " "
+        }
+        if (c == " " || c == "\t") {
+            if (have) tok[++ntok] = cur
+            cur = ""
+            have = 0
+            continue
+        }
+        if (index("\n;&|<>)`", c) > 0) {
+            # The 2 of 2>&1 is a file descriptor, not an argument.
+            if ((c == ">" || c == "<") && cur ~ /^[0-9]+$/) have = 0
+            break
+        }
+        cur = cur c
+        have = 1
+    }
+    if (inq != "") return -1
+    if (have) tok[++ntok] = cur
+    return ntok
+}
+
+function scan_commands(body, base,   rest, off, o) {
+    off = 0
+    rest = body
+    while (match(rest, /(rg|cargo)[ \t]/)) {
+        o = off + RSTART
+        if (is_word_start(body, o)) {
+            if (substr(body, o, 2) == "rg") check_rg(body, base, o)
+            else check_cargo(body, base, o)
+        }
+        off = o
+        rest = substr(body, o + 1)
+    }
+}
+
+# rg -c and --count print nothing (not 0) on zero matches and exit 1, so a
+# count compared in shell misreads the zero case.
+function check_rg(body, base, o,   n, i, j, t, ch, hit) {
+    n = tokenize(body, o)
+    if (n < 0) {
+        report(base, o, "cannot parse this rg command (a quote does not close before the command ends)")
+        return
+    }
+    for (i = 2; i <= n && hit == ""; i++) {
+        t = tok[i]
+        if (t == "--") break
+        if (t ~ /^--count(-matches)?(=|$)/) {
+            hit = t
+        } else if (t ~ /^--/) {
+            if (t !~ /=/ && (substr(t, 3) in RG_LONGVAL)) i++
+        } else if (t ~ /^-./) {
+            for (j = 2; j <= length(t); j++) {
+                ch = substr(t, j, 1)
+                if (ch == "c") {
+                    hit = t
+                    break
+                }
+                if (index(RG_SHORTVAL, ch) > 0) {
+                    if (j == length(t)) i++
+                    break
+                }
+            }
+        }
+    }
+    if (hit != "") {
+        report(base, o, "rg count flag " hit " in a verify gate (rg prints nothing, not 0, on zero matches; count source structure in a Rust source-scan test, or use rg -q)")
+    }
+}
+
+function check_cargo(body, base, o,   n, k, i) {
+    n = tokenize(body, o)
+    if (n < 0) {
+        report(base, o, "cannot parse this cargo command (a quote does not close before the command ends)")
+        return
+    }
+    for (i = 2; i <= n; i++) {
+        if (tok[i] == "--") break
+        if (((tok[i] == "-p" || tok[i] == "--package") && tok[i + 1] == "devflow-cli") || tok[i] == "--package=devflow-cli") {
+            report(base, o, "-p devflow-cli names no package (the CLI package is devflow)")
+        }
+    }
+    k = 2
+    if (tok[k] ~ /^\+/) k++
+    if (tok[k] == "test") {
+        report(base, o, "cargo test in a verify gate (a name filter that matches nothing still exits 0; run one named test as cargo nextest run -p PKG --lib --no-tests=fail -E " SQ "test(=module::path::name)" SQ ", a suite as cargo nextest run -p PKG --test NAME --no-tests=fail)")
+    } else if (tok[k] == "nextest" && tok[k + 1] == "run") {
+        check_nextest(base, o, k + 2, n)
+    }
+}
+
+# One nextest command proves one named test: --no-tests=fail makes a name that
+# matches nothing exit 4, and a filter combining two names passes when only one
+# of them exists.
+function check_nextest(base, o, i, n,   t, nofail, nfilt, npos, val) {
+    for (; i <= n; i++) {
+        t = tok[i]
+        if (t == "--") {
+            npos += n - i
+            break
+        }
+        if (t == "--no-tests=fail") {
+            nofail = 1
+        } else if (t == "--no-tests") {
+            if (tok[i + 1] == "fail") nofail = 1
+            i++
+        } else if (t == "-E" || t == "--filterset" || t == "--skip") {
+            nfilt++
+            val = tok[++i]
+        } else if (t ~ /^(--filterset|--skip)=/) {
+            nfilt++
+            val = substr(t, index(t, "=") + 1)
+        } else if (t ~ /^-E./) {
+            nfilt++
+            val = substr(t, 3)
+        } else if (t ~ /^--/) {
+            if (t !~ /=/ && (substr(t, 3) in NX_LONGVAL)) i++
+        } else if (t ~ /^-./) {
+            if (length(t) == 2 && index(NX_SHORTVAL, substr(t, 2, 1)) > 0) i++
+        } else {
+            npos++
+        }
+    }
+    if (!nofail) {
+        report(base, o, "cargo nextest run without --no-tests=fail (a filter that matches nothing then passes)")
+    }
+    if (npos > 0) {
+        report(base, o, "cargo nextest run with a positional test filter (a substring match; use -E " SQ "test(=module::path::name)" SQ ")")
+    }
+    if (nfilt > 1) {
+        report(base, o, "cargo nextest run with " nfilt " test filters (a wrong name is skipped silently; run one test per command and chain them with &&)")
+    } else if (nfilt == 1 && val !~ /^test\(=[A-Za-z0-9_:]+\)$/) {
+        report(base, o, "cargo nextest run filter is not exactly test(=module::path::name): " val " (one test per command, chained with &&)")
     }
 }
 
@@ -262,6 +463,13 @@ BEGIN {
     OPEN = "<" "automated" ">"
     CLOSE = "<" "/automated" ">"
     violations = 0
+    # Flags that take a separate value, so the next token is not a filter.
+    RG_SHORTVAL = "efgtTmABCrMjEd"
+    split("regexp file glob iglob type type-not type-add type-clear max-count after-context before-context context replace max-columns threads encoding max-depth sort sortr color colors pre pre-glob path-separator context-separator field-match-separator field-context-separator dfa-size-limit regex-size-limit max-filesize ignore-file engine hostname-bin hyperlink-format", rgv, " ")
+    for (n in rgv) RG_LONGVAL[rgv[n]] = 1
+    NX_SHORTVAL = "pFZRjP"
+    split("color package exclude bin example test bench features build-jobs cargo-profile target target-dir manifest-path cargo-message-format config rerun run-ignored partition platform-filter test-threads retries flaky-result max-fail debugger tracer stress-count stress-duration failure-output success-output status-level final-status-level show-progress max-progress-running message-format message-format-version archive-file archive-format extract-to cargo-metadata workspace-remap binaries-metadata target-dir-remap build-dir-remap config-file user-config-file tool-config-file profile", nxv, " ")
+    for (n in nxv) NX_LONGVAL[nxv[n]] = 1
 }
 
 { buf = buf $0 "\n" }
@@ -295,11 +503,14 @@ done
 echo "$SELF: scanned $count file(s)"
 
 if [ "$status" -ne 0 ]; then
-    echo "$SELF: refusing a plan whose <automated> verify command uses bash-only" >&2
-    echo "  syntax that expands to NOTHING under the executor's zsh shell:" >&2
+    echo "$SELF: refusing a plan whose <automated> verify command has a shape" >&2
+    echo "  that passes on broken work or fails on correct work:" >&2
     printf '%s' "$hits" | cut -c1-200 | sed 's/^/    /' >&2
-    echo "  These assertions would pass without ever reading the value they claim" >&2
-    echo "  to check. Wrap the command so it runs under bash, e.g.:" >&2
+    echo "  A cargo, nextest or rg line above names its own fix. A bash-only" >&2
+    echo "  expansion (\${...} or declare -A) expands to NOTHING under the" >&2
+    echo "  executor's zsh shell, so an assertion on it would pass without ever" >&2
+    echo "  reading the value it claims to check. Wrap the command so it runs" >&2
+    echo "  under bash, e.g.:" >&2
     echo "      <automated>bash -c 'cargo test ... ; echo \"exit=\${PIPESTATUS[0]}\"'</automated>" >&2
     echo "  The bashism must sit INSIDE the single quotes that follow bash -c;" >&2
     echo "  a trailing '# bash -c' comment, a closed 'bash -c \":\";' prefix, or a" >&2
