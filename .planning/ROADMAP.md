@@ -1086,6 +1086,27 @@ removed from OPERATIONS.md.
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.161: Move Plan-Check Shell Tools to a Rust Tool Crate (BACKLOG)
+
+**Found:** 2026-10-16, operator decision while revising Phase 50's checks: keep its tools in shell for Phase 50, then
+backlog the move. About 12 of the ~18 plan-gate defects found across six Phase 50 checker and review rounds were in
+bespoke shell; five were in the evidence checker's logic (which data to judge, which Rust alone would not prevent).
+
+**Scope:** Phase 50's `tools/semver-gate.sh`, `tools/check-supervisor-evidence.sh` and `tools/fault-arm.sh`, and
+`scripts/lint-plan-bashisms.sh` (awk; must run under both gawk and the CI image's mawk 1.3.4), as an unpublished
+workspace member run by `cargo xtask <command>`. Phase 49's `tools/negctl.sh`, `check-evidence.sh` and
+`collect-attempt.sh` are candidates to decide at discuss time. Costs to weigh: a new workspace member CI builds, and a
+cold build on the first commit-hook run.
+
+**Done when:** each moved tool's two-direction selftest is a Rust test that passes, plus a negative control that fails
+on a planted wrong input; the shell versions are deleted, with their callers updated in the same change.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
