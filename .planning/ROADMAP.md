@@ -456,6 +456,16 @@ a short OS lock (`flock`) around every state write; an `update_state(root, phase
 gate-waiter registration (which closes the stale-gate-answer hazard, AR-48-04 and the T-48-12-05
 caveat); fsync of the file and its directory. See the 999.130 entry for evidence and constraints.
 **Requirements**: TBD (none assigned yet; set at discuss/plan)
+**Success Criteria** (what must be TRUE):
+
+  1. A supervisor that is live but whose record was never saved is never joined by a second one:
+     `devflow start` and `devflow resume` refuse over it even when the state file loads. Each case
+     from Phase 50's crash table has its own fixture: the launcher dies during its publish wait
+     (`50-CRASH-TABLE.md` row A7, T-50-90), and stage N's supervisor dies after spawning N+1 and
+     before saving N+1's record (row C4, T-50-91). Negative control: with no such supervisor, the
+     launch proceeds.
+  2. In both cases, neither `status` nor `stop` suggests `devflow resume` while that supervisor is
+     live; each names the repair that addresses it.
 **Depends on:** Phase 50
 **Plans:** 0 plans
 

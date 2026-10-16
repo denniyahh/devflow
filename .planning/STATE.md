@@ -7,10 +7,10 @@ current_phase_name: Addressable Monitor Liveness
 current_plan: Not started
 status: executing
 stopped_at: Phase 50 planned (24 plans, 16 waves)
-last_updated: "2026-10-15T15:31:50.558Z"
+last_updated: "2026-10-16T16:04:17.085Z"
 last_activity: 2026-10-09
 last_activity_desc: Phase 49.1 removed; CR-01 fix moves to a fix branch, Phase 50 next
-state_head: 27f6523bc1a1c04ed3ed7ead9d4edd6e4a844478
+state_head: 2f1a46191ba359c4c9c954c2f5b5e4330a3df159
 progress:
   total_phases: 7
   completed_phases: 4
@@ -990,3 +990,4 @@ None pending in `.planning/todos/pending/` (the two phase-48 merge-back todos cl
 - Phase 49.1 inserted after Phase 49: Declared checkpoint detection: replace e3f9ddd's prose heuristic (agent_result.rs marker_reports_human_gate auto-resumes any Failed reason containing blocking-human plus gate/checkpoint/halted) with an explicit checkpoint field in the DEVFLOW_RESULT marker; fixes 49-REVIEW.md CR-01; decide whether a new live attempt is needed, since Phase 49's VERIFY-01 evidence ran the heuristic binary (084625c) (URGENT)
 - Phase 50.1 inserted after Phase 50: Split-Lock State-Handling Overhaul, promoted from backlog 999.130 (50-CONTEXT D-11)
 - Phase 51 edited: edited fields: depends_on (Phase 50 -> Phase 50.1)
+- Phase 50.1 edited: edited fields: success_criteria
