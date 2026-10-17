@@ -320,6 +320,12 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   explicitly (never a floating tag), persists cargo registry + `target/` as named Docker volumes.
 - [ ] **[PROJECT]** `rust-toolchain.toml` — pins an **exact** rustc version (`1.97.1`), not a
   floating `channel = "stable"`, for the same drift-prevention reason as the image pin.
+- [ ] **[PROJECT]** the `aarch64-apple-darwin` rustup target — needed by the macOS compile gate
+  (`cargo check --target aarch64-apple-darwin` for `devflow-core` and `devflow` with `--all-targets`,
+  Phase 50 MAC-1). Install it with `rustup target add aarch64-apple-darwin`; it is per toolchain, so
+  add it again after a `rust-toolchain.toml` bump. Without it the gate fails with
+  `error[E0463]: can't find crate for core`. The gate compiles only: it never links or runs anything
+  for macOS.
 - [ ] **[PATTERN]** `scripts/check.sh` (runs fmt/clippy/tests) and
   `scripts/check-in-container.sh` (the same, but launched inside the pinned image) — the single
   source of truth CI, the pre-push hook, and a developer's manual check all call into.
