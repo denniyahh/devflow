@@ -3206,6 +3206,14 @@ fn doctor_checks() -> Vec<Check> {
 
 /// Audit the environment and report what's installed, missing, or broken.
 pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
+    doctor_in(project_root, json, registry::cache_dir().as_deref())
+}
+
+/// [`doctor`] against an explicit cache dir, whose `sock/` directory the
+/// read-only supervisor sweep lists (50-12); `None` (no cache dir can be
+/// resolved) skips the sweep without an error. Split out so tests sweep a
+/// tempdir, never the operator's real cache.
+fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Result<(), CliError> {
     let checks = doctor_checks();
 
     let facts = collect_phase_facts(project_root);
@@ -3215,6 +3223,12 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     // scan, which never signals anything (T-25-62, doctor's read-only
     // contract).
     let stray_findings = collect_stray_process_findings(project_root);
+    // 50-12 (D-06): the read-only socket sweep — orphaned, superseded and
+    // deleted-root supervisors. It removes nothing and signals nothing.
+    let orphans = cache_dir
+        .map(|cache| collect_orphan_supervisors(project_root, cache))
+        .unwrap_or_default();
+    let sweep_unlistable = cache_dir.and_then(socket_dir_unlistable);
 
     if json {
         // WR-01 (18-fix): a single top-level JSON document —
@@ -3228,7 +3242,13 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         // planning-doc check (D-05) and this plan's stray-process finding
         // (999.44) each extend this SAME object with one more key rather
         // than forking a second array.
-        let body = doctor_json_body(&checks, &facts, &doc_findings, &stray_findings);
+        let body = doctor_json_body(
+            &checks,
+            &facts,
+            &doc_findings,
+            &stray_findings,
+            (&orphans, sweep_unlistable.as_deref()),
+        );
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -3254,6 +3274,10 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         print!("{}", render_reconciliation_text(&facts));
         print!("{}", render_planning_doc_text(&doc_findings));
         print!("{}", render_stray_process_text(&stray_findings));
+        print!(
+            "{}",
+            render_orphan_supervisors_text(&orphans, sweep_unlistable.as_deref())
+        );
     }
 
     Ok(())
@@ -4220,17 +4244,24 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// [...], "planning_doc_staleness": [...]}` — 21b's addition (D-05) extends
 /// this SAME object with a third key rather than forking a second reporter
 /// or printing a second top-level array.
+/// 50-12 adds `"orphan_supervisors"` (the socket sweep's findings) and
+/// `"orphan_supervisor_sweep_error"` (`null`, or why the socket directory
+/// could not be listed, so an empty array is never mistaken for a clean
+/// sweep).
 fn doctor_json_body(
     checks: &[Check],
     facts: &[PhaseFacts],
     doc_findings: &[PlanningDocFinding],
     stray_findings: &[StrayProcessFinding],
+    (orphans, sweep_unlistable): (&[OrphanSupervisorFinding], Option<&str>),
 ) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
         "reconciliation": render_reconciliation_json(facts),
         "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
         "stray_processes": render_stray_process_findings_json(stray_findings),
+        "orphan_supervisors": render_orphan_supervisors_json(orphans),
+        "orphan_supervisor_sweep_error": sweep_unlistable,
     })
 }
 
@@ -4636,6 +4667,13 @@ pub(crate) fn build_stray_process_findings(
 /// into the reachable set via [`unreachable_stray_candidates`] so a project
 /// the machine registry has not recorded still has its own live monitors
 /// protected from being reported as orphans.
+///
+/// The census matches only the two 2.x process shapes (the `sh -c` monitor
+/// wrapper and its `devflow advance` child), which a 3.x binary never
+/// starts, so this finding covers 2.x leftovers only (50-12). A 3.x
+/// supervisor is found through its socket by [`check_supervisor`] and
+/// [`collect_orphan_supervisors`] (which also takes over the deleted-root
+/// class) and ended with `devflow stop --phase N --launch <id>`.
 fn collect_stray_process_findings(project_root: &Path) -> Vec<StrayProcessFinding> {
     build_stray_process_findings(&unreachable_stray_candidates(&[project_root.to_path_buf()]))
 }
@@ -4690,17 +4728,234 @@ pub(crate) struct OrphanSupervisorFinding {
     pub(crate) launch_id: String,
     /// `alive` or `stale`.
     pub(crate) liveness: &'static str,
-    /// Whether the project root the socket names still exists.
+    /// Whether the project root the socket names still exists. `true` for a
+    /// sidecar-less socket, which is attributed to this (existing) root.
     pub(crate) root_exists: bool,
 }
 
-/// RED stub (50-12 Task 3): reports nothing.
-#[allow(dead_code)]
+/// Every ALIVE or STALE supervisor socket under `cache_dir` that nothing
+/// claims (50-12, D-06): (1) this root's sockets whose phase has no loadable
+/// state, or whose state records no supervisor or another launch
+/// (superseded); (2) machine-wide, sockets whose sidecar names a project
+/// root that no longer exists (the 999.44 deleted-root class the 2.x `/proc`
+/// census used to cover); (3) (R5-I3) sockets of this root whose sidecar is
+/// missing or does not parse, attributed by file name through
+/// [`supervisor::sweep_for_in`] so 50-06's digest rule stays in one place.
+///
+/// Not listed, by design: a socket named outside the 50-05 scheme (it
+/// carries no launch id, so no verb addresses it), and a sidecar-less socket
+/// of a deleted root (only the digest survives, so nothing attributes it).
+///
+/// Read-only (D-06, T-50-31): it sweeps, probes and loads state, and removes
+/// nothing and signals nothing. Every finding's repair is `devflow stop
+/// --phase N --launch <id>` (50-14), never the bare stop, which addresses
+/// the state's own record and would stop a live successor (T-50-51).
 fn collect_orphan_supervisors(
-    _project_root: &Path,
-    _cache_dir: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
 ) -> Vec<OrphanSupervisorFinding> {
-    Vec::new()
+    let mut findings = Vec::new();
+    for entry in supervisor::sweep_in(cache_dir) {
+        let liveness = match &entry.liveness {
+            Ok(supervisor::Liveness::Alive(_)) => "alive",
+            Ok(supervisor::Liveness::Stale) => "stale",
+            _ => continue,
+        };
+        if let Some(sidecar) = &entry.sidecar {
+            // A root that cannot be examined counts as present: only a
+            // proven-missing root is the deleted-root class.
+            let root_exists = sidecar.project_root.try_exists().unwrap_or(true);
+            let reason = if !root_exists {
+                Some(OrphanReason::RootDeleted)
+            } else if sidecar.project_root == project_root {
+                unclaimed_by_state(project_root, sidecar.phase, &sidecar.launch_id)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let launch = (sidecar.phase, sidecar.launch_id.as_str());
+                findings.push(orphan_finding(launch, liveness, root_exists, &reason));
+            }
+            continue;
+        }
+        // R5-I3: no usable sidecar, so the file name is the only address.
+        let (Some(launch_id), Some(phase)) = (
+            entry.launch_id_in_name.as_deref(),
+            phase_in_socket_name(&entry.socket_path),
+        ) else {
+            continue;
+        };
+        let ours = supervisor::sweep_for_in(cache_dir, project_root, phase)
+            .iter()
+            .any(|candidate| candidate.socket_path == entry.socket_path);
+        let Some(unclaimed) = ours
+            .then(|| unclaimed_by_state(project_root, phase, launch_id))
+            .flatten()
+        else {
+            continue;
+        };
+        let reason = OrphanReason::NoUsableSidecar {
+            broken: entry.sidecar_error.is_some(),
+            unclaimed: Box::new(unclaimed),
+        };
+        findings.push(orphan_finding((phase, launch_id), liveness, true, &reason));
+    }
+    findings
+}
+
+/// Why [`collect_orphan_supervisors`] lists a socket.
+enum OrphanReason {
+    /// This root's phase has no state file.
+    NoState,
+    /// This root's phase has a state file that does not load.
+    StateUnloadable,
+    /// The phase's state records no supervisor.
+    NoRecord,
+    /// The phase's state records another launch (the R-10 aftermath).
+    Superseded,
+    /// The sidecar names a project root that no longer exists.
+    RootDeleted,
+    /// The sidecar is missing (`broken: false`) or does not parse, and the
+    /// state does not claim the launch for `unclaimed`'s reason.
+    NoUsableSidecar {
+        broken: bool,
+        unclaimed: Box<OrphanReason>,
+    },
+}
+
+impl OrphanReason {
+    /// Path-free text for the finding's detail (T-18-01).
+    fn describe(&self) -> String {
+        match self {
+            OrphanReason::NoState => "its phase has no state".to_string(),
+            OrphanReason::StateUnloadable => "its phase's state does not load".to_string(),
+            OrphanReason::NoRecord => "its phase's state records no supervisor".to_string(),
+            OrphanReason::Superseded => {
+                "its phase's state records another launch (superseded)".to_string()
+            }
+            OrphanReason::RootDeleted => "its project root no longer exists".to_string(),
+            OrphanReason::NoUsableSidecar { broken, unclaimed } => format!(
+                "its sidecar {}, and {}",
+                if *broken {
+                    "does not parse"
+                } else {
+                    "is missing"
+                },
+                unclaimed.describe()
+            ),
+        }
+    }
+}
+
+/// Whether this root's state for `phase` claims `launch_id`; the reason
+/// when it does not. Reads the state file only.
+fn unclaimed_by_state(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+) -> Option<OrphanReason> {
+    match workflow::load_state(project_root, phase) {
+        Err(workflow::WorkflowError::MissingState(_)) => Some(OrphanReason::NoState),
+        Err(_) => Some(OrphanReason::StateUnloadable),
+        Ok(state) => match state.supervisor {
+            None => Some(OrphanReason::NoRecord),
+            Some(record) if record.launch_id != launch_id => Some(OrphanReason::Superseded),
+            Some(_) => None,
+        },
+    }
+}
+
+/// The phase segment of a socket file name in the 50-05 scheme
+/// (`<016x digest>-<padded phase>-<launch id>.sock`): the text between the
+/// first and second `-`. `None` when it does not parse as a phase.
+fn phase_in_socket_name(socket: &Path) -> Option<PhaseId> {
+    let stem = socket.file_stem()?.to_str()?;
+    stem.split('-').nth(1)?.parse().ok()
+}
+
+/// One orphan finding for `(phase, launch_id)`, path-free, with the
+/// `--launch` repair that tears down exactly that socket.
+fn orphan_finding(
+    (phase, launch_id): (PhaseId, &str),
+    liveness: &'static str,
+    root_exists: bool,
+    reason: &OrphanReason,
+) -> OrphanSupervisorFinding {
+    OrphanSupervisorFinding {
+        finding: PhaseFinding {
+            phase,
+            severity: Severity::Problem,
+            detail: format!(
+                "phase {phase}: supervisor launch {launch_id} is {} but {}",
+                liveness.to_uppercase(),
+                reason.describe()
+            ),
+            repair: Some(format!("devflow stop --phase {phase} --launch {launch_id}")),
+        },
+        launch_id: launch_id.to_string(),
+        liveness,
+        root_exists,
+    }
+}
+
+/// Whether doctor's socket sweep could look (50-12): `None` when the socket
+/// directory is absent or listable, else why it cannot be listed.
+/// [`supervisor::sweep_in`] answers an unlistable directory with no entries,
+/// so without this check doctor would report "nothing" when it saw nothing.
+fn socket_dir_unlistable(cache_dir: &Path) -> Option<String> {
+    match std::fs::read_dir(registry::socket_dir_in(cache_dir)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Some(error.kind().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Build `doctor --json`'s `"orphan_supervisors"` array (50-12).
+fn render_orphan_supervisors_json(findings: &[OrphanSupervisorFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|orphan| {
+                serde_json::json!({
+                    "phase": orphan.finding.phase,
+                    "launch_id": orphan.launch_id,
+                    "liveness": orphan.liveness,
+                    "root_exists": orphan.root_exists,
+                    "severity": orphan.finding.severity.label(),
+                    "detail": orphan.finding.detail,
+                    "repair": orphan.finding.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor`'s text section for the socket sweep (50-12). Like
+/// [`render_stray_process_text`] it prints nothing when there is nothing to
+/// report, but a socket directory it could not list is reported, never
+/// shown as "nothing".
+fn render_orphan_supervisors_text(
+    findings: &[OrphanSupervisorFinding],
+    unlistable: Option<&str>,
+) -> String {
+    if findings.is_empty() && unlistable.is_none() {
+        return String::new();
+    }
+    let mut out = String::from("\nsupervisor sockets no state claims:\n");
+    if let Some(why) = unlistable {
+        out.push_str(&format!(
+            "  warn: the socket directory could not be listed ({why}); its sockets are not \
+             reported\n"
+        ));
+    }
+    for orphan in findings {
+        out.push_str(&format!("  {}\n", orphan.finding.detail));
+        if let Some(repair) = &orphan.finding.repair {
+            out.push_str(&format!("    repair: {repair}\n"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -5652,7 +5907,7 @@ mod tests {
             "boot".to_string(),
         );
         for stopped in [false, true] {
-            let rows = vec![
+            let rows = [
                 phase_liveness(None, None, stopped),
                 phase_liveness(Some(&record), Some(Ok(Probe::Gone)), stopped),
                 phase_liveness(Some(&record), Some(Ok(Probe::Stale)), stopped),
@@ -7679,6 +7934,34 @@ mod tests {
             );
         }
 
+        /// 50-12: `supervisor::sweep_in` answers a socket directory it
+        /// cannot list with no entries, so doctor checks that case itself and
+        /// reports it rather than printing nothing. Controls: an absent and a
+        /// listable directory report nothing.
+        #[test]
+        fn doctor_reports_an_unlistable_socket_dir_instead_of_nothing() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let cache = tempfile::tempdir().unwrap();
+            assert_eq!(socket_dir_unlistable(cache.path()), None, "absent");
+            assert_eq!(render_orphan_supervisors_text(&[], None), "");
+            let sock = registry::socket_dir_in(cache.path());
+            std::fs::create_dir_all(&sock).unwrap();
+            assert_eq!(socket_dir_unlistable(cache.path()), None, "listable");
+
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unlistable = socket_dir_unlistable(cache.path());
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let why = unlistable.expect("a directory without read permission is unlistable");
+            assert!(!why.contains('/'), "path-free: {why}");
+            let text = render_orphan_supervisors_text(&[], Some(&why));
+            assert!(
+                text.contains("could not be listed") && text.contains(&why),
+                "{text}"
+            );
+            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)));
+            assert_eq!(body["orphan_supervisor_sweep_error"], why.as_str());
+        }
+
         /// The comment-stripped body of `fn collect_orphan_supervisors(` in
         /// `source` (cut at its first `mod tests {` line), from that line to
         /// the next line that is exactly `}`; `None` when absent.
@@ -8205,7 +8488,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts, &[], &[]);
+            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None));
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -8228,10 +8511,14 @@ mod tests {
                 "999.44: must carry the stray-process findings under a FOURTH key, \
                  never a second concatenated array: {reparsed}"
             );
+            assert!(
+                reparsed.get("orphan_supervisors").is_some(),
+                "50-12: must carry the socket sweep's findings under their own key: {reparsed}"
+            );
             assert_eq!(
                 reparsed.as_object().unwrap().len(),
-                4,
-                "doctor --json must have exactly four top-level keys: {reparsed}"
+                6,
+                "doctor --json must have exactly six top-level keys: {reparsed}"
             );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
@@ -8279,8 +8566,18 @@ mod tests {
                 .lines()
                 .count();
 
-            doctor(root, false).unwrap();
-            doctor(root, false).unwrap();
+            // 50-12: a hermetic cache whose STALE socket no state claims, so
+            // the run also exercises the socket sweep, which must leave it.
+            let cache = short_cache();
+            let (orphan, _) = publish_launch(cache.path(), root, 91, "aaaa0000aaaa0091");
+            write_sidecar_for(&orphan, root, 91, "aaaa0000aaaa0091");
+
+            doctor_in(root, false, Some(cache.path())).unwrap();
+            doctor_in(root, false, Some(cache.path())).unwrap();
+            assert!(
+                orphan.as_path().exists() && orphan.sidecar_path().exists(),
+                "doctor must not remove a socket or sidecar it reports"
+            );
 
             let after_len = std::fs::metadata(&state_path).unwrap().len();
             let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
@@ -8396,9 +8693,9 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &[], &stray_findings);
+            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None));
             let obj = body.as_object().unwrap();
-            assert_eq!(obj.len(), 4, "must be exactly four top-level keys: {body}");
+            assert_eq!(obj.len(), 6, "must be exactly six top-level keys: {body}");
             assert!(obj.contains_key("stray_processes"));
             let strays = obj["stray_processes"].as_array().unwrap();
             assert_eq!(strays.len(), 1);
@@ -8472,9 +8769,11 @@ mod tests {
 
             // Also exercise doctor() itself, end to end, twice — not just
             // the pure finding collector — proving the full read-only path.
-            doctor(dir.path(), false).unwrap();
+            // A hermetic, empty cache: never sweep the operator's real one.
+            let cache = tempfile::tempdir().unwrap();
+            doctor_in(dir.path(), false, Some(cache.path())).unwrap();
             assert!(agent::agent_running(pid), "doctor() itself must not signal");
-            doctor(dir.path(), false).unwrap();
+            doctor_in(dir.path(), false, Some(cache.path())).unwrap();
             assert!(
                 agent::agent_running(pid),
                 "doctor() must remain read-only across repeated runs"
@@ -9164,13 +9463,13 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &doc_findings, &[]);
+            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None));
             let obj = body.as_object().unwrap();
             assert_eq!(
                 obj.len(),
-                4,
+                6,
                 "must be exactly {{environment, reconciliation, planning_doc_staleness, \
-                 stray_processes}}: {body}"
+                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error}}: {body}"
             );
             assert!(obj.contains_key("environment"));
             assert!(obj.contains_key("reconciliation"));

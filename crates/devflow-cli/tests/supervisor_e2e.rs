@@ -565,6 +565,8 @@ fn status_reports_each_liveness_state_with_its_repair_verb() {
 
     let sidecar = supervisor::read_sidecar(&socket.with_extension("json")).expect("sidecar");
     let pid = sidecar.supervisor_pid;
+    census_never_sees_a_live_supervisor(pid);
+
     assert!(
         devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
         "the sidecar's supervisor {pid} is the recorded process"
@@ -612,4 +614,55 @@ fn status_reports_each_liveness_state_with_its_repair_verb() {
         !gone.contains(&stop_verb),
         "GONE names no stop, there is nothing left to stop:\n{gone}"
     );
+}
+
+/// A 2.x-shaped monitor wrapper (`sh -c` with the trap line the 2.x script
+/// carried), in its own process group, which drop SIGKILLs and reaps.
+struct PlantedWrapper(std::process::Child);
+
+impl PlantedWrapper {
+    fn spawn() -> Self {
+        use std::os::unix::process::CommandExt as _;
+        // The trailing `:` keeps `sh` from exec-ing `sleep` in its place, so
+        // the wrapper's own argv stays visible in `/proc`.
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("cleanup() { :; }\ntrap cleanup TERM INT\nsleep 30\n:")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the planted 2.x wrapper");
+        Self(child)
+    }
+}
+
+impl Drop for PlantedWrapper {
+    fn drop(&mut self) {
+        common::signal_group(self.0.id(), libc::SIGKILL);
+        let _ = self.0.wait();
+    }
+}
+
+/// 50-12 (T-50-52): the `/proc` stray census, run against a real 3.x
+/// supervisor, never lists it. The control is a planted 2.x-shaped wrapper
+/// that the same census run must list, so an empty census cannot pass.
+fn census_never_sees_a_live_supervisor(supervisor_pid: u32) {
+    let wrapper = PlantedWrapper::spawn();
+    let wrapper_pid = wrapper.0.id();
+    let mut census = Vec::new();
+    assert!(
+        holds_within(RUN_WAIT, || {
+            census = devflow_core::agent::discover_stray_devflow_processes();
+            census.iter().any(|stray| stray.pid == wrapper_pid)
+        }),
+        "control: the census must list the planted 2.x wrapper {wrapper_pid}"
+    );
+    assert!(
+        devflow_core::agent::agent_running(supervisor_pid),
+        "the supervisor {supervisor_pid} is alive while the census runs"
+    );
+    assert!(
+        census.iter().all(|stray| stray.pid != supervisor_pid),
+        "the 2.x census must never list the 3.x supervisor {supervisor_pid}: {census:?}"
+    );
+    drop(wrapper);
 }
