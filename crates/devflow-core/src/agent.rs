@@ -339,8 +339,15 @@ pub fn process_age(pid: u32) -> Option<std::time::Duration> {
 /// cleanup — cleared on the next invocation — never a missed one.
 pub const STRAY_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Which structural layer of a DevFlow-spawned process tree
+/// Which structural layer of a DevFlow 2.x process tree
 /// [`discover_stray_devflow_processes`] matched a candidate against.
+///
+/// Both layers are 2.x process shapes, and a 3.x binary starts neither
+/// (50-11 deleted the `sh` monitor wrapper and its `devflow advance` child):
+/// the census is kept for 2.x leftovers only. A 3.x supervisor is a
+/// `devflow __monitor` process that this census never matches; `doctor`
+/// finds it through its socket (its supervisor findings), and `devflow stop
+/// --phase N --launch <id>` ends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrayLayer {
     /// The monitor wrapper shell spawned by `monitor::spawn_monitor` — the
@@ -370,12 +377,11 @@ pub struct StrayProcess {
     pub layer: StrayLayer,
 }
 
-/// The monitor wrapper's trap-installation line, copied byte-for-byte from
-/// `monitor::spawn_monitor_inner`'s literal script text (see
-/// `crates/devflow-core/src/monitor.rs`) — not paraphrased or reduced to a
-/// single word, so a reader can grep both files for this exact string to
-/// confirm they still agree. If the wrapper script's text ever changes, this
-/// constant must change with it in the same commit.
+/// The 2.x monitor wrapper's trap-installation line, as its `sh -c` script
+/// carried it. That script no longer exists in this source tree: 50-11
+/// replaced it with the Rust `__monitor` supervisor, so nothing a 3.x binary
+/// starts carries this marker. It is kept, unchanged, so the census can
+/// still recognise a 2.x wrapper left running from before the upgrade.
 const MONITOR_WRAPPER_MARKER: &str = "trap cleanup TERM INT";
 
 /// The devflow CLI binary's name — `crates/devflow-cli/Cargo.toml`'s
@@ -387,10 +393,21 @@ const DEVFLOW_BINARY_NAME: &str = "devflow";
 /// `devflow-cli/src/main.rs`), matched against argv[1] for Layer 2.
 const ADVANCE_SUBCOMMAND: &str = "advance";
 
-/// Census both of DevFlow's orphan-prone process layers directly from the OS
-/// process table — the only remaining discovery surface once a project root
-/// has been deleted off disk, taking every registry entry, lock file and
-/// state file with it (999.44).
+/// Census both of DevFlow 2.x's orphan-prone process layers directly from
+/// the OS process table — for 2.x, the only remaining discovery surface once
+/// a project root has been deleted off disk, taking every registry entry,
+/// lock file and state file with it (999.44).
+///
+/// **2.x-only.** Both matchers name 2.x process shapes (the `sh -c` monitor
+/// wrapper and its trailing `devflow advance` child) that 50-11 deleted, so
+/// this census never matches a process a 3.x binary starts. It is kept for
+/// 2.x leftovers (D-20 keeps none live at install). A 3.x supervisor is
+/// found through its socket instead — `doctor`'s supervisor findings,
+/// including the deleted-root class this census used to cover — and ended
+/// with `devflow stop --phase N --launch <id>`. Do not add a `__monitor`
+/// matcher: a live supervisor's pid is in no reachability safety set once
+/// `monitor_pid` leaves it (50-22), so `--reap-strays` would treat every
+/// live run as a stray.
 ///
 /// This is a pure, read-only survey: it never signals a process. Deciding
 /// whether to act on a result, and re-confirming identity immediately
