@@ -36,8 +36,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 
 /// The exit code a stopped run reports: the shell convention for a death by
-/// SIGTERM, `128 + 15`.
-const STOPPED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
+/// SIGTERM, `128 + 15`. The monitor writes it to the exit file on
+/// [`AgentOutcome::Stopped`].
+pub(crate) const STOPPED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
 
 /// Who owns the run right now. Its [`as_str`](Self::as_str) label is the
 /// `owner` field of a ping reply.

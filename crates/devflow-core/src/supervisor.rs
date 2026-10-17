@@ -404,13 +404,6 @@ pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
 
 /// The current time as [`rfc3339_from_unix`] formats it, for
 /// [`Sidecar::created_at`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the launcher (50-08) is the first non-test writer of a sidecar timestamp"
-    )
-)]
 pub(crate) fn rfc3339_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
