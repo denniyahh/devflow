@@ -1009,7 +1009,7 @@ pub fn run_pipe_owning_monitor(
     // a capture from a previous attempt can never be mixed into this one's
     // (the launch path archives the prior capture first, but relying on that
     // to make an append-mode open safe would be an unstated coupling).
-    let mut capture = std::fs::File::create(&stdout_file)?;
+    let capture = std::fs::File::create(&stdout_file)?;
 
     let mut agent_cmd = hermetic_command(program, workdir);
     // The coding agent never needs the gate notify command (WR-07).
@@ -1037,6 +1037,70 @@ pub fn run_pipe_owning_monitor(
     let child_pid = child.id();
     std::fs::write(&pid_file, format!("{child_pid}\n"))?;
 
+    let threads = drive_stream_io(&mut child, capture, agent, prompt, idle_timeout, || {
+        fire_idle_timeout(project_root, phase, workdir, child_pid, idle_timeout);
+    })?;
+
+    let status = child.wait()?;
+    // A signal-killed child has NO exit code — `status.code()` is `None`, and
+    // the previous `unwrap_or(-1)` threw the signal away (peer review
+    // 2026-08-03, found independently by both reviewers and by the 31-04 plan
+    // review as W1). That silently defeated the classification 31-04 took care
+    // to preserve: `evaluate_layer2` and
+    // `reconcile_stream_success_against_exit_code` map **137** to
+    // `ResourceKilled` (routed to `GateInfra` — an infrastructure fault) and
+    // **127** to `AgentUnavailable`. Recording `-1` matched neither, so a real
+    // OOM kill arrived as a generic `Failed` and routed to `GateReview`, asking
+    // an operator to code-review a stage that was killed by the kernel.
+    //
+    // `128 + signal` is the shell convention those constants already encode:
+    // SIGKILL(9) -> 137, SIGTERM(15) -> 143. `-1` is now reachable only when a
+    // status is neither exited nor signalled, which POSIX does not define.
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(-1, |signal| 128 + signal)
+    });
+    std::fs::write(&exit_file, format!("{code}\n"))?;
+
+    threads.join();
+
+    info!("supervised child {child_pid} exited with code {code}");
+    Ok(code)
+}
+
+/// The stream shape's writer and reader threads, joined once the agent has
+/// been reaped.
+struct StreamThreads {
+    writer: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl StreamThreads {
+    fn join(self) {
+        let _ = self.writer.join();
+        let _ = self.reader.join();
+    }
+}
+
+/// Drive a `stream-json` child's two pipes until its stream is over, with
+/// the threading model [`run_pipe_owning_monitor`]'s doc describes: a writer
+/// thread that delivers the first turn and holds stdin open, a reader thread
+/// that tees stdout into `capture`, and this thread applying the close rule
+/// and the idle timeout.
+///
+/// Returns once stdout reaches EOF, the idle timeout has fired (after
+/// `on_idle_timeout` ran), or the stream stayed quiet after the close rule
+/// released stdin. Stdin is released before it returns, so the caller may
+/// then wait for the child. Shared by [`run_pipe_owning_monitor`] and
+/// [`run_supervised_stage`]'s stream shape, so the two cannot drift apart.
+fn drive_stream_io(
+    child: &mut std::process::Child,
+    mut capture: std::fs::File,
+    agent: AgentKind,
+    prompt: &str,
+    idle_timeout: Duration,
+    on_idle_timeout: impl FnOnce(),
+) -> Result<StreamThreads, MonitorError> {
     let mut child_stdin = child
         .stdin
         .take()
@@ -1192,7 +1256,7 @@ pub fn run_pipe_owning_monitor(
                          ({idle_timeout:?} each) — treating as a hang, not as progress"
                     );
                 }
-                fire_idle_timeout(project_root, phase, workdir, child_pid, idle_timeout);
+                on_idle_timeout();
                 break;
             }
         }
@@ -1202,32 +1266,7 @@ pub fn run_pipe_owning_monitor(
     // open stdin may never exit, and `child.wait()` would then block forever.
     drop(close_tx);
 
-    let status = child.wait()?;
-    // A signal-killed child has NO exit code — `status.code()` is `None`, and
-    // the previous `unwrap_or(-1)` threw the signal away (peer review
-    // 2026-08-03, found independently by both reviewers and by the 31-04 plan
-    // review as W1). That silently defeated the classification 31-04 took care
-    // to preserve: `evaluate_layer2` and
-    // `reconcile_stream_success_against_exit_code` map **137** to
-    // `ResourceKilled` (routed to `GateInfra` — an infrastructure fault) and
-    // **127** to `AgentUnavailable`. Recording `-1` matched neither, so a real
-    // OOM kill arrived as a generic `Failed` and routed to `GateReview`, asking
-    // an operator to code-review a stage that was killed by the kernel.
-    //
-    // `128 + signal` is the shell convention those constants already encode:
-    // SIGKILL(9) -> 137, SIGTERM(15) -> 143. `-1` is now reachable only when a
-    // status is neither exited nor signalled, which POSIX does not define.
-    let code = status.code().unwrap_or_else(|| {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal().map_or(-1, |signal| 128 + signal)
-    });
-    std::fs::write(&exit_file, format!("{code}\n"))?;
-
-    let _ = writer.join();
-    let _ = reader.join();
-
-    info!("supervised child {child_pid} exited with code {code}");
-    Ok(code)
+    Ok(StreamThreads { writer, reader })
 }
 
 /// How [`run_supervised_stage`] wires the agent's stdio: the two supervision
@@ -1349,7 +1388,11 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    returns [`MonitorError::PgidMismatch`].
 /// 3. Write the agent pid file, then [`Supervisor::serve`]: the sidecar is
 ///    written before the socket name appears (R-7).
-/// 4. [`Supervisor::wait_agent`], then the exit file: the agent's code for
+/// 4. The stream shape only: drive the agent's pipes through the same
+///    helper `run_pipe_owning_monitor` uses (first turn, capture tee, close
+///    rule, idle timeout). An idle-timeout group kill is a natural outcome,
+///    `Completed(128 + n)` with the idle-timeout verdict file, never a stop.
+/// 5. [`Supervisor::wait_agent`], then the exit file: the agent's code for
 ///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`].
 ///
 /// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
@@ -1363,25 +1406,13 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     crate::supervisor::runtime::install_signal_pipe()?;
 
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
-    let stderr_file = crate::agent_result::stderr_path(&spec.project_root, spec.phase);
     let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
     let pid_file = crate::agent_result::agent_pid_path(&spec.project_root, spec.phase);
     if let Some(parent) = stdout_file.parent() {
         crate::workflow::ensure_devflow_dir(parent)?;
     }
 
-    // Both files truncate at open, as the Legacy script's `>` and `2>` do,
-    // and stay separate so stderr never corrupts the parsed stdout capture.
-    let mut agent_cmd = hermetic_command(&spec.program, &spec.workdir);
-    strip_notify_env(&mut agent_cmd);
-    agent_cmd
-        .args(&spec.args)
-        .envs(spec.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(&stdout_file)?))
-        .stderr(Stdio::from(std::fs::File::create(&stderr_file)?))
-        .process_group(0);
-    let mut child = agent_cmd.spawn()?;
+    let (mut child, stream_capture) = spawn_stage_agent(&spec)?;
     let pid = child.id();
 
     if let Err(pgid) = confirm_own_group(pid) {
@@ -1400,6 +1431,29 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         }
     };
 
+    let threads = match (&spec.io, stream_capture) {
+        (
+            StageIo::Stream {
+                prompt,
+                idle_timeout,
+            },
+            Some(capture),
+        ) => {
+            let idle = *idle_timeout;
+            let driven = drive_stream_io(&mut child, capture, spec.agent, prompt, idle, || {
+                fire_idle_timeout(&spec.project_root, spec.phase, &spec.workdir, pid, idle);
+            });
+            match driven {
+                Ok(threads) => Some(threads),
+                Err(err) => {
+                    abandon_agent(&mut child);
+                    return Err(err);
+                }
+            }
+        }
+        _ => None,
+    };
+
     let outcome = match supervisor.wait_agent(&mut child) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -1412,6 +1466,9 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         AgentOutcome::Stopped => crate::supervisor::runtime::STOPPED_EXIT_CODE,
     };
     std::fs::write(&exit_file, format!("{code}\n"))?;
+    if let Some(threads) = threads {
+        threads.join();
+    }
     info!(
         "supervised {} agent {pid} ended: {outcome:?}",
         spec.io.label()
@@ -1420,6 +1477,46 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         outcome,
         supervisor,
     })
+}
+
+/// Spawn `spec`'s agent in its own process group (`process_group(0)`, R-3),
+/// through `hermetic_command` with the adapter env re-applied after its
+/// scrub and the gate notify command stripped. Returns the child and, for
+/// the stream shape, the capture file the reader thread tees into.
+///
+/// The capture and stderr files truncate at open, as the Legacy script's
+/// `>` and `2>` do, and stay separate so stderr never corrupts the parsed
+/// stdout capture. The capture shape hands the capture file to the agent as
+/// its stdout, with stdin `/dev/null`; the stream shape pipes both.
+fn spawn_stage_agent(
+    spec: &StageSpec,
+) -> Result<(std::process::Child, Option<std::fs::File>), MonitorError> {
+    let capture = std::fs::File::create(crate::agent_result::stdout_path(
+        &spec.project_root,
+        spec.phase,
+    ))?;
+    let stderr = std::fs::File::create(crate::agent_result::stderr_path(
+        &spec.project_root,
+        spec.phase,
+    ))?;
+    let mut agent_cmd = hermetic_command(&spec.program, &spec.workdir);
+    strip_notify_env(&mut agent_cmd);
+    agent_cmd
+        .args(&spec.args)
+        .envs(spec.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stderr(Stdio::from(stderr))
+        .process_group(0);
+    let stream_capture = match spec.io {
+        StageIo::Capture => {
+            agent_cmd.stdin(Stdio::null()).stdout(Stdio::from(capture));
+            None
+        }
+        StageIo::Stream { .. } => {
+            agent_cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+            Some(capture)
+        }
+    };
+    Ok((agent_cmd.spawn()?, stream_capture))
 }
 
 /// Require that `pid` leads its own process group: `getpgid(pid) == pid`.
