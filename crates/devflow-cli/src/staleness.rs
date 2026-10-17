@@ -1196,7 +1196,7 @@ mod tests {
         // identical "self-dogfood stale build blocked" error produced above.
         workflow::save_state(&state).unwrap();
         let path_dir = agent_free_dir_with_agent_stub("claude");
-        let output = devflow_core::test_support::run_test_in_child(
+        let output = crate::test_support::run_hermetic_test_in_child(
             NAME,
             path_dir.path(),
             &[(ROOT_ENV, project_root.as_os_str())],

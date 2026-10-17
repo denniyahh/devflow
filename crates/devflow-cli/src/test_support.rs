@@ -372,6 +372,9 @@ pub(crate) fn child_no_git_root() -> Option<PathBuf> {
 pub(crate) fn run_test_without_git(test_name: &str, root: &Path) -> std::process::Output {
     // Deliberately empty. Nothing is written into it, by design.
     let empty = tempfile::tempdir().unwrap();
+    // 50-10 (D-07): a launch inside this child registers here, never under
+    // the developer's real HOME.
+    let cache = hermetic_cache_dir();
     let exe = std::env::current_exe().expect("current_exe for child test re-invocation");
     let output = std::process::Command::new(&exe)
         .arg(test_name)
@@ -379,10 +382,42 @@ pub(crate) fn run_test_without_git(test_name: &str, root: &Path) -> std::process
         .arg("--test-threads=1")
         .env("PATH", empty.path())
         .env(CHILD_NO_GIT_ROOT, root)
+        .env("DEVFLOW_CACHE_DIR", cache.path())
         .output()
         .expect("spawn child test process with an empty PATH");
-    // Explicit, not incidental: the empty directory must outlive the child.
+    // Explicit, not incidental: both directories must outlive the child.
     drop(empty);
+    drop(cache);
+    output
+}
+
+/// A parent-owned DevFlow cache dir for one child test process (50-10, D-07):
+/// short and under `/tmp`, so 50-11's socket paths inside it stay under the
+/// 107-byte `sun_path` limit.
+pub(crate) fn hermetic_cache_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("dfu")
+        .tempdir_in("/tmp")
+        .expect("create a hermetic DevFlow cache dir under /tmp")
+}
+
+/// [`devflow_core::test_support::run_test_in_child`] with a fresh
+/// [`hermetic_cache_dir`] passed as the child's `DEVFLOW_CACHE_DIR` (50-10,
+/// D-07). Every in-crate test that may launch a stage runs its child through
+/// this, so the launch registers (and, from 50-11, binds its socket) inside
+/// that dir and never under the developer's real HOME. The cache dir lives
+/// until the child has exited. A `DEVFLOW_CACHE_DIR` in `extra_env` wins.
+pub(crate) fn run_hermetic_test_in_child(
+    test_name: &str,
+    path_dir: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let cache = hermetic_cache_dir();
+    let mut env: Vec<(&str, &std::ffi::OsStr)> =
+        vec![("DEVFLOW_CACHE_DIR", cache.path().as_os_str())];
+    env.extend_from_slice(extra_env);
+    let output = devflow_core::test_support::run_test_in_child(test_name, path_dir, &env);
+    drop(cache);
     output
 }
 

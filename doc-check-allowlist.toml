@@ -49,3 +49,13 @@ reason = "Named in the unattended-mode guide as a flag that does NOT exist (D-09
 kind = "docs_to_source"
 token = "DEVFLOW_ALLOW_OFF_WORKTREE"
 reason = "Read by scripts/lint-phase-worktree.sh (the pre-commit phase-worktree guard), not by Rust source."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_MONITOR_ARGV"
+reason = "Test-only: carries the __monitor argv to the CLI #[cfg(test)] monitor harness entries (set by MonitorExec::HarnessEntry, test-support feature only); no release build reads it, so it is not an operator setting (Phase 50, plan 50-10)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_MONITOR_FULL"
+reason = "Test-only: selects the advance-running monitor harness entry for #[cfg(test)] stage launches in the CLI own unit tests; no release build reads it, so it is not an operator setting (Phase 50, plan 50-10)."
