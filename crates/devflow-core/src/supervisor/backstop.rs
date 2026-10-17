@@ -1366,4 +1366,401 @@ mod tests {
             "{gone}"
         );
     }
+
+    const TABLE_PGID: u32 = 4242;
+    const TABLE_START: u64 = 100;
+    const TABLE_BOOT: &str = "boot-now";
+    const TABLE_CALLER: i32 = 7;
+
+    fn table_member(pid: u32) -> GroupMember {
+        GroupMember {
+            pid,
+            start_time: TABLE_START,
+            state: 'S',
+            session: 4000,
+            cmdline: "agent".to_string(),
+        }
+    }
+
+    fn table_identity() -> RecordedIdentity {
+        RecordedIdentity {
+            launch_id: "launch-a".to_string(),
+            pgid: TABLE_PGID,
+            start_time: TABLE_START,
+            boot_id: TABLE_BOOT.to_string(),
+        }
+    }
+
+    /// Facts for a validated, leader-present group: the one shape that
+    /// signals. Each table row changes one or two facts from here.
+    fn signalling_facts() -> BackstopFacts {
+        BackstopFacts {
+            recorded: table_identity(),
+            state_record: Some(table_identity()),
+            caller_pgrp: TABLE_CALLER,
+            current_boot_id: Some(TABLE_BOOT.to_string()),
+            leader: Some(ProcStat {
+                state: 'S',
+                pgrp: 4242,
+                session: 4000,
+                start_time: TABLE_START,
+            }),
+            members: vec![table_member(TABLE_PGID), table_member(TABLE_PGID + 1)],
+            identity_provable: true,
+        }
+    }
+
+    fn with(change: impl FnOnce(&mut BackstopFacts)) -> BackstopFacts {
+        let mut facts = signalling_facts();
+        change(&mut facts);
+        facts
+    }
+
+    fn set_pgid(facts: &mut BackstopFacts, pgid: u32) {
+        facts.recorded.pgid = pgid;
+        if let Some(record) = facts.state_record.as_mut() {
+            record.pgid = pgid;
+        }
+        if let Some(leader) = facts.leader.as_mut() {
+            leader.pgrp = i32::try_from(pgid).unwrap_or(-1);
+        }
+    }
+
+    fn mismatched(field: &str) -> BackstopFacts {
+        with(|facts| {
+            let record = facts.state_record.as_mut().expect("a state record");
+            match field {
+                "launch id" => record.launch_id = "launch-b".to_string(),
+                "pgid" => record.pgid = TABLE_PGID + 9,
+                "agent start time" => record.start_time = TABLE_START + 9,
+                "boot id" => record.boot_id = "boot-other".to_string(),
+                other => panic!("no field {other}"),
+            }
+        })
+    }
+
+    fn previous_boot() -> BackstopFacts {
+        with(|facts| facts.current_boot_id = Some("boot-later".to_string()))
+    }
+
+    fn empty_group() -> BackstopFacts {
+        with(|facts| facts.members.clear())
+    }
+
+    fn recycled_leader() -> BackstopFacts {
+        with(|facts| {
+            facts.leader = Some(ProcStat {
+                state: 'S',
+                pgrp: 4242,
+                session: 5000,
+                start_time: TABLE_START + 1,
+            });
+        })
+    }
+
+    fn leader_gone() -> BackstopFacts {
+        with(|facts| facts.leader = None)
+    }
+
+    fn gone_members() -> BackstopDecision {
+        BackstopDecision::RefuseLeaderGone(signalling_facts().members)
+    }
+
+    /// The decision rule, case by case and order by order, over synthetic
+    /// facts. Runs on every target: `classify` has no `cfg`.
+    #[test]
+    fn classify_covers_every_rule_in_order() {
+        use BackstopDecision as D;
+        let own_group = u32::try_from(TABLE_CALLER).expect("positive");
+        let largest_pid = u32::try_from(i32::MAX).expect("fits");
+        let mut rows: Vec<(&str, BackstopFacts, BackstopDecision)> = vec![
+            // Step 4 (the only signalling row), and its boundaries.
+            (
+                "validated leader present",
+                signalling_facts(),
+                D::LeaderPresentSignal,
+            ),
+            (
+                "no state record",
+                with(|f| f.state_record = None),
+                D::LeaderPresentSignal,
+            ),
+            (
+                "pgid 2 is a safe target",
+                with(|f| set_pgid(f, 2)),
+                D::LeaderPresentSignal,
+            ),
+            (
+                "i32::MAX fits pid_t",
+                with(|f| set_pgid(f, largest_pid)),
+                D::LeaderPresentSignal,
+            ),
+            (
+                "a zombie leader still leads",
+                with(|f| {
+                    f.leader.as_mut().expect("leader").state = 'Z';
+                }),
+                D::LeaderPresentSignal,
+            ),
+            // The unsafe-target guard, first of all.
+            ("pgid 0", with(|f| set_pgid(f, 0)), D::RefuseUnsafeTarget),
+            ("pgid 1", with(|f| set_pgid(f, 1)), D::RefuseUnsafeTarget),
+            (
+                "the caller's own group",
+                with(|f| set_pgid(f, own_group)),
+                D::RefuseUnsafeTarget,
+            ),
+            (
+                "pgid beyond pid_t",
+                with(|f| set_pgid(f, largest_pid + 1)),
+                D::RefuseUnsafeTarget,
+            ),
+            (
+                "u32::MAX",
+                with(|f| set_pgid(f, u32::MAX)),
+                D::RefuseUnsafeTarget,
+            ),
+            (
+                "unsafe wins over unprovable identity",
+                with(|f| {
+                    set_pgid(f, 1);
+                    f.identity_provable = false;
+                }),
+                D::RefuseUnsafeTarget,
+            ),
+            (
+                "unsafe wins over a mismatch",
+                {
+                    let mut f = mismatched("launch id");
+                    set_pgid(&mut f, 0);
+                    f
+                },
+                D::RefuseUnsafeTarget,
+            ),
+            // An unreadable boot id is the identity refusal, never PreviousBoot.
+            (
+                "no current boot id",
+                with(|f| f.current_boot_id = None),
+                D::RefuseIdentityUnavailable,
+            ),
+            // Step 3: previous boot, and it wins over an empty group.
+            ("previous boot", previous_boot(), D::PreviousBoot),
+            (
+                "previous boot wins over an empty group",
+                with(|f| {
+                    f.current_boot_id = Some("boot-later".to_string());
+                    f.members.clear();
+                }),
+                D::PreviousBoot,
+            ),
+            (
+                "previous boot wins over a gone leader",
+                with(|f| {
+                    f.current_boot_id = Some("boot-later".to_string());
+                    f.leader = None;
+                }),
+                D::PreviousBoot,
+            ),
+            // Step 4: an empty group, and it wins over the leader checks.
+            ("empty group", empty_group(), D::EmptyGroup),
+            (
+                "empty group wins over a recycled leader",
+                with(|f| {
+                    f.members.clear();
+                    f.leader.as_mut().expect("leader").start_time = TABLE_START + 1;
+                }),
+                D::EmptyGroup,
+            ),
+            (
+                "empty group with no leader",
+                with(|f| {
+                    f.members.clear();
+                    f.leader = None;
+                }),
+                D::EmptyGroup,
+            ),
+            // Step 6: recycled leader, whatever its group.
+            ("recycled leader", recycled_leader(), D::LeaderRecycled),
+            (
+                "recycled leader in another group",
+                with(|f| {
+                    let leader = f.leader.as_mut().expect("leader");
+                    leader.start_time = TABLE_START - 1;
+                    leader.pgrp = 9999;
+                }),
+                D::LeaderRecycled,
+            ),
+            // Step 7: leader gone, or the original leader left the group.
+            ("leader gone, members live", leader_gone(), gone_members()),
+            (
+                "original leader left the group",
+                with(|f| {
+                    f.leader.as_mut().expect("leader").pgrp = 9999;
+                }),
+                gone_members(),
+            ),
+        ];
+        // Step 2: each mismatched field refuses, and a mismatch wins over
+        // everything after it.
+        for field in ["launch id", "pgid", "agent start time", "boot id"] {
+            rows.push((
+                "mismatch",
+                mismatched(field),
+                D::RefuseMismatch(String::new()),
+            ));
+        }
+        for (name, later) in [
+            ("mismatch wins over previous boot", previous_boot()),
+            ("mismatch wins over an empty group", empty_group()),
+            ("mismatch wins over a recycled leader", recycled_leader()),
+            ("mismatch wins over a gone leader", leader_gone()),
+        ] {
+            let mut facts = later;
+            facts.state_record.as_mut().expect("record").launch_id = "launch-b".to_string();
+            rows.push((name, facts, D::RefuseMismatch(String::new())));
+        }
+        // MAC-2: unprovable identity refuses before every step after the
+        // unsafe-target guard, whatever those steps would have answered.
+        for (name, base) in [
+            ("unprovable over a mismatch", mismatched("pgid")),
+            ("unprovable over a previous boot", previous_boot()),
+            ("unprovable over an empty group", empty_group()),
+            ("unprovable over a present leader", signalling_facts()),
+            ("unprovable over a recycled leader", recycled_leader()),
+            ("unprovable over a gone leader", leader_gone()),
+        ] {
+            let mut facts = base;
+            facts.identity_provable = false;
+            rows.push((name, facts, D::RefuseIdentityUnavailable));
+        }
+
+        for (name, facts, expected) in &rows {
+            let actual = classify(facts);
+            match (expected, &actual) {
+                // A mismatch is matched by variant; its text is checked below.
+                (D::RefuseMismatch(_), D::RefuseMismatch(_)) => {}
+                _ => assert_eq!(&actual, expected, "row {name:?}"),
+            }
+        }
+
+        // The mismatch text names the field that differs, and both values.
+        for (field, sidecar_value, state_value) in [
+            ("launch id", "launch-a", "launch-b"),
+            ("pgid", "4242", "4251"),
+            ("agent start time", "100", "109"),
+            ("boot id", "boot-now", "boot-other"),
+        ] {
+            let D::RefuseMismatch(why) = classify(&mismatched(field)) else {
+                panic!("{field} must be a mismatch");
+            };
+            assert_eq!(
+                why,
+                format!("{field}: sidecar {sidecar_value}, state {state_value}")
+            );
+        }
+    }
+
+    /// The kernel-capability check (RESEARCH A3): on a kernel with
+    /// `PIDFD_SIGNAL_PROCESS_GROUP` the backstop must use it. The kernel is
+    /// probed independently of the code under test (signal 0 with the flag
+    /// on a pidfd of a group this test owns); a kernel without it is
+    /// reported on stderr, never passed silently.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_group_signal_is_used_when_the_kernel_supports_it() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let cache = short_cache();
+        let boot = super::super::boot_id().expect("read the boot id");
+        let mut group = TestGroup::spawn(LEADER_WAITS);
+        group.settle(2);
+
+        let leader = libc::pid_t::try_from(group.pgid).expect("fits pid_t");
+        // SAFETY: pidfd_open on this test's own unreaped child.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, leader, 0 as libc::c_uint) };
+        assert!(raw >= 0, "pidfd_open: {}", io::Error::last_os_error());
+        // SAFETY: a pidfd this call just opened and nothing else owns.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(libc::c_int::try_from(raw).expect("an fd")) };
+        // SAFETY: signal 0 only checks permission; the flag is what is probed.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                0 as libc::c_int,
+                std::ptr::null::<libc::siginfo_t>(),
+                libc::PIDFD_SIGNAL_PROCESS_GROUP,
+            )
+        };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINVAL),
+                "probe failed: {error}"
+            );
+            eprintln!("skipped: kernel lacks PIDFD_SIGNAL_PROCESS_GROUP");
+            return;
+        }
+
+        let (socket, sidecar) = stale_launch(cache.path(), group.pgid, group.leader_start, &boot);
+        let outcome = teardown_stale(&socket, &sidecar, None).expect("teardown");
+        let BackstopOutcome::Killed { via, .. } = outcome else {
+            panic!("a validated group must be Killed, got {outcome:?}");
+        };
+        assert_eq!(
+            via,
+            SignalPath::PidfdGroup,
+            "a supporting kernel uses the pidfd group signal"
+        );
+        group.wait_all_gone();
+    }
+
+    /// T-50-24: after opening the leader's pidfd, the helper re-reads the
+    /// leader and sends nothing unless it is still the recorded process and
+    /// still leads the group its pid names. Signal 0 is used throughout, so
+    /// a wrongly "sent" signal shows in the return value and harms nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_group_signal_revalidates_the_leader_after_opening_its_pidfd() {
+        struct Reaped(Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut group = TestGroup::spawn(LEADER_WAITS);
+        group.settle(2);
+        assert_eq!(
+            signal_validated_group(group.pgid, group.leader_start + 1, 0).expect("signal"),
+            GroupSignal::LeaderGone,
+            "a different start time sends nothing"
+        );
+
+        // A process that does not lead a group of its own pid: it stays in
+        // this test's group.
+        let outsider = Reaped(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn a process in this test's group"),
+        );
+        let outsider_pid = outsider.0.id();
+        let outsider_start =
+            crate::agent::process_start_time(outsider_pid).expect("read its start time");
+        assert_eq!(
+            signal_validated_group(outsider_pid, outsider_start, 0).expect("signal"),
+            GroupSignal::LeaderGone,
+            "a process that does not lead the group its pid names sends nothing"
+        );
+
+        // Control: the recorded leader of its own group is signalled.
+        assert!(matches!(
+            signal_validated_group(group.pgid, group.leader_start, 0).expect("signal"),
+            GroupSignal::Sent(_)
+        ));
+        assert!(group.all_alive(), "signal 0 ends nothing");
+    }
 }
