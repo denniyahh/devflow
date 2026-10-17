@@ -31,8 +31,8 @@ use super::{PublishError, Sidecar, SocketPath};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 
 /// The exit code a stopped run reports: the shell convention for a death by
@@ -337,10 +337,114 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     })
 }
 
-/// Turn SIGTERM and SIGINT into stop events for this process's supervisor.
-/// RED stub: installs nothing yet.
+/// The signal pipe's read end, or `-1` before [`install_signal_pipe`].
+static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
+/// The signal pipe's write end, the handler's only output.
+static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+/// The pid that installed the handler. A forked child that has not exec'd
+/// yet runs the inherited handler under another pid and writes nothing.
+static SUPERVISOR_PID: AtomicI32 = AtomicI32::new(0);
+
+/// The SIGTERM/SIGINT handler: the pid check and a one-byte `write`, both
+/// async-signal-safe, and nothing else. The control thread turns the byte
+/// into a stop.
+extern "C" fn on_stop_signal(signo: libc::c_int) {
+    // SAFETY: getpid is async-signal-safe and has no preconditions.
+    if unsafe { libc::getpid() } == SUPERVISOR_PID.load(Ordering::Relaxed) {
+        let byte = signo as u8;
+        // SAFETY: write is async-signal-safe; `byte` is a live one-byte
+        // buffer. A full pipe drops the byte, which is harmless: the first
+        // byte already requested the stop.
+        unsafe {
+            libc::write(
+                SIGNAL_WRITE_FD.load(Ordering::Relaxed),
+                (&raw const byte).cast(),
+                1,
+            );
+        }
+    }
+}
+
+/// Turn SIGTERM and SIGINT into stop events for this process's supervisor:
+/// once per process, create a close-on-exec, non-blocking pipe and install
+/// [`on_stop_signal`] with `SA_RESTART` for both signals. The control thread
+/// [`Supervisor::serve`] starts reads the pipe and requests the stop.
+///
+/// Call it at supervisor-process entry, before the agent is spawned. It
+/// installs process-global signal state, so only a supervisor process calls
+/// it, and it never blocks a signal: a blocked mask would be inherited by
+/// every agent (RESEARCH Finding 3).
 pub fn install_signal_pipe() -> io::Result<()> {
+    static INSTALLED: OnceLock<Result<(), (io::ErrorKind, String)>> = OnceLock::new();
+    INSTALLED
+        .get_or_init(|| install_once().map_err(|error| (error.kind(), error.to_string())))
+        .clone()
+        .map_err(|(kind, message)| io::Error::new(kind, message))
+}
+
+fn install_once() -> io::Result<()> {
+    let [read, write] = cloexec_nonblocking_pipe()?;
+    SIGNAL_WRITE_FD.store(write, Ordering::SeqCst);
+    // SAFETY: getpid has no preconditions.
+    SUPERVISOR_PID.store(unsafe { libc::getpid() }, Ordering::SeqCst);
+    SIGNAL_READ_FD.store(read, Ordering::SeqCst);
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: an all-zero sigaction is valid; the fields that matter
+        // are set below.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: `action.sa_mask` is a live sigset_t.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: `action` is a fully initialized sigaction; the old action
+        // is not wanted.
+        if unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(())
+}
+
+/// A pipe whose two ends are close-on-exec and non-blocking, so no agent
+/// inherits it and a full pipe never blocks the handler.
+#[cfg(target_os = "linux")]
+fn cloexec_nonblocking_pipe() -> io::Result<[libc::c_int; 2]> {
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` is a live two-element out-parameter.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fds)
+}
+
+/// [`cloexec_nonblocking_pipe`] where libc has no `pipe2` (Apple targets):
+/// `pipe`, then `FD_CLOEXEC` and `O_NONBLOCK` on each end.
+#[cfg(not(target_os = "linux"))]
+fn cloexec_nonblocking_pipe() -> io::Result<[libc::c_int; 2]> {
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` is a live two-element out-parameter.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // SAFETY: `fd` is an open descriptor this call created.
+        let configured = unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0 && {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+            }
+        };
+        if !configured {
+            let error = io::Error::last_os_error();
+            for fd in fds {
+                // SAFETY: both descriptors were created above and are not
+                // shared yet.
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+    }
+    Ok(fds)
 }
 
 /// A running supervisor: its published socket, its sidecar and its control
@@ -487,6 +591,28 @@ impl Drop for Supervisor {
     }
 }
 
+/// Read every pending byte from the non-blocking signal pipe; each is one
+/// delivered signal's number.
+fn drain_signal_pipe(fd: libc::c_int) -> Vec<i32> {
+    let mut signals = Vec::new();
+    let mut buf = [0_u8; 64];
+    loop {
+        // SAFETY: `buf` is a live buffer of the length passed.
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let Ok(read) = usize::try_from(read) else {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // WouldBlock: the pipe is drained.
+            return signals;
+        };
+        if read == 0 {
+            return signals;
+        }
+        signals.extend(buf[..read].iter().map(|&byte| i32::from(byte)));
+    }
+}
+
 /// The control thread's state.
 struct Control {
     listener: UnixListener,
@@ -503,16 +629,26 @@ impl Control {
         let tick = libc::c_int::try_from(crate::agent::TERMINATE_VERIFY_POLL.as_millis())
             .unwrap_or(libc::c_int::MAX);
         while !self.quit.load(Ordering::Acquire) {
-            let mut fds = [libc::pollfd {
-                fd: self.listener.as_raw_fd(),
+            // A negative fd (no pipe installed) is ignored by poll.
+            let mut fds = [
+                self.listener.as_raw_fd(),
+                SIGNAL_READ_FD.load(Ordering::SeqCst),
+            ]
+            .map(|fd| libc::pollfd {
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
-            }];
+            });
             // SAFETY: `fds` is a live array of initialized pollfd entries and
             // its length is passed alongside it.
             let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, tick) };
             if ready <= 0 {
                 continue;
+            }
+            if fds[1].revents & libc::POLLIN != 0 {
+                for signal in drain_signal_pipe(fds[1].fd) {
+                    self.stop(StopSource::Signal(signal), None, &mut parked);
+                }
             }
             if fds[0].revents & libc::POLLIN != 0 {
                 self.accept_all(&mut parked);
@@ -800,12 +936,17 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn the agent");
-        let _group = GroupGuard(agent.id());
+        // Covers a panic before the supervisor has decided the run. Once
+        // `wait_agent` returns, ending the group is the supervisor's job, so
+        // the guard is disarmed: a cleanup here would hide a member the
+        // supervisor failed to kill. The parent's guard still reaps it.
+        let group = GroupGuard(agent.id());
         let sidecar = test_sidecar(&socket, agent.id());
         let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
         let outcome = supervisor
             .wait_agent(&mut agent)
             .expect("wait for the agent");
+        std::mem::forget(group);
         supervisor.finish();
         std::fs::write(outcome_path, format!("{outcome:?}")).expect("record the outcome");
     }
@@ -1255,6 +1396,7 @@ mod tests {
     }
 
     /// Send `signal` to a child this test spawned and still owns.
+    #[cfg(target_os = "linux")]
     fn signal_child(child: &mut ChildGuard, signal: libc::c_int) {
         let pid = libc::pid_t::try_from(child.child().id()).expect("pid fits pid_t");
         assert!(pid > 1, "refusing to signal pid {pid}");
