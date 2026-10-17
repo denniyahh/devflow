@@ -36,7 +36,8 @@ use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::ship_evidence;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, State, SupervisorRecord};
+use devflow_core::supervisor;
 use devflow_core::version;
 use devflow_core::workflow;
 use devflow_core::worktree;
@@ -871,10 +872,12 @@ fn remove_worktree_with_retry(
 /// associated feature branches, then prune and clean up merged branches.
 ///
 /// Hard-refuses (D-06, no override flag) removal of any worktree whose owning
-/// phase has a live agent (any monitor state, including Unknown/Stuck) or an
-/// active monitor (Healthy/BetweenStages) — closing the race where a real
-/// `cleanup --force` run could delete a worktree a live agent/monitor is
+/// phase has a live agent (whatever its supervisor's liveness) or a
+/// supervisor that answers ALIVE — closing the race where a real
+/// `cleanup --force` run could delete a worktree a live agent/supervisor is
 /// still writing into (review: Codex HIGH, fail-closed on a live agent).
+/// A STALE supervisor (or a failed probe) keeps the worktree unless
+/// `--force` (50-12); GONE and NotLaunched follow the rules above.
 pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
     // Project-resolved (45-01): `cleanup_merged` computes "merged" relative
     // to the trunk and treats it as protected — both must be the configured
@@ -903,19 +906,18 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         let agent_alive = phase
             .and_then(|p| agent_pid_from_file(project_root, p))
             .is_some_and(agent::agent_running);
-        let monitor_pid = matched_state.and_then(|s| s.monitor_pid);
-        let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
-        let phase_liveness = liveness(monitor_pid, monitor_alive, agent_alive);
+        // 50-12: the supervisor's liveness comes from its recorded socket,
+        // never a pid.
+        let phase_liveness = matched_state.map_or(PhaseLiveness::NotLaunched, probe_phase);
 
-        // A phase halted via `devflow start --until <stage>` (20c) clears
-        // `monitor_pid` and its agent has already exited by design — that
-        // reads as `Liveness::Unknown` with `agent_alive == false`, which
-        // would otherwise sail straight through the live-agent refusal
+        // A phase halted via `devflow start --until <stage>` (20c) has no
+        // running supervisor and its agent has already exited by design —
+        // which would otherwise sail straight through the live-agent refusal
         // below. Treat it the same way `doctor`'s `check_dead_agent`/
-        // `check_dead_monitor` were taught about `facts.stopped` in this
-        // same phase: an intentionally-parked worktree is never implicitly
-        // safe to remove — require `--force`, mirroring the `reference`
-        // worktree's own precedent above.
+        // `check_supervisor` were taught about `facts.stopped`: an
+        // intentionally-parked worktree is never implicitly safe to remove —
+        // require `--force`, mirroring the `reference` worktree's own
+        // precedent above.
         let stopped = matched_state.is_some_and(|s| s.stopped);
         if stopped && !force {
             let phase_label = phase
@@ -928,11 +930,10 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
             continue;
         }
 
-        // Fail-closed on a live agent: refuse whenever the agent is alive
-        // (regardless of monitor liveness — Unknown/Stuck included) OR the
-        // monitor is actively running the stage (Healthy/BetweenStages).
-        // Only Stuck/Unknown WITHOUT a live agent proceeds.
-        if agent_alive || matches!(phase_liveness, Liveness::Healthy | Liveness::BetweenStages) {
+        // Fail-closed on a live run: refuse whenever the agent is alive
+        // (whatever the supervisor's liveness) OR the supervisor answers
+        // ALIVE, `--force` or not.
+        if agent_alive || matches!(phase_liveness, PhaseLiveness::Alive { .. }) {
             let phase_label = phase
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
@@ -941,6 +942,26 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
                 wt.path.display(),
                 phase_liveness.describe(),
             )));
+        }
+
+        // 50-12: a STALE supervisor may have left its agent group running,
+        // and a failed probe proves nothing either way: keep the worktree
+        // unless `--force`, and name the verb that ends the orphaned run.
+        if !force
+            && matches!(
+                phase_liveness,
+                PhaseLiveness::Stale | PhaseLiveness::ProbeFailed(_)
+            )
+        {
+            let phase_label = phase
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "keeping worktree {} for phase {phase_label} — supervisor {}; run `devflow stop --phase {phase_label}` first, or pass --force to discard it",
+                wt.path.display(),
+                phase_liveness.describe(),
+            );
+            continue;
         }
 
         match remove_worktree_with_retry(project_root, &wt.path, force) {
@@ -981,103 +1002,152 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     Ok(())
 }
 
-/// A phase's monitor/agent liveness, distinguishing a dead monitor (nothing
-/// will call `devflow advance` when the agent exits) from a normal
-/// between-stages moment (18b — "who watches the watcher").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Liveness {
-    /// Monitor and agent are both alive — the stage is actively running.
-    Healthy,
-    /// Monitor is alive, agent has exited — normal between-stages moment;
-    /// the monitor will advance the phase shortly.
-    BetweenStages,
-    /// The recorded monitor is dead. Whether or not the agent is also dead,
-    /// nothing will call `devflow advance` for this phase — it needs a
-    /// manual `devflow resume`.
-    Stuck,
-    /// No monitor PID has been recorded for this state — either none has
-    /// been spawned yet, or the state was written by a binary predating
-    /// this field. Never reported as a problem.
-    Unknown,
-}
-
-impl Liveness {
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            Liveness::Healthy => "healthy",
-            Liveness::BetweenStages => "between stages",
-            Liveness::Stuck => "stuck — needs devflow resume",
-            Liveness::Unknown => "unknown (no monitor recorded)",
-        }
-    }
-}
-
-/// Pure liveness predicate — no I/O. `monitor_pid` is matched `None` first
-/// so a state written by a pre-18b binary (carrying no `monitor_pid`) can
-/// never be misclassified as `Stuck` (T-18-11).
-fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) -> Liveness {
-    match monitor_pid {
-        None => Liveness::Unknown,
-        Some(_) => match (monitor_alive, agent_alive) {
-            (true, true) => Liveness::Healthy,
-            (true, false) => Liveness::BetweenStages,
-            (false, _) => Liveness::Stuck,
-        },
-    }
-}
-
 /// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
 /// it (50-12): answered from the socket recorded in `state.supervisor`
-/// through [`supervisor::probe`], never from a pid.
+/// through [`supervisor::probe`], never from a pid. Three parts, like the
+/// 18b presentation it replaces: this enum, [`PhaseLiveness::describe`], and
+/// the pure mapping [`phase_liveness`], which `doctor`'s `check_supervisor`
+/// reuses so the two can never drift.
+///
+/// A supervisor runs its own advance in-process, so a moment between stages
+/// is ALIVE (its owner reads `advancing`), not a separate state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // RED stub (50-12 Task 1)
 pub(crate) enum PhaseLiveness {
     /// The recorded socket answered a ping.
     Alive {
         /// Who owns the run right now, from the ping reply.
         owner: String,
-        /// The launch shape, from the ping reply.
+        /// The launch shape (`capture` or `stream`), from the ping reply.
         launch: String,
     },
-    /// The socket file remains but nothing listens on it.
+    /// The socket file remains but nothing listens on it: the supervisor
+    /// died without cleaning up, and its agent group may still run.
     Stale,
-    /// No socket at the recorded path, and the phase is stopped.
+    /// No socket at the recorded path, and the phase is stopped: a normal
+    /// end.
     Gone,
-    /// No socket at the recorded path, but the phase is not stopped.
+    /// No socket at the recorded path while the phase is not stopped:
+    /// nothing will advance it. A finding, not a normal state.
     GoneWhileActive,
-    /// The state records no supervisor.
+    /// The state records no supervisor: nothing has been launched yet, or the
+    /// state predates the record. Never a finding.
     NotLaunched,
-    /// The probe could not answer; a path-free summary of why.
+    /// The probe could not answer; a path-free summary of why (see
+    /// [`probe_error_summary`]). Neither ALIVE nor GONE is guessed.
     ProbeFailed(String),
 }
 
-/// RED stub (50-12 Task 1): answers `NotLaunched` for every input.
-#[allow(dead_code)]
-fn phase_liveness(
-    _record: Option<&devflow_core::state::SupervisorRecord>,
-    _probe: Option<Result<devflow_core::supervisor::Liveness, devflow_core::supervisor::ProbeError>>,
-    _stopped: bool,
-) -> PhaseLiveness {
-    PhaseLiveness::NotLaunched
+impl PhaseLiveness {
+    /// The operator-facing text. The three states the operator acts on lead
+    /// with `ALIVE`, `STALE` and `GONE`.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            PhaseLiveness::Alive { owner, launch } => {
+                format!("ALIVE (owner: {owner}, launch: {launch})")
+            }
+            PhaseLiveness::Stale => {
+                "STALE — the socket remains but no supervisor answers".to_string()
+            }
+            PhaseLiveness::Gone => {
+                "GONE — the supervisor has exited and the phase is stopped".to_string()
+            }
+            PhaseLiveness::GoneWhileActive => {
+                "GONE — no supervisor runs this phase, but it is not stopped".to_string()
+            }
+            PhaseLiveness::NotLaunched => "not launched (no supervisor recorded)".to_string(),
+            PhaseLiveness::ProbeFailed(why) => format!("UNKNOWN — the probe failed: {why}"),
+        }
+    }
 }
 
-/// Recovery verbs discoverable from a phase's liveness (21a, D-03) — the
-/// pure, testable counterpart to `status`'s old inline Stuck `println!`.
-/// Always includes `devflow resume` for `Stuck`; additionally includes
-/// `devflow advance` when the phase is gate-pending (the operator answers
-/// the gate then advances — the primary footgun this closes; widening the
-/// predicate further risks suggesting `advance` where nothing proves it is
-/// right, per 21-CONTEXT.md's Review Incorporation). Empty for any other
-/// liveness, so a healthy/between-stages/unknown phase prints nothing new.
-fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
-    if liveness != Liveness::Stuck {
-        return Vec::new();
+/// Pure mapping from a phase's supervisor record and its probe result to a
+/// [`PhaseLiveness`]. No I/O. No record (or no probe) is `NotLaunched`; GONE
+/// splits on `stopped`; a probe error is `ProbeFailed`, never a guess.
+fn phase_liveness(
+    record: Option<&SupervisorRecord>,
+    probe: Option<Result<supervisor::Liveness, supervisor::ProbeError>>,
+    stopped: bool,
+) -> PhaseLiveness {
+    let (Some(_), Some(probe)) = (record, probe) else {
+        return PhaseLiveness::NotLaunched;
+    };
+    match probe {
+        Ok(supervisor::Liveness::Alive(reply)) => PhaseLiveness::Alive {
+            owner: reply.owner,
+            launch: reply.launch,
+        },
+        Ok(supervisor::Liveness::Stale) => PhaseLiveness::Stale,
+        Ok(supervisor::Liveness::Gone) if stopped => PhaseLiveness::Gone,
+        Ok(supervisor::Liveness::Gone) => PhaseLiveness::GoneWhileActive,
+        Err(error) => PhaseLiveness::ProbeFailed(probe_error_summary(&error)),
     }
-    let mut hints = vec![format!("devflow resume --phase {}", state.phase)];
-    if state.gate_pending {
-        hints.push(format!("devflow advance --phase {}", state.phase));
+}
+
+/// A [`supervisor::ProbeError`] as a path-free kind and cause (T-18-01):
+/// `NotASocket`'s own text names the path, and a `NoReply` text may quote
+/// whatever the peer sent, so neither is passed through.
+fn probe_error_summary(error: &supervisor::ProbeError) -> String {
+    match error {
+        supervisor::ProbeError::Stat(cause) => {
+            format!("could not stat the socket ({})", cause.kind())
+        }
+        supervisor::ProbeError::NotASocket(_) => "the recorded path is not a socket".to_string(),
+        supervisor::ProbeError::ForeignOwner { uid } => {
+            format!("the socket is owned by uid {uid}, not this user")
+        }
+        supervisor::ProbeError::Connect(cause) => {
+            format!("could not connect to the socket ({})", cause.kind())
+        }
+        supervisor::ProbeError::NoReply(_) => "no valid ping reply".to_string(),
+        _ => "the probe failed".to_string(),
     }
-    hints
+}
+
+/// Probe the socket `state.supervisor` records, once, and map the answer.
+/// The only I/O half of [`phase_liveness`]; reads no pid.
+fn probe_phase(state: &State) -> PhaseLiveness {
+    let record = state.supervisor.as_ref();
+    let probe = record.map(|record| supervisor::probe(&record.socket_path));
+    phase_liveness(record, probe, state.stopped)
+}
+
+/// Recovery verbs discoverable from a phase's liveness (21a, D-03; 50-12) —
+/// the pure, testable counterpart to `status`'s hints. STALE names
+/// `devflow stop` (it ends the orphaned agent group and removes the socket)
+/// and then `devflow resume`; GONE while active names `devflow resume`, plus
+/// `devflow advance` when the phase is gate-pending (answer the gate, then
+/// advance — widening that predicate risks suggesting `advance` where
+/// nothing proves it is right, per 21-CONTEXT.md's Review Incorporation); a
+/// failed probe names the socket to inspect. Empty for ALIVE, a stopped
+/// GONE and NotLaunched.
+fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+    let phase = state.phase;
+    match liveness {
+        PhaseLiveness::Stale => vec![
+            format!("devflow stop --phase {phase}"),
+            format!("devflow resume --phase {phase}"),
+        ],
+        PhaseLiveness::GoneWhileActive => {
+            let mut hints = vec![format!("devflow resume --phase {phase}")];
+            if state.gate_pending {
+                hints.push(format!("devflow advance --phase {phase}"));
+            }
+            hints
+        }
+        PhaseLiveness::ProbeFailed(why) => {
+            let socket = state
+                .supervisor
+                .as_ref()
+                .map(|record| record.socket_path.display().to_string())
+                .unwrap_or_default();
+            vec![format!(
+                "the probe failed ({why}); inspect the socket at {socket}"
+            )]
+        }
+        PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
+            Vec::new()
+        }
+    }
 }
 
 /// `status`'s in-stage progress line: real elapsed time since the phase's
@@ -1149,19 +1219,15 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 }
                 None => println!("  agent_pid: none"),
             }
-            match state.monitor_pid {
-                Some(pid) => {
-                    println!(
-                        "  monitor_pid: {pid} (running: {})",
-                        agent::agent_running(pid)
-                    );
-                }
-                None => println!("  monitor_pid: none"),
-            }
-            let agent_alive = agent_pid.is_some_and(agent::agent_running);
-            let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
-            let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
-            println!("  liveness: {}", phase_liveness.describe());
+            // 50-12: liveness comes from the recorded socket, never a pid.
+            // `status` speaks only about the operator's own project, so it
+            // names the socket path (doctor does not, T-18-01).
+            let phase_liveness = probe_phase(state);
+            let socket = state.supervisor.as_ref().map_or_else(
+                || "none".to_string(),
+                |record| record.socket_path.display().to_string(),
+            );
+            println!("  supervisor: {socket} — {}", phase_liveness.describe());
             let phase_summary = last_events.remove(&state.phase);
             println!(
                 "{}",
@@ -1170,7 +1236,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                     phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
-            for hint in recovery_hints(state, phase_liveness) {
+            for hint in recovery_hints(state, &phase_liveness) {
                 println!("    → {hint}");
             }
             if let Some(summary) = phase_summary {
@@ -3848,17 +3914,12 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// The recorded monitor pid is dead — nothing will call `devflow advance`
 /// for this phase, whether or not the agent is also dead (an agent that
 /// outlived its monitor is orphaned too, since nothing will advance it when
-/// it exits either). Reuses `liveness` rather than re-deriving the matrix,
-/// so the two copies can never drift (18b, T-18-11's `Unknown` guard applies
-/// here transitively — an unrecorded monitor is silently `Unknown`, never a
-/// finding).
+/// it exits either). An unrecorded monitor is never a finding (T-18-11).
 fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.stopped
-        || liveness(facts.monitor_pid, facts.monitor_alive, facts.agent_alive) != Liveness::Stuck
-    {
+    let pid = facts.monitor_pid?;
+    if facts.stopped || facts.monitor_alive {
         return None;
     }
-    let pid = facts.monitor_pid?;
     Some(PhaseFinding {
         phase: facts.phase,
         severity: Severity::Problem,
@@ -5487,32 +5548,6 @@ mod tests {
         assert!(default_logs_phase(dir.path()).is_err());
     }
 
-    /// 18b: a state with no recorded monitor is never reported as stuck,
-    /// regardless of the (unreliable, since no monitor was ever recorded)
-    /// liveness bits passed alongside it.
-    #[test]
-    fn liveness_unknown_when_no_monitor_recorded() {
-        assert_eq!(liveness(None, false, false), Liveness::Unknown);
-        assert_eq!(liveness(None, false, true), Liveness::Unknown);
-        assert_eq!(liveness(None, true, false), Liveness::Unknown);
-        assert_eq!(liveness(None, true, true), Liveness::Unknown);
-    }
-
-    /// 18b: the full four-row matrix for a recorded monitor pid. A dead
-    /// agent with a dead monitor OR a live monitor with a dead agent are
-    /// different states — only the former is `Stuck` (nothing will call
-    /// `devflow advance`); the latter is a normal between-stages moment. An
-    /// agent that outlived its monitor is also `Stuck` — orphaned, since
-    /// nothing will advance it when it exits either.
-    #[test]
-    fn liveness_matrix_covers_all_four_rows() {
-        let pid = Some(4242);
-        assert_eq!(liveness(pid, true, true), Liveness::Healthy);
-        assert_eq!(liveness(pid, true, false), Liveness::BetweenStages);
-        assert_eq!(liveness(pid, false, false), Liveness::Stuck);
-        assert_eq!(liveness(pid, false, true), Liveness::Stuck);
-    }
-
     /// A ping reply as a supervisor sends it; built through serde because
     /// `PingReply` is `#[non_exhaustive]`.
     fn ping_reply(owner: &str, launch: &str) -> devflow_core::supervisor::protocol::PingReply {
@@ -5586,7 +5621,10 @@ mod tests {
             }
             for (at, row) in rows.iter().enumerate() {
                 for other in &rows[at + 1..] {
-                    assert_ne!(row, other, "stopped={stopped}: two outcomes share one answer");
+                    assert_ne!(
+                        row, other,
+                        "stopped={stopped}: two outcomes share one answer"
+                    );
                 }
             }
         }
@@ -6953,11 +6991,13 @@ mod tests {
         assert!(row.contains('?'), "row must render the unknown age: {row}");
     }
 
-    /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
-    /// additionally an `advance` hint when the phase is gate-pending
-    /// (answer the gate, then advance), and nothing for a non-stuck phase.
+    /// 21a / 50-12: `recovery_hints` returns a `resume` hint for a phase
+    /// whose supervisor is GONE while it is not stopped, additionally an
+    /// `advance` hint when the phase is gate-pending (answer the gate, then
+    /// advance), `stop` then `resume` for a STALE socket, and nothing for an
+    /// ALIVE, stopped or unlaunched phase.
     #[test]
-    fn recovery_hints_includes_resume_for_stuck() {
+    fn recovery_hints_includes_resume_for_gone_while_active() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
             PhaseId::new(7),
@@ -6966,13 +7006,13 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        let hints = recovery_hints(&state, Liveness::Stuck);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
 
     #[test]
-    fn recovery_hints_includes_advance_when_stuck_and_gate_pending() {
+    fn recovery_hints_includes_advance_when_gone_while_active_and_gate_pending() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::new(
             PhaseId::new(7),
@@ -6982,7 +7022,7 @@ mod tests {
         );
         state.gate_pending = true;
 
-        let hints = recovery_hints(&state, Liveness::Stuck);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
         assert_eq!(
             hints,
@@ -6994,7 +7034,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_hints_empty_for_healthy() {
+    fn recovery_hints_names_stop_then_resume_for_stale() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
             PhaseId::new(7),
@@ -7003,7 +7043,35 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::Stale),
+            vec![
+                "devflow stop --phase 7".to_string(),
+                "devflow resume --phase 7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_hints_empty_for_alive_stopped_and_unlaunched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let alive = PhaseLiveness::Alive {
+            owner: "agent_running".to_string(),
+            launch: "stream".to_string(),
+        };
+
+        for liveness in [alive, PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+            assert!(
+                recovery_hints(&state, &liveness).is_empty(),
+                "{liveness:?} needs no repair"
+            );
+        }
     }
 
     /// 21a / 999.30 IN-01: the shared one-pass event summary's

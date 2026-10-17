@@ -596,7 +596,10 @@ fn status_reports_each_liveness_state_with_its_repair_verb() {
         .find(&resume_verb)
         .unwrap_or_else(|| panic!("STALE names `{resume_verb}` after the stop:\n{stale}"));
     assert!(stop_at < resume_at, "stop comes before resume:\n{stale}");
-    assert!(!stale.contains("ALIVE"), "a STALE run is not ALIVE:\n{stale}");
+    assert!(
+        !stale.contains("ALIVE"),
+        "a STALE run is not ALIVE:\n{stale}"
+    );
 
     fs::remove_file(&socket).expect("remove the stale socket");
     let gone = run_status(&home, &root);
