@@ -1331,13 +1331,166 @@ pub struct StageRun {
     pub supervisor: Supervisor,
 }
 
+/// How long [`confirm_own_group`] waits for a just-spawned agent's
+/// `setpgid` to become visible before it declares a mismatch.
+const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
+
 /// Supervise one stage's agent under an addressed [`Supervisor`], in either
-/// supervision shape.
+/// supervision shape, and return once the agent has exited.
+///
+/// The order is the contract:
+/// 1. [`install_signal_pipe`](crate::supervisor::runtime::install_signal_pipe),
+///    so SIGTERM and SIGINT to this process become stop events, never a
+///    death that orphans the agent (D-05, 999.134).
+/// 2. Spawn the agent through `hermetic_command` (the adapter env re-applied
+///    after its scrub, the gate notify command stripped) with
+///    `process_group(0)`, then require that it leads its own process group
+///    before anything is recorded (R-3). A mismatch kills and reaps it and
+///    returns [`MonitorError::PgidMismatch`].
+/// 3. Write the agent pid file, then [`Supervisor::serve`]: the sidecar is
+///    written before the socket name appears (R-7).
+/// 4. [`Supervisor::wait_agent`], then the exit file: the agent's code for
+///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`].
+///
+/// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
+/// advances only on [`AgentOutcome::Completed`].
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
-    Err(MonitorError::NotReady(format!(
-        "{} shape: RED stub",
+    if let StageIo::Stream { .. } = spec.io {
+        return Err(MonitorError::NotReady(
+            "stream shape lands in task 2".to_string(),
+        ));
+    }
+    crate::supervisor::runtime::install_signal_pipe()?;
+
+    let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
+    let stderr_file = crate::agent_result::stderr_path(&spec.project_root, spec.phase);
+    let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
+    let pid_file = crate::agent_result::agent_pid_path(&spec.project_root, spec.phase);
+    if let Some(parent) = stdout_file.parent() {
+        crate::workflow::ensure_devflow_dir(parent)?;
+    }
+
+    // Both files truncate at open, as the Legacy script's `>` and `2>` do,
+    // and stay separate so stderr never corrupts the parsed stdout capture.
+    let mut agent_cmd = hermetic_command(&spec.program, &spec.workdir);
+    strip_notify_env(&mut agent_cmd);
+    agent_cmd
+        .args(&spec.args)
+        .envs(spec.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::fs::File::create(&stdout_file)?))
+        .stderr(Stdio::from(std::fs::File::create(&stderr_file)?))
+        .process_group(0);
+    let mut child = agent_cmd.spawn()?;
+    let pid = child.id();
+
+    if let Err(pgid) = confirm_own_group(pid) {
+        abandon_agent(&mut child);
+        return Err(MonitorError::PgidMismatch { pid, pgid });
+    }
+    if let Err(err) = std::fs::write(&pid_file, format!("{pid}\n")) {
+        abandon_agent(&mut child);
+        return Err(err.into());
+    }
+    let supervisor = match Supervisor::serve(spec.socket.clone(), stage_sidecar(&spec, pid)) {
+        Ok(supervisor) => supervisor,
+        Err(err) => {
+            abandon_agent(&mut child);
+            return Err(err.into());
+        }
+    };
+
+    let outcome = match supervisor.wait_agent(&mut child) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            abandon_agent(&mut child);
+            return Err(err.into());
+        }
+    };
+    let code = match outcome {
+        AgentOutcome::Completed(code) => code,
+        AgentOutcome::Stopped => crate::supervisor::runtime::STOPPED_EXIT_CODE,
+    };
+    std::fs::write(&exit_file, format!("{code}\n"))?;
+    info!(
+        "supervised {} agent {pid} ended: {outcome:?}",
         spec.io.label()
-    )))
+    );
+    Ok(StageRun {
+        outcome,
+        supervisor,
+    })
+}
+
+/// Require that `pid` leads its own process group: `getpgid(pid) == pid`.
+/// A just-spawned child's `setpgid` has normally landed by the time `spawn`
+/// returns; if it has not, re-read `/proc/<pid>/stat` field 5 (falling back
+/// to `getpgid` where `/proc` is unreadable) for at most
+/// [`PGID_SETTLE_WAIT`]. Returns the pgid last seen on a mismatch (`-1` when
+/// it could not be read).
+fn confirm_own_group(pid: u32) -> Result<(), i32> {
+    let Ok(signed) = libc::pid_t::try_from(pid) else {
+        return Err(-1);
+    };
+    // SAFETY: getpgid has no memory preconditions; a bad pid returns -1.
+    let read_pgid = || proc_stat_pgrp(pid).unwrap_or_else(|| unsafe { libc::getpgid(signed) });
+    // SAFETY: as above.
+    let mut pgid = unsafe { libc::getpgid(signed) };
+    let deadline = std::time::Instant::now() + PGID_SETTLE_WAIT;
+    while pgid != signed && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        pgid = read_pgid();
+    }
+    if pgid == signed { Ok(()) } else { Err(pgid) }
+}
+
+/// Field 5 (`pgrp`) of `/proc/<pid>/stat`, or `None` where it cannot be read.
+fn proc_stat_pgrp(pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) may hold spaces or parentheses: split after the last
+    // `)`. Field 3 is then index 0, so field 5 is index 2.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// SIGKILL an agent this function's caller spawned (its group, when it leads
+/// one) and reap it, on a path that gives up before the supervisor owns it.
+/// The pid comes from the in-memory `Child`, never from disk.
+fn abandon_agent(child: &mut std::process::Child) {
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    let own_group = unsafe { libc::getpgrp() };
+    if let Ok(signed) = libc::pid_t::try_from(child.id())
+        && signed > 1
+        && signed != own_group
+    {
+        // SAFETY: `signed > 1` and not our own group. A child that does not
+        // lead a group makes this ESRCH: no group can be numbered by a pid
+        // that is still alive as a non-leader.
+        unsafe { libc::kill(-signed, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The sidecar for `spec`'s agent, spawned as `agent_pid` (its own group
+/// leader), served by this process.
+fn stage_sidecar(spec: &StageSpec, agent_pid: u32) -> crate::supervisor::Sidecar {
+    let supervisor_pid = std::process::id();
+    crate::supervisor::Sidecar {
+        launch_id: spec.launch_id.clone(),
+        project_root: spec.project_root.clone(),
+        phase: spec.phase,
+        stage: spec.stage.as_ref().map(ToString::to_string),
+        agent: spec.agent.to_string(),
+        launch: spec.io.label().to_string(),
+        agent_pid,
+        agent_pgid: agent_pid,
+        agent_start_time: crate::agent::process_start_time(agent_pid).unwrap_or(0),
+        boot_id: crate::supervisor::boot_id().unwrap_or_default(),
+        supervisor_pid,
+        supervisor_start_time: crate::agent::process_start_time(supervisor_pid).unwrap_or(0),
+        created_at: crate::supervisor::rfc3339_now(),
+    }
 }
 
 /// The idle-timeout firing sequence, in the ONE order it may run (D-05).
