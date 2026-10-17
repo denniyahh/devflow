@@ -925,6 +925,38 @@ pub(crate) fn run_monitor(
     agent: AgentKind,
     argv: &[String],
 ) -> Result<(), CliError> {
+    supervise_monitor(
+        project_root,
+        phase,
+        stage,
+        workdir,
+        prompt_file,
+        idle_timeout_secs,
+        agent,
+        argv,
+        true,
+    )
+}
+
+/// [`run_monitor`]'s body. `advance` is `true` on every production path; the
+/// test build's supervise-only monitor harness entry (50-10) passes `false`
+/// so an in-crate launch supervises its agent without moving the stage
+/// machine on.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "run_monitor's independently parsed monitor arguments plus the advance switch"
+)]
+pub(crate) fn supervise_monitor(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+    workdir: &Path,
+    prompt_file: &Path,
+    idle_timeout_secs: u64,
+    agent: AgentKind,
+    argv: &[String],
+    advance: bool,
+) -> Result<(), CliError> {
     let prompt = std::fs::read_to_string(prompt_file).map_err(|err| {
         CliError::Message(format!(
             "monitor could not read the prompt file {}: {err}",
@@ -989,6 +1021,9 @@ pub(crate) fn run_monitor(
     )
     .map_err(|err| CliError::Message(format!("pipe-owning monitor failed: {err}")))?;
 
+    if !advance {
+        return Ok(());
+    }
     advance_for_stage(project_root, Some(phase), stage)
 }
 
@@ -1161,7 +1196,7 @@ fn spawn_agent_and_record(
     // registry on the same code path that just recorded monitor_pid, so a
     // running phase cannot be missing from `devflow gate list --all-roots`.
     // Best-effort observability — never a reason to fail a launch.
-    let _ = devflow_core::registry::register(&state.project_root, state.phase);
+    let _ = devflow_core::registry::register_in(&ctx.cache_dir, &state.project_root, state.phase);
     events::emit(
         &state.project_root,
         state.phase,

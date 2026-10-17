@@ -733,11 +733,19 @@ fn monitor_command(
         MonitorExec::Subcommand { .. } => {
             command.args(monitor_argv);
         }
-        // RED (50-10 Task 1): the harness entry is not wired yet, so a test
-        // build still re-execs the test binary as `__monitor`.
+        // libtest cannot parse `__monitor`'s arguments, so they travel in the
+        // environment and the test binary runs exactly the named entry.
         #[cfg(feature = "test-support")]
-        MonitorExec::HarnessEntry { .. } => {
-            command.args(monitor_argv);
+        MonitorExec::HarnessEntry { test_name, .. } => {
+            let after_subcommand = match monitor_argv.split_first() {
+                Some((first, rest)) if first == "__monitor" => rest,
+                _ => monitor_argv,
+            };
+            let encoded = serde_json::to_string(after_subcommand).map_err(std::io::Error::other)?;
+            command
+                .arg(test_name)
+                .args(["--exact", "--include-ignored", "--test-threads=1"])
+                .env(MONITOR_ARGV_ENV, encoded);
         }
     }
     Ok(command)
