@@ -40,8 +40,9 @@ use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
+use devflow_core::state::SupervisorRecord;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
-use devflow_core::supervisor::runtime::AgentOutcome;
+use devflow_core::supervisor::runtime::{AgentOutcome, OwnerPhase, StopToken};
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
     agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
@@ -952,25 +953,139 @@ pub(crate) const SUPERVISOR_STOP_REASON: &str =
 /// records the stop.
 const STOP_RECORD_LOCK_WAIT: Duration = Duration::from_secs(30);
 
+/// What a supervisor's advance reads on this thread (50-13): its stop token,
+/// for the advance's safe points, and the successor the advance recorded.
+struct EngagedAdvance {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the advance safe points (50-13 Task 2)")
+    )]
+    token: StopToken,
+    successor: Option<SupervisorRecord>,
+}
+
+thread_local! {
+    /// Set only while [`StopTokenGuard`] is alive. Thread-local, not a
+    /// process-global static, so parallel in-crate tests never share it; an
+    /// advance run by anything other than a supervisor (the hidden
+    /// `devflow advance`, a test calling `advance_with` directly) sees `None`
+    /// and every safe point proceeds.
+    static ENGAGED_ADVANCE: std::cell::RefCell<Option<EngagedAdvance>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes a supervisor's stop token visible to the safe points of the
+/// advance running on this thread, for as long as the guard lives (RAII,
+/// the [`AutoChainGuard`] shape). Dropping it clears the token and the
+/// successor slot.
+struct StopTokenGuard {
+    /// Keeps the guard on the thread whose slot it set.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl StopTokenGuard {
+    fn engage(token: StopToken) -> Self {
+        ENGAGED_ADVANCE.with(|slot| {
+            *slot.borrow_mut() = Some(EngagedAdvance {
+                token,
+                successor: None,
+            });
+        });
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for StopTokenGuard {
+    fn drop(&mut self) {
+        ENGAGED_ADVANCE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Run `f` on the engaged stop token, or return `None` when no supervisor's
+/// advance is running on this thread.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the advance safe points (50-13 Task 2)")
+)]
+fn with_stop_token<R>(f: impl FnOnce(&StopToken) -> R) -> Option<R> {
+    let token = ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().map(|e| e.token.clone()));
+    token.map(|token| f(&token))
+}
+
+/// Remember `record` as the successor this advance published, so
+/// [`run_monitor`] marks this supervisor handed off once the advance has
+/// returned. A no-op when no supervisor's advance is engaged.
+fn record_successor(record: SupervisorRecord) {
+    ENGAGED_ADVANCE.with(|slot| {
+        if let Some(engaged) = slot.borrow_mut().as_mut() {
+            engaged.successor = Some(record);
+        }
+    });
+}
+
+/// Take the successor [`record_successor`] stored, if any.
+fn take_successor() -> Option<SupervisorRecord> {
+    ENGAGED_ADVANCE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|engaged| engaged.successor.take())
+    })
+}
+
+/// How long a [`test_hold`] waits for its release file.
+#[cfg(test)]
+const TEST_HOLD_WAIT: Duration = Duration::from_secs(30);
+
+/// Test-only hold point (50-13): inside a supervisor's own advance (a stop
+/// token engaged), when `DEVFLOW_TEST_HOLD` is `<point>:<path>` for this
+/// `point`, write `<path>.held` and wait (bounded by [`TEST_HOLD_WAIT`]) until
+/// `<path>` exists, so a test can land a stop, a signal or a kill in a chosen
+/// window. A launch made outside an advance (the test's own first launch)
+/// never holds. Compiled out of non-test builds, together with every call.
+#[cfg(test)]
+fn test_hold(point: &str) {
+    if with_stop_token(|_| ()).is_none() {
+        return;
+    }
+    let Ok(hold) = std::env::var("DEVFLOW_TEST_HOLD") else {
+        return;
+    };
+    let Some((at, path)) = hold.split_once(':') else {
+        return;
+    };
+    if at != point {
+        return;
+    }
+    let _ = std::fs::write(format!("{path}.held"), "");
+    let release = Path::new(path);
+    let deadline = std::time::Instant::now() + TEST_HOLD_WAIT;
+    while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The `__monitor` process body (50-11): supervise the stage's agent under
 /// an addressed supervisor (`monitor::run_supervised_stage`), then, only
 /// when the agent completed on its own, advance the stage machine
 /// in-process (D-02). A stopped run is recorded as stopped and never
 /// advances.
 ///
+/// The handoff (50-13, R-1): the advance runs with this supervisor's stop
+/// token engaged for its safe points and, when it launches the next stage,
+/// records the next supervisor under the per-phase lock before it returns.
+/// Only after it has returned (the lock released) is this supervisor marked
+/// handed off, so every stop that reaches it during the advance is a
+/// flagged `Advancing` stop (RV-04), and only then does `finish` unlink its
+/// socket: the state never names a socket that is gone.
+///
+/// `advance` is `true` on every production path; the test build's
+/// supervise-only monitor harness entry (50-10) passes `false` so an
+/// in-crate launch supervises its agent without moving the stage machine on.
+///
 /// Runs in the detached `__monitor` process, never in the operator's CLI.
-pub(crate) fn run_monitor(invocation: &MonitorInvocation) -> Result<(), CliError> {
-    supervise_monitor(invocation, true)
-}
-
-/// [`run_monitor`]'s body. `advance` is `true` on every production path; the
-/// test build's supervise-only monitor harness entry (50-10) passes `false`
-/// so an in-crate launch supervises its agent without moving the stage
-/// machine on.
-pub(crate) fn supervise_monitor(
-    invocation: &MonitorInvocation,
-    advance: bool,
-) -> Result<(), CliError> {
+pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Result<(), CliError> {
     let MonitorInvocation {
         project_root,
         phase,
@@ -1029,7 +1144,15 @@ pub(crate) fn supervise_monitor(
 
     let result = match run.outcome {
         AgentOutcome::Completed(_) if advance => {
-            advance_for_stage(project_root, Some(phase), stage)
+            let stop_guard = StopTokenGuard::engage(run.supervisor.token());
+            let advanced = advance_for_stage(project_root, Some(phase), stage);
+            // The advance has returned and released the per-phase lock. Only
+            // a run whose advance published a successor is handed off.
+            if take_successor().is_some() {
+                run.supervisor.token().enter(OwnerPhase::HandedOff);
+            }
+            drop(stop_guard);
+            advanced
         }
         AgentOutcome::Completed(_) => {
             wait_for_launch_record(project_root, phase, &invocation.launch_id);
@@ -1292,8 +1415,12 @@ fn spawn_agent_and_record(
         monitor::MonitorLaunch::PipeOwning { .. } => "stream",
         monitor::MonitorLaunch::Legacy => "capture",
     };
+    #[cfg(test)]
+    test_hold("before_spawn");
     let published = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    #[cfg(test)]
+    test_hold("before_publish");
     let pid = published.supervisor_pid;
     let socket_path = published.record.socket_path.display().to_string();
     let launch_id = published.record.launch_id.clone();
@@ -1303,9 +1430,20 @@ fn spawn_agent_and_record(
     // in this same save; it is never cleared first (WR-04's pre-clear above
     // applies to `monitor_pid` only). `monitor_pid` names the supervisor
     // until 50-22 removes it.
+    //
+    // The handoff (50-13, R-1): this save is the publish. The previous
+    // supervisor, when this launch is its advance, stays alive and
+    // `Advancing` through it (RV-04: never handed off here) and only
+    // unlinks its own socket after the advance has returned, so a reader
+    // between the two always finds a live address.
+    #[cfg(test)]
+    test_hold("before_record_save");
     state.monitor_pid = Some(pid);
-    state.supervisor = Some(published.record);
+    state.supervisor = Some(published.record.clone());
     workflow::save_state(state)?;
+    record_successor(published.record);
+    #[cfg(test)]
+    test_hold("after_publish");
     match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
         Ok(Some(path_kind)) => {
             let path_kind = match path_kind {

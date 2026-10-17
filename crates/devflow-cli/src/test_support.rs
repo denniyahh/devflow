@@ -744,7 +744,7 @@ fn run_monitor_harness_entry(advance: bool) {
         idle_timeout_secs,
         argv,
     };
-    crate::pipeline_launch::supervise_monitor(&invocation, advance)
+    crate::pipeline_launch::run_monitor(&invocation, advance)
         .expect("the harness-entry monitor must supervise its agent");
 }
 
