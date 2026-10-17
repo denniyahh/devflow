@@ -388,12 +388,12 @@ former criterion 4 (detect and report a 2.x state as incompatible) is retired;
 the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 0/25 plans complete (17 waves); 50-19 is the single operator checkpoint for the live attempt
+**Plans**: 2/25 plans executed (17 waves); 50-19 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
-- [ ] 50-01-PLAN.md *(no plan dependencies)* — staged semver gate (`tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
-- [ ] 50-02-PLAN.md *(no plan dependencies)* — 999.141 tracer: shared hermetic test helper, V-26 with its negative control, start_lock/stop e2e migrated
+- [x] 50-01-PLAN.md *(no plan dependencies)* — staged semver gate (`tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
+- [x] 50-02-PLAN.md *(no plan dependencies)* — 999.141 tracer: shared hermetic test helper, V-26 with its negative control, start_lock/stop e2e migrated
 
 **Wave 2**
 
@@ -676,7 +676,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 0/24 | Planned | — |
+| 50 | 2/25 | In Progress | — |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
