@@ -340,3 +340,7 @@ None.
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-17*
+
+## Self-Check: PASSED
+
+All seven commits (`28e0351`, `8cf5a1b`, `ed26076`, `d6e3de4`, `dc8512c`, `723fe3e`, `f909aba`) are ancestors of HEAD, and this SUMMARY exists on disk.
