@@ -310,7 +310,14 @@ impl Gates {
     }
 
     /// [`poll_response`](Self::poll_response) that a caller can cancel
-    /// (50-13, R-2): RED scaffold.
+    /// (50-13, R-2): the same loop, except that every sleep is at most one
+    /// second and `cancel` is checked on every iteration, so a cancel ends
+    /// the wait within about a second of being set.
+    ///
+    /// Returns the response when it appears, or `None` on a timeout or a
+    /// cancel. A caller tells the two apart by asking its own `cancel`
+    /// again: a `None` returned before the timeout means `cancel` answered
+    /// `true`. A response already on disk wins over a cancel.
     pub fn poll_response_cancellable(
         project_root: &Path,
         phase: PhaseId,
@@ -318,8 +325,30 @@ impl Gates {
         timeout_secs: u64,
         cancel: impl Fn() -> bool,
     ) -> Option<GateResponse> {
-        let _ = &cancel;
-        Self::poll_response(project_root, phase, stage, timeout_secs)
+        let path = Self::response_path(project_root, phase, stage);
+        let deadline = Duration::from_secs(timeout_secs);
+        let mut waited = Duration::ZERO;
+        let mut backoff = Duration::from_secs(1);
+        let cap = Duration::from_secs(60);
+        let slice = Duration::from_secs(1);
+        debug!(
+            "polling (cancellable) for gate response at {}",
+            path.display()
+        );
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&path)
+                && let Ok(response) = serde_json::from_str::<GateResponse>(&contents)
+            {
+                return Some(response);
+            }
+            if waited >= deadline || cancel() {
+                return None;
+            }
+            let sleep = backoff.min(deadline - waited).min(slice);
+            std::thread::sleep(sleep);
+            waited += sleep;
+            backoff = (backoff * 2).min(cap);
+        }
     }
 
     /// Write an ack file signalling the response was read.
