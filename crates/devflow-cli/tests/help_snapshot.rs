@@ -5,12 +5,12 @@
 //! ```bash
 //! cargo run -q -p devflow -- --help > crates/devflow-cli/tests/snapshots/devflow-help.txt
 //! ```
+//!
+//! The child is built by `common::hermetic_devflow`, so it never reads the
+//! operator's real config or cache (999.141); the help text does not depend
+//! on either.
 
-use std::process::Command;
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
+mod common;
 
 /// Normalize trailing whitespace per line so editor/clap cosmetic drift
 /// doesn't produce false diffs.
@@ -25,7 +25,8 @@ fn normalized(text: &str) -> String {
 
 #[test]
 fn help_output_matches_committed_snapshot() {
-    let output = Command::new(devflow_bin())
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
         .arg("--help")
         .output()
         .expect("run devflow --help");
