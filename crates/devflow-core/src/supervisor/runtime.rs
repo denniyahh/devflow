@@ -1092,10 +1092,18 @@ mod tests {
                     action
                 })
             };
+            let reached = std::cell::Cell::new(false);
             let verdict = run_stage(&token, Some(window), &|| {
+                reached.set(true);
                 ready.wait();
                 done.wait();
             });
+            // A run that ended before its window would leave the stopper
+            // blocked on the barrier: fail here rather than hang on the join.
+            assert!(
+                reached.get(),
+                "{window:?}: the run ended before its window was reached: {verdict:?}"
+            );
             let action = stopper.join().expect("the stopper thread");
             assert_eq!(action, expected_action, "{window:?}: the stop's action");
             assert_eq!(
