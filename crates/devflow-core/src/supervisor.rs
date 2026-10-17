@@ -298,16 +298,8 @@ pub enum ProbeError {
 /// 4. A connect is not proof of life (a listen backlog accepts it with
 ///    nobody serving): only a valid ping reply makes it `Alive`.
 pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Liveness::Gone),
-        Err(error) => return Err(ProbeError::Stat(error)),
-        Ok(meta) => meta,
-    };
-    if !meta.file_type().is_socket() {
-        return Err(ProbeError::NotASocket(path.to_path_buf()));
-    }
-    if meta.uid() != protocol::euid() {
-        return Err(ProbeError::ForeignOwner { uid: meta.uid() });
+    if !own_socket_at(path)? {
+        return Ok(Liveness::Gone);
     }
     let stream = match UnixStream::connect(path) {
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -319,6 +311,25 @@ pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
     protocol::ping(stream)
         .map(Liveness::Alive)
         .map_err(ProbeError::NoReply)
+}
+
+/// [`probe`]'s pre-connect checks, shared with [`request_shutdown`]:
+/// `Ok(false)` when no file is at `path` (`lstat` NotFound), `Ok(true)` for a
+/// socket owned by this uid, and a [`ProbeError`] for a stat failure, a
+/// non-socket (a symlink included) or another uid's socket.
+fn own_socket_at(path: &Path) -> Result<bool, ProbeError> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(ProbeError::Stat(error)),
+        Ok(meta) => meta,
+    };
+    if !meta.file_type().is_socket() {
+        return Err(ProbeError::NotASocket(path.to_path_buf()));
+    }
+    if meta.uid() != protocol::euid() {
+        return Err(ProbeError::ForeignOwner { uid: meta.uid() });
+    }
+    Ok(true)
 }
 
 /// The JSON file beside a socket (same stem, `.json`, mode `0600`) that
@@ -631,8 +642,17 @@ fn socket_name_parts(stem: &str) -> Option<(u64, &str, &str)> {
 /// [`sweep_for_in`], [`probe`] and [`read_sidecar`] (D-06): only `stop` and
 /// the stale-socket backstop call it.
 pub fn remove_launch_files(socket: &SocketPath) -> io::Result<()> {
-    let _ = socket;
-    Ok(()) // RED stub
+    let mut first_error = None;
+    for path in [socket.as_path().to_path_buf(), socket.sidecar_path()] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// How a supervisor answered a shutdown request.
@@ -665,8 +685,106 @@ pub fn request_shutdown(
     path: &Path,
     final_timeout: std::time::Duration,
 ) -> Result<ShutdownOutcome, ProbeError> {
-    let _ = (path, final_timeout);
-    Err(ProbeError::NoReply("RED stub".to_string()))
+    use std::io::Write;
+    if !own_socket_at(path)? {
+        return Err(ProbeError::Stat(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no socket at {}", path.display()),
+        )));
+    }
+    let stream = UnixStream::connect(path).map_err(ProbeError::Connect)?;
+    let timeout_error =
+        |error: io::Error| ProbeError::NoReply(format!("could not set socket timeouts: {error}"));
+    stream
+        .set_read_timeout(Some(protocol::IO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(protocol::IO_TIMEOUT)))
+        .map_err(timeout_error)?;
+    let request = serde_json::to_string(&protocol::Request::Shutdown)
+        .map_err(|error| ProbeError::NoReply(format!("could not encode shutdown: {error}")))?;
+    (&stream)
+        .write_all(format!("{request}\n").as_bytes())
+        .map_err(|error| ProbeError::NoReply(format!("could not send shutdown: {error}")))?;
+    // One reader across both lines: it may already hold the final line.
+    let mut reader = io::BufReader::new(&stream);
+    match read_shutdown_line(&mut reader, "accepted")? {
+        ShutdownLine::Accepted => {}
+        ShutdownLine::Refused(error) => return Ok(refusal(error)),
+        ShutdownLine::Stopped(_) => {
+            return Err(ProbeError::NoReply(
+                "a stopped line arrived before the accepted line".to_string(),
+            ));
+        }
+    }
+    stream
+        .set_read_timeout(Some(final_timeout))
+        .map_err(timeout_error)?;
+    match read_shutdown_line(&mut reader, "final")? {
+        ShutdownLine::Stopped(stopped) => Ok(ShutdownOutcome::Stopped {
+            exit_code: stopped.exit_code,
+            advance_suppressed: stopped.advance_suppressed,
+        }),
+        ShutdownLine::Refused(error) => Ok(refusal(error)),
+        ShutdownLine::Accepted => Err(ProbeError::NoReply(
+            "a second accepted line arrived instead of the final line".to_string(),
+        )),
+    }
+}
+
+/// One parsed shutdown reply line.
+enum ShutdownLine {
+    Accepted,
+    Stopped(protocol::ShutdownStopped),
+    Refused(String),
+}
+
+/// A refusal's error string as an outcome: `handed_off` is its own outcome.
+fn refusal(error: String) -> ShutdownOutcome {
+    if error == "handed_off" {
+        ShutdownOutcome::HandedOff
+    } else {
+        ShutdownOutcome::Refused(error)
+    }
+}
+
+/// Read and classify one shutdown reply line. A missing, oversized or
+/// malformed line, `"ok":true` with neither marker, and `"ok":false` with no
+/// error string are all errors.
+fn read_shutdown_line(
+    reader: &mut impl io::BufRead,
+    which: &str,
+) -> Result<ShutdownLine, ProbeError> {
+    let line = protocol::read_line(reader)
+        .map_err(|error| ProbeError::NoReply(format!("no {which} shutdown line: {error}")))?;
+    let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+        ProbeError::NoReply(format!(
+            "{which} shutdown line is not JSON ({error}): {line}"
+        ))
+    })?;
+    let is_true = |key: &str| value.get(key) == Some(&serde_json::Value::Bool(true));
+    let (ok, stopped, accepted) = (is_true("ok"), is_true("stopped"), is_true("accepted"));
+    if value.get("ok") == Some(&serde_json::Value::Bool(false)) {
+        return match value.get("error").and_then(serde_json::Value::as_str) {
+            Some(error) => Ok(ShutdownLine::Refused(error.to_string())),
+            None => Err(ProbeError::NoReply(format!(
+                "{which} shutdown line refuses without an error: {line}"
+            ))),
+        };
+    }
+    if ok && stopped {
+        return serde_json::from_value(value)
+            .map(ShutdownLine::Stopped)
+            .map_err(|error| {
+                ProbeError::NoReply(format!(
+                    "{which} shutdown line is missing fields ({error}): {line}"
+                ))
+            });
+    }
+    if ok && accepted {
+        return Ok(ShutdownLine::Accepted);
+    }
+    Err(ProbeError::NoReply(format!(
+        "{which} shutdown line is neither accepted nor stopped: {line}"
+    )))
 }
 
 #[cfg(test)]
