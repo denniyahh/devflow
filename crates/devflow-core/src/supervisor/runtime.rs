@@ -337,6 +337,12 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     })
 }
 
+/// Turn SIGTERM and SIGINT into stop events for this process's supervisor.
+/// RED stub: installs nothing yet.
+pub fn install_signal_pipe() -> io::Result<()> {
+    Ok(())
+}
+
 /// A running supervisor: its published socket, its sidecar and its control
 /// thread. Dropping it without [`finish`](Self::finish) still stops the
 /// thread and removes the launch files.
@@ -661,6 +667,8 @@ mod tests {
     const OUTCOME_ENV: &str = "DEVFLOW_TEST_RUNTIME_OUTCOME";
     /// The `sh -c` script the child supervisor runs as its agent.
     const AGENT_ENV: &str = "DEVFLOW_TEST_RUNTIME_AGENT";
+    /// `1` when the child supervisor installs the signal pipe first.
+    const PIPE_ENV: &str = "DEVFLOW_TEST_RUNTIME_PIPE";
 
     /// How long the parent waits for a child supervisor to answer a ping or
     /// to exit.
@@ -771,13 +779,17 @@ mod tests {
         }
     }
 
-    /// The child half shared by every runtime process test: spawn the agent script in its own process
+    /// The child half shared by every runtime process test: optionally
+    /// install the signal pipe, spawn the agent script in its own process
     /// group, serve, wait, finish, and record the outcome.
     fn supervise_in_child() {
         let socket = std::env::var_os(SOCKET_ENV).expect("the parent names the socket");
         let socket = SocketPath::new(PathBuf::from(socket)).expect("socket path fits");
         let outcome_path = std::env::var_os(OUTCOME_ENV).expect("the parent names the outcome");
         let script = std::env::var_os(AGENT_ENV).expect("the parent names the agent script");
+        if std::env::var_os(PIPE_ENV).is_some_and(|value| value == "1") {
+            install_signal_pipe().expect("install the signal pipe");
+        }
         let mut agent = Command::new("/bin/sh")
             .arg("-c")
             .arg(script)
@@ -815,7 +827,7 @@ mod tests {
 
     /// Re-run `test_name` as a child supervisor for `script` and wait until
     /// its socket answers a ping.
-    fn launch(test_name: &str, cache: &Path, script: &str) -> Launched {
+    fn launch(test_name: &str, cache: &Path, script: &str, install_pipe: bool) -> Launched {
         let socket = SocketPath::for_launch(
             cache,
             Path::new("/project/runtime"),
@@ -824,6 +836,7 @@ mod tests {
         )
         .expect("socket path fits sun_path");
         let outcome = cache.join("outcome");
+        let pipe = if install_pipe { "1" } else { "0" };
         let mut child = ChildGuard(Some(spawn_test_in_child(
             test_name,
             cache,
@@ -831,6 +844,7 @@ mod tests {
                 (SOCKET_ENV, socket.as_path().as_os_str()),
                 (OUTCOME_ENV, outcome.as_os_str()),
                 (AGENT_ENV, std::ffi::OsStr::new(script)),
+                (PIPE_ENV, std::ffi::OsStr::new(pipe)),
             ],
         )));
         let deadline = Instant::now() + CHILD_WAIT;
@@ -863,7 +877,12 @@ mod tests {
             return;
         }
         let cache = short_cache();
-        let mut run = launch(SHUTDOWN_TEST, cache.path(), "sleep 60 & sleep 60 & wait");
+        let mut run = launch(
+            SHUTDOWN_TEST,
+            cache.path(),
+            "sleep 60 & sleep 60 & wait",
+            false,
+        );
         assert_eq!(run.reply.owner, "agent_running");
         let pgid = run.reply.agent_pgid;
         assert_eq!(pgid, run.reply.agent_pid, "the agent leads its own group");
@@ -910,7 +929,7 @@ mod tests {
             "while [ ! -e '{}' ]; do sleep 0.05; done; exit 7",
             go.display()
         );
-        let mut run = launch(COMPLETES_TEST, cache.path(), &script);
+        let mut run = launch(COMPLETES_TEST, cache.path(), &script, false);
         assert_eq!(run.reply.owner, "agent_running");
         std::fs::write(&go, "").expect("let the agent exit");
         let output = run.child.wait_exit();
@@ -1200,5 +1219,208 @@ mod tests {
         );
         assert_eq!(stopped.phase(), OwnerPhase::Finished);
         assert!(stopped.ended_stopped());
+    }
+
+    /// The named mask field of `/proc/<pid>/status` (`SigBlk`, `SigCgt`,
+    /// `SigIgn`, ...). Panics when the field is absent, so an unreadable
+    /// mask never reads as clear.
+    #[cfg(target_os = "linux")]
+    fn signal_mask_field(pid: u32, field: &str) -> u64 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap_or_else(|error| panic!("/proc/{pid}/status must be readable: {error}"));
+        let hex = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("/proc/{pid}/status has no {field} line"))
+            .trim();
+        u64::from_str_radix(hex, 16).expect("signal masks are hex")
+    }
+
+    /// `signal`'s bit in a `/proc` signal mask.
+    #[cfg(target_os = "linux")]
+    fn mask_bit(signal: libc::c_int) -> u64 {
+        1 << (signal - 1)
+    }
+
+    /// Whether `pid` is gone or a zombie: it can no longer run.
+    #[cfg(target_os = "linux")]
+    fn process_is_dead(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rfind(')')
+                .and_then(|end| stat[end + 1..].split_whitespace().next())
+                .is_some_and(|state| state == "Z"),
+        }
+    }
+
+    /// Send `signal` to a child this test spawned and still owns.
+    fn signal_child(child: &mut ChildGuard, signal: libc::c_int) {
+        let pid = libc::pid_t::try_from(child.child().id()).expect("pid fits pid_t");
+        assert!(pid > 1, "refusing to signal pid {pid}");
+        // SAFETY: `pid > 1` is a single, unreaped child of this process.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal the child");
+    }
+
+    #[cfg(target_os = "linux")]
+    const SIGNAL_TEST: &str = "supervisor::runtime::tests::sigterm_is_delivered_as_a_stop_event_not_handled_in_the_handler";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigterm_is_delivered_as_a_stop_event_not_handled_in_the_handler() {
+        use crate::test_support::{EXEC_VISIBILITY_POLL, EXEC_VISIBILITY_WAIT};
+        use std::os::unix::process::ExitStatusExt;
+        if crate::test_support::in_child_test(SIGNAL_TEST) {
+            supervise_in_child();
+            return;
+        }
+        let script = "sleep 60 & exec sleep 60";
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            let cache = short_cache();
+            let mut run = launch(SIGNAL_TEST, cache.path(), script, true);
+            let (agent, pgid) = (run.reply.agent_pid, run.reply.agent_pgid);
+            // Read the masks only once the agent runs `sleep`: before exec it
+            // is a copy of the supervisor and carries its handler.
+            assert!(
+                crate::test_support::wait_for_exec_visibility(
+                    agent,
+                    "sleep",
+                    EXEC_VISIBILITY_WAIT,
+                    EXEC_VISIBILITY_POLL
+                ),
+                "the agent must exec sleep"
+            );
+            let supervisor = run.child.child().id();
+            assert_ne!(
+                signal_mask_field(supervisor, "SigCgt") & mask_bit(libc::SIGTERM),
+                0,
+                "control: the mask reader sees the supervisor's own TERM handler"
+            );
+            let term_and_int = mask_bit(libc::SIGTERM) | mask_bit(libc::SIGINT);
+            assert_eq!(
+                signal_mask_field(agent, "SigBlk") & term_and_int,
+                0,
+                "the agent must not inherit a blocked TERM or INT"
+            );
+            assert_eq!(
+                signal_mask_field(agent, "SigCgt") & mask_bit(libc::SIGTERM),
+                0,
+                "the agent's TERM handler must be the default"
+            );
+
+            signal_child(&mut run.child, signal);
+            let output = run.child.wait_exit();
+            assert_child_ran_exactly_one_passing_test(&output, SIGNAL_TEST);
+            assert_eq!(run.outcome(), "Stopped", "signal {signal} is a stop");
+            assert!(
+                wait_until(Duration::from_secs(5), || !group_exists(pgid)),
+                "signal {signal}: the agent group must be gone"
+            );
+            assert!(
+                matches!(probe(&run.socket), Ok(Liveness::Gone)),
+                "signal {signal}: the socket must be gone"
+            );
+        }
+
+        // Control: a supervisor that did not install the pipe dies on the
+        // same SIGTERM and leaves its agent group running.
+        let cache = short_cache();
+        let mut run = launch(SIGNAL_TEST, cache.path(), script, false);
+        let pgid = run.reply.agent_pgid;
+        signal_child(&mut run.child, libc::SIGTERM);
+        let output = run.child.wait_exit();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGTERM),
+            "with no handler the supervisor dies on TERM: {output:?}"
+        );
+        assert!(
+            group_exists(pgid),
+            "with no handler the agent group outlives its supervisor"
+        );
+        // Reap that group by the pgid its ping reply named.
+        assert!(
+            signal_group(pgid, libc::SIGKILL),
+            "SIGKILL the orphaned group"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !group_exists(pgid)),
+            "the orphaned group must be gone after SIGKILL"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    const IGNORER_TEST: &str =
+        "supervisor::runtime::tests::a_term_ignoring_group_member_is_killed_after_the_leader_exits";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_term_ignoring_group_member_is_killed_after_the_leader_exits() {
+        use crate::test_support::{EXEC_VISIBILITY_POLL, EXEC_VISIBILITY_WAIT};
+        if crate::test_support::in_child_test(IGNORER_TEST) {
+            supervise_in_child();
+            return;
+        }
+        let cache = short_cache();
+        let member_file = cache.path().join("member");
+        let script = format!(
+            "(trap '' TERM; exec sleep 60) & echo $! > '{}'; wait",
+            member_file.display()
+        );
+        let mut run = launch(IGNORER_TEST, cache.path(), &script, false);
+        let pgid = run.reply.agent_pgid;
+        let mut member = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                member = std::fs::read_to_string(&member_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                member.is_some()
+            }),
+            "the agent must record its member's pid"
+        );
+        let member = member.expect("member pid");
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                member,
+                "sleep",
+                EXEC_VISIBILITY_WAIT,
+                EXEC_VISIBILITY_POLL
+            ),
+            "the member must exec sleep"
+        );
+        // The fixture is what it claims: the member is in the agent's group
+        // and ignores TERM.
+        // SAFETY: getpgid only reads; `member` is a live pid we just saw.
+        let member_pgid = unsafe { libc::getpgid(libc::pid_t::try_from(member).expect("pid")) };
+        assert_eq!(u32::try_from(member_pgid).ok(), Some(pgid));
+        assert_ne!(
+            signal_mask_field(member, "SigIgn") & mask_bit(libc::SIGTERM),
+            0,
+            "the member must ignore TERM"
+        );
+
+        let answer = request_shutdown(&run.socket, CHILD_WAIT);
+        assert_eq!(
+            answer.as_ref().ok(),
+            Some(&ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true
+            }),
+            "the stop is reported, got {answer:?}"
+        );
+        assert!(
+            wait_until(crate::agent::TERMINATE_VERIFY_WAIT, || process_is_dead(
+                member
+            )),
+            "the TERM-ignoring member must be gone within the grace window"
+        );
+        let output = run.child.wait_exit();
+        assert_child_ran_exactly_one_passing_test(&output, IGNORER_TEST);
+        assert_eq!(run.outcome(), "Stopped");
+        assert!(
+            wait_until(Duration::from_secs(5), || !group_exists(pgid)),
+            "the agent group must be gone"
+        );
     }
 }
