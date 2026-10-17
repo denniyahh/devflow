@@ -269,9 +269,15 @@ None.
 
 ## Next Phase Readiness
 
-- 50-11 can call `wait_for_publish(&mut child, &socket, &launch_id, PUBLISH_WAIT)` from `spawn_monitor` and remove every `cfg_attr(not(test), expect(dead_code, reason = "spawn_monitor calls it from 50-11"))` this plan added. There are 15 such items; an unfulfilled `expect` fails `-D warnings`, so none can be kept by accident.
+- 50-11 can call `wait_for_publish(&mut child, &socket, &launch_id, PUBLISH_WAIT)` from `spawn_monitor` and remove every `cfg_attr(not(test), expect(dead_code, reason = "spawn_monitor calls it from 50-11"))` this plan added. There are 18 such items (counted two independent ways, `rg -c` and a Python substring count over the non-test text, both 18); an unfulfilled `expect` fails `-D warnings`, so none can be kept by accident.
 - 50-13's CLI `test_hold` can rely on the `DEVFLOW_TEST_HOLD` allowlist entry.
 
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-17*
+
+## Self-Check: PASSED
+
+- Files: `crates/devflow-core/src/monitor.rs`, `doc-check-allowlist.toml` and this SUMMARY exist.
+- Commits `3d30a73`, `08e48e1`, `098c500`, `13f5d8f` and `eac1c55` are ancestors of HEAD (`git merge-base --is-ancestor`). Each RED `test(50-24)` commit comes before its GREEN `feat(50-24)` commit.
+- Correction made after the first write: an earlier draft of this SUMMARY said 15 dead-code expectations. The real count is 18, and the text above now says 18.
