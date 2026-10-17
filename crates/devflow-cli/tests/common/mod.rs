@@ -144,10 +144,17 @@ pub fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Terminates, on drop, the monitor recorded in the phase state and the
-/// agent named in the agent-pid file, unless its pid is in `spare`. Bind it
-/// before (or right after) the spawn that launches a run, and keep the
-/// run's [`HermeticHome`] alive until this has dropped.
+/// How long [`LaunchedRunReaper`] waits for a supervisor's final shutdown line.
+const REAP_SHUTDOWN_WAIT: Duration = Duration::from_secs(15);
+
+/// Ends, on drop, the run recorded in the phase state, through its
+/// supervisor's socket (D-07): a `shutdown` request first; then, if the
+/// recorded agent group's leader is still the process the record names
+/// (`agent::is_same_process` against its start time), a SIGKILL to that
+/// group. Only when the state holds no `supervisor` record does it fall back
+/// to the agent named in the agent-pid file. A pid in `spare` is never
+/// signalled. Bind it before (or right after) the spawn that launches a run,
+/// and keep the run's [`HermeticHome`] alive until this has dropped.
 pub struct LaunchedRunReaper {
     root: PathBuf,
     phase: PhaseId,
@@ -166,23 +173,50 @@ impl LaunchedRunReaper {
 
 impl Drop for LaunchedRunReaper {
     fn drop(&mut self) {
-        let monitor = devflow_core::workflow::load_state(&self.root, self.phase)
+        let record = devflow_core::workflow::load_state(&self.root, self.phase)
             .ok()
-            .and_then(|state| state.monitor_pid);
+            .and_then(|state| state.supervisor);
+        if let Some(record) = record {
+            let _ =
+                devflow_core::supervisor::request_shutdown(&record.socket_path, REAP_SHUTDOWN_WAIT);
+            let leader = record.agent_pgid;
+            if !self.spare.contains(&leader)
+                && devflow_core::agent::agent_running(leader)
+                && devflow_core::agent::is_same_process(leader, record.agent_start_time)
+            {
+                signal_group(leader, libc::SIGKILL);
+            }
+            return;
+        }
         let agent = fs::read_to_string(devflow_core::agent_result::agent_pid_path(
             &self.root, self.phase,
         ))
         .ok()
         .and_then(|pid| pid.trim().parse::<u32>().ok());
-        for pid in [monitor, agent].into_iter().flatten() {
-            if !self.spare.contains(&pid) && devflow_core::agent::agent_running(pid) {
-                let _ = devflow_core::agent::terminate_and_verify(
-                    pid,
-                    devflow_core::agent::TERMINATE_VERIFY_WAIT,
-                    devflow_core::agent::TERMINATE_VERIFY_POLL,
-                );
-            }
+        if let Some(pid) = agent
+            && !self.spare.contains(&pid)
+            && devflow_core::agent::agent_running(pid)
+        {
+            let _ = devflow_core::agent::terminate_and_verify(
+                pid,
+                devflow_core::agent::TERMINATE_VERIFY_WAIT,
+                devflow_core::agent::TERMINATE_VERIFY_POLL,
+            );
         }
+    }
+}
+
+/// Send `signal` to process group `pgid`. Refuses pgid 0 or 1, a value that
+/// does not fit `pid_t`, and this process's own group.
+pub fn signal_group(pgid: u32, signal: libc::c_int) {
+    let Ok(signed) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    if signed > 1 && signed != unsafe { libc::getpgrp() } {
+        // SAFETY: `signed > 1` and not our own group: one process group
+        // whose leader the caller has just identity-checked.
+        unsafe { libc::kill(-signed, signal) };
     }
 }
 

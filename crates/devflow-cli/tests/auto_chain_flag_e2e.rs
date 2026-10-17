@@ -202,6 +202,16 @@ impl Fixture {
 
     /// Run the REAL binary's hidden `__monitor` subcommand over `argv`.
     fn run_monitor(&self, argv: &[&str]) -> Output {
+        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
+        // under the hermetic cache dir this file's child process gets.
+        let launch_id = devflow_core::supervisor::new_launch_id();
+        let socket = devflow_core::supervisor::SocketPath::for_launch(
+            &self.home.cache_dir(),
+            &self.root,
+            self.phase,
+            &launch_id,
+        )
+        .expect("the hermetic socket path fits sun_path");
         common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
@@ -216,6 +226,12 @@ impl Fixture {
             .arg("30")
             .arg("--agent")
             .arg("claude")
+            .arg("--launch")
+            .arg("stream")
+            .arg("--launch-id")
+            .arg(&launch_id)
+            .arg("--socket")
+            .arg(socket.as_path())
             .arg("--")
             .args(argv)
             .output()
@@ -325,7 +341,7 @@ fn supervise_mode_code_stage_child_observes_the_flag_clear() {
 }
 
 /// The in-process half of criterion 2: the flag is cleared even when the run
-/// dies before `advance` is ever reached — `run_pipe_owning_monitor`'s
+/// dies before `advance` is ever reached — `run_supervised_stage`'s
 /// early-return `Err` path, driven here by a child program that cannot be
 /// spawned at all. (`35.1-02` owns the kill half.)
 ///
