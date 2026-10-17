@@ -220,6 +220,60 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
+/// The `/proc/<pid>/stat` fields the stale-socket backstop decides on
+/// ([`crate::supervisor::backstop`]): one read gives state, process group,
+/// session and start time together, so they describe the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "read only by the Linux backstop (MAC-2)")
+)]
+pub(crate) struct ProcStat {
+    /// Field 3, the one-letter state (`R`, `S`, `Z`, ...).
+    pub(crate) state: char,
+    /// Field 5, the process group id.
+    pub(crate) pgrp: i32,
+    /// Field 6, the session id.
+    pub(crate) session: i32,
+    /// Field 22, the start time in clock ticks since boot, as
+    /// [`process_start_time`] reads it.
+    pub(crate) start_time: u64,
+}
+
+/// Read [`ProcStat`] for `pid` from one read of `/proc/<pid>/stat`. `None`
+/// when the file cannot be read or parsed (the process is gone, or this is
+/// not Linux): the fail-closed direction, as for [`process_start_time`].
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "read only by the Linux backstop (MAC-2)")
+)]
+pub(crate) fn process_stat_fields(pid: u32) -> Option<ProcStat> {
+    parse_stat_fields(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// [`process_stat_fields`]'s parser. Splits after the FINAL `)`, because
+/// field 2 (comm) may contain spaces and parentheses; after that point field
+/// 3 is index 0, so field 5 is 2, field 6 is 3 and field 22 is 19.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "read only by the Linux backstop (MAC-2)")
+)]
+fn parse_stat_fields(stat: &str) -> Option<ProcStat> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let mut state_chars = fields.first()?.chars();
+    let state = state_chars.next()?;
+    if state_chars.next().is_some() {
+        return None;
+    }
+    Some(ProcStat {
+        state,
+        pgrp: fields.get(2)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
 /// Whether `pid` is the same process instance that recorded `expected_start`.
 ///
 /// The identity check `devflow stop` and friends should use. See
@@ -1023,5 +1077,34 @@ mod tests {
             second >= first,
             "age must grow monotonically across a sleep, never shrink"
         );
+    }
+
+    #[test]
+    fn stat_fields_parse_after_the_last_paren_and_reject_a_short_line() {
+        // comm carries spaces and a ") (" so a naive split would misread
+        // every field after it. Fields after comm: state R, ppid 1, pgrp
+        // 4242, session 4100, then 15 filler fields, then start time 98765.
+        let filler = "0 ".repeat(15);
+        let line = format!("4242 (a) (b c) R 1 4242 4100 {filler}98765 0 0");
+        assert_eq!(
+            parse_stat_fields(&line),
+            Some(ProcStat {
+                state: 'R',
+                pgrp: 4242,
+                session: 4100,
+                start_time: 98_765,
+            })
+        );
+        // Control: a line cut before field 22 is not a stat.
+        assert_eq!(parse_stat_fields("4242 (a) R 1 4242 4100 0 0"), None);
+        // And the live file agrees with process_start_time for this process.
+        #[cfg(target_os = "linux")]
+        {
+            let me = std::process::id();
+            let stat = process_stat_fields(me).expect("read this process's own stat");
+            assert_eq!(Some(stat.start_time), process_start_time(me));
+            // SAFETY: getpgrp has no preconditions and cannot fail.
+            assert_eq!(stat.pgrp, unsafe { libc::getpgrp() });
+        }
     }
 }
