@@ -972,4 +972,225 @@ mod tests {
             assert_eq!(found[index], format!("line {line}: {needle}"));
         }
     }
+
+    /// The windows of one stage's life in which a stop can land (V-14).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Window {
+        /// The agent is still running.
+        BeforeExit,
+        /// `waitid` has seen the exit, the leader is unreaped, and the exit
+        /// decision has not been taken.
+        ExitObservedBeforeDecision,
+        /// The CLI is waiting on a gate.
+        DuringGateWait,
+        /// Safe point 1 has passed and the run is `Advancing` again, before
+        /// safe point 2 (right before the next stage's spawn).
+        AfterAdvancingBeforeSpawn,
+        /// The next stage is spawned and answers ping, before it is
+        /// published (safe point 3).
+        BetweenSpawnAndPublish,
+    }
+
+    /// How one stage's life ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        /// The next stage was published: the pipeline advanced.
+        Advanced,
+        /// The run stopped at this decision and launched nothing further.
+        Stopped(&'static str),
+    }
+
+    /// One stage's life against a real [`StopToken`]: a real agent process
+    /// (`cat`, which exits when its stdin closes) is observed with `waitid`
+    /// without reaping, the exit is decided under the owner lock, and the
+    /// advance passes its gate wait and three safe points. `pause` runs at
+    /// `window` and holds it open.
+    fn run_stage(token: &StopToken, window: Option<Window>, pause: &dyn Fn()) -> Verdict {
+        let at = |here: Window| {
+            if window == Some(here) {
+                pause();
+            }
+        };
+        let mut agent = ChildGuard(Some(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn the agent"),
+        ));
+        at(Window::BeforeExit);
+        drop(agent.child().stdin.take());
+        wait_for_exit_without_reaping(agent.child().id()).expect("observe the exit");
+        at(Window::ExitObservedBeforeDecision);
+        let outcome = token
+            .observe_exit(|_| agent.child().wait().map(exit_code))
+            .expect("decide the exit");
+        if outcome == AgentOutcome::Stopped {
+            return Verdict::Stopped("exit decision");
+        }
+        assert_eq!(outcome, AgentOutcome::Completed(0));
+        assert_eq!(token.phase(), OwnerPhase::Advancing);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("safe point 1");
+        }
+        token.enter(OwnerPhase::GateWait);
+        at(Window::DuringGateWait);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("gate wait");
+        }
+        token.enter(OwnerPhase::Advancing);
+        at(Window::AfterAdvancingBeforeSpawn);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("safe point 2");
+        }
+        at(Window::BetweenSpawnAndPublish);
+        if token.safe_point() == SafePoint::StopHere {
+            return Verdict::Stopped("safe point 3");
+        }
+        Verdict::Advanced
+    }
+
+    #[test]
+    fn a_stop_racing_natural_completion_never_advances() {
+        let cases = [
+            (
+                Window::BeforeExit,
+                StopAction::KillAgentGroup,
+                "exit decision",
+            ),
+            (
+                Window::ExitObservedBeforeDecision,
+                StopAction::KillAgentGroup,
+                "exit decision",
+            ),
+            (
+                Window::DuringGateWait,
+                StopAction::FlagForSafePoint,
+                "gate wait",
+            ),
+            (
+                Window::AfterAdvancingBeforeSpawn,
+                StopAction::FlagForSafePoint,
+                "safe point 2",
+            ),
+            (
+                Window::BetweenSpawnAndPublish,
+                StopAction::FlagForSafePoint,
+                "safe point 3",
+            ),
+        ];
+        for (window, expected_action, stopped_at) in cases {
+            let token = StopToken::new(OwnerPhase::AgentRunning);
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            let done = Arc::new(std::sync::Barrier::new(2));
+            let stopper = {
+                let (token, ready, done) = (token.clone(), Arc::clone(&ready), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    ready.wait();
+                    let action = token.request_stop(StopSource::Socket);
+                    done.wait();
+                    action
+                })
+            };
+            let verdict = run_stage(&token, Some(window), &|| {
+                ready.wait();
+                done.wait();
+            });
+            let action = stopper.join().expect("the stopper thread");
+            assert_eq!(action, expected_action, "{window:?}: the stop's action");
+            assert_eq!(
+                verdict,
+                Verdict::Stopped(stopped_at),
+                "{window:?}: a stop must end the run, never advance it"
+            );
+            assert!(token.stop_requested(), "{window:?}: the stop is recorded");
+            assert!(token.ended_stopped(), "{window:?}: the run ended as a stop");
+        }
+    }
+
+    #[test]
+    fn natural_completion_without_a_stop_advances() {
+        let token = StopToken::new(OwnerPhase::AgentRunning);
+        assert_eq!(run_stage(&token, None, &|| {}), Verdict::Advanced);
+        assert!(!token.stop_requested());
+        assert!(!token.ended_stopped(), "no stop, so no stopped line");
+        assert_eq!(token.phase(), OwnerPhase::Advancing);
+    }
+
+    #[test]
+    fn every_owner_phase_has_exactly_one_stop_decision() {
+        use OwnerPhase::{Advancing, AgentRunning, Finished, GateWait, HandedOff};
+        let table = [
+            (
+                AgentRunning,
+                StopAction::KillAgentGroup,
+                true,
+                "agent_running",
+            ),
+            (Advancing, StopAction::FlagForSafePoint, true, "advancing"),
+            (GateWait, StopAction::FlagForSafePoint, true, "gate_wait"),
+            (HandedOff, StopAction::ReplyHandedOff, false, "handed_off"),
+            (Finished, StopAction::AlreadyFinished, false, "finished"),
+        ];
+        for (phase, action, flags, label) in table {
+            assert_eq!(on_stop_request(phase), action, "{phase:?}");
+            assert_eq!(phase.as_str(), label);
+            let token = StopToken::new(phase);
+            assert_eq!(
+                token.safe_point(),
+                SafePoint::Proceed,
+                "{phase:?}: before a stop"
+            );
+            assert!(!token.ended_stopped(), "{phase:?}: before a stop");
+            assert_eq!(
+                token.request_stop(StopSource::Signal(libc::SIGTERM)),
+                action
+            );
+            assert_eq!(token.stop_requested(), flags, "{phase:?}: the stop flag");
+            assert_eq!(
+                token.phase(),
+                phase,
+                "{phase:?}: a stop never moves the phase"
+            );
+            let expected = if flags {
+                SafePoint::StopHere
+            } else {
+                SafePoint::Proceed
+            };
+            assert_eq!(
+                token.safe_point(),
+                expected,
+                "{phase:?}: the next safe point"
+            );
+            assert_eq!(token.ended_stopped(), flags, "{phase:?}: ended as a stop");
+        }
+    }
+
+    #[test]
+    fn exit_and_safe_point_decisions_cover_every_input() {
+        for code in [0, 1, 7, 137, STOPPED_EXIT_CODE] {
+            assert_eq!(on_agent_exit(false, code), AgentOutcome::Completed(code));
+            assert_eq!(on_agent_exit(true, code), AgentOutcome::Stopped);
+        }
+        assert_eq!(at_safe_point(false), SafePoint::Proceed);
+        assert_eq!(at_safe_point(true), SafePoint::StopHere);
+        // The exit decision leaves the phase where the CLI expects it.
+        let completed = StopToken::new(OwnerPhase::AgentRunning);
+        assert_eq!(
+            completed.observe_exit(|_| Ok(7)).expect("decide"),
+            AgentOutcome::Completed(7)
+        );
+        assert_eq!(completed.phase(), OwnerPhase::Advancing);
+        assert!(!completed.ended_stopped());
+        let stopped = StopToken::new(OwnerPhase::AgentRunning);
+        stopped.request_stop(StopSource::Socket);
+        assert_eq!(
+            stopped
+                .observe_exit(|stop| Ok(if stop { 143 } else { 0 }))
+                .expect("decide"),
+            AgentOutcome::Stopped
+        );
+        assert_eq!(stopped.phase(), OwnerPhase::Finished);
+        assert!(stopped.ended_stopped());
+    }
 }
