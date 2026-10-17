@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 6
+open_count: 5
 waived_count: 2
-fixed_count: 10
+fixed_count: 11
 total_count: 18
-last_updated: 2026-10-17T11:53:12.257Z
+last_updated: 2026-10-17T16:27:14.778Z
 ---
 
 # Broken Windows Ledger
@@ -32,7 +32,7 @@ last_updated: 2026-10-17T11:53:12.257Z
 | 15 | 46 | deviation | crates/devflow-cli/tests/plan_bashism_scanner.rs | 400 | Rename status assertion uses direct slice membership to satisfy workspace Clippy. | fixed |  | 2026-09-07T01:00:07.688Z | 2026-09-07T01:00:39.114Z |
 | 16 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-09-PLAN.md |  | Verification regex reran with rg -e because this Ripgrep treats -E as an encoding flag. | fixed |  | 2026-09-07T01:00:07.933Z | 2026-09-07T01:00:39.341Z |
 | 17 | 49 | stub | scripts/scratch-dogfood-repo.sh | 79 | The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook) | open |  | 2026-09-29T19:39:11.821Z |  |
-| 18 | 50 | deviation | crates/devflow-cli/tests/phase7_cli.rs |  | 50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md | open |  | 2026-10-17T11:53:12.257Z |  |
+| 18 | 50 | deviation | crates/devflow-cli/tests/phase7_cli.rs |  | 50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md | fixed |  | 2026-10-17T11:53:12.257Z | 2026-10-17T16:27:14.778Z |
 
 ````json
 [
@@ -248,10 +248,10 @@ last_updated: 2026-10-17T11:53:12.257Z
     "file": "crates/devflow-cli/tests/phase7_cli.rs",
     "line": null,
     "description": "50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-10-17T11:53:12.257Z",
-    "resolved_at": null,
+    "resolved_at": "2026-10-17T16:27:14.778Z",
     "milestone": "v3.0.0"
   }
 ]
