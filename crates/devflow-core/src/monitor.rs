@@ -14,10 +14,13 @@
 use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
 use crate::git::hermetic_command;
 use crate::phase_id::PhaseId;
+use crate::stage::Stage;
 use crate::state::{AgentKind, State};
+use crate::supervisor::SocketPath;
+use crate::supervisor::runtime::{AgentOutcome, Supervisor};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -25,6 +28,7 @@ use tracing::{debug, info, warn};
 
 /// Errors produced by monitor operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MonitorError {
     /// Spawning the monitor process failed.
     #[error("failed to spawn monitor: {0}")]
@@ -38,6 +42,25 @@ pub enum MonitorError {
     /// A child spawned with piped stdio did not expose one of its pipes.
     #[error("supervised child exposed no {0} pipe")]
     NoChildPipe(&'static str),
+    /// The supervisor socket path was refused before anything was bound.
+    #[error("supervisor socket path refused: {0}")]
+    SocketPath(#[from] crate::supervisor::SocketPathError),
+    /// The supervisor socket or its sidecar could not be published.
+    #[error("could not publish the supervisor socket: {0}")]
+    Publish(#[from] crate::supervisor::PublishError),
+    /// The agent did not lead its own process group, so a group signal
+    /// could reach a process that is not the agent's (R-3). The agent was
+    /// killed and reaped.
+    #[error("agent {pid} is not its own process-group leader (pgid {pgid})")]
+    PgidMismatch {
+        /// The agent's pid.
+        pid: u32,
+        /// The process group the agent was found in (`-1` when unreadable).
+        pgid: i32,
+    },
+    /// A supervision shape that this build cannot run yet.
+    #[error("supervision shape not ready: {0}")]
+    NotReady(String),
 }
 
 /// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
@@ -1205,6 +1228,116 @@ pub fn run_pipe_owning_monitor(
 
     info!("supervised child {child_pid} exited with code {code}");
     Ok(code)
+}
+
+/// How [`run_supervised_stage`] wires the agent's stdio: the two supervision
+/// shapes of one supervisor body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StageIo {
+    /// The capture shape (the `MonitorLaunch::Legacy` script's replacement):
+    /// stdin is `/dev/null`, stdout and stderr go straight to the phase's
+    /// capture and stderr files.
+    Capture,
+    /// The stream shape (`MonitorLaunch::PipeOwning`): the supervisor owns
+    /// both pipes, delivers `prompt` as the first turn on stdin, tees stdout
+    /// to the capture file, applies the close rule and fires the idle
+    /// timeout after `idle_timeout` of silence.
+    Stream {
+        /// The stage prompt, delivered on the agent's stdin.
+        prompt: String,
+        /// How long the stream may be silent before the idle timeout fires.
+        idle_timeout: Duration,
+    },
+}
+
+impl StageIo {
+    /// The launch label a ping reply and the sidecar carry: `capture` or
+    /// `stream`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Stream { .. } => "stream",
+        }
+    }
+}
+
+/// Everything [`run_supervised_stage`] needs to supervise one stage's agent.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StageSpec {
+    /// The project root the capture, stderr, exit and pid files live under.
+    pub project_root: PathBuf,
+    /// The phase the stage runs for.
+    pub phase: PhaseId,
+    /// The stage the agent runs, when one is known.
+    pub stage: Option<Stage>,
+    /// The agent's working directory (the phase worktree, or the project
+    /// root when worktree mode is off).
+    pub workdir: PathBuf,
+    /// The agent program.
+    pub program: String,
+    /// The agent's argv after the program, passed literally.
+    pub args: Vec<String>,
+    /// The adapter environment, applied after `hermetic_command`'s scrub so
+    /// deliberate configuration survives it (process env, never argv).
+    pub envs: Vec<(String, String)>,
+    /// Which coding agent this is.
+    pub agent: AgentKind,
+    /// The supervision shape.
+    pub io: StageIo,
+    /// Where the supervisor publishes its socket.
+    pub socket: SocketPath,
+    /// The per-launch id the sidecar records.
+    pub launch_id: String,
+}
+
+impl StageSpec {
+    /// A spec with no stage, no extra argv and no adapter env, whose agent
+    /// runs in `project_root`. Set the public fields for the rest.
+    pub fn new(
+        project_root: PathBuf,
+        phase: PhaseId,
+        agent: AgentKind,
+        program: String,
+        io: StageIo,
+        socket: SocketPath,
+        launch_id: String,
+    ) -> Self {
+        Self {
+            workdir: project_root.clone(),
+            project_root,
+            phase,
+            stage: None,
+            program,
+            args: Vec::new(),
+            envs: Vec::new(),
+            agent,
+            io,
+            socket,
+            launch_id,
+        }
+    }
+}
+
+/// A supervised stage whose agent has exited.
+#[derive(Debug)]
+pub struct StageRun {
+    /// How the agent's run ended. Only [`AgentOutcome::Completed`] may
+    /// advance the pipeline.
+    pub outcome: AgentOutcome,
+    /// The still-published supervisor. The caller owns
+    /// [`Supervisor::hand_off`] and [`Supervisor::finish`].
+    pub supervisor: Supervisor,
+}
+
+/// Supervise one stage's agent under an addressed [`Supervisor`], in either
+/// supervision shape.
+pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
+    Err(MonitorError::NotReady(format!(
+        "{} shape: RED stub",
+        spec.io.label()
+    )))
 }
 
 /// The idle-timeout firing sequence, in the ONE order it may run (D-05).
@@ -4283,5 +4416,409 @@ exit 0
             std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
         let parsed = crate::agent_result::parse_antigravity_event_result(&capture).unwrap();
         assert_eq!(parsed.status, crate::agent_result::AgentStatus::Success);
+    }
+
+    // ---- 50-08: both supervision shapes on the 50-07 runtime ----------
+    //
+    // Each supervisor runs in a child test process (`spawn_test_in_child`),
+    // because `run_supervised_stage` installs process-wide signal state.
+    // The parent probes the child's socket, signals the child by the pid of
+    // the `Child` it owns, and reads the files the child wrote.
+
+    /// The socket the child supervisor publishes.
+    const STAGE_SOCKET_ENV: &str = "DEVFLOW_TEST_STAGE_SOCKET";
+    /// Where the child records `<outcome> <owner phase>`.
+    const STAGE_OUTCOME_ENV: &str = "DEVFLOW_TEST_STAGE_OUTCOME";
+    /// `capture` or `stream`.
+    const STAGE_SHAPE_ENV: &str = "DEVFLOW_TEST_STAGE_SHAPE";
+    /// The fake agent's absolute path.
+    const STAGE_PROGRAM_ENV: &str = "DEVFLOW_TEST_STAGE_PROGRAM";
+    /// The project root the phase files live under.
+    const STAGE_ROOT_ENV: &str = "DEVFLOW_TEST_STAGE_ROOT";
+    /// The agent's working directory.
+    const STAGE_WORKDIR_ENV: &str = "DEVFLOW_TEST_STAGE_WORKDIR";
+    /// The agent kind's label.
+    const STAGE_AGENT_ENV: &str = "DEVFLOW_TEST_STAGE_AGENT";
+    /// One adapter env pair as `NAME=VALUE`, or empty for none.
+    const STAGE_ADAPTER_ENV: &str = "DEVFLOW_TEST_STAGE_ADAPTER_ENV";
+
+    /// The phase every supervised-stage test runs.
+    const STAGE_PHASE: PhaseId = PhaseId::new(50);
+    /// The stream shape's idle timeout in these tests: far above every wait
+    /// below, so it never fires unless a test asks it to.
+    const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    /// How long the parent waits for a child supervisor to answer or exit.
+    const STAGE_CHILD_WAIT: Duration = Duration::from_secs(30);
+    /// The first turn the stream shape delivers.
+    const STAGE_PROMPT: &str = "SUPERVISED-STAGE-PROMPT";
+
+    /// One supervision shape, as the tests name it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Shape {
+        Capture,
+        Stream,
+    }
+
+    impl Shape {
+        fn label(self) -> &'static str {
+            self.io().label()
+        }
+
+        fn io(self) -> StageIo {
+            match self {
+                Shape::Capture => StageIo::Capture,
+                Shape::Stream => StageIo::Stream {
+                    prompt: STAGE_PROMPT.to_string(),
+                    idle_timeout: STAGE_IDLE_TIMEOUT,
+                },
+            }
+        }
+
+        fn parse(label: &str) -> Self {
+            match label {
+                "capture" => Shape::Capture,
+                "stream" => Shape::Stream,
+                other => panic!("unknown shape {other}"),
+            }
+        }
+    }
+
+    /// The child half of every supervised-stage test: build the spec from
+    /// the parent's env, run the stage, record `<outcome> <owner>`, finish.
+    fn supervise_stage_in_child() {
+        let var =
+            |name: &str| std::env::var_os(name).unwrap_or_else(|| panic!("the parent sets {name}"));
+        let socket =
+            SocketPath::new(PathBuf::from(var(STAGE_SOCKET_ENV))).expect("socket path fits");
+        let launch_id = socket
+            .as_path()
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|stem| stem.rsplit('-').next())
+            .expect("the socket name ends in its launch id")
+            .to_string();
+        let shape = Shape::parse(var(STAGE_SHAPE_ENV).to_str().expect("utf-8 shape"));
+        let agent: AgentKind = var(STAGE_AGENT_ENV)
+            .to_str()
+            .expect("utf-8 agent")
+            .parse()
+            .expect("a known agent label");
+        let program = var(STAGE_PROGRAM_ENV)
+            .into_string()
+            .expect("utf-8 program path");
+        let mut spec = StageSpec::new(
+            PathBuf::from(var(STAGE_ROOT_ENV)),
+            STAGE_PHASE,
+            agent,
+            program,
+            shape.io(),
+            socket,
+            launch_id,
+        );
+        spec.workdir = PathBuf::from(var(STAGE_WORKDIR_ENV));
+        spec.stage = Some(Stage::Code);
+        let adapter_env = var(STAGE_ADAPTER_ENV)
+            .into_string()
+            .expect("utf-8 adapter env");
+        if let Some((name, value)) = adapter_env.split_once('=') {
+            spec.envs.push((name.to_string(), value.to_string()));
+        }
+        let run = run_supervised_stage(spec).expect("supervise the stage");
+        let record = format!(
+            "{:?} {}",
+            run.outcome,
+            run.supervisor.token().phase().as_str()
+        );
+        run.supervisor.finish();
+        std::fs::write(var(STAGE_OUTCOME_ENV), record).expect("record the outcome");
+    }
+
+    /// A short tempdir under `/tmp` holding the cache, the project root and
+    /// the agent's separate working directory (`<root>/wt`).
+    struct StageFixture {
+        cache: tempfile::TempDir,
+        root: PathBuf,
+        workdir: PathBuf,
+    }
+
+    impl StageFixture {
+        fn new() -> Self {
+            let cache = tempfile::Builder::new()
+                .prefix("dfs")
+                .tempdir_in("/tmp")
+                .expect("create a short cache dir under /tmp");
+            let root = cache.path().join("proj");
+            let workdir = root.join("wt");
+            std::fs::create_dir_all(&workdir).expect("create the project and its worktree");
+            Self {
+                cache,
+                root,
+                workdir,
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.cache.path().join(name)
+        }
+
+        /// Write an executable `#!/bin/sh` fake agent named `name`.
+        fn agent(&self, name: &str, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\n{body}\n"),
+            )
+            .expect("write the fake agent");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fake agent executable");
+            path
+        }
+
+        fn read(&self, path: PathBuf) -> String {
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+        }
+
+        fn stdout(&self) -> String {
+            self.read(crate::agent_result::stdout_path(&self.root, STAGE_PHASE))
+        }
+
+        fn stderr(&self) -> String {
+            self.read(crate::agent_result::stderr_path(&self.root, STAGE_PHASE))
+        }
+
+        fn exit_code(&self) -> String {
+            self.read(crate::agent_result::exit_code_path(&self.root, STAGE_PHASE))
+                .trim()
+                .to_string()
+        }
+
+        fn pid_file(&self) -> String {
+            self.read(crate::agent_result::agent_pid_path(&self.root, STAGE_PHASE))
+                .trim()
+                .to_string()
+        }
+    }
+
+    /// Polls `done` every 20 ms until it holds or `within` elapses.
+    fn stage_wait_until(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if done() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Kills and reaps the child test process on every exit path. Only the
+    /// pid of the `Child` this test spawned is ever signalled.
+    struct StageChild(Option<std::process::Child>);
+
+    impl StageChild {
+        fn try_exited(&mut self) -> bool {
+            self.0
+                .as_mut()
+                .expect("the child is still owned")
+                .try_wait()
+                .expect("poll the child")
+                .is_some()
+        }
+
+        /// Wait for the child to exit on its own and collect its output.
+        fn wait_exit(&mut self) -> std::process::Output {
+            let exited = stage_wait_until(STAGE_CHILD_WAIT, || self.try_exited());
+            let child = self.0.take().expect("the child is still owned");
+            if !exited {
+                let mut child = StageChild(Some(child));
+                let _ = child.0.as_mut().expect("owned").kill();
+                let output = child.0.take().expect("owned").wait_with_output();
+                panic!("the child supervisor did not exit within {STAGE_CHILD_WAIT:?}: {output:?}");
+            }
+            child
+                .wait_with_output()
+                .expect("collect the child's output")
+        }
+    }
+
+    impl Drop for StageChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// SIGKILLs whatever is left of the agent's process group on drop.
+    struct StageGroup(u32);
+
+    impl Drop for StageGroup {
+        fn drop(&mut self) {
+            let Ok(signed) = libc::pid_t::try_from(self.0) else {
+                return;
+            };
+            // SAFETY: getpgrp has no preconditions.
+            if signed > 1 && signed != unsafe { libc::getpgrp() } {
+                // SAFETY: `signed > 1` and not our own group.
+                unsafe { libc::kill(-signed, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// A child supervisor the parent launched, once its socket answered.
+    struct StageLaunch {
+        child: StageChild,
+        group: StageGroup,
+        socket: SocketPath,
+        outcome: PathBuf,
+        reply: crate::supervisor::protocol::PingReply,
+        sidecar: crate::supervisor::Sidecar,
+    }
+
+    impl StageLaunch {
+        fn agent_pid(&self) -> u32 {
+            self.reply.agent_pid
+        }
+
+        fn liveness(&self) -> crate::supervisor::Liveness {
+            crate::supervisor::probe(self.socket.as_path()).expect("probe the socket")
+        }
+
+        /// Wait for the child to exit, require that it ran exactly its one
+        /// test, and return the outcome it recorded.
+        fn finish(&mut self, test_name: &str) -> String {
+            let output = self.child.wait_exit();
+            crate::test_support::assert_child_ran_exactly_one_passing_test(&output, test_name);
+            std::fs::read_to_string(&self.outcome).expect("the child recorded its outcome")
+        }
+    }
+
+    /// Re-run `test_name` as a child supervisor of `program` in `shape`, and
+    /// wait until its socket answers a ping. At that first Alive the sidecar
+    /// must already be readable (R-7: the sidecar precedes the socket name).
+    fn launch_stage(
+        test_name: &str,
+        fixture: &StageFixture,
+        shape: Shape,
+        agent: AgentKind,
+        program: &Path,
+        adapter_env: &str,
+    ) -> StageLaunch {
+        let socket = SocketPath::for_launch(
+            fixture.cache.path(),
+            &fixture.root,
+            STAGE_PHASE,
+            &crate::supervisor::new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let outcome = fixture.path("outcome");
+        let agent_label = agent.to_string();
+        let mut child = StageChild(Some(crate::test_support::spawn_test_in_child(
+            test_name,
+            fixture.cache.path(),
+            &[
+                (STAGE_SOCKET_ENV, socket.as_path().as_os_str()),
+                (STAGE_OUTCOME_ENV, outcome.as_os_str()),
+                (STAGE_SHAPE_ENV, std::ffi::OsStr::new(shape.label())),
+                (STAGE_PROGRAM_ENV, program.as_os_str()),
+                (STAGE_ROOT_ENV, fixture.root.as_os_str()),
+                (STAGE_WORKDIR_ENV, fixture.workdir.as_os_str()),
+                (STAGE_AGENT_ENV, std::ffi::OsStr::new(&agent_label)),
+                (STAGE_ADAPTER_ENV, std::ffi::OsStr::new(adapter_env)),
+            ],
+        )));
+        let deadline = std::time::Instant::now() + STAGE_CHILD_WAIT;
+        let reply = loop {
+            if let Ok(crate::supervisor::Liveness::Alive(reply)) =
+                crate::supervisor::probe(socket.as_path())
+            {
+                break reply;
+            }
+            let exited = child.try_exited();
+            if exited || std::time::Instant::now() >= deadline {
+                let output = child.0.take().expect("owned").wait_with_output();
+                panic!("the child supervisor never answered a ping (exited: {exited}): {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let group = StageGroup(reply.agent_pgid);
+        let sidecar = crate::supervisor::read_sidecar(&socket.sidecar_path())
+            .expect("the sidecar is readable at the first moment the socket answers (R-7)");
+        StageLaunch {
+            child,
+            group,
+            socket,
+            outcome,
+            reply,
+            sidecar,
+        }
+    }
+
+    const CAPTURE_TRACER_TEST: &str =
+        "monitor::tests::capture_arm_runs_the_agent_under_an_addressed_supervisor";
+
+    #[test]
+    fn capture_arm_runs_the_agent_under_an_addressed_supervisor() {
+        if crate::test_support::in_child_test(CAPTURE_TRACER_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        let fixture = StageFixture::new();
+        let go = fixture.path("go");
+        let program = fixture.agent(
+            "codex",
+            &format!(
+                "echo 'DEVFLOW_RESULT: {{\"status\":\"success\"}}'\n\
+                 echo 'CAPTURE-STDERR-LINE' >&2\n\
+                 while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+                 exit 7",
+                go = go.display()
+            ),
+        );
+        let mut run = launch_stage(
+            CAPTURE_TRACER_TEST,
+            &fixture,
+            Shape::Capture,
+            AgentKind::Codex,
+            &program,
+            "",
+        );
+        assert_eq!(run.reply.launch, "capture");
+        assert_eq!(run.reply.owner, "agent_running");
+        assert_eq!(
+            run.reply.agent_pgid,
+            run.agent_pid(),
+            "the agent leads its group"
+        );
+        assert_eq!(run.sidecar.launch, "capture");
+        assert_eq!(run.sidecar.agent, "codex");
+        assert_eq!(run.sidecar.agent_pid, run.agent_pid());
+        assert_eq!(run.sidecar.stage.as_deref(), Some("code"));
+
+        std::fs::write(&go, "").expect("let the agent exit");
+        assert_eq!(run.finish(CAPTURE_TRACER_TEST), "Completed(7) advancing");
+
+        let stdout = fixture.stdout();
+        let stderr = fixture.stderr();
+        assert!(stdout.contains("DEVFLOW_RESULT:"), "stdout: {stdout:?}");
+        assert!(
+            !stdout.contains("CAPTURE-STDERR-LINE"),
+            "stdout: {stdout:?}"
+        );
+        assert!(stderr.contains("CAPTURE-STDERR-LINE"), "stderr: {stderr:?}");
+        assert!(!stderr.contains("DEVFLOW_RESULT"), "stderr: {stderr:?}");
+        assert_eq!(fixture.pid_file(), run.agent_pid().to_string());
+        assert_eq!(fixture.exit_code(), "7");
+        assert_eq!(run.liveness(), crate::supervisor::Liveness::Gone);
+        assert!(
+            !run.socket.sidecar_path().exists(),
+            "finish removes the sidecar with the socket"
+        );
+        drop(run.group);
     }
 }
