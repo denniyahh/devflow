@@ -7111,4 +7111,583 @@ mod tests {
              the guard for ANY pipe-owning launch (Claude + Antigravity today)"
         );
     }
+
+    // ---- 50-13: the stage handoff, advance safe points and the gate wait ----
+
+    /// The `<point>:<path>` hold variable `test_hold` reads (50-13).
+    const HOLD_ENV: &str = "DEVFLOW_TEST_HOLD";
+
+    /// The marker a handoff fixture's first agent prints when it completes.
+    const SUCCESS_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"success"}"#;
+
+    /// How long a handoff child waits for any one step of the chain.
+    const HANDOFF_STEP_WAIT: Duration = Duration::from_secs(45);
+
+    /// A PATH dir whose fake `claude` answers `--version`. Its first run
+    /// (stage N) waits for `go` in its working directory (the project root)
+    /// and then prints `first_marker` and exits 0. Every later run (stage
+    /// N+1) waits for `go2` and then prints a success marker. Both waits are
+    /// bounded (about 60 s), so no fake agent outlives a failed test by long,
+    /// and the fixture's `stop_until` ends the chain after N+1.
+    fn handoff_claude_dir(first_marker: &str) -> tempfile::TempDir {
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             if [ ! -e first-done ]; then\n  : > first-done\n  gate=go\n  marker='{first_marker}'\n\
+             else\n  gate=go2\n  marker='{SUCCESS_MARKER}'\nfi\n\
+             i=0\nwhile [ ! -e \"$gate\" ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             printf '%s\\n' \"$marker\"\nexit 0\n"
+        );
+        std::fs::write(path_dir.path().join("claude"), script).unwrap();
+        let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .expect("sleep must exist to run this test");
+        std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+        path_dir
+    }
+
+    /// The parent half of a handoff test: run `name` in a hermetic child on
+    /// the advance-running monitor entry, with `DEVFLOW_TEST_HOLD` naming
+    /// `hold` (when given) and a release path in a parent-owned dir.
+    fn run_handoff_child(name: &str, hold: Option<&str>, first_marker: &str) {
+        let path_dir = handoff_claude_dir(first_marker);
+        let hold_dir = tempfile::Builder::new()
+            .prefix("dfh")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let hold_value = hold.map(|point| {
+            std::ffi::OsString::from(format!(
+                "{point}:{}",
+                hold_dir.path().join("release").display()
+            ))
+        });
+        let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
+            (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+            ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("120")),
+        ];
+        if let Some(value) = &hold_value {
+            env.push((HOLD_ENV, value.as_os_str()));
+        }
+        let output = run_hermetic_test_in_child(name, path_dir.path(), &env);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// One launched stage N in a handoff child: the repo, its phase, N's
+    /// record and the hermetic cache dir. Dropping it releases any hold and
+    /// reaps every supervisor whose socket is still in the cache dir, so a
+    /// failing assertion leaves no `__monitor` or fake agent behind.
+    struct HandoffRun {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        phase: PhaseId,
+        n: devflow_core::state::SupervisorRecord,
+        cache: PathBuf,
+    }
+
+    impl HandoffRun {
+        /// Launch stage Define for `phase` (capture shape, Supervise mode,
+        /// `--until plan`) and return once N is recorded.
+        fn launch(phase: PhaseId) -> Self {
+            let cache = PathBuf::from(
+                std::env::var_os("DEVFLOW_CACHE_DIR").expect("the parent passes DEVFLOW_CACHE_DIR"),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            init_repo(&root);
+            std::fs::create_dir_all(root.join(".planning")).unwrap();
+            std::fs::write(
+                root.join(".planning/ROADMAP.md"),
+                format!("# Roadmap\n\n### Phase {phase}: handoff fixture\n"),
+            )
+            .unwrap();
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+            state.legacy_claude_launch = true;
+            state.stop_until = Some(Stage::Plan);
+            workflow::save_state(&state).unwrap();
+            let launched = launch_stage(&mut state, None, None);
+            let n = state.supervisor.clone();
+            let run = Self {
+                _dir: dir,
+                root,
+                phase,
+                n: n.clone().unwrap_or_else(|| {
+                    panic!("the launch must record stage N's supervisor: {launched:?}")
+                }),
+                cache,
+            };
+            launched.unwrap();
+            run
+        }
+
+        /// The release path `test_hold` waits on, from `DEVFLOW_TEST_HOLD`.
+        fn release_path() -> Option<PathBuf> {
+            let hold = std::env::var(HOLD_ENV).ok()?;
+            let (_, path) = hold.split_once(':')?;
+            Some(PathBuf::from(path))
+        }
+
+        /// Let stage N's agent finish.
+        fn go(&self) {
+            std::fs::write(self.root.join("go"), "").unwrap();
+        }
+
+        /// Block until a supervisor reports it reached the configured hold.
+        fn wait_held(&self) {
+            let release = Self::release_path().expect("this child runs with a hold");
+            let held = PathBuf::from(format!("{}.held", release.display()));
+            assert!(
+                poll_until(HANDOFF_STEP_WAIT, || held.exists()),
+                "the {} hold was never reached; events:\n{}",
+                std::env::var(HOLD_ENV).unwrap_or_default(),
+                self.events()
+            );
+        }
+
+        /// The run's whole event log, for failure messages.
+        fn events(&self) -> String {
+            std::fs::read_to_string(devflow_core::events::events_path(&self.root))
+                .unwrap_or_default()
+        }
+
+        /// Release the configured hold.
+        fn release(&self) {
+            if let Some(release) = Self::release_path() {
+                std::fs::write(release, "").unwrap();
+            }
+        }
+
+        fn state(&self) -> State {
+            workflow::load_state(&self.root, self.phase).expect("the run's state loads")
+        }
+    }
+
+    impl Drop for HandoffRun {
+        fn drop(&mut self) {
+            self.release();
+            // Two passes: a stage N still advancing when the first pass
+            // stops it may have launched N+1 by the second.
+            for _ in 0..2 {
+                let sockets: Vec<PathBuf> = std::fs::read_dir(self.cache.join("sock"))
+                    .map(|entries| {
+                        entries
+                            .filter_map(|entry| Some(entry.ok()?.path()))
+                            .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for socket in sockets {
+                    let Ok(sidecar) =
+                        devflow_core::supervisor::read_sidecar(&socket.with_extension("json"))
+                    else {
+                        continue;
+                    };
+                    let mut holder = self.state_holder();
+                    holder.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                        socket,
+                        sidecar.launch_id,
+                        sidecar.agent_pgid,
+                        sidecar.agent_start_time,
+                        sidecar.boot_id,
+                    ));
+                    drop(ReapMonitorOnDrop::after_launch(&holder));
+                }
+            }
+        }
+    }
+
+    impl HandoffRun {
+        /// A throwaway `State` to carry one record into `ReapMonitorOnDrop`.
+        fn state_holder(&self) -> State {
+            State::new(
+                self.phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                self.root.clone(),
+            )
+        }
+    }
+
+    /// What a handoff observer saw in one poll: the state's recorded
+    /// supervisor and how its socket probed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Seen {
+        Alive(String),
+        Stale,
+        Gone,
+        NoRecord,
+        Unloadable,
+        ProbeFailed,
+    }
+
+    fn observe(root: &Path, phase: PhaseId) -> Seen {
+        let Ok(state) = workflow::load_state(root, phase) else {
+            return Seen::Unloadable;
+        };
+        let Some(record) = state.supervisor else {
+            return Seen::NoRecord;
+        };
+        match devflow_core::supervisor::probe(&record.socket_path) {
+            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => Seen::Alive(reply.launch_id),
+            Ok(devflow_core::supervisor::Liveness::Stale) => Seen::Stale,
+            Ok(devflow_core::supervisor::Liveness::Gone) => Seen::Gone,
+            Err(_) => Seen::ProbeFailed,
+        }
+    }
+
+    /// A thread that polls [`observe`] every 5 ms (and whether `watched`
+    /// exists) until stopped.
+    struct Observer {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<Vec<(Seen, bool)>>,
+    }
+
+    impl Observer {
+        fn start(root: &Path, phase: PhaseId, watched: &Path) -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (root, watched, flag) = (
+                root.to_path_buf(),
+                watched.to_path_buf(),
+                std::sync::Arc::clone(&stop),
+            );
+            let handle = std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !flag.load(std::sync::atomic::Ordering::Acquire) {
+                    seen.push((observe(&root, phase), watched.exists()));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                seen
+            });
+            Self { stop, handle }
+        }
+
+        fn finish(self) -> Vec<(Seen, bool)> {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.handle.join().expect("the observer thread")
+        }
+    }
+
+    /// Every observation between the first `Alive(from)` and the first
+    /// `Alive(to)` that reads `Gone`, `Stale` or no record: the handoff's
+    /// gaps. An error when either endpoint was never observed.
+    fn handoff_gaps(seen: &[(Seen, bool)], from: &str, to: &str) -> Result<Vec<Seen>, String> {
+        let first = |id: &str| {
+            seen.iter()
+                .position(|(observed, _)| *observed == Seen::Alive(id.to_string()))
+        };
+        let start = first(from).ok_or_else(|| format!("never saw {from} alive"))?;
+        let end = first(to).ok_or_else(|| format!("never saw {to} alive"))?;
+        if end < start {
+            return Err(format!("saw {to} alive before {from}"));
+        }
+        Ok(seen[start..end]
+            .iter()
+            .map(|(observed, _)| observed.clone())
+            .filter(|observed| matches!(observed, Seen::Gone | Seen::Stale | Seen::NoRecord))
+            .collect())
+    }
+
+    /// V-13 (R-1, T-50-34): a stage handoff publishes N+1 before N unlinks.
+    /// Stage N's agent finishes, N's in-process advance launches N+1 and
+    /// records it, and N is parked at the `after_publish` hold (lock still
+    /// held). At the hold the state names N+1, N+1 probes Alive, and N's
+    /// socket still exists and answers with owner `advancing` (RV-04: N is
+    /// not marked handed off inside the advance). Released, N unlinks and
+    /// N+1 stays Alive. A 5 ms observer must see no Gone, Stale or missing
+    /// record between N's first Alive and N+1's first Alive; it can miss a
+    /// gap shorter than 5 ms, so that check is supplementary and
+    /// `the_handoff_observer_detects_a_pre_clear_gap` shows it sees one.
+    #[test]
+    fn stage_handoff_publishes_the_next_socket_before_the_old_one_is_unlinked() {
+        const NAME: &str = "pipeline_launch::tests::stage_handoff_publishes_the_next_socket_before_the_old_one_is_unlinked";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_publish"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1301));
+        let observer = Observer::start(&run.root, run.phase, &run.n.socket_path);
+        run.go();
+        run.wait_held();
+
+        let next = run
+            .state()
+            .supervisor
+            .expect("at the after_publish hold the state records a supervisor");
+        assert_ne!(
+            next.launch_id, run.n.launch_id,
+            "at the after_publish hold the state names N+1, not N"
+        );
+        match devflow_core::supervisor::probe(&next.socket_path) {
+            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => {
+                assert_eq!(reply.launch_id, next.launch_id);
+            }
+            other => panic!("N+1 must probe Alive at the hold, got {other:?}"),
+        }
+        assert!(
+            run.n.socket_path.exists(),
+            "N's socket file must still exist at the after_publish hold"
+        );
+        match devflow_core::supervisor::probe(&run.n.socket_path) {
+            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => assert_eq!(
+                reply.owner, "advancing",
+                "RV-04: N stays Advancing until its advance returns"
+            ),
+            other => panic!("N must still answer at the hold, got {other:?}"),
+        }
+
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            }),
+            "N unlinks its socket once its advance has returned"
+        );
+        match devflow_core::supervisor::probe(&next.socket_path) {
+            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => {
+                assert_eq!(reply.launch_id, next.launch_id);
+            }
+            other => panic!("N+1 must stay Alive after N exits, got {other:?}"),
+        }
+        let seen = observer.finish();
+        let gaps = handoff_gaps(&seen, &run.n.launch_id, &next.launch_id)
+            .unwrap_or_else(|why| panic!("observer: {why}: {seen:?}"));
+        assert!(
+            gaps.is_empty(),
+            "state read GONE or no record across the handoff: {gaps:?}"
+        );
+    }
+
+    /// A live in-process supervisor serving `launch_id` at a short socket
+    /// path in `dir`, for the observer control.
+    fn fake_supervisor(
+        dir: &Path,
+        root: &Path,
+        phase: PhaseId,
+        launch_id: &str,
+    ) -> (
+        devflow_core::supervisor::runtime::Supervisor,
+        devflow_core::state::SupervisorRecord,
+    ) {
+        let path = dir.join(format!("{launch_id}.sock"));
+        let socket = devflow_core::supervisor::SocketPath::new(path.clone()).unwrap();
+        let sidecar: devflow_core::supervisor::Sidecar =
+            serde_json::from_value(serde_json::json!({
+                "launch_id": launch_id,
+                "project_root": root,
+                "phase": phase,
+                "stage": null,
+                "agent": "claude",
+                "launch": "capture",
+                "agent_pid": 0,
+                "agent_pgid": 0,
+                "agent_start_time": 0,
+                "boot_id": "",
+                "supervisor_pid": std::process::id(),
+                "supervisor_start_time": 0,
+                "created_at": "2026-10-17T00:00:00Z",
+            }))
+            .unwrap();
+        let supervisor = devflow_core::supervisor::runtime::Supervisor::serve(socket, sidecar)
+            .expect("serve the fake supervisor");
+        let record = devflow_core::state::SupervisorRecord::new(
+            path,
+            launch_id.to_string(),
+            0,
+            0,
+            String::new(),
+        );
+        (supervisor, record)
+    }
+
+    /// The observer control for V-13: the same observer and gap rule applied
+    /// to a simulated pre-clear handoff (a save with no supervisor between
+    /// N's record and N+1's, the WR-04 pitfall) reports the gap; the same
+    /// sequence without the pre-clear reports none. Both endpoints are real
+    /// in-process supervisors answering pings.
+    #[test]
+    fn the_handoff_observer_detects_a_pre_clear_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sock_dir = tempfile::Builder::new()
+            .prefix("dfs")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let phase = PhaseId::new(1302);
+        let (sup_n, rec_n) = fake_supervisor(sock_dir.path(), root, phase, "obsn");
+        let (sup_next, rec_next) = fake_supervisor(sock_dir.path(), root, phase, "obsnext");
+        let save = |record: Option<&devflow_core::state::SupervisorRecord>| {
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+            state.supervisor = record.cloned();
+            workflow::save_state(&state).unwrap();
+        };
+        let hold = Duration::from_millis(80);
+
+        for pre_clear in [true, false] {
+            save(Some(&rec_n));
+            let observer = Observer::start(root, phase, &rec_n.socket_path);
+            std::thread::sleep(hold);
+            if pre_clear {
+                save(None);
+                std::thread::sleep(hold);
+            }
+            save(Some(&rec_next));
+            std::thread::sleep(hold);
+            let seen = observer.finish();
+            let gaps = handoff_gaps(&seen, "obsn", "obsnext")
+                .unwrap_or_else(|why| panic!("observer: {why}: {seen:?}"));
+            if pre_clear {
+                assert!(
+                    gaps.contains(&Seen::NoRecord),
+                    "the observer must see the pre-clear gap: {seen:?}"
+                );
+            } else {
+                assert!(gaps.is_empty(), "control: no pre-clear, no gap: {gaps:?}");
+            }
+        }
+        sup_n.finish();
+        sup_next.finish();
+    }
+
+    /// The RV-04 order rule, as a pure scan over `src`: `spawn_agent_and_record`
+    /// records N+1 as the successor and never marks N handed off, and
+    /// `run_monitor` takes the successor and marks the hand-off. Each function
+    /// is its comment-stripped lines from the column-0 line starting with its
+    /// signature through the next line that is exactly `}`.
+    fn handoff_order_violations(src: &str) -> Vec<String> {
+        fn body<'a>(src: &'a str, signature: &str, floor: usize) -> Option<Vec<&'a str>> {
+            let mut lines = src.lines();
+            let first = lines.by_ref().find(|line| line.starts_with(signature))?;
+            let mut body = vec![first];
+            for line in lines {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                body.push(line);
+                if line == "}" {
+                    break;
+                }
+            }
+            (body.len() >= floor).then_some(body)
+        }
+        let has = |lines: &[&str], needle: &str| lines.iter().any(|line| line.contains(needle));
+        let mut violations = Vec::new();
+        match body(src, "fn spawn_agent_and_record(", 40) {
+            None => violations.push(SCAN_SPAWN_NOT_FOUND.to_string()),
+            Some(lines) => {
+                if has(&lines, "OwnerPhase::HandedOff") {
+                    violations.push(SCAN_SPAWN_HANDS_OFF.to_string());
+                }
+                if !has(&lines, "record_successor(") {
+                    violations.push(SCAN_SPAWN_NO_SUCCESSOR.to_string());
+                }
+            }
+        }
+        match body(src, "pub(crate) fn run_monitor(", 10) {
+            None => violations.push(SCAN_RUN_NOT_FOUND.to_string()),
+            Some(lines) => {
+                if !has(&lines, "OwnerPhase::HandedOff") {
+                    violations.push(SCAN_RUN_NO_HAND_OFF.to_string());
+                }
+                if !has(&lines, "take_successor(") {
+                    violations.push(SCAN_RUN_NO_TAKE.to_string());
+                }
+            }
+        }
+        violations
+    }
+
+    const SCAN_SPAWN_NOT_FOUND: &str =
+        "spawn_agent_and_record not found (or under 40 comment-stripped lines)";
+    const SCAN_SPAWN_HANDS_OFF: &str = "spawn_agent_and_record enters the handed-off phase";
+    const SCAN_SPAWN_NO_SUCCESSOR: &str = "spawn_agent_and_record never calls record_successor";
+    const SCAN_RUN_NOT_FOUND: &str = "run_monitor not found (or under 10 comment-stripped lines)";
+    const SCAN_RUN_NO_HAND_OFF: &str = "run_monitor never enters the handed-off phase";
+    const SCAN_RUN_NO_TAKE: &str = "run_monitor never calls take_successor";
+
+    /// RV-04 (permanent source scan): N is marked handed off only in
+    /// `run_monitor`, after its advance returned and only when the advance
+    /// recorded a successor; `spawn_agent_and_record` records the successor
+    /// and leaves N `Advancing`. Planted controls prove the scan can flag
+    /// each violation and passes a correct layout.
+    #[test]
+    fn the_handed_off_marking_stays_in_run_monitor_after_the_advance() {
+        let real = handoff_order_violations(include_str!("pipeline_launch.rs"));
+        assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
+
+        let pad = |n: usize| "    let _filler = 0;\n".repeat(n);
+        let spawn = |extra: &str| format!("fn spawn_agent_and_record(\n{}{extra}}}\n", pad(40));
+        let run = |extra: &str| format!("pub(crate) fn run_monitor(\n{}{extra}}}\n", pad(10));
+        let good_spawn = spawn("    record_successor(record);\n");
+        let good_run = run(
+            "    if let Some(next) = take_successor() {\n        token.enter(OwnerPhase::HandedOff);\n    }\n",
+        );
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            handoff_order_violations(&format!("{good_spawn}{good_run}")),
+            Vec::<String>::new(),
+            "a correct pair"
+        );
+        assert_eq!(
+            handoff_order_violations(&format!(
+                "{}{good_run}",
+                spawn("    record_successor(record);\n    token.enter(OwnerPhase::HandedOff);\n")
+            )),
+            only(SCAN_SPAWN_HANDS_OFF)
+        );
+        assert_eq!(
+            handoff_order_violations(&format!(
+                "{}{good_run}",
+                spawn(
+                    "    record_successor(record);\n    // token.enter(OwnerPhase::HandedOff);\n"
+                )
+            )),
+            Vec::<String>::new(),
+            "a comment line is not code"
+        );
+        assert_eq!(
+            handoff_order_violations(&format!("{}{good_run}", spawn(""))),
+            only(SCAN_SPAWN_NO_SUCCESSOR)
+        );
+        assert_eq!(
+            handoff_order_violations(&format!(
+                "{good_spawn}{}",
+                run("    let _next = take_successor();\n")
+            )),
+            only(SCAN_RUN_NO_HAND_OFF)
+        );
+        assert_eq!(
+            handoff_order_violations(&format!(
+                "{good_spawn}{}",
+                run("    token.enter(OwnerPhase::HandedOff);\n")
+            )),
+            only(SCAN_RUN_NO_TAKE)
+        );
+        assert_eq!(
+            handoff_order_violations(&good_run),
+            only(SCAN_SPAWN_NOT_FOUND)
+        );
+        assert_eq!(
+            handoff_order_violations(&good_spawn),
+            only(SCAN_RUN_NOT_FOUND)
+        );
+        assert_eq!(
+            handoff_order_violations(&format!(
+                "fn spawn_agent_and_record(\n{}    record_successor(record);\n}}\n{good_run}",
+                pad(5)
+            )),
+            only(SCAN_SPAWN_NOT_FOUND),
+            "a body under its floor"
+        );
+        assert_eq!(
+            handoff_order_violations(&format!(
+                "{good_spawn}pub(crate) fn run_monitor(\n    take_successor();\n    token.enter(OwnerPhase::HandedOff);\n}}\n"
+            )),
+            only(SCAN_RUN_NOT_FOUND),
+            "a run_monitor under its floor"
+        );
+    }
 }
