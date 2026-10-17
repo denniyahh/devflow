@@ -3808,6 +3808,10 @@ pub(crate) struct PhaseFacts {
     /// written by a binary predating the field — never treated as a problem.
     pub(crate) monitor_pid: Option<u32>,
     pub(crate) monitor_alive: bool,
+    /// RED stub (50-12 Task 2): the supervisor's liveness.
+    pub(crate) supervisor: PhaseLiveness,
+    /// RED stub (50-12 Task 2): the recorded launch id.
+    pub(crate) supervisor_launch_id: Option<String>,
     /// The most recent event's `event` field value, for display context.
     pub(crate) last_event: Option<String>,
     /// The `stage` field of the most recent `stage_launched` event; `None`
@@ -3929,6 +3933,12 @@ fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
         ),
         repair: Some(format!("devflow resume --phase {}", facts.phase)),
     })
+}
+
+/// RED stub (50-12 Task 2): reports nothing.
+#[allow(dead_code)]
+fn check_supervisor(_facts: &PhaseFacts) -> Option<PhaseFinding> {
+    None
 }
 
 /// The last `stage_launched` event named a different stage than
@@ -4053,6 +4063,8 @@ fn build_phase_facts(
         agent_alive,
         monitor_pid,
         monitor_alive,
+        supervisor: PhaseLiveness::NotLaunched,
+        supervisor_launch_id: None,
         last_event: last_event_name,
         last_launched_stage,
         open_gate_stages,
@@ -7166,6 +7178,162 @@ mod tests {
     mod doctor_reconciliation {
         use super::*;
 
+        /// The launch id every fixture's supervisor record carries.
+        const SUPERVISOR_LAUNCH_ID: &str = "0123456789abcdef";
+
+        /// Every string anywhere inside `value`.
+        fn strings_in(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => out.push(text.clone()),
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| strings_in(item, out));
+                }
+                serde_json::Value::Object(map) => {
+                    map.values().for_each(|item| strings_in(item, out));
+                }
+                _ => {}
+            }
+        }
+
+        /// 50-12: a STALE supervisor, one GONE while its phase is not
+        /// stopped, and a failed probe are each a `Problem` naming the
+        /// launch, never its socket path; STALE's repair stops then resumes,
+        /// GONE's resumes, and a failed probe points at `devflow status`
+        /// (which prints the operator's own socket path).
+        #[test]
+        fn check_supervisor_reports_stale_and_gone_while_active() {
+            let stale = check_supervisor(&PhaseFacts {
+                supervisor: PhaseLiveness::Stale,
+                ..agreeing_facts(PhaseId::new(21))
+            })
+            .expect("a STALE supervisor is a finding");
+            assert_eq!(stale.severity, Severity::Problem);
+            assert_eq!(
+                stale.repair.as_deref(),
+                Some("devflow stop --phase 21 && devflow resume --phase 21")
+            );
+            assert!(
+                stale.detail.contains("STALE") && stale.detail.contains(SUPERVISOR_LAUNCH_ID),
+                "{}",
+                stale.detail
+            );
+
+            let gone = check_supervisor(&PhaseFacts {
+                supervisor: PhaseLiveness::GoneWhileActive,
+                ..agreeing_facts(PhaseId::new(22))
+            })
+            .expect("GONE while active is a finding");
+            assert_eq!(gone.severity, Severity::Problem);
+            assert_eq!(gone.repair.as_deref(), Some("devflow resume --phase 22"));
+            assert!(gone.detail.contains("GONE"), "{}", gone.detail);
+
+            let record = devflow_core::state::SupervisorRecord::new(
+                PathBuf::from("/home/someone/.cache/devflow/sock/x.sock"),
+                SUPERVISOR_LAUNCH_ID.to_string(),
+                10,
+                20,
+                "boot".to_string(),
+            );
+            let failed = phase_liveness(
+                Some(&record),
+                Some(Err(devflow_core::supervisor::ProbeError::NotASocket(
+                    record.socket_path.clone(),
+                ))),
+                false,
+            );
+            let failed = check_supervisor(&PhaseFacts {
+                supervisor: failed,
+                ..agreeing_facts(PhaseId::new(23))
+            })
+            .expect("a failed probe is a finding");
+            assert_eq!(failed.severity, Severity::Problem);
+            assert!(
+                failed.detail.contains("not a socket") && !failed.detail.contains('/'),
+                "a failed probe names its kind and no path: {}",
+                failed.detail
+            );
+            assert_eq!(failed.repair.as_deref(), Some("devflow status"));
+
+            let reconciled = reconcile_phase(&PhaseFacts {
+                supervisor: PhaseLiveness::Stale,
+                ..agreeing_facts(PhaseId::new(21))
+            });
+            assert!(
+                reconciled.iter().any(|f| f.detail == stale.detail),
+                "reconcile_phase runs check_supervisor"
+            );
+        }
+
+        /// 50-12 control: ALIVE, GONE while stopped, and NotLaunched are not
+        /// findings, so the checks above can only fire for the three states
+        /// that need a repair.
+        #[test]
+        fn check_supervisor_is_silent_when_alive_or_stopped() {
+            let alive = agreeing_facts(PhaseId::new(24));
+            assert!(check_supervisor(&alive).is_none());
+            assert!(reconcile_phase(&alive).is_empty());
+            let stopped = PhaseFacts {
+                supervisor: PhaseLiveness::Gone,
+                stopped: true,
+                ..agreeing_facts(PhaseId::new(25))
+            };
+            assert!(check_supervisor(&stopped).is_none());
+            let unlaunched = PhaseFacts {
+                supervisor: PhaseLiveness::NotLaunched,
+                supervisor_launch_id: None,
+                ..agreeing_facts(PhaseId::new(26))
+            };
+            assert!(check_supervisor(&unlaunched).is_none());
+        }
+
+        /// 50-12 (T-50-32): `doctor --json` phase facts carry the
+        /// supervisor's liveness, owner, launch and launch id, and no string
+        /// in the reconciliation section holds a path.
+        #[test]
+        fn doctor_json_reports_supervisor_liveness_without_paths() {
+            let record = devflow_core::state::SupervisorRecord::new(
+                PathBuf::from("/home/someone/.cache/devflow/sock/x.sock"),
+                SUPERVISOR_LAUNCH_ID.to_string(),
+                10,
+                20,
+                "boot".to_string(),
+            );
+            let failed = phase_liveness(
+                Some(&record),
+                Some(Err(devflow_core::supervisor::ProbeError::NotASocket(
+                    record.socket_path.clone(),
+                ))),
+                false,
+            );
+            let facts = vec![
+                agreeing_facts(PhaseId::new(27)),
+                PhaseFacts {
+                    supervisor: failed,
+                    ..agreeing_facts(PhaseId::new(28))
+                },
+            ];
+            let body = render_reconciliation_json(&facts);
+            let entries = body.as_array().expect("an array");
+            let alive = &entries[0]["supervisor"];
+            assert_eq!(alive["liveness"], "alive", "{body}");
+            assert_eq!(alive["owner"], "agent_running", "{body}");
+            assert_eq!(alive["launch"], "stream", "{body}");
+            assert_eq!(alive["launch_id"], SUPERVISOR_LAUNCH_ID, "{body}");
+            let failed = &entries
+                .iter()
+                .find(|entry| entry["phase"] == 28)
+                .expect("phase 28's finding")["supervisor"];
+            assert_eq!(failed["liveness"], "probe_failed", "{body}");
+            assert!(failed["owner"].is_null(), "{body}");
+            let mut strings = Vec::new();
+            strings_in(&body, &mut strings);
+            assert!(!strings.is_empty(), "the scan must see strings: {body}");
+            assert!(
+                strings.iter().all(|text| !text.contains('/')),
+                "no string in the reconciliation section may hold a path: {strings:?}"
+            );
+        }
+
         /// A fully-agreeing baseline: `reconcile_phase` over this returns
         /// zero findings. Each test overrides only the field(s) needed to
         /// trigger the one check it's proving.
@@ -7179,6 +7347,11 @@ mod tests {
                 agent_alive: true,
                 monitor_pid: Some(4343),
                 monitor_alive: true,
+                supervisor: PhaseLiveness::Alive {
+                    owner: "agent_running".to_string(),
+                    launch: "stream".to_string(),
+                },
+                supervisor_launch_id: Some(SUPERVISOR_LAUNCH_ID.to_string()),
                 last_event: Some("stage_launched".into()),
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
