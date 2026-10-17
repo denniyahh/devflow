@@ -254,6 +254,16 @@ impl Fixture {
     /// sleeper, as a child of this test process so it can be signalled
     /// directly.
     fn spawn_monitor(&self) -> Child {
+        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
+        // under the hermetic cache dir this file's child process gets.
+        let launch_id = devflow_core::supervisor::new_launch_id();
+        let socket = devflow_core::supervisor::SocketPath::for_launch(
+            &self.home.cache_dir(),
+            &self.root,
+            self.phase,
+            &launch_id,
+        )
+        .expect("the hermetic socket path fits sun_path");
         let child = common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
@@ -270,6 +280,12 @@ impl Fixture {
             .arg("120")
             .arg("--agent")
             .arg("claude")
+            .arg("--launch")
+            .arg("stream")
+            .arg("--launch-id")
+            .arg(&launch_id)
+            .arg("--socket")
+            .arg(socket.as_path())
             .arg("--")
             .arg("sh")
             .arg(&self.script)
