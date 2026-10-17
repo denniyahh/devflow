@@ -635,6 +635,74 @@ impl Drop for ReapMonitorOnDrop {
     }
 }
 
+/// Parse the `__monitor` argv a [`MonitorExec::HarnessEntry`] re-exec put in
+/// [`MONITOR_ARGV_ENV`] and run it as `main` dispatches `__monitor`, with or
+/// without the advance tail. Returns without doing anything when the variable
+/// is absent, so a run of ignored tests that reaches an entry is a no-op.
+///
+/// [`MonitorExec::HarnessEntry`]: devflow_core::monitor::MonitorExec::HarnessEntry
+/// [`MONITOR_ARGV_ENV`]: devflow_core::monitor::MONITOR_ARGV_ENV
+fn run_monitor_harness_entry(advance: bool) {
+    use clap::Parser as _;
+    let Some(encoded) = std::env::var_os(devflow_core::monitor::MONITOR_ARGV_ENV) else {
+        return;
+    };
+    let encoded = encoded
+        .into_string()
+        .expect("the monitor argv must be UTF-8 JSON");
+    let after_subcommand: Vec<String> =
+        serde_json::from_str(&encoded).expect("the monitor argv must be a JSON array of strings");
+    let argv = ["devflow", "__monitor"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(after_subcommand);
+    let cli = crate::Cli::try_parse_from(argv).expect("the monitor argv must parse as __monitor");
+    let crate::Command::Monitor {
+        project,
+        phase,
+        stage,
+        workdir,
+        prompt_file,
+        idle_timeout_secs,
+        agent,
+        argv,
+    } = cli.command
+    else {
+        panic!("the monitor argv parsed as a command other than __monitor");
+    };
+    let project_root = crate::project_root(project).expect("monitor project root");
+    crate::pipeline_launch::supervise_monitor(
+        &project_root,
+        phase,
+        stage,
+        &workdir,
+        &prompt_file,
+        idle_timeout_secs,
+        agent,
+        &argv,
+        advance,
+    )
+    .expect("the harness-entry monitor must supervise its agent");
+}
+
+/// The test build's full monitor entry (50-10): `run_monitor` exactly as the
+/// `__monitor` subcommand runs it, advance tail included. Selected by
+/// `pipeline_launch::launch_context` when `DEVFLOW_TEST_MONITOR_FULL=1`.
+#[test]
+#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
+fn monitor_entry_full() {
+    run_monitor_harness_entry(true);
+}
+
+/// The test build's default monitor entry (50-10): `run_monitor`'s
+/// supervision without its advance tail, so an in-crate launch supervises its
+/// fake agent and leaves the stage machine where the test put it.
+#[test]
+#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
+fn monitor_entry_supervise_only() {
+    run_monitor_harness_entry(false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
