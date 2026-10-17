@@ -59,3 +59,8 @@ reason = "Test-only: carries the __monitor argv to the CLI #[cfg(test)] monitor 
 kind = "source_to_docs"
 token = "DEVFLOW_TEST_MONITOR_FULL"
 reason = "Test-only: selects the advance-running monitor harness entry for #[cfg(test)] stage launches in the CLI own unit tests; no release build reads it, so it is not an operator setting (Phase 50, plan 50-10)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_HOLD"
+reason = "Test-only: #[cfg(test)] hold points in the devflow-core monitor (50-24) and the CLI stage handoff (50-13, 50-23) wait while it names <point>:<path> and that path does not exist, so tests can land a fault in a chosen window; compiled out of release builds, so it is not an operator setting."
