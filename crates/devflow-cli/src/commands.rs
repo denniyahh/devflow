@@ -4681,6 +4681,28 @@ fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
     out
 }
 
+/// One supervisor socket `doctor`'s read-only sweep reports (50-12, D-06).
+pub(crate) struct OrphanSupervisorFinding {
+    /// The path-free finding: detail and `devflow stop --phase N --launch
+    /// <id>` repair.
+    pub(crate) finding: PhaseFinding,
+    /// The launch id that addresses exactly this socket.
+    pub(crate) launch_id: String,
+    /// `alive` or `stale`.
+    pub(crate) liveness: &'static str,
+    /// Whether the project root the socket names still exists.
+    pub(crate) root_exists: bool,
+}
+
+/// RED stub (50-12 Task 3): reports nothing.
+#[allow(dead_code)]
+fn collect_orphan_supervisors(
+    _project_root: &Path,
+    _cache_dir: &Path,
+) -> Vec<OrphanSupervisorFinding> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7368,6 +7390,383 @@ mod tests {
             assert!(
                 strings.iter().all(|text| !text.contains('/')),
                 "no string in the reconciliation section may hold a path: {strings:?}"
+            );
+        }
+
+        /// A short cache dir directly under `/tmp`, so every socket path
+        /// below it fits `sun_path`.
+        fn short_cache() -> tempfile::TempDir {
+            tempfile::Builder::new()
+                .prefix("dfs")
+                .tempdir_in("/tmp")
+                .expect("create a short cache dir under /tmp")
+        }
+
+        /// Publish the socket for `(root, phase, launch_id)` under `cache`.
+        /// Dropping the returned listener leaves the socket STALE.
+        fn publish_launch(
+            cache: &Path,
+            root: &Path,
+            phase: u32,
+            launch_id: &str,
+        ) -> (supervisor::SocketPath, std::os::unix::net::UnixListener) {
+            let socket =
+                supervisor::SocketPath::for_launch(cache, root, PhaseId::new(phase), launch_id)
+                    .expect("socket path fits sun_path");
+            let listener = supervisor::publish(&socket).expect("publish the socket");
+            (socket, listener)
+        }
+
+        /// A complete sidecar for `(root, phase, launch_id)`, as a supervisor
+        /// writes it.
+        fn write_sidecar_for(socket: &supervisor::SocketPath, root: &Path, phase: u32, id: &str) {
+            let sidecar = serde_json::json!({
+                "launch_id": id,
+                "project_root": root,
+                "phase": PhaseId::new(phase),
+                "stage": "code",
+                "agent": "claude",
+                "launch": "stream",
+                "agent_pid": 1,
+                "agent_pgid": 1,
+                "agent_start_time": 0,
+                "boot_id": "boot",
+                "supervisor_pid": 1,
+                "supervisor_start_time": 0,
+                "created_at": "2026-10-17T00:00:00Z",
+            });
+            std::fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
+            supervisor::read_sidecar(&socket.sidecar_path()).expect("the planted sidecar parses");
+        }
+
+        /// A loadable state for `phase` whose supervisor record carries
+        /// `launch_id`.
+        fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
+            let mut state = State::new(
+                PhaseId::new(phase),
+                AgentKind::Claude,
+                Mode::Auto,
+                root.to_path_buf(),
+            );
+            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                PathBuf::from("/elsewhere.sock"),
+                launch_id.to_string(),
+                1,
+                0,
+                "boot".to_string(),
+            ));
+            workflow::save_state(&state).unwrap();
+        }
+
+        /// Answers every ping on `listener` as a supervisor would, until
+        /// [`PingResponder::stop`].
+        struct PingResponder {
+            done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            socket: PathBuf,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl PingResponder {
+            fn start(
+                socket: &supervisor::SocketPath,
+                listener: std::os::unix::net::UnixListener,
+                launch_id: &str,
+                phase: u32,
+            ) -> Self {
+                use std::io::{BufRead as _, Write as _};
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let reply = serde_json::json!({
+                    "ok": true,
+                    "launch_id": launch_id,
+                    "phase": phase.to_string(),
+                    "stage": "code",
+                    "launch": "stream",
+                    "owner": "agent_running",
+                    "agent_pid": 1,
+                    "agent_pgid": 1,
+                    "agent_start_time": 0,
+                    "boot_id": null,
+                    "supervisor_pid": 1,
+                });
+                let stop = std::sync::Arc::clone(&done);
+                let thread = std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(stream) = stream else { continue };
+                        let mut line = String::new();
+                        if std::io::BufReader::new(&stream)
+                            .read_line(&mut line)
+                            .is_ok()
+                        {
+                            let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+                        }
+                    }
+                });
+                Self {
+                    done,
+                    socket: socket.as_path().to_path_buf(),
+                    thread: Some(thread),
+                }
+            }
+
+            fn stop(&mut self) {
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Wake the blocked accept so the thread sees the flag.
+                let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+                if let Some(thread) = self.thread.take() {
+                    thread.join().expect("the ping responder thread");
+                }
+            }
+        }
+
+        impl Drop for PingResponder {
+            fn drop(&mut self) {
+                self.stop();
+            }
+        }
+
+        /// Every file under `dir` as (name, length, mtime), sorted.
+        fn snapshot(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .expect("list the socket dir")
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        meta.len(),
+                        meta.modified().unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        }
+
+        /// 50-12 (D-06, R5-I3, T-50-31, T-50-51, T-50-84): doctor's sweep
+        /// lists the ALIVE and STALE sockets that no loadable state of this
+        /// root claims — no state, an unparsable state, a superseded launch,
+        /// a missing or broken sidecar attributed by file name — and,
+        /// machine-wide, those whose project root is gone. Each names the
+        /// `--launch` teardown, never the bare stop. Another root's sockets
+        /// and the ones a state claims are not listed, and nothing under
+        /// `sock/` changes.
+        #[test]
+        fn doctor_reports_an_orphan_socket_without_removing_it() {
+            let cache = short_cache();
+            let cache = cache.path();
+            let repo = tempfile::tempdir().unwrap();
+            let root = repo.path();
+            let other = tempfile::tempdir().unwrap();
+            let other_root = other.path();
+            let deleted = tempfile::tempdir().unwrap();
+            let deleted_root = deleted.path().to_path_buf();
+
+            // (a) STALE, sidecar for phase 7, whose state file is corrupt.
+            let (a, _) = publish_launch(cache, root, 7, "aaaa0000aaaa0007");
+            write_sidecar_for(&a, root, 7, "aaaa0000aaaa0007");
+            let state7 = workflow::state_path(root, PhaseId::new(7));
+            std::fs::create_dir_all(state7.parent().unwrap()).unwrap();
+            std::fs::write(&state7, "{").unwrap();
+            // (b) STALE, superseded: phase 8's state names its successor.
+            let (b, _) = publish_launch(cache, root, 8, "aaaa0000aaaa0008");
+            write_sidecar_for(&b, root, 8, "aaaa0000aaaa0008");
+            save_state_with_launch(root, 8, "ffff0000ffff0008");
+            // (c) STALE, another root that exists: not ours.
+            let (c, _) = publish_launch(cache, other_root, 7, "aaaa0000aaaa000c");
+            write_sidecar_for(&c, other_root, 7, "aaaa0000aaaa000c");
+            // (d) STALE, a project root deleted after the launch.
+            let (d, _) = publish_launch(cache, &deleted_root, 5, "aaaa0000aaaa000d");
+            write_sidecar_for(&d, &deleted_root, 5, "aaaa0000aaaa000d");
+            drop(deleted);
+            assert!(!deleted_root.exists(), "the root of (d) is deleted");
+            // (e) ALIVE, this root's phase 9, no state, sidecar `{`.
+            let (e, listener) = publish_launch(cache, root, 9, "bbbb0000bbbb0000");
+            std::fs::write(e.sidecar_path(), "{").unwrap();
+            let mut responder = PingResponder::start(&e, listener, "bbbb0000bbbb0000", 9);
+            // (f) STALE, this root's phase 10, no sidecar, no state.
+            let (_f, _) = publish_launch(cache, root, 10, "cccc0000cccc0000");
+            // (g) control: STALE, the other root's phase 9, no sidecar.
+            let (_g, _) = publish_launch(cache, other_root, 9, "dddd0000dddd0000");
+            // (h) control: STALE, no sidecar, whose state claims it.
+            let (_h, _) = publish_launch(cache, root, 11, "eeee0000eeee0000");
+            save_state_with_launch(root, 11, "eeee0000eeee0000");
+            // (i) control: STALE with a sidecar, whose state claims it.
+            let (i, _) = publish_launch(cache, root, 12, "aaaa0000aaaa0012");
+            write_sidecar_for(&i, root, 12, "aaaa0000aaaa0012");
+            save_state_with_launch(root, 12, "aaaa0000aaaa0012");
+
+            let sock_dir = registry::socket_dir_in(cache);
+            let before = snapshot(&sock_dir);
+            let findings = collect_orphan_supervisors(root, cache);
+            assert_eq!(
+                snapshot(&sock_dir),
+                before,
+                "the sweep must change nothing under sock/"
+            );
+            responder.stop();
+
+            let mut listed: Vec<(PhaseId, &str, &str, bool)> = findings
+                .iter()
+                .map(|orphan| {
+                    (
+                        orphan.finding.phase,
+                        orphan.launch_id.as_str(),
+                        orphan.liveness,
+                        orphan.root_exists,
+                    )
+                })
+                .collect();
+            listed.sort();
+            assert_eq!(
+                listed,
+                vec![
+                    (PhaseId::new(5), "aaaa0000aaaa000d", "stale", false),
+                    (PhaseId::new(7), "aaaa0000aaaa0007", "stale", true),
+                    (PhaseId::new(8), "aaaa0000aaaa0008", "stale", true),
+                    (PhaseId::new(9), "bbbb0000bbbb0000", "alive", true),
+                    (PhaseId::new(10), "cccc0000cccc0000", "stale", true),
+                ],
+                "exactly (a), (b), (d), (e) and (f) are listed"
+            );
+            for orphan in &findings {
+                let finding = &orphan.finding;
+                let repair = finding
+                    .repair
+                    .as_deref()
+                    .expect("every orphan names a repair");
+                assert_eq!(
+                    repair,
+                    format!(
+                        "devflow stop --phase {} --launch {}",
+                        finding.phase, orphan.launch_id
+                    ),
+                    "the repair addresses exactly this socket"
+                );
+                assert!(
+                    repair.contains("--launch")
+                        && repair != format!("devflow stop --phase {}", finding.phase),
+                    "never the bare stop, which would stop the state's own record: {repair}"
+                );
+                assert!(
+                    !finding.detail.contains('/'),
+                    "a path-free detail: {}",
+                    finding.detail
+                );
+                assert_eq!(finding.severity, Severity::Problem);
+            }
+            let detail_of = |id: &str| {
+                findings
+                    .iter()
+                    .find(|orphan| orphan.launch_id == id)
+                    .map(|orphan| orphan.finding.detail.clone())
+                    .unwrap()
+            };
+            assert!(detail_of("aaaa0000aaaa000d").contains("no longer exists"));
+            assert!(detail_of("bbbb0000bbbb0000").contains("does not parse"));
+            assert!(detail_of("cccc0000cccc0000").contains("missing"));
+            assert!(detail_of("aaaa0000aaaa0008").contains("another launch"));
+
+            // Control: removing (a)'s files changes the snapshot, so the
+            // comparison above can fail.
+            supervisor::remove_launch_files(&a).unwrap();
+            assert_ne!(
+                snapshot(&sock_dir),
+                before,
+                "the snapshot must see a removal"
+            );
+        }
+
+        /// The comment-stripped body of `fn collect_orphan_supervisors(` in
+        /// `source` (cut at its first `mod tests {` line), from that line to
+        /// the next line that is exactly `}`; `None` when absent.
+        fn orphan_sweep_body(source: &str) -> Option<Vec<&str>> {
+            let lines: Vec<&str> = source
+                .lines()
+                .take_while(|line| !line.contains("mod tests {"))
+                .collect();
+            let start = lines
+                .iter()
+                .position(|line| line.contains("fn collect_orphan_supervisors("))?;
+            let end = start + lines[start..].iter().position(|line| *line == "}")?;
+            Some(
+                lines[start..=end]
+                    .iter()
+                    .copied()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect(),
+            )
+        }
+
+        /// Why `source`'s `collect_orphan_supervisors` breaks R6-G4: absent
+        /// or under 5 lines, an acting call, or no `sweep_for_in(` call.
+        fn orphan_sweep_violations(source: &str) -> Vec<String> {
+            const ACTING: [&str; 5] = [
+                "remove_launch_files",
+                "remove_file",
+                "teardown_stale",
+                "request_shutdown",
+                "kill(",
+            ];
+            let Some(body) = orphan_sweep_body(source) else {
+                return vec!["fn collect_orphan_supervisors( not found".to_string()];
+            };
+            let mut violations = Vec::new();
+            if body.len() < 5 {
+                violations.push(format!("body has {} lines, under 5", body.len()));
+            }
+            for line in &body {
+                for call in ACTING {
+                    if line.contains(call) {
+                        violations.push(format!("acting call {call}: {line}"));
+                    }
+                }
+            }
+            if !body.iter().any(|line| line.contains("sweep_for_in(")) {
+                violations.push("no sweep_for_in( call".to_string());
+            }
+            violations
+        }
+
+        /// 50-12 R6-G4 (T-50-31, T-50-84): doctor's orphan sweep only reads,
+        /// and attributes a sidecar-less socket through `sweep_for_in`, so
+        /// 50-06's digest rule stays in one place. Planted controls run the
+        /// same check.
+        #[test]
+        fn the_orphan_sweep_only_reads_and_attributes_through_sweep_for_in() {
+            let reads = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    for entry in supervisor::sweep_for_in(b, a, p) {\n        out.push(entry);\n    }\n    out\n}\n";
+            assert!(
+                orphan_sweep_violations(reads).is_empty(),
+                "a read-only fn passes"
+            );
+            let acts = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    for entry in supervisor::sweep_for_in(b, a, p) {\n        supervisor::remove_launch_files(&entry);\n        out.push(entry);\n    }\n    out\n}\n";
+            let found = orphan_sweep_violations(acts);
+            assert!(
+                found.len() == 1 && found[0].contains("remove_launch_files"),
+                "an acting call fails: {found:?}"
+            );
+            let reimplements = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    // sweep_for_in(b, a, p) re-derived below\n    for entry in supervisor::sweep_in(b) {\n        out.push(entry);\n    }\n    out\n}\n";
+            let found = orphan_sweep_violations(reimplements);
+            assert!(
+                found.len() == 1 && found[0].contains("no sweep_for_in"),
+                "a commented-out sweep_for_in fails: {found:?}"
+            );
+            let absent = "fn other() {\n}\n";
+            assert_eq!(
+                orphan_sweep_violations(absent),
+                vec!["fn collect_orphan_supervisors( not found".to_string()]
+            );
+
+            let source = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+            )
+            .expect("read src/commands.rs");
+            assert_eq!(
+                orphan_sweep_violations(&source),
+                Vec::<String>::new(),
+                "collect_orphan_supervisors must only read and must call sweep_for_in"
             );
         }
 
