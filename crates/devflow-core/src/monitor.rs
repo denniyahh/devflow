@@ -5639,12 +5639,15 @@ exit 0
         }
     }
 
+    #[cfg(target_os = "linux")]
     const RESPONSIBILITIES_TEST: &str =
         "monitor::tests::both_arms_meet_every_supervisor_responsibility_with_a_non_claude_adapter";
 
     /// The adapter variable R-F threads: one `hermetic_command` scrubs, so
     /// it only reaches the agent when `envs` is applied after the scrub.
+    #[cfg(target_os = "linux")]
     const R_F_VARIABLE: &str = "GIT_CONFIG_COUNT";
+    #[cfg(target_os = "linux")]
     const R_F_VALUE: &str = "1";
 
     /// V-08 (R-11): the spike's responsibilities under both shapes, with a
