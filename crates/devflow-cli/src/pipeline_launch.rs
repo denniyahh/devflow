@@ -42,7 +42,7 @@ use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::SupervisorRecord;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
-use devflow_core::supervisor::runtime::{AgentOutcome, OwnerPhase, StopToken};
+use devflow_core::supervisor::runtime::{AgentOutcome, OwnerPhase, SafePoint, StopToken};
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
     agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
@@ -951,23 +951,19 @@ pub(crate) const SUPERVISOR_STOP_REASON: &str =
 
 /// The stop reason an advance records when it stops at a safe point
 /// (50-13, R-2).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "RED scaffold: the safe points (50-13 Task 2) record it")
-)]
 pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
 
-/// How long a stopped supervisor waits for the per-phase lock before it
-/// records the stop.
-const STOP_RECORD_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// The bound on the two waits a stop can put between two supervisors
+/// (50-13, T-50-54): a stopped supervisor's wait for the per-phase lock
+/// before it records its stop, and safe point 3's wait for an unpublished
+/// next supervisor's final `stopped` line. `2 × TERMINATE_VERIFY_WAIT + 5 s`:
+/// the next supervisor's kill grace plus margin.
+const SUPERVISOR_STOP_WAIT: Duration =
+    Duration::from_secs(2 * devflow_core::agent::TERMINATE_VERIFY_WAIT.as_secs() + 5);
 
 /// What a supervisor's advance reads on this thread (50-13): its stop token,
 /// for the advance's safe points, and the successor the advance recorded.
 struct EngagedAdvance {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the advance safe points (50-13 Task 2)")
-    )]
     token: StopToken,
     successor: Option<SupervisorRecord>,
 }
@@ -1013,10 +1009,6 @@ impl Drop for StopTokenGuard {
 
 /// Run `f` on the engaged stop token, or return `None` when no supervisor's
 /// advance is running on this thread.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the advance safe points (50-13 Task 2)")
-)]
 fn with_stop_token<R>(f: impl FnOnce(&StopToken) -> R) -> Option<R> {
     let token = ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().map(|e| e.token.clone()));
     token.map(|token| f(&token))
@@ -1040,6 +1032,63 @@ fn take_successor() -> Option<SupervisorRecord> {
             .as_mut()
             .and_then(|engaged| engaged.successor.take())
     })
+}
+
+/// An advance safe point (50-13, R-2): when the engaged supervisor's stop
+/// has been requested, record the stop in `state` and return `true`, so the
+/// caller returns at once without launching anything (the per-phase lock
+/// guard drops on the way out, and the supervisor's `finish` answers a
+/// parked caller `stopped`). `false` with no stop requested, or outside a
+/// supervisor's advance.
+fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliError> {
+    if with_stop_token(StopToken::safe_point) != Some(SafePoint::StopHere) {
+        return Ok(false);
+    }
+    record_advance_stop(state, safe_point)?;
+    Ok(true)
+}
+
+/// Persist a stop an advance honoured at `safe_point`: `stopped` with
+/// [`ADVANCE_STOP_REASON`], and an `advance_stopped` event naming the point.
+fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
+    state.stopped = true;
+    state.stop_reason = Some(ADVANCE_STOP_REASON.to_string());
+    workflow::save_state(state)?;
+    events::emit(
+        &state.project_root,
+        state.phase,
+        "advance_stopped",
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "safe_point": safe_point,
+        }),
+    );
+    info!(
+        "phase {}: {ADVANCE_STOP_REASON} (safe point {safe_point})",
+        state.phase
+    );
+    Ok(())
+}
+
+/// Safe point 3's shutdown of a next supervisor that was spawned and
+/// answered its ping but is not published: ask it to stop through its own
+/// socket, bounded by [`SUPERVISOR_STOP_WAIT`]. It records nothing itself
+/// (the state does not name it), so this launcher's stop is the record.
+fn shut_down_unpublished(record: &SupervisorRecord) {
+    match devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT) {
+        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. }) => info!(
+            "stopped the unpublished next supervisor at {}",
+            record.socket_path.display()
+        ),
+        Ok(other) => warn!(
+            "the unpublished next supervisor at {} answered {other:?} to shutdown",
+            record.socket_path.display()
+        ),
+        Err(err) => warn!(
+            "could not stop the unpublished next supervisor at {}: {err}",
+            record.socket_path.display()
+        ),
+    }
 }
 
 /// How long a [`test_hold`] waits for its release file.
@@ -1166,7 +1215,10 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
             wait_for_launch_record(project_root, phase, &invocation.launch_id);
             Ok(())
         }
-        _ => record_supervisor_stop(project_root, phase),
+        _ => {
+            record_supervisor_stop(project_root, phase, &invocation.launch_id);
+            Ok(())
+        }
     };
     // Never a `stopped` line for a completed run: `finish` decides the final
     // line from the recorded outcome, so a shutdown that arrived while
@@ -1244,18 +1296,63 @@ fn kept_env(names: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Record a run its supervisor stopped: under the per-phase lock (bounded
-/// wait), `state.stopped = true` with [`SUPERVISOR_STOP_REASON`]. Never
-/// advances.
-fn record_supervisor_stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    let _lock = lock::acquire_blocking(project_root, phase, STOP_RECORD_LOCK_WAIT)
-        .map_err(|err| CliError::Message(format!("could not record the stop: {err}")))?;
-    let mut state = workflow::load_state(project_root, phase)?;
+/// Record a run its supervisor stopped: `state.stopped = true` with
+/// [`SUPERVISOR_STOP_REASON`], under the per-phase lock. Never advances.
+///
+/// Only when the state names THIS launch (50-13, T-50-54): checked without
+/// the lock first, then again under it. A next supervisor that was never
+/// published (safe point 3 stops it while its launcher holds the lock and
+/// records the stop itself) and a superseded supervisor (the state names its
+/// successor, whose run it must not mark stopped) both write nothing, so
+/// neither waits on a lock its stopper holds.
+///
+/// Never fails (T-50-68): a state that will not load, a lock wait that
+/// times out or a save that fails is logged, naming the state path and why
+/// `stopped` was not recorded, and the caller still reaches `finish`, which
+/// answers a parked stop caller `stopped`.
+fn record_supervisor_stop(project_root: &Path, phase: PhaseId, launch_id: &str) {
+    let path = workflow::state_path(project_root, phase);
+    let names_this_launch = |state: &State| {
+        state
+            .supervisor
+            .as_ref()
+            .is_some_and(|record| record.launch_id == launch_id)
+    };
+    let not_recorded = |why: &str| {
+        warn!(
+            "phase {phase}: `stopped` was not recorded in {}: {why}",
+            path.display()
+        );
+    };
+    match workflow::load_state(project_root, phase) {
+        Err(err) => return not_recorded(&format!("the state does not load ({err})")),
+        Ok(state) if !names_this_launch(&state) => {
+            info!(
+                "phase {phase}: the state does not name launch {launch_id}; its stop is \
+                 not this supervisor's to record"
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+    let _lock = match lock::acquire_blocking(project_root, phase, SUPERVISOR_STOP_WAIT) {
+        Ok(guard) => guard,
+        Err(err) => return not_recorded(&format!("the per-phase lock was not acquired ({err})")),
+    };
+    let mut state = match workflow::load_state(project_root, phase) {
+        Ok(state) if names_this_launch(&state) => state,
+        Ok(_) => {
+            info!("phase {phase}: launch {launch_id} was superseded before its stop was recorded");
+            return;
+        }
+        Err(err) => return not_recorded(&format!("the state does not load ({err})")),
+    };
     state.stopped = true;
     state.stop_reason = Some(SUPERVISOR_STOP_REASON.to_string());
-    workflow::save_state(&state)?;
+    if let Err(err) = workflow::save_state(&state) {
+        return not_recorded(&format!("the save failed ({err})"));
+    }
     info!("phase {phase}: {SUPERVISOR_STOP_REASON}");
-    Ok(())
 }
 
 /// How long the supervise-only entry waits for its launcher's record.
@@ -1425,10 +1522,23 @@ fn spawn_agent_and_record(
     };
     #[cfg(test)]
     test_hold("before_spawn");
+    // Safe point 2 (50-13): a stop taken during the advance ends it before
+    // the next stage's supervisor is spawned.
+    if stopped_at_safe_point(state, 2)? {
+        return Ok(());
+    }
     let published = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     #[cfg(test)]
     test_hold("before_publish");
+    // Safe point 3 (50-13): the next supervisor answered its ping but is not
+    // published. On a stop, shut it down through its socket and never save
+    // its record; the state keeps this run's record, marked stopped.
+    if with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) {
+        shut_down_unpublished(&published.record);
+        record_advance_stop(state, 3)?;
+        return Ok(());
+    }
     let pid = published.supervisor_pid;
     let socket_path = published.record.socket_path.display().to_string();
     let launch_id = published.record.launch_id.clone();
@@ -2041,6 +2151,29 @@ pub(crate) fn advance_with(
     // different file. A duplicate advance of THIS phase queues behind the
     // lock, then stage binding below handles a launch that has moved on.
     let mut state = workflow::load_state(project_root, phase)?;
+    // Safe point 1 (50-13): a stop taken while this supervisor waited for
+    // the lock ends the advance before it evaluates anything.
+    if stopped_at_safe_point(&mut state, 1)? {
+        return Ok(());
+    }
+    // 999.138 residual: a stopped run never advances. `resume` clears
+    // `stopped` before it launches, so no caller advances a stopped state
+    // legitimately.
+    if state.stopped {
+        events::emit(
+            project_root,
+            phase,
+            "advance_failed",
+            serde_json::json!({
+                "reason": "stopped",
+                "stop_reason": state.stop_reason,
+            }),
+        );
+        return Err(CliError::Message(format!(
+            "phase {phase} is stopped ({}); run `devflow resume --phase {phase}` to continue it",
+            state.stop_reason.as_deref().unwrap_or("no reason recorded")
+        )));
+    }
     // CR-03 (49-REVIEW.md): a hand-run `advance` updates the run's notify
     // command; the detached chain carries no variable, so its `advance`
     // keeps the persisted one.
