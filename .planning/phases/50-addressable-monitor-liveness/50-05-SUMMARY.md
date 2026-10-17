@@ -256,3 +256,8 @@ None. The `aarch64-apple-darwin` target is already installed on this host, and t
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-17*
+
+## Self-Check: PASSED
+
+- Files: supervisor.rs, supervisor/protocol.rs, 50-05-SUMMARY.md, DEV-SETUP-CHECKLIST.md (3 `aarch64-apple-darwin` mentions) all present.
+- Commits c141930, 5b8a1b8, e7f2060, 3f8b0f3, cce908f are ancestors of HEAD; RED `test(50-05)` c141930 precedes GREEN `feat(50-05)` 5b8a1b8.
