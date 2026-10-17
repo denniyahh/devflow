@@ -3500,6 +3500,14 @@ pid_t fork(void) {
     /// the field cannot be read: an absent field must not read as "clear".
     #[cfg(target_os = "linux")]
     fn sigterm_in_mask(pid: u32, field: &str) -> bool {
+        signal_mask(pid, field) & (1 << (libc::SIGTERM - 1)) != 0
+    }
+
+    /// The named signal mask of `pid`'s `/proc/<pid>/status` (`SigCgt`,
+    /// `SigBlk`, ...). Panics when the field cannot be read: an absent field
+    /// must not read as "clear".
+    #[cfg(target_os = "linux")]
+    fn signal_mask(pid: u32, field: &str) -> u64 {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
             .expect("/proc/<pid>/status must be readable for a live child");
         let hex = status
@@ -3507,8 +3515,7 @@ pid_t fork(void) {
             .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
             .unwrap_or_else(|| panic!("/proc/{pid}/status has no {field} line"))
             .trim();
-        let mask = u64::from_str_radix(hex, 16).expect("signal masks are hex");
-        mask & (1 << (libc::SIGTERM - 1)) != 0
+        u64::from_str_radix(hex, 16).expect("signal masks are hex")
     }
 
     #[cfg(target_os = "linux")]
@@ -4930,6 +4937,17 @@ exit 0
             self.0.as_ref().expect("the child is still owned").id()
         }
 
+        /// Send `signal` to the child, by the pid of the `Child` this test
+        /// owns.
+        fn signal(&self, signal: libc::c_int) {
+            let pid = libc::pid_t::try_from(self.id()).expect("pid fits pid_t");
+            assert!(pid > 1, "refusing to signal pid {pid}");
+            // SAFETY: `pid > 1` names one process this test spawned and still
+            // owns unreaped.
+            let rc = unsafe { libc::kill(pid, signal) };
+            assert_eq!(rc, 0, "signal {signal} to the child supervisor {pid}");
+        }
+
         /// SIGKILL the child (by the pid of the `Child` this test owns) and
         /// reap it.
         fn kill_now(&mut self) {
@@ -5365,5 +5383,454 @@ exit 0
             }
         }
         assert!(failures.is_empty(), "rows that probed wrong: {failures:#?}");
+    }
+
+    /// Whether any member of process group `pgid` still exists (zombies
+    /// included). `EPERM` means a member exists that we may not signal.
+    fn stage_group_exists(pgid: u32) -> bool {
+        let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
+        assert!(signed > 1, "refusing to probe process group {signed}");
+        // SAFETY: `signed > 1`; signal 0 only checks for existence.
+        let rc = unsafe { libc::kill(-signed, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    /// A fake agent for `shape` that leaves a second group member running
+    /// (`sleep 60`, its stdio detached so it holds no capture pipe), then
+    /// waits for a file that never appears. Only a signal ends it.
+    fn group_agent(fixture: &StageFixture, shape: Shape) -> PathBuf {
+        fixture.agent(
+            &shape.adapter().to_string(),
+            &format!(
+                "{preamble}sleep 60 </dev/null >/dev/null 2>&1 &\n\
+                 printf '%s\\n' '{result}'\n\
+                 while [ ! -e '{never}' ]; do sleep 0.05; done\n\
+                 exit 0",
+                preamble = shape.preamble(),
+                result = shape.result_line(),
+                never = fixture.path("never").display(),
+            ),
+        )
+    }
+
+    const STOP_SIGNAL_TEST: &str = "monitor::tests::sigterm_to_the_supervisor_kills_the_agent_group_records_143_and_does_not_advance";
+
+    /// V-16. Do NOT widen the 5 s windows below to make this pass: a missed
+    /// TERM or INT is a defect, not slowness.
+    #[test]
+    fn sigterm_to_the_supervisor_kills_the_agent_group_records_143_and_does_not_advance() {
+        if crate::test_support::in_child_test(STOP_SIGNAL_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        for shape in Shape::BOTH {
+            for (name, signal) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
+                let fixture = StageFixture::new();
+                let program = group_agent(&fixture, shape);
+                let mut run = launch_stage(
+                    STOP_SIGNAL_TEST,
+                    &fixture,
+                    shape,
+                    shape.adapter(),
+                    &program,
+                    "",
+                );
+                let pgid = run.reply.agent_pgid;
+                assert!(
+                    stage_group_exists(pgid),
+                    "{shape:?} {name}: control: the agent group runs before the signal"
+                );
+
+                // The supervisor child's own pid, from the `Child` we own.
+                run.child.signal(signal);
+                let outcome = run.finish(STOP_SIGNAL_TEST);
+                assert_eq!(
+                    outcome, "Stopped finished",
+                    "{shape:?} {name}: a signal to the supervisor is a stop, never a completion"
+                );
+                assert!(
+                    stage_wait_until(Duration::from_secs(5), || !stage_group_exists(pgid)),
+                    "{shape:?} {name}: every member of the agent group must be gone: {}",
+                    proc_snapshot(run.agent_pid())
+                );
+                assert_eq!(fixture.exit_code(), "143", "{shape:?} {name}");
+                assert_eq!(
+                    run.liveness(),
+                    crate::supervisor::Liveness::Gone,
+                    "{shape:?} {name}: the socket is gone after the stop"
+                );
+                drop(run.group);
+            }
+
+            // Control: SIGTERM straight to the agent, not the supervisor. The
+            // agent dies of it (the test observes a real death), and the
+            // supervisor reports that as a natural completion that advances.
+            let fixture = StageFixture::new();
+            let program = group_agent(&fixture, shape);
+            let mut run = launch_stage(
+                STOP_SIGNAL_TEST,
+                &fixture,
+                shape,
+                shape.adapter(),
+                &program,
+                "",
+            );
+            let agent = libc::pid_t::try_from(run.agent_pid()).expect("pid fits pid_t");
+            assert!(agent > 1, "refusing to signal pid {agent}");
+            // SAFETY: `agent > 1` is the live agent the child supervisor
+            // still holds unreaped (it is waiting on it).
+            assert_eq!(unsafe { libc::kill(agent, libc::SIGTERM) }, 0);
+            assert_eq!(
+                run.finish(STOP_SIGNAL_TEST),
+                "Completed(143) advancing",
+                "{shape:?} control: a TERM to the agent alone is not a supervisor stop"
+            );
+            assert_eq!(fixture.exit_code(), "143", "{shape:?} control");
+            drop(run.group);
+        }
+    }
+
+    /// One checker per supervisor responsibility of the spike's R-A..R-M
+    /// table (V-08), each returning the violation it found. Linux-only:
+    /// they read `/proc`.
+    #[cfg(target_os = "linux")]
+    mod responsibilities {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        /// R-A: the agent's cwd is the worktree, not the project root.
+        pub(super) fn r_a_cwd(agent_pid: u32, workdir: &Path) -> Result<(), String> {
+            let cwd = std::fs::read_link(format!("/proc/{agent_pid}/cwd"))
+                .map_err(|err| format!("agent cwd unreadable: {err}"))?;
+            let want = workdir.canonicalize().map_err(|err| err.to_string())?;
+            (cwd == want)
+                .then_some(())
+                .ok_or_else(|| format!("agent cwd {} is not {}", cwd.display(), want.display()))
+        }
+
+        /// R-B: stdout and stderr land in separate files, and stderr never
+        /// reaches the stdout capture.
+        pub(super) fn r_b_streams(
+            stdout: &str,
+            stderr: &str,
+            result_line: &str,
+            stderr_line: &str,
+        ) -> Result<(), String> {
+            if !stdout.lines().any(|line| line == result_line) {
+                return Err(format!("stdout lacks the result line: {stdout:?}"));
+            }
+            if stdout.contains(stderr_line) {
+                return Err(format!("stderr text reached stdout: {stdout:?}"));
+            }
+            if !stderr.contains(stderr_line) {
+                return Err(format!("stderr lacks its line: {stderr:?}"));
+            }
+            Ok(())
+        }
+
+        /// R-C: the pid file names the agent, and that pid runs the adapter
+        /// program, not the supervisor.
+        pub(super) fn r_c_pid(
+            pid_file: &str,
+            agent_pid: u32,
+            program: &Path,
+        ) -> Result<(), String> {
+            if pid_file != agent_pid.to_string() {
+                return Err(format!("pid file {pid_file:?} is not agent {agent_pid}"));
+            }
+            let cmdline = std::fs::read(format!("/proc/{agent_pid}/cmdline"))
+                .map_err(|err| format!("agent cmdline unreadable: {err}"))?;
+            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            cmdline
+                .contains(&*program.to_string_lossy())
+                .then_some(())
+                .ok_or_else(|| format!("agent {agent_pid} runs {cmdline:?}, not the adapter"))
+        }
+
+        /// R-D: the exit file holds the exact code (`128 + n` for signal n).
+        pub(super) fn r_d_exit(exit_file: &str, code: i32) -> Result<(), String> {
+            (exit_file == code.to_string())
+                .then_some(())
+                .ok_or_else(|| format!("exit file {exit_file:?}, want {code}"))
+        }
+
+        /// R-E: natural completion is `Completed(code)` and the run is left
+        /// advancing.
+        pub(super) fn r_e_completes(outcome: &str, code: i32) -> Result<(), String> {
+            (outcome == format!("Completed({code}) advancing"))
+                .then_some(())
+                .ok_or_else(|| format!("outcome {outcome:?} is not a completion with {code}"))
+        }
+
+        /// R-F: the adapter variable reached a grandchild of the agent.
+        pub(super) fn r_f_env(recorded: Option<&str>, value: &str) -> Result<(), String> {
+            (recorded == Some(value))
+                .then_some(())
+                .ok_or_else(|| format!("grandchild saw {recorded:?}, want {value:?}"))
+        }
+
+        /// R-J: a sweep for the root and phase finds the live launch with no
+        /// state file on disk.
+        pub(super) fn r_j_sweep(
+            cache: &Path,
+            root: &Path,
+            phase: crate::phase_id::PhaseId,
+            launch_id: &str,
+        ) -> Result<(), String> {
+            if crate::workflow::state_path(root, phase).exists() {
+                return Err("a state file exists, so this does not test the no-state sweep".into());
+            }
+            let found = crate::supervisor::sweep_for_in(cache, root, phase);
+            let ours: Vec<_> = found
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .sidecar
+                        .as_ref()
+                        .is_some_and(|sidecar| sidecar.launch_id == launch_id)
+                })
+                .collect();
+            match ours.as_slice() {
+                [entry] if matches!(entry.liveness, Ok(crate::supervisor::Liveness::Alive(_))) => {
+                    Ok(())
+                }
+                _ => Err(format!("sweep found {found:?}, want our one Alive launch")),
+            }
+        }
+
+        /// R-K: a stopped run still records an exit code, 143.
+        pub(super) fn r_k_stop_exit(exit_file: &str) -> Result<(), String> {
+            r_d_exit(exit_file, 143)
+        }
+
+        /// R-L: the socket is 0600 and the socket directory 0700.
+        pub(super) fn r_l_modes(socket: &Path) -> Result<(), String> {
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .map(|meta| meta.permissions().mode() & 0o777)
+                    .map_err(|err| format!("{}: {err}", path.display()))
+            };
+            let socket_mode = mode(socket)?;
+            let dir_mode = mode(socket.parent().ok_or("socket has no parent")?)?;
+            (socket_mode == 0o600 && dir_mode == 0o700)
+                .then_some(())
+                .ok_or_else(|| format!("socket {socket_mode:o}, sock/ {dir_mode:o}"))
+        }
+
+        /// R-M: a stop is not a completion: the run ended `Stopped` and
+        /// finished, so nothing advances.
+        pub(super) fn r_m_stop_is_not_completion(outcome: &str) -> Result<(), String> {
+            (outcome == "Stopped finished")
+                .then_some(())
+                .ok_or_else(|| format!("a stopped run reported {outcome:?}"))
+        }
+
+        /// The agent was handed no blocked signal: its leader (a shell, which
+        /// blocks SIGCHLD itself while it waits) has no TERM or INT bit in
+        /// `SigBlk`, and a child the shell runs, which inherits the mask the
+        /// agent was handed, has an empty `SigBlk`.
+        pub(super) fn sigblk_clear(agent_pid: u32, grandchild_pid: u32) -> Result<(), String> {
+            let stop_bits = (1_u64 << (libc::SIGTERM - 1)) | (1_u64 << (libc::SIGINT - 1));
+            let leader = super::signal_mask(agent_pid, "SigBlk");
+            let inherited = super::signal_mask(grandchild_pid, "SigBlk");
+            (leader & stop_bits == 0 && inherited == 0)
+                .then_some(())
+                .ok_or_else(|| format!("SigBlk leader {leader:016x}, inherited {inherited:016x}"))
+        }
+    }
+
+    const RESPONSIBILITIES_TEST: &str =
+        "monitor::tests::both_arms_meet_every_supervisor_responsibility_with_a_non_claude_adapter";
+
+    /// The adapter variable R-F threads: one `hermetic_command` scrubs, so
+    /// it only reaches the agent when `envs` is applied after the scrub.
+    const R_F_VARIABLE: &str = "GIT_CONFIG_COUNT";
+    const R_F_VALUE: &str = "1";
+
+    /// V-08 (R-11): the spike's responsibilities under both shapes, with a
+    /// fake `codex` under capture and a fake `antigravity` under stream.
+    /// R-G (detached from the spawning CLI) is proved in 50-11, where
+    /// `spawn_monitor` gives the supervisor its own group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_arms_meet_every_supervisor_responsibility_with_a_non_claude_adapter() {
+        use responsibilities as r;
+        if crate::test_support::in_child_test(RESPONSIBILITIES_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        let mut rows: Vec<(Shape, &str, Result<(), String>)> = Vec::new();
+        let adapter_env = format!("{R_F_VARIABLE}={R_F_VALUE}");
+        for shape in Shape::BOTH {
+            // Run 1: a natural exit 7, observed alive first.
+            let fixture = StageFixture::new();
+            let (go, env_out, gc_pid) = (
+                fixture.path("go"),
+                fixture.path("grandchild-env"),
+                fixture.path("grandchild-pid"),
+            );
+            let program = fixture.agent(
+                &shape.adapter().to_string(),
+                &format!(
+                    "{preamble}sh -c 'printf %s \"${R_F_VARIABLE}\" > \"$1\"; exec sleep 60' sh '{env_out}' </dev/null >/dev/null 2>&1 &\n\
+                     echo $! > '{gc_pid}'\n\
+                     printf '%s\\n' '{result}'\n\
+                     echo '{STAGE_STDERR_LINE}' >&2\n\
+                     while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+                     kill \"$(cat '{gc_pid}')\"\n\
+                     exit 7",
+                    preamble = shape.preamble(),
+                    result = shape.result_line(),
+                    env_out = env_out.display(),
+                    gc_pid = gc_pid.display(),
+                    go = go.display(),
+                ),
+            );
+            let mut run = launch_stage(
+                RESPONSIBILITIES_TEST,
+                &fixture,
+                shape,
+                shape.adapter(),
+                &program,
+                &adapter_env,
+            );
+            let agent = run.agent_pid();
+            assert!(
+                stage_wait_until(Duration::from_secs(5), || env_out.exists()
+                    && gc_pid.exists()),
+                "{shape:?}: the agent's grandchild started"
+            );
+            let grandchild: u32 = fixture
+                .read(gc_pid.clone())
+                .trim()
+                .parse()
+                .expect("grandchild pid");
+            rows.push((shape, "R-A", r::r_a_cwd(agent, &fixture.workdir)));
+            rows.push((
+                shape,
+                "R-C",
+                r::r_c_pid(&fixture.pid_file(), agent, &program),
+            ));
+            rows.push((
+                shape,
+                "R-F",
+                r::r_f_env(std::fs::read_to_string(&env_out).ok().as_deref(), R_F_VALUE),
+            ));
+            rows.push((
+                shape,
+                "R-J",
+                r::r_j_sweep(
+                    fixture.cache.path(),
+                    &fixture.root,
+                    STAGE_PHASE,
+                    &run.sidecar.launch_id,
+                ),
+            ));
+            rows.push((shape, "R-L", r::r_l_modes(run.socket.as_path())));
+            rows.push((shape, "SigBlk", r::sigblk_clear(agent, grandchild)));
+            std::fs::write(&go, "").expect("let the agent exit");
+            let outcome = run.finish(RESPONSIBILITIES_TEST);
+            rows.push((
+                shape,
+                "R-B",
+                r::r_b_streams(
+                    &fixture.stdout(),
+                    &fixture.stderr(),
+                    shape.result_line(),
+                    STAGE_STDERR_LINE,
+                ),
+            ));
+            rows.push((shape, "R-D exit", r::r_d_exit(&fixture.exit_code(), 7)));
+            rows.push((shape, "R-E", r::r_e_completes(&outcome, 7)));
+            drop(run.group);
+
+            // Run 2: the agent kills itself with SIGUSR1 (128 + 10). Under
+            // capture it first merges stderr into stdout: the R-B control.
+            let fixture = StageFixture::new();
+            let go = fixture.path("go");
+            let merge = if shape == Shape::Capture {
+                "exec 2>&1\n"
+            } else {
+                ""
+            };
+            let program = fixture.agent(
+                &shape.adapter().to_string(),
+                &format!(
+                    "{preamble}{merge}printf '%s\\n' '{result}'\n\
+                     echo '{STAGE_STDERR_LINE}' >&2\n\
+                     while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+                     kill -USR1 $$\n\
+                     sleep 5\n\
+                     exit 0",
+                    preamble = shape.preamble(),
+                    result = shape.result_line(),
+                    go = go.display(),
+                ),
+            );
+            let mut run = launch_stage(
+                RESPONSIBILITIES_TEST,
+                &fixture,
+                shape,
+                shape.adapter(),
+                &program,
+                "",
+            );
+            std::fs::write(&go, "").expect("let the agent signal itself");
+            let outcome = run.finish(RESPONSIBILITIES_TEST);
+            let by_signal = 128 + libc::SIGUSR1;
+            rows.push((
+                shape,
+                "R-D signal",
+                r::r_d_exit(&fixture.exit_code(), by_signal),
+            ));
+            rows.push((shape, "R-E signal", r::r_e_completes(&outcome, by_signal)));
+            if shape == Shape::Capture {
+                assert!(
+                    r::r_b_streams(
+                        &fixture.stdout(),
+                        &fixture.stderr(),
+                        shape.result_line(),
+                        STAGE_STDERR_LINE
+                    )
+                    .is_err(),
+                    "control: the R-B checker must reject a capture whose agent merged stderr \
+                     into stdout: {:?}",
+                    fixture.stdout()
+                );
+            }
+            drop(run.group);
+
+            // Run 3: a stop (SIGTERM to the supervisor) still records 143 and
+            // is not a completion.
+            let fixture = StageFixture::new();
+            let program = group_agent(&fixture, shape);
+            let mut run = launch_stage(
+                RESPONSIBILITIES_TEST,
+                &fixture,
+                shape,
+                shape.adapter(),
+                &program,
+                "",
+            );
+            run.child.signal(libc::SIGTERM);
+            let outcome = run.finish(RESPONSIBILITIES_TEST);
+            rows.push((shape, "R-K", r::r_k_stop_exit(&fixture.exit_code())));
+            rows.push((shape, "R-M", r::r_m_stop_is_not_completion(&outcome)));
+            drop(run.group);
+        }
+        let failures: Vec<String> = rows
+            .iter()
+            .filter_map(|(shape, row, result)| {
+                result
+                    .as_ref()
+                    .err()
+                    .map(|reason| format!("{shape:?} {row}: {reason}"))
+            })
+            .collect();
+        assert_eq!(rows.len(), 26, "every row ran: {rows:?}");
+        assert!(
+            failures.is_empty(),
+            "responsibilities not met: {failures:#?}"
+        );
     }
 }
