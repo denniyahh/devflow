@@ -58,10 +58,78 @@ stage_index() {
 
 verdict_error() { echo "SEMVER verdict=error reason=$1"; exit 3; }
 
+# parse_log <file>: fills ITEM_LINT/ITEM_TEXT. A block starts at `--- failure <lint>[: ]`; its items are
+# the two-space-indented lines after `Failed in:` up to a blank line (or the end); an item's text drops
+# everything from ` in /` or `, previously in ` onward.
+ITEM_LINT=()
+ITEM_TEXT=()
+BLOCKS=0
+parse_log() {
+    local line lint="" in_items=0 block_items=0 text
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ $line == '--- failure '* ]]; then
+            if [ "$BLOCKS" -gt 0 ] && [ "$block_items" -eq 0 ]; then
+                verdict_error "failure block $lint lists no items"
+            fi
+            [[ $line =~ ^---\ failure\ ([a-z0-9_]+)[:\ ] ]] || verdict_error "unparseable failure header: $line"
+            lint=${BASH_REMATCH[1]}
+            BLOCKS=$((BLOCKS + 1)); block_items=0; in_items=0
+        elif [ -n "$lint" ] && [ "$line" = 'Failed in:' ]; then
+            in_items=1
+        elif [ -z "$line" ]; then
+            in_items=0
+        elif [ "$in_items" -eq 1 ]; then
+            [[ $line == '  '[!\ ]* ]] || verdict_error "unparseable item line in block $lint: $line"
+            text=${line#  }
+            text=${text%% in /*}
+            text=${text%%, previously in *}
+            ITEM_LINT+=("$lint"); ITEM_TEXT+=("$text"); block_items=$((block_items + 1))
+        fi
+    done <"$1"
+    if [ "$BLOCKS" -gt 0 ] && [ "$block_items" -eq 0 ]; then verdict_error "failure block $lint lists no items"; fi
+    [ "$BLOCKS" -gt 0 ] || verdict_error "semver-checks produced no failure lines"
+}
+
 # compare_log <stage> <file> [<fail count reported by semver-checks>]
 compare_log() {
-    echo "SEMVER verdict=unimplemented"
-    exit 99
+    local through=$1 log=$2 fail_count=${3:-} limit stage kind lint ident i j matched
+    local -a row_kind=() row_lint=() row_ident=() row_hit=() unexpected=() missing=()
+    limit="$(stage_index "$through")"
+    while read -r stage kind lint ident; do
+        [ -n "$stage" ] || continue
+        [ "$(stage_index "$stage")" -le "$limit" ] || continue
+        row_kind+=("$kind"); row_lint+=("$lint"); row_ident+=("$ident"); row_hit+=(0)
+    done <<<"$NAMED_BREAKS"
+
+    parse_log "$log"
+    if [ -n "$fail_count" ] && [ "$fail_count" -ne "$BLOCKS" ]; then
+        verdict_error "parsed $BLOCKS failure blocks but semver-checks reported $fail_count failed checks"
+    fi
+
+    for i in "${!ITEM_TEXT[@]}"; do
+        echo "SEMVER lint=${ITEM_LINT[$i]} item=${ITEM_TEXT[$i]}"
+        matched=0
+        for j in "${!row_lint[@]}"; do
+            if [ "${row_lint[$j]}" = "${ITEM_LINT[$i]}" ] \
+                && printf '%s\n' "${ITEM_TEXT[$i]}" | rg -q -w -F -e "${row_ident[$j]}"; then
+                row_hit[j]=1; matched=1
+            fi
+        done
+        [ "$matched" -eq 1 ] || unexpected+=("${ITEM_LINT[$i]}:${ITEM_TEXT[$i]}")
+    done
+    for j in "${!row_lint[@]}"; do
+        if [ "${row_kind[$j]}" = required ] && [ "${row_hit[$j]}" -eq 0 ]; then
+            missing+=("${row_lint[$j]}:${row_ident[$j]}")
+        fi
+    done
+
+    if [ "${#unexpected[@]}" -eq 0 ] && [ "${#missing[@]}" -eq 0 ]; then
+        echo "SEMVER verdict=match"
+        exit 0
+    fi
+    local IFS=';'
+    echo "SEMVER verdict=mismatch unexpected=${unexpected[*]:--} missing=${missing[*]:--}"
+    exit 1
 }
 
 run_check() {
@@ -177,6 +245,13 @@ selftest() {
 
     log_baseline >"$d/baseline.log"
     { log_baseline; b_traitmethod; } >"$d/unlisted.log"
+    {
+        log_baseline
+        block enum_variant_missing "pub enum variant removed or renamed" \
+            "A publicly-visible enum has at least one variant that is no longer available under its prior name." \
+            https://doc.rust-lang.org/cargo/reference/semver.html#item-remove \
+            "variant WorkflowError::Paused, previously in file $P/workflow.rs:31"
+    } >"$d/cross-lint.log"
     log_baseline | rg -v -F 'enum WorkflowError in' >"$d/missing.log"
     : >"$d/empty.log"
     log_50_11 "function devflow_core::other_fn, previously in file $P/lib.rs:7" >"$d/extra-item.log"
@@ -190,6 +265,9 @@ selftest() {
     expect "an unlisted lint is unexpected" 1 \
         "SEMVER verdict=mismatch unexpected=trait_method_missing:method shutdown of trait Probe missing=-" \
         -- compare --through baseline "$d/unlisted.log"
+    expect "an unlisted lint naming a listed identifier is unexpected" 1 \
+        "SEMVER verdict=mismatch unexpected=enum_variant_missing:variant WorkflowError::Paused missing=-" \
+        -- compare --through baseline "$d/cross-lint.log"
     expect "a missing required item is named missing" 1 \
         "SEMVER verdict=mismatch unexpected=- missing=enum_marked_non_exhaustive:WorkflowError" \
         -- compare --through baseline "$d/missing.log"
