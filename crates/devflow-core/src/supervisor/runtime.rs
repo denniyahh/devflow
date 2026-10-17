@@ -300,6 +300,34 @@ fn signal_group(pgid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(-signed, signal) == 0 }
 }
 
+/// Block until `pid` (a child of this process) has exited, without reaping
+/// it: `waitid(P_PID, pid, WEXITED | WNOWAIT)`. The unreaped zombie keeps its
+/// pid and process group, so a group signal sent afterwards still reaches
+/// only that group.
+fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+    let id = libc::id_t::from(pid);
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, correctly sized out-parameter.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// An exit status as a code: the exit code, or `128 + n` for a death by
 /// signal `n` (the `monitor` convention: SIGTERM is 143, SIGKILL 137).
 fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -374,9 +402,16 @@ impl Supervisor {
     /// are SIGKILLed first, while the unreaped leader still holds the pgid
     /// (RESEARCH Pitfall 9).
     pub fn wait_agent(&self, child: &mut std::process::Child) -> io::Result<AgentOutcome> {
-        // RED stub: no stop handling yet.
-        let status = child.wait()?;
-        self.token.observe_exit(|_| Ok(exit_code(status)))
+        wait_for_exit_without_reaping(child.id())?;
+        let pgid = self.agent_pgid;
+        self.token.observe_exit(|stop_requested| {
+            if stop_requested {
+                // The zombie leader still holds the pgid, so this reaches
+                // only the agent's own leftover members.
+                signal_group(pgid, libc::SIGKILL);
+            }
+            child.wait().map(exit_code)
+        })
     }
 
     /// A handle to this run's owner, for the CLI's safe points.
@@ -508,15 +543,86 @@ impl Control {
                     tracing::warn!("could not answer a ping: {error}");
                 }
             }
-            Ok(Request::Shutdown) => {
-                // RED stub: shutdown is not implemented yet.
-                let _ = parked;
-                let _ = protocol::write_reply(&stream, &Reply::Error("not_implemented".into()));
-            }
+            Ok(Request::Shutdown) => self.stop(StopSource::Socket, Some(stream), parked),
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                 let _ = protocol::write_reply(&stream, &Reply::Error("unknown_op".to_string()));
             }
             Err(_) => {}
+        }
+    }
+
+    /// Take a stop request (with the requesting connection, for a socket
+    /// `shutdown`) and act on [`StopToken::request_stop`]'s decision.
+    ///
+    /// - `KillAgentGroup`: under the owner lock, and only while the exit has
+    ///   not been observed, SIGTERM the agent's group. Reply `accepted` and
+    ///   park the connection for [`Supervisor::finish`]'s final line. Then
+    ///   wait up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the main
+    ///   thread to observe the exit, and SIGKILL the group if it has not.
+    /// - `FlagForSafePoint`: reply `accepted` and park; the CLI's next safe
+    ///   point stops the run.
+    /// - `ReplyHandedOff`: reply `handed_off`.
+    /// - `AlreadyFinished`: report the stop if the run ended as one,
+    ///   otherwise reply `already_finished`.
+    fn stop(&self, source: StopSource, stream: Option<UnixStream>, parked: &mut Vec<UnixStream>) {
+        let pgid = self.sidecar.agent_pgid;
+        let mut state = self.token.lock();
+        let action = request_stop_locked(&mut state, source);
+        let owner = state.phase.as_str().to_string();
+        let ended_stopped = state.ended_stopped;
+        if action == StopAction::KillAgentGroup && !state.agent_exited {
+            tracing::info!("stop requested by {source:?}: terminating agent group {pgid}");
+            signal_group(pgid, libc::SIGTERM);
+        }
+        drop(state);
+
+        let accepted = Reply::Accepted(ShutdownAccepted { owner });
+        let replies: &[Reply] = match action {
+            StopAction::KillAgentGroup | StopAction::FlagForSafePoint => {
+                std::slice::from_ref(&accepted)
+            }
+            StopAction::ReplyHandedOff => &[Reply::Error("handed_off".to_string())],
+            StopAction::AlreadyFinished if ended_stopped => &[
+                accepted.clone(),
+                Reply::Stopped(ShutdownStopped {
+                    exit_code: STOPPED_EXIT_CODE,
+                    advance_suppressed: true,
+                }),
+            ],
+            StopAction::AlreadyFinished => &[Reply::Error("already_finished".to_string())],
+        };
+        if let Some(stream) = stream {
+            let sent = replies
+                .iter()
+                .try_for_each(|reply| protocol::write_reply(&stream, reply));
+            match sent {
+                Ok(())
+                    if matches!(
+                        action,
+                        StopAction::KillAgentGroup | StopAction::FlagForSafePoint
+                    ) =>
+                {
+                    parked.push(stream);
+                }
+                Ok(()) => {}
+                Err(error) => tracing::warn!("could not answer a shutdown request: {error}"),
+            }
+        }
+
+        if action == StopAction::KillAgentGroup {
+            let state = self.token.lock();
+            let (state, _) = self
+                .token
+                .owner
+                .exited
+                .wait_timeout_while(state, crate::agent::TERMINATE_VERIFY_WAIT, |state| {
+                    !state.agent_exited
+                })
+                .unwrap_or_else(PoisonError::into_inner);
+            if !state.agent_exited {
+                tracing::warn!("agent group {pgid} outlived SIGTERM; sending SIGKILL");
+                signal_group(pgid, libc::SIGKILL);
+            }
         }
     }
 
@@ -820,9 +926,19 @@ mod tests {
     /// `source` that holds one: a process exit or a signal-mask or
     /// signal-wait call.
     fn forbidden_calls(source: &str) -> Vec<String> {
-        // RED stub.
-        let _ = source;
-        Vec::new()
+        let needles = needles();
+        let mut found = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for needle in &needles {
+                if line.contains(needle.as_str()) {
+                    found.push(format!("line {}: {needle}", index + 1));
+                }
+            }
+        }
+        found
     }
 
     /// The needles, each joined from two fragments at run time so this test
