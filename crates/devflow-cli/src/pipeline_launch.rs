@@ -8316,4 +8316,188 @@ mod tests {
             }
         }
     }
+
+    /// The marker a gate fixture's first agent prints: a failed Define,
+    /// which the never-silent path parks at a human gate.
+    const FAILED_MARKER: &str = r#"DEVFLOW_RESULT: {"status":"failed","reason":"gate fixture"}"#;
+
+    /// Signal stage N's supervisor by the pid in its sidecar, after
+    /// confirming that pid is still the recorded process.
+    fn signal_supervisor(run: &HandoffRun, signal: libc::c_int) {
+        let sidecar =
+            devflow_core::supervisor::read_sidecar(&run.n.socket_path.with_extension("json"))
+                .expect("N's sidecar");
+        let pid = sidecar.supervisor_pid;
+        assert!(
+            devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
+            "the sidecar's supervisor {pid} is the recorded process"
+        );
+        let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        assert!(signed > 1, "refusing to signal pid {signed}");
+        // SAFETY: `signed > 1` names the supervisor just identity-checked.
+        assert_eq!(unsafe { libc::kill(signed, signal) }, 0, "signal {pid}");
+    }
+
+    /// Launch a gate fixture and return once N is parked at its Define gate:
+    /// the gate file exists and N holds the lock (its owner phase is the
+    /// control's assertion, not a precondition here).
+    fn launch_parked_at_gate(phase: PhaseId) -> HandoffRun {
+        let run = HandoffRun::launch(phase);
+        run.go();
+        let gate = Gates::gate_path(&run.root, phase, Stage::Define);
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || gate.exists()
+                && events_named(&run.root, "gate_fired").len() == 1),
+            "N parks at the Define gate: {}",
+            run.events()
+        );
+        assert!(
+            matches!(
+                lock::holder_status(&run.root, phase),
+                lock::HolderStatus::Live { .. }
+            ),
+            "N holds the per-phase lock across the gate wait"
+        );
+        run
+    }
+
+    /// V-15 (R-2, T-50-33): SIGTERM to a supervisor parked at a gate aborts
+    /// the wait (safe point 4): within 5 s the lock has no holder, the state
+    /// is stopped with the safe-point reason, the socket is gone and no next
+    /// stage was launched.
+    #[test]
+    fn a_signal_during_a_gate_wait_aborts_and_releases_the_lock() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_signal_during_a_gate_wait_aborts_and_releases_the_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = launch_parked_at_gate(PhaseId::new(1310));
+        signal_supervisor(&run, libc::SIGTERM);
+        let ended = poll_until(Duration::from_secs(5), || {
+            matches!(
+                lock::holder_status(&run.root, run.phase),
+                lock::HolderStatus::NoHolder
+            ) && devflow_core::supervisor::probe(&run.n.socket_path)
+                .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+        });
+        assert!(
+            ended,
+            "within 5 s of SIGTERM the lock is released and the socket gone: {}",
+            run.events()
+        );
+        let state = run.state();
+        assert!(state.stopped, "state.stopped after a signal at the gate");
+        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            1,
+            "{}",
+            run.events()
+        );
+        let stopped = events_named(&run.root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{}", run.events());
+        assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
+    }
+
+    /// The V-15 control: with no signal the gate wait holds (lock held, N in
+    /// `gate_wait`) after 3 s, and answering the gate lets it proceed: an
+    /// abort answer releases the lock and ends the supervisor.
+    #[test]
+    fn without_a_signal_the_gate_wait_holds_until_answered() {
+        const NAME: &str =
+            "pipeline_launch::tests::without_a_signal_the_gate_wait_holds_until_answered";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = launch_parked_at_gate(PhaseId::new(1311));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            matches!(
+                lock::holder_status(&run.root, run.phase),
+                lock::HolderStatus::Live { .. }
+            ),
+            "control: still parked with the lock held after 3 s"
+        );
+        assert!(
+            matches!(
+                devflow_core::supervisor::probe(&run.n.socket_path),
+                Ok(devflow_core::supervisor::Liveness::Alive(ref reply)) if reply.owner == "gate_wait"
+            ),
+            "control: N still answers gate_wait"
+        );
+        assert!(!run.state().stopped, "control: not stopped while waiting");
+        Gates::respond(
+            &run.root,
+            run.phase,
+            Stage::Define,
+            &devflow_core::gates::GateResponse {
+                approved: false,
+                note: Some("abort: control answer".to_string()),
+                responded_by: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        let ended = poll_until(HANDOFF_STEP_WAIT, || {
+            matches!(
+                lock::holder_status(&run.root, run.phase),
+                lock::HolderStatus::NoHolder
+            ) && devflow_core::supervisor::probe(&run.n.socket_path)
+                .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+        });
+        assert!(
+            ended,
+            "control: the answered gate proceeds: {}",
+            run.events()
+        );
+        assert_eq!(events_named(&run.root, "workflow_aborted").len(), 1);
+        assert!(events_named(&run.root, "advance_stopped").is_empty());
+    }
+
+    /// R-10: a SIGKILL of N between N+1's publish and N's unlink (N parked
+    /// at `after_publish`) leaves the state naming the live N+1, and N's
+    /// leftover socket probes Stale with a sidecar whose launch id differs
+    /// from the state's.
+    #[test]
+    fn a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor()
+    {
+        const NAME: &str = "pipeline_launch::tests::a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_publish"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1312));
+        run.go();
+        run.wait_held();
+        signal_supervisor(&run, libc::SIGKILL);
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || matches!(
+                devflow_core::supervisor::probe(&run.n.socket_path),
+                Ok(devflow_core::supervisor::Liveness::Stale)
+            )),
+            "N's leftover socket probes Stale after the kill"
+        );
+        let state = run.state();
+        let next = state.supervisor.expect("the state names a supervisor");
+        assert_ne!(next.launch_id, run.n.launch_id, "the state names N+1");
+        match devflow_core::supervisor::probe(&next.socket_path) {
+            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => {
+                assert_eq!(reply.launch_id, next.launch_id);
+            }
+            other => panic!("N+1 must be Alive after N's kill, got {other:?}"),
+        }
+        let leftover =
+            devflow_core::supervisor::read_sidecar(&run.n.socket_path.with_extension("json"))
+                .expect("N's sidecar is left behind");
+        assert_ne!(
+            leftover.launch_id, next.launch_id,
+            "N's leftover sidecar names a launch other than the state's"
+        );
+        assert_eq!(leftover.launch_id, run.n.launch_id);
+    }
 }

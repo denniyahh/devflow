@@ -309,6 +309,19 @@ impl Gates {
         }
     }
 
+    /// [`poll_response`](Self::poll_response) that a caller can cancel
+    /// (50-13, R-2): RED scaffold.
+    pub fn poll_response_cancellable(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        timeout_secs: u64,
+        cancel: impl Fn() -> bool,
+    ) -> Option<GateResponse> {
+        let _ = &cancel;
+        Self::poll_response(project_root, phase, stage, timeout_secs)
+    }
+
     /// Write an ack file signalling the response was read.
     pub fn ack(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<PathBuf, GateError> {
         let path = Self::ack_path(project_root, phase, stage);
@@ -1065,5 +1078,70 @@ mod tests {
         let cmd = format!("touch {}", sentinel.display());
         fire_gate_notify_with_fallback(PhaseId::new(11), Stage::Ship, "ctx", false, Some(&cmd));
         assert!(sentinel.exists());
+    }
+
+    /// R-2 (50-13): a cancel set during the wait ends it within a second,
+    /// even once the backoff has grown past a second. The cancel is set
+    /// 3.2 s in, where `poll_response`'s own schedule (sleeps of 1, 2, then
+    /// 4 s) would sleep until 7 s; the 60 s timeout rules out a timeout.
+    #[test]
+    fn poll_response_cancellable_returns_abort_within_a_second_of_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = std::sync::Arc::clone(&cancelled);
+        let set_at = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(3200));
+            setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::time::Instant::now()
+        });
+        let got = Gates::poll_response_cancellable(
+            dir.path(),
+            PhaseId::new(13),
+            Stage::Define,
+            60,
+            || cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let returned = std::time::Instant::now();
+        let set_at = set_at.join().unwrap();
+        assert!(got.is_none(), "a cancelled wait has no response: {got:?}");
+        let after_cancel = returned.saturating_duration_since(set_at);
+        assert!(
+            after_cancel < std::time::Duration::from_millis(1500),
+            "returned {after_cancel:?} after the cancel, not within 1.5 s"
+        );
+    }
+
+    /// The control: never cancelled, the wait returns the response that
+    /// appears, and with no response it times out like `poll_response`.
+    #[test]
+    fn poll_response_cancellable_returns_the_response_when_not_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(13), Stage::Define);
+        Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let response = GateResponse {
+            approved: true,
+            note: Some("go".into()),
+            responded_by: Some("human".into()),
+        };
+        let root = dir.path().to_path_buf();
+        let answer = response.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1300));
+            Gates::respond(&root, phase, stage, &answer).unwrap();
+        });
+        let got = Gates::poll_response_cancellable(dir.path(), phase, stage, 30, || false);
+        writer.join().unwrap();
+        assert_eq!(got, Some(response));
+
+        let empty = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            Gates::poll_response_cancellable(empty.path(), phase, Stage::Ship, 1, || false)
+                .is_none()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "an uncancelled wait runs to its timeout"
+        );
     }
 }
