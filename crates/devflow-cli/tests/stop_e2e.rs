@@ -10,6 +10,8 @@
 //! `gate_sweep_e2e.rs`) — this drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
+mod common;
+
 use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -20,10 +22,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Hermetic `git` invocation for fixture setup (999.37) — never a bare
 /// `Command::new("git")`.
@@ -97,15 +95,9 @@ fn write_live_lock(root: &Path, phase: PhaseId, child: &Child, recorded_start: u
     std::fs::write(lock, format!("{}\n{recorded_start}", child.id())).unwrap();
 }
 
-fn kill_and_reap(child: &mut Child) {
-    if child.try_wait().expect("poll holder").is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
-
 #[test]
 fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(103);
@@ -118,7 +110,7 @@ fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
     let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
     write_live_lock(root, phase, &holder, start);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -141,6 +133,7 @@ fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
 
 #[test]
 fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(104);
@@ -155,7 +148,7 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
     let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
     write_live_lock(root, phase, &holder, start);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -170,11 +163,12 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
     assert!(stderr.contains(&holder.id().to_string()) && stderr.contains("not marked"));
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
     assert!(holder.try_wait().expect("poll holder").is_none());
-    kill_and_reap(&mut holder);
+    common::kill_and_reap(&mut holder);
 }
 
 #[test]
 fn stop_never_signals_the_recorded_monitor_pid() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(105);
@@ -186,7 +180,7 @@ fn stop_never_signals_the_recorded_monitor_pid() {
     state.monitor_pid = Some(monitor.id());
     devflow_core::workflow::save_state(&state).unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -198,11 +192,12 @@ fn stop_never_signals_the_recorded_monitor_pid() {
             .unwrap()
             .stopped
     );
-    kill_and_reap(&mut monitor);
+    common::kill_and_reap(&mut monitor);
 }
 
 #[test]
 fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(106);
@@ -218,7 +213,7 @@ fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
         devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
     write_live_lock(root, phase, &holder, wrong_start);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -227,7 +222,7 @@ fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to signal"));
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
-    kill_and_reap(&mut holder);
+    common::kill_and_reap(&mut holder);
 }
 
 /// Saves a fresh state for `phase`, starts a live `sleep` as the process the
@@ -253,6 +248,7 @@ fn gated_phase_with_foreign_holder(
 /// gate for the real recovery path.
 #[test]
 fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(108);
@@ -267,7 +263,7 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response
     write_live_lock(root, phase, &holder, wrong_start);
     Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -292,7 +288,7 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response
     );
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
-    kill_and_reap(&mut holder);
+    common::kill_and_reap(&mut holder);
 }
 
 /// Finding B: a legacy single-line lock makes the holder's identity
@@ -300,6 +296,7 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response
 /// response that no confirmed process can consume.
 #[test]
 fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(109);
@@ -315,7 +312,7 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
     std::fs::write(lock, holder.id().to_string()).unwrap();
     Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -345,7 +342,7 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
     );
     assert!(holder.try_wait().expect("poll holder").is_none());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
-    kill_and_reap(&mut holder);
+    common::kill_and_reap(&mut holder);
 }
 
 /// Finding C-3: an old gate request is not evidence that the current live
@@ -353,6 +350,7 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
 /// writing an abort response and reporting an unevidenced successful stop.
 #[test]
 fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(112);
@@ -369,7 +367,7 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
     write_live_lock(root, phase, &holder, start);
     Gates::write_gate(root, phase, Stage::Code, "stale request").unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -381,7 +379,7 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
         String::from_utf8_lossy(&output.stderr)
     );
     let Some(status) = holder.try_wait().expect("poll holder") else {
-        kill_and_reap(&mut holder);
+        common::kill_and_reap(&mut holder);
         panic!("stop must signal the live holder instead of trusting the stale gate");
     };
     assert!(!status.success(), "SIGTERM must end the live holder");
@@ -403,12 +401,13 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
 /// live holder exists.
 #[test]
 fn gate_approve_without_a_live_holder_does_not_claim_advance() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(110);
     Gates::write_gate(root, phase, Stage::Ship, "approve merge").unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["gate", "approve", &phase.to_string(), "--project"])
         .arg(root)
         .output()
@@ -476,6 +475,7 @@ fn wait_for_child_exit(
 /// class `23-ORPHAN-FORENSICS.md` documented, now remedied.
 #[test]
 fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
@@ -490,7 +490,7 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
     // failed stop still lets `wait_for_child_exit`'s cleanup `wait()`
     // return promptly. Set per-`Command` via `.env(...)`, never via a
     // process-global env mutation (999.37).
-    let mut child = Command::new(devflow_bin())
+    let mut child = common::hermetic_devflow(&home)
         .args(["advance", "--phase", &phase.to_string()])
         .arg(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
@@ -518,7 +518,7 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
          blocking on it"
     );
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -566,6 +566,7 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
 /// may race a second writer).
 #[test]
 fn stop_marks_state_stopped_and_records_reason() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(96);
@@ -576,7 +577,7 @@ fn stop_marks_state_stopped_and_records_reason() {
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -603,6 +604,7 @@ fn stop_marks_state_stopped_and_records_reason() {
 /// `--until` halt) must survive — appended to, not overwritten.
 #[test]
 fn stop_preserves_pre_existing_stop_reason() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(97);
@@ -612,7 +614,7 @@ fn stop_preserves_pre_existing_stop_reason() {
     state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
     devflow_core::workflow::save_state(&state).unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -636,6 +638,7 @@ fn stop_preserves_pre_existing_stop_reason() {
 /// halt stage for `devflow start --until`) and must be left untouched.
 #[test]
 fn stop_leaves_stop_until_unchanged() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(98);
@@ -644,7 +647,7 @@ fn stop_leaves_stop_until_unchanged() {
     state.stop_until = Some(Stage::Plan);
     devflow_core::workflow::save_state(&state).unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -665,7 +668,8 @@ fn stop_leaves_stop_until_unchanged() {
 /// verification map.
 #[test]
 fn stop_help_documents_phase_flag() {
-    let output = Command::new(devflow_bin())
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--help"])
         .output()
         .expect("run devflow stop --help");
@@ -689,6 +693,7 @@ fn stop_help_documents_phase_flag() {
 /// one wrote.
 #[test]
 fn stop_is_idempotent_against_an_already_answered_gate() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(99);
@@ -700,7 +705,7 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
     devflow_core::workflow::save_state(&state).unwrap();
 
     let run_stop = || {
-        Command::new(devflow_bin())
+        common::hermetic_devflow(&home)
             .args(["stop", "--phase", &phase.to_string(), "--root"])
             .arg(root)
             .output()
@@ -735,6 +740,7 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
 /// success no-op here, not a clobber.
 #[test]
 fn stop_against_a_hand_written_response_is_a_success_no_op() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(100);
@@ -754,7 +760,7 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
     let response_path = Gates::response_path(root, phase, Stage::Ship);
     let before = std::fs::read(&response_path).unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -777,11 +783,12 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
 /// not an error.
 #[test]
 fn stop_against_a_root_with_no_state_is_a_success() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(101);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -800,6 +807,7 @@ fn stop_against_a_root_with_no_state_is_a_success() {
 /// fail-closed guarantee is provably unweakened by this plan.
 #[test]
 fn stop_then_cleanup_composes_refuse_then_force() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(102);
@@ -832,7 +840,7 @@ fn stop_then_cleanup_composes_refuse_then_force() {
 
     // No open gate, no lock — the lock-holder fallback is a no-op, and the
     // only observable effect of this stop is state.stopped/stop_reason.
-    let stopped = Command::new(devflow_bin())
+    let stopped = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output()
@@ -850,7 +858,7 @@ fn stop_then_cleanup_composes_refuse_then_force() {
 
     // cleanup without --force must still decline — the fail-closed
     // guarantee this plan's design depends on and does not weaken.
-    let refused = Command::new(devflow_bin())
+    let refused = common::hermetic_devflow(&home)
         .args(["cleanup"])
         .arg(root)
         .output()
@@ -867,7 +875,7 @@ fn stop_then_cleanup_composes_refuse_then_force() {
 
     // cleanup --force is the documented escape hatch — the two verbs
     // compose in that order.
-    let forced = Command::new(devflow_bin())
+    let forced = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
         .output()
@@ -893,6 +901,7 @@ fn stop_then_cleanup_composes_refuse_then_force() {
 /// root and the stop is asserted to have landed THERE.
 #[test]
 fn stop_accepts_the_project_root_as_a_positional_argument() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(103);
@@ -900,7 +909,7 @@ fn stop_accepts_the_project_root_as_a_positional_argument() {
     let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     devflow_core::workflow::save_state(&state).unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string()])
         .arg(root)
         .output()
@@ -940,6 +949,7 @@ fn stop_accepts_the_project_root_as_a_positional_argument() {
 /// measurement of PRECEDENCE rather than of the walk.
 #[test]
 fn stop_root_flag_takes_precedence_over_the_positional() {
+    let home = common::HermeticHome::new();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let root_a = dir_a.path();
@@ -959,7 +969,7 @@ fn stop_root_flag_takes_precedence_over_the_positional() {
     // Ordering 1 — flag names A, positional names B.
     seed(root_a);
     seed(root_b);
-    let first = Command::new(devflow_bin())
+    let first = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root_a)
         .arg(root_b)
@@ -979,7 +989,7 @@ fn stop_root_flag_takes_precedence_over_the_positional() {
     // Ordering 2 — roles reversed: flag names B, positional names A.
     seed(root_a);
     seed(root_b);
-    let second = Command::new(devflow_bin())
+    let second = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root_b)
         .arg(root_a)
@@ -1008,6 +1018,7 @@ fn stop_root_flag_takes_precedence_over_the_positional() {
 /// discriminate.
 #[test]
 fn stop_against_a_nonexistent_positional_root_names_the_offending_path() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("no-such-project-root");
     let phase = PhaseId::new(105);
@@ -1017,7 +1028,7 @@ fn stop_against_a_nonexistent_positional_root_names_the_offending_path() {
         "fixture error: the offending path must NOT exist"
     );
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string()])
         .arg(&missing)
         .output()
@@ -1058,10 +1069,11 @@ fn stop_against_a_nonexistent_positional_root_names_the_offending_path() {
 /// is the precise legibility failure the plan was worried about.
 #[test]
 fn stop_with_an_empty_project_root_is_refused_identically_for_both_spellings() {
+    let home = common::HermeticHome::new();
     let phase = PhaseId::new(106);
 
     // Spelling 1 — empty POSITIONAL.
-    let positional = Command::new(devflow_bin())
+    let positional = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string()])
         .arg("")
         .output()
@@ -1085,7 +1097,7 @@ fn stop_with_an_empty_project_root_is_refused_identically_for_both_spellings() {
     );
 
     // Spelling 2 — empty value supplied to the long FLAG.
-    let flag = Command::new(devflow_bin())
+    let flag = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg("")
         .output()
@@ -1120,6 +1132,7 @@ fn stop_with_an_empty_project_root_is_refused_identically_for_both_spellings() {
 #[cfg(unix)]
 #[test]
 fn stop_positional_root_survives_a_non_utf8_path() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let phase = PhaseId::new(107);
 
@@ -1138,7 +1151,7 @@ fn stop_positional_root_survives_a_non_utf8_path() {
         "fixture error: the offending path must NOT exist"
     );
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string()])
         .arg(&missing)
         .output()
