@@ -388,7 +388,7 @@ former criterion 4 (detect and report a 2.x state as incompatible) is retired;
 the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 10/25 plans executed (17 waves); 50-19 is the single operator checkpoint for the live attempt
+**Plans**: 11/25 plans executed (17 waves); 50-19 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
@@ -417,7 +417,7 @@ the milestone's major-version call.
 
 **Wave 6**
 
-- [ ] 50-10-PLAN.md *(depends on 50-04, 50-08)* — `LaunchContext` and test-binary monitor entry; every `spawn_monitor` caller named; in-crate cache isolation
+- [x] 50-10-PLAN.md *(depends on 50-04, 50-08)* — `LaunchContext` and test-binary monitor entry; every `spawn_monitor` caller named; in-crate cache isolation
 
 **Wave 7**
 
@@ -676,7 +676,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 10/25 | In Progress | — |
+| 50 | 11/25 | In Progress | — |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
