@@ -1398,11 +1398,6 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 /// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
 /// advances only on [`AgentOutcome::Completed`].
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
-    if let StageIo::Stream { .. } = spec.io {
-        return Err(MonitorError::NotReady(
-            "stream shape lands in task 2".to_string(),
-        ));
-    }
     crate::supervisor::runtime::install_signal_pipe()?;
 
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
