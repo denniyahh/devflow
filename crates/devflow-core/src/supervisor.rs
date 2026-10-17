@@ -464,4 +464,205 @@ mod tests {
             "a path with no file must be Gone, got {outcome:?}"
         );
     }
+
+    /// The V-04 test, re-invoked as a child process to hold a socket until it
+    /// is SIGKILLed.
+    const HOLDER_TEST: &str = "supervisor::tests::each_fixture_produces_exactly_one_liveness_state";
+    /// The socket path the holder child publishes at.
+    const HOLDER_SOCKET_ENV: &str = "DEVFLOW_TEST_HOLDER_SOCKET";
+
+    /// What a probe answered, without the payload, so fixtures can be
+    /// compared and counted.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum Outcome {
+        Gone,
+        Stale,
+        Alive,
+        NotASocket,
+        NoReply,
+        OtherError,
+    }
+
+    fn outcome(result: &Result<Liveness, ProbeError>) -> Outcome {
+        match result {
+            Ok(Liveness::Gone) => Outcome::Gone,
+            Ok(Liveness::Stale) => Outcome::Stale,
+            Ok(Liveness::Alive(_)) => Outcome::Alive,
+            Err(ProbeError::NotASocket(_)) => Outcome::NotASocket,
+            Err(ProbeError::NoReply(_)) => Outcome::NoReply,
+            Err(_) => Outcome::OtherError,
+        }
+    }
+
+    /// The child half of the SIGKILLed-holder fixture: publish at the path the
+    /// parent named and answer pings until killed.
+    fn hold_a_published_socket_until_killed() -> ! {
+        let path = std::env::var_os(HOLDER_SOCKET_ENV).expect("the parent names the socket path");
+        let socket = SocketPath::new(PathBuf::from(path)).expect("holder socket path fits");
+        let listener = publish(&socket).expect("holder publishes its socket");
+        loop {
+            let (stream, _) = listener.accept().expect("holder accepts a probe");
+            answer_one(&stream, "sigkilled-holder");
+        }
+    }
+
+    /// A socket whose holder was a separate process, SIGKILLed while
+    /// listening, so nothing in it ran an orderly shutdown.
+    fn sigkilled_holder_socket(cache: &Path) -> PathBuf {
+        let socket = SocketPath::for_launch(
+            cache,
+            Path::new("/project/holder"),
+            PhaseId::new(50),
+            &new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let mut child = crate::test_support::spawn_test_in_child(
+            HOLDER_TEST,
+            cache,
+            &[(HOLDER_SOCKET_ENV, socket.as_path().as_os_str())],
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !matches!(probe(socket.as_path()), Ok(Liveness::Alive(_))) {
+            let exited = child.try_wait().expect("poll the holder child").is_some();
+            if exited || std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("collect holder output");
+                panic!(
+                    "the holder child never answered a ping (exited early: {exited}); stdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // `Child::kill` sends SIGKILL on Unix, to the pid this test spawned
+        // and still owns (unreaped), never to a pid read from disk.
+        child.kill().expect("SIGKILL the holder child");
+        child.wait().expect("reap the holder child");
+        socket.as_path().to_path_buf()
+    }
+
+    #[test]
+    fn each_fixture_produces_exactly_one_liveness_state() {
+        if crate::test_support::in_child_test(HOLDER_TEST) {
+            hold_a_published_socket_until_killed();
+        }
+        let cache = short_cache();
+
+        let no_file = cache.path().join("absent.sock");
+
+        let (dropped, _, listener) = published(cache.path());
+        drop(listener);
+
+        let sigkilled = sigkilled_holder_socket(cache.path());
+
+        let (answering, answering_id, listener) = published(cache.path());
+        let server = serve_pings(listener, answering_id, 1);
+
+        let regular = cache.path().join("regular.sock");
+        std::fs::write(&regular, b"not a socket").expect("write a regular file");
+
+        let (silent, _, silent_listener) = published(cache.path());
+
+        let fixtures = [
+            ("no file", no_file.as_path(), Outcome::Gone),
+            ("dropped listener", dropped.as_path(), Outcome::Stale),
+            ("SIGKILLed holder", sigkilled.as_path(), Outcome::Stale),
+            (
+                "ping-answering listener",
+                answering.as_path(),
+                Outcome::Alive,
+            ),
+            ("regular file", regular.as_path(), Outcome::NotASocket),
+            (
+                "never-replying listener",
+                silent.as_path(),
+                Outcome::NoReply,
+            ),
+        ];
+        let mut positives = std::collections::HashSet::new();
+        for (name, path, expected) in fixtures {
+            let result = probe(path);
+            assert_eq!(
+                outcome(&result),
+                expected,
+                "fixture `{name}` must produce only {expected:?}, got {result:?}"
+            );
+            if matches!(expected, Outcome::Gone | Outcome::Stale | Outcome::Alive) {
+                positives.insert(outcome(&result));
+            }
+        }
+        drop(silent_listener);
+        drop(server.join().expect("ping server thread"));
+        assert_eq!(
+            positives.len(),
+            3,
+            "the positive fixtures must yield three distinct answers, got {positives:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_socket_or_unreadable_path_is_a_probe_error_not_stale() {
+        use std::os::unix::fs::symlink;
+        let cache = short_cache();
+
+        let regular = cache.path().join("regular.sock");
+        std::fs::write(&regular, b"not a socket").expect("write a regular file");
+        let directory = cache.path().join("directory.sock");
+        std::fs::create_dir(&directory).expect("create a directory");
+        let (live, live_id, listener) = published(cache.path());
+        let server = serve_pings(listener, live_id.clone(), 1);
+        expect_alive(live.as_path(), &live_id);
+        let link = cache.path().join("link.sock");
+        symlink(live.as_path(), &link).expect("symlink to the live socket");
+
+        for (name, path) in [
+            ("regular file", regular.as_path()),
+            ("directory", directory.as_path()),
+            ("symlink to a live socket", link.as_path()),
+        ] {
+            let result = probe(path);
+            assert!(
+                matches!(result, Err(ProbeError::NotASocket(_))),
+                "{name} must be NotASocket, never Stale, got {result:?}"
+            );
+        }
+        drop(server.join().expect("ping server thread"));
+
+        // A path that cannot be examined (a component is a regular file, so
+        // lstat fails ENOTDIR) is a Stat error, never Gone.
+        let under_a_file = regular.join("child.sock");
+        let result = probe(&under_a_file);
+        assert!(
+            matches!(result, Err(ProbeError::Stat(_))),
+            "a path that cannot be stat'ed must be a Stat error, got {result:?}"
+        );
+
+        let (unreadable, _, listener) = published(cache.path());
+        drop(listener);
+        if protocol::euid() == 0 {
+            // Root bypasses permission bits, so a mode-000 socket is no
+            // obstacle to its connect and this row cannot be built (999.113).
+            eprintln!(
+                "skipping the mode-000 row: running as root, which bypasses the 0o000 fixture"
+            );
+        } else {
+            std::fs::set_permissions(unreadable.as_path(), std::fs::Permissions::from_mode(0o000))
+                .expect("chmod the socket 000");
+            let result = probe(unreadable.as_path());
+            assert!(
+                matches!(&result, Err(ProbeError::Connect(error)) if error.kind() == io::ErrorKind::PermissionDenied),
+                "an unreadable socket must be a Connect error, never Stale, got {result:?}"
+            );
+        }
+
+        // Control: the same socket file, readable again, is a real stale socket.
+        std::fs::set_permissions(unreadable.as_path(), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod the socket back to 600");
+        let result = probe(unreadable.as_path());
+        assert!(
+            matches!(result, Ok(Liveness::Stale)),
+            "a readable socket with no listener must be Stale, got {result:?}"
+        );
+    }
 }
