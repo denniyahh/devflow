@@ -346,6 +346,7 @@ rather than by diagnosis. This is the milestone's breaking change.
 that mechanism is replaced, so the reference run is not perturbed by the change it would otherwise
 be measuring.
 **Requirements**: SUPV-01
+**Folded backlog**: 999.128, 999.134, 999.138, 999.139, 999.141 (operator, 2026-10-10; 50-CONTEXT.md D-04…D-10)
 **Success Criteria** (what must be TRUE):
 
   1. Liveness resolves to exactly one of GONE / STALE / ALIVE from `state.json` plus the socket at
@@ -360,11 +361,31 @@ be measuring.
   3. The socket path is persisted in `state.json` and resolves under `~/.cache/devflow/` — not the
      project tree, and not `$XDG_RUNTIME_DIR`, which systemd deletes at logout. A path that would
      exceed `sun_path` (108 bytes on Linux, 104 on macOS) is refused at construction with a named
-     error rather than silently truncated.
+     error rather than silently truncated. The directory is resolved by `registry::cache_dir()` —
+     `DEVFLOW_CACHE_DIR`, then `$XDG_CACHE_HOME/devflow`, default `~/.cache/devflow/` — which
+     honours both exclusions above.
+  4. `devflow stop --phase N` on an ALIVE supervisor sends `shutdown` over the socket; the supervisor
+     kills its agent's process group (grace, then SIGKILL), records exit code 143, does not advance,
+     removes its socket and exits. This holds for a run that holds no per-phase lock (999.138), and a
+     stop that races the agent's natural exit never launches the next stage (D-04, R-2).
+  5. SIGTERM or SIGINT delivered to either supervisor shape behaves exactly like a socket `shutdown`
+     (D-05, closes 999.134).
+  6. On a STALE socket, `stop` signals the recorded agent group only when the group is non-empty, the
+     boot id matches and the group leader is present with the recorded start time. A previous-boot
+     socket is removed with nothing signalled; a group whose leader is gone is refused and its members
+     reported, never signalled (R-4, R-8; the residual F1 limit is documented).
+  7. Sockets and their sidecars can be listed and probed with no state file; `doctor` reports
+     orphans; no read-only command kills a process or removes a socket. `start` and `resume` refuse
+     when a state file will not load but a sidecar for that root and phase is ALIVE or STALE with a
+     live group (D-06, D-09, R-12, closes 999.139).
+  8. Lock reclaim treats a live pid with a different start time as stale (999.128), and every e2e
+     test isolates `HOME`, `XDG_CACHE_HOME` and `DEVFLOW_CACHE_DIR` per child and reaps any
+     supervisor it launches (999.141).
 **No 2.x → 3.x migration (operator, 2026-10-12).** DevFlow has no outside users, so 3.x makes no
 promise about a `state.json` written by 2.x: it may read as GONE or fail to load, and either is
 acceptable. There is no version detection, no upgrade verb and no 2.x compatibility test. The
-former criterion 4 (detect and report a 2.x state as incompatible) is retired. This does not change
+former criterion 4 (detect and report a 2.x state as incompatible) is retired;
+the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
 **Plans**: 0/25 plans complete (17 waves); 50-19 is the single operator checkpoint for the live attempt
@@ -1174,6 +1195,8 @@ guard placed just before `launch_stage`, and passes at HEAD.
 
 ### Phase 999.143: A Recycled Recorded Pid Leaves `resume` No Work-Preserving Way Out (BACKLOG)
 
+**Phase 50 removes the monitor-pid half** by construction (`50-CONTEXT.md` D-12): liveness is socket-addressed and `State::monitor_pid` is removed. The agent-pid identity and the work-preserving repair stay in this entry.
+
 **Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md Known limits, T-48-20-05). **Reasoned from source
 only — not reproduced; no test covers it.** **Filed by operator decision 2026-09-23:** defer to a later
 phase rather than accept it inside 48-20.
@@ -1224,6 +1247,8 @@ and name the repair that works there, as the 48-19/48-20 refusal text does, inst
 
 ### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (BACKLOG)
 
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-07). This entry stays as the evidence record; the work is tracked there.
+
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-05); cache count verified
 by the orchestrator the same day.
 
@@ -1267,6 +1292,8 @@ the lock; decide whether `status` should stop suggesting `resume` while the agen
 
 ### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (BACKLOG)
 
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-09). This entry stays as the evidence record; the work is tracked there.
+
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-03). **Reproduced
 2026-09-23 by the Phase 48 re-verification** (HEAD `5eb3a61`): corrupt state + dead agent + live stand-in
 monitor → `start --force` exited 0, overwrote the state and launched a second agent. `resume` is not
@@ -1288,6 +1315,8 @@ but will not load (fail closed, pointing at `recover --clean`), or recover the m
 recorded monitor.
 
 ### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (BACKLOG)
+
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-04 and D-10). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** 2026-09-22 by the Phase 48 gap planner while wording 48-19's refusal message.
 **Reasoned from source only — not reproduced.**
@@ -1397,6 +1426,8 @@ from the next natural full-gate failure, or force it with ~15 repeated full-gate
 **Acceptance:** not decided; set at promotion.
 
 ### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (BACKLOG)
+
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-05 and D-10). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** 2026-09-22, while debugging the Legacy monitor's lost-TERM flake
 (`.planning/debug/resolved/monitor-sigterm-orphans-agent.md`). The operator decided to backlog it and
@@ -1537,6 +1568,8 @@ then `devflow ship --phase N`.
 **Acceptance:** not decided; set at promotion.
 
 ### Phase 999.128: Lock Reclaim Ignores the Holder's Start Time (BACKLOG)
+
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-08). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** Phase 48 D-05 limits and `<deferred>` (`48-CONTEXT.md`), which defer it to Phase 50's
 liveness work. Phase 50's roadmap entry does not carry it, so it is filed here. The operator decided
