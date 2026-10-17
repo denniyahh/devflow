@@ -375,8 +375,19 @@ pub enum SidecarError {
 
 /// `unix_secs` as an RFC 3339 UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ`.
 pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
-    let _ = unix_secs;
-    String::new() // RED stub
+    const SECS_PER_MINUTE: u64 = 60;
+    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
+    const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+    // u64::MAX / SECS_PER_DAY is below 2^48, so the day count fits i64.
+    let days = i64::try_from(unix_secs / SECS_PER_DAY).unwrap_or(i64::MAX);
+    let (year, month, day) = crate::ship::civil_from_days(days);
+    let of_day = unix_secs % SECS_PER_DAY;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z",
+        hour = of_day / SECS_PER_HOUR,
+        minute = of_day % SECS_PER_HOUR / SECS_PER_MINUTE,
+        second = of_day % SECS_PER_MINUTE
+    )
 }
 
 /// The current time as [`rfc3339_from_unix`] formats it, for
@@ -409,14 +420,48 @@ pub(crate) fn rfc3339_now() -> String {
     )
 )]
 pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Result<()> {
-    let _ = (socket, sidecar);
-    Ok(()) // RED stub
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let target = socket.sidecar_path();
+    let (Some(dir), Some(stem)) = (target.parent(), target.file_stem()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no directory or stem", target.display()),
+        ));
+    };
+    ensure_socket_dir(dir).map_err(|error| match error {
+        PublishError::Io(error) => error,
+        unsafe_dir => io::Error::new(io::ErrorKind::PermissionDenied, unsafe_dir.to_string()),
+    })?;
+    let contents = serde_json::to_vec_pretty(sidecar)?;
+    let count = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut temp_name = stem.to_os_string();
+    temp_name.push(format!(".{}-{count}.tmp", std::process::id()));
+    let temp = dir.join(temp_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    let written = file
+        .write_all(&contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)))
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if written.is_err() {
+        // The temp name is unique to this call, so removing it touches
+        // nothing another writer owns.
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
 }
 
 /// Read and parse the sidecar at `path`. Read-only.
 pub fn read_sidecar(path: &Path) -> Result<Sidecar, SidecarError> {
-    let _ = path;
-    Err(SidecarError::Io(io::Error::other("RED stub")))
+    let contents = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&contents)?)
 }
 
 /// One socket stem found under `sock/`: its socket (if present), its sidecar
@@ -442,19 +487,141 @@ pub struct SweepEntry {
     pub liveness: Result<Liveness, ProbeError>,
 }
 
-/// Every socket stem under `cache_dir`'s socket directory, sorted by socket
-/// path. Read-only and never acting (D-06): it lists, probes and reads, and
-/// removes no file and sends no shutdown.
+/// Every socket stem under `cache_dir`'s socket directory, one entry per
+/// stem that has a `.sock` or a `.json` file, sorted by socket path. Other
+/// names, including a half-published `.part` and a sidecar's in-flight
+/// `.tmp`, are skipped. Each present socket is [`probe`]d and each present
+/// sidecar read.
+///
+/// Read-only and never acting (D-06): it lists, probes and reads, and removes
+/// no file and sends no shutdown; `remove_launch_files` is the acting
+/// counterpart, and only `stop` and the backstop call it.
+///
+/// A socket directory that is absent or cannot be listed yields an empty
+/// `Vec`, as `registry::load_roots_in` does: enumeration degrades rather than
+/// fails.
 pub fn sweep_in(cache_dir: &Path) -> Vec<SweepEntry> {
-    let _ = cache_dir;
-    Vec::new() // RED stub
+    let dir = registry::socket_dir_in(cache_dir);
+    let Ok(listing) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    // stem -> (has a `.sock`, has a `.json`)
+    let mut stems: std::collections::BTreeMap<String, (bool, bool)> =
+        std::collections::BTreeMap::new();
+    for entry in listing.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(stem) = name.strip_suffix(".sock") {
+            stems.entry(stem.to_string()).or_default().0 = true;
+        } else if let Some(stem) = name.strip_suffix(".json") {
+            stems.entry(stem.to_string()).or_default().1 = true;
+        }
+    }
+    let mut entries: Vec<SweepEntry> = stems
+        .into_iter()
+        .map(|(stem, (has_socket, has_sidecar))| sweep_entry(&dir, &stem, has_socket, has_sidecar))
+        .collect();
+    // Sorted by path, not stem: `a-b.sock` sorts before `a.sock`.
+    entries.sort_by(|left, right| left.socket_path.cmp(&right.socket_path));
+    entries
+}
+
+/// Build one [`SweepEntry`] from what the listing saw. Read-only.
+fn sweep_entry(dir: &Path, stem: &str, has_socket: bool, has_sidecar: bool) -> SweepEntry {
+    let socket_path = dir.join(format!("{stem}.sock"));
+    let liveness = if has_socket {
+        probe(&socket_path)
+    } else {
+        Ok(Liveness::Gone)
+    };
+    let (sidecar, sidecar_error) = if has_sidecar {
+        match read_sidecar(&dir.join(format!("{stem}.json"))) {
+            Ok(sidecar) => (Some(sidecar), None),
+            // Removed between the listing and the read: missing, not broken.
+            Err(SidecarError::Io(error)) if error.kind() == io::ErrorKind::NotFound => (None, None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    SweepEntry {
+        socket_path,
+        socket_present: has_socket,
+        sidecar,
+        sidecar_error,
+        launch_id_in_name: socket_name_parts(stem).map(|(_, _, launch_id)| launch_id.to_string()),
+        liveness,
+    }
 }
 
 /// The [`sweep_in`] entries that may belong to `project_root` and `phase`.
-/// Read-only and never acting (D-06).
+///
+/// An entry whose sidecar parsed matches when the sidecar names that root and
+/// phase; the sidecar wins whenever it parses. An entry whose sidecar is
+/// missing or broken is attributed by its file name instead (RV-05; D-09 lets
+/// the pairing be recovered from the name): a stem that fits the
+/// `<016x digest>-<padded phase>-<launch id>` scheme matches when its digest
+/// is `project_root`'s and its phase segment is `phase.padded()`. A stem
+/// outside the scheme names no root, so it matches any root when its socket
+/// is Alive and its ping reply names `phase`: it may belong, and the D-09
+/// guard fails closed on it.
+///
+/// Read-only and never acting (D-06): it filters [`sweep_in`]'s output, so it
+/// removes no file and sends no shutdown. The name fallback only widens what
+/// is reported.
 pub fn sweep_for_in(cache_dir: &Path, project_root: &Path, phase: PhaseId) -> Vec<SweepEntry> {
-    let _ = (cache_dir, project_root, phase);
-    Vec::new() // RED stub
+    sweep_in(cache_dir)
+        .into_iter()
+        .filter(|entry| may_belong(entry, project_root, phase))
+        .collect()
+}
+
+/// Whether `entry` may belong to `project_root` and `phase`; see
+/// [`sweep_for_in`].
+fn may_belong(entry: &SweepEntry, project_root: &Path, phase: PhaseId) -> bool {
+    if let Some(sidecar) = &entry.sidecar {
+        return sidecar.project_root == project_root && sidecar.phase == phase;
+    }
+    let stem = entry
+        .socket_path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    match socket_name_parts(stem) {
+        Some((digest, padded, _)) => {
+            digest == registry::path_digest(project_root) && padded == phase.padded()
+        }
+        None => matches!(
+            &entry.liveness,
+            Ok(Liveness::Alive(reply)) if reply.phase.parse::<PhaseId>().is_ok_and(|named| named == phase)
+        ),
+    }
+}
+
+/// Split a socket stem of the form `<016x digest>-<padded phase>-<launch id>`
+/// into its parts: 16 lowercase hex digits, a non-empty run of digits and
+/// dots (`PhaseId::padded` never contains `-`), and a non-empty launch id,
+/// which may itself contain `-`. Anything else is `None`.
+fn socket_name_parts(stem: &str) -> Option<(u64, &str, &str)> {
+    const DIGEST_HEX_LEN: usize = 16;
+    let (hex, rest) = stem.split_at_checked(DIGEST_HEX_LEN)?;
+    if !hex
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let (padded, launch_id) = rest.strip_prefix('-')?.split_once('-')?;
+    if padded.is_empty()
+        || launch_id.is_empty()
+        || !padded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let digest = u64::from_str_radix(hex, 16).ok()?;
+    Some((digest, padded, launch_id))
 }
 
 #[cfg(test)]
@@ -1217,6 +1384,45 @@ mod tests {
             matches!(&missing, Err(SidecarError::Io(error)) if error.kind() == io::ErrorKind::NotFound),
             "a missing sidecar is an Io error, got {missing:?}"
         );
+    }
+
+    #[test]
+    fn socket_name_parts_accepts_only_the_launch_scheme() {
+        let digest = registry::path_digest(Path::new(ROOT));
+        let built = SocketPath::for_launch(
+            Path::new("/c"),
+            Path::new(ROOT),
+            "35.1".parse::<PhaseId>().expect("phase"),
+            "orphan-a",
+        )
+        .expect("fits");
+        let stem = built
+            .as_path()
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("utf-8 stem");
+        assert_eq!(
+            socket_name_parts(stem),
+            Some((digest, "35.1", "orphan-a")),
+            "a launch id may contain '-'"
+        );
+        for outside in [
+            "foreign",
+            "",
+            "0123456789ABCDEF-07-id",
+            "0123456789abcde-07-id",
+            "0123456789abcdef07-id",
+            "0123456789abcdef--id",
+            "0123456789abcdef-07-",
+            "0123456789abcdef-7a-id",
+            "0123456789abcdef-07",
+        ] {
+            assert_eq!(
+                socket_name_parts(outside),
+                None,
+                "{outside:?} is outside the scheme"
+            );
+        }
     }
 
     #[test]
