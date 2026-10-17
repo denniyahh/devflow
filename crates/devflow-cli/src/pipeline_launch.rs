@@ -2452,6 +2452,182 @@ mod tests {
         }
     }
 
+    /// Names the file a V-07 child writes its recorded socket path to.
+    const V07_OUT_ENV: &str = "DEVFLOW_TEST_V07_OUT";
+
+    /// A `claude` stand-in that answers `--version`, then waits for `go` in
+    /// its working directory (the project root) and exits 0, with `sleep`
+    /// linked beside it so the wait works under the replaced PATH.
+    fn go_waiting_claude_dir() -> tempfile::TempDir {
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        std::fs::write(
+            path_dir.path().join("claude"),
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
+        )
+        .unwrap();
+        let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .expect("sleep must exist to run this test");
+        std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+        path_dir
+    }
+
+    /// V-07 (criterion 3): a launch persists `state.supervisor.socket_path`
+    /// under its context's cache dir (`DEVFLOW_CACHE_DIR/sock/`), never under
+    /// the project root, and the reloaded state holds exactly the published
+    /// record. Control: the same launch in a child with another cache dir
+    /// records a path under THAT dir, so the path follows the context.
+    ///
+    /// The first child also runs the advance-running harness entry
+    /// (`test_support::monitor_entry_full`, `DEVFLOW_TEST_MONITOR_FULL=1`) and
+    /// proves it is reached: with the state moved on to Plan while the agent
+    /// runs, its in-process advance records `advance_failed` naming the
+    /// launched stage (`define`). The second child, on the supervise-only
+    /// entry, must record no advance event at all.
+    #[test]
+    fn launch_publishes_the_socket_path_under_the_cache_dir_in_state() {
+        const NAME: &str =
+            "pipeline_launch::tests::launch_publishes_the_socket_path_under_the_cache_dir_in_state";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let mut recorded = Vec::new();
+            for full in [true, false] {
+                let path_dir = go_waiting_claude_dir();
+                let cache = crate::test_support::hermetic_cache_dir();
+                let out = path_dir.path().join("v07-socket-path");
+                let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
+                    ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                    (V07_OUT_ENV, out.as_os_str()),
+                ];
+                if full {
+                    env.push((TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")));
+                }
+                let output =
+                    devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+                let socket = PathBuf::from(std::fs::read_to_string(&out).unwrap());
+                assert!(
+                    socket.starts_with(cache.path().join("sock")),
+                    "{} must be under {}",
+                    socket.display(),
+                    cache.path().display()
+                );
+                recorded.push((cache, socket));
+            }
+            let (a, b) = (&recorded[0], &recorded[1]);
+            assert_ne!(a.0.path(), b.0.path(), "two distinct cache dirs");
+            assert!(
+                !a.1.starts_with(b.0.path()) && !b.1.starts_with(a.0.path()),
+                "control: each launch's socket follows its own cache dir: {} and {}",
+                a.1.display(),
+                b.1.display()
+            );
+            return;
+        }
+        let _guard = env_lock();
+        let cache = PathBuf::from(
+            std::env::var_os("DEVFLOW_CACHE_DIR").expect("the parent passes DEVFLOW_CACHE_DIR"),
+        );
+        let out =
+            PathBuf::from(std::env::var_os(V07_OUT_ENV).expect("the parent passes the out file"));
+        let full = std::env::var_os(TEST_MONITOR_FULL_ENV).is_some_and(|value| value == "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(1107);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        // The capture shape, for the same reason as
+        // `launch_stage_persists_monitor_pid_for_reload`: no delivery canary.
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+
+        let result = launch_stage(&mut state, None, None);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        result.unwrap();
+
+        let record = state
+            .supervisor
+            .clone()
+            .expect("the launch records its supervisor");
+        assert!(
+            record.socket_path.starts_with(cache.join("sock")),
+            "{} must be under {}/sock",
+            record.socket_path.display(),
+            cache.display()
+        );
+        assert!(
+            !record.socket_path.starts_with(root),
+            "the socket must not live in the project tree"
+        );
+        assert!(record.socket_path.as_os_str().len() <= 107);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.supervisor.as_ref(),
+            Some(&record),
+            "the reloaded state holds exactly the published record"
+        );
+        match devflow_core::supervisor::probe(&record.socket_path).unwrap() {
+            devflow_core::supervisor::Liveness::Alive(reply) => {
+                assert_eq!(reply.launch_id, record.launch_id);
+                assert_eq!(reply.launch, "capture");
+            }
+            other => panic!("the recorded socket must answer ALIVE, got {other:?}"),
+        }
+        std::fs::write(&out, record.socket_path.display().to_string()).unwrap();
+
+        let events_path = devflow_core::events::events_path(root);
+        let advance_events = || {
+            std::fs::read_to_string(&events_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| {
+                    event["event"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("advance_"))
+                })
+                .collect::<Vec<_>>()
+        };
+        if full {
+            let mut moved = workflow::load_state(root, phase).unwrap();
+            moved.stage = Stage::Plan;
+            workflow::save_state(&moved).unwrap();
+        }
+        std::fs::write(root.join("go"), "").unwrap();
+        let gone = poll_until(Duration::from_secs(30), || {
+            devflow_core::supervisor::probe(&record.socket_path)
+                .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+        });
+        assert!(gone, "the supervisor finishes once its agent exits");
+        let events = advance_events();
+        if full {
+            let failed = events
+                .iter()
+                .find(|event| event["event"] == "advance_failed")
+                .unwrap_or_else(|| panic!("monitor_entry_full must run the advance: {events:?}"));
+            assert_eq!(failed["reason"], "stage mismatch", "{failed}");
+            assert_eq!(
+                failed["expected"], "define",
+                "the advance is passed the launched stage: {failed}"
+            );
+        } else {
+            assert!(
+                events.is_empty(),
+                "control: the supervise-only entry never advances: {events:?}"
+            );
+        }
+    }
+
     /// A `claude` stand-in that leaves `agent-ran` in its working directory
     /// (the project root) and exits 0 without reading its stdin.
     fn marker_writing_claude_dir() -> tempfile::TempDir {
