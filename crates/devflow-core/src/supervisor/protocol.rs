@@ -289,3 +289,71 @@ pub(crate) fn ping(stream: UnixStream) -> Result<PingReply, String> {
     serde_json::from_value(value)
         .map_err(|error| format!("ping reply is missing fields ({error}): {line}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(reply: &Reply) -> serde_json::Value {
+        reply.to_json().expect("serialize a reply")
+    }
+
+    #[test]
+    fn every_reply_has_its_wire_shape() {
+        let accepted = wire(&Reply::Accepted(ShutdownAccepted {
+            owner: "agent_running".to_string(),
+        }));
+        assert_eq!(
+            accepted,
+            serde_json::json!({"ok": true, "accepted": true, "owner": "agent_running"})
+        );
+        let stopped = wire(&Reply::Stopped(ShutdownStopped {
+            exit_code: 143,
+            advance_suppressed: true,
+        }));
+        assert_eq!(
+            stopped,
+            serde_json::json!({"ok": true, "stopped": true, "exit_code": 143, "advance_suppressed": true})
+        );
+        assert_eq!(
+            wire(&Reply::Error("handed_off".to_string())),
+            serde_json::json!({"ok": false, "error": "handed_off"})
+        );
+        let ping = wire(&Reply::Ping(PingReply {
+            launch_id: "00000000000000ab".to_string(),
+            phase: "50".to_string(),
+            stage: "code".to_string(),
+            launch: "capture".to_string(),
+            owner: "gate_wait".to_string(),
+            agent_pid: 10,
+            agent_pgid: 10,
+            agent_start_time: 99,
+            boot_id: None,
+            supervisor_pid: 9,
+        }));
+        assert_eq!(ping["ok"], serde_json::Value::Bool(true));
+        assert_eq!(ping["launch"], "capture");
+        assert_eq!(ping["supervisor_pid"], 9);
+        assert_eq!(
+            serde_json::to_string(&Request::Shutdown).expect("encode"),
+            r#"{"op":"shutdown"}"#
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"reboot"}"#).is_err(),
+            "an unknown op must not parse"
+        );
+    }
+
+    #[test]
+    fn a_line_longer_than_max_line_is_refused() {
+        let long = format!("{}\n", "x".repeat(MAX_LINE));
+        let error = read_line(&mut long.as_bytes()).expect_err("an oversized line must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // Control: the longest allowed line, newline included, is read whole.
+        let fits = format!("{}\n", "x".repeat(MAX_LINE - 1));
+        assert_eq!(
+            read_line(&mut fits.as_bytes()).expect("a line at the cap is read"),
+            "x".repeat(MAX_LINE - 1)
+        );
+    }
+}

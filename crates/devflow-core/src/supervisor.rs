@@ -180,8 +180,8 @@ pub(crate) fn publish_with(
     ensure_socket_dir(dir)?;
     let part = path.part_path();
     let listener = UnixListener::bind(&part)?;
-    let linked = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| {
+    let linked =
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600)).and_then(|()| {
             before_link();
             std::fs::hard_link(&part, path.as_path())
         });
@@ -284,9 +284,40 @@ pub enum ProbeError {
 }
 
 /// Classify the socket recorded at `path`. Reads no pid.
+///
+/// 1. No file at the path (`lstat` NotFound) is `Gone`; any other stat
+///    failure is [`ProbeError::Stat`].
+/// 2. Anything but a socket (a symlink included) is
+///    [`ProbeError::NotASocket`]; a socket of another uid is
+///    [`ProbeError::ForeignOwner`]. Both are checked before connecting,
+///    because a connect to a regular file or a directory is also refused.
+/// 3. A refused connect is `Stale`. Every other connect error is
+///    [`ProbeError::Connect`], NotFound included: a socket removed between
+///    the stat and the connect is reported, never guessed to be `Gone`.
+/// 4. A connect is not proof of life (a listen backlog accepts it with
+///    nobody serving): only a valid ping reply makes it `Alive`.
 pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
-    let _ = path;
-    Err(ProbeError::NoReply("probe is not implemented yet".into()))
+    let meta = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Liveness::Gone),
+        Err(error) => return Err(ProbeError::Stat(error)),
+        Ok(meta) => meta,
+    };
+    if !meta.file_type().is_socket() {
+        return Err(ProbeError::NotASocket(path.to_path_buf()));
+    }
+    if meta.uid() != protocol::euid() {
+        return Err(ProbeError::ForeignOwner { uid: meta.uid() });
+    }
+    let stream = match UnixStream::connect(path) {
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            return Ok(Liveness::Stale);
+        }
+        Err(error) => return Err(ProbeError::Connect(error)),
+        Ok(stream) => stream,
+    };
+    protocol::ping(stream)
+        .map(Liveness::Alive)
+        .map_err(ProbeError::NoReply)
 }
 
 #[cfg(test)]
@@ -311,7 +342,7 @@ mod tests {
             phase: "50".to_string(),
             stage: "code".to_string(),
             launch: "stream".to_string(),
-            owner: "agent_running".to_string(),
+            owner: "advancing".to_string(),
             agent_pid: 1,
             agent_pgid: 1,
             agent_start_time: 0,
