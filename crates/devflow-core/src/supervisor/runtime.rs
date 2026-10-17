@@ -1565,4 +1565,84 @@ mod tests {
             "the agent group must be gone"
         );
     }
+
+    /// A supervisor served from this test process for an agent that is
+    /// never signalled: its sidecar pgid is `0`, which `signal_group`
+    /// refuses, and no test here stops it in `AgentRunning`.
+    fn in_process_supervisor(cache: &Path) -> (Supervisor, PathBuf) {
+        let socket = SocketPath::for_launch(
+            cache,
+            Path::new("/project/runtime"),
+            PhaseId::new(50),
+            &new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let mut sidecar = test_sidecar(&socket, std::process::id());
+        sidecar.agent_pgid = 0;
+        let path = socket.as_path().to_path_buf();
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
+        (supervisor, path)
+    }
+
+    #[test]
+    fn a_parked_shutdown_hears_stopped_only_when_the_run_stopped() {
+        let cache = short_cache();
+        let stopped = ShutdownOutcome::Stopped {
+            exit_code: 143,
+            advance_suppressed: true,
+        };
+
+        // Taken while the CLI advances, then stopped at a safe point: the
+        // parked caller hears `stopped`, and the socket is already gone.
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        let token = supervisor.token();
+        token.enter(OwnerPhase::Advancing);
+        let caller = {
+            let path = path.clone();
+            std::thread::spawn(move || request_shutdown(&path, CHILD_WAIT).ok())
+        };
+        assert!(
+            wait_until(CHILD_WAIT, || token.stop_requested()),
+            "the request is taken"
+        );
+        assert_eq!(token.safe_point(), SafePoint::StopHere);
+        supervisor.finish();
+        assert_eq!(caller.join().expect("caller"), Some(stopped));
+        assert!(matches!(probe(&path), Ok(Liveness::Gone)));
+
+        // Control: taken while advancing, but no safe point stopped the run
+        // before it ended: the caller hears `handed_off`, never `stopped`.
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        let token = supervisor.token();
+        token.enter(OwnerPhase::Advancing);
+        let caller = {
+            let path = path.clone();
+            std::thread::spawn(move || request_shutdown(&path, CHILD_WAIT).ok())
+        };
+        assert!(
+            wait_until(CHILD_WAIT, || token.stop_requested()),
+            "the request is taken"
+        );
+        supervisor.finish();
+        assert_eq!(
+            caller.join().expect("caller"),
+            Some(ShutdownOutcome::HandedOff)
+        );
+
+        // Handed off before the request: answered at once, nothing flagged,
+        // and a ping names the owner.
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        supervisor.hand_off();
+        match probe(&path) {
+            Ok(Liveness::Alive(reply)) => assert_eq!(reply.owner, "handed_off"),
+            other => panic!("a served socket answers ping, got {other:?}"),
+        }
+        assert_eq!(
+            request_shutdown(&path, CHILD_WAIT).ok(),
+            Some(ShutdownOutcome::HandedOff)
+        );
+        assert!(!supervisor.token().stop_requested());
+        supervisor.finish();
+        assert!(matches!(probe(&path), Ok(Liveness::Gone)));
+    }
 }
