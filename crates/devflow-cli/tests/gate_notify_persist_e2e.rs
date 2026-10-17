@@ -21,6 +21,8 @@
 //! The variable is set or removed on each spawned child only (TEST-01), so the
 //! developer's own shell hook never reaches these runs.
 
+mod common;
+
 use devflow_core::gates::{GATE_NOTIFY_CMD_ENV, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -31,10 +33,6 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -109,29 +107,16 @@ fn fake_bin_dir() -> FakeBin {
 }
 
 /// Owns a spawned `devflow` process so a panicking assertion never leaks a
-/// parked process for the length of its gate timeout, and the private cache
-/// directory it registers in (`Drop::drop` reaps the child before the field
-/// is removed).
-struct ReapOnDrop(
-    Child,
-    #[expect(dead_code, reason = "held only so the cache dir outlives the child")]
-    tempfile::TempDir,
-);
+/// parked process for the length of its gate timeout: dropping it kills and
+/// reaps the child through [`common::kill_and_reap`]. The child is built by
+/// [`common::hermetic_devflow`], so its root registration lands in the test's
+/// [`common::HermeticHome`], which each test binds before this guard and so
+/// outlives it.
+struct ParkedChild(Child);
 
-/// A private `DEVFLOW_CACHE_DIR` for one spawned child, so its root
-/// registration never lands in the developer's real `~/.cache/devflow`.
-fn isolated_cache(command: &mut Command) -> tempfile::TempDir {
-    let cache = tempfile::tempdir().unwrap();
-    command.env("DEVFLOW_CACHE_DIR", cache.path());
-    cache
-}
-
-impl Drop for ReapOnDrop {
+impl Drop for ParkedChild {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
+        common::kill_and_reap(&mut self.0);
     }
 }
 
@@ -148,7 +133,7 @@ fn apply_notify_env(command: &mut Command, notify: NotifyEnv<'_>) {
     };
 }
 
-fn wait_until_parked(child: &mut ReapOnDrop, gate: &Path, what: &str) {
+fn wait_until_parked(child: &mut ParkedChild, gate: &Path, what: &str) {
     let waited = Instant::now();
     while !gate.exists() {
         if let Some(status) = child.0.try_wait().expect("poll child") {
@@ -181,24 +166,26 @@ fn wait_for_notify_fired(root: &Path) {
 }
 
 fn spawn_parked_start(
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
-) -> ReapOnDrop {
-    spawn_parked_start_with(root, phase, fake_bin, notify, true)
+) -> ParkedChild {
+    spawn_parked_start_with(home, root, phase, fake_bin, notify, true)
 }
 
 fn spawn_parked_start_with(
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
     notify: NotifyEnv<'_>,
     legacy_launch: bool,
-) -> ReapOnDrop {
+) -> ParkedChild {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
-    let mut command = Command::new(devflow_bin());
+    let mut command = common::hermetic_devflow(home);
     command
         .args([
             "start",
@@ -217,8 +204,7 @@ fn spawn_parked_start_with(
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);
-    let cache = isolated_cache(&mut command);
-    let mut start = ReapOnDrop(command.spawn().expect("spawn foreground start"), cache);
+    let mut start = ParkedChild(command.spawn().expect("spawn foreground start"));
     wait_until_parked(
         &mut start,
         &Gates::gate_path(root, phase, Stage::Define),
@@ -228,23 +214,23 @@ fn spawn_parked_start_with(
 }
 
 fn spawn_parked_advance(
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     persisted: Option<&str>,
     notify: NotifyEnv<'_>,
-) -> ReapOnDrop {
+) -> ParkedChild {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stage = Stage::Code;
     state.gate_notify_cmd = persisted.map(str::to_owned);
     devflow_core::workflow::save_state(&state).unwrap();
-    let mut command = Command::new(devflow_bin());
+    let mut command = common::hermetic_devflow(home);
     command
         .args(["advance", "--phase", &phase.to_string()])
         .arg(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30");
     apply_notify_env(&mut command, notify);
-    let cache = isolated_cache(&mut command);
-    let mut advance = ReapOnDrop(command.spawn().expect("spawn foreground advance"), cache);
+    let mut advance = ParkedChild(command.spawn().expect("spawn foreground advance"));
     wait_until_parked(
         &mut advance,
         &Gates::gate_path(root, phase, Stage::Code),
@@ -261,6 +247,7 @@ fn persisted_cmd(root: &Path, phase: PhaseId) -> Option<String> {
 
 #[test]
 fn start_persists_the_notify_command_from_the_environment() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(94);
@@ -269,26 +256,28 @@ fn start_persists_the_notify_command_from_the_environment() {
     let cmd = format!("touch {}", sentinel.path().join("fired").display());
     let fake_bin = fake_bin_dir();
 
-    let _start = spawn_parked_start(root, phase, &fake_bin, NotifyEnv::Set(&cmd));
+    let _start = spawn_parked_start(&home, root, phase, &fake_bin, NotifyEnv::Set(&cmd));
 
     assert_eq!(persisted_cmd(root, phase).as_deref(), Some(cmd.as_str()));
 }
 
 #[test]
 fn start_with_an_empty_notify_variable_persists_nothing() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(94);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir();
 
-    let _start = spawn_parked_start(root, phase, &fake_bin, NotifyEnv::Set(""));
+    let _start = spawn_parked_start(&home, root, phase, &fake_bin, NotifyEnv::Set(""));
 
     assert_eq!(persisted_cmd(root, phase), None);
 }
 
 #[test]
 fn advance_gate_runs_the_persisted_command_when_the_variable_is_unset() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
@@ -297,7 +286,7 @@ fn advance_gate_runs_the_persisted_command_when_the_variable_is_unset() {
     let sentinel = sentinel_dir.path().join("fired");
     let cmd = format!("touch {}", sentinel.display());
 
-    let _advance = spawn_parked_advance(root, phase, Some(&cmd), NotifyEnv::Unset);
+    let _advance = spawn_parked_advance(&home, root, phase, Some(&cmd), NotifyEnv::Unset);
     wait_for_notify_fired(root);
 
     assert!(sentinel.exists(), "the persisted notify command must run");
@@ -310,6 +299,7 @@ fn advance_gate_runs_the_persisted_command_when_the_variable_is_unset() {
 
 #[test]
 fn advance_gate_prefers_a_set_variable_over_the_persisted_command() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
@@ -321,6 +311,7 @@ fn advance_gate_prefers_a_set_variable_over_the_persisted_command() {
     let override_cmd = format!("touch {}", overriding.display());
 
     let _advance = spawn_parked_advance(
+        &home,
         root,
         phase,
         Some(&persisted_hook),
@@ -342,6 +333,7 @@ fn advance_gate_prefers_a_set_variable_over_the_persisted_command() {
 
 #[test]
 fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
@@ -350,7 +342,7 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
     let sentinel = sentinel_dir.path().join("fired");
     let cmd = format!("touch {}", sentinel.display());
 
-    let _advance = spawn_parked_advance(root, phase, Some(&cmd), NotifyEnv::Set(""));
+    let _advance = spawn_parked_advance(&home, root, phase, Some(&cmd), NotifyEnv::Set(""));
     wait_for_notify_fired(root);
 
     assert!(
@@ -368,6 +360,7 @@ fn advance_gate_with_an_empty_variable_skips_the_persisted_command() {
 /// persisted command, so a command exported (or emptied) after `start`
 /// reaches the chain it launches.
 fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(97);
@@ -379,7 +372,7 @@ fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
     let _reaper = MarkedReaper(root.to_string_lossy().into_owned());
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
-    let mut command = Command::new(devflow_bin());
+    let mut command = common::hermetic_devflow(&home);
     command
         .args([
             "resume",
@@ -393,8 +386,8 @@ fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .env(TEST_MARKER_ENV, root);
     apply_notify_env(&mut command, notify);
-    let cache = isolated_cache(&mut command);
-    let mut resume = ReapOnDrop(command.spawn().expect("spawn resume"), cache);
+    let mut resume = ParkedChild(command.spawn().expect("spawn resume"));
+    let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
     let waited = Instant::now();
     loop {
         let saved = persisted_cmd(root, phase);
@@ -467,8 +460,13 @@ fn marked_processes(marker: &str) -> Vec<(u32, String, Vec<String>)> {
 /// Approve the parked Define gate, wait for the monitor chain to launch the
 /// fake agent, and return the agent's environment from `/proc`. Every marked
 /// process is killed before returning.
-fn agent_environment_after_define(root: &Path, phase: PhaseId, fake_bin: &FakeBin) -> Vec<String> {
-    let approve = Command::new(devflow_bin())
+fn agent_environment_after_define(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &FakeBin,
+) -> Vec<String> {
+    let approve = common::hermetic_devflow(home)
         .args(["gate", "approve", &phase.to_string(), "define"])
         .arg(root)
         .output()
@@ -495,7 +493,7 @@ fn agent_environment_after_define(root: &Path, phase: PhaseId, fake_bin: &FakeBi
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let _ = Command::new(devflow_bin())
+    let _ = common::hermetic_devflow(home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
         .arg(root)
         .output();
@@ -503,20 +501,23 @@ fn agent_environment_after_define(root: &Path, phase: PhaseId, fake_bin: &FakeBi
 }
 
 fn assert_chain_has_no_notify_variable(legacy_launch: bool) {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(96);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir();
     let _start = spawn_parked_start_with(
+        &home,
         root,
         phase,
         &fake_bin,
         NotifyEnv::Set("touch /nonexistent/notify-sentinel"),
         legacy_launch,
     );
+    let _run_reaper = common::LaunchedRunReaper::new(root, phase, Vec::new());
 
-    let environment = agent_environment_after_define(root, phase, &fake_bin);
+    let environment = agent_environment_after_define(&home, root, phase, &fake_bin);
 
     // Control: a variable set on `start` the same way does reach the agent,
     // so an absent entry below means stripped, not unread.
