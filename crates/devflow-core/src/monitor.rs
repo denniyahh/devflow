@@ -1694,6 +1694,67 @@ fn stage_sidecar(spec: &StageSpec, agent_pid: u32) -> crate::supervisor::Sidecar
     }
 }
 
+/// How long a launcher waits for a new supervisor to answer a ping with its
+/// launch id before it ends what it started (50-24).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+const PUBLISH_WAIT: Duration = Duration::from_secs(10);
+
+/// The `/proc/<pid>/stat` fields the not-ready teardown picks its targets
+/// by, from one read.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildStat {
+    /// Field 4, the parent pid.
+    ppid: u32,
+    /// Field 5, the process group id.
+    pgid: i32,
+    /// Field 22, the start time in clock ticks since boot.
+    start_time: u64,
+}
+
+/// Parse one `/proc/<pid>/stat` line into [`ChildStat`].
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn parse_proc_stat_line(_line: &str) -> Option<ChildStat> {
+    None
+}
+
+/// Wait up to `wait` for the supervisor `child` to publish `socket` with
+/// `launch_id`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn wait_for_publish(
+    child: &mut std::process::Child,
+    socket: &SocketPath,
+    launch_id: &str,
+    wait: Duration,
+) -> Result<crate::supervisor::protocol::PingReply, MonitorError> {
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        if let Ok(crate::supervisor::Liveness::Alive(reply)) =
+            crate::supervisor::probe(socket.as_path())
+            && reply.launch_id == launch_id
+        {
+            return Ok(reply);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(MonitorError::NotReady(format!(
+        "supervisor {} did not publish",
+        child.id()
+    )))
+}
+
 /// The idle-timeout firing sequence, in the ONE order it may run (D-05).
 ///
 /// 1. Enumerate the commits the agent made.
@@ -6078,5 +6139,224 @@ exit 0
             failures.is_empty(),
             "responsibilities not met: {failures:#?}"
         );
+    }
+
+    // ---- 50-24: the publish wait and its not-ready teardown -------------
+
+    /// Kills (by the pid of the `Child` this test spawned) and reaps the
+    /// child on every exit path. A child the helper already reaped is not
+    /// signalled again: `Child::kill` on a reaped child sends nothing.
+    struct OwnedChild(std::process::Child);
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process group led by `pgid`, whose leader started at `start_time`.
+    /// On drop it SIGKILLs the group, and only while the leader still has
+    /// that start time, so a recycled pgid is never signalled.
+    struct LeaderGroup {
+        pgid: u32,
+        start_time: u64,
+    }
+
+    impl LeaderGroup {
+        /// Record the group `pid` leads, by its start time now.
+        fn of(pid: u32) -> Self {
+            let start_time = crate::agent::process_start_time(pid)
+                .unwrap_or_else(|| panic!("read the start time of {pid}"));
+            Self {
+                pgid: pid,
+                start_time,
+            }
+        }
+
+        fn alive(&self) -> bool {
+            crate::agent::is_same_process(self.pgid, self.start_time)
+        }
+    }
+
+    impl Drop for LeaderGroup {
+        fn drop(&mut self) {
+            let Ok(signed) = libc::pid_t::try_from(self.pgid) else {
+                return;
+            };
+            // SAFETY: getpgrp has no preconditions.
+            if signed > 1 && signed != unsafe { libc::getpgrp() } && self.alive() {
+                // SAFETY: `signed > 1`, not our own group, and its leader is
+                // still the recorded process.
+                unsafe { libc::kill(-signed, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// Whether no process is left in group `pgid` (`kill(-pgid, 0)` fails
+    /// with ESRCH), polled every 20 ms up to `within`.
+    fn group_gone_within(pgid: u32, within: Duration) -> bool {
+        let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
+        assert!(signed > 1, "refusing to probe group {signed}");
+        stage_wait_until(within, || {
+            // SAFETY: signal 0 only checks for existence; `signed > 1`.
+            let rc = unsafe { libc::kill(-signed, 0) };
+            rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })
+    }
+
+    /// The env var naming the file the never-publishing supervisor writes
+    /// its sleeper's pid to (read by `sh`, not by Rust).
+    const SLEEPER_PID_ENV: &str = "SLEEPER_PID_FILE";
+
+    /// A fake supervisor that never binds: it ignores SIGTERM, starts a
+    /// sleeper in its own group with util-linux `setsid` as a background job
+    /// (a non-interactive `sh` job is not a group leader, so `setsid` does
+    /// not fork and `$!` is the sleeper), records the sleeper's pid, then
+    /// becomes `sleep 300`.
+    fn never_publishing_supervisor(fixture: &StageFixture) -> PathBuf {
+        fixture.agent(
+            "never-publishes",
+            &format!(
+                "trap '' TERM\n\
+                 setsid sleep 300 &\n\
+                 echo $! > \"${SLEEPER_PID_ENV}.tmp\"\n\
+                 mv \"${SLEEPER_PID_ENV}.tmp\" \"${SLEEPER_PID_ENV}\"\n\
+                 exec sleep 300"
+            ),
+        )
+    }
+
+    /// Spawn `script` as `spawn_monitor` will spawn a supervisor
+    /// (`process_group(0)`), wait up to 2 s for its sleeper's pid, and return
+    /// the child and the sleeper's group, both guarded.
+    fn spawn_never_publishing(script: &Path, pid_file: &Path) -> (OwnedChild, LeaderGroup) {
+        let child = OwnedChild(
+            std::process::Command::new(script)
+                .env(SLEEPER_PID_ENV, pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn the never-publishing supervisor"),
+        );
+        assert!(
+            stage_wait_until(Duration::from_secs(2), || pid_file.exists()),
+            "the supervisor recorded no sleeper pid within 2 s"
+        );
+        let sleeper: u32 = std::fs::read_to_string(pid_file)
+            .expect("read the sleeper pid")
+            .trim()
+            .parse()
+            .expect("the sleeper pid parses");
+        let group = LeaderGroup::of(sleeper);
+        assert_eq!(
+            crate::agent::process_stat_fields(sleeper).map(|stat| stat.pgrp),
+            libc::pid_t::try_from(sleeper).ok(),
+            "the sleeper leads its own group"
+        );
+        (child, group)
+    }
+
+    #[test]
+    fn a_supervisor_that_never_publishes_is_ended_with_its_agent_group() {
+        let fixture = StageFixture::new();
+        let script = never_publishing_supervisor(&fixture);
+
+        // Control: a SIGKILL of the child's own group alone orphans the
+        // sleeper, which leads a group of its own.
+        {
+            let (mut child, sleeper) =
+                spawn_never_publishing(&script, &fixture.path("control-pid"));
+            let pid = libc::pid_t::try_from(child.0.id()).expect("pid fits pid_t");
+            assert!(pid > 1, "refusing to signal group {pid}");
+            // SAFETY: `pid > 1` leads the group this test just spawned and
+            // still owns unreaped.
+            assert_eq!(unsafe { libc::kill(-pid, libc::SIGKILL) }, 0);
+            child.0.wait().expect("reap the control child");
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(
+                sleeper.alive(),
+                "control: a bare kill of the child's group must leave its sleeper alive"
+            );
+            let pgid = sleeper.pgid;
+            drop(sleeper);
+            assert!(group_gone_within(pgid, Duration::from_secs(2)));
+        }
+
+        let (mut child, sleeper) = spawn_never_publishing(&script, &fixture.path("sleeper-pid"));
+        let child_pid = child.0.id();
+        let socket = SocketPath::for_launch(
+            fixture.cache.path(),
+            &fixture.root,
+            STAGE_PHASE,
+            "never-publishes",
+        )
+        .expect("socket path fits sun_path");
+        assert!(
+            Duration::from_secs(1) < PUBLISH_WAIT,
+            "this test runs on a wait shorter than the production one"
+        );
+        let started = std::time::Instant::now();
+        let result = wait_for_publish(
+            &mut child.0,
+            &socket,
+            "never-publishes",
+            Duration::from_secs(1),
+        );
+        let elapsed = started.elapsed();
+        match &result {
+            Err(MonitorError::NotReady(text)) => assert!(
+                text.contains(&child_pid.to_string()),
+                "the NotReady text names the child {child_pid}: {text}"
+            ),
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+        let bound = Duration::from_secs(1)
+            + 2 * crate::agent::TERMINATE_VERIFY_WAIT
+            + Duration::from_secs(3);
+        assert!(elapsed <= bound, "took {elapsed:?}, bound {bound:?}");
+        assert!(
+            group_gone_within(sleeper.pgid, Duration::from_secs(2)),
+            "the teardown must end the sleeper's group {}",
+            sleeper.pgid
+        );
+        assert!(
+            child.0.try_wait().expect("poll the child").is_some(),
+            "the helper reaped the child"
+        );
+    }
+
+    #[test]
+    fn proc_stat_parse_reads_ppid_pgid_and_start_time_after_the_last_paren() {
+        // comm `(a) b (c)` holds spaces and parentheses; every field the
+        // parse could confuse carries a distinct value (session 555, tty 0,
+        // itrealvalue 0, vsize 1000).
+        let head = "1234 ((a) b (c)) S 4242 777 555 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0";
+        let line = format!("{head} 98765 1000 200 18446744073709551615");
+        assert_eq!(
+            parse_proc_stat_line(&line),
+            Some(ChildStat {
+                ppid: 4242,
+                pgid: 777,
+                start_time: 98765,
+            })
+        );
+        assert_eq!(
+            parse_proc_stat_line(head),
+            None,
+            "a line cut off before field 22"
+        );
+
+        let own = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
+        let parsed = parse_proc_stat_line(&own).expect("parse /proc/self/stat");
+        assert_eq!(parsed.ppid, std::os::unix::process::parent_id());
+        assert_eq!(
+            Some(parsed.start_time),
+            crate::agent::process_start_time(std::process::id())
+        );
+        // SAFETY: getpgrp has no preconditions.
+        assert_eq!(parsed.pgid, unsafe { libc::getpgrp() });
     }
 }
