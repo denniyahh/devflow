@@ -949,6 +949,14 @@ pub(crate) struct MonitorInvocation {
 pub(crate) const SUPERVISOR_STOP_REASON: &str =
     "stopped through the supervisor (socket shutdown or SIGTERM/SIGINT)";
 
+/// The stop reason an advance records when it stops at a safe point
+/// (50-13, R-2).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "RED scaffold: the safe points (50-13 Task 2) record it")
+)]
+pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
+
 /// How long a stopped supervisor waits for the per-phase lock before it
 /// records the stop.
 const STOP_RECORD_LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -7399,6 +7407,19 @@ mod tests {
         fn state(&self) -> State {
             workflow::load_state(&self.root, self.phase).expect("the run's state loads")
         }
+
+        /// Every `.sock` in the cache dir's `sock/` other than N's.
+        fn other_sockets(&self) -> Vec<PathBuf> {
+            std::fs::read_dir(self.cache.join("sock"))
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| Some(entry.ok()?.path()))
+                        .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+                        .filter(|path| *path != self.n.socket_path)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
     }
 
     impl Drop for HandoffRun {
@@ -7827,5 +7848,339 @@ mod tests {
             only(SCAN_RUN_NOT_FOUND),
             "a run_monitor under its floor"
         );
+    }
+
+    /// The run's events named `name`.
+    fn events_named(root: &Path, name: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"].as_str() == Some(name))
+            .collect()
+    }
+
+    /// Send `shutdown` to the supervisor at `socket` on the wire, wait for
+    /// its `accepted` line (returned first), run `then`, and return the final
+    /// line read within `final_wait`. Unlike `request_shutdown`, the caller
+    /// acts at a known point: after the supervisor has taken the stop.
+    fn shutdown_accepted_then(
+        socket: &Path,
+        then: impl FnOnce(),
+        final_wait: Duration,
+    ) -> (serde_json::Value, serde_json::Value) {
+        use std::io::{BufRead as _, Write as _};
+        let stream = std::os::unix::net::UnixStream::connect(socket).expect("connect to N");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (&stream)
+            .write_all(b"{\"op\":\"shutdown\"}\n")
+            .expect("send shutdown");
+        let mut reader = std::io::BufReader::new(&stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("the accepted line");
+        let accepted: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|err| panic!("accepted line {line:?}: {err}"));
+        then();
+        stream.set_read_timeout(Some(final_wait)).unwrap();
+        line.clear();
+        reader.read_line(&mut line).expect("the final line");
+        let last: serde_json::Value =
+            serde_json::from_str(&line).unwrap_or_else(|err| panic!("final line {line:?}: {err}"));
+        (accepted, last)
+    }
+
+    /// Whether any process is left in group `pgid` (`kill(-pgid, 0)`).
+    fn group_alive(pgid: u32) -> bool {
+        let Ok(signed) = libc::pid_t::try_from(pgid) else {
+            return false;
+        };
+        assert!(signed > 1, "refusing to probe group {signed}");
+        // SAFETY: signal 0 only checks for existence; `-signed < -1` names
+        // one process group, never our own (0) or every process (-1).
+        unsafe { libc::kill(-signed, 0) == 0 }
+    }
+
+    /// The body of the held-advance pair: N parks at `before_spawn` (safe
+    /// point 2 follows the hold), then a stop is (or is not) taken before the
+    /// release.
+    fn held_advance_before_spawn(phase: PhaseId, stop: bool) {
+        let _guard = env_lock();
+        let run = HandoffRun::launch(phase);
+        run.go();
+        run.wait_held();
+        let release = || run.release();
+        if stop {
+            let (accepted, last) =
+                shutdown_accepted_then(&run.n.socket_path, release, Duration::from_secs(30));
+            assert_eq!(accepted["owner"], "advancing", "{accepted}");
+            assert_eq!(last["stopped"], true, "N answers stopped: {last}");
+            assert!(
+                poll_until(HANDOFF_STEP_WAIT, || {
+                    devflow_core::supervisor::probe(&run.n.socket_path)
+                        .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+                }),
+                "N's socket is gone after the stop"
+            );
+            assert!(
+                poll_until(Duration::from_secs(5), || matches!(
+                    lock::holder_status(&run.root, run.phase),
+                    lock::HolderStatus::NoHolder
+                )),
+                "the per-phase lock is released"
+            );
+            let state = run.state();
+            assert!(state.stopped, "state.stopped after a stop at safe point 2");
+            assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+            assert_eq!(
+                stage_launched_count(&run.root, run.phase),
+                1,
+                "no next stage is launched: {}",
+                run.events()
+            );
+            let stopped = events_named(&run.root, "advance_stopped");
+            assert_eq!(stopped.len(), 1, "{}", run.events());
+            assert_eq!(stopped[0]["safe_point"], 2, "{}", stopped[0]);
+            assert!(
+                run.other_sockets().is_empty(),
+                "no next supervisor was spawned"
+            );
+        } else {
+            release();
+            assert!(
+                poll_until(HANDOFF_STEP_WAIT, || stage_launched_count(
+                    &run.root, run.phase
+                ) == 2),
+                "control: without a stop the held advance launches the next stage: {}",
+                run.events()
+            );
+            let next = run
+                .state()
+                .supervisor
+                .expect("control: the next stage is recorded");
+            assert_ne!(next.launch_id, run.n.launch_id);
+            assert!(
+                matches!(
+                    devflow_core::supervisor::probe(&next.socket_path),
+                    Ok(devflow_core::supervisor::Liveness::Alive(_))
+                ),
+                "control: the next supervisor is Alive"
+            );
+            assert!(!run.state().stopped, "control: not stopped");
+        }
+    }
+
+    /// R-2, safe point 2: a stop taken while N is advancing is honoured right
+    /// before the next stage's spawn. Nothing is launched, the state is
+    /// stopped with the safe-point reason, the lock is released and N's
+    /// socket is gone.
+    #[test]
+    fn a_stop_during_advance_stops_at_the_next_safe_point_and_launches_nothing() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_during_advance_stops_at_the_next_safe_point_and_launches_nothing";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_spawn"), SUCCESS_MARKER);
+            return;
+        }
+        held_advance_before_spawn(PhaseId::new(1303), true);
+    }
+
+    /// The control for the held-advance pair: the same hold and no stop, so
+    /// the next stage is launched and Alive.
+    #[test]
+    fn without_a_stop_the_held_advance_launches_the_next_stage() {
+        const NAME: &str =
+            "pipeline_launch::tests::without_a_stop_the_held_advance_launches_the_next_stage";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_spawn"), SUCCESS_MARKER);
+            return;
+        }
+        held_advance_before_spawn(PhaseId::new(1304), false);
+    }
+
+    /// R-2, safe point 3 (T-50-54): a stop taken while N holds the lock
+    /// between N+1's ping and its publish shuts N+1 down through its socket
+    /// and does not publish it. The state keeps N's record and is stopped with
+    /// N's safe-point reason; no agent of N+1 survives; and N answers
+    /// `stopped` in under `TERMINATE_VERIFY_WAIT + 3 s`, below both bounded
+    /// waits a lock deadlock would sit out (N's final timeout and N+1's lock
+    /// wait), so a stopped N+1 that waited on N's lock fails the timing.
+    #[test]
+    fn a_stop_between_the_next_spawn_and_its_publish_shuts_the_next_supervisor_down() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_between_the_next_spawn_and_its_publish_shuts_the_next_supervisor_down";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_publish"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1305));
+        run.go();
+        run.wait_held();
+        let next_socket = match run.other_sockets().as_slice() {
+            [one] => one.clone(),
+            other => panic!("exactly one next supervisor is spawned at the hold: {other:?}"),
+        };
+        let next = devflow_core::supervisor::read_sidecar(&next_socket.with_extension("json"))
+            .expect("N+1's sidecar");
+        assert!(group_alive(next.agent_pgid), "N+1's agent runs at the hold");
+
+        let mut released_at = None;
+        let (accepted, last) = shutdown_accepted_then(
+            &run.n.socket_path,
+            || {
+                released_at = Some(std::time::Instant::now());
+                run.release();
+            },
+            Duration::from_secs(30),
+        );
+        let took = released_at.expect("released").elapsed();
+        assert_eq!(accepted["owner"], "advancing", "{accepted}");
+        assert_eq!(last["stopped"], true, "N answers stopped: {last}");
+        let bound = devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(3);
+        assert!(
+            took < bound,
+            "N's stop took {took:?}, not under {bound:?}: a lock deadlock between N and N+1"
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&next_socket)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            }),
+            "N+1 was shut down through its socket"
+        );
+        assert!(
+            poll_until(Duration::from_secs(5), || !group_alive(next.agent_pgid)),
+            "no agent of N+1 survives"
+        );
+        let state = run.state();
+        assert_eq!(
+            state.supervisor.as_ref().map(|record| &record.launch_id),
+            Some(&run.n.launch_id),
+            "N+1 was never published: the state keeps N's record"
+        );
+        assert!(state.stopped, "state.stopped after a stop at safe point 3");
+        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            1,
+            "{}",
+            run.events()
+        );
+        let stopped = events_named(&run.root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{}", run.events());
+        assert_eq!(stopped[0]["safe_point"], 3, "{}", stopped[0]);
+    }
+
+    /// Write a capture whose Layer 1 marker reads success, with exit code 0.
+    fn write_success_capture(root: &Path, phase: PhaseId) {
+        let stdout = devflow_core::agent_result::stdout_path(root, phase);
+        std::fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+        std::fs::write(&stdout, format!("work done\n{SUCCESS_MARKER}\n")).unwrap();
+        std::fs::write(
+            devflow_core::agent_result::exit_code_path(root, phase),
+            "0\n",
+        )
+        .unwrap();
+    }
+
+    /// 999.138 residual (A6): `advance_with` refuses a stopped state with an
+    /// `advance_failed {reason: "stopped"}` event and an error naming
+    /// `devflow resume`. Control: the same state with `stopped: false`
+    /// advances (here to its `--until define` stop, so nothing launches).
+    #[test]
+    fn advance_refuses_a_stopped_state() {
+        let _guard = env_lock();
+        for stopped in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(1307);
+            let mut state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            state.stop_until = Some(Stage::Define);
+            state.stopped = stopped;
+            workflow::save_state(&state).unwrap();
+            write_success_capture(root, phase);
+
+            let result = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(5));
+            let failed = events_named(root, "advance_failed");
+            if stopped {
+                let err = result.expect_err("a stopped state must not advance");
+                assert!(
+                    err.to_string().contains("devflow resume --phase 1307"),
+                    "the error names the repair: {err}"
+                );
+                assert_eq!(failed.len(), 1, "{failed:?}");
+                assert_eq!(failed[0]["reason"], "stopped", "{}", failed[0]);
+                assert!(
+                    events_named(root, "advance_evaluated").is_empty(),
+                    "a refused advance evaluates nothing"
+                );
+            } else {
+                result.expect("control: an unstopped state advances");
+                assert!(failed.is_empty(), "control: {failed:?}");
+                assert_eq!(events_named(root, "advance_evaluated").len(), 1);
+                let finished = events_named(root, "workflow_finished");
+                assert_eq!(finished.len(), 1, "control reaches its --until stop");
+            }
+        }
+    }
+
+    /// T-50-68: a supervisor stopped while its state file will not load still
+    /// answers `stopped` (not an error, a closed connection or the final
+    /// timeout), its socket goes, its agent group goes, and the state bytes
+    /// are unchanged: the no-write path. Control: the same stop on a run
+    /// whose state loads records `stopped`, so the unchanged bytes are the
+    /// no-write path and not a harness that cannot see a write.
+    #[test]
+    fn a_stopped_supervisor_whose_state_will_not_load_still_answers_stopped() {
+        const NAME: &str = "pipeline_launch::tests::a_stopped_supervisor_whose_state_will_not_load_still_answers_stopped";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let wait = 2 * devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(5);
+        for corrupt in [true, false] {
+            let run = HandoffRun::launch(PhaseId::new(if corrupt { 1308 } else { 1309 }));
+            let state_file = workflow::state_path(&run.root, run.phase);
+            if corrupt {
+                std::fs::write(&state_file, b"{ this is not json").unwrap();
+            }
+            let before = std::fs::read(&state_file).unwrap();
+            let outcome = devflow_core::supervisor::request_shutdown(&run.n.socket_path, wait);
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+                ),
+                "corrupt={corrupt}: the stop reads Stopped, got {outcome:?}"
+            );
+            assert!(
+                poll_until(HANDOFF_STEP_WAIT, || {
+                    devflow_core::supervisor::probe(&run.n.socket_path)
+                        .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+                }),
+                "corrupt={corrupt}: the socket is gone"
+            );
+            assert!(
+                poll_until(Duration::from_secs(5), || !group_alive(run.n.agent_pgid)),
+                "corrupt={corrupt}: the agent group is gone"
+            );
+            if corrupt {
+                assert_eq!(
+                    std::fs::read(&state_file).unwrap(),
+                    before,
+                    "the state that will not load is left byte for byte"
+                );
+            } else {
+                let state = run.state();
+                assert!(state.stopped, "control: a loadable state records stopped");
+                assert_eq!(state.stop_reason.as_deref(), Some(SUPERVISOR_STOP_REASON));
+            }
+        }
     }
 }
