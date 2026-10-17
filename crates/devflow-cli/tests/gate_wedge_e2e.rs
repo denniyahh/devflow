@@ -7,6 +7,8 @@
 //! - the `advance_*` arms cover a foreground `devflow advance` parked at a
 //!   Code gate.
 
+mod common;
+
 use devflow_core::gates::Gates;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -17,10 +19,6 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -62,11 +60,11 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
     }
 }
 
-fn spawn_gated_advance(root: &Path, phase: PhaseId) -> Child {
+fn spawn_gated_advance(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> Child {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stage = Stage::Code;
     devflow_core::workflow::save_state(&state).unwrap();
-    let child = Command::new(devflow_bin())
+    let child = common::hermetic_devflow(home)
         .args(["advance", "--phase", &phase.to_string()])
         .arg(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
@@ -83,8 +81,8 @@ fn spawn_gated_advance(root: &Path, phase: PhaseId) -> Child {
     child
 }
 
-fn reject(root: &Path, phase: PhaseId) -> std::process::Output {
-    Command::new(devflow_bin())
+fn reject(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Output {
+    common::hermetic_devflow(home)
         .args([
             "gate",
             "reject",
@@ -142,10 +140,15 @@ fn fake_bin_dir(agent_body: &str) -> FakeBin {
 
 /// A foreground `devflow start --mode auto` with the fake agent first on the
 /// child's PATH. PATH is set on the child only (TEST-01).
-fn start_child(root: &Path, phase: PhaseId, fake_bin: &FakeBin) -> Command {
+fn start_child(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &FakeBin,
+) -> Command {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
-    let mut command = Command::new(devflow_bin());
+    let mut command = common::hermetic_devflow(home);
     command
         .args([
             "start",
@@ -180,13 +183,14 @@ impl Drop for ReapOnDrop {
 /// Spawns `start` (owned by `ReapOnDrop` from the moment it exists) and waits
 /// up to 20 s for it to park at the Define preflight gate.
 fn spawn_parked_start(
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     fake_bin: &FakeBin,
     gate_timeout_secs: &str,
 ) -> ReapOnDrop {
     let mut start = ReapOnDrop(
-        start_child(root, phase, fake_bin)
+        start_child(home, root, phase, fake_bin)
             .env("DEVFLOW_GATE_TIMEOUT_SECS", gate_timeout_secs)
             .spawn()
             .expect("spawn foreground start"),
@@ -205,8 +209,8 @@ fn spawn_parked_start(
     start
 }
 
-fn reject_define(root: &Path, phase: PhaseId) -> std::process::Output {
-    Command::new(devflow_bin())
+fn reject_define(home: &common::HermeticHome, root: &Path, phase: PhaseId) -> std::process::Output {
+    common::hermetic_devflow(home)
         .args([
             "gate",
             "reject",
@@ -245,15 +249,16 @@ fn phase_gate_entries(root: &Path, phase: PhaseId) -> Vec<String> {
 
 #[test]
 fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_honestly() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4816);
     init_repo(root, phase);
-    let mut child = spawn_gated_advance(root, phase);
+    let mut child = spawn_gated_advance(&home, root, phase);
     child.kill().expect("kill foreground advance");
     child.wait().expect("reap foreground advance");
 
-    let output = reject(root, phase);
+    let output = reject(&home, root, phase);
     assert!(
         !output.status.success(),
         "wedge reject unexpectedly succeeded: {}",
@@ -273,7 +278,7 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "unexpected output: {output_text}"
     );
 
-    let recovery = Command::new(devflow_bin())
+    let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
         .output()
@@ -323,13 +328,14 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
 
 #[test]
 fn advance_self_resolving_arm_live_advance_consumes_the_code_rejection() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4817);
     init_repo(root, phase);
-    let mut child = spawn_gated_advance(root, phase);
+    let mut child = spawn_gated_advance(&home, root, phase);
     let before = Instant::now();
-    let output = reject(root, phase);
+    let output = reject(&home, root, phase);
     assert!(
         output.status.success(),
         "live reject failed: {}",
@@ -359,6 +365,7 @@ fn advance_self_resolving_arm_live_advance_consumes_the_code_rejection() {
 
 #[test]
 fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(4818);
@@ -375,7 +382,7 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
     Gates::write_gate(root, live_ship_phase, Stage::Ship, "live poller").unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "gate",
             "sweep",
@@ -425,12 +432,13 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
 
 #[test]
 fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(93);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir("sleep 60");
-    let mut start = spawn_parked_start(root, phase, &fake_bin, "30");
+    let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "30");
 
     assert_eq!(
         devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
@@ -445,7 +453,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         "the interrupted start must leave its Define gate behind"
     );
 
-    let output = reject_define(root, phase);
+    let output = reject_define(&home, root, phase);
     let output_text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -502,7 +510,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         );
     }
 
-    let recovery = Command::new(devflow_bin())
+    let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
         .output()
@@ -539,12 +547,13 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
 
 #[test]
 fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(94);
     init_start_repo(root, phase);
     let fake_bin = fake_bin_dir("sleep 60");
-    let mut start = spawn_parked_start(root, phase, &fake_bin, "60");
+    let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "60");
 
     assert_eq!(
         devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
@@ -553,7 +562,7 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
     );
 
     let before = Instant::now();
-    let output = reject_define(root, phase);
+    let output = reject_define(&home, root, phase);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
