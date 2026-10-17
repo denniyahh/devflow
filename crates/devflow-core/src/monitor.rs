@@ -4710,6 +4710,8 @@ exit 0
     }
 
     impl Shape {
+        const BOTH: [Shape; 2] = [Shape::Capture, Shape::Stream];
+
         fn label(self) -> &'static str {
             self.io().label()
         }
@@ -4731,6 +4733,65 @@ exit 0
                 other => panic!("unknown shape {other}"),
             }
         }
+
+        /// The other shape, for the label control.
+        fn other(self) -> Self {
+            match self {
+                Shape::Capture => Shape::Stream,
+                Shape::Stream => Shape::Capture,
+            }
+        }
+
+        /// The non-Claude adapter each shape runs in these tests (R-11):
+        /// Codex under capture, Antigravity under stream.
+        fn adapter(self) -> AgentKind {
+            match self {
+                Shape::Capture => AgentKind::Codex,
+                Shape::Stream => AgentKind::Antigravity,
+            }
+        }
+
+        /// The agent script's first lines: the stream shape reads its first
+        /// turn from stdin before anything else, as a real stream agent does,
+        /// and exits 91 or 92 when the turn is missing or lacks the prompt.
+        fn preamble(self) -> &'static str {
+            match self {
+                Shape::Capture => "",
+                Shape::Stream => {
+                    "IFS= read -r turn || { echo NO_FIRST_TURN >&2; exit 91; }\n\
+                     case \"$turn\" in *SUPERVISED-STAGE-PROMPT*) ;; *) echo BAD_TURN >&2; exit 92 ;; esac\n"
+                }
+            }
+        }
+
+        /// The result line the shape's adapter prints on stdout.
+        fn result_line(self) -> &'static str {
+            match self {
+                Shape::Capture => r#"DEVFLOW_RESULT: {"status":"success"}"#,
+                Shape::Stream => ANTG_RESULT_MARKER_LINE,
+            }
+        }
+    }
+
+    /// The stderr line every waiting agent prints.
+    const STAGE_STDERR_LINE: &str = "STAGE-STDERR-LINE";
+
+    /// A fake agent for `shape`, named after its adapter: it reads its first
+    /// turn (stream), prints the shape's result line on stdout and
+    /// [`STAGE_STDERR_LINE`] on stderr, then waits for `go` and exits `code`.
+    fn waiting_agent(fixture: &StageFixture, shape: Shape, go: &Path, code: i32) -> PathBuf {
+        fixture.agent(
+            &shape.adapter().to_string(),
+            &format!(
+                "{preamble}printf '%s\\n' '{result}'\n\
+                 echo '{STAGE_STDERR_LINE}' >&2\n\
+                 while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+                 exit {code}",
+                preamble = shape.preamble(),
+                result = shape.result_line(),
+                go = go.display(),
+            ),
+        )
     }
 
     /// The child half of every supervised-stage test: build the spec from
@@ -4870,6 +4931,18 @@ exit 0
     struct StageChild(Option<std::process::Child>);
 
     impl StageChild {
+        fn id(&self) -> u32 {
+            self.0.as_ref().expect("the child is still owned").id()
+        }
+
+        /// SIGKILL the child (by the pid of the `Child` this test owns) and
+        /// reap it.
+        fn kill_now(&mut self) {
+            let mut child = self.0.take().expect("the child is still owned");
+            child.kill().expect("SIGKILL the child supervisor");
+            child.wait().expect("reap the child supervisor");
+        }
+
         fn try_exited(&mut self) -> bool {
             self.0
                 .as_mut()
@@ -5070,5 +5143,232 @@ exit 0
             "finish removes the sidecar with the socket"
         );
         drop(run.group);
+    }
+
+    const STREAM_TRACER_TEST: &str =
+        "monitor::tests::stream_arm_runs_the_agent_under_an_addressed_supervisor";
+
+    #[test]
+    fn stream_arm_runs_the_agent_under_an_addressed_supervisor() {
+        if crate::test_support::in_child_test(STREAM_TRACER_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        let fixture = StageFixture::new();
+        let go = fixture.path("go");
+        let program = waiting_agent(&fixture, Shape::Stream, &go, 0);
+        let mut run = launch_stage(
+            STREAM_TRACER_TEST,
+            &fixture,
+            Shape::Stream,
+            AgentKind::Antigravity,
+            &program,
+            "",
+        );
+        assert_eq!(run.reply.launch, "stream");
+        assert_eq!(run.reply.owner, "agent_running");
+        assert_eq!(run.sidecar.launch, "stream");
+        assert_eq!(run.sidecar.agent, "antigravity");
+        assert_eq!(run.sidecar.agent_pid, run.agent_pid());
+
+        std::fs::write(&go, "").expect("let the agent exit");
+        let outcome = run.finish(STREAM_TRACER_TEST);
+        let stderr = fixture.stderr();
+        assert_eq!(
+            outcome, "Completed(0) advancing",
+            "91/92 mean the first turn was missing or lacked the prompt; stderr: {stderr:?}"
+        );
+        let stdout = fixture.stdout();
+        assert!(
+            stdout.lines().any(|line| line == ANTG_RESULT_MARKER_LINE),
+            "the capture holds the stream's result line verbatim: {stdout:?}"
+        );
+        assert!(!stdout.contains(STAGE_STDERR_LINE), "stdout: {stdout:?}");
+        assert!(stderr.contains(STAGE_STDERR_LINE), "stderr: {stderr:?}");
+        assert_eq!(fixture.pid_file(), run.agent_pid().to_string());
+        assert_eq!(fixture.exit_code(), "0");
+        assert_eq!(run.liveness(), crate::supervisor::Liveness::Gone);
+        drop(run.group);
+    }
+
+    /// `Ok` when `agent_pid` leads its own process group and that group is
+    /// not `supervisor_pid`'s; the reason otherwise. Uses the production
+    /// [`confirm_own_group`] check for the first half.
+    fn check_own_group(agent_pid: u32, supervisor_pid: u32) -> Result<(), String> {
+        confirm_own_group(agent_pid)
+            .map_err(|pgid| format!("agent {agent_pid} is in group {pgid}, not its own"))?;
+        let supervisor = libc::pid_t::try_from(supervisor_pid).expect("pid fits pid_t");
+        // SAFETY: getpgid has no memory preconditions.
+        let supervisor_group = unsafe { libc::getpgid(supervisor) };
+        if i64::from(supervisor_group) == i64::from(agent_pid) {
+            return Err(format!(
+                "agent {agent_pid} shares its group with supervisor {supervisor_pid}"
+            ));
+        }
+        Ok(())
+    }
+
+    const OWN_GROUP_TEST: &str = "monitor::tests::both_arms_put_the_agent_in_its_own_group";
+
+    #[test]
+    fn both_arms_put_the_agent_in_its_own_group() {
+        if crate::test_support::in_child_test(OWN_GROUP_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        for shape in Shape::BOTH {
+            let fixture = StageFixture::new();
+            let go = fixture.path("go");
+            let program = waiting_agent(&fixture, shape, &go, 0);
+            let mut run = launch_stage(
+                OWN_GROUP_TEST,
+                &fixture,
+                shape,
+                shape.adapter(),
+                &program,
+                "",
+            );
+            let agent = run.agent_pid();
+            check_own_group(agent, run.child.id())
+                .unwrap_or_else(|reason| panic!("{shape:?}: {reason}"));
+            let agent_signed = libc::pid_t::try_from(agent).expect("pid fits pid_t");
+            let child_signed = libc::pid_t::try_from(run.child.id()).expect("pid fits pid_t");
+            // SAFETY: getpgid has no memory preconditions.
+            let (agent_group, child_group) =
+                unsafe { (libc::getpgid(agent_signed), libc::getpgid(child_signed)) };
+            assert_eq!(agent_group, agent_signed, "{shape:?}: pgid == pid");
+            assert_ne!(
+                agent_group, child_group,
+                "{shape:?}: the agent's group is not the supervisor's"
+            );
+            std::fs::write(&go, "").expect("let the agent exit");
+            assert_eq!(run.finish(OWN_GROUP_TEST), "Completed(0) advancing");
+            drop(run.group);
+        }
+
+        // Control: the same check refuses a process spawned without
+        // `process_group(0)`, which stays in this test process's group.
+        let mut stray = StageChild(Some(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a process in this test's group"),
+        ));
+        let verdict = check_own_group(stray.id(), std::process::id());
+        stray.kill_now();
+        assert!(
+            verdict.is_err(),
+            "control: a process left in the launcher's group must fail the check"
+        );
+    }
+
+    /// What one (shape, condition) row of V-09 must probe as.
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedLiveness {
+        Alive(&'static str),
+        Stale,
+        Gone,
+    }
+
+    /// `Ok` when `got` is exactly `expected` (an Alive reply must carry the
+    /// expected launch label); the mismatch otherwise.
+    fn liveness_row(
+        expected: ExpectedLiveness,
+        got: &crate::supervisor::Liveness,
+    ) -> Result<(), String> {
+        use crate::supervisor::Liveness;
+        match (expected, got) {
+            (ExpectedLiveness::Alive(label), Liveness::Alive(reply)) if reply.launch == label => {
+                Ok(())
+            }
+            (ExpectedLiveness::Stale, Liveness::Stale)
+            | (ExpectedLiveness::Gone, Liveness::Gone) => Ok(()),
+            _ => Err(format!("expected {expected:?}, got {got:?}")),
+        }
+    }
+
+    /// The condition a V-09 row puts the supervisor in before probing.
+    #[derive(Debug, Clone, Copy)]
+    enum Condition {
+        /// The agent is still running.
+        Running,
+        /// The supervisor child was SIGKILLed; its agent may live on.
+        SupervisorKilled,
+        /// The agent exited and the supervisor finished.
+        Finished,
+    }
+
+    const LIVENESS_TEST: &str =
+        "monitor::tests::both_arms_answer_liveness_identically_for_each_condition";
+
+    /// Launch `shape`, put it in `condition`, and probe its socket.
+    fn probe_under(shape: Shape, condition: Condition) -> crate::supervisor::Liveness {
+        let fixture = StageFixture::new();
+        let go = fixture.path("go");
+        let program = waiting_agent(&fixture, shape, &go, 0);
+        let mut run = launch_stage(
+            LIVENESS_TEST,
+            &fixture,
+            shape,
+            shape.adapter(),
+            &program,
+            "",
+        );
+        match condition {
+            Condition::Running => {
+                let got = run.liveness();
+                std::fs::write(&go, "").expect("let the agent exit");
+                assert_eq!(run.finish(LIVENESS_TEST), "Completed(0) advancing");
+                got
+            }
+            Condition::SupervisorKilled => {
+                // The `Child` the parent spawned, never a pid from disk. The
+                // agent outlives it in its own group; `run.group` kills it.
+                run.child.kill_now();
+                run.liveness()
+            }
+            Condition::Finished => {
+                std::fs::write(&go, "").expect("let the agent exit");
+                assert_eq!(run.finish(LIVENESS_TEST), "Completed(0) advancing");
+                run.liveness()
+            }
+        }
+    }
+
+    #[test]
+    fn both_arms_answer_liveness_identically_for_each_condition() {
+        if crate::test_support::in_child_test(LIVENESS_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        let mut failures = Vec::new();
+        for shape in Shape::BOTH {
+            for condition in [
+                Condition::Running,
+                Condition::SupervisorKilled,
+                Condition::Finished,
+            ] {
+                let expected = match condition {
+                    Condition::Running => ExpectedLiveness::Alive(shape.label()),
+                    Condition::SupervisorKilled => ExpectedLiveness::Stale,
+                    Condition::Finished => ExpectedLiveness::Gone,
+                };
+                let got = probe_under(shape, condition);
+                if let Err(reason) = liveness_row(expected, &got) {
+                    failures.push(format!("{shape:?} {condition:?}: {reason}"));
+                }
+                // Control: an Alive reply does not satisfy the other shape's
+                // label, so the label column is really checked.
+                if let Condition::Running = condition {
+                    assert!(
+                        liveness_row(ExpectedLiveness::Alive(shape.other().label()), &got).is_err(),
+                        "control: {shape:?}'s Alive reply must fail the {:?} label",
+                        shape.other()
+                    );
+                }
+            }
+        }
+        assert!(failures.is_empty(), "rows that probed wrong: {failures:#?}");
     }
 }
