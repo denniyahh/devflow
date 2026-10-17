@@ -128,12 +128,13 @@ enum Command {
         #[arg(long)]
         stage: Option<Stage>,
     },
-    /// Internal: the pipe-owning monitor's own process entry point (Phase 31).
+    /// Internal: the stage supervisor's own process entry point (50-11).
     ///
-    /// `monitor::spawn_monitor`'s `PipeOwning` arm re-execs this binary as this
-    /// subcommand, detached. Everything after `--` is the supervised child's
-    /// program and argv. Hidden for the same reason `advance` is: it is an
-    /// implementation detail of the monitor chain, never an operator verb.
+    /// `monitor::spawn_monitor` re-execs this binary as this subcommand,
+    /// detached and in its own process group, for both launch shapes.
+    /// Everything after `--` is the supervised agent's program and argv.
+    /// Hidden for the same reason `advance` is: it is an implementation
+    /// detail of the monitor chain, never an operator verb.
     #[command(name = "__monitor", hide = true)]
     Monitor {
         /// Project root whose `.devflow/` capture files this monitor writes.
@@ -149,17 +150,28 @@ enum Command {
         /// worktree mode is active, else the project root).
         #[arg(long)]
         workdir: PathBuf,
-        /// File holding the stage prompt. A file, not argv: argv has a hard
-        /// length ceiling and DevFlow stage prompts routinely exceed it.
-        #[arg(long)]
-        prompt_file: PathBuf,
-        /// Seconds of stream silence before the idle timeout fires.
-        #[arg(long)]
-        idle_timeout_secs: u64,
         /// Which agent's transport the monitor supervises (selects the
         /// first-turn schema and the close-rule marker predicate).
         #[arg(long)]
         agent: AgentKind,
+        /// Supervision shape: `capture` (stdin null, stdout to the capture file) or `stream`.
+        #[arg(long, value_enum)]
+        launch: pipeline_launch::LaunchShape,
+        /// Socket path this supervisor publishes, under the DevFlow cache dir.
+        #[arg(long)]
+        socket: PathBuf,
+        /// Per-launch id the launcher waits to see in this supervisor's ping reply.
+        #[arg(long)]
+        launch_id: String,
+        /// Adapter env var NAME to re-apply to the agent (repeatable; the value stays off argv).
+        #[arg(long = "keep-env")]
+        keep_env: Vec<String>,
+        /// File holding the stage prompt (stream shape; a file, not argv, for length).
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Seconds of stream silence before the idle timeout fires (stream shape).
+        #[arg(long)]
+        idle_timeout_secs: Option<u64>,
         /// The supervised child's program and arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
@@ -590,20 +602,28 @@ fn run() -> Result<(), CliError> {
             phase,
             stage,
             workdir,
+            agent,
+            launch,
+            socket,
+            launch_id,
+            keep_env,
             prompt_file,
             idle_timeout_secs,
-            agent,
             argv,
-        } => run_monitor(
-            &project_root(project)?,
+        } => run_monitor(&pipeline_launch::MonitorInvocation {
+            project_root: project_root(project)?,
             phase,
             stage,
-            &workdir,
-            &prompt_file,
-            idle_timeout_secs,
+            workdir,
             agent,
-            &argv,
-        ),
+            launch,
+            socket,
+            launch_id,
+            keep_env,
+            prompt_file,
+            idle_timeout_secs,
+            argv,
+        }),
         Command::Resume {
             phase,
             agent,

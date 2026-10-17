@@ -41,6 +41,7 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
+use devflow_core::supervisor::runtime::AgentOutcome;
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
     agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
@@ -900,131 +901,253 @@ impl Drop for AutoChainGuard {
     }
 }
 
-/// The detached pipe-owning monitor's own process body (Phase 31): supervise
-/// the child, then advance the stage machine exactly as the shell monitor's
-/// `devflow advance` tail did.
+/// The `__monitor` subcommand's `--launch` value: which supervision shape the
+/// supervisor wires the agent's stdio for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum LaunchShape {
+    /// Stdin `/dev/null`, stdout to the phase capture file
+    /// (`MonitorLaunch::Legacy`).
+    Capture,
+    /// The supervisor owns both pipes and delivers the prompt as the first
+    /// turn (`MonitorLaunch::PipeOwning`).
+    Stream,
+}
+
+/// One `__monitor` invocation, as `main` (or the test build's harness entry)
+/// parsed it from the argv `monitor::spawn_monitor` built.
+#[derive(Debug, Clone)]
+pub(crate) struct MonitorInvocation {
+    /// Project root whose `.devflow/` files the supervisor writes.
+    pub(crate) project_root: PathBuf,
+    /// Phase whose stage machine to advance once the agent completes.
+    pub(crate) phase: PhaseId,
+    /// Stage the launch ran; passed to advance.
+    pub(crate) stage: Option<Stage>,
+    /// The agent's working directory.
+    pub(crate) workdir: PathBuf,
+    /// Which coding agent this is.
+    pub(crate) agent: AgentKind,
+    /// The supervision shape.
+    pub(crate) launch: LaunchShape,
+    /// Where the supervisor publishes its socket.
+    pub(crate) socket: PathBuf,
+    /// The per-launch id the launcher waits to see in a ping reply.
+    pub(crate) launch_id: String,
+    /// Adapter environment variable NAMES to re-apply to the agent from this
+    /// process's environment (values never travel on argv, T-50-41).
+    pub(crate) keep_env: Vec<String>,
+    /// The stream shape's prompt file.
+    pub(crate) prompt_file: Option<PathBuf>,
+    /// The stream shape's idle timeout in seconds.
+    pub(crate) idle_timeout_secs: Option<u64>,
+    /// The agent's program and argv.
+    pub(crate) argv: Vec<String>,
+}
+
+/// The stop reason a run ended through its supervisor records.
+pub(crate) const SUPERVISOR_STOP_REASON: &str =
+    "stopped through the supervisor (socket shutdown or SIGTERM/SIGINT)";
+
+/// How long a stopped supervisor waits for the per-phase lock before it
+/// records the stop.
+const STOP_RECORD_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// The `__monitor` process body (50-11): supervise the stage's agent under
+/// an addressed supervisor (`monitor::run_supervised_stage`), then, only
+/// when the agent completed on its own, advance the stage machine
+/// in-process (D-02). A stopped run is recorded as stopped and never
+/// advances.
 ///
-/// Runs in the `__monitor` process, never in the operator's CLI.
-///
-/// `envs` is deliberately empty here — the adapter's extra env was applied to
-/// THIS process by `spawn_monitor` and rides down by inheritance. That is
-/// sufficient only because the sole adapter routed through the pipe-owning arm
-/// (Claude) declares no extra env; see the note at `spawn_monitor`'s
-/// `PipeOwning` arm before widening it.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the hidden CLI dispatch supplies these independently parsed monitor arguments"
-)]
-pub(crate) fn run_monitor(
-    project_root: &Path,
-    phase: PhaseId,
-    stage: Option<Stage>,
-    workdir: &Path,
-    prompt_file: &Path,
-    idle_timeout_secs: u64,
-    agent: AgentKind,
-    argv: &[String],
-) -> Result<(), CliError> {
-    supervise_monitor(
-        project_root,
-        phase,
-        stage,
-        workdir,
-        prompt_file,
-        idle_timeout_secs,
-        agent,
-        argv,
-        true,
-    )
+/// Runs in the detached `__monitor` process, never in the operator's CLI.
+pub(crate) fn run_monitor(invocation: &MonitorInvocation) -> Result<(), CliError> {
+    supervise_monitor(invocation, true)
 }
 
 /// [`run_monitor`]'s body. `advance` is `true` on every production path; the
 /// test build's supervise-only monitor harness entry (50-10) passes `false`
 /// so an in-crate launch supervises its agent without moving the stage
 /// machine on.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "run_monitor's independently parsed monitor arguments plus the advance switch"
-)]
 pub(crate) fn supervise_monitor(
-    project_root: &Path,
-    phase: PhaseId,
-    stage: Option<Stage>,
-    workdir: &Path,
-    prompt_file: &Path,
-    idle_timeout_secs: u64,
-    agent: AgentKind,
-    argv: &[String],
+    invocation: &MonitorInvocation,
     advance: bool,
 ) -> Result<(), CliError> {
-    let prompt = std::fs::read_to_string(prompt_file).map_err(|err| {
-        CliError::Message(format!(
-            "monitor could not read the prompt file {}: {err}",
-            prompt_file.display()
-        ))
-    })?;
-    let Some((program, args)) = argv.split_first() else {
-        return Err(CliError::Message(
-            "monitor was given no child program to supervise".to_string(),
-        ));
-    };
+    let MonitorInvocation {
+        project_root,
+        phase,
+        stage,
+        workdir,
+        launch,
+        ..
+    } = invocation;
+    let (project_root, phase, stage) = (project_root.as_path(), *phase, *stage);
+    let spec = stage_spec(invocation)?;
 
     // D-01/D-06: hold GSD's `workflow._auto_chain_active` at the value this
-    // launch requires for as long as the child runs, and return it to `false`
-    // when this function returns — by `?` on the monitor's `Err` OR by falling
-    // through to `advance` below. Both exits are covered because the guard is
-    // bound to a named variable in THIS scope; `let _ = ...` would drop it
-    // immediately and the flag's true-window would collapse to nothing.
+    // launch requires for as long as the agent runs, and return it to
+    // `false` before anything else happens: on the `?` below when the
+    // supervisor fails, and right after the agent's run otherwise.
     //
-    // The target is `workdir`, not `project_root`: `.planning/config.json` is a
-    // tracked file inside the worktree the agent's cwd is set to, and that copy
-    // is the one GSD's `check auto-mode` reads.
+    // The target is `workdir`, not `project_root`: `.planning/config.json` is
+    // a tracked file inside the worktree the agent's cwd is set to, and that
+    // copy is the one GSD's `check auto-mode` reads.
     //
-    // F-4 — no agent or launch-shape condition belongs in the predicate.
-    // `run_monitor` is the body of the hidden `__monitor` subcommand, which
-    // `monitor::spawn_monitor` re-execs ONLY on its `MonitorLaunch::PipeOwning`
-    // arm. Being inside this function already implies a stream launch (Claude
-    // and Antigravity today, round-3 D-10) — the old "Claude + stream launch"
-    // claim became false when the predicate widened — so re-checking
-    // `state.agent` or `state.legacy_claude_launch` here would be a second,
-    // driftable notion of the same fact. The consequence — a Legacy-arm or
-    // non-stream-agent launch never gets the flag — is accepted and is turned
-    // into a loud preflight refusal by plan `35.1-03`, not left silent.
+    // Conditioned on the launch shape explicitly: since 50-11 both shapes
+    // reach this function, and only a stream launch can bound the flag's
+    // lifetime to the agent's (35.1-03's preflight refuses the capture shape
+    // in `Mode::Auto` for exactly that reason). A capture launch never gets
+    // the flag.
+    //
+    // The guard is dropped BEFORE the advance, not after it: the advance
+    // launches the next stage and waits for that stage's supervisor to
+    // publish, and that supervisor has already set the flag for its own
+    // agent. Clearing it after the advance would clear the next stage's
+    // value.
     //
     // A state that will not load is NOT fatal here: warn, skip the guard, and
     // let `advance` surface the real state error afterwards with its own
     // context.
-    let _auto_chain_guard = match workflow::load_state(project_root, phase) {
-        Ok(state) => Some(AutoChainGuard::engage(
-            workdir,
-            auto_chain_flag_eligible(state.stage, state.mode),
-        )),
-        Err(err) => {
-            warn!(
-                "monitor could not load state for phase {phase} ({err}) — running \
-                 without the GSD chain-flag guard"
-            );
-            None
-        }
+    let auto_chain_guard = match launch {
+        LaunchShape::Capture => None,
+        LaunchShape::Stream => match workflow::load_state(project_root, phase) {
+            Ok(state) => Some(AutoChainGuard::engage(
+                workdir,
+                auto_chain_flag_eligible(state.stage, state.mode),
+            )),
+            Err(err) => {
+                warn!(
+                    "monitor could not load state for phase {phase} ({err}) — running \
+                     without the GSD chain-flag guard"
+                );
+                None
+            }
+        },
     };
 
-    monitor::run_pipe_owning_monitor(
-        project_root,
-        phase,
-        workdir,
-        &prompt,
-        std::time::Duration::from_secs(idle_timeout_secs),
-        program,
-        args,
-        &[],
-        agent,
-    )
-    .map_err(|err| CliError::Message(format!("pipe-owning monitor failed: {err}")))?;
+    let run = monitor::run_supervised_stage(spec)
+        .map_err(|err| CliError::Message(format!("stage supervisor failed: {err}")))?;
+    drop(auto_chain_guard);
 
-    if !advance {
-        return Ok(());
+    let result = match run.outcome {
+        AgentOutcome::Completed(_) if advance => {
+            advance_for_stage(project_root, Some(phase), stage)
+        }
+        AgentOutcome::Completed(_) => {
+            wait_for_launch_record(project_root, phase, &invocation.launch_id);
+            Ok(())
+        }
+        _ => record_supervisor_stop(project_root, phase),
+    };
+    // Never a `stopped` line for a completed run: `finish` decides the final
+    // line from the recorded outcome, so a shutdown that arrived while
+    // advancing is answered `handed_off`.
+    run.supervisor.finish();
+    result
+}
+
+/// The [`monitor::StageSpec`] for `invocation`: the stream shape reads its
+/// prompt file, and each `--keep-env` name takes its value from this
+/// process's environment.
+fn stage_spec(invocation: &MonitorInvocation) -> Result<monitor::StageSpec, CliError> {
+    let Some((program, args)) = invocation.argv.split_first() else {
+        return Err(CliError::Message(
+            "monitor was given no child program to supervise".to_string(),
+        ));
+    };
+    let io = match invocation.launch {
+        LaunchShape::Capture => monitor::StageIo::Capture,
+        LaunchShape::Stream => {
+            let (Some(prompt_file), Some(idle_secs)) =
+                (&invocation.prompt_file, invocation.idle_timeout_secs)
+            else {
+                return Err(CliError::Message(
+                    "a stream launch needs --prompt-file and --idle-timeout-secs".to_string(),
+                ));
+            };
+            let prompt = std::fs::read_to_string(prompt_file).map_err(|err| {
+                CliError::Message(format!(
+                    "monitor could not read the prompt file {}: {err}",
+                    prompt_file.display()
+                ))
+            })?;
+            monitor::StageIo::Stream {
+                prompt,
+                idle_timeout: Duration::from_secs(idle_secs),
+            }
+        }
+    };
+    let socket = devflow_core::supervisor::SocketPath::new(invocation.socket.clone())
+        .map_err(|err| CliError::Message(format!("monitor socket path refused: {err}")))?;
+    let mut spec = monitor::StageSpec::new(
+        invocation.project_root.clone(),
+        invocation.phase,
+        invocation.agent,
+        program.clone(),
+        io,
+        socket,
+        invocation.launch_id.clone(),
+    );
+    spec.stage = invocation.stage;
+    spec.workdir = invocation.workdir.clone();
+    spec.args = args.to_vec();
+    spec.envs = kept_env(&invocation.keep_env);
+    Ok(spec)
+}
+
+/// Each named variable with its value from this process's environment,
+/// where `spawn_monitor` put it. A name that is unset or not UTF-8 is
+/// skipped with a warning.
+fn kept_env(names: &[String]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .filter_map(
+            |name| match std::env::var_os(name).map(|value| value.into_string()) {
+                Some(Ok(value)) => Some((name.clone(), value)),
+                _ => {
+                    warn!(
+                        "--keep-env {name}: not set to a UTF-8 value in the monitor's environment"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// Record a run its supervisor stopped: under the per-phase lock (bounded
+/// wait), `state.stopped = true` with [`SUPERVISOR_STOP_REASON`]. Never
+/// advances.
+fn record_supervisor_stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    let _lock = lock::acquire_blocking(project_root, phase, STOP_RECORD_LOCK_WAIT)
+        .map_err(|err| CliError::Message(format!("could not record the stop: {err}")))?;
+    let mut state = workflow::load_state(project_root, phase)?;
+    state.stopped = true;
+    state.stop_reason = Some(SUPERVISOR_STOP_REASON.to_string());
+    workflow::save_state(&state)?;
+    info!("phase {phase}: {SUPERVISOR_STOP_REASON}");
+    Ok(())
+}
+
+/// How long the supervise-only entry waits for its launcher's record.
+const LAUNCH_RECORD_WAIT: Duration = Duration::from_secs(15);
+
+/// The supervise-only path (test build): keep serving until the launcher has
+/// recorded THIS launch in the state file (bounded), so a launcher still
+/// waiting for the publish cannot miss a socket that finished first. A
+/// production supervisor gets the same ordering from `advance`, which takes
+/// the per-phase lock its launcher holds until after the publish.
+fn wait_for_launch_record(project_root: &Path, phase: PhaseId, launch_id: &str) {
+    let deadline = std::time::Instant::now() + LAUNCH_RECORD_WAIT;
+    while std::time::Instant::now() < deadline {
+        let recorded = workflow::load_state(project_root, phase)
+            .ok()
+            .and_then(|state| state.supervisor)
+            .is_some_and(|record| record.launch_id == launch_id);
+        if recorded {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    advance_for_stage(project_root, Some(phase), stage)
+    warn!("launch {launch_id} was not recorded within {LAUNCH_RECORD_WAIT:?}");
 }
 
 /// Resolve, once per launch, the cache directory and the monitor executable
@@ -1165,12 +1288,23 @@ fn spawn_agent_and_record(
         );
     }
     let ctx = launch_context()?;
-    let pid = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
+    let launch_label = match &launch {
+        monitor::MonitorLaunch::PipeOwning { .. } => "stream",
+        monitor::MonitorLaunch::Legacy => "capture",
+    };
+    let published = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    let pid = published.supervisor_pid;
+    let socket_path = published.record.socket_path.display().to_string();
+    let launch_id = published.record.launch_id.clone();
     // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
     // pid recorded only in memory here is lost unless it is written again
-    // (18b).
+    // (18b). The ping-confirmed supervisor record replaces any previous one
+    // in this same save; it is never cleared first (WR-04's pre-clear above
+    // applies to `monitor_pid` only). `monitor_pid` names the supervisor
+    // until 50-22 removes it.
     state.monitor_pid = Some(pid);
+    state.supervisor = Some(published.record);
     workflow::save_state(state)?;
     match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
         Ok(Some(path_kind)) => {
@@ -1205,10 +1339,13 @@ fn spawn_agent_and_record(
             "stage": state.stage.to_string(),
             "agent": state.agent.to_string(),
             "monitor_pid": pid,
+            "socket_path": socket_path,
+            "launch_id": launch_id,
+            "launch": launch_label,
         }),
     );
     println!(
-        "stage {} → launched {} (monitor pid {pid})",
+        "stage {} → launched {} (monitor pid {pid}, {launch_label} supervisor at {socket_path})",
         state.stage,
         agents::driver_for(state.agent).name()
     );
@@ -2410,15 +2547,15 @@ mod tests {
                 exe: std::env::current_exe().unwrap(),
             },
         );
-        let control_pid =
-            monitor::spawn_monitor(&control, "claude", &[], &[], prompt(), &subcommand).unwrap();
-        control.monitor_pid = Some(control_pid);
-        let _control_reap = ReapMonitorOnDrop::after_launch(&control);
+        // Since 50-11 `spawn_monitor` waits for the publish, so the control
+        // monitor (libtest given `__monitor`'s arguments) exiting by itself
+        // comes back as `NotReady` rather than as a pid to poll.
+        let control_result =
+            monitor::spawn_monitor(&control, "claude", &[], &[], prompt(), &subcommand);
         assert!(
-            poll_until(Duration::from_secs(30), || {
-                !devflow_core::agent::agent_running(control_pid)
-            }),
-            "the control monitor (libtest given __monitor's arguments) must exit by itself"
+            matches!(control_result, Err(monitor::MonitorError::NotReady(_))),
+            "the control monitor (libtest given __monitor's arguments) must exit by itself \
+             without publishing: {control_result:?}"
         );
         assert!(
             !control_root.join("agent-ran").exists(),
@@ -3310,6 +3447,21 @@ mod tests {
             serde_json::json!({ "recorded": [] }),
             "the handoff's Code preflight must record the set it saw — this fixture has no \
              plan files, so the set is legitimately empty"
+        );
+
+        // 50-11: the relaunch also records its ping-confirmed supervisor,
+        // asserted rather than merely excluded for the same reason.
+        let supervisor_before = before
+            .as_object_mut()
+            .unwrap()
+            .remove("supervisor")
+            .unwrap();
+        let supervisor_after = after.as_object_mut().unwrap().remove("supervisor").unwrap();
+        assert_eq!(supervisor_before, serde_json::Value::Null);
+        assert!(
+            supervisor_after["socket_path"].is_string()
+                && supervisor_after["launch_id"].is_string(),
+            "the relaunch must record its published supervisor: {supervisor_after}"
         );
 
         for value in [&mut before, &mut after] {

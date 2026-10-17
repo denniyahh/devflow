@@ -1,15 +1,16 @@
-//! Background monitor daemon.
+//! Background monitor: the addressed Rust supervisor that owns a stage's
+//! coding agent.
 //!
-//! Spawns a detached child process that *owns* the coding agent: it launches
-//! the agent, captures its stdout and exit code into `.devflow/`, and — when
-//! the agent exits — runs `devflow advance` to advance the stage machine.
+//! [`spawn_monitor`] re-execs the `devflow` binary as its hidden `__monitor`
+//! subcommand, which runs [`run_supervised_stage`]: it launches the agent,
+//! captures its stdout and exit code into `.devflow/`, publishes a socket that
+//! answers liveness and shutdown requests, and — when the agent completes —
+//! advances the stage machine in-process.
 //!
 //! Owning the agent is the key fix over a CLI-scoped capture thread: because
-//! the monitor outlives `devflow start`, the agent's stdout keeps flowing into
-//! the capture file and its exit code is still reaped after the CLI exits.
-//!
-//! This is the core automation primitive — no cron, no scheduler,
-//! no agent cooperation needed.
+//! the supervisor outlives `devflow start`, the agent's stdout keeps flowing
+//! into the capture file and its exit code is still reaped after the CLI
+//! exits.
 
 use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
 use crate::git::hermetic_command;
@@ -284,24 +285,25 @@ pub fn idle_timeout_setting_for(agent: AgentKind) -> IdleTimeoutSetting {
 
 /// Which supervision shape [`spawn_monitor`] should launch.
 ///
-/// This is a MODE selection on one supervisor, not two monitors: both arms
-/// write the same capture, exit-code and agent-pid files under `.devflow/`,
-/// and both end by advancing the same stage machine. Nothing downstream needs
-/// to know which arm ran.
+/// Both arms launch the same Rust supervisor (the hidden `__monitor`
+/// subcommand running [`run_supervised_stage`]): it owns the agent in its own
+/// process group, publishes an addressed socket, writes the same capture,
+/// exit-code and agent-pid files under `.devflow/`, and advances the stage
+/// machine in-process once the agent completes (D-02). The arm only selects
+/// how the agent's stdio is wired.
 pub enum MonitorLaunch {
-    /// Phase 31: a Rust supervisor that owns BOTH of the child's pipes,
-    /// delivers `prompt` as a JSON user turn on the child's stdin, and holds
-    /// that stdin open past the child's first turn so a task-notification turn
-    /// can still be delivered (constraint 4).
+    /// The stream shape ([`StageIo::Stream`]): the supervisor owns BOTH of
+    /// the agent's pipes, delivers `prompt` as a JSON user turn on its stdin,
+    /// and holds that stdin open past the first turn so a task-notification
+    /// turn can still be delivered (constraint 4).
     PipeOwning {
         /// The stage prompt, delivered on the child's stdin rather than argv.
         prompt: String,
     },
-    /// The pre-31 detached `sh` script: stdin is `/dev/null`, stdout is
-    /// redirected to the capture file by the shell, and the script waits on
-    /// the agent then runs `devflow advance`. Every non-Claude adapter, every
-    /// stage not yet widened by D-09/D-10's rollout, and the checkpoint-resume
-    /// relaunch all run through here, unchanged.
+    /// The capture shape ([`StageIo::Capture`]): stdin is `/dev/null` and
+    /// stdout goes to the capture file. Every non-Claude adapter not on the
+    /// stream path, every stage not yet widened by D-09/D-10's rollout, and
+    /// the checkpoint-resume relaunch run through here.
     Legacy,
 }
 
@@ -381,21 +383,38 @@ pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
     child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
 }
 
-/// Spawn a background monitor that owns the agent for the given workflow state.
+/// A supervisor [`spawn_monitor`] started and saw publish: the record the
+/// caller persists in [`State::supervisor`] and the supervisor's pid.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    /// The ping-confirmed handle on the supervisor: its socket, launch id,
+    /// agent process group, agent start time and boot id.
+    pub record: crate::state::SupervisorRecord,
+    /// The pid of the `__monitor` process serving the socket.
+    pub supervisor_pid: u32,
+}
+
+/// Start the addressed Rust supervisor that owns the agent for `state`'s
+/// stage, and return once it has published its socket.
 ///
-/// The monitor is a detached process that:
-/// 1. Launches the agent (`program` + `args`) with stdout captured to the
-///    phase stdout file, recording the agent PID to the agent-pid file
-/// 2. Waits for the agent to exit and records its exit code to the exit file
-/// 3. Runs `devflow advance --phase N` to advance the workflow through its
-///    remaining stages
+/// Both [`MonitorLaunch`] shapes re-exec the monitor executable
+/// ([`LaunchContext::exec`]) as the hidden `__monitor` subcommand, in its own
+/// process group, with this launch's socket and launch id on its argv. That
+/// process runs [`run_supervised_stage`]: it spawns the agent (`program` +
+/// `args`) in the agent's own process group, publishes the socket under
+/// [`LaunchContext::cache_dir`], and advances the stage machine in-process
+/// once the agent completes (D-02). Adapter env values (`envs`) travel on the
+/// `__monitor` process's environment and only their names on its argv
+/// (`--keep-env NAME`), so a value is never visible in the process table.
 ///
-/// `launch` selects the supervision shape — see [`MonitorLaunch`]. `ctx`
-/// names the monitor executable: the `PipeOwning` arm re-execs it as
-/// [`LaunchContext::exec`] says, and the `Legacy` arm's `advance` tail runs
-/// the same executable.
+/// Returns only after the new supervisor answers a ping with this launch's
+/// id, through [`wait_for_publish`]. A supervisor that exits first, or does
+/// not publish within [`PUBLISH_WAIT`], is ended with what it started and
+/// reported as [`MonitorError::NotReady`].
 ///
-/// Returns the PID of the spawned monitor.
+/// The capture directory (and its `.gitignore`) is created before the spawn,
+/// so it exists even when the launch fails.
 pub fn spawn_monitor(
     state: &State,
     program: &str,
@@ -403,43 +422,11 @@ pub fn spawn_monitor(
     envs: &[(String, String)],
     launch: MonitorLaunch,
     ctx: &LaunchContext,
-) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(
-        state,
-        program,
-        args,
-        envs,
-        launch,
-        ctx,
-        MonitorTail::Advance,
-    )
-}
-
-/// What the Legacy monitor runs after it records the agent's exit code.
-enum MonitorTail {
-    /// `devflow advance` for this phase and stage — every production launch.
-    Advance,
-    /// Test-only stand-in for `advance` (empty for none), so a test neither
-    /// re-execs the test binary as `devflow advance` nor loses the window in
-    /// which the monitor outlives its agent.
-    #[cfg(test)]
-    Script(String),
-}
-
-fn spawn_monitor_inner(
-    state: &State,
-    program: &str,
-    args: &[String],
-    envs: &[(String, String)],
-    launch: MonitorLaunch,
-    ctx: &LaunchContext,
-    tail: MonitorTail,
-) -> Result<u32, MonitorError> {
+) -> Result<Published, MonitorError> {
     let project_root = state
         .project_root
         .to_str()
         .ok_or(MonitorError::NonUtf8Path)?;
-
     let binary = ctx
         .exec
         .exe()
@@ -453,274 +440,171 @@ fn spawn_monitor_inner(
         args.join(" ")
     );
 
-    let stdout_file = crate::agent_result::stdout_path(&state.project_root, state.phase);
-    let stderr_file = crate::agent_result::stderr_path(&state.project_root, state.phase);
-    let exit_file = crate::agent_result::exit_code_path(&state.project_root, state.phase);
-    let pid_file = crate::agent_result::agent_pid_path(&state.project_root, state.phase);
-
     // Ensure the capture directory exists before the detached process runs.
+    let stdout_file = crate::agent_result::stdout_path(&state.project_root, state.phase);
     if let Some(parent) = stdout_file.parent() {
         crate::workflow::ensure_devflow_dir(parent)?;
     }
 
-    let stdout_file = stdout_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
-    let stderr_file = stderr_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
-    let exit_file = exit_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
-    let pid_file = pid_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
-
-    // The agent runs in its worktree when worktree mode is active; otherwise it
-    // runs in the project root. Capture/state files and the `devflow check`
-    // calls below always use the main project root, regardless of cwd.
+    // The agent runs in its worktree when worktree mode is active; otherwise
+    // it runs in the project root. Capture and state files always use the
+    // main project root, regardless of cwd.
     let workdir_path = state
         .worktree_path
         .as_deref()
         .unwrap_or(&state.project_root);
     let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
-    if let MonitorLaunch::PipeOwning { prompt } = launch {
-        // `tail` is not consulted on this arm: the `__monitor`
-        // subcommand always advances after reaping, and `spawn_monitor` is the
-        // only caller of this function — it hardcodes `Advance`. Adding a
-        // `--no-advance` flag for a case nothing exercises would be an
-        // untested branch; add it when a caller actually needs it.
-        let _ = tail;
+    let launch_id = crate::supervisor::new_launch_id();
+    let socket =
+        SocketPath::for_launch(&ctx.cache_dir, &state.project_root, state.phase, &launch_id)?;
+    let socket_str = socket.as_path().to_str().ok_or(MonitorError::NonUtf8Path)?;
 
-        // The adapter's extra env rides down by INHERITANCE here (set via
-        // `.envs(...)` on the `__monitor` process below), and that is only
-        // sufficient because the adapters routed through this arm — Claude
-        // and Antigravity (round-3) — declare no extra env at all
-        // (`codex_disables_signing_via_env_others_do_not` asserts this).
-        // Widening this arm to an adapter that DOES set env requires
-        // threading it explicitly to `run_pipe_owning_monitor`: the inner
-        // `hermetic_command` scrubs `GIT_CONFIG_COUNT`, which neutralises any
-        // inherited `GIT_CONFIG_KEY_n` pair (Codex's unsigned-commit
-        // override is exactly that shape). Loud rather than silent, and in
-        // the CLI process where an operator can actually see it.
-        if !envs.is_empty() {
-            warn!(
-                "pipe-owning monitor: {} adapter env var(s) will not survive the \
-                 inner hermetic_command scrub — thread them explicitly before \
-                 routing an env-setting adapter through this arm",
-                envs.len()
-            );
+    let stream = match launch {
+        MonitorLaunch::PipeOwning { prompt } => {
+            // D-04: resolve and clamp the idle timeout HERE, in the parent,
+            // and hand the monitor the already-resolved integer. The monitor's
+            // stdio is all `Stdio::null()`, so a warning logged there scrolls
+            // into nothing: the notice goes to BOTH `tracing::warn!` and
+            // stdout, for the human watching `devflow start` right now.
+            let idle = idle_timeout_setting_for(state.agent);
+            // The notice names the variable the operator actually set (D-08):
+            // the literal is deliberately spelled here so `doc_check` keeps
+            // BOTH variables visible to the operator-doc parity gate.
+            let idle_env = match state.agent {
+                AgentKind::Antigravity => "DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS",
+                _ => IDLE_TIMEOUT_ENV,
+            };
+            if let Some(notice) = idle.notice_for(idle_env) {
+                warn!("{notice}");
+                println!("{notice}");
+            }
+            // The prompt travels as a FILE, not argv: argv has a hard length
+            // ceiling and DevFlow stage prompts routinely exceed it.
+            let prompt_file = crate::agent_result::prompt_path(&state.project_root, state.phase);
+            std::fs::write(&prompt_file, &prompt)?;
+            let prompt_file = prompt_file
+                .to_str()
+                .ok_or(MonitorError::NonUtf8Path)?
+                .to_string();
+            Some((prompt_file, idle.timeout.as_secs()))
         }
-
-        // D-04: resolve and clamp the idle timeout HERE, in the parent, and
-        // hand the monitor the already-resolved integer.
-        //
-        // The placement is the whole point. `spawn_monitor` runs inside
-        // `devflow start`, attached to the operator's terminal; the monitor is
-        // a detached process whose stdio is all `Stdio::null()`, so a warning
-        // logged there scrolls into nothing. A silent clamp is the exact
-        // failure class this project keeps paying for, so the notice goes to
-        // BOTH `tracing::warn!` and stdout — the log for the record, stdout
-        // for the human who is watching right now.
-        let idle = idle_timeout_setting_for(state.agent);
-        // The notice names the variable the operator actually set (D-08): the
-        // literal is deliberately spelled here so `doc_check` keeps BOTH
-        // variables visible to the operator-doc parity gate.
-        let idle_env = match state.agent {
-            AgentKind::Antigravity => "DEVFLOW_ANTIGRAVITY_IDLE_TIMEOUT_SECS",
-            _ => IDLE_TIMEOUT_ENV,
-        };
-        if let Some(notice) = idle.notice_for(idle_env) {
-            warn!("{notice}");
-            println!("{notice}");
-        }
-
-        // The prompt travels as a FILE, not argv: argv has a hard length
-        // ceiling and DevFlow stage prompts routinely exceed what is safe to
-        // pass positionally.
-        let prompt_file = crate::agent_result::prompt_path(&state.project_root, state.phase);
-        std::fs::write(&prompt_file, &prompt)?;
-        let prompt_file = prompt_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
-
-        // Re-exec THIS binary as its hidden `__monitor` subcommand. The
-        // monitor must outlive `devflow start`/`advance`, so it has to be a
-        // distinct OS process; re-exec needs no daemonization primitive beyond
-        // `spawn()`-without-`wait()`, which is exactly what the `sh` monitor
-        // below already relies on.
-        //
-        // Ordering is load-bearing for the same reason the Legacy arm's
-        // comment gives: `hermetic_command` does its `env_remove`s at
-        // construction and `.envs(...)` runs after, so deliberate
-        // configuration survives while inherited pollution does not.
-        let mut monitor_argv = pipe_owning_monitor_args(
-            project_root,
-            state,
-            workdir,
-            prompt_file,
-            idle.timeout.as_secs(),
-        );
-        monitor_argv.push(program.to_string());
-        monitor_argv.extend(args.iter().cloned());
-        let mut child_cmd = monitor_command(&ctx.exec, &binary, workdir_path, &monitor_argv)?;
-        child_cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-
-        strip_notify_env(&mut child_cmd);
-
-        let child = child_cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let pid = child.id();
-        info!("pipe-owning monitor spawned with pid {pid}");
-        return Ok(pid);
-    }
-
-    // Shell script that launches the agent in the background, captures its
-    // stdout and exit code, then advances the workflow. Because this process
-    // is the agent's parent, capture survives the CLI exiting.
-    //
-    // stderr is captured to a separate file so it cannot corrupt the (possibly
-    // JSON) stdout capture that DevFlow parses for DEVFLOW_RESULT. Inspect
-    // .devflow/phase-NN-stderr.log for agent error output on failures.
-    //
-    // `devflow advance --phase N` evaluates the agent result, moves the stage
-    // machine forward, and (for an agent stage) spawns the next monitor
-    // itself. The phase is recorded here at spawn time so advance's identity
-    // never depends on a shared state singleton (13-DEFERRED-CR-03): under
-    // `devflow parallel`, each phase's monitor advances exactly its own
-    // stage machine.
-    //
-    // Traps SIGTERM and SIGINT for clean shutdown. WR-08 (13-REVIEW.md):
-    // the trap must also kill the backgrounded agent ($apid) — previously
-    // it only exited the monitor shell itself, orphaning the agent so it
-    // kept running/committing unsupervised with nothing left to call
-    // `devflow advance` once it finished. `apid` is initialized to empty
-    // before the trap is installed so a signal arriving before the agent is
-    // even backgrounded doesn't reference an unset variable.
-    //
-    // A single `kill` from the trap is NOT enough on its own
-    // (monitor-sigterm-orphans-agent, .planning/debug, 2026-09-22). Two
-    // windows lose it, and both orphaned the agent (PPid=1) in the tests
-    // that hold them open:
-    //
-    // - Window A (dash, i.e. Debian's /bin/sh and CI's): the forked agent
-    //   child keeps the monitor's *caught* TERM handler until dash's
-    //   post-fork trap reset. A TERM landing first is recorded, then
-    //   discarded (the trap it would run is gone), and the child execs an
-    //   agent that never saw it. bash does not lose it.
-    // - Window F (dash and bash): a TERM reaching the monitor after its fork
-    //   but before `apid=$!` ran `cleanup` with an empty `apid`.
-    //
-    // So `cleanup` creates a stop marker BEFORE it kills, and the agent child
-    // checks that marker right before `exec`. The check runs after the
-    // child's trap reset, so a TERM it lost is always followed by a check
-    // that sees the marker — no timing assumption. `echo`, not `:`, creates
-    // the marker: a failed redirect on the special builtin `:` would exit the
-    // shell before the `kill`. `${apid:-$!}` closes window F, since `$!` is
-    // set as soon as the fork returns. The marker is removed in Rust before
-    // the spawn, never by the script, so the agent launch stays the monitor's
-    // first fork and a stale marker cannot stop the next agent.
-    //
-    // Once `wait` has reaped the agent, `cleanup` must leave it alone (WR-01,
-    // 48-REVIEW.md). The trap stays armed through the advance tail, and the
-    // shell defers it until that foreground command returns — after
-    // `advance` has launched the next stage's monitor, which removed the
-    // marker. Writing it then stops that next agent, and the `kill` targets a
-    // pid reaped long ago. `reaped` gates both; clearing `apid` would not,
-    // because `$!` still names the same pid. A TERM landing between `wait`
-    // returning and `reaped=1` still writes the marker, but the trap then
-    // exits before `advance` runs, so the next launch removes it as stale.
-    let stop_path = crate::agent_result::stop_marker_path(&state.project_root, state.phase);
-    if let Err(err) = std::fs::remove_file(&stop_path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(err.into());
-    }
-    let stop_file = stop_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
-    let advance_tail = match tail {
-        MonitorTail::Advance => advance_tail(&binary, project_root, state),
-        #[cfg(test)]
-        MonitorTail::Script(script) if script.is_empty() => String::new(),
-        #[cfg(test)]
-        MonitorTail::Script(script) => format!("; {script}"),
+        MonitorLaunch::Legacy => None,
     };
-    let script = format!(
-        "apid=''; reaped=''; cleanup() {{ if [ -z \"$reaped\" ]; then echo > {stop_file}; \
-         [ -n \"${{apid:-$!}}\" ] && kill \"${{apid:-$!}}\" 2>/dev/null; fi; exit 0; }}; \
-         trap cleanup TERM INT; \
-         cd {workdir} || exit 1; \
-         {{ [ -e {stop_file} ] && exit 143; exec \"$@\"; }} > {stdout_file} 2>{stderr_file} & \
-         apid=$!; echo $apid > {pid_file}; \
-         wait $apid; rc=$?; reaped=1; echo $rc > {exit_file}{advance_tail}",
-        stop_file = shell_escape(stop_file),
-        workdir = shell_escape(workdir),
-        stdout_file = shell_escape(stdout_file),
-        stderr_file = shell_escape(stderr_file),
-        exit_file = shell_escape(exit_file),
-        pid_file = shell_escape(pid_file),
-    );
 
-    // 27-REVIEW WR-03: built through `hermetic_command`, not a bare
-    // `Command::new("sh")`. This is the spawn that launches the coding agent
-    // itself, and the comment below is precisely the hazard: whatever
-    // environment this `sh` carries rides down into the agent and into every
-    // git command the agent runs. An inherited `GIT_DIR` here would silently
-    // retarget the phase's real commits at a repository the operator never
-    // named — the worst case this phase exists to prevent, on its
-    // highest-consequence call site.
-    //
+    let keep_env: Vec<&str> = envs.iter().map(|(name, _)| name.as_str()).collect();
+    let mut monitor_argv = monitor_args(&MonitorArgs {
+        project_root,
+        state,
+        workdir,
+        socket: socket_str,
+        launch_id: &launch_id,
+        keep_env: &keep_env,
+        stream: stream
+            .as_ref()
+            .map(|(prompt_file, idle_secs)| (prompt_file.as_str(), *idle_secs)),
+    });
+    monitor_argv.push(program.to_string());
+    monitor_argv.extend(args.iter().cloned());
+
     // Ordering is load-bearing: `hermetic_command` does its `env_remove`s at
-    // construction, and `.envs(...)` below runs after, so an adapter that
-    // deliberately sets one of these variables still wins. Deliberate
-    // configuration survives; inherited pollution does not. That is what
-    // keeps Codex's unsigned-commit override (`GIT_CONFIG_*`) working.
-    let mut child_cmd = hermetic_command("sh", workdir_path);
-    child_cmd
-        .arg("-c")
-        .arg(&script)
-        .arg("sh")
-        .arg(program)
-        .args(args)
-        // Adapter-scoped env (e.g. Codex's unsigned-commit override) rides
-        // the whole monitor chain: sh → agent → its git children (13-06).
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-
+    // construction and `.envs(...)` runs after, so deliberate adapter
+    // configuration survives while inherited pollution does not. The
+    // supervisor re-applies the names in `--keep-env` to the agent after its
+    // own `hermetic_command` scrub.
+    let mut child_cmd = monitor_command(&ctx.exec, &binary, workdir_path, &monitor_argv)?;
+    child_cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     strip_notify_env(&mut child_cmd);
 
-    let child = child_cmd
+    // RESEARCH Finding 6: the supervisor leads its own process group, so it
+    // never sits in the operator's shell job and a terminal Ctrl-C to a
+    // lingering `devflow start` does not reach the unattended run.
+    let mut child = child_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()?;
+    let supervisor_pid = child.id();
+    info!("monitor spawned with pid {supervisor_pid}; waiting for its socket");
 
-    let pid = child.id();
-    info!("monitor spawned with pid {pid}");
-    Ok(pid)
+    let reply = wait_for_publish(&mut child, &socket, &launch_id, PUBLISH_WAIT)?;
+    info!(
+        "supervisor {supervisor_pid} published {} ({})",
+        socket.as_path().display(),
+        reply.launch
+    );
+    Ok(Published {
+        record: crate::state::SupervisorRecord::new(
+            socket.as_path().to_path_buf(),
+            launch_id,
+            reply.agent_pgid,
+            reply.agent_start_time,
+            reply.boot_id.unwrap_or_default(),
+        ),
+        supervisor_pid,
+    })
 }
 
-fn pipe_owning_monitor_args(
-    project_root: &str,
-    state: &State,
-    workdir: &str,
-    prompt_file: &str,
-    idle_timeout_secs: u64,
-) -> Vec<String> {
-    vec![
-        "__monitor".to_string(),
-        "--project".to_string(),
-        project_root.to_string(),
-        "--phase".to_string(),
-        state.phase.to_string(),
-        "--stage".to_string(),
-        state.stage.to_string(),
-        "--workdir".to_string(),
-        workdir.to_string(),
-        "--prompt-file".to_string(),
-        prompt_file.to_string(),
-        "--idle-timeout-secs".to_string(),
-        idle_timeout_secs.to_string(),
-        "--agent".to_string(),
-        state.agent.to_string(),
-        "--".to_string(),
+/// The inputs [`monitor_args`] turns into a `__monitor` argv.
+struct MonitorArgs<'a> {
+    project_root: &'a str,
+    state: &'a State,
+    workdir: &'a str,
+    socket: &'a str,
+    launch_id: &'a str,
+    /// The adapter env NAMES the supervisor re-applies to the agent.
+    keep_env: &'a [&'a str],
+    /// The stream shape's prompt file and idle timeout in seconds; `None`
+    /// for the capture shape.
+    stream: Option<(&'a str, u64)>,
+}
+
+/// The `__monitor` argv up to and including `--`; the caller appends the
+/// agent's program and argv.
+fn monitor_args(args: &MonitorArgs<'_>) -> Vec<String> {
+    let launch = if args.stream.is_some() {
+        "stream"
+    } else {
+        "capture"
+    };
+    let mut argv: Vec<String> = [
+        "__monitor",
+        "--project",
+        args.project_root,
+        "--phase",
+        &args.state.phase.to_string(),
+        "--stage",
+        &args.state.stage.to_string(),
+        "--workdir",
+        args.workdir,
+        "--agent",
+        &args.state.agent.to_string(),
+        "--launch",
+        launch,
+        "--socket",
+        args.socket,
+        "--launch-id",
+        args.launch_id,
     ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    for name in args.keep_env {
+        argv.push("--keep-env".to_string());
+        argv.push((*name).to_string());
+    }
+    if let Some((prompt_file, idle_secs)) = args.stream {
+        argv.push("--prompt-file".to_string());
+        argv.push(prompt_file.to_string());
+        argv.push("--idle-timeout-secs".to_string());
+        argv.push(idle_secs.to_string());
+    }
+    argv.push("--".to_string());
+    argv
 }
 
-/// The `PipeOwning` re-exec command for `exec`, before the adapter env is
+/// The `__monitor` re-exec command for `exec`, before the adapter env is
 /// applied. `monitor_argv` starts with `__monitor` and ends with the child's
 /// program and argv; `binary` is `exec`'s executable as UTF-8.
 fn monitor_command(
@@ -750,16 +634,6 @@ fn monitor_command(
         }
     }
     Ok(command)
-}
-
-fn advance_tail(binary: &str, project_root: &str, state: &State) -> String {
-    format!(
-        "; {binary} advance {project_root} --phase {phase} --stage {stage}",
-        binary = shell_escape(binary),
-        project_root = shell_escape(project_root),
-        phase = state.phase,
-        stage = state.stage,
-    )
 }
 
 /// Constraint 4's close rule as a pure, line-fed state machine: stdin may be
@@ -1063,121 +937,6 @@ pub fn user_turn_line_for(agent: AgentKind, prompt: &str) -> String {
     }
 }
 
-/// Supervise a `stream-json` child, owning both of its pipes, until the close
-/// rule is satisfied and the child exits. Returns the child's exit code, which
-/// is also written to the phase exit file.
-///
-/// Agent-aware transport (round-3): the first turn is written via
-/// [`user_turn_line_for`] and the close rule via [`CloseRule::for_agent`], so
-/// the write/read/close triple matches whichever CLI is being supervised.
-///
-/// This runs INSIDE the detached `__monitor` process, not in the CLI.
-///
-/// Threading model (constraint 4 / T-31-04). Three participants:
-/// - a **writer thread** owning the child's stdin: it writes the initial user
-///   turn, then BLOCKS on a channel rather than returning. It drops stdin only
-///   when told to, because constraint 4's `AND` can never be honoured if stdin
-///   is already gone — a task-notification turn arriving after the child's
-///   first turn would have nowhere to be delivered.
-/// - a **reader thread** owning the child's stdout: it tees each line verbatim
-///   to the capture file and forwards it to the supervisor. Dropping its
-///   sender at EOF is what surfaces `Disconnected` below.
-/// - the **supervisor** (this function's own thread), which applies the close
-///   rule and reaps.
-///
-/// The write and the read MUST be on independent threads. Writing the prompt
-/// synchronously before reading stdout is the textbook two-pipe deadlock: it
-/// passes every short-prompt smoke test and hangs on exactly the context-heavy
-/// production stages that matter (the Linux pipe buffer is commonly 64KiB and
-/// a DevFlow stage prompt can exceed that in one write).
-#[allow(clippy::too_many_arguments)]
-pub fn run_pipe_owning_monitor(
-    project_root: &Path,
-    phase: PhaseId,
-    workdir: &Path,
-    prompt: &str,
-    idle_timeout: Duration,
-    program: &str,
-    args: &[String],
-    envs: &[(String, String)],
-    agent: AgentKind,
-) -> Result<i32, MonitorError> {
-    let stdout_file = crate::agent_result::stdout_path(project_root, phase);
-    let stderr_file = crate::agent_result::stderr_path(project_root, phase);
-    let exit_file = crate::agent_result::exit_code_path(project_root, phase);
-    let pid_file = crate::agent_result::agent_pid_path(project_root, phase);
-    if let Some(parent) = stdout_file.parent() {
-        crate::workflow::ensure_devflow_dir(parent)?;
-    }
-
-    // stderr goes to its own file so it cannot corrupt the JSONL stdout
-    // capture DevFlow parses — the same separation the Legacy script's
-    // `2>{stderr_file}` provides.
-    let stderr_handle = std::fs::File::create(&stderr_file)?;
-    // One handle, opened once, truncating at open and appending line by line.
-    // Truncate-at-open reproduces the Legacy arm's `>` redirection exactly, so
-    // a capture from a previous attempt can never be mixed into this one's
-    // (the launch path archives the prior capture first, but relying on that
-    // to make an append-mode open safe would be an unstated coupling).
-    let capture = std::fs::File::create(&stdout_file)?;
-
-    let mut agent_cmd = hermetic_command(program, workdir);
-    // The coding agent never needs the gate notify command (WR-07).
-    strip_notify_env(&mut agent_cmd);
-    let mut child = agent_cmd
-        .args(args)
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_handle))
-        // T-31-05: make the child its own process-group leader so a later
-        // group signal cannot reach this monitor's own ancestors. Verified
-        // source shows the pre-31 `spawn_monitor` had NO session or group
-        // configuration at all — detachment came only from the parent not
-        // waiting — so this closes a gap rather than preserving one.
-        // Full `setsid()` session detachment is deliberately NOT done: no
-        // forensics record cites a SIGHUP-related monitor loss, so there is
-        // no evidence it buys anything. `pre_exec` calling `libc::setsid()`
-        // is the one-line follow-on if such a loss ever surfaces.
-        .process_group(0)
-        .spawn()?;
-
-    // Recorded immediately, before any pipe work: `wait_for_agent_pid` polls
-    // for this and the rest of DevFlow's liveness reporting depends on it.
-    let child_pid = child.id();
-    std::fs::write(&pid_file, format!("{child_pid}\n"))?;
-
-    let threads = drive_stream_io(&mut child, capture, agent, prompt, idle_timeout, || {
-        fire_idle_timeout(project_root, phase, workdir, child_pid, idle_timeout);
-    })?;
-
-    let status = child.wait()?;
-    // A signal-killed child has NO exit code — `status.code()` is `None`, and
-    // the previous `unwrap_or(-1)` threw the signal away (peer review
-    // 2026-08-03, found independently by both reviewers and by the 31-04 plan
-    // review as W1). That silently defeated the classification 31-04 took care
-    // to preserve: `evaluate_layer2` and
-    // `reconcile_stream_success_against_exit_code` map **137** to
-    // `ResourceKilled` (routed to `GateInfra` — an infrastructure fault) and
-    // **127** to `AgentUnavailable`. Recording `-1` matched neither, so a real
-    // OOM kill arrived as a generic `Failed` and routed to `GateReview`, asking
-    // an operator to code-review a stage that was killed by the kernel.
-    //
-    // `128 + signal` is the shell convention those constants already encode:
-    // SIGKILL(9) -> 137, SIGTERM(15) -> 143. `-1` is now reachable only when a
-    // status is neither exited nor signalled, which POSIX does not define.
-    let code = status.code().unwrap_or_else(|| {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal().map_or(-1, |signal| 128 + signal)
-    });
-    std::fs::write(&exit_file, format!("{code}\n"))?;
-
-    threads.join();
-
-    info!("supervised child {child_pid} exited with code {code}");
-    Ok(code)
-}
-
 /// The stream shape's writer and reader threads, joined once the agent has
 /// been reaped.
 struct StreamThreads {
@@ -1192,17 +951,33 @@ impl StreamThreads {
     }
 }
 
-/// Drive a `stream-json` child's two pipes until its stream is over, with
-/// the threading model [`run_pipe_owning_monitor`]'s doc describes: a writer
-/// thread that delivers the first turn and holds stdin open, a reader thread
-/// that tees stdout into `capture`, and this thread applying the close rule
-/// and the idle timeout.
+/// Drive a `stream-json` child's two pipes until its stream is over.
+///
+/// Agent-aware transport (round-3): the first turn is written via
+/// [`user_turn_line_for`] and the close rule via [`CloseRule::for_agent`], so
+/// the write/read/close triple matches whichever CLI is being supervised.
+///
+/// Threading model (constraint 4 / T-31-04). Three participants:
+/// - a **writer thread** owning the child's stdin: it writes the initial user
+///   turn, then BLOCKS on a channel rather than returning. It drops stdin only
+///   when told to, because constraint 4's `AND` can never be honoured if stdin
+///   is already gone — a task-notification turn arriving after the child's
+///   first turn would have nowhere to be delivered.
+/// - a **reader thread** owning the child's stdout: it tees each line verbatim
+///   to `capture` and forwards it to this thread. Dropping its sender at EOF
+///   is what surfaces `Disconnected`.
+/// - this thread, which applies the close rule and the idle timeout.
+///
+/// The write and the read MUST be on independent threads. Writing the prompt
+/// synchronously before reading stdout is the textbook two-pipe deadlock: it
+/// passes every short-prompt smoke test and hangs on exactly the
+/// context-heavy production stages that matter (the Linux pipe buffer is
+/// commonly 64KiB and a DevFlow stage prompt can exceed that in one write).
 ///
 /// Returns once stdout reaches EOF, the idle timeout has fired (after
 /// `on_idle_timeout` ran), or the stream stayed quiet after the close rule
 /// released stdin. Stdin is released before it returns, so the caller may
-/// then wait for the child. Shared by [`run_pipe_owning_monitor`] and
-/// [`run_supervised_stage`]'s stream shape, so the two cannot drift apart.
+/// then wait for the child. Used by [`run_supervised_stage`]'s stream shape.
 fn drive_stream_io(
     child: &mut std::process::Child,
     mut capture: std::fs::File,
@@ -1502,9 +1277,9 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    sidecar exists before the socket name appears (R-7), and it is the
 ///    launcher's only record of the agent if this process is SIGKILLed
 ///    before it publishes (RV-03; `serve` rewrites it with the same content).
-/// 4. The stream shape only: drive the agent's pipes through the same
-///    helper `run_pipe_owning_monitor` uses (first turn, capture tee, close
-///    rule, idle timeout). An idle-timeout group kill is a natural outcome,
+/// 4. The stream shape only: drive the agent's pipes through
+///    `drive_stream_io` (first turn, capture tee, close rule, idle
+///    timeout). An idle-timeout group kill is a natural outcome,
 ///    `Completed(128 + n)` with the idle-timeout verdict file, never a stop.
 /// 5. [`Supervisor::wait_agent`], then the exit file: the agent's code for
 ///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`].
@@ -1774,34 +1549,18 @@ fn stage_sidecar(spec: &StageSpec, agent_pid: u32) -> crate::supervisor::Sidecar
 
 /// How long a launcher waits for a new supervisor to answer a ping with its
 /// launch id before it ends what it started (50-24).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 const PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
 /// How often [`wait_for_publish`] polls the child and probes the socket.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 const PUBLISH_POLL: Duration = Duration::from_millis(20);
 
 /// How long the not-ready teardown waits for its SIGSTOP to show in
 /// `/proc` before it lists the child's children.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 const STOP_SETTLE_WAIT: Duration = Duration::from_millis(100);
 
 /// The `/proc/<pid>/stat` fields the not-ready teardown picks its targets
 /// by, from one read. 50-09's `agent::ProcStat` carries no parent pid, so
 /// this is a separate, private parse.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChildStat {
     /// Field 4, the parent pid.
@@ -1818,10 +1577,6 @@ struct ChildStat {
 /// `)`: index 0 is then field 3, so the parent pid (field 4) is index 1,
 /// the process group (field 5) index 2 and the start time (field 22)
 /// index 19. A missing or unparsable field is `None`, never a guess.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn parse_proc_stat_line(line: &str) -> Option<ChildStat> {
     let rest = &line[line.rfind(')')? + 1..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
@@ -1834,20 +1589,12 @@ fn parse_proc_stat_line(line: &str) -> Option<ChildStat> {
 
 /// [`ChildStat`] for `pid` from one read of `/proc/<pid>/stat`, or `None`
 /// when it cannot be read or parsed.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn read_child_stat(pid: u32) -> Option<ChildStat> {
     parse_proc_stat_line(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
 /// Every process whose parent pid is `parent`, each with the stat it was
 /// chosen by. An entry that cannot be read is skipped.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn direct_children(parent: u32) -> Vec<(u32, ChildStat)> {
     proc_table()
         .into_iter()
@@ -1857,10 +1604,6 @@ fn direct_children(parent: u32) -> Vec<(u32, ChildStat)> {
 
 /// Every readable `/proc/<pid>/stat`, each from one read. An unlistable
 /// `/proc` is an empty table (logged); an unreadable entry is skipped.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn proc_table() -> Vec<(u32, ChildStat)> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         warn!("could not list /proc");
@@ -1900,10 +1643,6 @@ fn signal_guarded_group(pgid: u32, signal: libc::c_int) -> bool {
 
 /// Send `signal` to `child` alone, by the pid of the `Child` this process
 /// spawned and has not reaped (so the pid cannot name another process).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn signal_own_child(child: &std::process::Child, signal: libc::c_int) -> bool {
     match libc::pid_t::try_from(child.id()) {
         // SAFETY: `pid > 1` names one unreaped child of this process.
@@ -1913,10 +1652,6 @@ fn signal_own_child(child: &std::process::Child, signal: libc::c_int) -> bool {
 }
 
 /// Poll `child` until it exits (reaping it) or `wait` elapses.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn exit_within(
     child: &mut std::process::Child,
     wait: Duration,
@@ -1946,10 +1681,6 @@ fn exit_within(
 /// 4. SIGKILL the group of each listed child that leads its own group
 ///    (R-3's agent shape) and still has the listed start time. A bare kill
 ///    of the child's group would orphan such an agent.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn end_unpublished_child(child: &mut std::process::Child, wait: Duration) -> String {
     signal_own_child(child, libc::SIGTERM);
     if let Some(status) = exit_within(child, 2 * crate::agent::TERMINATE_VERIFY_WAIT) {
@@ -1998,10 +1729,6 @@ fn end_unpublished_child(child: &mut std::process::Child, wait: Duration) -> Str
 /// launch's address any more (its only server was the reaped child), so its
 /// launch files are removed, and the result is [`MonitorError::NotReady`]
 /// naming the child, how it ended and how many child groups were ended.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn wait_for_publish(
     child: &mut std::process::Child,
     socket: &SocketPath,
@@ -2050,18 +1777,10 @@ fn wait_for_publish(
 
 /// How long the ending step waits for a SIGKILLed recorded agent group to
 /// empty.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 const RECORDED_GROUP_GONE_WAIT: Duration = Duration::from_secs(2);
 
 /// What the ending step did about the agent group a launch's sidecar
 /// records.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 struct RecordedGroupEnd {
     /// The sentence the `NotReady` message carries.
     text: String,
@@ -2085,10 +1804,6 @@ struct RecordedGroupEnd {
 /// [`agent::is_same_process`](crate::agent::is_same_process) re-confirms
 /// the leader immediately before the SIGKILL. No sidecar, another launch
 /// id or any other decision signals nothing, and the text says which.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn end_recorded_agent_group(socket: &SocketPath, launch_id: &str) -> RecordedGroupEnd {
     use crate::supervisor::backstop::BackstopDecision;
     let done = |text: String| RecordedGroupEnd {
@@ -2164,10 +1879,6 @@ fn end_recorded_agent_group(socket: &SocketPath, launch_id: &str) -> RecordedGro
 }
 
 /// The variant name of a backstop decision, for the `NotReady` text.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn decision_name(decision: &crate::supervisor::backstop::BackstopDecision) -> &'static str {
     use crate::supervisor::backstop::BackstopDecision;
     match decision {
@@ -2183,10 +1894,6 @@ fn decision_name(decision: &crate::supervisor::backstop::BackstopDecision) -> &'
 }
 
 /// How many processes `/proc` lists in group `pgid` right now.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn group_member_count(pgid: u32) -> usize {
     proc_table()
         .iter()
@@ -2197,10 +1904,6 @@ fn group_member_count(pgid: u32) -> usize {
 /// Poll until no process is left in group `pgid` (`kill(-pgid, 0)` fails
 /// with ESRCH), up to `wait`. A pgid that is not a safe group target never
 /// counts as empty.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn group_empties_within(pgid: u32, wait: Duration) -> bool {
     let Ok(signed) = libc::pid_t::try_from(pgid) else {
         return false;
@@ -2386,9 +2089,9 @@ fn enumerate_phase_commits(
     // `workdir`, which is a different bug and left this one open.
     //
     // The state file is the same source of truth `git_flow_for_run` reads;
-    // consulting it here rather than threading a base through
-    // `run_pipe_owning_monitor`'s public signature keeps the fix local to
-    // the site that needs it. A missing or unreadable state degrades to the
+    // consulting it here rather than threading a base through the
+    // supervisor's `StageSpec` keeps the fix local to the site that needs
+    // it. A missing or unreadable state degrades to the
     // ambient resolution — the pre-existing behaviour, never an abort,
     // because losing the verdict is worse than losing the commit names.
     let persisted_base = crate::workflow::load_state(project_root, phase)
@@ -2571,11 +2274,6 @@ pub fn wait_for_agent_pid(project_root: &Path, phase: PhaseId) -> Option<u32> {
     None
 }
 
-/// Escape a string for safe use in a single-quoted shell context.
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2583,29 +2281,76 @@ mod tests {
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
 
+    /// The `__monitor` argv carries the stage, the launch shape, the socket and
+    /// launch id, and adapter env NAMES only (T-50-41): values travel on the
+    /// process environment, never on an argv every local user can read. The
+    /// stream-only flags appear only for the stream shape.
     #[test]
-    fn legacy_advance_tail_passes_the_launched_stage() {
+    fn monitor_args_carry_the_launch_and_only_adapter_env_names() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = state_in(dir.path());
-        state.stage = Stage::Code;
-        let root = dir.path().to_str().unwrap();
+        let state = state_in(dir.path());
+        let keep_env = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"];
+        let args = |stream| {
+            monitor_args(&MonitorArgs {
+                project_root: "/project",
+                state: &state,
+                workdir: "/workdir",
+                socket: "/cache/sock/x.sock",
+                launch_id: "0123456789abcdef",
+                keep_env: &keep_env,
+                stream,
+            })
+        };
+        let value_after = |argv: &[String], flag: &str| {
+            let at = argv.iter().position(|arg| arg == flag);
+            at.map(|at| argv[at + 1].clone())
+        };
 
-        let tail = advance_tail("devflow", root, &state);
-        assert!(tail.contains(" advance "));
-        assert!(tail.contains(&format!("--phase {} --stage code", state.phase)));
-    }
+        let stream = args(Some(("/prompt", 60)));
+        let separator = stream.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            separator,
+            stream.len() - 1,
+            "`--` ends the monitor's own argv"
+        );
+        assert_eq!(stream[0], "__monitor");
+        assert_eq!(value_after(&stream, "--stage").as_deref(), Some("code"));
+        assert_eq!(value_after(&stream, "--launch").as_deref(), Some("stream"));
+        assert_eq!(
+            value_after(&stream, "--socket").as_deref(),
+            Some("/cache/sock/x.sock")
+        );
+        assert_eq!(
+            value_after(&stream, "--launch-id").as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(
+            value_after(&stream, "--prompt-file").as_deref(),
+            Some("/prompt")
+        );
+        assert_eq!(
+            value_after(&stream, "--idle-timeout-secs").as_deref(),
+            Some("60")
+        );
+        let kept: Vec<&str> = stream
+            .windows(2)
+            .filter(|pair| pair[0] == "--keep-env")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(kept, keep_env, "one --keep-env per adapter env name");
+        assert!(
+            !stream.iter().any(|arg| arg.contains('=')),
+            "no NAME=VALUE pair may reach the argv: {stream:?}"
+        );
 
-    #[test]
-    fn pipe_owning_monitor_args_pass_the_stage() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = state_in(dir.path());
-        state.stage = Stage::Code;
-        let args = pipe_owning_monitor_args("/project", &state, "/workdir", "/prompt", 60);
-        let stage = args.iter().position(|arg| arg == "--stage").unwrap();
-        let separator = args.iter().position(|arg| arg == "--").unwrap();
-
-        assert_eq!(args[stage + 1], "code");
-        assert!(stage < separator, "stage must be parsed before child argv");
+        // Control: the capture shape names itself and carries no stream flags.
+        let capture = args(None);
+        assert_eq!(
+            value_after(&capture, "--launch").as_deref(),
+            Some("capture")
+        );
+        assert_eq!(value_after(&capture, "--prompt-file"), None);
+        assert_eq!(value_after(&capture, "--idle-timeout-secs"), None);
     }
 
     /// WR-07 (49-REVIEW.md): the chain's command never carries the variable.
@@ -2635,19 +2380,6 @@ mod tests {
         );
         state.stage = Stage::Code;
         state
-    }
-
-    /// The launch context every pre-50-10 `spawn_monitor` test passes: this
-    /// test binary as the monitor executable, exactly what `current_exe()`
-    /// resolved to inside `spawn_monitor` before 50-10, and a cache dir under
-    /// the test's own project tempdir.
-    fn test_launch_context(state: &State) -> LaunchContext {
-        LaunchContext::new(
-            state.project_root.join("cache"),
-            MonitorExec::Subcommand {
-                exe: std::env::current_exe().unwrap(),
-            },
-        )
     }
 
     /// T-50-26's source scan: whether the first `HarnessEntry {` after
@@ -3274,13 +3006,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_escape_wraps_basic_strings() {
-        assert_eq!(shell_escape("hello"), "'hello'");
-        assert_eq!(shell_escape("hello world"), "'hello world'");
-        assert_eq!(shell_escape("/tmp/devflow"), "'/tmp/devflow'");
-    }
-
     /// The Phase 31 tracer: ONE Claude-shaped stage driven end to end through
     /// the pipe-owning supervisor.
     ///
@@ -3365,7 +3090,7 @@ exit 0
             early = early_file.display(),
         );
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -3473,7 +3198,7 @@ exit 0
         let phase = PhaseId::new(51);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -3527,7 +3252,7 @@ exit 0
 "#
         );
 
-        let _ = run_pipe_owning_monitor(
+        let _ = supervise_stream_child(
             root,
             phase,
             root,
@@ -3557,7 +3282,7 @@ exit 0
         let phase = PhaseId::new(52);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
-        let _ = run_pipe_owning_monitor(
+        let _ = supervise_stream_child(
             root,
             phase,
             root,
@@ -3604,7 +3329,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id
 exit 0
 "#;
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -3669,7 +3394,7 @@ sleep 3
 exit 0
 "#;
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -3725,7 +3450,7 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"sig-1"}'
 kill -9 $$
 "#;
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -3747,17 +3472,6 @@ kill -9 $$
         let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
             .expect("the monitor must record the exit code");
         assert_eq!(exit.trim(), "137", "exit file contents: {exit:?}");
-    }
-
-    #[test]
-    fn shell_escape_handles_single_quotes() {
-        assert_eq!(shell_escape("can't"), "'can'\\''t'");
-        assert_eq!(shell_escape("a'b'c"), "'a'\\''b'\\''c'");
-    }
-
-    #[test]
-    fn shell_escape_handles_empty_string() {
-        assert_eq!(shell_escape(""), "''");
     }
 
     #[test]
@@ -3793,53 +3507,6 @@ kill -9 $$
         assert_eq!(wait_for_agent_pid(dir.path(), PhaseId::new(4)), None);
     }
 
-    #[test]
-    fn spawn_monitor_captures_agent_pid_and_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        // Stub agent: write a known marker to stdout, then exit cleanly.
-        let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
-
-        let monitor_pid = spawn_monitor(
-            &state,
-            "sh",
-            &args,
-            &[],
-            MonitorLaunch::Legacy,
-            &test_launch_context(&state),
-        )
-        .unwrap();
-        assert!(monitor_pid > 0);
-
-        // Observable side effect #1: the monitor records the agent PID to its
-        // pid file with valid numeric content.
-        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
-            .expect("monitor should record the agent pid");
-        assert!(agent_pid > 0);
-
-        // Observable side effect #2: the agent's stdout is captured to the
-        // phase stdout file (proving the monitor actually ran the agent).
-        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
-        let mut captured = String::new();
-        for _ in 0..100 {
-            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
-                && contents.contains("MONITOR_READY")
-            {
-                captured = contents;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            captured.contains("MONITOR_READY"),
-            "expected MONITOR_READY in captured stdout, got {captured:?}"
-        );
-    }
-
-    /// WR-08 (13-REVIEW.md): sending SIGTERM/SIGINT to the monitor must also
-    /// terminate the agent it owns. Before the fix, `cleanup()` only exited
-    /// the monitor shell, leaving the agent orphaned and running/committing
-    /// unsupervised with nothing left to call `devflow advance` for it.
     /// A one-line identity/state summary of a pid, for failure diagnostics.
     /// `Name`/`State`/`PPid` come from `/proc/<pid>/status`; the cmdline
     /// distinguishes a shell that exec'd its command from one that forked it.
@@ -3878,374 +3545,85 @@ kill -9 $$
         )
     }
 
-    #[test]
-    fn sigterm_to_monitor_also_kills_the_agent() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        // Stub agent that runs long enough to observe: sleeps well past the
-        // window this test needs to send SIGTERM and check liveness.
-        let args = vec!["-c".to_string(), "sleep 30".to_string()];
+    /// The stream shape's pipe driving without the published socket: spawn
+    /// `program` through `spawn_stage_agent` (its own process group, the
+    /// adapter env, the truncating capture and stderr files), record its pid,
+    /// drive it through `drive_stream_io` with `fire_idle_timeout` as the idle
+    /// action, reap it, and record `runtime::exit_code` in the exit file.
+    /// That is the sequence `run_supervised_stage` runs for its stream shape,
+    /// minus the signal pipe and the socket, which need a child test process
+    /// (the `*_arm_runs_the_agent_under_an_addressed_supervisor` tests cover
+    /// those). Returns the recorded exit code.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the stream shape's independently varied inputs"
+    )]
+    fn supervise_stream_child(
+        project_root: &Path,
+        phase: PhaseId,
+        workdir: &Path,
+        prompt: &str,
+        idle_timeout: Duration,
+        program: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        agent: AgentKind,
+    ) -> Result<i32, MonitorError> {
+        let stdout_file = crate::agent_result::stdout_path(project_root, phase);
+        if let Some(parent) = stdout_file.parent() {
+            crate::workflow::ensure_devflow_dir(parent)?;
+        }
+        let never_bound = SocketPath::new(PathBuf::from("/nonexistent/never-bound.sock"))
+            .expect("a short socket path");
+        let mut spec = StageSpec::new(
+            project_root.to_path_buf(),
+            phase,
+            agent,
+            program.to_string(),
+            StageIo::Stream {
+                prompt: prompt.to_string(),
+                idle_timeout,
+            },
+            never_bound,
+            "never-bound".to_string(),
+        );
+        spec.workdir = workdir.to_path_buf();
+        spec.args = args.to_vec();
+        spec.envs = envs.to_vec();
+        let (mut child, capture) = spawn_stage_agent(&spec)?;
+        let pid = child.id();
+        std::fs::write(
+            crate::agent_result::agent_pid_path(project_root, phase),
+            format!("{pid}\n"),
+        )?;
+        let capture = capture.expect("the stream shape pipes the agent's stdout");
+        let threads = drive_stream_io(&mut child, capture, agent, prompt, idle_timeout, || {
+            fire_idle_timeout(project_root, phase, workdir, pid, idle_timeout);
+        })?;
+        let code = crate::supervisor::runtime::exit_code(child.wait()?);
+        std::fs::write(
+            crate::agent_result::exit_code_path(project_root, phase),
+            format!("{code}\n"),
+        )?;
+        threads.join();
+        Ok(code)
+    }
 
-        let monitor_pid = spawn_monitor(
-            &state,
-            "sh",
-            &args,
-            &[],
-            MonitorLaunch::Legacy,
-            &test_launch_context(&state),
+    // ---- the three capture-shape launch tests 50-11 moved off the deleted
+    //      `sh` monitor onto `run_supervised_stage`, each in a child test
+    //      process (`launch_stage_with`, below), keeping its name and its
+    //      assertions.
+
+    /// A capture-shape fake agent `codex` running `body`, then waiting for
+    /// `go` so the parent sees its socket answer before it exits.
+    fn released_agent(fixture: &StageFixture, body: &str, go: &Path) -> PathBuf {
+        fixture.agent(
+            "codex",
+            &format!(
+                "{body}\nwhile [ ! -e '{go}' ]; do sleep 0.05; done\nexit 0",
+                go = go.display()
+            ),
         )
-        .unwrap();
-        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
-            .expect("monitor should record the agent pid");
-        assert!(
-            crate::agent::agent_running(agent_pid),
-            "agent should be running before SIGTERM"
-        );
-
-        // Snapshot both processes before signalling. This assertion fails in
-        // containerised CI and cannot be reproduced locally, and a bare
-        // "still running" message discards everything that could explain it
-        // — the same antipattern that made 999.47 expensive to diagnose.
-        let monitor_before = proc_snapshot(monitor_pid);
-        let agent_before = proc_snapshot(agent_pid);
-
-        // SIGTERM the monitor, as an operator (or lock.rs's stale-holder
-        // reclaim path) would to abort a run.
-        let kill_rc = unsafe { libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM) };
-        let kill_err = if kill_rc == 0 {
-            "ok".to_string()
-        } else {
-            format!("errno {}", std::io::Error::last_os_error())
-        };
-
-        // The agent should be killed promptly by the monitor's trap —
-        // poll rather than sleep a fixed amount to keep this fast and
-        // avoid flaking under load. (Window widened to 5s: at 2s this
-        // still flaked under a fully parallel workspace test run.)
-        //
-        // 2026-07-26: this was widened 5s -> 15s for the containerised CI
-        // job and STILL failed, then reverted to 5s. That widening was a
-        // mistake: 15s is far beyond any plausible trap-and-kill latency,
-        // so the agent is not being reaped SLOWLY, it is not being reaped.
-        // Buying silence with a bigger number would have hidden a real
-        // defect behind a green check — the exact false negative this
-        // repository keeps getting bitten by.
-        //
-        // 2026-09-22 diagnosis (monitor-sigterm-orphans-agent,
-        // .planning/debug): under dash (the container's /bin/sh; the Fedora
-        // host's is bash), a TERM that lands in the agent child after its
-        // fork but before dash's post-fork trap reset is caught by the
-        // inherited handler and then discarded, and the child execs an agent
-        // that never saw it. The CI failures' `agent before` snapshot shows
-        // the child still pre-exec, consistent with that window; this test
-        // only races it. The `sigterm_before_*` tests below hold it (and the
-        // monitor-side `apid=$!` window) open deterministically; the Legacy
-        // script's stop marker closes the first and `${apid:-$!}` the second.
-        //
-        // Do NOT widen this window: a failure here is a lost TERM, not a slow
-        // one.
-        let mut still_running = true;
-        for _ in 0..250 {
-            if !crate::agent::agent_running(agent_pid) {
-                still_running = false;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let monitor_after = proc_snapshot(monitor_pid);
-        let agent_after = proc_snapshot(agent_pid);
-        let pidfile =
-            std::fs::read_to_string(crate::agent_result::agent_pid_path(dir.path(), state.phase))
-                .unwrap_or_else(|e| format!("<unreadable: {e}>"));
-
-        assert!(
-            !still_running,
-            "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM\n\
-             \x20 monitor pid:      {monitor_pid}\n\
-             \x20 kill(TERM) rc:    {kill_rc} ({kill_err})\n\
-             \x20 monitor before:   {monitor_before}\n\
-             \x20 monitor after:    {monitor_after}\n\
-             \x20 agent pid:        {agent_pid}\n\
-             \x20 agent before:     {agent_before}\n\
-             \x20 agent after:      {agent_after}\n\
-             \x20 pidfile contents: {}\n\
-             Read the monitor's `after` line first. GONE means the shell died \
-             without running its trap — most likely SIGTERM arrived before \
-             `trap` was installed, or it was killed rather than handling the \
-             signal, either way leaving the agent unreaped. STILL ALIVE means \
-             the trap never fired or `kill $apid` failed, so compare the agent \
-             pid against the pidfile and check the agent's PPid: if PPid is not \
-             the monitor, `$!` did not name the process we are polling. If the \
-             agent's Name is `sh` rather than `sleep`, the agent shell forked \
-             rather than exec'd, so killing it leaves its own child behind.",
-            pidfile.trim()
-        );
-    }
-
-    // ---- monitor-sigterm-orphans-agent (.planning/debug, 2026-09-22): a TERM
-    //      that lands inside one of the Legacy monitor script's spawn windows.
-    //
-    // Window A (dash only; Debian's /bin/sh, so CI's): the forked agent child
-    // keeps the monitor's *caught* TERM handler until dash's fork-reset clears
-    // the trap. A TERM that lands first is recorded by that handler and then
-    // discarded (`dotrap` skips a signal whose trap is now NULL), and the child
-    // goes on to exec the agent, which never sees a TERM and is orphaned when
-    // the monitor exits. bash does not lose it, which is why the Fedora host
-    // never reproduced `sigterm_to_monitor_also_kills_the_agent`'s CI failures.
-    //
-    // Window F (dash and bash): a TERM that reaches the monitor after its fork
-    // but before `apid=$!` runs `cleanup` with an empty `apid`, so it kills
-    // nothing.
-    //
-    // Both windows are microseconds wide, so these tests hold them open
-    // deterministically instead of racing them. An LD_PRELOAD `fork()` shim,
-    // compiled here with `cc` and handed to the monitor through
-    // `spawn_monitor`'s own `envs`, holds ONE side of the monitor's first fork
-    // (the agent launch) until the test creates a release file. The shim
-    // blocks every signal for the hold, so a TERM sent inside it stays pending
-    // (kernel-visible in /proc) until the hold ends, and each test asserts that
-    // the TERM really landed inside the window instead of assuming it.
-
-    /// The `fork()` interposer. Only the first fork, on the configured side,
-    /// in a process carrying these variables holds: that side unlinks the
-    /// `HOLDFORK_ONCE` file, and every later fork (the exec'd agent inherits
-    /// `LD_PRELOAD`) finds it gone.
-    #[cfg(target_os = "linux")]
-    const HOLDFORK_SHIM_C: &str = r#"
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
-
-static void record_pending_term(const char *path) {
-    sigset_t pending;
-    if (sigpending(&pending) == 0 && sigismember(&pending, SIGTERM)) {
-        int fd = open(path, O_WRONLY | O_CREAT, 0600);
-        if (fd >= 0) close(fd);
-    }
-}
-
-pid_t fork(void) {
-    pid_t (*real_fork)(void) = (pid_t (*)(void))dlsym(RTLD_NEXT, "fork");
-    pid_t pid = real_fork();
-    if (pid < 0) return pid;
-    int saved_errno = errno;
-    const char *side = getenv("HOLDFORK_SIDE");
-    const char *once = getenv("HOLDFORK_ONCE");
-    const char *release = getenv("HOLDFORK_RELEASE");
-    const char *term_seen = getenv("HOLDFORK_TERM_SEEN");
-    if (side && once && release && term_seen
-        && strcmp(side, pid == 0 ? "child" : "parent") == 0
-        && unlink(once) == 0) {
-        /* Every signal is blocked for the hold, so one sent inside it stays
-           pending instead of running a handler whose only trace would be a
-           cut-short sleep, which a process that is descheduled when the
-           signal lands never sees. A pending TERM is recorded each tick and
-           once more at release; restoring the mask then delivers it to the
-           handler this process already had, still before any of the shell's
-           own post-fork code. Hold until released: 10 ms ticks, capped at
-           20 s so a crashed test cannot wedge a process forever. */
-        sigset_t all, saved;
-        sigfillset(&all);
-        sigprocmask(SIG_BLOCK, &all, &saved);
-        for (int tick = 0; tick < 2000 && access(release, F_OK) != 0; tick++) {
-            struct timespec step = {0, 10 * 1000 * 1000};
-            nanosleep(&step, NULL);
-            record_pending_term(term_seen);
-        }
-        record_pending_term(term_seen);
-        sigprocmask(SIG_SETMASK, &saved, NULL);
-    }
-    errno = saved_errno;
-    return pid;
-}
-"#;
-
-    /// Which side of the monitor's first `fork()` the shim holds.
-    #[cfg(target_os = "linux")]
-    #[derive(Clone, Copy)]
-    enum HoldSide {
-        /// The agent child, before any of the shell's post-fork code runs.
-        Child,
-        /// The monitor, after the fork returned and before `apid=$!`.
-        Parent,
-    }
-
-    /// A Legacy monitor whose first fork is held open by the shim. Dropping it
-    /// releases the hold and SIGKILLs every still-tracked process that is
-    /// still recognisably ours, so a failing assertion leaks neither a held
-    /// monitor nor a 30-second agent.
-    #[cfg(target_os = "linux")]
-    struct HeldMonitor {
-        state: State,
-        monitor_pid: u32,
-        release: std::path::PathBuf,
-        term_seen: std::path::PathBuf,
-        tracked: Vec<u32>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl HeldMonitor {
-        fn spawn(root: &Path, side: HoldSide) -> Self {
-            let shim = compile_holdfork_shim(root);
-            let once = root.join("holdfork-once");
-            std::fs::write(&once, "").unwrap();
-            let release = root.join("holdfork-release");
-            let term_seen = root.join("holdfork-term-seen");
-            let side = match side {
-                HoldSide::Child => "child",
-                HoldSide::Parent => "parent",
-            };
-            let envs = [
-                ("LD_PRELOAD", shim.to_str().unwrap()),
-                ("HOLDFORK_SIDE", side),
-                ("HOLDFORK_ONCE", once.to_str().unwrap()),
-                ("HOLDFORK_RELEASE", release.to_str().unwrap()),
-                ("HOLDFORK_TERM_SEEN", term_seen.to_str().unwrap()),
-            ]
-            .map(|(key, value)| (key.to_string(), value.to_string()));
-            let state = state_in(root);
-            let args = vec!["-c".to_string(), "sleep 30".to_string()];
-            let monitor_pid = spawn_monitor(
-                &state,
-                "sh",
-                &args,
-                &envs,
-                MonitorLaunch::Legacy,
-                &test_launch_context(&state),
-            )
-            .unwrap();
-            Self {
-                state,
-                monitor_pid,
-                release,
-                term_seen,
-                tracked: vec![monitor_pid],
-            }
-        }
-
-        fn release(&self) {
-            std::fs::write(&self.release, "").unwrap();
-        }
-
-        /// Whether the shim saw a TERM pending during its hold.
-        fn hold_saw_a_pending_term(&self) -> bool {
-            self.term_seen.exists()
-        }
-
-        fn sigterm_monitor(&self) {
-            let rc = unsafe { libc::kill(self.monitor_pid as libc::pid_t, libc::SIGTERM) };
-            assert_eq!(
-                rc,
-                0,
-                "kill(monitor, TERM): {}",
-                std::io::Error::last_os_error()
-            );
-        }
-
-        /// Reap the monitor (this test process is its parent) and require that
-        /// it left through its trap: `cleanup` ends in `exit 0`, whereas a
-        /// shell killed by the TERM itself reports a signal. Once reaped, its
-        /// pid may be reused, so it is no longer tracked.
-        fn reap_monitor_expecting_trap_exit(&mut self) {
-            let pid = self.monitor_pid as libc::pid_t;
-            let mut reaped = None;
-            for _ in 0..250 {
-                let mut status: libc::c_int = 0;
-                let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                if rc == pid {
-                    reaped = Some(status);
-                    break;
-                }
-                assert_eq!(
-                    rc,
-                    0,
-                    "waitpid(monitor): {}",
-                    std::io::Error::last_os_error()
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let status = reaped.expect("the monitor did not exit within 5s of SIGTERM");
-            self.tracked.retain(|&tracked| tracked != self.monitor_pid);
-            assert!(
-                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                "the monitor must leave through its trap (`cleanup` → `exit 0`); \
-                 wait status {status:#x}"
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for HeldMonitor {
-        fn drop(&mut self) {
-            let _ = std::fs::write(&self.release, "");
-            for &pid in &self.tracked {
-                let cmd = cmdline_of(pid);
-                let ours = cmd.contains("trap cleanup TERM INT") || cmd.contains("sleep 30");
-                if ours && crate::agent::agent_running(pid) {
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn compile_holdfork_shim(dir: &Path) -> std::path::PathBuf {
-        let source = dir.join("holdfork.c");
-        std::fs::write(&source, HOLDFORK_SHIM_C).unwrap();
-        let shim = dir.join("holdfork.so");
-        let out = std::process::Command::new("cc")
-            .args(["-shared", "-fPIC", "-o"])
-            .arg(&shim)
-            .arg(&source)
-            .arg("-ldl")
-            .output()
-            .expect(
-                "these tests compile an LD_PRELOAD fork() shim and need `cc`, \
-                 the C toolchain cargo already links with on Linux",
-            );
-        assert!(
-            out.status.success(),
-            "compiling the fork() shim failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        shim
-    }
-
-    /// `/proc/<pid>/cmdline` with its NULs as spaces; empty once the pid is
-    /// gone or a zombie.
-    #[cfg(target_os = "linux")]
-    fn cmdline_of(pid: u32) -> String {
-        std::fs::read(format!("/proc/{pid}/cmdline"))
-            .map(|raw| {
-                raw.split(|&byte| byte == 0)
-                    .filter(|arg| !arg.is_empty())
-                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default()
-    }
-
-    /// Whether `pid` has exec'd the stub agent (`sh -c 'sleep 30'`, or
-    /// `sleep 30` itself where the shell execs its last command).
-    #[cfg(target_os = "linux")]
-    fn runs_the_agent(pid: u32) -> bool {
-        let cmd = cmdline_of(pid);
-        !cmd.contains("trap cleanup TERM INT") && cmd.contains("sleep 30")
-    }
-
-    /// Whether SIGTERM is set in the named signal mask of `pid`'s
-    /// `/proc/<pid>/status` (`SigCgt`, `SigPnd`, `ShdPnd`, ...). Panics when
-    /// the field cannot be read: an absent field must not read as "clear".
-    #[cfg(target_os = "linux")]
-    fn sigterm_in_mask(pid: u32, field: &str) -> bool {
-        signal_mask(pid, field) & (1 << (libc::SIGTERM - 1)) != 0
     }
 
     /// The named signal mask of `pid`'s `/proc/<pid>/status` (`SigCgt`,
@@ -4263,379 +3641,46 @@ pid_t fork(void) {
         u64::from_str_radix(hex, 16).expect("signal masks are hex")
     }
 
-    #[cfg(target_os = "linux")]
-    fn sigterm_is_caught(pid: u32) -> bool {
-        sigterm_in_mask(pid, "SigCgt")
-    }
-
-    /// Whether a TERM has reached `pid` while it was held. The shim blocks
-    /// signals for the hold, so the TERM sits pending (`ShdPnd` for a
-    /// process-directed `kill`) until the hold ends, and the shim records it.
-    #[cfg(target_os = "linux")]
-    fn held_process_received_sigterm(held: &HeldMonitor, pid: u32) -> bool {
-        held.hold_saw_a_pending_term()
-            || sigterm_in_mask(pid, "ShdPnd")
-            || sigterm_in_mask(pid, "SigPnd")
-    }
-
-    #[cfg(target_os = "linux")]
-    fn within_5s(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..250 {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        done()
-    }
-
-    /// Window A. Fails under dash before the fix (bash does not lose the TERM,
-    /// so on a bash `/bin/sh` this passes either way).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sigterm_before_the_agent_child_resets_its_traps_still_kills_the_agent() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut held = HeldMonitor::spawn(dir.path(), HoldSide::Child);
-        let agent_pid = wait_for_agent_pid(dir.path(), held.state.phase)
-            .expect("the monitor records the agent pid right after its fork");
-        held.tracked.push(agent_pid);
-
-        // The injection landed where this test claims it did: the agent child
-        // is held before its trap reset, still running the monitor's script
-        // and still catching TERM with the handler it inherited.
-        let held_cmd = cmdline_of(agent_pid);
-        assert!(
-            held_cmd.contains("trap cleanup TERM INT"),
-            "the hold did not land on the agent fork; child already runs [{held_cmd}]"
-        );
-        assert!(
-            sigterm_is_caught(agent_pid),
-            "the held agent child does not catch TERM, so it is not in the pre-reset window"
-        );
-
-        held.sigterm_monitor();
-        held.reap_monitor_expecting_trap_exit();
-        // `cleanup` has run, so its `kill` was sent while the child was held.
-        // It is pending there, and the handler the child inherited catches it
-        // when the hold ends, before the child's trap reset.
-        assert!(
-            within_5s(|| held_process_received_sigterm(&held, agent_pid)),
-            "the held agent child never received the monitor's TERM, so the kill did \
-             not land inside the window"
-        );
-
-        held.release();
-        let died = within_5s(|| !crate::agent::agent_running(agent_pid));
-        assert!(
-            died,
-            "agent (pid {agent_pid}) survived a TERM that reached it before its trap \
-             reset, orphaned: {}",
-            proc_snapshot(agent_pid)
-        );
-    }
-
-    /// Opposite-result control for the test above: the same shim and the same
-    /// hold, but released BEFORE the TERM, so the TERM finds an exec'd agent.
-    /// Passes before and after the fix; if it ever fails, the harness, not the
-    /// monitor, is what keeps the agent alive.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sigterm_after_a_held_agent_child_execs_kills_the_agent() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut held = HeldMonitor::spawn(dir.path(), HoldSide::Child);
-        let agent_pid = wait_for_agent_pid(dir.path(), held.state.phase)
-            .expect("the monitor records the agent pid right after its fork");
-        held.tracked.push(agent_pid);
-        let held_cmd = cmdline_of(agent_pid);
-        assert!(
-            held_cmd.contains("trap cleanup TERM INT"),
-            "the hold did not land on the agent fork; child already runs [{held_cmd}]"
-        );
-
-        held.release();
-        assert!(
-            within_5s(|| runs_the_agent(agent_pid)),
-            "the released agent child never exec'd the agent: [{}]",
-            cmdline_of(agent_pid)
-        );
-        held.sigterm_monitor();
-        held.reap_monitor_expecting_trap_exit();
-
-        let died = within_5s(|| !crate::agent::agent_running(agent_pid));
-        assert!(
-            died,
-            "agent (pid {agent_pid}) survived a TERM sent after it exec'd: {}",
-            proc_snapshot(agent_pid)
-        );
-        assert!(
-            !held.hold_saw_a_pending_term(),
-            "a TERM landed inside the hold; this control must only TERM after exec"
-        );
-    }
-
-    /// Window F. Fails under dash and bash before the fix.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sigterm_before_the_monitor_records_the_agent_pid_still_kills_the_agent() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut held = HeldMonitor::spawn(dir.path(), HoldSide::Parent);
-        // The monitor is held right after its fork, so it has not written the
-        // pidfile; the agent is the monitor's only child.
-        let children = format!("/proc/{0}/task/{0}/children", held.monitor_pid);
-        let mut agent_pid = None;
-        let found = within_5s(|| {
-            agent_pid = std::fs::read_to_string(&children)
-                .expect("/proc/<pid>/task/<tid>/children must be readable")
-                .split_whitespace()
-                .next()
-                .map(|pid| pid.parse::<u32>().expect("children lists numeric pids"));
-            agent_pid.is_some()
-        });
-        assert!(found, "the held monitor never forked its agent");
-        let agent_pid = agent_pid.unwrap();
-        held.tracked.push(agent_pid);
-        assert!(
-            within_5s(|| runs_the_agent(agent_pid)),
-            "the agent child of the held monitor never exec'd: [{}]",
-            cmdline_of(agent_pid)
-        );
-        let pidfile = crate::agent_result::agent_pid_path(dir.path(), held.state.phase);
-        assert!(
-            !pidfile.exists(),
-            "the monitor already wrote the pidfile, so the hold did not land between \
-             its fork and `apid=$!`"
-        );
-
-        held.sigterm_monitor();
-        let monitor_pid = held.monitor_pid;
-        assert!(
-            within_5s(|| held_process_received_sigterm(&held, monitor_pid)),
-            "the held monitor never received the TERM"
-        );
-        held.release();
-        held.reap_monitor_expecting_trap_exit();
-
-        let died = within_5s(|| !crate::agent::agent_running(agent_pid));
-        assert!(
-            died,
-            "agent (pid {agent_pid}) survived a TERM that reached the monitor before \
-             it recorded the agent pid, orphaned: {}",
-            proc_snapshot(agent_pid)
-        );
-    }
-
-    /// The stop marker a TERM'd monitor leaves behind must not stop the NEXT
-    /// agent for that phase: the Legacy launch removes a stale marker before
-    /// it spawns. Without that, the agent child finds the marker, exits 143
-    /// without ever running, and the stage records a kill nobody sent.
-    ///
-    /// The tail is empty so the monitor does not re-exec this test binary as
-    /// `devflow advance`; the marker handling does not depend on it.
-    #[test]
-    fn a_stale_stop_marker_does_not_stop_the_next_agent() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        let marker = crate::agent_result::stop_marker_path(dir.path(), state.phase);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "\n").unwrap();
-        let args = vec![
-            "-c".to_string(),
-            "echo STALE_MARKER_AGENT_RAN; exit 7".to_string(),
-        ];
-
-        spawn_monitor_inner(
-            &state,
-            "sh",
-            &args,
-            &[],
-            MonitorLaunch::Legacy,
-            &test_launch_context(&state),
-            MonitorTail::Script(String::new()),
-        )
-        .unwrap();
-
-        let exit_path = crate::agent_result::exit_code_path(dir.path(), state.phase);
-        let mut recorded = None;
-        for _ in 0..250 {
-            recorded = std::fs::read_to_string(&exit_path)
-                .ok()
-                .filter(|contents| contents.ends_with('\n'));
-            if recorded.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let recorded = recorded.expect("the monitor never recorded the agent's exit code");
-        assert_eq!(
-            recorded.trim(),
-            "7",
-            "a stale stop marker stopped the next agent: its exit code is {:?}, not the \
-             agent's own 7 (143 means the agent child found the marker and never exec'd)",
-            recorded.trim()
-        );
-        let captured =
-            std::fs::read_to_string(crate::agent_result::stdout_path(dir.path(), state.phase))
-                .unwrap();
-        assert!(
-            captured.contains("STALE_MARKER_AGENT_RAN"),
-            "the agent did not run under a stale stop marker; captured stdout: {captured:?}"
-        );
-        assert!(
-            !marker.exists(),
-            "the stale stop marker survived the launch that should have removed it"
-        );
-    }
-
-    /// WR-01 (48-REVIEW.md): a TERM that reaches the monitor after its agent
-    /// has been reaped — while the `advance` tail runs — must not act on the
-    /// agent. The shell defers the trap until the foreground tail returns, and
-    /// by then `advance` has launched the next stage's monitor, which removed
-    /// the phase's stop marker. A `cleanup` that writes the marker anyway stops
-    /// that next agent (exit 143) and `kill`s a pid reaped long ago.
-    ///
-    /// The tail stands in for `advance`: it announces itself, blocks until
-    /// released (capped at 10 s so a failed test cannot leak it), then exits 5.
-    /// `kill()` queues the TERM before it returns and the release comes after,
-    /// so the TERM always lands while the tail runs; and the monitor exiting 0
-    /// rather than the tail's 5 proves `cleanup` ran rather than being missed.
-    #[test]
-    fn a_term_after_the_agent_exits_leaves_no_stop_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        let marker = crate::agent_result::stop_marker_path(dir.path(), state.phase);
-        let started = dir.path().join("tail-started");
-        let release = dir.path().join("tail-release");
-        let tail = format!(
-            "sh -c 'echo > \"$1\"; i=0; while [ ! -e \"$2\" ] && [ $i -lt 500 ]; do \
-             sleep 0.02; i=$((i+1)); done; exit 5' tail {} {}",
-            shell_escape(started.to_str().unwrap()),
-            shell_escape(release.to_str().unwrap()),
-        );
-        let args = vec!["-c".to_string(), "exit 7".to_string()];
-        let monitor_pid = spawn_monitor_inner(
-            &state,
-            "sh",
-            &args,
-            &[],
-            MonitorLaunch::Legacy,
-            &test_launch_context(&state),
-            MonitorTail::Script(tail),
-        )
-        .unwrap();
-
-        let mut tail_running = false;
-        for _ in 0..250 {
-            if started.exists() {
-                tail_running = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(tail_running, "the monitor never reached its tail");
-        let recorded =
-            std::fs::read_to_string(crate::agent_result::exit_code_path(dir.path(), state.phase))
-                .unwrap();
-        assert_eq!(
-            recorded.trim(),
-            "7",
-            "the tail runs only after the agent was reaped and its exit recorded"
-        );
-        let monitor_cmd = std::fs::read(format!("/proc/{monitor_pid}/cmdline")).unwrap();
-        assert!(
-            String::from_utf8_lossy(&monitor_cmd).contains("trap cleanup TERM INT"),
-            "the monitor shell exec'd its tail, so no trap is left to test"
-        );
-
-        let rc = unsafe { libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM) };
-        assert_eq!(
-            rc,
-            0,
-            "kill(monitor, TERM): {}",
-            std::io::Error::last_os_error()
-        );
-        std::fs::write(&release, "").unwrap();
-
-        let pid = monitor_pid as libc::pid_t;
-        let mut status = None;
-        for _ in 0..600 {
-            let mut raw: libc::c_int = 0;
-            let waited = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG) };
-            if waited == pid {
-                status = Some(raw);
-                break;
-            }
-            assert_eq!(
-                waited,
-                0,
-                "waitpid(monitor): {}",
-                std::io::Error::last_os_error()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let status = status.expect("the monitor did not exit within 12s of its release");
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "the monitor must leave through its trap (`cleanup` → `exit 0`), not finish \
-             its tail (exit 5); wait status {status:#x}"
-        );
-        assert!(
-            !marker.exists(),
-            "a TERM after the agent was reaped wrote the phase's stop marker, which stops \
-             the next stage's agent before it runs"
-        );
-    }
+    const WORKTREE_CAPTURE_TEST: &str =
+        "monitor::tests::spawn_monitor_runs_agent_in_worktree_but_captures_in_project_root";
 
     #[test]
     fn spawn_monitor_runs_agent_in_worktree_but_captures_in_project_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let worktree = dir.path().join(".worktrees/phase-04");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let mut state = state_in(dir.path());
-        state.worktree_path = Some(worktree.clone());
-
-        // Stub agent: print its cwd so the test proves the monitor changed
-        // directories before launching the agent.
-        let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
-
-        let monitor_pid = spawn_monitor(
-            &state,
-            "sh",
-            &args,
-            &[],
-            MonitorLaunch::Legacy,
-            &test_launch_context(&state),
-        )
-        .unwrap();
-        assert!(monitor_pid > 0);
-
-        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
-            .expect("monitor should record the agent pid in the main project");
-        assert!(agent_pid > 0);
-
-        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
-        let mut captured = String::new();
-        for _ in 0..100 {
-            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
-                && contents.contains("WORKTREE_READY")
-            {
-                captured = contents;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if crate::test_support::in_child_test(WORKTREE_CAPTURE_TEST) {
+            supervise_stage_in_child();
+            return;
         }
+        let fixture = StageFixture::new();
+        let go = fixture.path("go");
+        // Stub agent: print its cwd so the test proves the supervisor started
+        // it in the worktree.
+        let program = released_agent(&fixture, "pwd; echo WORKTREE_READY", &go);
+        let mut run = launch_stage(
+            WORKTREE_CAPTURE_TEST,
+            &fixture,
+            Shape::Capture,
+            AgentKind::Codex,
+            &program,
+            "",
+        );
+        std::fs::write(&go, "").expect("release the agent");
+        assert_eq!(run.finish(WORKTREE_CAPTURE_TEST), "Completed(0) advancing");
 
+        let captured = fixture.stdout();
         assert!(
-            captured.contains(&worktree.display().to_string()),
+            captured.contains("WORKTREE_READY")
+                && captured.contains(&fixture.workdir.display().to_string()),
             "agent did not run in worktree cwd; captured stdout: {captured:?}"
         );
         assert!(
-            stdout_path.exists(),
+            crate::agent_result::stdout_path(&fixture.root, STAGE_PHASE).exists(),
             "stdout capture missing in main .devflow"
         );
         assert!(
-            !crate::agent_result::stdout_path(&worktree, state.phase).exists(),
+            !crate::agent_result::stdout_path(&fixture.workdir, STAGE_PHASE).exists(),
             "stdout capture should not be written under the worktree"
         );
+        drop(run.group);
     }
 
     /// Build the fixture repositories through the scrubbing constructor, as
@@ -4663,152 +3708,109 @@ pid_t fork(void) {
         git(root, &["config", "user.name", "Test"]);
     }
 
-    /// 27-REVIEW WR-03: the `sh` this function spawns owns the coding
-    /// agent, and whatever environment rides down with it reaches every git
-    /// command the agent runs (`sh` -> agent -> agent's git children). This
-    /// proves the scrub with a real spawned agent process, not by
-    /// inspecting the `Command` object: the agent shells out to
-    /// `git rev-parse --absolute-git-dir`, and the resolved path must be
-    /// the caller's own workdir, never a hostile `GIT_DIR` pointed at an
-    /// unrelated foreign repository.
+    const HOSTILE_GIT_DIR_TEST: &str =
+        "monitor::tests::spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir";
+
+    /// 27-REVIEW WR-03: whatever environment the supervisor carries rides
+    /// down to the agent and every git command it runs. This proves the
+    /// scrub with a real spawned agent process: the supervisor (a child test
+    /// process) runs with `GIT_DIR` pointed at an unrelated foreign
+    /// repository, the agent shells out to `git rev-parse --absolute-git-dir`,
+    /// and the resolved path must be the agent's own workdir.
     ///
-    /// Mirrors `tag_reads_resolve_caller_root_under_a_hostile_git_dir`
-    /// (version.rs, 27-03/WR-01): `GIT_DIR` is never set on this test
-    /// process itself (Rust 2024 `unsafe`, unsound under threaded tests —
-    /// Phase 25 D-14), only on one freshly spawned child re-invoking this
-    /// binary filtered to this test.
+    /// `GIT_DIR` is never set on this test process itself (Rust 2024
+    /// `unsafe`, unsound under threaded tests — Phase 25 D-14), only on the
+    /// child supervisor. Control: the child's own environment is read from
+    /// `/proc` and must carry the hostile value, so a pass cannot come from a
+    /// `GIT_DIR` that never reached the supervisor.
     #[test]
     fn spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir() {
-        const INNER_ROOT: &str = "DEVFLOW_27_MONITOR_INNER_ROOT";
-
-        if let Ok(root) = std::env::var(INNER_ROOT) {
-            // Inner mode: GIT_DIR points at a foreign repository unrelated
-            // to `root`, scoped to this child process only.
-            let root = std::path::PathBuf::from(root);
-            let state = state_in(&root);
-            let args = vec![
-                "-c".to_string(),
-                "git rev-parse --absolute-git-dir".to_string(),
-            ];
-
-            spawn_monitor(
-                &state,
-                "sh",
-                &args,
-                &[],
-                MonitorLaunch::Legacy,
-                &test_launch_context(&state),
-            )
-            .unwrap();
-            wait_for_agent_pid(&root, state.phase).expect("monitor should record the agent pid");
-
-            let stdout_path = crate::agent_result::stdout_path(&root, state.phase);
-            let mut captured = String::new();
-            for _ in 0..100 {
-                if let Ok(contents) = std::fs::read_to_string(&stdout_path)
-                    && !contents.trim().is_empty()
-                {
-                    captured = contents;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-
-            let resolved = std::fs::canonicalize(captured.trim())
-                .expect("agent's reported git-dir must exist on disk");
-            let expected =
-                std::fs::canonicalize(root.join(".git")).expect("caller repo .git must exist");
-            assert_eq!(
-                resolved, expected,
-                "agent's git call resolved to a hostile GIT_DIR's \
-                 repository instead of the caller's own workdir: \
-                 got {resolved:?}, want {expected:?}"
-            );
+        if crate::test_support::in_child_test(HOSTILE_GIT_DIR_TEST) {
+            supervise_stage_in_child();
             return;
         }
-
-        // Outer mode: a real repository at `root`, and an unrelated
-        // foreign repository whose .git must never leak into the agent's
-        // environment.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("caller-repo");
-        std::fs::create_dir_all(&root).unwrap();
-        init_repo(&root);
-
+        let fixture = StageFixture::new();
+        init_repo(&fixture.workdir);
         let foreign = tempfile::tempdir().unwrap();
         init_repo(foreign.path());
-
-        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
-        let out = std::process::Command::new(&exe)
-            // Substring filter, NOT `--exact`: the binary's real test name
-            // is module-qualified (`monitor::tests::spawn_monitor_...`), so
-            // `--exact` against the bare name matches nothing, runs zero
-            // tests, and still exits 0 — a false green.
-            .arg("spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir")
-            .arg("--test-threads=1")
-            .env(INNER_ROOT, root.to_str().unwrap())
-            .env("GIT_DIR", foreign.path().join(".git"))
-            .output()
-            .expect("spawn hostile child test process");
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // Assert the child actually RAN the test, not merely that it
-        // exited 0. A filter that matches nothing exits 0 with "0 passed".
-        assert!(
-            stdout.contains("1 passed"),
-            "child test process must have run exactly the inner test; \
-             stdout:\n{stdout}"
+        let foreign_git = foreign.path().join(".git");
+        let go = fixture.path("go");
+        let program = released_agent(&fixture, "git rev-parse --absolute-git-dir", &go);
+        let mut run = launch_stage_with(
+            HOSTILE_GIT_DIR_TEST,
+            &fixture,
+            StageLaunchArgs {
+                shape: Shape::Capture,
+                agent: AgentKind::Codex,
+                program: &program,
+                adapter_env: "",
+                args: &[],
+                extra_env: &[("GIT_DIR", foreign_git.as_os_str())],
+            },
         );
+        let environ = std::fs::read(format!("/proc/{}/environ", run.child.id()))
+            .expect("read the child supervisor's environment");
+        let hostile = format!("GIT_DIR={}", foreign_git.display());
         assert!(
-            out.status.success(),
-            "monitor-spawned agent (hostile GIT_DIR pointed at an \
-             unrelated foreign repository) must still resolve its git \
-             calls against the caller's own workdir; child exit status \
-             {:?}\nstdout:\n{stdout}",
-            out.status
+            environ
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == hostile.as_bytes()),
+            "control: the supervisor must run with the hostile {hostile}"
         );
+        std::fs::write(&go, "").expect("release the agent");
+        assert_eq!(run.finish(HOSTILE_GIT_DIR_TEST), "Completed(0) advancing");
+
+        let captured = fixture.stdout();
+        let resolved = std::fs::canonicalize(captured.trim())
+            .expect("agent's reported git-dir must exist on disk");
+        let expected = std::fs::canonicalize(fixture.workdir.join(".git"))
+            .expect("caller repo .git must exist");
+        assert_eq!(
+            resolved, expected,
+            "agent's git call resolved to a hostile GIT_DIR's repository instead of the \
+             caller's own workdir: got {resolved:?}, want {expected:?}"
+        );
+        drop(run.group);
     }
+
+    const LITERAL_ARGV_TEST: &str =
+        "monitor::tests::spawn_monitor_treats_agent_args_as_literal_argv";
 
     #[test]
     fn spawn_monitor_treats_agent_args_as_literal_argv() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        let payload = "value; touch INJECTED";
-        let args = vec![
-            "-c".to_string(),
-            "printf '%s\\n' \"$0\"; echo ARGV_SAFE".to_string(),
-            payload.to_string(),
-        ];
-
-        spawn_monitor(
-            &state,
-            "sh",
-            &args,
-            &[],
-            MonitorLaunch::Legacy,
-            &test_launch_context(&state),
-        )
-        .unwrap();
-        wait_for_agent_pid(dir.path(), state.phase).expect("monitor should record the agent pid");
-
-        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
-        let mut captured = String::new();
-        for _ in 0..100 {
-            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
-                && contents.contains("ARGV_SAFE")
-            {
-                captured = contents;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if crate::test_support::in_child_test(LITERAL_ARGV_TEST) {
+            supervise_stage_in_child();
+            return;
         }
+        let fixture = StageFixture::new();
+        let go = fixture.path("go");
+        let payload = "value; touch INJECTED";
+        let program = released_agent(&fixture, "printf '%s\\n' \"$1\"; echo ARGV_SAFE", &go);
+        let args = [payload.to_string()];
+        let mut run = launch_stage_with(
+            LITERAL_ARGV_TEST,
+            &fixture,
+            StageLaunchArgs {
+                shape: Shape::Capture,
+                agent: AgentKind::Codex,
+                program: &program,
+                adapter_env: "",
+                args: &args,
+                extra_env: &[],
+            },
+        );
+        std::fs::write(&go, "").expect("release the agent");
+        assert_eq!(run.finish(LITERAL_ARGV_TEST), "Completed(0) advancing");
 
+        let captured = fixture.stdout();
         assert!(
             captured.contains(payload),
             "literal argv missing: {captured:?}"
         );
         assert!(captured.contains("ARGV_SAFE"));
-        assert!(!dir.path().join("INJECTED").exists());
+        assert!(!fixture.workdir.join("INJECTED").exists());
+        assert!(!fixture.root.join("INJECTED").exists());
+        drop(run.group);
     }
 
     // ---- idle timeout (31-02, D-01..D-08) --------------------------------
@@ -4924,7 +3926,7 @@ exit 0
 "#;
 
         let started = std::time::Instant::now();
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -5012,7 +4014,7 @@ sleep 120
             None
         });
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             &root,
             phase,
             &root,
@@ -5136,7 +4138,7 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"idle-3"}'
 sleep 120
 "#;
 
-        run_pipe_owning_monitor(
+        supervise_stream_child(
             root,
             phase,
             root,
@@ -5388,7 +4390,7 @@ exit 0
             eof = eof_file.display(),
         );
 
-        let code = run_pipe_owning_monitor(
+        let code = supervise_stream_child(
             root,
             phase,
             root,
@@ -5464,6 +4466,8 @@ exit 0
     const STAGE_AGENT_ENV: &str = "DEVFLOW_TEST_STAGE_AGENT";
     /// One adapter env pair as `NAME=VALUE`, or empty for none.
     const STAGE_ADAPTER_ENV: &str = "DEVFLOW_TEST_STAGE_ADAPTER_ENV";
+    /// The agent's argv after its program, as a JSON array of strings.
+    const STAGE_ARGS_ENV: &str = "DEVFLOW_TEST_STAGE_ARGS";
 
     /// The phase every supervised-stage test runs.
     const STAGE_PHASE: PhaseId = PhaseId::new(50);
@@ -5606,6 +4610,10 @@ exit 0
             .expect("utf-8 adapter env");
         if let Some((name, value)) = adapter_env.split_once('=') {
             spec.envs.push((name.to_string(), value.to_string()));
+        }
+        if let Some(args) = std::env::var_os(STAGE_ARGS_ENV) {
+            spec.args = serde_json::from_str(args.to_str().expect("utf-8 agent args"))
+                .expect("the parent passes the agent args as a JSON array");
         }
         let run = run_supervised_stage(spec).expect("supervise the stage");
         let record = format!(
@@ -5805,9 +4813,19 @@ exit 0
         }
     }
 
-    /// Re-run `test_name` as a child supervisor of `program` in `shape`, and
-    /// wait until its socket answers a ping. At that first Alive the sidecar
-    /// must already be readable (R-7: the sidecar precedes the socket name).
+    /// What [`launch_stage_with`] launches beyond the fixture: the shape,
+    /// the agent, its program and argv, one adapter env pair, and extra
+    /// environment for the child supervisor itself.
+    struct StageLaunchArgs<'a> {
+        shape: Shape,
+        agent: AgentKind,
+        program: &'a Path,
+        adapter_env: &'a str,
+        args: &'a [String],
+        extra_env: &'a [(&'a str, &'a std::ffi::OsStr)],
+    }
+
+    /// [`launch_stage_with`] with no agent argv and no extra environment.
     fn launch_stage(
         test_name: &str,
         fixture: &StageFixture,
@@ -5816,6 +4834,37 @@ exit 0
         program: &Path,
         adapter_env: &str,
     ) -> StageLaunch {
+        launch_stage_with(
+            test_name,
+            fixture,
+            StageLaunchArgs {
+                shape,
+                agent,
+                program,
+                adapter_env,
+                args: &[],
+                extra_env: &[],
+            },
+        )
+    }
+
+    /// Re-run `test_name` as a child supervisor of `launch.program` in
+    /// `launch.shape`, and wait until its socket answers a ping. At that first
+    /// Alive the sidecar must already be readable (R-7: the sidecar precedes
+    /// the socket name).
+    fn launch_stage_with(
+        test_name: &str,
+        fixture: &StageFixture,
+        launch: StageLaunchArgs<'_>,
+    ) -> StageLaunch {
+        let StageLaunchArgs {
+            shape,
+            agent,
+            program,
+            adapter_env,
+            args,
+            extra_env,
+        } = launch;
         let socket = SocketPath::for_launch(
             fixture.cache.path(),
             &fixture.root,
@@ -5825,19 +4874,23 @@ exit 0
         .expect("socket path fits sun_path");
         let outcome = fixture.path("outcome");
         let agent_label = agent.to_string();
+        let args_json = serde_json::to_string(args).expect("encode the agent args");
+        let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![
+            (STAGE_SOCKET_ENV, socket.as_path().as_os_str()),
+            (STAGE_OUTCOME_ENV, outcome.as_os_str()),
+            (STAGE_SHAPE_ENV, std::ffi::OsStr::new(shape.label())),
+            (STAGE_PROGRAM_ENV, program.as_os_str()),
+            (STAGE_ROOT_ENV, fixture.root.as_os_str()),
+            (STAGE_WORKDIR_ENV, fixture.workdir.as_os_str()),
+            (STAGE_AGENT_ENV, std::ffi::OsStr::new(&agent_label)),
+            (STAGE_ADAPTER_ENV, std::ffi::OsStr::new(adapter_env)),
+            (STAGE_ARGS_ENV, std::ffi::OsStr::new(&args_json)),
+        ];
+        env.extend_from_slice(extra_env);
         let mut child = StageChild(Some(crate::test_support::spawn_test_in_child(
             test_name,
             fixture.cache.path(),
-            &[
-                (STAGE_SOCKET_ENV, socket.as_path().as_os_str()),
-                (STAGE_OUTCOME_ENV, outcome.as_os_str()),
-                (STAGE_SHAPE_ENV, std::ffi::OsStr::new(shape.label())),
-                (STAGE_PROGRAM_ENV, program.as_os_str()),
-                (STAGE_ROOT_ENV, fixture.root.as_os_str()),
-                (STAGE_WORKDIR_ENV, fixture.workdir.as_os_str()),
-                (STAGE_AGENT_ENV, std::ffi::OsStr::new(&agent_label)),
-                (STAGE_ADAPTER_ENV, std::ffi::OsStr::new(adapter_env)),
-            ],
+            &env,
         )));
         let deadline = std::time::Instant::now() + STAGE_CHILD_WAIT;
         let reply = loop {
