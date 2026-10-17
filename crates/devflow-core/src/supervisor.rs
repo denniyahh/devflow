@@ -22,6 +22,7 @@
 //! a stray file can never be mistaken for a dead supervisor (R-6).
 
 pub mod protocol;
+pub mod runtime;
 
 use crate::phase_id::PhaseId;
 use crate::registry;
@@ -407,7 +408,7 @@ pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
     not(test),
     expect(
         dead_code,
-        reason = "the launcher (50-07) is the first non-test writer of a sidecar"
+        reason = "the launcher (50-08) is the first non-test writer of a sidecar timestamp"
     )
 )]
 pub(crate) fn rfc3339_now() -> String {
@@ -423,13 +424,6 @@ pub(crate) fn rfc3339_now() -> String {
 /// is safe here; only sockets must never be renamed into place. The socket
 /// directory is created `0700` if absent and refused if it is unsafe, as
 /// [`publish`] does.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the launcher (50-07) is the first non-test writer of a sidecar"
-    )
-)]
 pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
