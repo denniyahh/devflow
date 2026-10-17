@@ -665,4 +665,218 @@ mod tests {
             "a readable socket with no listener must be Stale, got {result:?}"
         );
     }
+
+    /// A `.sock` path in `cache`'s socket directory, padded to exactly `len`
+    /// bytes, so the boundary does not depend on the tempdir's length.
+    #[cfg(target_os = "linux")]
+    fn sock_path_of_len(cache: &Path, len: usize) -> PathBuf {
+        let dir = registry::socket_dir_in(cache);
+        let fixed = dir.as_os_str().len() + "/".len() + ".sock".len();
+        let path = dir.join(format!("{}.sock", "a".repeat(len - fixed)));
+        assert_eq!(path.as_os_str().len(), len, "fixture path length");
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_path_of_107_bytes_binds_and_108_is_refused_by_name() {
+        assert_eq!(SUN_PATH_MAX_LINUX, 107);
+        assert_eq!(
+            SUN_PATH_MAX_MACOS, 103,
+            "the macOS limit is a constant only"
+        );
+        assert_eq!(SUN_PATH_MAX, SUN_PATH_MAX_LINUX);
+        let cache = short_cache();
+
+        for len in [106, 107] {
+            let socket = SocketPath::new(sock_path_of_len(cache.path(), len))
+                .unwrap_or_else(|error| panic!("a {len}-byte path must be accepted: {error}"));
+            assert_eq!(
+                socket.part_path().as_os_str().len(),
+                len,
+                "the temporary name must be exactly as long as the final name"
+            );
+            let listener = publish(&socket)
+                .unwrap_or_else(|error| panic!("a {len}-byte path must publish: {error}"));
+            let meta = std::fs::symlink_metadata(socket.as_path()).expect("published path");
+            assert!(
+                meta.file_type().is_socket(),
+                "{len} bytes: a socket is published"
+            );
+            drop(listener);
+        }
+
+        let too_long = sock_path_of_len(cache.path(), 108);
+        assert_eq!(
+            SocketPath::new(too_long.clone()),
+            Err(SocketPathError::TooLong { len: 108, max: 107 })
+        );
+        assert!(
+            !too_long.exists() && !too_long.with_extension("part").exists(),
+            "a refused path must be refused before anything is bound"
+        );
+
+        // `new` checks the temporary name too: a final path with no `.sock`
+        // extension fits, but its `.part` name is five bytes longer.
+        let bare = sock_path_of_len(cache.path(), 112).with_extension("");
+        assert_eq!(bare.as_os_str().len(), 107, "fits as a final path");
+        assert_eq!(
+            SocketPath::new(bare),
+            Err(SocketPathError::TooLong { len: 112, max: 107 })
+        );
+    }
+
+    #[test]
+    fn publish_never_exposes_an_unlistening_socket_or_replaces_a_live_one() {
+        let cache = short_cache();
+        let launch_id = new_launch_id();
+        let socket = SocketPath::for_launch(
+            cache.path(),
+            Path::new("/project/root"),
+            PhaseId::new(50),
+            &launch_id,
+        )
+        .expect("socket path fits sun_path");
+
+        let in_window = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let leave_window = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publisher = {
+            let socket = socket.clone();
+            let in_window = in_window.clone();
+            let leave_window = leave_window.clone();
+            thread::spawn(move || {
+                publish_with(&socket, || {
+                    in_window.wait();
+                    leave_window.wait();
+                })
+            })
+        };
+        in_window.wait();
+        assert!(
+            std::fs::symlink_metadata(socket.part_path()).is_ok(),
+            "the temporary name is bound and listening inside the window"
+        );
+        let during = probe(socket.as_path());
+        leave_window.wait();
+        assert!(
+            matches!(during, Ok(Liveness::Gone)),
+            "the final name must not exist before the listener is listening, got {during:?}"
+        );
+        let listener = publisher
+            .join()
+            .expect("publisher thread")
+            .expect("first publish");
+        assert!(
+            !socket.part_path().exists(),
+            "the temporary name is removed"
+        );
+
+        let server = serve_pings(listener, launch_id.clone(), 1);
+        let second = publish(&socket);
+        assert!(
+            matches!(&second, Err(PublishError::AlreadyExists(path)) if path == socket.as_path()),
+            "a second publish onto a live name must fail, got {second:?}"
+        );
+        assert!(
+            !socket.part_path().exists(),
+            "the refused publish removes its temporary name"
+        );
+        expect_alive(socket.as_path(), &launch_id);
+        drop(server.join().expect("ping server thread"));
+
+        // Control: a socket bound with no listen() reads Stale, which is the
+        // hazard binding under the temporary name avoids.
+        let raw = registry::socket_dir_in(cache.path()).join("bound-not-listening.sock");
+        let bytes = raw.as_os_str().as_encoded_bytes();
+        // SAFETY: plain socket(2) call; the result is checked before use.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket(2) failed: {}", io::Error::last_os_error());
+        // SAFETY: fd is a freshly created, owned descriptor.
+        let _owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        // SAFETY: sockaddr_un is plain old data; all-zero is a valid value.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(bytes.len() < addr.sun_path.len(), "raw path fits sun_path");
+        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        // SAFETY: addr is a valid, NUL-terminated sockaddr_un of the given size.
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                (&raw const addr).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "bind(2) failed: {}", io::Error::last_os_error());
+        let result = probe(&raw);
+        assert!(
+            matches!(result, Ok(Liveness::Stale)),
+            "a bound socket with no listener must read Stale, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn the_socket_dir_is_private_and_the_socket_is_owner_only() {
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let cache = short_cache();
+        let (socket, _, _listener) = published(cache.path());
+        assert_eq!(mode(&registry::socket_dir_in(cache.path())), 0o700);
+        assert_eq!(mode(socket.as_path()), 0o600);
+
+        // An existing, looser socket directory is tightened, not trusted.
+        let loose = short_cache();
+        let loose_dir = registry::socket_dir_in(loose.path());
+        std::fs::create_dir(&loose_dir).expect("create sock/");
+        std::fs::set_permissions(&loose_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod sock/ 755");
+        let (_, _, _loose_listener) = published(loose.path());
+        assert_eq!(mode(&loose_dir), 0o700);
+
+        // A symlinked or non-directory sock/ is refused.
+        let target = short_cache();
+        let linked = short_cache();
+        std::os::unix::fs::symlink(target.path(), registry::socket_dir_in(linked.path()))
+            .expect("symlink sock/");
+        let socket = SocketPath::for_launch(
+            linked.path(),
+            Path::new("/project/root"),
+            PhaseId::new(50),
+            &new_launch_id(),
+        )
+        .expect("socket path fits");
+        let result = publish(&socket);
+        assert!(
+            matches!(&result, Err(PublishError::UnsafeDir(why)) if why.contains("is a symlink")),
+            "a symlinked sock/ must be refused as a symlink, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(target.path())
+                .expect("read target")
+                .count(),
+            0,
+            "nothing is created through the symlink"
+        );
+
+        let filed = short_cache();
+        std::fs::write(registry::socket_dir_in(filed.path()), b"").expect("sock as a file");
+        let socket = SocketPath::for_launch(
+            filed.path(),
+            Path::new("/project/root"),
+            PhaseId::new(50),
+            &new_launch_id(),
+        )
+        .expect("socket path fits");
+        let result = publish(&socket);
+        assert!(
+            matches!(result, Err(PublishError::UnsafeDir(_))),
+            "a sock/ that is not a directory must be refused, got {result:?}"
+        );
+    }
 }
