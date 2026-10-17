@@ -1058,6 +1058,18 @@ impl PhaseLiveness {
             PhaseLiveness::ProbeFailed(why) => format!("UNKNOWN — the probe failed: {why}"),
         }
     }
+
+    /// A stable machine label for `doctor --json`.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            PhaseLiveness::Alive { .. } => "alive",
+            PhaseLiveness::Stale => "stale",
+            PhaseLiveness::Gone => "gone",
+            PhaseLiveness::GoneWhileActive => "gone_while_active",
+            PhaseLiveness::NotLaunched => "not_launched",
+            PhaseLiveness::ProbeFailed(_) => "probe_failed",
+        }
+    }
 }
 
 /// Pure mapping from a phase's supervisor record and its probe result to a
@@ -3803,14 +3815,12 @@ pub(crate) struct PhaseFacts {
     pub(crate) waiter: lock::HolderStatus,
     pub(crate) agent_pid: Option<u32>,
     pub(crate) agent_alive: bool,
-    /// The monitor pid recorded in `State.monitor_pid` (18b). `None` means
-    /// no monitor has been spawned for this state yet, or the state was
-    /// written by a binary predating the field — never treated as a problem.
-    pub(crate) monitor_pid: Option<u32>,
-    pub(crate) monitor_alive: bool,
-    /// RED stub (50-12 Task 2): the supervisor's liveness.
+    /// The supervisor's liveness, from one probe of the socket
+    /// `state.supervisor` records (50-12) — never a pid.
     pub(crate) supervisor: PhaseLiveness,
-    /// RED stub (50-12 Task 2): the recorded launch id.
+    /// The launch id `state.supervisor` records; `None` when no supervisor
+    /// is recorded. It identifies the supervisor in findings in place of its
+    /// socket path (T-18-01).
     pub(crate) supervisor_launch_id: Option<String>,
     /// The most recent event's `event` field value, for display context.
     pub(crate) last_event: Option<String>,
@@ -3821,8 +3831,8 @@ pub(crate) struct PhaseFacts {
     pub(crate) feature_branch_exists: bool,
     /// Whether this phase was intentionally halted by `devflow start --until
     /// <stage>` (20c) — `State.stopped`. A stopped phase's dead agent
-    /// pid/stale monitor pid are expected, not a crash; both
-    /// `check_dead_agent` and `check_dead_monitor` must recognize this
+    /// pid/exited supervisor are expected, not a crash; both
+    /// `check_dead_agent` and `check_supervisor` must recognize this
     /// marker instead of reporting a `Problem` (review: Codex HIGH — the
     /// doctor gap is bigger than `check_dead_agent` alone).
     pub(crate) stopped: bool,
@@ -3915,30 +3925,39 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
     })
 }
 
-/// The recorded monitor pid is dead — nothing will call `devflow advance`
-/// for this phase, whether or not the agent is also dead (an agent that
-/// outlived its monitor is orphaned too, since nothing will advance it when
-/// it exits either). An unrecorded monitor is never a finding (T-18-11).
-fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    let pid = facts.monitor_pid?;
-    if facts.stopped || facts.monitor_alive {
-        return None;
-    }
+/// The supervisor's liveness needs a repair (50-12): STALE (its socket
+/// remains, nothing answers, its agent group may still run), GONE while the
+/// phase is not stopped (nothing will advance it), or a probe that could not
+/// answer. Reuses [`phase_liveness`]'s result from the facts rather than
+/// re-deriving it, so `status` and `doctor` cannot drift. ALIVE, a stopped
+/// GONE and NotLaunched are never findings (T-18-11: an unrecorded
+/// supervisor is never a problem). Identifies the supervisor by phase and
+/// launch id, never by its socket path (T-18-01).
+fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let phase = facts.phase;
+    let repair = match &facts.supervisor {
+        PhaseLiveness::Stale => {
+            format!("devflow stop --phase {phase} && devflow resume --phase {phase}")
+        }
+        PhaseLiveness::GoneWhileActive => format!("devflow resume --phase {phase}"),
+        // `status` prints the operator's own socket path, which doctor
+        // must not.
+        PhaseLiveness::ProbeFailed(_) => "devflow status".to_string(),
+        PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
+            return None;
+        }
+    };
+    let launch = facts.supervisor_launch_id.as_deref().unwrap_or("?");
     Some(PhaseFinding {
-        phase: facts.phase,
+        phase,
         severity: Severity::Problem,
         detail: format!(
-            "phase {}: monitor pid {pid} recorded but not running at stage {}",
-            facts.phase, facts.stage
+            "phase {phase}: supervisor launch {launch} at stage {} is {}",
+            facts.stage,
+            facts.supervisor.describe()
         ),
-        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+        repair: Some(repair),
     })
-}
-
-/// RED stub (50-12 Task 2): reports nothing.
-#[allow(dead_code)]
-fn check_supervisor(_facts: &PhaseFacts) -> Option<PhaseFinding> {
-    None
 }
 
 /// The last `stage_launched` event named a different stage than
@@ -3992,7 +4011,7 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
         check_open_gate_without_waiter(facts),
         check_orphan_gate(facts),
         check_dead_agent(facts),
-        check_dead_monitor(facts),
+        check_supervisor(facts),
         check_stage_event_drift(facts),
         check_missing_branch(facts),
     ]
@@ -4036,8 +4055,11 @@ fn build_phase_facts(
     let waiter = lock::holder_status(project_root, phase);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
-    let monitor_pid = state.monitor_pid;
-    let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
+    let supervisor = probe_phase(&state);
+    let supervisor_launch_id = state
+        .supervisor
+        .as_ref()
+        .map(|record| record.launch_id.clone());
     let last_event = last_events.remove(&phase).map(|summary| summary.event);
     let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
     let last_event_name = last_event
@@ -4061,10 +4083,8 @@ fn build_phase_facts(
         waiter,
         agent_pid,
         agent_alive,
-        monitor_pid,
-        monitor_alive,
-        supervisor: PhaseLiveness::NotLaunched,
-        supervisor_launch_id: None,
+        supervisor,
+        supervisor_launch_id,
         last_event: last_event_name,
         last_launched_stage,
         open_gate_stages,
@@ -4147,10 +4167,27 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
                     "detail": finding.detail,
                     "repair": finding.repair,
                     "last_event": phase_facts.last_event,
+                    "supervisor": supervisor_json(phase_facts),
                 })
             })
             .collect(),
     )
+}
+
+/// A phase's supervisor facts for `doctor --json` (50-12): its liveness
+/// label, the owner and launch shape an ALIVE ping reported, and the
+/// recorded launch id. Never the socket path (T-18-01, T-50-32).
+fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
+    let (owner, launch) = match &facts.supervisor {
+        PhaseLiveness::Alive { owner, launch } => (Some(owner), Some(launch)),
+        _ => (None, None),
+    };
+    serde_json::json!({
+        "liveness": facts.supervisor.label(),
+        "owner": owner,
+        "launch": launch,
+        "launch_id": facts.supervisor_launch_id,
+    })
 }
 
 /// Build `doctor --json`'s `"environment"` array from the pre-existing
@@ -7345,8 +7382,6 @@ mod tests {
                 waiter: lock::HolderStatus::NoHolder,
                 agent_pid: Some(4242),
                 agent_alive: true,
-                monitor_pid: Some(4343),
-                monitor_alive: true,
                 supervisor: PhaseLiveness::Alive {
                     owner: "agent_running".to_string(),
                     launch: "stream".to_string(),
@@ -7527,27 +7562,27 @@ mod tests {
             assert!(findings[0].repair.is_none());
         }
 
-        /// 18b: a dead monitor with a dead agent is `Stuck` — nothing will
-        /// call `devflow advance` for this phase — and reports a `Problem`
-        /// finding with a `devflow resume --phase N` repair.
+        /// 18b / 50-12: a supervisor GONE while its phase is not stopped,
+        /// with a dead agent — nothing will call `devflow advance` for this
+        /// phase — reports a `Problem` finding with a `devflow resume --phase
+        /// N` repair.
         #[test]
-        fn reconcile_reports_stuck_when_monitor_and_agent_are_both_dead() {
+        fn reconcile_reports_gone_supervisor_and_dead_agent() {
             let facts = PhaseFacts {
-                monitor_pid: Some(5150),
-                monitor_alive: false,
+                supervisor: PhaseLiveness::GoneWhileActive,
                 agent_pid: Some(4242),
                 agent_alive: false,
                 ..agreeing_facts(PhaseId::new(8))
             };
             let findings = reconcile_phase(&facts);
-            let monitor_finding = findings
+            let supervisor_finding = findings
                 .iter()
-                .find(|f| f.detail.contains("monitor pid"))
-                .expect("expected a monitor finding when monitor and agent are both dead");
-            assert_eq!(monitor_finding.severity, Severity::Problem);
-            assert!(monitor_finding.detail.contains("monitor pid 5150"));
+                .find(|f| f.detail.contains("supervisor launch"))
+                .expect("expected a supervisor finding when the supervisor is gone");
+            assert_eq!(supervisor_finding.severity, Severity::Problem);
+            assert!(supervisor_finding.detail.contains(SUPERVISOR_LAUNCH_ID));
             assert_eq!(
-                monitor_finding.repair.as_deref(),
+                supervisor_finding.repair.as_deref(),
                 Some("devflow resume --phase 8")
             );
         }
@@ -7576,17 +7611,14 @@ mod tests {
         }
 
         /// 20c (D-09 + review: Codex HIGH — the doctor gap is bigger than
-        /// `check_dead_agent`): the same stopped phase may also carry a
-        /// stale `monitor_pid` (though the stop path clears it — this
-        /// proves the guard holds even if that clear were ever bypassed).
-        /// `check_dead_monitor` must also recognize `facts.stopped` and
-        /// report ZERO findings.
+        /// `check_dead_agent`): the same stopped phase's supervisor has
+        /// exited. `check_supervisor` must also recognize `facts.stopped`
+        /// and report ZERO findings.
         #[test]
-        fn reconcile_phase_ignores_dead_monitor_when_stopped() {
+        fn reconcile_phase_ignores_gone_supervisor_when_stopped() {
             let facts = PhaseFacts {
                 stage: Stage::Plan,
-                monitor_pid: Some(5150),
-                monitor_alive: false,
+                supervisor: PhaseLiveness::Gone,
                 agent_pid: Some(4242),
                 agent_alive: false,
                 stopped: true,
@@ -7595,45 +7627,48 @@ mod tests {
             let findings = reconcile_phase(&facts);
             assert!(
                 findings.iter().all(|f| f.severity != Severity::Problem),
-                "a --until-stopped phase must yield zero Problem findings even with a \
-                 stale monitor_pid, got: {:?}",
+                "a --until-stopped phase must yield zero Problem findings even with an \
+                 exited supervisor, got: {:?}",
                 findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
             );
         }
 
-        /// 18b (T-18-11): an unrecorded monitor is unknown, not a problem —
-        /// a state file written by a pre-18b binary must never render as
-        /// stuck.
+        /// 18b (T-18-11): an unrecorded supervisor is not launched, not a
+        /// problem — a state file written before the record existed must
+        /// never render as a finding.
         #[test]
-        fn reconcile_is_silent_when_monitor_pid_is_unrecorded() {
+        fn reconcile_is_silent_when_no_supervisor_is_recorded() {
             let facts = PhaseFacts {
-                monitor_pid: None,
-                monitor_alive: false,
+                supervisor: PhaseLiveness::NotLaunched,
+                supervisor_launch_id: None,
                 ..agreeing_facts(PhaseId::new(9))
             };
             assert!(
                 reconcile_phase(&facts).is_empty(),
-                "an unrecorded monitor must never produce a finding"
+                "an unrecorded supervisor must never produce a finding"
             );
         }
 
-        /// 18b: a live monitor with a dead agent is a normal between-stages
-        /// moment (the monitor hasn't advanced the phase yet), not a monitor
-        /// finding. `check_dead_agent`'s own pre-existing finding for the
-        /// dead agent pid is unrelated to this check and out of this plan's
-        /// scope.
+        /// 18b / 50-12: an ALIVE supervisor with a dead agent is a normal
+        /// between-stages moment (the supervisor runs the advance itself),
+        /// not a supervisor finding. `check_dead_agent`'s own pre-existing
+        /// finding for the dead agent pid is unrelated to this check.
         #[test]
-        fn reconcile_is_silent_when_monitor_alive_and_agent_dead() {
+        fn reconcile_is_silent_when_supervisor_alive_and_agent_dead() {
             let facts = PhaseFacts {
-                monitor_pid: Some(5150),
-                monitor_alive: true,
+                supervisor: PhaseLiveness::Alive {
+                    owner: "advancing".to_string(),
+                    launch: "stream".to_string(),
+                },
                 agent_alive: false,
                 ..agreeing_facts(PhaseId::new(10))
             };
             let findings = reconcile_phase(&facts);
             assert!(
-                findings.iter().all(|f| !f.detail.contains("monitor pid")),
-                "a live monitor with a dead agent must not produce a monitor finding"
+                findings
+                    .iter()
+                    .all(|f| !f.detail.contains("supervisor launch")),
+                "a live supervisor with a dead agent must not produce a supervisor finding"
             );
         }
 
@@ -7646,8 +7681,7 @@ mod tests {
                 gate_pending: true,
                 agent_pid: Some(999_999),
                 agent_alive: false,
-                monitor_pid: Some(999_998),
-                monitor_alive: false,
+                supervisor: PhaseLiveness::GoneWhileActive,
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
                 feature_branch_exists: false,
@@ -7660,14 +7694,15 @@ mod tests {
                 vec![
                     Severity::Problem, // check_gate_pending_without_gate
                     Severity::Problem, // check_dead_agent
-                    Severity::Problem, // check_dead_monitor
+                    Severity::Problem, // check_supervisor
                     Severity::Warn,    // check_stage_event_drift
                     Severity::Warn,    // check_missing_branch
                 ]
             );
             assert!(findings[0].detail.contains("gate_pending is true"));
             assert!(findings[1].detail.contains("agent pid 999999"));
-            assert!(findings[2].detail.contains("monitor pid 999998"));
+            assert!(findings[2].detail.contains("supervisor launch"));
+            assert!(findings[2].detail.contains("GONE"));
             assert!(
                 findings[3]
                     .detail
