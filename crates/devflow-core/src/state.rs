@@ -295,7 +295,7 @@ pub struct State {
     /// by a binary predating this field. The socket path is the only handle a
     /// liveness question starts from: it is passed to
     /// [`crate::supervisor::probe`] as recorded, never re-derived.
-    #[serde(skip)] // RED stub: not persisted yet
+    #[serde(default)]
     pub supervisor: Option<SupervisorRecord>,
     /// The Claude session id captured from the most recent captured stdout
     /// envelope for this phase's current stage (D-04, 28-02), read via
