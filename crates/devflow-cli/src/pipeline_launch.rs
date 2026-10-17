@@ -992,6 +992,76 @@ pub(crate) fn run_monitor(
     advance_for_stage(project_root, Some(phase), stage)
 }
 
+/// Resolve, once per launch, the cache directory and the monitor executable
+/// a stage launch uses (50-10).
+///
+/// The released binary always re-execs itself as `__monitor` and registers
+/// under [`devflow_core::registry::cache_dir`]. There is no environment
+/// override of either: the test-build branch below is selected at compile
+/// time.
+#[cfg(not(test))]
+pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
+    let cache_dir = devflow_core::registry::cache_dir().ok_or_else(|| {
+        CliError::Message(
+            "cannot resolve DevFlow's cache directory for this launch: set HOME, \
+             XDG_CACHE_HOME or DEVFLOW_CACHE_DIR"
+                .to_string(),
+        )
+    })?;
+    let exe = std::env::current_exe().map_err(|err| {
+        CliError::Message(format!(
+            "could not resolve the devflow executable for the stage monitor: {err}"
+        ))
+    })?;
+    Ok(monitor::LaunchContext::new(
+        cache_dir,
+        monitor::MonitorExec::Subcommand { exe },
+    ))
+}
+
+/// Selects the advance-running monitor harness entry for a `cfg(test)` stage
+/// launch when set to `1` (50-10). Read only by the test build of
+/// [`launch_context`].
+#[cfg(test)]
+pub(crate) const TEST_MONITOR_FULL_ENV: &str = "DEVFLOW_TEST_MONITOR_FULL";
+
+/// The test build of [`launch_context`] (50-10, D-07).
+///
+/// Inside this crate's unit-test binary, `current_exe()` is libtest, which
+/// rejects `__monitor`'s arguments, so the monitor is re-entered at an
+/// `#[ignore]`d harness entry in `test_support` that runs the same
+/// `run_monitor` body. The cache dir must come from the test process's own
+/// `DEVFLOW_CACHE_DIR`, which only a child test process given one through
+/// `run_test_in_child`'s `extra_env` has: an in-crate test that launches a
+/// stage any other way fails here, loudly, instead of registering under the
+/// developer's real HOME.
+#[cfg(test)]
+pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
+    let cache_dir = std::env::var_os("DEVFLOW_CACHE_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Message(
+                "in-crate test launched a stage without a hermetic DEVFLOW_CACHE_DIR; \
+                 run it through run_test_in_child with extra_env"
+                    .to_string(),
+            )
+        })?;
+    let exe = std::env::current_exe()
+        .map_err(|err| CliError::Message(format!("could not resolve the test binary: {err}")))?;
+    let test_name = if std::env::var_os(TEST_MONITOR_FULL_ENV).is_some_and(|value| value == "1") {
+        "test_support::monitor_entry_full"
+    } else {
+        "test_support::monitor_entry_supervise_only"
+    };
+    Ok(monitor::LaunchContext::new(
+        cache_dir,
+        monitor::MonitorExec::HarnessEntry {
+            exe,
+            test_name: test_name.to_string(),
+        },
+    ))
+}
+
 /// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
 /// the agent binary, archive the prior capture, spawn the monitor, and
 /// record the launch. Extracted (28-03, Task 2) so
@@ -1059,7 +1129,8 @@ fn spawn_agent_and_record(
             }),
         );
     }
-    let pid = monitor::spawn_monitor(state, program, args, extra_env, launch)
+    let ctx = launch_context()?;
+    let pid = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
     // pid recorded only in memory here is lost unless it is written again
@@ -2190,6 +2261,232 @@ mod tests {
             reloaded.monitor_pid, state.monitor_pid,
             "the monitor pid recorded by launch_stage must be persisted to disk, \
              since transition() saves state before launch_stage runs"
+        );
+    }
+
+    /// Poll `done` every 50 ms until it holds or `limit` passes; returns its
+    /// last answer.
+    fn poll_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if done() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// A `claude` stand-in that leaves `agent-ran` in its working directory
+    /// (the project root) and exits 0 without reading its stdin.
+    fn marker_writing_claude_dir() -> tempfile::TempDir {
+        let path_dir = agent_free_dir_with_agent_stub("claude");
+        std::fs::write(
+            path_dir.path().join("claude"),
+            "#!/bin/sh\necho ran > agent-ran\nexit 0\n",
+        )
+        .unwrap();
+        path_dir
+    }
+
+    /// 50-10 tracer (D-07, T-50-27): an in-crate stream launch really runs its
+    /// agent, because `launch_context()`'s test branch re-enters this test
+    /// binary at the `test_support::monitor_entry_supervise_only` harness
+    /// entry, which runs the real `run_monitor` body; and the launch registers
+    /// only under the cache dir its parent handed it.
+    ///
+    /// The control launches the same shape through
+    /// `MonitorExec::Subcommand` at this test binary, which is what every
+    /// in-crate stream launch did before 50-10: libtest rejects `__monitor`'s
+    /// arguments, so the agent never runs. The same "agent ran" check that
+    /// passes above must fail there, or it proves nothing.
+    #[test]
+    fn an_in_crate_stream_launch_runs_its_monitor_through_the_harness_entry() {
+        const NAME: &str = "pipeline_launch::tests::an_in_crate_stream_launch_runs_its_monitor_through_the_harness_entry";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let cache = tempfile::Builder::new()
+                .prefix("dfu")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path_dir = marker_writing_claude_dir();
+            let output = devflow_core::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_CACHE_DIR", cache.path().as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let cache = PathBuf::from(
+            std::env::var_os("DEVFLOW_CACHE_DIR").expect("the parent passes DEVFLOW_CACHE_DIR"),
+        );
+        let prompt = || monitor::MonitorLaunch::PipeOwning {
+            prompt: "50-10 tracer".to_string(),
+        };
+
+        // The harness-entry launch.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(1010);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        let launched = spawn_agent_and_record(&mut state, "claude", &[], &[], None, prompt());
+        let _reap = ReapMonitorOnDrop::after_launch(&state);
+        launched.unwrap();
+        let exit_path = devflow_core::agent_result::exit_code_path(root, phase);
+        let exited = poll_until(Duration::from_secs(30), || {
+            std::fs::read_to_string(&exit_path).is_ok_and(|code| !code.trim().is_empty())
+        });
+        assert!(
+            root.join("agent-ran").is_file(),
+            "the harness entry must run the agent: no marker at {} (exit file written: {exited})",
+            root.join("agent-ran").display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exit_path).unwrap().trim(),
+            "0",
+            "the supervised agent's exit code must be recorded"
+        );
+        let entry = devflow_core::registry::entry_path_in(&cache, &state.project_root, phase);
+        assert!(
+            entry.is_file(),
+            "the launch must register under its own cache dir: no {}",
+            entry.display()
+        );
+
+        // The control: the pre-50-10 re-exec of this test binary.
+        let control_dir = tempfile::tempdir().unwrap();
+        let control_root = control_dir.path();
+        let control_phase = PhaseId::new(1011);
+        let mut control = State::new(
+            control_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            control_root.to_path_buf(),
+        );
+        control.stage = Stage::Code;
+        let subcommand = monitor::LaunchContext::new(
+            cache.clone(),
+            monitor::MonitorExec::Subcommand {
+                exe: std::env::current_exe().unwrap(),
+            },
+        );
+        let control_pid =
+            monitor::spawn_monitor(&control, "claude", &[], &[], prompt(), &subcommand).unwrap();
+        control.monitor_pid = Some(control_pid);
+        let _control_reap = ReapMonitorOnDrop::after_launch(&control);
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                !devflow_core::agent::agent_running(control_pid)
+            }),
+            "the control monitor (libtest given __monitor's arguments) must exit by itself"
+        );
+        assert!(
+            !control_root.join("agent-ran").exists(),
+            "control: re-execing the test binary as __monitor must NOT run the agent"
+        );
+        assert!(
+            !devflow_core::agent_result::exit_code_path(control_root, control_phase).exists(),
+            "control: no monitor body ran, so no exit file may exist"
+        );
+    }
+
+    /// The CLI source files under `src/`, found from `CARGO_MANIFEST_DIR`.
+    fn cli_source_files() -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        found.sort();
+        assert!(
+            found
+                .iter()
+                .any(|path| path.ends_with("src/pipeline_launch.rs")),
+            "the scan must see this file, or it scanned the wrong directory: {found:?}"
+        );
+        found
+    }
+
+    /// `source` with every line whose first non-blank characters are `//`
+    /// dropped.
+    fn code_lines(source: &str) -> impl Iterator<Item = &str> {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+    }
+
+    /// Lines of `source` (comments dropped) that register a root through the
+    /// env-reading `registry::register(`. `register_in(` does not match: `_`
+    /// follows `register` there.
+    fn unscoped_register_calls(source: &str) -> Vec<String> {
+        let needle = concat!("registry::", "register(");
+        code_lines(source)
+            .filter(|line| line.contains(needle))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// T-50-27: every root registration in the CLI goes through
+    /// `register_in(ctx.cache_dir, …)`, so a test's cache dir is the only
+    /// place an in-crate launch can register.
+    #[test]
+    fn cli_source_registers_roots_only_through_register_in() {
+        let planted = concat!(
+            "    let _ = devflow_core::registry::",
+            "register(&root, phase);\n"
+        );
+        assert_eq!(
+            unscoped_register_calls(planted).len(),
+            1,
+            "planted control: a live unscoped register call must be flagged"
+        );
+        let commented = concat!(
+            "    // let _ = devflow_core::registry::",
+            "register(&root, phase);\n"
+        );
+        assert!(
+            unscoped_register_calls(commented).is_empty(),
+            "planted control: the same call behind // must not be flagged"
+        );
+        let scoped = concat!(
+            "    let _ = devflow_core::registry::",
+            "register_in(&ctx.cache_dir, &root, phase);\n"
+        );
+        assert!(
+            unscoped_register_calls(scoped).is_empty(),
+            "register_in( must not be flagged"
+        );
+
+        let mut offenders = Vec::new();
+        for path in cli_source_files() {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for line in unscoped_register_calls(&source) {
+                offenders.push(format!("{}: {}", path.display(), line.trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "CLI source must register roots only through registry::register_in: {offenders:#?}"
         );
     }
     /// 20c (review: Codex MEDIUM — resume semantics): a phase halted by

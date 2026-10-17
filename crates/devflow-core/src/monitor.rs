@@ -304,6 +304,70 @@ pub enum MonitorLaunch {
     Legacy,
 }
 
+/// Name of the environment variable that carries the `__monitor` argv (the
+/// arguments after `__monitor`, as a JSON array of strings) to a test
+/// binary's monitor harness entry. Set only by
+/// [`MonitorExec::HarnessEntry`]; no release build reads it.
+#[cfg(feature = "test-support")]
+pub const MONITOR_ARGV_ENV: &str = "DEVFLOW_MONITOR_ARGV";
+
+/// Which executable a stream launch's detached monitor re-execs (50-10).
+///
+/// In the `devflow` binary this is always [`MonitorExec::Subcommand`]: the
+/// binary itself, run as its hidden `__monitor` subcommand. Inside a test
+/// binary, `current_exe()` is libtest, which rejects `__monitor`'s arguments,
+/// so a test build can instead name an `#[ignore]`d test that runs the same
+/// monitor body.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorExec {
+    /// `<exe> __monitor <args…>`.
+    Subcommand {
+        /// The `devflow` executable to re-exec.
+        exe: PathBuf,
+    },
+    /// `<exe> <test_name> --exact --include-ignored --test-threads=1`, with
+    /// the `__monitor` argv in [`MONITOR_ARGV_ENV`]. Test builds only: the
+    /// variant does not exist without the `test-support` feature.
+    #[cfg(feature = "test-support")]
+    HarnessEntry {
+        /// The test binary to re-exec.
+        exe: PathBuf,
+        /// The harness entry's full test name.
+        test_name: String,
+    },
+}
+
+impl MonitorExec {
+    /// The executable this monitor runs, whichever way it is entered.
+    fn exe(&self) -> &Path {
+        match self {
+            Self::Subcommand { exe } => exe,
+            #[cfg(feature = "test-support")]
+            Self::HarnessEntry { exe, .. } => exe,
+        }
+    }
+}
+
+/// Everything a stage launch resolves once, in one place, before it spawns a
+/// monitor (50-10): the machine-global cache directory its registration (and,
+/// from 50-11, its socket) lives under, and the executable its monitor runs.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchContext {
+    /// The DevFlow cache directory for this launch.
+    pub cache_dir: PathBuf,
+    /// The monitor executable and how it is entered.
+    pub exec: MonitorExec,
+}
+
+impl LaunchContext {
+    /// A launch context from its two parts.
+    pub fn new(cache_dir: PathBuf, exec: MonitorExec) -> Self {
+        Self { cache_dir, exec }
+    }
+}
+
 /// Strip `DEVFLOW_GATE_NOTIFY_CMD` from a detached monitor chain
 /// (49-REVIEW.md WR-07). Every gate in the chain then resolves the command
 /// from the run's state file at the moment it fires, so editing
@@ -325,7 +389,10 @@ pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
 /// 3. Runs `devflow advance --phase N` to advance the workflow through its
 ///    remaining stages
 ///
-/// `launch` selects the supervision shape — see [`MonitorLaunch`].
+/// `launch` selects the supervision shape — see [`MonitorLaunch`]. `ctx`
+/// names the monitor executable: the `PipeOwning` arm re-execs it as
+/// [`LaunchContext::exec`] says, and the `Legacy` arm's `advance` tail runs
+/// the same executable.
 ///
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(
@@ -334,8 +401,17 @@ pub fn spawn_monitor(
     args: &[String],
     envs: &[(String, String)],
     launch: MonitorLaunch,
+    ctx: &LaunchContext,
 ) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(state, program, args, envs, launch, MonitorTail::Advance)
+    spawn_monitor_inner(
+        state,
+        program,
+        args,
+        envs,
+        launch,
+        ctx,
+        MonitorTail::Advance,
+    )
 }
 
 /// What the Legacy monitor runs after it records the agent's exit code.
@@ -355,6 +431,7 @@ fn spawn_monitor_inner(
     args: &[String],
     envs: &[(String, String)],
     launch: MonitorLaunch,
+    ctx: &LaunchContext,
     tail: MonitorTail,
 ) -> Result<u32, MonitorError> {
     let project_root = state
@@ -362,8 +439,9 @@ fn spawn_monitor_inner(
         .to_str()
         .ok_or(MonitorError::NonUtf8Path)?;
 
-    let binary = std::env::current_exe()
-        .map_err(|_| MonitorError::NoBinaryPath)?
+    let binary = ctx
+        .exec
+        .exe()
         .to_str()
         .ok_or(MonitorError::NonUtf8Path)?
         .to_string();
@@ -466,18 +544,17 @@ fn spawn_monitor_inner(
         // comment gives: `hermetic_command` does its `env_remove`s at
         // construction and `.envs(...)` runs after, so deliberate
         // configuration survives while inherited pollution does not.
-        let mut child_cmd = hermetic_command(&binary, workdir_path);
-        child_cmd
-            .args(pipe_owning_monitor_args(
-                project_root,
-                state,
-                workdir,
-                prompt_file,
-                idle.timeout.as_secs(),
-            ))
-            .arg(program)
-            .args(args)
-            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let mut monitor_argv = pipe_owning_monitor_args(
+            project_root,
+            state,
+            workdir,
+            prompt_file,
+            idle.timeout.as_secs(),
+        );
+        monitor_argv.push(program.to_string());
+        monitor_argv.extend(args.iter().cloned());
+        let mut child_cmd = monitor_command(&ctx.exec, &binary, workdir_path, &monitor_argv)?;
+        child_cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
         strip_notify_env(&mut child_cmd);
 
@@ -640,6 +717,30 @@ fn pipe_owning_monitor_args(
         state.agent.to_string(),
         "--".to_string(),
     ]
+}
+
+/// The `PipeOwning` re-exec command for `exec`, before the adapter env is
+/// applied. `monitor_argv` starts with `__monitor` and ends with the child's
+/// program and argv; `binary` is `exec`'s executable as UTF-8.
+fn monitor_command(
+    exec: &MonitorExec,
+    binary: &str,
+    workdir: &Path,
+    monitor_argv: &[String],
+) -> Result<std::process::Command, MonitorError> {
+    let mut command = hermetic_command(binary, workdir);
+    match exec {
+        MonitorExec::Subcommand { .. } => {
+            command.args(monitor_argv);
+        }
+        // RED (50-10 Task 1): the harness entry is not wired yet, so a test
+        // build still re-execs the test binary as `__monitor`.
+        #[cfg(feature = "test-support")]
+        MonitorExec::HarnessEntry { .. } => {
+            command.args(monitor_argv);
+        }
+    }
+    Ok(command)
 }
 
 fn advance_tail(binary: &str, project_root: &str, state: &State) -> String {
@@ -2000,6 +2101,91 @@ mod tests {
         state
     }
 
+    /// The launch context every pre-50-10 `spawn_monitor` test passes: this
+    /// test binary as the monitor executable, exactly what `current_exe()`
+    /// resolved to inside `spawn_monitor` before 50-10, and a cache dir under
+    /// the test's own project tempdir.
+    fn test_launch_context(state: &State) -> LaunchContext {
+        LaunchContext::new(
+            state.project_root.join("cache"),
+            MonitorExec::Subcommand {
+                exe: std::env::current_exe().unwrap(),
+            },
+        )
+    }
+
+    /// T-50-26's source scan: whether the first `HarnessEntry {` after
+    /// `enum MonitorExec` in `source` carries `cfg(feature = "test-support")`
+    /// on its own line or on one of the two lines above it. The source is cut
+    /// at its first `mod tests {` line and `//` lines are dropped first, so
+    /// neither this test nor a comment can satisfy or fail the scan. `None`
+    /// when there is no such enum or variant.
+    fn harness_entry_is_feature_gated(source: &str) -> Option<bool> {
+        let code: Vec<&str> = source
+            .lines()
+            .take_while(|line| line.trim() != concat!("mod ", "tests {"))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let enum_at = code
+            .iter()
+            .position(|line| line.contains(concat!("enum ", "MonitorExec")))?;
+        let variant_at = enum_at
+            + code[enum_at..]
+                .iter()
+                .position(|line| line.contains(concat!("HarnessEntry", " {")))?;
+        let gate = concat!("cfg(feature = ", "\"test-support\")");
+        let window_start = variant_at.saturating_sub(2).max(enum_at);
+        Some(
+            code[window_start..=variant_at]
+                .iter()
+                .any(|line| line.contains(gate)),
+        )
+    }
+
+    /// T-50-26: the test-only monitor entry cannot exist in a release build,
+    /// because its variant is compiled only under `test-support`.
+    #[test]
+    fn the_harness_entry_variant_is_declared_only_under_the_test_support_feature() {
+        let ungated = concat!(
+            "pub enum ",
+            "MonitorExec {\n",
+            "    Subcommand { exe: PathBuf },\n",
+            "    /// docs\n",
+            "    HarnessEntry",
+            " { exe: PathBuf, test_name: String },\n",
+            "}\n"
+        );
+        assert_eq!(
+            harness_entry_is_feature_gated(ungated),
+            Some(false),
+            "planted control: an ungated HarnessEntry must be reported ungated"
+        );
+        let gated = concat!(
+            "pub enum ",
+            "MonitorExec {\n",
+            "    Subcommand { exe: PathBuf },\n",
+            "    #[cfg(feature = ",
+            "\"test-support\")]\n",
+            "    HarnessEntry",
+            " { exe: PathBuf, test_name: String },\n",
+            "}\n"
+        );
+        assert_eq!(
+            harness_entry_is_feature_gated(gated),
+            Some(true),
+            "planted control: a gated HarnessEntry must be reported gated"
+        );
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/monitor.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            harness_entry_is_feature_gated(&source),
+            Some(true),
+            "{}: MonitorExec::HarnessEntry must be declared under cfg(feature = \"test-support\")",
+            path.display()
+        );
+    }
+
     // ---- 45-01 Task 3: idle-timeout commit evidence resolves its trunk
     //      from the project, not from the phase worktree it runs `git log` in.
 
@@ -3078,7 +3264,15 @@ kill -9 $$
         // Stub agent: write a known marker to stdout, then exit cleanly.
         let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
+        let monitor_pid = spawn_monitor(
+            &state,
+            "sh",
+            &args,
+            &[],
+            MonitorLaunch::Legacy,
+            &test_launch_context(&state),
+        )
+        .unwrap();
         assert!(monitor_pid > 0);
 
         // Observable side effect #1: the monitor records the agent PID to its
@@ -3156,7 +3350,15 @@ kill -9 $$
         // window this test needs to send SIGTERM and check liveness.
         let args = vec!["-c".to_string(), "sleep 30".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
+        let monitor_pid = spawn_monitor(
+            &state,
+            "sh",
+            &args,
+            &[],
+            MonitorLaunch::Legacy,
+            &test_launch_context(&state),
+        )
+        .unwrap();
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
             .expect("monitor should record the agent pid");
         assert!(
@@ -3373,8 +3575,15 @@ pid_t fork(void) {
             .map(|(key, value)| (key.to_string(), value.to_string()));
             let state = state_in(root);
             let args = vec!["-c".to_string(), "sleep 30".to_string()];
-            let monitor_pid =
-                spawn_monitor(&state, "sh", &args, &envs, MonitorLaunch::Legacy).unwrap();
+            let monitor_pid = spawn_monitor(
+                &state,
+                "sh",
+                &args,
+                &envs,
+                MonitorLaunch::Legacy,
+                &test_launch_context(&state),
+            )
+            .unwrap();
             Self {
                 state,
                 monitor_pid,
@@ -3704,6 +3913,7 @@ pid_t fork(void) {
             &args,
             &[],
             MonitorLaunch::Legacy,
+            &test_launch_context(&state),
             MonitorTail::Script(String::new()),
         )
         .unwrap();
@@ -3772,6 +3982,7 @@ pid_t fork(void) {
             &args,
             &[],
             MonitorLaunch::Legacy,
+            &test_launch_context(&state),
             MonitorTail::Script(tail),
         )
         .unwrap();
@@ -3850,7 +4061,15 @@ pid_t fork(void) {
         // directories before launching the agent.
         let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
+        let monitor_pid = spawn_monitor(
+            &state,
+            "sh",
+            &args,
+            &[],
+            MonitorLaunch::Legacy,
+            &test_launch_context(&state),
+        )
+        .unwrap();
         assert!(monitor_pid > 0);
 
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
@@ -3936,7 +4155,15 @@ pid_t fork(void) {
                 "git rev-parse --absolute-git-dir".to_string(),
             ];
 
-            spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
+            spawn_monitor(
+                &state,
+                "sh",
+                &args,
+                &[],
+                MonitorLaunch::Legacy,
+                &test_launch_context(&state),
+            )
+            .unwrap();
             wait_for_agent_pid(&root, state.phase).expect("monitor should record the agent pid");
 
             let stdout_path = crate::agent_result::stdout_path(&root, state.phase);
@@ -4017,7 +4244,15 @@ pid_t fork(void) {
             payload.to_string(),
         ];
 
-        spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
+        spawn_monitor(
+            &state,
+            "sh",
+            &args,
+            &[],
+            MonitorLaunch::Legacy,
+            &test_launch_context(&state),
+        )
+        .unwrap();
         wait_for_agent_pid(dir.path(), state.phase).expect("monitor should record the agent pid");
 
         let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);

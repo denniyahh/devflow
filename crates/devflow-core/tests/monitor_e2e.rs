@@ -16,7 +16,9 @@ use devflow_core::agent_result::{
 };
 use devflow_core::config::GitFlowConfig;
 use devflow_core::mode::Mode;
-use devflow_core::monitor::{MonitorLaunch, spawn_monitor, wait_for_agent_pid};
+use devflow_core::monitor::{
+    LaunchContext, MonitorExec, MonitorLaunch, spawn_monitor, wait_for_agent_pid,
+};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -58,6 +60,18 @@ fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "agent work"]);
 }
 
+/// The launch context this suite passes `spawn_monitor` (50-10): this test
+/// binary as the monitor executable, which is what `spawn_monitor` resolved
+/// itself before it took a context, and a cache dir under the test's tempdir.
+fn launch_context(root: &Path) -> LaunchContext {
+    LaunchContext::new(
+        root.join("cache"),
+        MonitorExec::Subcommand {
+            exe: std::env::current_exe().unwrap(),
+        },
+    )
+}
+
 #[test]
 fn monitor_owns_fake_agent_and_records_devflow_result() {
     let dir = tempfile::tempdir().unwrap();
@@ -75,7 +89,15 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
             .to_string(),
     ];
 
-    spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).expect("spawn monitor");
+    spawn_monitor(
+        &state,
+        "sh",
+        &args,
+        &[],
+        MonitorLaunch::Legacy,
+        &launch_context(root),
+    )
+    .expect("spawn monitor");
 
     // The monitor records the agent PID.
     let agent_pid = wait_for_agent_pid(root, phase).expect("agent pid recorded");
