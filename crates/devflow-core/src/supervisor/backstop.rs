@@ -150,9 +150,77 @@ pub enum BackstopDecision {
 impl BackstopDecision {
     /// The text the CLI prints for this decision about the launch whose
     /// socket is `socket` and whose sidecar is `sidecar`.
-    pub fn describe(&self, _socket: &SocketPath, _sidecar: &Sidecar) -> String {
-        // RED stub (50-09 Task 2).
-        String::new()
+    ///
+    /// A `RefuseLeaderGone` text lists each member's pid, start time, state,
+    /// session and command line, states the residual F1 limit and gives an
+    /// inspection command. A `RefuseIdentityUnavailable` text gives the
+    /// manual repair and names no platform command (MAC-2, backlog 999.158).
+    pub fn describe(&self, socket: &SocketPath, sidecar: &Sidecar) -> String {
+        use std::fmt::Write as _;
+
+        let pgid = sidecar.agent_pgid;
+        let launch = &sidecar.launch_id;
+        let files = format!(
+            "{} and {}",
+            socket.as_path().display(),
+            socket.sidecar_path().display()
+        );
+        match self {
+            Self::RefuseUnsafeTarget => format!(
+                "refused: process group {pgid} of launch {launch} is not a safe target (it is 0 \
+                 or 1, does not fit a pid, or is this process's own group); nothing was \
+                 signalled or removed"
+            ),
+            Self::RefuseIdentityUnavailable => format!(
+                "nothing was signalled or removed; this platform gives DevFlow no process start \
+                 time or boot id, so it cannot prove process group {pgid} is still the agent \
+                 launch {launch} started; if you have confirmed it is, end that group yourself, \
+                 then delete {files}"
+            ),
+            Self::RefuseMismatch(why) => format!(
+                "refused: the sidecar and the state record of launch {launch} disagree ({why}); \
+                 nothing was signalled or removed"
+            ),
+            Self::PreviousBoot => format!(
+                "launch {launch} was recorded in a previous boot (boot id {}), so process group \
+                 {pgid} cannot still be its agent; nothing is signalled, and {files} are removed",
+                sidecar.boot_id
+            ),
+            Self::EmptyGroup => format!(
+                "process group {pgid} of launch {launch} has no live process of this user; \
+                 nothing is signalled, and {files} are removed"
+            ),
+            Self::LeaderPresentSignal => format!(
+                "process group {pgid} is still led by launch {launch}'s agent (start time {}); \
+                 the group is ended with SIGTERM, then SIGKILL, and {files} are removed",
+                sidecar.agent_start_time
+            ),
+            Self::LeaderRecycled => format!(
+                "pid {pgid} now belongs to a different process than launch {launch}'s agent \
+                 (start time {}), so the agent's group is gone; nothing is signalled, and {files} \
+                 are removed",
+                sidecar.agent_start_time
+            ),
+            Self::RefuseLeaderGone(members) => {
+                let mut text = format!(
+                    "refused: process group {pgid} of launch {launch} still has {} live \
+                     member(s), but its leader, the recorded agent (pid {pgid}), is gone or has \
+                     left the group. The leader is gone, so these may be the original agent's \
+                     children or an unrelated group that reused the id; nothing was signalled, \
+                     and {files} are kept. Inspect the group with: ps -o \
+                     pid,pgid,sid,lstart,args -g {pgid}",
+                    members.len()
+                );
+                for member in members {
+                    let _ = write!(
+                        text,
+                        "\n  pid {}, start time {}, state {}, session {}: {}",
+                        member.pid, member.start_time, member.state, member.session, member.cmdline
+                    );
+                }
+                text
+            }
+        }
     }
 }
 
