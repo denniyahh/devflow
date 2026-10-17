@@ -4,6 +4,12 @@
 //! the compiled CLI as a separate process. That makes the refusal observable
 //! at the same boundary an operator uses, rather than coupling the test to
 //! `commands::start`'s implementation details.
+//!
+//! Every `devflow` child runs through `common::hermetic_devflow`, so its
+//! registry entries land in a tempdir `HOME`, never the operator's real
+//! `~/.cache/devflow` (999.141).
+
+mod common;
 
 use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
@@ -11,14 +17,9 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
-use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
+use std::time::Duration;
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -50,31 +51,16 @@ fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["commit", "-q", "-m", "base"]);
 }
 
-struct FakeBin {
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-}
-
-fn fake_bin_dir(agent_body: &str) -> FakeBin {
-    let dir = tempfile::tempdir().unwrap();
-    let claude = dir.path().join("claude");
-    fs::write(&claude, format!("#!/bin/sh\n{agent_body}\n")).unwrap();
-    let mut permissions = fs::metadata(&claude).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&claude, permissions).unwrap();
-    for program in ["git", "sh"] {
-        symlink(format!("/usr/bin/{program}"), dir.path().join(program)).unwrap();
-    }
-    FakeBin {
-        path: dir.path().to_path_buf(),
-        _dir: dir,
-    }
-}
-
-fn child(root: &Path, phase: PhaseId, fake_bin: &FakeBin, mode: &str) -> Command {
+fn child(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &common::FakeBin,
+    mode: &str,
+) -> Command {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
-    let mut command = Command::new(devflow_bin());
+    let mut command = common::hermetic_devflow(home);
     command
         .args([
             "start",
@@ -93,31 +79,14 @@ fn child(root: &Path, phase: PhaseId, fake_bin: &FakeBin, mode: &str) -> Command
     command
 }
 
-fn wait_for(mut predicate: impl FnMut() -> bool, timeout: Duration, what: &str) {
-    let started = Instant::now();
-    while !predicate() {
-        assert!(
-            started.elapsed() < timeout,
-            "timed out after {timeout:?} waiting for {what}"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn kill_and_reap(child: &mut Child) {
-    if child.try_wait().expect("poll start child").is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
-
 #[test]
 fn start_refuses_while_another_process_holds_the_phase_lock() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(90);
     init_repo(root, phase);
-    let fake_bin = fake_bin_dir("exit 0");
+    let fake_bin = common::fake_bin_dir("exit 0");
     let holder = devflow_core::lock::acquire(root, phase).expect("test holds phase lock");
     let holder_pid = std::process::id();
     let worktrees_before = devflow_core::test_support::git_command(root)
@@ -126,7 +95,7 @@ fn start_refuses_while_another_process_holds_the_phase_lock() {
         .expect("list baseline worktrees");
     assert!(worktrees_before.status.success());
 
-    let output = child(root, phase, &fake_bin, "supervise")
+    let output = child(&home, root, phase, &fake_bin, "supervise")
         .output()
         .expect("run devflow start");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -172,13 +141,15 @@ fn start_refuses_while_another_process_holds_the_phase_lock() {
 
 #[test]
 fn start_proceeds_when_no_process_holds_the_phase_lock() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(91);
     init_repo(root, phase);
-    let fake_bin = fake_bin_dir("exit 0");
+    let fake_bin = common::fake_bin_dir("exit 0");
+    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
 
-    let output = child(root, phase, &fake_bin, "supervise")
+    let output = child(&home, root, phase, &fake_bin, "supervise")
         .output()
         .expect("run devflow start");
     assert!(
@@ -200,11 +171,12 @@ fn start_proceeds_when_no_process_holds_the_phase_lock() {
 
 #[test]
 fn start_clears_leftover_gate_files_after_taking_the_lock() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(92);
     init_repo(root, phase);
-    let fake_bin = fake_bin_dir("sleep 60");
+    let fake_bin = common::fake_bin_dir("sleep 60");
     let response_path = Gates::response_path(root, phase, Stage::Define);
     fs::create_dir_all(response_path.parent().unwrap()).unwrap();
     fs::write(
@@ -217,12 +189,13 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
         .unwrap(),
     )
     .unwrap();
+    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
 
-    let mut process = child(root, phase, &fake_bin, "auto")
+    let mut process = child(&home, root, phase, &fake_bin, "auto")
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "30")
         .spawn()
         .expect("spawn devflow start");
-    wait_for(
+    common::wait_for(
         || {
             Gates::gate_path(root, phase, Stage::Define).exists()
                 || process.try_wait().expect("poll start child").is_some()
@@ -249,7 +222,7 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
         !response_path.exists(),
         "the planted response must be removed"
     );
-    kill_and_reap(&mut process);
+    common::kill_and_reap(&mut process);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,8 +347,14 @@ fn snapshot_paths(snapshot: &[(PathBuf, Vec<u8>)]) -> Vec<&Path> {
     snapshot.iter().map(|(path, _)| path.as_path()).collect()
 }
 
-fn run_start(root: &Path, phase: PhaseId, fake_bin: &FakeBin, extra: &[&str]) -> Output {
-    child(root, phase, fake_bin, "supervise")
+fn run_start(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &common::FakeBin,
+    extra: &[&str],
+) -> Output {
+    child(home, root, phase, fake_bin, "supervise")
         .args(extra)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS)
         .output()
@@ -393,13 +372,14 @@ fn events_contain_workflow_started(root: &Path) -> bool {
 /// the absence of every side effect. `refusal` is the first assertion's
 /// message and names the arm.
 fn assert_start_refuses_live_run(
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
     extra: &[&str],
     live_pid: u32,
     refusal: &str,
 ) {
-    let fake_bin = fake_bin_dir("exit 0");
+    let fake_bin = common::fake_bin_dir("exit 0");
     let before = phase_file_snapshot(root, phase);
     // Negative control on the snapshot itself: it must cover the planted
     // state and both planted gate files, or byte-identity would prove nothing.
@@ -416,7 +396,7 @@ fn assert_start_refuses_live_run(
         );
     }
 
-    let output = run_start(root, phase, &fake_bin, extra);
+    let output = run_start(home, root, phase, &fake_bin, extra);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -517,6 +497,7 @@ fn assert_start_refuses_live_run(
 
 #[test]
 fn start_refuses_a_phase_whose_recorded_monitor_is_alive() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(95);
@@ -525,6 +506,7 @@ fn start_refuses_a_phase_whose_recorded_monitor_is_alive() {
     plant_leftover_run(root, phase, Some(monitor.pid()), None);
 
     assert_start_refuses_live_run(
+        &home,
         root,
         phase,
         &[],
@@ -535,6 +517,7 @@ fn start_refuses_a_phase_whose_recorded_monitor_is_alive() {
 
 #[test]
 fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(96);
@@ -543,6 +526,7 @@ fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
     plant_leftover_run(root, phase, None, Some(agent.pid()));
 
     assert_start_refuses_live_run(
+        &home,
         root,
         phase,
         &["--force"],
@@ -553,14 +537,16 @@ fn start_refuses_a_phase_whose_recorded_agent_is_alive() {
 
 #[test]
 fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(97);
     init_repo(root, phase);
     let planted = plant_leftover_run(root, phase, Some(NEVER_LIVE_PID), Some(NEVER_LIVE_PID));
-    let fake_bin = fake_bin_dir("exit 0");
+    let fake_bin = common::fake_bin_dir("exit 0");
+    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
 
-    let output = run_start(root, phase, &fake_bin, &[]);
+    let output = run_start(&home, root, phase, &fake_bin, &[]);
     assert!(
         output.status.success(),
         "a leftover state whose recorded processes are dead must be replaced as today\n\
@@ -586,6 +572,7 @@ fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
 
 #[test]
 fn start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_process() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(98);
@@ -596,9 +583,10 @@ fn start_proceeds_when_no_state_exists_even_if_the_agent_pid_file_names_a_live_p
         !devflow_core::workflow::state_path(root, phase).exists(),
         "the carve-out fixture must have no phase state"
     );
-    let fake_bin = fake_bin_dir("exit 0");
+    let fake_bin = common::fake_bin_dir("exit 0");
+    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![agent.pid()]);
 
-    let output = run_start(root, phase, &fake_bin, &[]);
+    let output = run_start(&home, root, phase, &fake_bin, &[]);
     assert!(
         output.status.success(),
         "without phase state, start must proceed even if the agent pid file names a live process\n\
@@ -655,10 +643,17 @@ fn plant_resumable_run(
     }
 }
 
-fn resume_command(root: &Path, phase: PhaseId, fake_bin: &FakeBin, cache_dir: &Path) -> Command {
+/// `devflow resume` for `phase`; its `DEVFLOW_CACHE_DIR` is `home`'s cache dir,
+/// set by `common::hermetic_devflow`.
+fn resume_command(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &common::FakeBin,
+) -> Command {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
-    let mut command = Command::new(devflow_bin());
+    let mut command = common::hermetic_devflow(home);
     command
         .args([
             "resume",
@@ -669,47 +664,8 @@ fn resume_command(root: &Path, phase: PhaseId, fake_bin: &FakeBin, cache_dir: &P
         .arg(root)
         .current_dir(root)
         .env("PATH", path)
-        .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS)
-        .env("DEVFLOW_CACHE_DIR", cache_dir);
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", GATE_TIMEOUT_SECS);
     command
-}
-
-struct LaunchedRunReaper {
-    root: PathBuf,
-    phase: PhaseId,
-    spare: Vec<u32>,
-}
-
-impl LaunchedRunReaper {
-    fn new(root: &Path, phase: PhaseId, spare: Vec<u32>) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            phase,
-            spare,
-        }
-    }
-}
-
-impl Drop for LaunchedRunReaper {
-    fn drop(&mut self) {
-        let monitor = devflow_core::workflow::load_state(&self.root, self.phase)
-            .ok()
-            .and_then(|state| state.monitor_pid);
-        let agent = fs::read_to_string(devflow_core::agent_result::agent_pid_path(
-            &self.root, self.phase,
-        ))
-        .ok()
-        .and_then(|pid| pid.trim().parse::<u32>().ok());
-        for pid in [monitor, agent].into_iter().flatten() {
-            if !self.spare.contains(&pid) && devflow_core::agent::agent_running(pid) {
-                let _ = devflow_core::agent::terminate_and_verify(
-                    pid,
-                    devflow_core::agent::TERMINATE_VERIFY_WAIT,
-                    devflow_core::agent::TERMINATE_VERIFY_POLL,
-                );
-            }
-        }
-    }
 }
 
 struct RefusalCase {
@@ -721,10 +677,10 @@ struct RefusalCase {
 }
 
 fn assert_resume_refuses_live_run(
+    home: &common::HermeticHome,
     root: &Path,
     phase: PhaseId,
-    fake_bin: &FakeBin,
-    cache_dir: &Path,
+    fake_bin: &common::FakeBin,
     case: &RefusalCase,
 ) {
     let before = phase_file_snapshot(root, phase);
@@ -737,7 +693,7 @@ fn assert_resume_refuses_live_run(
         );
     }
 
-    let output = resume_command(root, phase, fake_bin, cache_dir)
+    let output = resume_command(home, root, phase, fake_bin)
         .output()
         .expect("run devflow resume");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -824,13 +780,13 @@ fn assert_resume_refuses_live_run(
 #[test]
 fn resume_refuses_a_phase_whose_recorded_monitor_is_alive() {
     let repo = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let home = common::HermeticHome::new();
     let root = repo.path();
     let phase = PhaseId::new(85);
     init_repo(root, phase);
     let monitor = LiveProcess::spawn();
-    let fake_bin = fake_bin_dir("exec sleep 60");
-    let _reaper = LaunchedRunReaper::new(root, phase, vec![monitor.pid()]);
+    let fake_bin = common::fake_bin_dir("exec sleep 60");
+    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![monitor.pid()]);
     plant_resumable_run(
         root,
         phase,
@@ -840,10 +796,10 @@ fn resume_refuses_a_phase_whose_recorded_monitor_is_alive() {
     );
 
     assert_resume_refuses_live_run(
+        &home,
         root,
         phase,
         &fake_bin,
-        cache.path(),
         &RefusalCase {
             role: "monitor",
             live_pid: monitor.pid(),
@@ -860,13 +816,13 @@ fn resume_refuses_a_phase_whose_recorded_monitor_is_alive() {
 #[test]
 fn resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive() {
     let repo = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let home = common::HermeticHome::new();
     let root = repo.path();
     let phase = PhaseId::new(86);
     init_repo(root, phase);
     let agent = LiveProcess::spawn();
-    let fake_bin = fake_bin_dir("exec sleep 60");
-    let _reaper = LaunchedRunReaper::new(root, phase, vec![agent.pid()]);
+    let fake_bin = common::fake_bin_dir("exec sleep 60");
+    let _reaper = common::LaunchedRunReaper::new(root, phase, vec![agent.pid()]);
     plant_resumable_run(root, phase, Some(NEVER_LIVE_PID), Some(agent.pid()), true);
     let case = RefusalCase {
         role: "agent",
@@ -879,8 +835,8 @@ fn resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive() {
         refusal: "resume must refuse a phase whose recorded agent is alive",
     };
 
-    assert_resume_refuses_live_run(root, phase, &fake_bin, cache.path(), &case);
-    assert_resume_refuses_live_run(root, phase, &fake_bin, cache.path(), &case);
+    assert_resume_refuses_live_run(&home, root, phase, &fake_bin, &case);
+    assert_resume_refuses_live_run(&home, root, phase, &fake_bin, &case);
     assert!(
         devflow_core::workflow::load_state(root, phase)
             .expect("load planted state")
@@ -893,11 +849,11 @@ fn resume_refuses_a_stopped_phase_whose_recorded_agent_is_alive() {
 fn resume_relaunches_a_phase_whose_recorded_processes_are_dead() {
     for (phase, stopped) in [(PhaseId::new(87), false), (PhaseId::new(88), true)] {
         let repo = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let home = common::HermeticHome::new();
         let root = repo.path();
         init_repo(root, phase);
-        let fake_bin = fake_bin_dir("exec sleep 60");
-        let _reaper = LaunchedRunReaper::new(root, phase, vec![]);
+        let fake_bin = common::fake_bin_dir("exec sleep 60");
+        let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
         plant_resumable_run(
             root,
             phase,
@@ -906,7 +862,7 @@ fn resume_relaunches_a_phase_whose_recorded_processes_are_dead() {
             stopped,
         );
 
-        let output = resume_command(root, phase, &fake_bin, cache.path())
+        let output = resume_command(&home, root, phase, &fake_bin)
             .output()
             .expect("run devflow resume");
         assert!(
@@ -928,12 +884,12 @@ fn resume_relaunches_a_phase_whose_recorded_processes_are_dead() {
 #[test]
 fn resume_without_phase_state_reports_the_missing_state_not_a_live_run() {
     let repo = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let home = common::HermeticHome::new();
     let root = repo.path();
     let phase = PhaseId::new(84);
     init_repo(root, phase);
     let agent = LiveProcess::spawn();
-    let fake_bin = fake_bin_dir("exec sleep 60");
+    let fake_bin = common::fake_bin_dir("exec sleep 60");
     write_agent_pid(root, phase, agent.pid());
     assert!(
         !devflow_core::workflow::state_path(root, phase).exists(),
@@ -941,7 +897,7 @@ fn resume_without_phase_state_reports_the_missing_state_not_a_live_run() {
     );
     let before = phase_file_snapshot(root, phase);
 
-    let output = resume_command(root, phase, &fake_bin, cache.path())
+    let output = resume_command(&home, root, phase, &fake_bin)
         .output()
         .expect("run devflow resume");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -961,15 +917,16 @@ fn resume_without_phase_state_reports_the_missing_state_not_a_live_run() {
 
 #[test]
 fn start_refusal_text_stays_byte_identical_for_a_live_monitor() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(94);
     init_repo(root, phase);
     let monitor = LiveProcess::spawn();
-    let fake_bin = fake_bin_dir("exit 0");
+    let fake_bin = common::fake_bin_dir("exit 0");
     plant_leftover_run(root, phase, Some(monitor.pid()), None);
 
-    let output = run_start(root, phase, &fake_bin, &[]);
+    let output = run_start(&home, root, phase, &fake_bin, &[]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
