@@ -21,7 +21,7 @@
 
 use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
-use crate::pipeline_launch::launch_stage;
+use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, launch_stage};
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
@@ -70,8 +70,12 @@ pub(crate) fn transition(
         state.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
         // T-20-03b / doctor gap (D-09): clear monitor_pid/gate_pending so
         // neither check_dead_agent nor check_dead_monitor misreports this
-        // intentional stop as a crashed agent or dead monitor.
+        // intentional stop as a crashed agent or dead monitor. The supervisor
+        // record goes with monitor_pid (50-13): the supervisor running this
+        // advance finishes once it returns, so the record would otherwise
+        // name a socket that is gone.
         state.monitor_pid = None;
+        state.supervisor = None;
         state.gate_pending = false;
         workflow::save_state(state)?;
         events::emit(
@@ -426,8 +430,13 @@ pub(crate) fn run_gate_with_timeout(
             Err(err) => return Err(err.into()),
         }
     }
-    match Gates::poll_response(project_root, state.phase, stage, timeout_secs) {
-        Some(response) => {
+    match crate::pipeline_launch::wait_for_gate_response(
+        project_root,
+        state.phase,
+        stage,
+        timeout_secs,
+    ) {
+        GateWaitEnd::Answered(response) => {
             state.gate_pending = false;
             // WR-10 (49-REVIEW.md): the operator may have edited the run's
             // notify command on disk while this gate waited; keep that edit
@@ -455,7 +464,25 @@ pub(crate) fn run_gate_with_timeout(
             );
             Ok(action)
         }
-        None => {
+        GateWaitEnd::Stopped => {
+            // Safe point 4 (50-13, R-2): the supervisor running this advance
+            // was stopped during the wait. The gate has no waiter any more, so
+            // it is cleared (no stale request or response outlives the run),
+            // the stop is recorded, and an error unwinds every caller through
+            // `?`, which releases the per-phase lock. Deliberately not
+            // `GateAction::Abort`: `abort()` deletes the state file, and a
+            // stopped run keeps its state for `devflow resume`.
+            let _ = Gates::cleanup(project_root, state.phase, stage);
+            state.gate_pending = false;
+            if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
+                state.gate_notify_cmd = on_disk.gate_notify_cmd;
+            }
+            crate::pipeline_launch::record_advance_stop(state, 4)?;
+            Err(CliError::Message(format!(
+                "the gate wait for stage {stage} ended: {ADVANCE_STOP_REASON}"
+            )))
+        }
+        GateWaitEnd::TimedOut => {
             events::emit(
                 project_root,
                 state.phase,
@@ -886,6 +913,39 @@ mod tests {
         assert!(evidence.workflow_finished_seen);
         assert_eq!(evidence.finished_reason.as_deref(), Some("stopped_at"));
         assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
+    }
+
+    /// 50-13: the `--until` stop clears the supervisor record together with
+    /// `monitor_pid`, because the supervisor running this advance finishes
+    /// once the advance returns. Both are set first, so a stop that clears
+    /// neither (or only the pid) fails here.
+    #[test]
+    fn until_stop_clears_the_supervisor_record_with_the_monitor_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1313);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.monitor_pid = Some(4242);
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            root.join("until.sock"),
+            "until00000000000".to_string(),
+            4242,
+            1,
+            String::new(),
+        ));
+        workflow::save_state(&state).unwrap();
+
+        transition(root, &mut state, Stage::Code).unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(reloaded.stopped, "the --until stop marks the run stopped");
+        assert_eq!(reloaded.monitor_pid, None);
+        assert_eq!(
+            reloaded.supervisor, None,
+            "the supervisor record is cleared with monitor_pid"
+        );
     }
 
     #[test]

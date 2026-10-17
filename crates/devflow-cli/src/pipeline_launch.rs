@@ -1050,7 +1050,7 @@ fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliE
 
 /// Persist a stop an advance honoured at `safe_point`: `stopped` with
 /// [`ADVANCE_STOP_REASON`], and an `advance_stopped` event naming the point.
-fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
+pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
     state.stopped = true;
     state.stop_reason = Some(ADVANCE_STOP_REASON.to_string());
     workflow::save_state(state)?;
@@ -1088,6 +1088,45 @@ fn shut_down_unpublished(record: &SupervisorRecord) {
             "could not stop the unpublished next supervisor at {}: {err}",
             record.socket_path.display()
         ),
+    }
+}
+
+/// How an advance's gate wait ended (safe point 4).
+#[derive(Debug)]
+pub(crate) enum GateWaitEnd {
+    /// The gate was answered.
+    Answered(devflow_core::gates::GateResponse),
+    /// No answer arrived within the timeout.
+    TimedOut,
+    /// The supervisor running this advance was stopped during the wait.
+    Stopped,
+}
+
+/// An advance's gate wait (50-13, R-2, safe point 4). Inside a supervisor's
+/// advance the run is `GateWait` for the wait and `Advancing` again after
+/// it, and the poll is cancelled by the supervisor's stop token, so a
+/// SIGTERM/SIGINT or socket stop ends the wait within about a second as
+/// [`GateWaitEnd::Stopped`]. Anywhere else (the hidden `devflow advance`, a
+/// foreground gate) it is `Gates::poll_response`, unchanged.
+pub(crate) fn wait_for_gate_response(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    timeout_secs: u64,
+) -> GateWaitEnd {
+    let Some(token) = with_stop_token(StopToken::clone) else {
+        return Gates::poll_response(project_root, phase, stage, timeout_secs)
+            .map_or(GateWaitEnd::TimedOut, GateWaitEnd::Answered);
+    };
+    token.enter(OwnerPhase::GateWait);
+    let polled = Gates::poll_response_cancellable(project_root, phase, stage, timeout_secs, || {
+        token.stop_requested()
+    });
+    token.enter(OwnerPhase::Advancing);
+    match polled {
+        Some(response) => GateWaitEnd::Answered(response),
+        None if token.safe_point() == SafePoint::StopHere => GateWaitEnd::Stopped,
+        None => GateWaitEnd::TimedOut,
     }
 }
 
