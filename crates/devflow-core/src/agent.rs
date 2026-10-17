@@ -224,10 +224,6 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
 /// ([`crate::supervisor::backstop`]): one read gives state, process group,
 /// session and start time together, so they describe the same instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "read only by the Linux backstop (MAC-2)")
-)]
 pub(crate) struct ProcStat {
     /// Field 3, the one-letter state (`R`, `S`, `Z`, ...).
     pub(crate) state: char,
@@ -243,10 +239,6 @@ pub(crate) struct ProcStat {
 /// Read [`ProcStat`] for `pid` from one read of `/proc/<pid>/stat`. `None`
 /// when the file cannot be read or parsed (the process is gone, or this is
 /// not Linux): the fail-closed direction, as for [`process_start_time`].
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "read only by the Linux backstop (MAC-2)")
-)]
 pub(crate) fn process_stat_fields(pid: u32) -> Option<ProcStat> {
     parse_stat_fields(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
@@ -254,10 +246,6 @@ pub(crate) fn process_stat_fields(pid: u32) -> Option<ProcStat> {
 /// [`process_stat_fields`]'s parser. Splits after the FINAL `)`, because
 /// field 2 (comm) may contain spaces and parentheses; after that point field
 /// 3 is index 0, so field 5 is 2, field 6 is 3 and field 22 is 19.
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "read only by the Linux backstop (MAC-2)")
-)]
 fn parse_stat_fields(stat: &str) -> Option<ProcStat> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = rest.split_whitespace().collect();

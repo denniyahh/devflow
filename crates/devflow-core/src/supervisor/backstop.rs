@@ -36,11 +36,14 @@
 //! back to validate-then-`killpg` ([`SignalPath::ValidatedKillpg`]). Off Linux
 //! no signalling path exists.
 
-#[cfg(test)]
-use super::Liveness;
-use super::{Sidecar, SocketPath};
+use super::{Liveness, Sidecar, SocketPath};
+use crate::agent::ProcStat;
 use crate::state::SupervisorRecord;
 use std::io;
+
+/// How long to wait for the group to empty after SIGKILL. SIGKILL cannot be
+/// caught, but its delivery is not synchronous.
+const KILL_VERIFY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One live process of the recorded process group, as gathered from
 /// `/proc`.
@@ -57,6 +60,56 @@ pub struct GroupMember {
     pub session: i32,
     /// Its command line, arguments joined by spaces (empty when unreadable).
     pub cmdline: String,
+}
+
+/// The identity a launch recorded, read from its sidecar or its state
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedIdentity {
+    pub(crate) launch_id: String,
+    pub(crate) pgid: u32,
+    pub(crate) start_time: u64,
+    pub(crate) boot_id: String,
+}
+
+impl RecordedIdentity {
+    fn of_sidecar(sidecar: &Sidecar) -> Self {
+        Self {
+            launch_id: sidecar.launch_id.clone(),
+            pgid: sidecar.agent_pgid,
+            start_time: sidecar.agent_start_time,
+            boot_id: sidecar.boot_id.clone(),
+        }
+    }
+
+    fn of_record(record: &SupervisorRecord) -> Self {
+        Self {
+            launch_id: record.launch_id.clone(),
+            pgid: record.agent_pgid,
+            start_time: record.agent_start_time,
+            boot_id: record.boot_id.clone(),
+        }
+    }
+}
+
+/// Everything [`classify`] decides on, gathered once.
+#[derive(Debug, Clone)]
+pub(crate) struct BackstopFacts {
+    /// The sidecar's identity.
+    pub(crate) recorded: RecordedIdentity,
+    /// The state record's identity, when state loaded.
+    pub(crate) state_record: Option<RecordedIdentity>,
+    /// The caller's own process group (`getpgrp`).
+    pub(crate) caller_pgrp: i32,
+    /// The current kernel boot id.
+    pub(crate) current_boot_id: Option<String>,
+    /// `/proc/<pgid>/stat` when an own-uid process holds that pid.
+    pub(crate) leader: Option<ProcStat>,
+    /// Own-uid, non-zombie processes whose pgrp is the recorded pgid.
+    pub(crate) members: Vec<GroupMember>,
+    /// Whether this platform could gather the facts that prove identity
+    /// (MAC-2): `/proc` start times, the group census and the boot id.
+    pub(crate) identity_provable: bool,
 }
 
 /// What the backstop decides for a STALE socket. See the module doc for the
@@ -141,22 +194,446 @@ pub enum BackstopError {
     Io(#[from] io::Error),
 }
 
+/// `pgid` as a `pid_t` when it is a safe group to signal: it fits, is above
+/// 1, and is not `caller_pgrp`.
+fn safe_target(pgid: u32, caller_pgrp: i32) -> Option<libc::pid_t> {
+    let signed = libc::pid_t::try_from(pgid).ok()?;
+    (signed > 1 && signed != caller_pgrp).then_some(signed)
+}
+
+/// The first identity field on which the sidecar and the state record
+/// disagree, as text.
+fn first_disagreement(sidecar: &RecordedIdentity, record: &RecordedIdentity) -> Option<String> {
+    if sidecar.launch_id != record.launch_id {
+        return Some(format!(
+            "launch id: sidecar {}, state {}",
+            sidecar.launch_id, record.launch_id
+        ));
+    }
+    if sidecar.pgid != record.pgid {
+        return Some(format!(
+            "pgid: sidecar {}, state {}",
+            sidecar.pgid, record.pgid
+        ));
+    }
+    if sidecar.start_time != record.start_time {
+        return Some(format!(
+            "agent start time: sidecar {}, state {}",
+            sidecar.start_time, record.start_time
+        ));
+    }
+    if sidecar.boot_id != record.boot_id {
+        return Some(format!(
+            "boot id: sidecar {}, state {}",
+            sidecar.boot_id, record.boot_id
+        ));
+    }
+    None
+}
+
+/// The backstop's decision rule, pure. See the module doc for the order.
+pub(crate) fn classify(facts: &BackstopFacts) -> BackstopDecision {
+    let recorded = &facts.recorded;
+    let Some(pgid) = safe_target(recorded.pgid, facts.caller_pgrp) else {
+        return BackstopDecision::RefuseUnsafeTarget;
+    };
+    let current_boot = match (facts.identity_provable, facts.current_boot_id.as_deref()) {
+        (true, Some(boot)) => boot,
+        _ => return BackstopDecision::RefuseIdentityUnavailable,
+    };
+    if let Some(why) = facts
+        .state_record
+        .as_ref()
+        .and_then(|record| first_disagreement(recorded, record))
+    {
+        return BackstopDecision::RefuseMismatch(why);
+    }
+    if recorded.boot_id != current_boot {
+        return BackstopDecision::PreviousBoot;
+    }
+    if facts.members.is_empty() {
+        return BackstopDecision::EmptyGroup;
+    }
+    match facts.leader {
+        Some(leader) if leader.start_time != recorded.start_time => {
+            BackstopDecision::LeaderRecycled
+        }
+        Some(leader) if leader.pgrp == pgid => BackstopDecision::LeaderPresentSignal,
+        _ => BackstopDecision::RefuseLeaderGone(facts.members.clone()),
+    }
+}
+
+/// The caller's own process group.
+fn caller_pgrp() -> i32 {
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    unsafe { libc::getpgrp() }
+}
+
+/// Facts with nothing read about any process: the shape every platform
+/// starts from, and the whole answer off Linux.
+fn unread_facts(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopFacts {
+    BackstopFacts {
+        recorded: RecordedIdentity::of_sidecar(sidecar),
+        state_record: state_record.map(RecordedIdentity::of_record),
+        caller_pgrp: caller_pgrp(),
+        current_boot_id: None,
+        leader: None,
+        members: Vec::new(),
+        identity_provable: false,
+    }
+}
+
+/// Gather the facts [`classify`] needs. An unsafe target reads nothing.
+#[cfg(target_os = "linux")]
+fn gather(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopFacts {
+    let mut facts = unread_facts(sidecar, state_record);
+    let Some(pgid) = safe_target(facts.recorded.pgid, facts.caller_pgrp) else {
+        return facts;
+    };
+    let Some(members) = group_members(pgid) else {
+        // The process table could not be listed: identity is unprovable.
+        return facts;
+    };
+    facts.members = members;
+    facts.leader = own_process_stat(facts.recorded.pgid);
+    facts.current_boot_id = super::boot_id();
+    facts.identity_provable = true;
+    facts
+}
+
+/// Off Linux there is no `/proc` start time, group census or boot id
+/// (backlog 999.158, 999.159), so nothing is read and identity is
+/// unprovable: [`classify`] answers `RefuseIdentityUnavailable` (MAC-2).
+#[cfg(not(target_os = "linux"))]
+fn gather(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopFacts {
+    unread_facts(sidecar, state_record)
+}
+
+/// `/proc/<pid>/stat` for a process this uid owns; `None` for another uid's
+/// process or no process.
+#[cfg(target_os = "linux")]
+fn own_process_stat(pid: u32) -> Option<ProcStat> {
+    let owner = std::fs::metadata(format!("/proc/{pid}")).ok()?;
+    if std::os::unix::fs::MetadataExt::uid(&owner) != super::protocol::euid() {
+        return None;
+    }
+    crate::agent::process_stat_fields(pid)
+}
+
+/// Own-uid, non-zombie processes whose process group is `pgid`, by pid.
+/// The owner uid is checked before anything else is read (the
+/// `discover_stray_devflow_processes` rule). `None` when `/proc` cannot be
+/// listed, which is "cannot tell", never "empty".
+fn group_members(pgid: libc::pid_t) -> Option<Vec<GroupMember>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let my_uid = super::protocol::euid();
+    let mut members = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(owner) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if std::os::unix::fs::MetadataExt::uid(&owner) != my_uid {
+            continue;
+        }
+        let Some(stat) = crate::agent::process_stat_fields(pid) else {
+            continue;
+        };
+        if stat.pgrp != pgid || stat.state == 'Z' {
+            continue;
+        }
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                raw.split(|&byte| byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(String::from_utf8_lossy)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        members.push(GroupMember {
+            pid,
+            start_time: stat.start_time,
+            state: stat.state,
+            session: stat.session,
+            cmdline,
+        });
+    }
+    members.sort_by_key(|member| member.pid);
+    Some(members)
+}
+
 /// Decide what the backstop would do for this launch, without acting: for
 /// read-only callers (doctor, the launch guard) that classify a STALE socket.
-pub fn assess(_sidecar: &Sidecar, _state_record: Option<&SupervisorRecord>) -> BackstopDecision {
-    // RED stub (50-09 Task 1): the decision rule lands in GREEN.
-    BackstopDecision::RefuseIdentityUnavailable
+pub fn assess(sidecar: &Sidecar, state_record: Option<&SupervisorRecord>) -> BackstopDecision {
+    classify(&gather(sidecar, state_record))
 }
 
 /// Tear down the launch behind a STALE socket.
+///
+/// Re-probes first and returns [`BackstopError::NotStale`] unless the probe
+/// is `Ok(Liveness::Stale)`. Then gathers facts, [`classify`]s them and acts:
+/// `PreviousBoot`, `EmptyGroup` and `LeaderRecycled` remove the socket and
+/// sidecar and signal nothing; `LeaderPresentSignal` ends the group (SIGTERM,
+/// [`crate::agent::TERMINATE_VERIFY_WAIT`], SIGKILL) and then removes them;
+/// every `Refuse*` keeps them and signals nothing.
 pub fn teardown_stale(
-    _socket: &SocketPath,
-    _sidecar: &Sidecar,
-    _state_record: Option<&SupervisorRecord>,
+    socket: &SocketPath,
+    sidecar: &Sidecar,
+    state_record: Option<&SupervisorRecord>,
 ) -> Result<BackstopOutcome, BackstopError> {
-    // RED stub (50-09 Task 1): probing, the decision and acting land in GREEN.
-    Ok(BackstopOutcome::Refused(
-        BackstopDecision::RefuseIdentityUnavailable,
+    match super::probe(socket.as_path()) {
+        Ok(Liveness::Stale) => {}
+        Ok(Liveness::Gone) => return Err(BackstopError::NotStale("it is gone".to_string())),
+        Ok(Liveness::Alive(_)) => {
+            return Err(BackstopError::NotStale(
+                "its supervisor answered a ping".to_string(),
+            ));
+        }
+        Err(error) => {
+            return Err(BackstopError::NotStale(format!(
+                "it could not be probed: {error}"
+            )));
+        }
+    }
+    let facts = gather(sidecar, state_record);
+    match classify(&facts) {
+        BackstopDecision::LeaderPresentSignal => kill_group(socket, sidecar, state_record, &facts),
+        decision => settle(socket, decision),
+    }
+}
+
+/// Act on a decision that signals nothing: remove the files for the three
+/// decisions that prove the group gone, keep them for anything else.
+fn settle(
+    socket: &SocketPath,
+    decision: BackstopDecision,
+) -> Result<BackstopOutcome, BackstopError> {
+    match decision {
+        BackstopDecision::PreviousBoot
+        | BackstopDecision::EmptyGroup
+        | BackstopDecision::LeaderRecycled => {
+            super::remove_launch_files(socket)?;
+            Ok(BackstopOutcome::RemovedNothingSignalled(decision))
+        }
+        refusal => Ok(BackstopOutcome::Refused(refusal)),
+    }
+}
+
+/// The result of one validated group signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "no signalling path exists off Linux (MAC-2)")
+)]
+enum GroupSignal {
+    /// Sent to the whole group.
+    Sent(SignalPath),
+    /// The leader exited, or its pid no longer names the recorded leader of
+    /// the group: nothing was sent.
+    LeaderGone,
+}
+
+/// End a validated group: SIGTERM, wait for it to empty, then SIGKILL.
+fn kill_group(
+    socket: &SocketPath,
+    sidecar: &Sidecar,
+    state_record: Option<&SupervisorRecord>,
+    facts: &BackstopFacts,
+) -> Result<BackstopOutcome, BackstopError> {
+    let recorded = &facts.recorded;
+    let members = facts.members.clone();
+    let pgid = safe_target(recorded.pgid, facts.caller_pgrp).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "unsafe process group target")
+    })?;
+    let via = match signal_validated_group(recorded.pgid, recorded.start_time, libc::SIGTERM)? {
+        GroupSignal::Sent(via) => via,
+        GroupSignal::LeaderGone => {
+            // The leader changed between gathering and opening its pidfd;
+            // nothing was sent. Decide again on fresh facts.
+            let fresh = gather(sidecar, state_record);
+            return match classify(&fresh) {
+                BackstopDecision::LeaderPresentSignal => Err(BackstopError::Io(io::Error::other(
+                    "the group leader changed while it was being validated; nothing was signalled",
+                ))),
+                decision => settle(socket, decision),
+            };
+        }
+    };
+    if group_empties_within(pgid, crate::agent::TERMINATE_VERIFY_WAIT) {
+        super::remove_launch_files(socket)?;
+        return Ok(BackstopOutcome::Killed { via, members });
+    }
+    if signal_validated_group(recorded.pgid, recorded.start_time, libc::SIGKILL)?
+        == GroupSignal::LeaderGone
+    {
+        // The leader died during the grace period and members outlived the
+        // SIGTERM. Without a leader nothing proves they are the agent's, so
+        // decide again: an empty group is done, anything else is kept.
+        return match classify(&gather(sidecar, state_record)) {
+            BackstopDecision::EmptyGroup => {
+                super::remove_launch_files(socket)?;
+                Ok(BackstopOutcome::Killed { via, members })
+            }
+            decision => Ok(BackstopOutcome::Refused(decision)),
+        };
+    }
+    if group_empties_within(pgid, KILL_VERIFY_WAIT) {
+        super::remove_launch_files(socket)?;
+        return Ok(BackstopOutcome::Killed { via, members });
+    }
+    Err(BackstopError::Io(io::Error::other(format!(
+        "process group {pgid} still has members after SIGKILL; the socket and sidecar were kept"
+    ))))
+}
+
+/// Poll the census until no live member of `pgid` remains, up to `wait`.
+/// An unreadable process table never counts as empty.
+fn group_empties_within(pgid: libc::pid_t, wait: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if group_members(pgid).is_some_and(|members| members.is_empty()) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(crate::agent::TERMINATE_VERIFY_POLL);
+    }
+}
+
+/// Whether `/proc/<pgid>` is still the recorded leader (same start time)
+/// and still leads group `pgid`.
+#[cfg(target_os = "linux")]
+fn is_original_leader(pgid: u32, start_time: u64) -> bool {
+    own_process_stat(pgid).is_some_and(|stat| {
+        stat.start_time == start_time && i64::from(stat.pgrp) == i64::from(pgid)
+    })
+}
+
+/// Signal the group whose leader is `pgid` with the recorded `start_time`.
+///
+/// Opens a pidfd on the leader, which pins one process, then re-reads its
+/// start time and group: if they still match, the fd names the original
+/// leader (a recycled pid would show a later start time). Then
+/// `pidfd_send_signal(fd, signal, NULL, PIDFD_SIGNAL_PROCESS_GROUP)`. On
+/// `EINVAL` (a kernel before 6.9, RESEARCH A3) it re-validates and uses
+/// `killpg` ([`SignalPath::ValidatedKillpg`]). `ESRCH` is
+/// [`GroupSignal::LeaderGone`].
+#[cfg(target_os = "linux")]
+fn signal_validated_group(
+    pgid: u32,
+    start_time: u64,
+    signal: libc::c_int,
+) -> io::Result<GroupSignal> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let pid = safe_target(pgid, caller_pgrp()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "unsafe process group target")
+    })?;
+    // SAFETY: pidfd_open(pid, 0) takes plain integers and returns a new fd
+    // or -1 with errno set.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+    if raw < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(GroupSignal::LeaderGone),
+            _ => Err(error),
+        };
+    }
+    let raw = libc::c_int::try_from(raw)
+        .map_err(|_| io::Error::other("pidfd_open returned an out-of-range fd"))?;
+    // SAFETY: `raw` is a pidfd this call just opened and nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if !is_original_leader(pgid, start_time) {
+        return Ok(GroupSignal::LeaderGone);
+    }
+    // SAFETY: a live pidfd, a valid signal, a null siginfo (the kernel fills
+    // in a SI_USER one) and a flag the kernel validates.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            libc::PIDFD_SIGNAL_PROCESS_GROUP,
+        )
+    };
+    if rc == 0 {
+        return Ok(GroupSignal::Sent(SignalPath::PidfdGroup));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(GroupSignal::LeaderGone),
+        Some(libc::EINVAL) => validated_killpg(&pidfd, pid, pgid, start_time, signal),
+        _ => Err(error),
+    }
+}
+
+/// The `EINVAL` fallback: confirm through the pidfd that the pinned leader
+/// is alive, re-read its start time and group, then `killpg`. The window
+/// between the check and `killpg` is the documented TOCTOU this path keeps
+/// (T-50-24); while the leader is alive its pid cannot name another group.
+#[cfg(target_os = "linux")]
+fn validated_killpg(
+    pidfd: &std::os::fd::OwnedFd,
+    pid: libc::pid_t,
+    pgid: u32,
+    start_time: u64,
+    signal: libc::c_int,
+) -> io::Result<GroupSignal> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: signal 0 with no flags only checks that the pinned process is
+    // alive and signallable.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            0 as libc::c_int,
+            std::ptr::null::<libc::siginfo_t>(),
+            0 as libc::c_uint,
+        )
+    };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(GroupSignal::LeaderGone),
+            _ => Err(error),
+        };
+    }
+    if !is_original_leader(pgid, start_time) {
+        return Ok(GroupSignal::LeaderGone);
+    }
+    // SAFETY: `pid` passed `safe_target` (> 1, not our own group), so
+    // killpg reaches neither our group nor every process.
+    if unsafe { libc::killpg(pid, signal) } != 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(GroupSignal::LeaderGone),
+            _ => Err(error),
+        };
+    }
+    Ok(GroupSignal::Sent(SignalPath::ValidatedKillpg))
+}
+
+/// Off Linux there is no pidfd and no way to prove the leader's identity, so
+/// there is no signalling path: this sends nothing (MAC-2).
+#[cfg(not(target_os = "linux"))]
+fn signal_validated_group(
+    _pgid: u32,
+    _start_time: u64,
+    _signal: libc::c_int,
+) -> io::Result<GroupSignal> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "group signalling needs Linux pidfds; nothing was signalled",
     ))
 }
 
