@@ -286,6 +286,17 @@ pub struct State {
     /// liveness probe reports Unknown, never Stuck.
     #[serde(default)]
     pub monitor_pid: Option<u32>,
+    /// The published, ping-confirmed address of the supervisor that owns the
+    /// current stage (D-04): its socket path, launch id, and the agent
+    /// identity the stale-socket backstop validates. Written by the launcher,
+    /// under the per-phase lock, in one save that replaces the previous
+    /// record; it is never cleared ahead of that save. `None` means no
+    /// supervisor has been published for this state, OR the state was written
+    /// by a binary predating this field. The socket path is the only handle a
+    /// liveness question starts from: it is passed to
+    /// [`crate::supervisor::probe`] as recorded, never re-derived.
+    #[serde(skip)] // RED stub: not persisted yet
+    pub supervisor: Option<SupervisorRecord>,
     /// The Claude session id captured from the most recent captured stdout
     /// envelope for this phase's current stage (D-04, 28-02), read via
     /// [`crate::agent_result::session_id_from_capture`]. `None` means EITHER
@@ -435,6 +446,47 @@ pub struct State {
     /// field at each gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_notify_cmd: Option<String>,
+}
+
+/// The persisted handle on a launch's supervisor ([`State::supervisor`]).
+///
+/// The socket path is where [`crate::supervisor::probe`] asks; the launch id,
+/// agent process group, agent start time and boot id are what the
+/// stale-socket backstop checks before it may act, so a record from another
+/// launch or another boot never authorizes a signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupervisorRecord {
+    /// The published socket, `cache_dir/sock/<stem>.sock`.
+    pub socket_path: PathBuf,
+    /// The per-launch id, also the last segment of the socket's file name.
+    pub launch_id: String,
+    /// The agent's process group id.
+    pub agent_pgid: u32,
+    /// The agent's start time in clock ticks since boot.
+    pub agent_start_time: u64,
+    /// The kernel boot id at launch.
+    pub boot_id: String,
+}
+
+impl SupervisorRecord {
+    /// Build a record; the only way other crates can, since the struct is
+    /// `#[non_exhaustive]`.
+    pub fn new(
+        socket_path: PathBuf,
+        launch_id: String,
+        agent_pgid: u32,
+        agent_start_time: u64,
+        boot_id: String,
+    ) -> Self {
+        Self {
+            socket_path,
+            launch_id,
+            agent_pgid,
+            agent_start_time,
+            boot_id,
+        }
+    }
 }
 
 /// One human-only checkpoint recorded as seen for this run.
@@ -591,6 +643,7 @@ impl State {
             project_root,
             worktree_path: None,
             monitor_pid: None,
+            supervisor: None,
             session_id: None,
             checkpoint_resumes: 0,
             stop_until: None,
@@ -1194,6 +1247,47 @@ mod tests {
             Some(4242),
             "monitor_pid must round-trip through serde"
         );
+    }
+
+    /// `supervisor` survives a real save and load, and a state file without
+    /// the key (an older binary's) loads with `None` (D-04, 50-06).
+    #[test]
+    fn supervisor_record_round_trips_and_absent_reads_as_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let phase = PhaseId::new(50);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(state.supervisor, None, "a new state has no supervisor");
+        let record = SupervisorRecord::new(
+            PathBuf::from("/c/sock/0123456789abcdef-50-00000000000000ab.sock"),
+            "00000000000000ab".to_string(),
+            4242,
+            123_456,
+            "boot-id".to_string(),
+        );
+        state.supervisor = Some(record.clone());
+        crate::workflow::save_state(&state).expect("save the state");
+        let loaded = crate::workflow::load_state(dir.path(), phase).expect("load the state");
+        assert_eq!(
+            loaded.supervisor,
+            Some(record),
+            "the supervisor record must survive a save and load"
+        );
+
+        let absent = r#"{
+            "stage": "code",
+            "phase": 50,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(absent).expect("an older state file loads");
+        assert_eq!(loaded.supervisor, None, "an absent key reads as None");
     }
 
     /// A serde-absent `monitor_pid` (state written by a pre-18b binary) must
