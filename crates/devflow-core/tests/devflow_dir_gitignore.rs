@@ -82,6 +82,18 @@ fn wait_for_pid_to_die(pid: u32, timeout: Duration) {
 /// against its own fresh temp project root. Failures accumulate into a
 /// vector so one regressed site doesn't hide another (mirrors the
 /// accumulate-then-assert shape `gitignore_coverage.rs` already uses).
+/// The launch context case 3 passes `spawn_monitor` (50-10): this test binary
+/// as the monitor executable, which is what `spawn_monitor` resolved itself
+/// before it took a context, and a cache dir under the case's own tempdir.
+fn launch_context(root: &Path) -> monitor::LaunchContext {
+    monitor::LaunchContext::new(
+        root.join("cache"),
+        monitor::MonitorExec::Subcommand {
+            exe: std::env::current_exe().unwrap(),
+        },
+    )
+}
+
 #[test]
 fn all_seven_devflow_constructors_produce_the_gitignore() {
     let mut failures: Vec<&str> = Vec::new();
@@ -145,6 +157,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
             &["-c".to_string(), "exit 0".to_string()],
             &[],
             monitor::MonitorLaunch::Legacy,
+            &launch_context(root),
         )
         .expect("spawn_monitor");
 
