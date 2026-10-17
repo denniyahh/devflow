@@ -78,8 +78,19 @@ impl Default for HermeticHome {
 /// repo-redirecting `GIT_*` variable removed. `home` must outlive the child
 /// and any monitor it launches.
 pub fn hermetic_devflow(home: &HermeticHome) -> Command {
-    let _ = home;
-    Command::new(devflow_bin())
+    let mut command = Command::new(devflow_bin());
+    command
+        .env("HOME", home.home())
+        .env("XDG_CACHE_HOME", home.home().join(".cache"))
+        .env("XDG_CONFIG_HOME", home.config_dir())
+        .env("DEVFLOW_CACHE_DIR", home.cache_dir());
+    for name in devflow_core::test_support::REPO_LOCAL_GIT_VARS
+        .iter()
+        .chain(devflow_core::test_support::ALSO_REDIRECTING_GIT_VARS)
+    {
+        command.env_remove(name);
+    }
+    command
 }
 
 /// A directory of stub programs to put first on a child's `PATH`. Removed on

@@ -320,15 +320,31 @@ fn copy_char_or_lifetime(chars: &[char], start: usize, out: &mut String) -> usiz
 /// Raw devflow spawns in comment-stripped `code`: the two direct
 /// `Command::new` forms and Cargo's binary path variable.
 fn raw_devflow_spawns(code: &str) -> usize {
-    let _ = code;
-    0
+    [
+        concat!("Command::new(", "devflow_bin())"),
+        concat!("Command::new(common::", "devflow_bin())"),
+        concat!("CARGO_BIN_EXE_", "devflow"),
+    ]
+    .iter()
+    .map(|token| code.matches(token).count())
+    .sum()
 }
 
 /// Process-environment mutations in comment-stripped `code`, counted as whole
 /// identifiers so `a_set_variable` is not one.
 fn env_mutations(code: &str) -> usize {
-    let _ = code;
-    0
+    [concat!("set_", "var"), concat!("remove_", "var")]
+        .iter()
+        .map(|token| {
+            code.match_indices(token)
+                .filter(|&(at, _)| {
+                    let before = code[..at].chars().next_back();
+                    let after = code[at + token.len()..].chars().next();
+                    !before.is_some_and(is_ident_char) && !after.is_some_and(is_ident_char)
+                })
+                .count()
+        })
+        .sum()
 }
 
 fn read_source(path: &Path) -> String {
