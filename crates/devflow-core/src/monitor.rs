@@ -7208,4 +7208,52 @@ exit 0
             panic!("{path}: {why}");
         }
     }
+
+    /// `(process_group(0) calls, wait_for_publish( occurrences)` in `source`
+    /// cut at its first `mod tests {` line, with every line whose first
+    /// non-blank characters are `//` dropped, so neither comments nor this
+    /// module's own literals count.
+    fn launch_scan_counts(source: &str) -> (usize, usize) {
+        let code: Vec<&str> = source
+            .lines()
+            .take_while(|line| !line.starts_with("mod tests {"))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let code = code.join("\n");
+        (
+            code.matches("process_group(0)").count(),
+            code.matches("wait_for_publish(").count(),
+        )
+    }
+
+    /// R6-G4, permanent: the agent and the `__monitor` supervisor each lead
+    /// their own process group, and `spawn_monitor` waits for the publish
+    /// through 50-24's `wait_for_publish` (its definition plus the call).
+    #[test]
+    fn spawn_monitor_groups_both_processes_and_waits_for_publish() {
+        let planted = "fn f() {\n    command.process_group(0);\n    // .process_group(0)\n    \
+                       wait_for_publish(&mut child);\n}\nmod tests {\n    process_group(0) \
+                       process_group(0) wait_for_publish( wait_for_publish(\n}\n";
+        assert_eq!(
+            launch_scan_counts(planted),
+            (1, 1),
+            "planted control: one call and one publish wait count once each; the comment \
+             line and the test module do not count"
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/monitor.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        let (groups, waits) = launch_scan_counts(&source);
+        assert!(
+            groups >= 2,
+            "{path}: non-test code must start both the agent and the `__monitor` supervisor \
+             with `process_group(0)`; found {groups}"
+        );
+        assert!(
+            waits >= 2,
+            "{path}: non-test code must define `wait_for_publish(` and call it from \
+             `spawn_monitor`; found {waits}"
+        );
+    }
 }
