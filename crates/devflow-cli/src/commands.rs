@@ -1026,6 +1026,41 @@ fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) ->
     }
 }
 
+/// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
+/// it (50-12): answered from the socket recorded in `state.supervisor`
+/// through [`supervisor::probe`], never from a pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // RED stub (50-12 Task 1)
+pub(crate) enum PhaseLiveness {
+    /// The recorded socket answered a ping.
+    Alive {
+        /// Who owns the run right now, from the ping reply.
+        owner: String,
+        /// The launch shape, from the ping reply.
+        launch: String,
+    },
+    /// The socket file remains but nothing listens on it.
+    Stale,
+    /// No socket at the recorded path, and the phase is stopped.
+    Gone,
+    /// No socket at the recorded path, but the phase is not stopped.
+    GoneWhileActive,
+    /// The state records no supervisor.
+    NotLaunched,
+    /// The probe could not answer; a path-free summary of why.
+    ProbeFailed(String),
+}
+
+/// RED stub (50-12 Task 1): answers `NotLaunched` for every input.
+#[allow(dead_code)]
+fn phase_liveness(
+    _record: Option<&devflow_core::state::SupervisorRecord>,
+    _probe: Option<Result<devflow_core::supervisor::Liveness, devflow_core::supervisor::ProbeError>>,
+    _stopped: bool,
+) -> PhaseLiveness {
+    PhaseLiveness::NotLaunched
+}
+
 /// Recovery verbs discoverable from a phase's liveness (21a, D-03) — the
 /// pure, testable counterpart to `status`'s old inline Stuck `println!`.
 /// Always includes `devflow resume` for `Stuck`; additionally includes
@@ -5476,6 +5511,90 @@ mod tests {
         assert_eq!(liveness(pid, true, false), Liveness::BetweenStages);
         assert_eq!(liveness(pid, false, false), Liveness::Stuck);
         assert_eq!(liveness(pid, false, true), Liveness::Stuck);
+    }
+
+    /// A ping reply as a supervisor sends it; built through serde because
+    /// `PingReply` is `#[non_exhaustive]`.
+    fn ping_reply(owner: &str, launch: &str) -> devflow_core::supervisor::protocol::PingReply {
+        serde_json::from_value(serde_json::json!({
+            "launch_id": "0123456789abcdef",
+            "phase": "7",
+            "stage": "code",
+            "launch": launch,
+            "owner": owner,
+            "agent_pid": 10,
+            "agent_pgid": 10,
+            "agent_start_time": 20,
+            "boot_id": null,
+            "supervisor_pid": 11,
+        }))
+        .expect("a complete ping reply")
+    }
+
+    /// 50-12: the pure mapping over every probe outcome, with and without
+    /// `stopped`. Each row of one `stopped` value is a distinct answer, and
+    /// GONE splits by `stopped`: an abandoned active phase is not a stopped
+    /// one.
+    #[test]
+    fn liveness_matrix_covers_every_probe_outcome() {
+        use devflow_core::supervisor::{Liveness as Probe, ProbeError};
+        let record = devflow_core::state::SupervisorRecord::new(
+            PathBuf::from("/cache/sock/x.sock"),
+            "0123456789abcdef".to_string(),
+            10,
+            20,
+            "boot".to_string(),
+        );
+        for stopped in [false, true] {
+            let rows = vec![
+                phase_liveness(None, None, stopped),
+                phase_liveness(Some(&record), Some(Ok(Probe::Gone)), stopped),
+                phase_liveness(Some(&record), Some(Ok(Probe::Stale)), stopped),
+                phase_liveness(
+                    Some(&record),
+                    Some(Ok(Probe::Alive(ping_reply("agent_running", "stream")))),
+                    stopped,
+                ),
+                phase_liveness(
+                    Some(&record),
+                    Some(Err(ProbeError::NoReply("timed out".to_string()))),
+                    stopped,
+                ),
+            ];
+            assert_eq!(rows[0], PhaseLiveness::NotLaunched, "stopped={stopped}");
+            let gone = if stopped {
+                PhaseLiveness::Gone
+            } else {
+                PhaseLiveness::GoneWhileActive
+            };
+            assert_eq!(rows[1], gone, "stopped={stopped}");
+            assert_eq!(rows[2], PhaseLiveness::Stale, "stopped={stopped}");
+            assert_eq!(
+                rows[3],
+                PhaseLiveness::Alive {
+                    owner: "agent_running".to_string(),
+                    launch: "stream".to_string(),
+                },
+                "stopped={stopped}"
+            );
+            match &rows[4] {
+                PhaseLiveness::ProbeFailed(why) => assert!(
+                    why.contains("no valid ping reply") && !why.contains('/'),
+                    "a path-free probe failure, got {why:?}"
+                ),
+                other => panic!("a probe error must be ProbeFailed, got {other:?}"),
+            }
+            for (at, row) in rows.iter().enumerate() {
+                for other in &rows[at + 1..] {
+                    assert_ne!(row, other, "stopped={stopped}: two outcomes share one answer");
+                }
+            }
+        }
+        assert_ne!(
+            phase_liveness(Some(&record), Some(Ok(Probe::Gone)), true),
+            phase_liveness(Some(&record), Some(Ok(Probe::Gone)), false),
+            "GONE while stopped must differ from GONE while active"
+        );
     }
 
     /// 18b: a corrupt pid (0, or above `i32::MAX`) must never read as alive

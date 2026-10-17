@@ -503,3 +503,110 @@ fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
         "the supervisor's in-process advance evaluated the stage as success:\n{events}"
     );
 }
+
+/// `devflow status` for `root`, as an operator runs it; its stdout.
+fn run_status(home: &common::HermeticHome, root: &Path) -> String {
+    let output = common::hermetic_devflow(home)
+        .arg("status")
+        .arg(root)
+        .current_dir(root)
+        .output()
+        .expect("run devflow status");
+    assert!(
+        output.status.success(),
+        "status failed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// 50-12 criterion 1: `devflow status` answers ALIVE, STALE and GONE from the
+/// recorded socket, and each non-ALIVE answer names the verb that repairs it.
+/// The run is made STALE by a SIGKILL of its supervisor (the pid comes from
+/// the sidecar and is identity-checked first), and GONE by removing the stale
+/// socket file. The reaper ends the agent group the SIGKILL orphaned.
+#[test]
+fn status_reports_each_liveness_state_with_its_repair_verb() {
+    let phase = PhaseId::new(68);
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let output = run_start(&home, &root, phase, &fake_bin, Shape::Stream);
+    assert!(
+        output.status.success(),
+        "start failed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = devflow_core::workflow::load_state(&root, phase)
+        .expect("start saved state")
+        .supervisor
+        .expect("start must record state.supervisor");
+    let socket = record.socket_path.clone();
+    let stop_verb = format!("devflow stop --phase {phase}");
+    let resume_verb = format!("devflow resume --phase {phase}");
+
+    let alive = run_status(&home, &root);
+    assert!(
+        alive.contains("ALIVE") && alive.contains("owner: agent_running"),
+        "a live run reads ALIVE with its owner:\n{alive}"
+    );
+    assert!(
+        alive.contains(&format!("supervisor: {}", socket.display())),
+        "status names the recorded socket:\n{alive}"
+    );
+    assert!(
+        !alive.contains(&stop_verb) && !alive.contains(&resume_verb),
+        "an ALIVE run needs no repair:\n{alive}"
+    );
+
+    let sidecar = supervisor::read_sidecar(&socket.with_extension("json")).expect("sidecar");
+    let pid = sidecar.supervisor_pid;
+    assert!(
+        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
+        "the sidecar's supervisor {pid} is the recorded process"
+    );
+    let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    assert!(signed > 1, "refusing to signal pid {signed}");
+    // SAFETY: `signed > 1` names the supervisor just identity-checked.
+    assert_eq!(
+        unsafe { libc::kill(signed, libc::SIGKILL) },
+        0,
+        "SIGKILL {pid}"
+    );
+    assert!(
+        holds_within(RUN_WAIT, || !devflow_core::agent::agent_running(pid)),
+        "the supervisor {pid} is gone after SIGKILL"
+    );
+    assert_eq!(
+        supervisor::probe(&socket).expect("probe the orphaned socket"),
+        Liveness::Stale,
+        "a SIGKILLed supervisor leaves its socket STALE"
+    );
+
+    let stale = run_status(&home, &root);
+    assert!(stale.contains("STALE"), "the run reads STALE:\n{stale}");
+    let stop_at = stale
+        .find(&stop_verb)
+        .unwrap_or_else(|| panic!("STALE names `{stop_verb}`:\n{stale}"));
+    let resume_at = stale
+        .find(&resume_verb)
+        .unwrap_or_else(|| panic!("STALE names `{resume_verb}` after the stop:\n{stale}"));
+    assert!(stop_at < resume_at, "stop comes before resume:\n{stale}");
+    assert!(!stale.contains("ALIVE"), "a STALE run is not ALIVE:\n{stale}");
+
+    fs::remove_file(&socket).expect("remove the stale socket");
+    let gone = run_status(&home, &root);
+    assert!(gone.contains("GONE"), "the run reads GONE:\n{gone}");
+    assert!(
+        gone.contains(&resume_verb),
+        "GONE while active names `{resume_verb}`:\n{gone}"
+    );
+    assert!(
+        !gone.contains(&stop_verb),
+        "GONE names no stop, there is nothing left to stop:\n{gone}"
+    );
+}
