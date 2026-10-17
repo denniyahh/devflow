@@ -336,3 +336,9 @@ None.
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-17*
+
+## Self-Check: PASSED
+
+- Files: `crates/devflow-cli/tests/supervisor_e2e.rs`, `crates/devflow-core/src/monitor.rs` and this SUMMARY exist.
+- Commits `e69257f`, `a03b572`, `39c2af8`, `b921ace` and `2d08777` (this SUMMARY) are ancestors of HEAD.
+- Plan artifact `contains` checks hold: `pub struct Published` (monitor.rs), `launch_id` (main.rs), `NotReady` (devflow_dir_gitignore.rs), `start_publishes_a_live_supervisor_socket_for_each_launch_shape` (supervisor_e2e.rs). Key-link patterns hold: `wait_for_publish(`, `state.supervisor = Some`, `AgentOutcome::Completed`.
