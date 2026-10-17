@@ -6561,4 +6561,335 @@ exit 0
         // SAFETY: getpgrp has no preconditions.
         assert_eq!(parsed.pgid, unsafe { libc::getpgrp() });
     }
+
+    // ---- 50-24: run_supervised_stage before it publishes ----------------
+
+    /// The cache dir the publish-wait child entry builds its socket under.
+    const PUBLISH_CACHE_ENV: &str = "DEVFLOW_TEST_PUBLISH_CACHE";
+    /// The project root the publish-wait child entry supervises.
+    const PUBLISH_ROOT_ENV: &str = "DEVFLOW_TEST_PUBLISH_ROOT";
+    /// The launch id the publish-wait child entry publishes.
+    const PUBLISH_LAUNCH_ENV: &str = "DEVFLOW_TEST_PUBLISH_LAUNCH";
+    /// `monitor_test_hold`'s variable, set (never read) by these tests.
+    const TEST_HOLD_ENV: &str = "DEVFLOW_TEST_HOLD";
+    /// The child entry the publish-wait tests re-run.
+    const PUBLISH_ENTRY: &str = "monitor::tests::supervise_a_stage_for_the_publish_wait";
+
+    /// The child half of the publish-wait tests: supervise `sh -c 'exec
+    /// sleep 300'` in the capture shape on the spec the parent's env names.
+    /// Returns at once without that env, so an `--include-ignored` run is
+    /// harmless; panics with the error when `run_supervised_stage` fails.
+    #[test]
+    #[ignore = "child entry of the 50-24 publish-wait tests; returns at once without its env"]
+    fn supervise_a_stage_for_the_publish_wait() {
+        let (Some(cache), Some(root), Some(launch_id)) = (
+            std::env::var_os(PUBLISH_CACHE_ENV),
+            std::env::var_os(PUBLISH_ROOT_ENV),
+            std::env::var_os(PUBLISH_LAUNCH_ENV),
+        ) else {
+            return;
+        };
+        let launch_id = launch_id.into_string().expect("utf-8 launch id");
+        let root = PathBuf::from(root);
+        let socket = SocketPath::for_launch(Path::new(&cache), &root, STAGE_PHASE, &launch_id)
+            .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            root,
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            launch_id,
+        );
+        spec.args = vec!["-c".to_string(), "exec sleep 300".to_string()];
+        spec.stage = Some(Stage::Code);
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        run.supervisor.finish();
+    }
+
+    /// Spawn this test binary for [`PUBLISH_ENTRY`] under `process_group(0)`
+    /// (the argv shape `run_test_in_child` uses), with its stdout and stderr
+    /// in `log`. `hold` sets `DEVFLOW_TEST_HOLD=after_sidecar:<hold>`.
+    fn spawn_publish_entry(
+        cache: &Path,
+        fixture: &StageFixture,
+        launch_id: &str,
+        hold: Option<&Path>,
+        log: &Path,
+    ) -> OwnedChild {
+        let out = std::fs::File::create(log).expect("create the entry log");
+        let err = out.try_clone().expect("share the entry log");
+        let mut cmd = std::process::Command::new(
+            std::env::current_exe().expect("current_exe for the child entry"),
+        );
+        cmd.arg(PUBLISH_ENTRY)
+            .arg("--exact")
+            .arg("--include-ignored")
+            .arg("--test-threads=1")
+            .env(PUBLISH_CACHE_ENV, cache)
+            .env(PUBLISH_ROOT_ENV, &fixture.root)
+            .env(PUBLISH_LAUNCH_ENV, launch_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .process_group(0);
+        match hold {
+            Some(path) => cmd.env(TEST_HOLD_ENV, format!("after_sidecar:{}", path.display())),
+            None => cmd.env_remove(TEST_HOLD_ENV),
+        };
+        OwnedChild(cmd.spawn().expect("spawn the publish-wait child entry"))
+    }
+
+    /// The agent pid `run_supervised_stage` wrote before it published.
+    fn publish_agent_pid(fixture: &StageFixture) -> u32 {
+        fixture
+            .pid_file()
+            .parse()
+            .expect("the agent pid file holds a pid")
+    }
+
+    #[test]
+    fn a_supervisor_that_fails_to_publish_ends_its_agent_group() {
+        // Failure direction: `sock/` is a symlink, which publishing refuses.
+        let fixture = StageFixture::new();
+        let elsewhere = fixture.path("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("create the symlink target");
+        let bad_cache = fixture.path("bad-cache");
+        std::fs::create_dir(&bad_cache).expect("create the bad cache dir");
+        std::os::unix::fs::symlink(&elsewhere, bad_cache.join("sock")).expect("plant sock/");
+        let launch_id = crate::supervisor::new_launch_id();
+        let socket = SocketPath::for_launch(&bad_cache, &fixture.root, STAGE_PHASE, &launch_id)
+            .expect("socket path fits sun_path");
+        let log = fixture.path("fail.log");
+        let mut child = spawn_publish_entry(&bad_cache, &fixture, &launch_id, None, &log);
+        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT);
+        let entry_log = std::fs::read_to_string(&log).unwrap_or_default();
+        match &result {
+            Err(MonitorError::NotReady(text)) => assert!(
+                text.contains("exited by itself before publishing"),
+                "the child exited before publishing: {text}\n{entry_log}"
+            ),
+            other => panic!("expected NotReady, got {other:?}\n{entry_log}"),
+        }
+        let agent = publish_agent_pid(&fixture);
+        let survivor = crate::agent::process_start_time(agent).map(|start_time| LeaderGroup {
+            pgid: agent,
+            start_time,
+        });
+        assert!(
+            stage_wait_until(Duration::from_secs(2), || {
+                let signed = libc::pid_t::try_from(agent).expect("pid fits pid_t");
+                // SAFETY: signal 0 only checks for existence.
+                let rc = unsafe { libc::kill(signed, 0) };
+                rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            }),
+            "no agent survives a publish error: {agent} is alive\n{entry_log}"
+        );
+        drop(survivor);
+
+        // Control: a plain cache dir publishes, and the helper returns the
+        // reply and leaves the supervisor and its agent running.
+        let fixture = StageFixture::new();
+        let launch_id = crate::supervisor::new_launch_id();
+        let socket =
+            SocketPath::for_launch(fixture.cache.path(), &fixture.root, STAGE_PHASE, &launch_id)
+                .expect("socket path fits sun_path");
+        let log = fixture.path("ok.log");
+        let mut child = spawn_publish_entry(fixture.cache.path(), &fixture, &launch_id, None, &log);
+        let reply = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "a published supervisor is returned: {err}\n{}",
+                    std::fs::read_to_string(&log).unwrap_or_default()
+                )
+            });
+        let agent = LeaderGroup::of(reply.agent_pid);
+        assert_eq!(reply.launch_id, launch_id);
+        assert_eq!(publish_agent_pid(&fixture), reply.agent_pid);
+        assert!(
+            crate::agent::is_same_process(reply.agent_pid, reply.agent_start_time),
+            "the published agent is alive and is the recorded process"
+        );
+        assert!(
+            child.0.try_wait().expect("poll the child").is_none(),
+            "the published supervisor is left running"
+        );
+        let stopped =
+            crate::supervisor::request_shutdown(socket.as_path(), Duration::from_secs(10))
+                .expect("request the stop");
+        assert!(
+            matches!(stopped, crate::supervisor::ShutdownOutcome::Stopped { .. }),
+            "the supervisor stops: {stopped:?}"
+        );
+        assert!(
+            exit_within(&mut child.0, Duration::from_secs(5)).is_some(),
+            "the child exits within 5 s of the stop"
+        );
+        let entry_log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            entry_log.contains(&format!("test {PUBLISH_ENTRY} ... ok"))
+                && entry_log.contains("1 passed"),
+            "the child ran its one entry: {entry_log}"
+        );
+        assert!(group_gone_within(agent.pgid, Duration::from_secs(2)));
+    }
+
+    /// What one killed-before-publishing run left: the wait's text, the
+    /// agent's group (guarded), and the launch's socket.
+    struct KilledRun {
+        text: String,
+        agent: LeaderGroup,
+        socket: SocketPath,
+    }
+
+    /// Launch the child entry parked after its sidecar write, read the
+    /// sidecar, let `tamper` change it, SIGKILL the child by its own `Child`
+    /// and run the publish wait.
+    fn kill_before_publishing(
+        fixture: &StageFixture,
+        tamper: impl FnOnce(&SocketPath, &crate::supervisor::Sidecar),
+    ) -> KilledRun {
+        let launch_id = crate::supervisor::new_launch_id();
+        let socket =
+            SocketPath::for_launch(fixture.cache.path(), &fixture.root, STAGE_PHASE, &launch_id)
+                .expect("socket path fits sun_path");
+        let hold = fixture.path("never-created");
+        let log = fixture.path("killed.log");
+        let mut child =
+            spawn_publish_entry(fixture.cache.path(), fixture, &launch_id, Some(&hold), &log);
+        let mut sidecar = None;
+        let parked = stage_wait_until(Duration::from_secs(5), || {
+            sidecar = crate::supervisor::read_sidecar(&socket.sidecar_path()).ok();
+            sidecar.is_some() || child.0.try_wait().ok().flatten().is_some()
+        });
+        let entry_log = || std::fs::read_to_string(&log).unwrap_or_default();
+        let sidecar = sidecar
+            .filter(|_| parked)
+            .unwrap_or_else(|| panic!("no sidecar within 5 s\n{}", entry_log()));
+        let agent = LeaderGroup {
+            pgid: sidecar.agent_pgid,
+            start_time: sidecar.agent_start_time,
+        };
+        assert_eq!(sidecar.launch_id, launch_id);
+        assert_eq!(
+            sidecar.agent_pgid, sidecar.agent_pid,
+            "the agent leads its group"
+        );
+        assert!(agent.alive(), "the agent runs while the child is parked");
+        tamper(&socket, &sidecar);
+        child.0.kill().expect("SIGKILL the child by its own Child");
+        let result = wait_for_publish(&mut child.0, &socket, &launch_id, PUBLISH_WAIT);
+        let text = match result {
+            Err(MonitorError::NotReady(text)) => text,
+            other => panic!("expected NotReady, got {other:?}\n{}", entry_log()),
+        };
+        KilledRun {
+            text,
+            agent,
+            socket,
+        }
+    }
+
+    #[test]
+    fn a_supervisor_killed_before_publishing_has_its_agent_group_ended_through_its_sidecar() {
+        // Run 1: the sidecar is untouched, so the launcher ends its group.
+        let fixture = StageFixture::new();
+        let run = kill_before_publishing(&fixture, |_, _| {});
+        let pgid = run.agent.pgid;
+        assert!(
+            run.text
+                .contains(&format!("ended the agent group {pgid} its sidecar records")),
+            "{}",
+            run.text
+        );
+        assert!(
+            group_gone_within(pgid, Duration::from_secs(2)),
+            "the recorded agent group {pgid} is ended"
+        );
+        assert!(!run.socket.as_path().exists(), "no socket is left");
+        assert!(!run.socket.sidecar_path().exists(), "no sidecar is left");
+
+        // Run 2, control: without the sidecar nothing names the agent, so it
+        // survives the child's SIGKILL.
+        let fixture = StageFixture::new();
+        let run = kill_before_publishing(&fixture, |socket, _| {
+            std::fs::remove_file(socket.sidecar_path()).expect("remove the sidecar");
+        });
+        assert!(run.text.contains("no sidecar"), "{}", run.text);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            run.agent.alive(),
+            "control: the agent survives without a sidecar"
+        );
+        let pgid = run.agent.pgid;
+        drop(run.agent);
+        assert!(group_gone_within(pgid, Duration::from_secs(2)));
+
+        // Run 3, identity control: a recorded start time one tick off is
+        // LeaderRecycled, and nothing is signalled.
+        let fixture = StageFixture::new();
+        let run = kill_before_publishing(&fixture, |socket, sidecar| {
+            let wrong = crate::supervisor::Sidecar {
+                agent_start_time: sidecar.agent_start_time + 1,
+                ..sidecar.clone()
+            };
+            crate::supervisor::write_sidecar(socket, &wrong).expect("rewrite the sidecar");
+        });
+        assert!(
+            run.text.contains("LeaderRecycled") && run.text.contains("nothing was signalled"),
+            "{}",
+            run.text
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            run.agent.alive(),
+            "identity control: the agent is not signalled"
+        );
+        let pgid = run.agent.pgid;
+        drop(run.agent);
+        assert!(group_gone_within(pgid, Duration::from_secs(2)));
+    }
+
+    /// Whether non-test `monitor.rs` defines `fn monitor_test_hold(` exactly
+    /// once, directly under attribute lines that include `#[cfg(test)]`.
+    fn test_hold_guard_verdict(_non_test: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[test]
+    fn the_test_hold_is_compiled_out_of_non_test_builds() {
+        let guarded = "#[cfg(test)]\nfn monitor_test_hold(point: &str) {}\n";
+        assert_eq!(test_hold_guard_verdict(guarded), Ok(()));
+        let guarded_and_more = "/// Doc.\n#[cfg(test)]\n#[allow(clippy::needless_pass_by_value)]\nfn monitor_test_hold(point: &str) {}\n";
+        assert_eq!(test_hold_guard_verdict(guarded_and_more), Ok(()));
+        let unguarded = "fn monitor_test_hold(point: &str) {}\n";
+        assert!(test_hold_guard_verdict(unguarded).is_err(), "no attribute");
+        let wrong_attribute = "#[allow(dead_code)]\nfn monitor_test_hold(point: &str) {}\n";
+        assert!(
+            test_hold_guard_verdict(wrong_attribute).is_err(),
+            "only #[allow(dead_code)]"
+        );
+        let commented = "// #[cfg(test)]\n// fn monitor_test_hold(point: &str) {}\n";
+        assert!(
+            test_hold_guard_verdict(commented).is_err(),
+            "a commented-out definition is zero definitions"
+        );
+        let twice = format!("{guarded}{guarded}");
+        assert!(test_hold_guard_verdict(&twice).is_err(), "two definitions");
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/monitor.rs");
+        let source =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+        let lines: Vec<&str> = source.lines().collect();
+        let tests_at = lines
+            .iter()
+            .position(|line| *line == "mod tests {")
+            .unwrap_or_else(|| panic!("{path} has no `mod tests {{` line"));
+        let non_test = lines[..tests_at].join("\n");
+        if let Err(why) = test_hold_guard_verdict(&non_test) {
+            panic!("{path}: {why}");
+        }
+    }
 }
