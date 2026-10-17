@@ -25,6 +25,7 @@ pub mod protocol;
 
 use crate::phase_id::PhaseId;
 use crate::registry;
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -318,6 +319,142 @@ pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
     protocol::ping(stream)
         .map(Liveness::Alive)
         .map_err(ProbeError::NoReply)
+}
+
+/// The JSON file beside a socket (same stem, `.json`, mode `0600`) that
+/// records who the socket belongs to, so a sweep can answer by project root
+/// and phase without loading any state file (R-7).
+///
+/// Its identity fields (`agent_pgid`, `agent_start_time`, `boot_id`) are only
+/// an input to the stale-socket backstop's own validation; nothing signals a
+/// process because a sidecar names it (T-50-13). Built only inside this
+/// crate; other crates read it through [`read_sidecar`] and [`sweep_in`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Sidecar {
+    /// The per-launch id, also the last segment of the socket's file name.
+    pub launch_id: String,
+    /// The project root the launch runs for.
+    pub project_root: PathBuf,
+    /// The phase the launch runs for.
+    pub phase: PhaseId,
+    /// The stage the supervised agent runs, when one is known.
+    pub stage: Option<String>,
+    /// The agent kind, as its label.
+    pub agent: String,
+    /// The launch shape: `capture` or `stream`.
+    pub launch: String,
+    /// The agent's pid.
+    pub agent_pid: u32,
+    /// The agent's process group id.
+    pub agent_pgid: u32,
+    /// The agent's start time in clock ticks since boot.
+    pub agent_start_time: u64,
+    /// The kernel boot id at launch.
+    pub boot_id: String,
+    /// The supervisor's pid.
+    pub supervisor_pid: u32,
+    /// The supervisor's start time in clock ticks since boot.
+    pub supervisor_start_time: u64,
+    /// When the sidecar was written, RFC 3339 in UTC
+    /// (`YYYY-MM-DDTHH:MM:SSZ`).
+    pub created_at: String,
+}
+
+/// Why a sidecar could not be read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SidecarError {
+    /// The file could not be read.
+    #[error("could not read the sidecar: {0}")]
+    Io(#[from] io::Error),
+    /// The file is not a complete sidecar JSON object.
+    #[error("the sidecar does not parse: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// `unix_secs` as an RFC 3339 UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ`.
+pub(crate) fn rfc3339_from_unix(unix_secs: u64) -> String {
+    let _ = unix_secs;
+    String::new() // RED stub
+}
+
+/// The current time as [`rfc3339_from_unix`] formats it, for
+/// [`Sidecar::created_at`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the launcher (50-07) is the first non-test writer of a sidecar"
+    )
+)]
+pub(crate) fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    rfc3339_from_unix(secs)
+}
+
+/// Write `sidecar` beside `socket` atomically: a uniquely named `.tmp` file
+/// in the socket directory, set to mode `0600`, then renamed onto
+/// [`SocketPath::sidecar_path`]. The sidecar is a regular file, so `rename`
+/// is safe here; only sockets must never be renamed into place. The socket
+/// directory is created `0700` if absent and refused if it is unsafe, as
+/// [`publish`] does.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the launcher (50-07) is the first non-test writer of a sidecar"
+    )
+)]
+pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Result<()> {
+    let _ = (socket, sidecar);
+    Ok(()) // RED stub
+}
+
+/// Read and parse the sidecar at `path`. Read-only.
+pub fn read_sidecar(path: &Path) -> Result<Sidecar, SidecarError> {
+    let _ = path;
+    Err(SidecarError::Io(io::Error::other("RED stub")))
+}
+
+/// One socket stem found under `sock/`: its socket (if present), its sidecar
+/// (if present and readable) and its liveness.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SweepEntry {
+    /// `sock/<stem>.sock`, whether or not that file exists.
+    pub socket_path: PathBuf,
+    /// Whether `<stem>.sock` was listed in the directory.
+    pub socket_present: bool,
+    /// The parsed sidecar, when `<stem>.json` exists and parses.
+    pub sidecar: Option<Sidecar>,
+    /// `Some` only when `<stem>.json` exists but does not read or parse, so a
+    /// missing sidecar (`None` here and in [`Self::sidecar`]) is never
+    /// confused with a broken one.
+    pub sidecar_error: Option<String>,
+    /// The launch id segment of a stem that fits the
+    /// `<016x digest>-<padded phase>-<launch id>` scheme, else `None`.
+    pub launch_id_in_name: Option<String>,
+    /// [`probe`]'s answer for a present socket; `Ok(Liveness::Gone)` for a
+    /// sidecar with no socket.
+    pub liveness: Result<Liveness, ProbeError>,
+}
+
+/// Every socket stem under `cache_dir`'s socket directory, sorted by socket
+/// path. Read-only and never acting (D-06): it lists, probes and reads, and
+/// removes no file and sends no shutdown.
+pub fn sweep_in(cache_dir: &Path) -> Vec<SweepEntry> {
+    let _ = cache_dir;
+    Vec::new() // RED stub
+}
+
+/// The [`sweep_in`] entries that may belong to `project_root` and `phase`.
+/// Read-only and never acting (D-06).
+pub fn sweep_for_in(cache_dir: &Path, project_root: &Path, phase: PhaseId) -> Vec<SweepEntry> {
+    let _ = (cache_dir, project_root, phase);
+    Vec::new() // RED stub
 }
 
 #[cfg(test)]
@@ -877,6 +1014,322 @@ mod tests {
         assert!(
             matches!(result, Err(PublishError::UnsafeDir(_))),
             "a sock/ that is not a directory must be refused, got {result:?}"
+        );
+    }
+
+    const ROOT: &str = "/project/root";
+    const OTHER_ROOT: &str = "/project/other";
+
+    fn sample_sidecar(launch_id: &str, root: &Path, phase: PhaseId) -> Sidecar {
+        Sidecar {
+            launch_id: launch_id.to_string(),
+            project_root: root.to_path_buf(),
+            phase,
+            stage: Some("code".to_string()),
+            agent: "claude".to_string(),
+            launch: "stream".to_string(),
+            agent_pid: 4242,
+            agent_pgid: 4242,
+            agent_start_time: 123_456,
+            boot_id: "boot-test".to_string(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_time: 654_321,
+            created_at: rfc3339_from_unix(1_700_000_000),
+        }
+    }
+
+    fn reply_for(launch_id: &str, phase: PhaseId) -> PingReply {
+        let mut reply = sample_reply(launch_id);
+        reply.phase = phase.to_string();
+        reply
+    }
+
+    /// A ping server that answers every connection until stopped and records
+    /// each request it read, so a test can prove no shutdown was sent.
+    struct PingServer {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: JoinHandle<(UnixListener, Vec<Request>)>,
+    }
+
+    impl PingServer {
+        fn stop(self) -> (UnixListener, Vec<Request>) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.handle.join().expect("ping server thread")
+        }
+    }
+
+    fn serve_until_stopped(listener: UnixListener, reply: PingReply) -> PingServer {
+        listener
+            .set_nonblocking(true)
+            .expect("make the listener non-blocking");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = thread::spawn(move || {
+            let mut seen = Vec::new();
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make the accepted stream blocking");
+                        let answer = match protocol::read_request(&stream) {
+                            Ok(request) => {
+                                seen.push(request);
+                                match request {
+                                    Request::Ping => Reply::Ping(reply.clone()),
+                                    _ => Reply::Error("unknown_op".to_string()),
+                                }
+                            }
+                            Err(_) => Reply::Error("unknown_op".to_string()),
+                        };
+                        let _ = protocol::write_reply(&stream, &answer);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("the ping server could not accept: {error}"),
+                }
+            }
+            (listener, seen)
+        });
+        PingServer { stop, handle }
+    }
+
+    fn paths(entries: &[SweepEntry]) -> Vec<&Path> {
+        entries
+            .iter()
+            .map(|entry| entry.socket_path.as_path())
+            .collect()
+    }
+
+    #[test]
+    fn a_published_socket_is_found_by_root_and_phase_without_state() {
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let phase = PhaseId::new(7);
+        let launch_id = new_launch_id();
+        let socket = SocketPath::for_launch(cache.path(), root, phase, &launch_id)
+            .expect("socket path fits sun_path");
+        write_sidecar(&socket, &sample_sidecar(&launch_id, root, phase)).expect("write a sidecar");
+        let listener = publish(&socket).expect("publish the socket");
+        let server = serve_until_stopped(listener, reply_for(&launch_id, phase));
+
+        let found = sweep_for_in(cache.path(), root, phase);
+        let other_phase = sweep_for_in(cache.path(), root, PhaseId::new(8));
+        let other_root = sweep_for_in(cache.path(), Path::new(OTHER_ROOT), phase);
+        drop(server.stop());
+
+        let top_level: Vec<_> = std::fs::read_dir(cache.path())
+            .expect("read the cache dir")
+            .map(|entry| entry.expect("cache entry").file_name())
+            .collect();
+        assert_eq!(
+            top_level,
+            [std::ffi::OsString::from("sock")],
+            "no state file exists: the cache holds only sock/"
+        );
+        assert_eq!(found.len(), 1, "exactly one entry for (root, 7): {found:?}");
+        let entry = &found[0];
+        assert_eq!(entry.socket_path, socket.as_path());
+        assert!(entry.socket_present, "the socket is listed");
+        assert_eq!(
+            entry
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.launch_id.as_str()),
+            Some(launch_id.as_str()),
+            "the entry carries its sidecar"
+        );
+        assert!(
+            matches!(&entry.liveness, Ok(Liveness::Alive(reply)) if reply.launch_id == launch_id),
+            "the entry is Alive, got {:?}",
+            entry.liveness
+        );
+        assert!(
+            other_phase.is_empty(),
+            "another phase finds nothing: {other_phase:?}"
+        );
+        assert!(
+            other_root.is_empty(),
+            "another root finds nothing: {other_root:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_round_trips_and_is_owner_only() {
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let phase = PhaseId::new(7);
+        let launch_id = new_launch_id();
+        let socket = SocketPath::for_launch(cache.path(), root, phase, &launch_id)
+            .expect("socket path fits sun_path");
+        let sidecar = sample_sidecar(&launch_id, root, phase);
+        let path = socket.sidecar_path();
+
+        let written = write_sidecar(&socket, &sidecar);
+        assert!(written.is_ok(), "write_sidecar failed: {written:?}");
+        let read = read_sidecar(&path);
+        assert_eq!(
+            read.as_ref().ok(),
+            Some(&sidecar),
+            "read_sidecar returns what was written, got {read:?}"
+        );
+        let mode = std::fs::metadata(&path)
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .ok();
+        assert_eq!(mode, Some(0o600), "the sidecar is owner-only");
+        let names: Vec<_> = std::fs::read_dir(registry::socket_dir_in(cache.path()))
+            .expect("read sock/")
+            .map(|entry| entry.expect("sock/ entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            [path.file_name().expect("sidecar file name").to_os_string()],
+            "the temporary file is gone after the write"
+        );
+
+        // A second write replaces the first in place.
+        let mut changed = sidecar.clone();
+        changed.stage = Some("verify".to_string());
+        write_sidecar(&socket, &changed).expect("rewrite the sidecar");
+        assert_eq!(read_sidecar(&path).ok(), Some(changed));
+
+        assert_eq!(rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_from_unix(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(rfc3339_from_unix(951_825_599), "2000-02-29T11:59:59Z");
+        let now = rfc3339_now();
+        assert!(
+            now.len() == "1970-01-01T00:00:00Z".len()
+                && now.starts_with("20")
+                && now.ends_with('Z'),
+            "rfc3339_now has the RFC 3339 UTC shape, got {now:?}"
+        );
+
+        let bytes = std::fs::read(&path).expect("read the sidecar bytes");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate the sidecar");
+        let truncated = read_sidecar(&path);
+        assert!(
+            matches!(truncated, Err(SidecarError::Json(_))),
+            "a truncated sidecar is a Json error, got {truncated:?}"
+        );
+        let missing = read_sidecar(&cache.path().join("absent.json"));
+        assert!(
+            matches!(&missing, Err(SidecarError::Io(error)) if error.kind() == io::ErrorKind::NotFound),
+            "a missing sidecar is an Io error, got {missing:?}"
+        );
+    }
+
+    #[test]
+    fn a_socket_whose_sidecar_will_not_parse_is_still_found_by_its_name() {
+        const NAMED: &str = "aaaa0000aaaa0000";
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let other_root = Path::new(OTHER_ROOT);
+        let seven = PhaseId::new(7);
+        let eight = PhaseId::new(8);
+
+        let named = SocketPath::for_launch(cache.path(), root, seven, NAMED)
+            .expect("socket path fits sun_path");
+        write_sidecar(&named, &sample_sidecar(NAMED, root, seven)).expect("write a sidecar");
+        let named_server = serve_until_stopped(
+            publish(&named).expect("publish the named socket"),
+            reply_for(NAMED, seven),
+        );
+
+        // (1) A broken sidecar: found by the name's root digest and phase.
+        std::fs::write(named.sidecar_path(), b"{").expect("break the sidecar");
+        let found = sweep_for_in(cache.path(), root, seven);
+        assert_eq!(
+            paths(&found),
+            [named.as_path()],
+            "a broken sidecar is found by name"
+        );
+        let entry = &found[0];
+        assert!(entry.sidecar.is_none(), "the broken sidecar is not parsed");
+        assert!(
+            entry.sidecar_error.is_some(),
+            "a broken sidecar is reported as broken"
+        );
+        assert_eq!(entry.launch_id_in_name.as_deref(), Some(NAMED));
+        assert!(
+            matches!(&entry.liveness, Ok(Liveness::Alive(_))),
+            "the named socket is Alive, got {:?}",
+            entry.liveness
+        );
+        assert!(
+            sweep_for_in(cache.path(), other_root, seven).is_empty(),
+            "another root's digest does not claim it"
+        );
+        assert!(
+            sweep_for_in(cache.path(), root, eight).is_empty(),
+            "another phase does not claim it"
+        );
+
+        // (2) A missing sidecar: still found, and told apart from a broken one.
+        std::fs::remove_file(named.sidecar_path()).expect("remove the sidecar");
+        let found = sweep_for_in(cache.path(), root, seven);
+        assert_eq!(
+            paths(&found),
+            [named.as_path()],
+            "a missing sidecar is found by name"
+        );
+        assert!(found[0].sidecar.is_none());
+        assert!(
+            found[0].sidecar_error.is_none(),
+            "a missing sidecar is not reported as broken"
+        );
+        assert_eq!(found[0].launch_id_in_name.as_deref(), Some(NAMED));
+
+        // (3) A name outside the scheme with no sidecar: attributed only by the
+        // phase its ping reply names, for any root.
+        let foreign = SocketPath::new(registry::socket_dir_in(cache.path()).join("foreign.sock"))
+            .expect("foreign path fits");
+        let foreign_server = serve_until_stopped(
+            publish(&foreign).expect("publish the foreign socket"),
+            reply_for("foreign", seven),
+        );
+        for owner in [root, other_root] {
+            let found = sweep_for_in(cache.path(), owner, seven);
+            let entry = found
+                .iter()
+                .find(|entry| entry.socket_path == foreign.as_path());
+            assert!(
+                entry.is_some(),
+                "the foreign socket answering phase 7 may belong to {}: {found:?}",
+                owner.display()
+            );
+            assert_eq!(
+                entry.and_then(|entry| entry.launch_id_in_name.clone()),
+                None
+            );
+        }
+        assert!(
+            !paths(&sweep_for_in(cache.path(), root, eight)).contains(&foreign.as_path()),
+            "the foreign socket answering phase 7 is not claimed for phase 8"
+        );
+
+        // (4) A parsed sidecar wins over the name.
+        const MISLABELED: &str = "bbbb0000bbbb0000";
+        let mislabeled = SocketPath::for_launch(cache.path(), root, seven, MISLABELED)
+            .expect("socket path fits sun_path");
+        write_sidecar(&mislabeled, &sample_sidecar(MISLABELED, other_root, seven))
+            .expect("write the mislabeled sidecar");
+        let mislabeled_server = serve_until_stopped(
+            publish(&mislabeled).expect("publish the mislabeled socket"),
+            reply_for(MISLABELED, seven),
+        );
+        let for_other = sweep_for_in(cache.path(), other_root, seven);
+        let for_root = sweep_for_in(cache.path(), root, seven);
+        drop(mislabeled_server.stop());
+        drop(foreign_server.stop());
+        drop(named_server.stop());
+        assert!(
+            paths(&for_other).contains(&mislabeled.as_path()),
+            "the sidecar's root claims it: {for_other:?}"
+        );
+        assert!(
+            !paths(&for_root).contains(&mislabeled.as_path()),
+            "the name's root does not, once a sidecar parses: {for_root:?}"
         );
     }
 }
