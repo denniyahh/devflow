@@ -4,27 +4,25 @@
 //! `pub(crate)` inside `devflow-cli`, and driving the actual CLI is what
 //! proves the `--check` gate and the self-pin comparison end-to-end).
 
-use std::path::Path;
-use std::process::{Command, Output};
+mod common;
 
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
+use std::path::Path;
+use std::process::Output;
 
 /// Runs `devflow release <args> <project>` with an ISOLATED `HOME` (a fresh
-/// empty directory, no `.gitconfig`) and no inherited `SSH_AUTH_SOCK`/
+/// empty directory, no `.gitconfig`, set by `common::hermetic_devflow` along
+/// with the XDG and DevFlow cache dirs) and no inherited `SSH_AUTH_SOCK`/
 /// `SSH_AGENT_PID` — so the release check reads git config through the
 /// fixture's own repo-local config, never the OPERATOR's global
 /// `~/.gitconfig`. Without this isolation, these tests would be
 /// non-deterministic on any machine whose global config sets git signing
 /// or other release-relevant values.
 fn run_release(project: &Path, args: &[&str]) -> Output {
-    let isolated_home = tempfile::tempdir().unwrap();
-    Command::new(devflow_bin())
+    let isolated_home = common::HermeticHome::new();
+    common::hermetic_devflow(&isolated_home)
         .arg("release")
         .args(args)
         .arg(project)
-        .env("HOME", isolated_home.path())
         .env_remove("SSH_AUTH_SOCK")
         .env_remove("SSH_AGENT_PID")
         .output()
