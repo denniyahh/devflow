@@ -156,6 +156,33 @@ pub fn run_test_in_child(
     path_dir: &std::path::Path,
     extra_env: &[(&str, &std::ffi::OsStr)],
 ) -> std::process::Output {
+    child_test_command(test_name, path_dir, extra_env)
+        .output()
+        .expect("spawn child test process with an isolated PATH")
+}
+
+/// [`run_test_in_child`], but spawned rather than waited for: the caller gets
+/// the running [`std::process::Child`] (stdout and stderr piped) and owns it,
+/// so it can act on the child while it runs and must wait on it afterwards.
+pub fn spawn_test_in_child(
+    test_name: &str,
+    path_dir: &std::path::Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Child {
+    child_test_command(test_name, path_dir, extra_env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child test process with an isolated PATH")
+}
+
+/// The command both child-test helpers run: this test binary, filtered to
+/// exactly `test_name`, with a child-local `PATH` and environment.
+fn child_test_command(
+    test_name: &str,
+    path_dir: &std::path::Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Command {
     assert!(
         path_dir.is_dir(),
         "child test PATH must be an existing directory: {}",
@@ -174,8 +201,6 @@ pub fn run_test_in_child(
         command.env(name, value);
     }
     command
-        .output()
-        .expect("spawn child test process with an isolated PATH")
 }
 
 /// Asserts that a child test process ran precisely its requested test and did
