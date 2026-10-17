@@ -1762,8 +1762,17 @@ fn antigravity_init_without_marker_gates_at_plan() {
 /// or seen its monitor exit naturally), the registry must DRAIN. Polls
 /// bounded so a slow legitimate test does not flake; a genuinely leaked
 /// monitor keeps the registry non-empty and the audit panics naming the pid.
+///
+/// The audit reads process-wide counters the other tests in this binary bump,
+/// so it only means something when they share its process, as under
+/// `cargo test` (what `scripts/check.sh` runs). cargo-nextest runs every test
+/// in its own process and sets `NEXTEST`, where `REAPED` is always 0 and the
+/// audit could only time out; there it returns without asserting.
 #[test]
 fn suite_reap_audit() {
+    if std::env::var_os("NEXTEST").is_some() {
+        return;
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     // Ordering barrier: wait for a SUSTAINED clean state, not a single empty
     // poll. A clean state means: no guard in flight (ACTIVE_GUARDS == 0), at
