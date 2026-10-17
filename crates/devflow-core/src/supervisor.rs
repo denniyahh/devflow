@@ -494,7 +494,7 @@ pub struct SweepEntry {
 /// sidecar read.
 ///
 /// Read-only and never acting (D-06): it lists, probes and reads, and removes
-/// no file and sends no shutdown; `remove_launch_files` is the acting
+/// no file and sends no shutdown; [`remove_launch_files`] is the acting
 /// counterpart, and only `stop` and the backstop call it.
 ///
 /// A socket directory that is absent or cannot be listed yields an empty
@@ -622,6 +622,51 @@ fn socket_name_parts(stem: &str) -> Option<(u64, &str, &str)> {
     }
     let digest = u64::from_str_radix(hex, 16).ok()?;
     Some((digest, padded, launch_id))
+}
+
+/// Remove a launch's socket and its sidecar. A file that is already gone is
+/// not an error.
+///
+/// This is the acting counterpart of the read-only [`sweep_in`],
+/// [`sweep_for_in`], [`probe`] and [`read_sidecar`] (D-06): only `stop` and
+/// the stale-socket backstop call it.
+pub fn remove_launch_files(socket: &SocketPath) -> io::Result<()> {
+    let _ = socket;
+    Ok(()) // RED stub
+}
+
+/// How a supervisor answered a shutdown request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownOutcome {
+    /// The request was accepted and the final line reported the stop.
+    Stopped {
+        /// The exit code the supervisor ends with.
+        exit_code: i32,
+        /// Whether the stage advance was suppressed by the stop.
+        advance_suppressed: bool,
+    },
+    /// The supervisor had already handed the run off and did not stop it.
+    HandedOff,
+    /// The supervisor refused the request with this error.
+    Refused(String),
+}
+
+/// Ask the supervisor at `path` to stop. Applies [`probe`]'s pre-connect
+/// checks (a socket, owned by this uid), connects, sends
+/// `{"op":"shutdown"}`, reads the immediate `accepted` line within
+/// [`protocol::IO_TIMEOUT`], then the final line within `final_timeout`.
+///
+/// Only a final `stopped` line is [`ShutdownOutcome::Stopped`]; a
+/// `handed_off` answer is [`ShutdownOutcome::HandedOff`] and any other
+/// refusal is [`ShutdownOutcome::Refused`]. A missing, late or malformed
+/// line is an error, never a stop.
+pub fn request_shutdown(
+    path: &Path,
+    final_timeout: std::time::Duration,
+) -> Result<ShutdownOutcome, ProbeError> {
+    let _ = (path, final_timeout);
+    Err(ProbeError::NoReply("RED stub".to_string()))
 }
 
 #[cfg(test)]
@@ -1536,6 +1581,291 @@ mod tests {
         assert!(
             !paths(&for_root).contains(&mislabeled.as_path()),
             "the name's root does not, once a sidecar parses: {for_root:?}"
+        );
+    }
+
+    /// Every file under `sock/` as `(name, length, mtime)`, sorted.
+    fn snapshot(cache: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+        let mut files: Vec<_> = std::fs::read_dir(registry::socket_dir_in(cache))
+            .expect("read sock/")
+            .map(|entry| {
+                let entry = entry.expect("sock/ entry");
+                let meta = std::fs::symlink_metadata(entry.path()).expect("stat a sock/ entry");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    meta.len(),
+                    meta.modified().expect("mtime"),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn sweep_reports_without_removing_or_signalling() {
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let phase = PhaseId::new(7);
+        let launch = |id: &str| {
+            let socket = SocketPath::for_launch(cache.path(), root, phase, id)
+                .expect("socket path fits sun_path");
+            write_sidecar(&socket, &sample_sidecar(id, root, phase)).expect("write a sidecar");
+            socket
+        };
+        let alive_id = new_launch_id();
+        let alive = launch(&alive_id);
+        let server = serve_until_stopped(
+            publish(&alive).expect("publish the alive socket"),
+            reply_for(&alive_id, phase),
+        );
+        let stale = launch(&new_launch_id());
+        drop(publish(&stale).expect("publish the stale socket"));
+        let leftover = launch(&new_launch_id());
+        let half = SocketPath::for_launch(cache.path(), root, phase, &new_launch_id())
+            .expect("socket path fits sun_path");
+        std::fs::write(half.part_path(), b"half-published").expect("write a .part file");
+
+        let before = snapshot(cache.path());
+        let entries = sweep_in(cache.path());
+        let after = snapshot(cache.path());
+        let still_alive = probe(alive.as_path());
+        let (_listener, requests) = server.stop();
+
+        let mut expected = vec![alive.as_path(), stale.as_path(), leftover.as_path()];
+        expected.sort();
+        assert_eq!(
+            paths(&entries),
+            expected,
+            "one entry per .sock/.json stem; the .part is not one"
+        );
+        let liveness_of = |socket: &SocketPath| {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.socket_path == socket.as_path())
+                .expect("entry present");
+            (entry.socket_present, &entry.liveness)
+        };
+        assert!(matches!(
+            liveness_of(&alive),
+            (true, Ok(Liveness::Alive(_)))
+        ));
+        assert!(matches!(liveness_of(&stale), (true, Ok(Liveness::Stale))));
+        assert!(matches!(
+            liveness_of(&leftover),
+            (false, Ok(Liveness::Gone))
+        ));
+        assert_eq!(
+            before, after,
+            "the sweep leaves every name, length and mtime under sock/ unchanged"
+        );
+        assert!(
+            matches!(still_alive, Ok(Liveness::Alive(_))),
+            "the alive listener still answers after the sweep, got {still_alive:?}"
+        );
+        assert!(
+            requests.iter().all(|request| *request == Request::Ping),
+            "the sweep sent only pings, got {requests:?}"
+        );
+
+        // Control: the acting function changes the same snapshot, so the
+        // comparison above can see a removal.
+        remove_launch_files(&stale).expect("remove the stale launch's files");
+        let removed = snapshot(cache.path());
+        assert_ne!(before, removed, "the snapshot detects a removal");
+        let stale_names = [stale.as_path(), stale.sidecar_path().as_path()].map(|path| {
+            path.file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned()
+        });
+        assert_eq!(
+            removed,
+            before
+                .iter()
+                .filter(|(name, _, _)| !stale_names.contains(name))
+                .cloned()
+                .collect::<Vec<_>>(),
+            "exactly the stale socket and its sidecar are removed"
+        );
+        assert!(
+            remove_launch_files(&stale).is_ok(),
+            "removing files that are already gone succeeds"
+        );
+    }
+
+    /// Accept one connection on `listener`, require a shutdown request, then
+    /// run `script` on the connection.
+    fn serve_shutdown(
+        listener: UnixListener,
+        script: impl FnOnce(&UnixStream) + Send + 'static,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            // Poll, so a client that never connects ends the thread instead
+            // of wedging the test on `accept`.
+            listener
+                .set_nonblocking(true)
+                .expect("make the listener non-blocking");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("the scripted server could not accept: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("make the accepted stream blocking");
+            let request = protocol::read_request(&stream);
+            assert!(
+                matches!(request, Ok(Request::Shutdown)),
+                "the client sends a shutdown request, got {request:?}"
+            );
+            script(&stream);
+        })
+    }
+
+    fn write_raw(mut stream: &UnixStream, line: &str) {
+        use std::io::Write;
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write a raw line");
+    }
+
+    #[test]
+    fn request_shutdown_reads_accepted_then_stopped() {
+        use std::time::Duration;
+        let cache = short_cache();
+        let accepted = || {
+            Reply::Accepted(protocol::ShutdownAccepted {
+                owner: "agent_running".to_string(),
+            })
+        };
+        let run = |script: Box<dyn FnOnce(&UnixStream) + Send>, final_timeout: Duration| {
+            let (socket, _, listener) = published(cache.path());
+            let server = serve_shutdown(listener, script);
+            let outcome = request_shutdown(socket.as_path(), final_timeout);
+            server.join().expect("scripted server thread");
+            outcome
+        };
+
+        let stopped = run(
+            Box::new(move |stream| {
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+                thread::sleep(Duration::from_millis(200));
+                protocol::write_reply(
+                    stream,
+                    &Reply::Stopped(protocol::ShutdownStopped {
+                        exit_code: 143,
+                        advance_suppressed: true,
+                    }),
+                )
+                .expect("write stopped");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(
+                stopped,
+                Ok(ShutdownOutcome::Stopped {
+                    exit_code: 143,
+                    advance_suppressed: true
+                })
+            ),
+            "accepted then stopped is Stopped, got {stopped:?}"
+        );
+
+        let handed_off = run(
+            Box::new(|stream| {
+                protocol::write_reply(stream, &Reply::Error("handed_off".to_string()))
+                    .expect("write handed_off");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(handed_off, Ok(ShutdownOutcome::HandedOff)),
+            "handed_off is HandedOff, got {handed_off:?}"
+        );
+
+        let late_hand_off = run(
+            Box::new(move |stream| {
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+                protocol::write_reply(stream, &Reply::Error("handed_off".to_string()))
+                    .expect("write handed_off");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(late_hand_off, Ok(ShutdownOutcome::HandedOff)),
+            "a hand-off after accepted is HandedOff, never Stopped, got {late_hand_off:?}"
+        );
+
+        let refused = run(
+            Box::new(|stream| {
+                protocol::write_reply(stream, &Reply::Error("unknown_op".to_string()))
+                    .expect("write the refusal");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(&refused, Ok(ShutdownOutcome::Refused(error)) if error == "unknown_op"),
+            "another refusal is Refused, got {refused:?}"
+        );
+
+        let closed = run(
+            Box::new(move |stream| {
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(closed, Err(ProbeError::NoReply(_))),
+            "a close after accepted is an error, never Stopped, got {closed:?}"
+        );
+
+        let silent = run(
+            Box::new(move |stream| {
+                use std::io::Read;
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+                // Hold the connection open until the client gives up and
+                // closes it, past its final timeout.
+                let _ = (&mut &*stream).read(&mut [0_u8; 1]);
+            }),
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(silent, Err(ProbeError::NoReply(_))),
+            "no final line within the timeout is an error, got {silent:?}"
+        );
+
+        let malformed = run(
+            Box::new(move |stream| {
+                protocol::write_reply(stream, &accepted()).expect("write accepted");
+                write_raw(
+                    stream,
+                    r#"{"ok":true,"exit_code":143,"advance_suppressed":true}"#,
+                );
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(
+            matches!(malformed, Err(ProbeError::NoReply(_))),
+            "a final line without stopped:true is an error, got {malformed:?}"
+        );
+
+        // The pre-connect checks are probe's: a regular file is never asked.
+        let regular = cache.path().join("regular.sock");
+        std::fs::write(&regular, b"not a socket").expect("write a regular file");
+        let not_a_socket = request_shutdown(&regular, Duration::from_secs(1));
+        assert!(
+            matches!(not_a_socket, Err(ProbeError::NotASocket(_))),
+            "a regular file is NotASocket, got {not_a_socket:?}"
         );
     }
 }
