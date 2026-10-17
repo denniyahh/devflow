@@ -89,13 +89,6 @@ pub struct ShutdownStopped {
 
 /// Every reply a server writes, one variant per wire shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "server side of the protocol; the supervisor runtime (50-07) is its first non-test caller"
-    )
-)]
 pub(crate) enum Reply {
     /// `{"ok":true, ...}` answering a ping.
     Ping(PingReply),
@@ -108,10 +101,6 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used only by write_reply; see Reply")
-    )]
     fn to_json(&self) -> serde_json::Result<serde_json::Value> {
         let mut object = match self {
             Self::Ping(reply) => serde_json::to_value(reply)?,
@@ -171,10 +160,6 @@ fn set_timeouts(stream: &UnixStream) -> io::Result<()> {
 /// Server side: read the connection's single request. A request that is not
 /// valid JSON or names an unknown op is `InvalidData`; the caller answers it
 /// with `Reply::Error("unknown_op")`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "server side of the protocol; see Reply")
-)]
 pub(crate) fn read_request(stream: &UnixStream) -> io::Result<Request> {
     set_timeouts(stream)?;
     let line = read_line(&mut BufReader::new(stream))?;
@@ -182,10 +167,6 @@ pub(crate) fn read_request(stream: &UnixStream) -> io::Result<Request> {
 }
 
 /// Server side: write one reply line.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "server side of the protocol; see Reply")
-)]
 pub(crate) fn write_reply(mut stream: &UnixStream, reply: &Reply) -> io::Result<()> {
     set_timeouts(stream)?;
     let mut line = serde_json::to_string(&reply.to_json()?)?;
@@ -211,10 +192,6 @@ pub(crate) fn euid() -> u32 {
 /// A failed read returns false, and so does every other target, so the uid
 /// check is never skipped (T-50-10, T-50-87).
 #[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "server side of the protocol; see Reply")
-)]
 pub(crate) fn peer_is_same_user(stream: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
     let mut cred = libc::ucred {
@@ -242,10 +219,6 @@ pub(crate) fn peer_is_same_user(stream: &UnixStream) -> bool {
 /// uid, read with `getpeereid`. Compile-checked only: no macOS host has run it
 /// (backlog 999.160).
 #[cfg(target_os = "macos")]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "server side of the protocol; see Reply")
-)]
 pub(crate) fn peer_is_same_user(stream: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
     let mut uid: libc::uid_t = 0;
@@ -260,10 +233,6 @@ pub(crate) fn peer_is_same_user(stream: &UnixStream) -> bool {
 /// fail closed. A client then reads no reply (`NoReply`), never `Stale`, so
 /// the backstop cannot arm on this target.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "server side of the protocol; see Reply")
-)]
 pub(crate) fn peer_is_same_user(_stream: &UnixStream) -> bool {
     false
 }
