@@ -1,139 +1,15 @@
-//! End-to-end monitor integration test.
+//! Monitor integration tests that need no running supervisor.
 //!
-//! Spawns a real background monitor that owns a *fake* agent (a `sh` script
-//! that prints a `DEVFLOW_RESULT` marker and exits 0), then asserts the monitor
-//! captured everything `devflow check` needs to advance the state machine.
-//!
-//! Boundary note: the real `devflow` binary is not built inside the library's
-//! integration-test harness, so the monitor's tail `devflow check` self-call is
-//! a no-op here (it re-invokes this test binary with a non-matching filter).
-//! We therefore assert the **capture/result** side — that Layers 1–2 evaluate
-//! to `Success` from the files the monitor wrote — rather than the state
-//! transition itself.
+//! Boundary note (50-11): a library integration-test binary cannot re-exec
+//! the `devflow` binary's hidden `__monitor` subcommand, so no test here can
+//! start a supervisor. The end-to-end capture-result check that lived here
+//! (`monitor_owns_fake_agent_and_records_devflow_result`) moved to
+//! `crates/devflow-cli/tests/supervisor_e2e.rs` as
+//! `capture_supervisor_owns_a_fake_agent_and_records_devflow_result`, which
+//! drives the real binary. What remains is the advance-side state loading.
 
-use devflow_core::agent_result::{
-    AgentStatus, agent_pid_path, evaluate_agent_result, exit_code_path, stdout_path,
-};
-use devflow_core::config::GitFlowConfig;
-use devflow_core::mode::Mode;
-use devflow_core::monitor::{
-    LaunchContext, MonitorExec, MonitorLaunch, spawn_monitor, wait_for_agent_pid,
-};
 use devflow_core::phase_id::PhaseId;
-use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::{WorkflowError, load_state};
-use std::path::Path;
-use std::time::Duration;
-
-fn git(root: &Path, args: &[&str]) {
-    // Hermetic: pinning cwd alone does not stop an inherited GIT_DIR from
-    // retargeting the real repository (999.37).
-    let output = devflow_core::test_support::git_command(root)
-        .args(args)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Init a temp repo with `develop` and a `feature/phase-NN` branch holding one
-/// commit, hooks disabled for isolation.
-fn init_repo(root: &Path, phase: PhaseId) {
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "devflow@example.com"]);
-    git(root, &["config", "user.name", "DevFlow Tests"]);
-    git(root, &["config", "commit.gpgsign", "false"]);
-    git(root, &["config", "core.hooksPath", "/dev/null"]);
-    git(root, &["checkout", "-q", "-b", "develop"]);
-    std::fs::write(root.join("README.md"), "base\n").unwrap();
-    git(root, &["add", "README.md"]);
-    git(root, &["commit", "-q", "-m", "base"]);
-
-    let branch = format!("feature/phase-{padded}", padded = phase.padded());
-    git(root, &["checkout", "-q", "-b", &branch]);
-    std::fs::write(root.join("work.txt"), "agent work\n").unwrap();
-    git(root, &["add", "work.txt"]);
-    git(root, &["commit", "-q", "-m", "agent work"]);
-}
-
-/// The launch context this suite passes `spawn_monitor` (50-10): this test
-/// binary as the monitor executable, which is what `spawn_monitor` resolved
-/// itself before it took a context, and a cache dir under the test's tempdir.
-fn launch_context(root: &Path) -> LaunchContext {
-    LaunchContext::new(
-        root.join("cache"),
-        MonitorExec::Subcommand {
-            exe: std::env::current_exe().unwrap(),
-        },
-    )
-}
-
-#[test]
-fn monitor_owns_fake_agent_and_records_devflow_result() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let phase = PhaseId::new(7);
-    init_repo(root, phase);
-
-    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-    state.stage = Stage::Code;
-
-    // Fake agent: emit the success marker on stdout, then exit 0.
-    let args = vec![
-        "-c".to_string(),
-        "printf 'work done\\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'"
-            .to_string(),
-    ];
-
-    spawn_monitor(
-        &state,
-        "sh",
-        &args,
-        &[],
-        MonitorLaunch::Legacy,
-        &launch_context(root),
-    )
-    .expect("spawn monitor");
-
-    // The monitor records the agent PID.
-    let agent_pid = wait_for_agent_pid(root, phase).expect("agent pid recorded");
-    assert!(agent_pid > 0);
-
-    // Wait until the monitor writes the exit-code file (agent finished).
-    let exit_path = exit_code_path(root, phase);
-    let mut exit_seen = false;
-    for _ in 0..200 {
-        if exit_path.exists() {
-            exit_seen = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(exit_seen, "monitor never wrote the exit-code file");
-
-    // Captured stdout contains the marker.
-    let stdout = std::fs::read_to_string(stdout_path(root, phase)).unwrap();
-    assert!(
-        stdout.contains("DEVFLOW_RESULT"),
-        "captured stdout missing marker: {stdout:?}"
-    );
-
-    // Exit code recorded as 0.
-    let exit = std::fs::read_to_string(&exit_path).unwrap();
-    assert_eq!(exit.trim(), "0");
-
-    // The pid file exists (the monitor created the capture directory + files).
-    assert!(agent_pid_path(root, phase).exists());
-
-    // End-to-end: the layered evaluator reads the monitor's files and reports
-    // Success — exactly what `devflow check` would act on to advance state.
-    let result = evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap();
-    assert_eq!(result.status, AgentStatus::Success);
-}
 
 #[test]
 fn advance_state_loading_fails_cleanly_for_missing_and_corrupt_state() {

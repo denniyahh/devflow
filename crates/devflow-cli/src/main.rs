@@ -90,8 +90,8 @@ enum Command {
         #[arg(long)]
         yes_ship: bool,
         /// Force the pre-31 single-document Claude launch: the prompt
-        /// positionally in argv, `--output-format json`, and the `sh` monitor
-        /// (D-11, `31-CONTEXT.md`). Off by default.
+        /// positionally in argv, `--output-format json`, and the capture-shape
+        /// supervisor (D-11, `31-CONTEXT.md`). Off by default.
         ///
         /// It exists so an operator can recover from a defect in the
         /// `stream-json` transport without waiting for a release. Its use is

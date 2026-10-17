@@ -20,7 +20,7 @@ use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a shutdown waits for the supervisor's final line.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
@@ -106,6 +106,18 @@ fn run_start(
     fake_bin: &common::FakeBin,
     shape: Shape,
 ) -> Output {
+    run_start_with(home, root, phase, fake_bin, shape, &[])
+}
+
+/// [`run_start`] with `extra` start flags (for example `--until plan`).
+fn run_start_with(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &common::FakeBin,
+    shape: Shape,
+    extra: &[&str],
+) -> Output {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
     common::hermetic_devflow(home)
@@ -120,6 +132,7 @@ fn run_start(
             "--no-worktree",
         ])
         .args(shape.start_flags())
+        .args(extra)
         .arg(root)
         .current_dir(root)
         .env("PATH", path)
@@ -215,4 +228,278 @@ fn start_publishes_for(shape: Shape, phase: PhaseId) {
 fn start_publishes_a_live_supervisor_socket_for_each_launch_shape() {
     start_publishes_for(Shape::Stream, PhaseId::new(61));
     start_publishes_for(Shape::Capture, PhaseId::new(62));
+}
+
+/// How long the tests below wait for a supervisor to act on a signal, or a
+/// stage chain to reach its stop point.
+const RUN_WAIT: Duration = Duration::from_secs(60);
+
+/// The stop reason `run_monitor` records for a run its supervisor stopped.
+const SUPERVISOR_STOP_REASON: &str =
+    "stopped through the supervisor (socket shutdown or SIGTERM/SIGINT)";
+
+/// A fake `claude` that answers `--version` and the canary like
+/// [`WAITING_CLAUDE`], commits one empty commit as its "work", prints the
+/// success marker and exits 0 on its own.
+const FINISHING_CLAUDE: &str = r#"if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi
+read -r turn
+case "$turn" in
+  *DEVFLOW_DELIVERY_CANARY_*)
+    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}\n' "$token"
+    exit 0
+    ;;
+esac
+git commit -q --allow-empty -m "fake stage work"
+printf 'work done\nDEVFLOW_RESULT: {"status":"success","commits":1}\n'
+exit 0"#;
+
+/// The `stage_launched` events recorded for `phase`.
+fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
+    fs::read_to_string(devflow_core::events::events_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            phase.matches_json(event.get("phase"))
+                && event["event"].as_str() == Some("stage_launched")
+        })
+        .count()
+}
+
+/// The pids whose process group (`/proc/<pid>/stat` field 5) is `pgid`.
+fn group_members(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let rest = &stat[stat.rfind(')')? + 1..];
+                    rest.split_whitespace().nth(2)?.parse::<u32>().ok()
+                })
+                == Some(pgid)
+        })
+        .collect()
+}
+
+/// Poll `done` every 25 ms until it holds or `within` elapses.
+fn holds_within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// D-05 at the CLI level (999.134) for one shape: SIGTERM to the live
+/// supervisor named in its sidecar ends the run. The agent group is gone,
+/// `state.stopped` carries the supervisor stop reason, no further
+/// `stage_launched` is recorded, and the socket is Gone.
+fn sigterm_stops_for(shape: Shape, phase: PhaseId) {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let output = run_start(&home, &root, phase, &fake_bin, shape);
+    assert!(
+        output.status.success(),
+        "{shape:?}: start failed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = devflow_core::workflow::load_state(&root, phase)
+        .expect("start saved state")
+        .supervisor
+        .unwrap_or_else(|| panic!("{shape:?}: start must record state.supervisor"));
+    let socket = record.socket_path.clone();
+    let sidecar = supervisor::read_sidecar(&socket.with_extension("json")).expect("sidecar");
+    assert_eq!(
+        stage_launched_count(&root, phase),
+        1,
+        "{shape:?}: one launch"
+    );
+    assert!(
+        !group_members(record.agent_pgid).is_empty(),
+        "{shape:?}: the agent group is running before the signal"
+    );
+
+    // The pid to signal comes from the sidecar and is confirmed against its
+    // recorded start time first, so a recycled pid is never signalled.
+    let pid = sidecar.supervisor_pid;
+    assert!(
+        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
+        "{shape:?}: the sidecar's supervisor {pid} is the recorded process"
+    );
+    let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    assert!(signed > 1, "refusing to signal pid {signed}");
+    // SAFETY: `signed > 1` names the supervisor just identity-checked.
+    assert_eq!(
+        unsafe { libc::kill(signed, libc::SIGTERM) },
+        0,
+        "SIGTERM {pid}"
+    );
+
+    assert!(
+        holds_within(RUN_WAIT, || !devflow_core::agent::agent_running(pid)),
+        "{shape:?}: the supervisor {pid} exits after SIGTERM"
+    );
+    assert_eq!(
+        supervisor::probe(&socket).expect("probe after the signal"),
+        Liveness::Gone,
+        "{shape:?}: the socket is gone"
+    );
+    assert_eq!(
+        group_members(record.agent_pgid),
+        Vec::<u32>::new(),
+        "{shape:?}: the agent group {} is gone",
+        record.agent_pgid
+    );
+    let state = devflow_core::workflow::load_state(&root, phase).expect("reload state");
+    assert!(state.stopped, "{shape:?}: state.stopped after the signal");
+    assert_eq!(
+        state.stop_reason.as_deref(),
+        Some(SUPERVISOR_STOP_REASON),
+        "{shape:?}: the supervisor stop reason"
+    );
+    assert_eq!(
+        stage_launched_count(&root, phase),
+        1,
+        "{shape:?}: no stage_launched after the signal"
+    );
+}
+
+/// The control for [`sigterm_stops_for`]: the same launch, whose fake agent
+/// exits 0 on its own, advances in-process and launches the next stage, so a
+/// following `stage_launched` names Plan (the launched stage was passed to the
+/// advance). `--until plan` stops the chain at the Plan boundary.
+fn finishing_run_advances_for(shape: Shape, phase: PhaseId) {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(FINISHING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let output = run_start_with(&home, &root, phase, &fake_bin, shape, &["--until", "plan"]);
+    assert!(
+        output.status.success(),
+        "{shape:?}: start failed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        holds_within(RUN_WAIT, || stage_launched_count(&root, phase) >= 2),
+        "{shape:?} control: a completed agent must advance and launch the next stage\n{}",
+        fs::read_to_string(devflow_core::events::events_path(&root)).unwrap_or_default()
+    );
+    let events = fs::read_to_string(devflow_core::events::events_path(&root)).unwrap();
+    let launched: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"].as_str() == Some("stage_launched"))
+        .collect();
+    assert_eq!(launched[0]["stage"], "define", "{shape:?}: {launched:?}");
+    assert_eq!(launched[1]["stage"], "plan", "{shape:?}: {launched:?}");
+    assert_eq!(
+        launched[1]["launch"],
+        shape.label(),
+        "{shape:?}: {launched:?}"
+    );
+    assert!(
+        holds_within(RUN_WAIT, || devflow_core::workflow::load_state(
+            &root, phase
+        )
+        .is_ok_and(|state| state.stopped)),
+        "{shape:?} control: the chain stops at --until plan"
+    );
+}
+
+#[test]
+fn sigterm_to_a_live_supervisor_ends_the_run_without_advancing() {
+    sigterm_stops_for(Shape::Stream, PhaseId::new(63));
+    sigterm_stops_for(Shape::Capture, PhaseId::new(64));
+    finishing_run_advances_for(Shape::Stream, PhaseId::new(65));
+    finishing_run_advances_for(Shape::Capture, PhaseId::new(66));
+}
+
+/// Re-homed from `devflow-core/tests/monitor_e2e.rs` (50-11): a library test
+/// binary cannot re-exec `__monitor`, so the capture-result check runs on the
+/// real binary. A capture-shape run whose fake agent prints a
+/// `DEVFLOW_RESULT` marker and exits 0: Layers 1–2 evaluate to Success from
+/// the files the supervisor wrote, and the supervisor's own advance recorded
+/// the same verdict.
+#[test]
+fn capture_supervisor_owns_a_fake_agent_and_records_devflow_result() {
+    let phase = PhaseId::new(67);
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(FINISHING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let output = run_start_with(
+        &home,
+        &root,
+        phase,
+        &fake_bin,
+        Shape::Capture,
+        &["--until", "define"],
+    );
+    assert!(
+        output.status.success(),
+        "start failed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        holds_within(RUN_WAIT, || devflow_core::workflow::load_state(
+            &root, phase
+        )
+        .is_ok_and(|state| state.stopped)),
+        "the run stops at --until define once its supervisor advanced"
+    );
+
+    let agent_pid: u32 =
+        fs::read_to_string(devflow_core::agent_result::agent_pid_path(&root, phase))
+            .expect("the supervisor records the agent pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+    assert!(agent_pid > 0);
+    let stdout = fs::read_to_string(devflow_core::agent_result::stdout_path(&root, phase)).unwrap();
+    assert!(
+        stdout.contains("DEVFLOW_RESULT"),
+        "captured stdout missing marker: {stdout:?}"
+    );
+    let exit = fs::read_to_string(devflow_core::agent_result::exit_code_path(&root, phase))
+        .expect("the supervisor records the exit code");
+    assert_eq!(exit.trim(), "0");
+
+    let state = devflow_core::workflow::load_state(&root, phase).unwrap();
+    let git_flow = devflow_core::config::git_flow_for_run(&root, state.base_branch.as_deref());
+    let result = devflow_core::agent_result::evaluate_agent_result(&root, &state, &git_flow)
+        .expect("evaluate the supervisor's files");
+    assert_eq!(
+        result.status,
+        devflow_core::agent_result::AgentStatus::Success,
+        "{result:?}"
+    );
+    let events = fs::read_to_string(devflow_core::events::events_path(&root)).unwrap();
+    assert!(
+        events
+            .lines()
+            .any(|line| line.contains("\"advance_evaluated\"")
+                && line.contains("\"status\":\"success\"")),
+        "the supervisor's in-process advance evaluated the stage as success:\n{events}"
+    );
 }
