@@ -7,13 +7,10 @@
 //! `devflow` binary, and PATH is scoped to each child via `Command::env` so
 //! no test-process-global environment mutation can poison parallel tests.
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 fn write_stub_agy(root: &Path) -> std::path::PathBuf {
     let bin = root.join("bin");
@@ -33,11 +30,12 @@ fn write_stub_agy(root: &Path) -> std::path::PathBuf {
 /// antigravity check present with the stub's version line.
 #[test]
 fn doctor_reports_antigravity_present_with_stub_on_path() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let bin = write_stub_agy(root);
 
-    let out = Command::new(devflow_bin())
+    let out = common::hermetic_devflow(&home)
         .arg("doctor")
         .arg(root)
         .env("PATH", &bin)
@@ -59,12 +57,13 @@ fn doctor_reports_antigravity_present_with_stub_on_path() {
 /// missing/warn — never a hard failure, never a false green.
 #[test]
 fn doctor_reports_antigravity_absent_without_agy() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let empty = root.join("empty-bin");
     std::fs::create_dir_all(&empty).unwrap();
 
-    let out = Command::new(devflow_bin())
+    let out = common::hermetic_devflow(&home)
         .arg("doctor")
         .arg(root)
         .env("PATH", &empty)

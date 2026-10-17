@@ -20,6 +20,8 @@
 //! scaffolding below is copied from `auto_chain_flag_e2e.rs` rather than
 //! shared. Keep the two in step.
 
+mod common;
+
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -31,10 +33,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Hermetic git invocation pinned to `root` (999.37) — never a bare
 /// `Command::new("git")`.
@@ -205,6 +203,9 @@ struct Fixture {
     script: PathBuf,
     child_pid_file: PathBuf,
     reaper: Reaper,
+    /// Every `devflow` child's `HOME` and cache. Declared last so it drops
+    /// after `reaper` has reaped the monitor.
+    home: common::HermeticHome,
 }
 
 impl Fixture {
@@ -245,6 +246,7 @@ impl Fixture {
             script,
             child_pid_file,
             reaper: Reaper::default(),
+            home: common::HermeticHome::new(),
         }
     }
 
@@ -252,7 +254,7 @@ impl Fixture {
     /// sleeper, as a child of this test process so it can be signalled
     /// directly.
     fn spawn_monitor(&self) -> Child {
-        let child = Command::new(devflow_bin())
+        let child = common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
             .arg(&self.root)
@@ -298,7 +300,7 @@ impl Fixture {
     /// process outlives the test binary" criterion forbids. See the SUMMARY for
     /// what this does NOT establish.
     fn run_resume(&self, git_only_path: &Path) -> Output {
-        Command::new(devflow_bin())
+        common::hermetic_devflow(&self.home)
             .arg("resume")
             .arg("--phase")
             .arg(self.phase.to_string())
@@ -379,6 +381,7 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     let path_dir = git_only_path();
 
     let mut monitor = fixture.spawn_monitor();
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
 
     // The fixture must actually engage the guard before anything downstream
     // means anything. A timeout here is "the fixture never set the flag", which
