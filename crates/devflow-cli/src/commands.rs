@@ -2736,8 +2736,10 @@ pub(crate) fn recover_cmd(
 ) -> Result<(), CliError> {
     if do_clean {
         match phase {
-            // Explicit phase: clear it regardless of staleness (14-CR-01's
-            // escape hatch for a wedged-but-fresh run).
+            // Explicit phase: cleaned when its lock holder is dead or its pid
+            // was recycled (a live pid whose start time differs from the one
+            // recorded, 999.128). A live, identity-confirmed holder still
+            // refuses, so a wedged live run needs `devflow stop` first.
             Some(phase) => {
                 let report = match recover::clean_phase_report(project_root, phase) {
                     Ok(report) => report,
