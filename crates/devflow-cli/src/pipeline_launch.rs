@@ -2081,7 +2081,7 @@ mod tests {
             if !devflow_core::test_support::in_child_test($name) {
                 let path_dir = agent_free_dir_with_agent_stub($program);
                 let output =
-                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                    crate::test_support::run_hermetic_test_in_child($name, path_dir.path(), &[]);
                 devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
                     &output, $name,
                 );
@@ -2241,7 +2241,8 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::launch_stage_persists_monitor_pid_for_reload";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -2341,16 +2342,10 @@ mod tests {
     fn an_in_crate_stream_launch_runs_its_monitor_through_the_harness_entry() {
         const NAME: &str = "pipeline_launch::tests::an_in_crate_stream_launch_runs_its_monitor_through_the_harness_entry";
         if !devflow_core::test_support::in_child_test(NAME) {
-            let cache = tempfile::Builder::new()
-                .prefix("dfu")
-                .tempdir_in("/tmp")
-                .unwrap();
+            // The child gets a parent-owned `/tmp/dfu…` DEVFLOW_CACHE_DIR.
             let path_dir = marker_writing_claude_dir();
-            let output = devflow_core::test_support::run_test_in_child(
-                NAME,
-                path_dir.path(),
-                &[("DEVFLOW_CACHE_DIR", cache.path().as_os_str())],
-            );
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -2524,6 +2519,123 @@ mod tests {
             "CLI source must register roots only through registry::register_in: {offenders:#?}"
         );
     }
+
+    /// The 48-09 D-09 ENV_MUTEX-guarded `set_var`/`remove_var` calls already
+    /// in this crate's tests (preflight 19, pipeline_launch 7, pipeline_gate
+    /// 6, pipeline_outcomes 4; counted 2026-10-14 and again 2026-10-16).
+    const GUARDED_ENV_MUTATION_CEILING: usize = 36;
+
+    /// The process-env mutators, spelled through `concat!` so this file adds
+    /// nothing to its own scan.
+    const ENV_MUTATORS: [&str; 2] = [concat!("env::", "set_var"), concat!("env::", "remove_var")];
+
+    /// The variables 50-10's cache isolation and harness-entry selection must
+    /// reach a child only through `run_test_in_child`'s `extra_env`.
+    const HERMETIC_ENV_LITERALS: [&str; 6] = [
+        concat!("\"DEVFLOW_", "CACHE_DIR\""),
+        concat!("\"HO", "ME\""),
+        concat!("\"XDG_", "CACHE_HOME\""),
+        concat!("\"XDG_", "CONFIG_HOME\""),
+        concat!("\"DEVFLOW_", "MONITOR_ARGV\""),
+        concat!("\"DEVFLOW_", "TEST_MONITOR_FULL\""),
+    ];
+
+    /// `source` with `//` lines dropped and the rest joined, so a call split
+    /// across lines still reads as one.
+    fn joined_code(source: &str) -> String {
+        code_lines(source).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Calls in comment-stripped `source` that mutate one of
+    /// [`HERMETIC_ENV_LITERALS`]: a mutator, `(`, optional whitespace, then
+    /// the variable's string literal.
+    fn hermetic_env_mutations(source: &str) -> Vec<String> {
+        let code = joined_code(source);
+        let mut found = Vec::new();
+        for mutator in ENV_MUTATORS {
+            let call = format!("{mutator}(");
+            for (at, _) in code.match_indices(&call) {
+                let argument = code[at + call.len()..].trim_start();
+                if let Some(literal) = HERMETIC_ENV_LITERALS
+                    .iter()
+                    .find(|literal| argument.starts_with(**literal))
+                {
+                    found.push(format!("{mutator}({literal}"));
+                }
+            }
+        }
+        found
+    }
+
+    /// Every `set_var`/`remove_var` in comment-stripped `source`.
+    fn env_mutation_count(source: &str) -> usize {
+        let code = joined_code(source);
+        ENV_MUTATORS
+            .iter()
+            .map(|mutator| code.matches(mutator).count())
+            .sum()
+    }
+
+    /// 50-10 Task 2: the hermetic variables reach a child test process only
+    /// through `extra_env`, never through a process-global mutation, and this
+    /// plan adds no other process-env mutation to the crate (the 36 guarded
+    /// 48-09 calls stay as they are).
+    #[test]
+    fn cli_source_sets_no_hermetic_env_var_and_adds_no_process_env_mutation() {
+        let split_call = concat!(
+            "        std::env::set",
+            "_var(\n",
+            "            \"DEVFLOW_",
+            "CACHE_DIR\", dir);\n"
+        );
+        assert_eq!(
+            hermetic_env_mutations(split_call).len(),
+            1,
+            "planted control: a two-line mutation of the cache variable must be flagged"
+        );
+        let other_var = concat!(
+            "        std::env::set",
+            "_var(\n",
+            "            \"DEVFLOW_",
+            "OTHER\", dir);\n"
+        );
+        assert!(
+            hermetic_env_mutations(other_var).is_empty(),
+            "planted control: a mutation of an unrelated variable must not be flagged"
+        );
+        let three_calls = concat!(
+            "    std::env::set",
+            "_var(\"A\", \"1\");\n",
+            "    std::env::remove",
+            "_var(\"A\");\n",
+            "    // std::env::set",
+            "_var(\"A\", \"2\");\n"
+        );
+        assert_eq!(
+            env_mutation_count(three_calls),
+            2,
+            "planted control: one set, one remove and one commented-out set count 2"
+        );
+
+        let mut hermetic = Vec::new();
+        let mut total = 0;
+        for path in cli_source_files() {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for call in hermetic_env_mutations(&source) {
+                hermetic.push(format!("{}: {call}", path.display()));
+            }
+            total += env_mutation_count(&source);
+        }
+        assert!(
+            hermetic.is_empty(),
+            "the hermetic variables must reach a child only through extra_env: {hermetic:#?}"
+        );
+        assert!(
+            total <= GUARDED_ENV_MUTATION_CEILING,
+            "CLI source holds {total} set_var/remove_var calls, more than the \
+             {GUARDED_ENV_MUTATION_CEILING} ENV_MUTEX-guarded 48-09 calls"
+        );
+    }
     /// 20c (review: Codex MEDIUM — resume semantics): a phase halted by
     /// `--until <stage>` has `stopped`/`stop_reason`/`stop_until` persisted.
     /// `resume` must clear all three BEFORE relaunching — otherwise
@@ -2545,7 +2657,8 @@ mod tests {
             "pipeline_launch::tests::resume_clears_stop_marker_and_advances_past_stop_point";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -2779,7 +2892,8 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::resume_preserves_unfired_until_cap";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -2856,7 +2970,8 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::resume_without_a_cap_is_unchanged";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -2911,7 +3026,8 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::resume_with_agent_hands_off_and_relaunches_under_the_new_driver";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("codex");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -2964,7 +3080,8 @@ mod tests {
             "pipeline_launch::tests::resume_without_agent_leaves_the_saved_agent_untouched";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -3062,7 +3179,8 @@ mod tests {
             "pipeline_launch::tests::resume_with_same_agent_is_an_ordinary_idempotent_resume";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -3102,7 +3220,8 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::resume_with_agent_allows_plan_stage";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("codex");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -3132,7 +3251,8 @@ mod tests {
         const NAME: &str = "pipeline_launch::tests::resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("codex");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -3205,7 +3325,8 @@ mod tests {
             "pipeline_launch::tests::resume_with_agent_from_a_rate_limited_state_relaunches";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("codex");
-            let output = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
         }
@@ -4489,7 +4610,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
 
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -4554,7 +4675,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
 
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -4799,7 +4920,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -4900,7 +5021,7 @@ mod tests {
                 Mode::Supervise,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -4976,7 +5097,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5131,7 +5252,7 @@ mod tests {
                 Mode::Supervise,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5241,7 +5362,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5305,7 +5426,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5342,7 +5463,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5380,7 +5501,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5425,7 +5546,7 @@ mod tests {
                 Mode::Auto,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5475,7 +5596,7 @@ mod tests {
                 Mode::Supervise,
             );
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5670,7 +5791,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
 
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],
@@ -5745,7 +5866,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
 
             let path_dir = agent_free_dir_with_agent_stub("claude");
-            let output = devflow_core::test_support::run_test_in_child(
+            let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(ROOT_ENV, root.as_os_str())],

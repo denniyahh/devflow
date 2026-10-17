@@ -1487,7 +1487,7 @@ mod tests {
             if !devflow_core::test_support::in_child_test($name) {
                 let path_dir = $path_dir;
                 let output =
-                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                    crate::test_support::run_hermetic_test_in_child($name, path_dir.path(), &[]);
                 devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
                     &output, $name,
                 );
