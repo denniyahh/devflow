@@ -245,18 +245,37 @@ fn acquire_after_existing(
     let Some(record) = read_holder_record(&path) else {
         return Err(contended(path));
     };
-    if crate::agent::agent_running(record.pid) {
-        return Err(LockError::Contended {
-            pid: record.pid.to_string(),
-            path,
-        });
+    // 999.128 (D-08): reclaim through the same holder classifier `holder_status`
+    // uses, so a live pid whose start time differs from the recorded one (the
+    // recorded holder exited and its pid was reused) counts as stale. Only an
+    // identity-confirmed live holder, or one whose identity cannot be checked,
+    // keeps the lock.
+    let is_running = crate::agent::agent_running(record.pid);
+    let observed_start_time = crate::agent::process_start_time(record.pid);
+    match classify_holder_record(record, is_running, observed_start_time) {
+        HolderStatus::Live { .. } | HolderStatus::Unconfirmable { .. } => {
+            return Err(LockError::Contended {
+                pid: record.pid.to_string(),
+                path,
+            });
+        }
+        HolderStatus::NoHolder => tracing::warn!(
+            "reclaiming stale devflow lock at {} (holder pid {} is not alive)",
+            path.display(),
+            record.pid
+        ),
+        HolderStatus::Recycled { pid } => {
+            let show =
+                |start: Option<u64>| start.map_or_else(|| "unknown".into(), |s| s.to_string());
+            tracing::warn!(
+                "reclaiming devflow lock at {}: holder pid {pid} is alive but its start time {} \
+                 differs from the recorded {} — reclaiming a recycled pid",
+                path.display(),
+                show(observed_start_time),
+                show(record.recorded_start_time)
+            );
+        }
     }
-
-    tracing::warn!(
-        "reclaiming stale devflow lock at {} (holder pid {} is not alive)",
-        path.display(),
-        record.pid
-    );
     before_reclaim();
     match fs::remove_file(&path) {
         Ok(()) => {}
