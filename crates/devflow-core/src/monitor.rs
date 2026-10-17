@@ -58,7 +58,8 @@ pub enum MonitorError {
         /// The process group the agent was found in (`-1` when unreadable).
         pgid: i32,
     },
-    /// A supervision shape that this build cannot run yet.
+    /// A supervision shape that this build cannot run yet, or a supervisor
+    /// that never published its socket (it and what it started were ended).
     #[error("supervision shape not ready: {0}")]
     NotReady(String),
 }
@@ -1702,8 +1703,24 @@ fn stage_sidecar(spec: &StageSpec, agent_pid: u32) -> crate::supervisor::Sidecar
 )]
 const PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
+/// How often [`wait_for_publish`] polls the child and probes the socket.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+const PUBLISH_POLL: Duration = Duration::from_millis(20);
+
+/// How long the not-ready teardown waits for its SIGSTOP to show in
+/// `/proc` before it lists the child's children.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+const STOP_SETTLE_WAIT: Duration = Duration::from_millis(100);
+
 /// The `/proc/<pid>/stat` fields the not-ready teardown picks its targets
-/// by, from one read.
+/// by, from one read. 50-09's `agent::ProcStat` carries no parent pid, so
+/// this is a separate, private parse.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "spawn_monitor calls it from 50-11")
@@ -1714,21 +1731,188 @@ struct ChildStat {
     ppid: u32,
     /// Field 5, the process group id.
     pgid: i32,
-    /// Field 22, the start time in clock ticks since boot.
+    /// Field 22, the start time in clock ticks since boot, as
+    /// [`crate::agent::is_same_process`] compares it.
     start_time: u64,
 }
 
-/// Parse one `/proc/<pid>/stat` line into [`ChildStat`].
+/// Parse one `/proc/<pid>/stat` line into [`ChildStat`]. `comm` (field 2)
+/// may hold spaces and parentheses, so the line is split after its last
+/// `)`: index 0 is then field 3, so the parent pid (field 4) is index 1,
+/// the process group (field 5) index 2 and the start time (field 22)
+/// index 19. A missing or unparsable field is `None`, never a guess.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "spawn_monitor calls it from 50-11")
 )]
-fn parse_proc_stat_line(_line: &str) -> Option<ChildStat> {
-    None
+fn parse_proc_stat_line(line: &str) -> Option<ChildStat> {
+    let rest = &line[line.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    Some(ChildStat {
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
 }
 
-/// Wait up to `wait` for the supervisor `child` to publish `socket` with
-/// `launch_id`.
+/// [`ChildStat`] for `pid` from one read of `/proc/<pid>/stat`, or `None`
+/// when it cannot be read or parsed.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn read_child_stat(pid: u32) -> Option<ChildStat> {
+    parse_proc_stat_line(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Every process whose parent pid is `parent`, each with the stat it was
+/// chosen by. An entry that cannot be read is skipped.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn direct_children(parent: u32) -> Vec<(u32, ChildStat)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        warn!("could not list /proc; no child of supervisor {parent} can be found");
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, read_child_stat(pid)?)))
+        .filter(|(_, stat)| stat.ppid == parent)
+        .collect()
+}
+
+/// Signal process group `pgid`: the one place this module's launch paths
+/// send a group signal. It refuses a pgid that does not fit `pid_t`, is `0`
+/// or `1`, or is this process's own group, because `kill(0, …)` signals our
+/// own group and `kill(-1, …)` every process we may signal (the runtime's
+/// rule, T-50-18). Callers pass only a group they started or one whose
+/// leader they have just re-validated.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn signal_guarded_group(pgid: u32, signal: libc::c_int) -> bool {
+    let Ok(signed) = libc::pid_t::try_from(pgid) else {
+        warn!("process group {pgid} does not fit pid_t; not signalling");
+        return false;
+    };
+    if signed <= 1 {
+        warn!("refusing to signal process group {signed}");
+        return false;
+    }
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    if signed == unsafe { libc::getpgrp() } {
+        warn!("refusing to signal this process's own group {signed}");
+        return false;
+    }
+    // SAFETY: `signed > 1`, so `-signed < -1`: neither our own group (`0`)
+    // nor every process (`-1`).
+    unsafe { libc::kill(-signed, signal) == 0 }
+}
+
+/// Send `signal` to `child` alone, by the pid of the `Child` this process
+/// spawned and has not reaped (so the pid cannot name another process).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn signal_own_child(child: &std::process::Child, signal: libc::c_int) -> bool {
+    match libc::pid_t::try_from(child.id()) {
+        // SAFETY: `pid > 1` names one unreaped child of this process.
+        Ok(pid) if pid > 1 => unsafe { libc::kill(pid, signal) == 0 },
+        _ => false,
+    }
+}
+
+/// Poll `child` until it exits (reaping it) or `wait` elapses.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn exit_within(
+    child: &mut std::process::Child,
+    wait: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(PUBLISH_POLL);
+    }
+}
+
+/// End a supervisor that did not publish in time, and what it started,
+/// using only its own `Child` and values read from `/proc` while it is
+/// stopped, never a pid from disk. Returns how it ended.
+///
+/// 1. SIGTERM: a supervisor that reached `serve` treats it as a stop (D-05)
+///    and ends its agent group itself. Wait up to
+///    `2 × agent::TERMINATE_VERIFY_WAIT`.
+/// 2. Still running: SIGSTOP it, so it cannot spawn or reap meanwhile, and
+///    list its direct children with their group and start time.
+/// 3. SIGKILL its own group (it leads it, `process_group(0)`) and reap it.
+/// 4. SIGKILL the group of each listed child that leads its own group
+///    (R-3's agent shape) and still has the listed start time. A bare kill
+///    of the child's group would orphan such an agent.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn end_unpublished_child(child: &mut std::process::Child, wait: Duration) -> String {
+    signal_own_child(child, libc::SIGTERM);
+    if let Some(status) = exit_within(child, 2 * crate::agent::TERMINATE_VERIFY_WAIT) {
+        return format!(
+            "did not publish within {wait:?} and was ended by SIGTERM ({status}); \
+             0 child process groups ended"
+        );
+    }
+    let pid = child.id();
+    signal_own_child(child, libc::SIGSTOP);
+    let deadline = std::time::Instant::now() + STOP_SETTLE_WAIT;
+    while !crate::agent::process_stat_fields(pid).is_some_and(|stat| stat.state == 'T')
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let children = direct_children(pid);
+    signal_guarded_group(pid, libc::SIGKILL);
+    // By pid as well, in case it leads no group: a pid still in use as a
+    // live non-leader names no group, so the group signal reached nothing.
+    let _ = child.kill();
+    let _ = child.wait();
+    let ended = children
+        .iter()
+        .filter(|(child_pid, stat)| {
+            i64::from(stat.pgid) == i64::from(*child_pid)
+                && crate::agent::is_same_process(*child_pid, stat.start_time)
+                && signal_guarded_group(*child_pid, libc::SIGKILL)
+        })
+        .count();
+    format!(
+        "did not publish within {wait:?} and was ended (SIGTERM ignored for {grace:?}, then \
+         SIGSTOP and SIGKILL of its group); {ended} child process group(s) ended",
+        grace = 2 * crate::agent::TERMINATE_VERIFY_WAIT
+    )
+}
+
+/// Wait up to `wait` for the supervisor `child` (spawned by this process
+/// with `process_group(0)`) to publish `socket` with `launch_id`.
+///
+/// Polls every [`PUBLISH_POLL`]: a ping reply with this launch id returns
+/// it and leaves the child running; Gone, Stale, a probe error or another
+/// launch id count as not yet published. If the child exits first it is
+/// reaped; if the wait expires it is ended with what it started
+/// ([`end_unpublished_child`]). Either way nothing can answer on this
+/// launch's address any more (its only server was the reaped child), so its
+/// launch files are removed, and the result is [`MonitorError::NotReady`]
+/// naming the child, how it ended and how many child groups were ended.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "spawn_monitor calls it from 50-11")
@@ -1739,20 +1923,32 @@ fn wait_for_publish(
     launch_id: &str,
     wait: Duration,
 ) -> Result<crate::supervisor::protocol::PingReply, MonitorError> {
+    let pid = child.id();
     let deadline = std::time::Instant::now() + wait;
-    while std::time::Instant::now() < deadline {
+    let how = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            break format!(
+                "exited by itself before publishing ({status}); 0 child process groups ended"
+            );
+        }
         if let Ok(crate::supervisor::Liveness::Alive(reply)) =
             crate::supervisor::probe(socket.as_path())
             && reply.launch_id == launch_id
         {
             return Ok(reply);
         }
-        std::thread::sleep(Duration::from_millis(20));
+        if std::time::Instant::now() >= deadline {
+            break end_unpublished_child(child, wait);
+        }
+        std::thread::sleep(PUBLISH_POLL);
+    };
+    if let Err(error) = crate::supervisor::remove_launch_files(socket) {
+        warn!(
+            "could not remove the launch files of {}: {error}",
+            socket.as_path().display()
+        );
     }
-    Err(MonitorError::NotReady(format!(
-        "supervisor {} did not publish",
-        child.id()
-    )))
+    Err(MonitorError::NotReady(format!("supervisor {pid} {how}")))
 }
 
 /// The idle-timeout firing sequence, in the ONE order it may run (D-05).
@@ -6312,6 +6508,12 @@ exit 0
                 "the NotReady text names the child {child_pid}: {text}"
             ),
             other => panic!("expected NotReady, got {other:?}"),
+        }
+        if let Err(MonitorError::NotReady(text)) = &result {
+            assert!(
+                text.contains("1 child process group(s) ended"),
+                "the teardown ended exactly the sleeper's group: {text}"
+            );
         }
         let bound = Duration::from_secs(1)
             + 2 * crate::agent::TERMINATE_VERIFY_WAIT
