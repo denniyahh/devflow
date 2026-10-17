@@ -331,7 +331,7 @@ fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
 
 /// An exit status as a code: the exit code, or `128 + n` for a death by
 /// signal `n` (the `monitor` convention: SIGTERM is 143, SIGKILL 137).
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
         status.signal().map_or(-1, |signal| 128 + signal)

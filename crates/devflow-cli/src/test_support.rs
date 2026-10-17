@@ -697,27 +697,34 @@ fn run_monitor_harness_entry(advance: bool) {
         phase,
         stage,
         workdir,
+        agent,
+        launch,
+        socket,
+        launch_id,
+        keep_env,
         prompt_file,
         idle_timeout_secs,
-        agent,
         argv,
     } = cli.command
     else {
         panic!("the monitor argv parsed as a command other than __monitor");
     };
-    let project_root = crate::project_root(project).expect("monitor project root");
-    crate::pipeline_launch::supervise_monitor(
-        &project_root,
+    let invocation = crate::pipeline_launch::MonitorInvocation {
+        project_root: crate::project_root(project).expect("monitor project root"),
         phase,
         stage,
-        &workdir,
-        &prompt_file,
-        idle_timeout_secs,
+        workdir,
         agent,
-        &argv,
-        advance,
-    )
-    .expect("the harness-entry monitor must supervise its agent");
+        launch,
+        socket,
+        launch_id,
+        keep_env,
+        prompt_file,
+        idle_timeout_secs,
+        argv,
+    };
+    crate::pipeline_launch::supervise_monitor(&invocation, advance)
+        .expect("the harness-entry monitor must supervise its agent");
 }
 
 /// The test build's full monitor entry (50-10): `run_monitor` exactly as the
