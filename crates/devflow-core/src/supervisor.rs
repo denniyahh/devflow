@@ -21,6 +21,7 @@
 //! refused is `Stale`; any other surprise at the path is a [`ProbeError`], so
 //! a stray file can never be mistaken for a dead supervisor (R-6).
 
+pub mod backstop;
 pub mod protocol;
 pub mod runtime;
 
