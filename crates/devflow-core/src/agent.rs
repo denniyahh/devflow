@@ -586,6 +586,154 @@ pub fn looks_like_devflow_process(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    /// 50-12 (T-50-52): the `/proc` stray census matches only the two 2.x
+    /// shapes 50-11 deleted. Its two matchers still fire (the control), and
+    /// the 3.x supervisor's argv — both launch shapes, laid out as
+    /// `monitor::monitor_args` builds it — matches neither.
+    #[test]
+    fn the_stray_census_matches_only_the_2x_process_shapes() {
+        let wrapper_script = format!("cleanup() {{ :; }}\n{MONITOR_WRAPPER_MARKER}\nclaude -p");
+        assert_eq!(
+            classify_stray_layer(&argv(&["sh", "-c", &wrapper_script])),
+            Some(StrayLayer::MonitorWrapper)
+        );
+        assert_eq!(
+            classify_stray_layer(&argv(&["/x/devflow", "advance", "--phase", "7"])),
+            Some(StrayLayer::AdvanceChild)
+        );
+
+        let plan_shape = argv(&[
+            "/x/devflow",
+            "__monitor",
+            "--project",
+            "/p",
+            "--phase",
+            "7",
+            "--launch",
+            "stream",
+            "--launch-id",
+            "abc",
+        ]);
+        let stream = argv(&[
+            "/x/devflow",
+            "__monitor",
+            "--project",
+            "/p",
+            "--phase",
+            "7",
+            "--stage",
+            "code",
+            "--workdir",
+            "/w",
+            "--agent",
+            "claude",
+            "--launch",
+            "stream",
+            "--socket",
+            "/c/sock/x.sock",
+            "--launch-id",
+            "0123456789abcdef",
+            "--keep-env",
+            "GIT_CONFIG_COUNT",
+            "--prompt-file",
+            "/w/prompt",
+            "--idle-timeout-secs",
+            "60",
+            "--",
+            "claude",
+            "-p",
+        ]);
+        let capture = argv(&[
+            "/x/devflow",
+            "__monitor",
+            "--project",
+            "/p",
+            "--phase",
+            "7",
+            "--stage",
+            "code",
+            "--workdir",
+            "/w",
+            "--agent",
+            "claude",
+            "--launch",
+            "capture",
+            "--socket",
+            "/c/sock/x.sock",
+            "--launch-id",
+            "0123456789abcdef",
+            "--",
+            "claude",
+            "-p",
+        ]);
+        for supervisor in [plan_shape, stream, capture] {
+            assert_eq!(
+                classify_stray_layer(&supervisor),
+                None,
+                "a 3.x supervisor is never a stray: {supervisor:?}"
+            );
+        }
+    }
+
+    /// The doc block directly above the line in `source` (cut at its first
+    /// `mod tests {` line) that starts with `item`: the contiguous `///` and
+    /// `#[` lines above it. `None` when the item is absent.
+    fn doc_block_above(source: &str, item: &str) -> Option<String> {
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| !line.contains("mod tests {"))
+            .collect();
+        let at = lines.iter().position(|line| line.starts_with(item))?;
+        let block: Vec<&str> = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| {
+                let line = line.trim_start();
+                line.starts_with("///") || line.starts_with("#[")
+            })
+            .copied()
+            .collect();
+        Some(block.into_iter().rev().collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Whether the doc block above `item` in `source` says the census is
+    /// 2.x-only; the reason when it does not.
+    fn census_doc_names_2x(source: &str, item: &str) -> Result<(), String> {
+        let doc = doc_block_above(source, item).ok_or_else(|| format!("{item} not found"))?;
+        if doc.contains("2.x") {
+            Ok(())
+        } else {
+            Err(format!("the doc above {item} does not name 2.x:\n{doc}"))
+        }
+    }
+
+    /// 50-12 R6-G4 (T-50-52): while the 2.x census exists, its docs must say
+    /// it matches only 2.x processes, so nobody reads it as covering 3.x.
+    /// The planted controls run the same extractor.
+    #[test]
+    fn the_stray_census_docs_say_it_is_2x_only() {
+        let planted = "/// Lists strays.\n#[derive(Debug)]\npub enum StrayLayer {";
+        assert!(census_doc_names_2x(planted, "pub enum StrayLayer").is_err());
+        let named = "/// Lists 2.x strays.\n#[derive(Debug)]\npub enum StrayLayer {";
+        assert_eq!(census_doc_names_2x(named, "pub enum StrayLayer"), Ok(()));
+        assert!(census_doc_names_2x("fn other() {}", "pub enum StrayLayer").is_err());
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent.rs"),
+        )
+        .expect("read src/agent.rs");
+        for item in [
+            "pub enum StrayLayer",
+            "pub fn discover_stray_devflow_processes",
+        ] {
+            assert_eq!(census_doc_names_2x(&source, item), Ok(()));
+        }
+    }
+
     #[test]
     fn agent_running_detects_self() {
         // The current process is, by definition, running.
