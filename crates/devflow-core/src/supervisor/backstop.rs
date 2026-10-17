@@ -147,6 +147,15 @@ pub enum BackstopDecision {
     RefuseLeaderGone(Vec<GroupMember>),
 }
 
+impl BackstopDecision {
+    /// The text the CLI prints for this decision about the launch whose
+    /// socket is `socket` and whose sidecar is `sidecar`.
+    pub fn describe(&self, _socket: &SocketPath, _sidecar: &Sidecar) -> String {
+        // RED stub (50-09 Task 2).
+        String::new()
+    }
+}
+
 /// How a group was signalled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -652,8 +661,11 @@ mod tests {
     /// A group whose leader stays: it waits on its two sleeping members.
     #[cfg(target_os = "linux")]
     const LEADER_WAITS: &str = "sleep 30 & sleep 30 & wait";
+    /// A group whose leader forks two sleeping members and exits at once.
     #[cfg(target_os = "linux")]
+    const LEADER_EXITS: &str = "sleep 30 & sleep 30 & exit 0";
     /// How long a fixture may take to reach the state a test needs.
+    #[cfg(target_os = "linux")]
     const SETTLE: Duration = Duration::from_secs(5);
     #[cfg(target_os = "linux")]
     const POLL: Duration = Duration::from_millis(20);
@@ -817,6 +829,14 @@ mod tests {
                 );
                 std::thread::sleep(POLL);
             }
+        }
+
+        /// Reap the leader (a script that exits on its own) and stop
+        /// counting it as a member.
+        fn reap_leader(&mut self) {
+            self.leader.wait().expect("reap the leader");
+            self.leader_reaped = true;
+            self.members.retain(|(pid, _)| *pid != self.pgid);
         }
 
         fn all_alive(&self) -> bool {
@@ -1005,6 +1025,277 @@ mod tests {
             files_exist(&stale),
             (true, true),
             "a refusal keeps the files"
+        );
+    }
+
+    /// A short pause after a call that must signal nothing, so a wrongly
+    /// sent signal has time to land before the survivors are checked.
+    #[cfg(target_os = "linux")]
+    const SIGNAL_LANDS: Duration = Duration::from_millis(200);
+
+    /// Tear down a fixture group whose leader is present with the recorded
+    /// identity, and require it gone: the opposite-direction control of
+    /// V-19, V-20 and V-21.
+    #[cfg(target_os = "linux")]
+    fn assert_validated_group_is_killed(cache: &Path, boot: &str) {
+        let mut group = TestGroup::spawn(LEADER_WAITS);
+        group.settle(2);
+        let (socket, sidecar) = stale_launch(cache, group.pgid, group.leader_start, boot);
+        let outcome = teardown_stale(&socket, &sidecar, None).expect("teardown the control");
+        assert!(
+            matches!(outcome, BackstopOutcome::Killed { .. }),
+            "the control group must be killed, got {outcome:?}"
+        );
+        group.wait_all_gone();
+        assert_eq!(files_exist(&socket), (false, false));
+    }
+
+    /// V-19 (R-4, RESEARCH Finding 1): the leader is gone and its members
+    /// live, so nothing proves they are the agent's. They are reported,
+    /// never signalled, and the files are kept. Control: the same shape with
+    /// the leader alive is killed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backstop_refuses_and_reports_a_group_whose_leader_is_gone() {
+        let cache = short_cache();
+        let boot = super::super::boot_id().expect("read the boot id");
+        let mut group = TestGroup::spawn(LEADER_EXITS);
+        group.reap_leader();
+        group.settle(2);
+        assert_eq!(group.members.len(), 2, "two members outlive the leader");
+
+        let (socket, sidecar) = stale_launch(cache.path(), group.pgid, group.leader_start, &boot);
+        let outcome = teardown_stale(&socket, &sidecar, None).expect("teardown");
+        let BackstopOutcome::Refused(decision) = outcome else {
+            panic!("a leader-gone group must be refused, got {outcome:?}");
+        };
+        let BackstopDecision::RefuseLeaderGone(members) = &decision else {
+            panic!("expected RefuseLeaderGone, got {decision:?}");
+        };
+        assert_eq!(
+            member_ids(members),
+            group.members,
+            "both members are reported"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|member| member.cmdline.starts_with("sleep 30")),
+            "each member is reported with its cmdline: {members:?}"
+        );
+        std::thread::sleep(SIGNAL_LANDS);
+        assert!(group.all_alive(), "a leader-gone group is never signalled");
+        assert_eq!(
+            files_exist(&socket),
+            (true, true),
+            "a refusal keeps the files"
+        );
+
+        let text = decision.describe(&socket, &sidecar);
+        assert!(
+            text.contains(&format!("ps -o pid,pgid,sid,lstart,args -g {}", group.pgid)),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "may be the original agent's children or an unrelated group that reused the id; \
+                 nothing was signalled"
+            ),
+            "{text}"
+        );
+        for member in members {
+            assert!(text.contains(&format!("pid {},", member.pid)), "{text}");
+            assert!(
+                text.contains(&format!("start time {},", member.start_time)),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("session {}", member.session)),
+                "{text}"
+            );
+        }
+
+        assert_validated_group_is_killed(cache.path(), &boot);
+    }
+
+    /// V-20 (R-4, T-50-22): the recorded pgid names a live, unrelated group
+    /// whose leader started at another time. That is a recycled pid, so the
+    /// recorded group is gone: nothing is signalled and the files go.
+    /// Control: the matching start time is signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reused_pgid_is_never_signalled() {
+        let cache = short_cache();
+        let boot = super::super::boot_id().expect("read the boot id");
+        let mut unrelated = TestGroup::spawn(LEADER_WAITS);
+        unrelated.settle(2);
+        assert!(
+            unrelated.leader_start > 0,
+            "a start time an earlier agent could precede"
+        );
+
+        // The recorded agent started one tick before the group now at its pid.
+        let recorded_start = unrelated.leader_start - 1;
+        let (socket, sidecar) = stale_launch(cache.path(), unrelated.pgid, recorded_start, &boot);
+        assert_eq!(
+            teardown_stale(&socket, &sidecar, None).expect("teardown"),
+            BackstopOutcome::RemovedNothingSignalled(BackstopDecision::LeaderRecycled)
+        );
+        std::thread::sleep(SIGNAL_LANDS);
+        assert!(
+            unrelated.all_alive(),
+            "the unrelated group must not be signalled"
+        );
+        assert_eq!(
+            files_exist(&socket),
+            (false, false),
+            "a recycled pgid is GONE"
+        );
+
+        assert_validated_group_is_killed(cache.path(), &boot);
+    }
+
+    /// V-21 (R-8): a sidecar from another boot over a live, otherwise valid
+    /// group is removed and nothing is signalled. Control: the current boot
+    /// id is signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_previous_boot_socket_is_removed_and_nothing_is_signalled() {
+        let cache = short_cache();
+        let boot = super::super::boot_id().expect("read the boot id");
+        let previous = "00000000-0000-4000-8000-000000000000";
+        assert_ne!(
+            boot, previous,
+            "the fabricated boot id must differ from this boot's"
+        );
+        let mut group = TestGroup::spawn(LEADER_WAITS);
+        group.settle(2);
+
+        let (socket, sidecar) =
+            stale_launch(cache.path(), group.pgid, group.leader_start, previous);
+        assert_eq!(
+            teardown_stale(&socket, &sidecar, None).expect("teardown"),
+            BackstopOutcome::RemovedNothingSignalled(BackstopDecision::PreviousBoot)
+        );
+        std::thread::sleep(SIGNAL_LANDS);
+        assert!(group.all_alive(), "a previous-boot socket signals nothing");
+        assert_eq!(
+            files_exist(&socket),
+            (false, false),
+            "a previous-boot socket is removed"
+        );
+
+        assert_validated_group_is_killed(cache.path(), &boot);
+    }
+
+    /// T-50-25: pgid 0, 1, the caller's own group and a value that does not
+    /// fit `pid_t` are refused before anything is read or signalled. Were
+    /// the caller's group signalled, this test would die. Control: an
+    /// ordinary pgid is not refused as unsafe.
+    #[test]
+    fn the_backstop_never_targets_pgid_one_or_its_own_group() {
+        let cache = short_cache();
+        // SAFETY: getpgrp has no preconditions and cannot fail.
+        let own = u32::try_from(unsafe { libc::getpgrp() }).expect("a positive pgrp");
+        for pgid in [0, 1, own, u32::MAX] {
+            let (socket, sidecar) = stale_launch(cache.path(), pgid, 1, "boot-test");
+            assert_eq!(
+                assess(&sidecar, None),
+                BackstopDecision::RefuseUnsafeTarget,
+                "pgid {pgid}"
+            );
+            assert_eq!(
+                teardown_stale(&socket, &sidecar, None).expect("teardown"),
+                BackstopOutcome::Refused(BackstopDecision::RefuseUnsafeTarget),
+                "pgid {pgid}"
+            );
+            assert_eq!(
+                files_exist(&socket),
+                (true, true),
+                "pgid {pgid} keeps its files"
+            );
+        }
+        let ordinary = sidecar_for(
+            "ordinary",
+            u32::try_from(i32::MAX).expect("fits"),
+            1,
+            "boot",
+        );
+        assert_ne!(
+            assess(&ordinary, None),
+            BackstopDecision::RefuseUnsafeTarget
+        );
+    }
+
+    /// T-50-25: gathering reads only this uid's processes. Group 1 (init's)
+    /// is visible to an independent `/proc` scan but owned by root, so the
+    /// census and the leader read find nothing there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gathering_skips_processes_of_another_uid() {
+        if super::super::protocol::euid() == 0 {
+            eprintln!("skipped: running as root, so no process belongs to another uid");
+            return;
+        }
+        assert!(
+            !live_in_group(1).is_empty(),
+            "control: an independent scan sees group 1"
+        );
+        assert_eq!(
+            group_members(1),
+            Some(Vec::new()),
+            "another uid's group reads empty"
+        );
+        assert_eq!(
+            own_process_stat(1),
+            None,
+            "another uid's leader reads absent"
+        );
+        let me = std::process::id();
+        assert!(
+            own_process_stat(me).is_some(),
+            "control: this uid's process is read"
+        );
+    }
+
+    /// MAC-2: the `RefuseIdentityUnavailable` text names the group, the
+    /// launch, both files and the manual repair, and no platform command.
+    /// Control: the leader-gone text does not claim identity is unprovable.
+    #[test]
+    fn the_identity_unavailable_refusal_names_the_group_and_the_manual_repair() {
+        let launch_id = "aaaa0000aaaa0000";
+        let socket = socket_for(Path::new("/tmp/dfs-text-fixture"), launch_id);
+        let sidecar = sidecar_for(launch_id, 4242, 99, "boot-test");
+        let text = BackstopDecision::RefuseIdentityUnavailable.describe(&socket, &sidecar);
+        for needle in [
+            "nothing was signalled or removed".to_string(),
+            "cannot prove process group 4242".to_string(),
+            launch_id.to_string(),
+            socket.as_path().display().to_string(),
+            socket.sidecar_path().display().to_string(),
+            "end that group yourself".to_string(),
+        ] {
+            assert!(text.contains(&needle), "missing {needle:?} in {text}");
+        }
+        for command in ["ps ", "kill", "pkill", "launchctl"] {
+            assert!(
+                !text.contains(command),
+                "names a command {command:?}: {text}"
+            );
+        }
+
+        let member = GroupMember {
+            pid: 4243,
+            start_time: 100,
+            state: 'S',
+            session: 4000,
+            cmdline: "sleep 30".to_string(),
+        };
+        let gone = BackstopDecision::RefuseLeaderGone(vec![member]).describe(&socket, &sidecar);
+        assert!(!gone.contains("cannot prove process group"), "{gone}");
+        assert!(
+            gone.contains("ps -o pid,pgid,sid,lstart,args -g 4242"),
+            "{gone}"
         );
     }
 }
