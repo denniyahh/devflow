@@ -1496,8 +1496,12 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    `process_group(0)`, then require that it leads its own process group
 ///    before anything is recorded (R-3). A mismatch kills and reaps it and
 ///    returns [`MonitorError::PgidMismatch`].
-/// 3. Write the agent pid file, then [`Supervisor::serve`]: the sidecar is
-///    written before the socket name appears (R-7).
+/// 3. Hand the agent's `Child` to an `AgentGroupGuard`, which ends the
+///    agent's group on any error or panic until `serve` succeeds. Write the
+///    agent pid file and the sidecar, then [`Supervisor::serve`]: the
+///    sidecar exists before the socket name appears (R-7), and it is the
+///    launcher's only record of the agent if this process is SIGKILLed
+///    before it publishes (RV-03; `serve` rewrites it with the same content).
 /// 4. The stream shape only: drive the agent's pipes through the same
 ///    helper `run_pipe_owning_monitor` uses (first turn, capture tee, close
 ///    rule, idle timeout). An idle-timeout group kill is a natural outcome,
@@ -1524,17 +1528,16 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         abandon_agent(&mut child);
         return Err(MonitorError::PgidMismatch { pid, pgid });
     }
-    if let Err(err) = std::fs::write(&pid_file, format!("{pid}\n")) {
-        abandon_agent(&mut child);
-        return Err(err.into());
-    }
-    let supervisor = match Supervisor::serve(spec.socket.clone(), stage_sidecar(&spec, pid)) {
-        Ok(supervisor) => supervisor,
-        Err(err) => {
-            abandon_agent(&mut child);
-            return Err(err.into());
-        }
-    };
+    // Armed only now: before the pgid check the agent's pid may not number
+    // its group. Until `serve` succeeds, any error or panic ends the group.
+    let guard = AgentGroupGuard::arm(child);
+    std::fs::write(&pid_file, format!("{pid}\n"))?;
+    let sidecar = stage_sidecar(&spec, pid);
+    crate::supervisor::write_sidecar(&spec.socket, &sidecar)?;
+    #[cfg(test)]
+    monitor_test_hold("after_sidecar");
+    let supervisor = Supervisor::serve(spec.socket.clone(), sidecar)?;
+    let mut child = guard.disarm();
 
     let threads = match (&spec.io, stream_capture) {
         (
@@ -1582,6 +1585,80 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         outcome,
         supervisor,
     })
+}
+
+/// Owns a just-spawned agent's unreaped `Child` from the moment its pgid
+/// check passes until [`Supervisor::serve`] succeeds, so a pid-file write
+/// error, a sidecar or publish error, or a panic in that span never leaves
+/// the agent running when `__monitor` exits. Dropped while armed, it
+/// SIGKILLs the agent's group and only then reaps the leader: because it
+/// holds the unreaped leader, the pgid cannot be recycled before its own
+/// signal. [`disarm`](Self::disarm) hands the `Child` back once the
+/// [`Supervisor`] owns teardown.
+struct AgentGroupGuard {
+    /// The agent, unreaped; `None` only once disarmed.
+    child: Option<std::process::Child>,
+    /// The agent's pgid: its pid, checked by `confirm_own_group`.
+    pgid: u32,
+}
+
+impl AgentGroupGuard {
+    /// Take ownership of `child`, which leads its own group.
+    fn arm(child: std::process::Child) -> Self {
+        let pgid = child.id();
+        Self {
+            child: Some(child),
+            pgid,
+        }
+    }
+
+    /// Hand the agent back: the [`Supervisor`] now owns its teardown.
+    fn disarm(mut self) -> std::process::Child {
+        self.child
+            .take()
+            .expect("an armed AgentGroupGuard holds its child until disarm")
+    }
+}
+
+impl Drop for AgentGroupGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            warn!(
+                "ending agent group {}: its supervisor failed before publishing",
+                self.pgid
+            );
+            signal_guarded_group(self.pgid, libc::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// How long [`monitor_test_hold`] waits for its release file.
+#[cfg(test)]
+const MONITOR_TEST_HOLD_WAIT: Duration = Duration::from_secs(30);
+
+/// A test-only hold point: when `DEVFLOW_TEST_HOLD` is `<point>:<path>` for
+/// this `point`, wait up to [`MONITOR_TEST_HOLD_WAIT`] for `<path>` to
+/// exist, so a test can land a fault in a chosen window. Compiled out of
+/// non-test builds (pinned by
+/// `monitor::tests::the_test_hold_is_compiled_out_of_non_test_builds`).
+#[cfg(test)]
+fn monitor_test_hold(point: &str) {
+    let Ok(hold) = std::env::var("DEVFLOW_TEST_HOLD") else {
+        return;
+    };
+    let Some((at, path)) = hold.split_once(':') else {
+        return;
+    };
+    if at != point {
+        return;
+    }
+    let release = Path::new(path);
+    let deadline = std::time::Instant::now() + MONITOR_TEST_HOLD_WAIT;
+    while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Spawn `spec`'s agent in its own process group (`process_group(0)`, R-3),
@@ -1772,15 +1849,27 @@ fn read_child_stat(pid: u32) -> Option<ChildStat> {
     expect(dead_code, reason = "spawn_monitor calls it from 50-11")
 )]
 fn direct_children(parent: u32) -> Vec<(u32, ChildStat)> {
+    proc_table()
+        .into_iter()
+        .filter(|(_, stat)| stat.ppid == parent)
+        .collect()
+}
+
+/// Every readable `/proc/<pid>/stat`, each from one read. An unlistable
+/// `/proc` is an empty table (logged); an unreadable entry is skipped.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn proc_table() -> Vec<(u32, ChildStat)> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        warn!("could not list /proc; no child of supervisor {parent} can be found");
+        warn!("could not list /proc");
         return Vec::new();
     };
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
         .filter_map(|pid| Some((pid, read_child_stat(pid)?)))
-        .filter(|(_, stat)| stat.ppid == parent)
         .collect()
 }
 
@@ -1790,10 +1879,6 @@ fn direct_children(parent: u32) -> Vec<(u32, ChildStat)> {
 /// own group and `kill(-1, …)` every process we may signal (the runtime's
 /// rule, T-50-18). Callers pass only a group they started or one whose
 /// leader they have just re-validated.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
-)]
 fn signal_guarded_group(pgid: u32, signal: libc::c_int) -> bool {
     let Ok(signed) = libc::pid_t::try_from(pgid) else {
         warn!("process group {pgid} does not fit pid_t; not signalling");
@@ -1942,13 +2027,199 @@ fn wait_for_publish(
         }
         std::thread::sleep(PUBLISH_POLL);
     };
-    if let Err(error) = crate::supervisor::remove_launch_files(socket) {
+    let recorded = end_recorded_agent_group(socket, launch_id);
+    let removed = if recorded.keep_sidecar {
+        match std::fs::remove_file(socket.as_path()) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    } else {
+        crate::supervisor::remove_launch_files(socket)
+    };
+    if let Err(error) = removed {
         warn!(
             "could not remove the launch files of {}: {error}",
             socket.as_path().display()
         );
     }
-    Err(MonitorError::NotReady(format!("supervisor {pid} {how}")))
+    Err(MonitorError::NotReady(format!(
+        "supervisor {pid} {how}; {}",
+        recorded.text
+    )))
+}
+
+/// How long the ending step waits for a SIGKILLed recorded agent group to
+/// empty.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+const RECORDED_GROUP_GONE_WAIT: Duration = Duration::from_secs(2);
+
+/// What the ending step did about the agent group a launch's sidecar
+/// records.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+struct RecordedGroupEnd {
+    /// The sentence the `NotReady` message carries.
+    text: String,
+    /// Keep the sidecar, so `doctor` still lists the launch: the backstop
+    /// refused the recorded group, or it did not empty after its SIGKILL.
+    keep_sidecar: bool,
+}
+
+/// End the agent group the sidecar beside `socket` records, once the
+/// supervisor that wrote it is reaped (RV-03). A `__monitor` SIGKILLed
+/// after its sidecar write and before it published ran neither its
+/// `AgentGroupGuard` nor its signal handler, and its agent (which leads its
+/// own group, R-3) was reparented away, so the sidecar is the only record of
+/// it.
+///
+/// This reads a pgid from disk, so it is held to D-04's rule for the
+/// backstop: the group is signalled only when the sidecar is this launch's,
+/// [`backstop::assess`](crate::supervisor::backstop::assess) returns
+/// `LeaderPresentSignal` (boot id current, leader present with the recorded
+/// start time and leading the recorded group) and
+/// [`agent::is_same_process`](crate::agent::is_same_process) re-confirms
+/// the leader immediately before the SIGKILL. No sidecar, another launch
+/// id or any other decision signals nothing, and the text says which.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn end_recorded_agent_group(socket: &SocketPath, launch_id: &str) -> RecordedGroupEnd {
+    use crate::supervisor::backstop::BackstopDecision;
+    let done = |text: String| RecordedGroupEnd {
+        text,
+        keep_sidecar: false,
+    };
+    let sidecar = match crate::supervisor::read_sidecar(&socket.sidecar_path()) {
+        Ok(sidecar) => sidecar,
+        Err(crate::supervisor::SidecarError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return done(format!(
+                "no sidecar for launch {launch_id}; no agent group could be identified"
+            ));
+        }
+        Err(error) => {
+            return done(format!(
+                "the sidecar for launch {launch_id} is unusable ({error}); nothing was signalled"
+            ));
+        }
+    };
+    if sidecar.launch_id != launch_id {
+        return done(format!(
+            "the sidecar names launch {}, not {launch_id}; nothing was signalled",
+            sidecar.launch_id
+        ));
+    }
+    let pgid = sidecar.agent_pgid;
+    let decision = crate::supervisor::backstop::assess(&sidecar, None);
+    let name = decision_name(&decision);
+    match decision {
+        BackstopDecision::LeaderPresentSignal => {
+            if !crate::agent::is_same_process(pgid, sidecar.agent_start_time) {
+                return done(format!(
+                    "the leader of the agent group {pgid} its sidecar records changed before \
+                     the signal; nothing was signalled"
+                ));
+            }
+            if !signal_guarded_group(pgid, libc::SIGKILL) {
+                return done(format!(
+                    "the agent group {pgid} its sidecar records could not be signalled"
+                ));
+            }
+            if group_empties_within(pgid, RECORDED_GROUP_GONE_WAIT) {
+                done(format!("ended the agent group {pgid} its sidecar records"))
+            } else {
+                RecordedGroupEnd {
+                    text: format!(
+                        "ended the agent group {pgid} its sidecar records, but it still had \
+                         members after {RECORDED_GROUP_GONE_WAIT:?}; the sidecar is kept"
+                    ),
+                    keep_sidecar: true,
+                }
+            }
+        }
+        BackstopDecision::EmptyGroup
+        | BackstopDecision::LeaderRecycled
+        | BackstopDecision::PreviousBoot => done(format!(
+            "the agent group {pgid} its sidecar records reads {name}; nothing was signalled"
+        )),
+        BackstopDecision::RefuseLeaderGone(_)
+        | BackstopDecision::RefuseMismatch(_)
+        | BackstopDecision::RefuseUnsafeTarget
+        | BackstopDecision::RefuseIdentityUnavailable => RecordedGroupEnd {
+            text: format!(
+                "the agent group {pgid} its sidecar records reads {name} with {members} \
+                 member(s); nothing was signalled and the sidecar is kept",
+                members = group_member_count(pgid)
+            ),
+            keep_sidecar: true,
+        },
+    }
+}
+
+/// The variant name of a backstop decision, for the `NotReady` text.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn decision_name(decision: &crate::supervisor::backstop::BackstopDecision) -> &'static str {
+    use crate::supervisor::backstop::BackstopDecision;
+    match decision {
+        BackstopDecision::RefuseUnsafeTarget => "RefuseUnsafeTarget",
+        BackstopDecision::RefuseIdentityUnavailable => "RefuseIdentityUnavailable",
+        BackstopDecision::RefuseMismatch(_) => "RefuseMismatch",
+        BackstopDecision::PreviousBoot => "PreviousBoot",
+        BackstopDecision::EmptyGroup => "EmptyGroup",
+        BackstopDecision::LeaderPresentSignal => "LeaderPresentSignal",
+        BackstopDecision::LeaderRecycled => "LeaderRecycled",
+        BackstopDecision::RefuseLeaderGone(_) => "RefuseLeaderGone",
+    }
+}
+
+/// How many processes `/proc` lists in group `pgid` right now.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn group_member_count(pgid: u32) -> usize {
+    proc_table()
+        .iter()
+        .filter(|(_, stat)| i64::from(stat.pgid) == i64::from(pgid))
+        .count()
+}
+
+/// Poll until no process is left in group `pgid` (`kill(-pgid, 0)` fails
+/// with ESRCH), up to `wait`. A pgid that is not a safe group target never
+/// counts as empty.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "spawn_monitor calls it from 50-11")
+)]
+fn group_empties_within(pgid: u32, wait: Duration) -> bool {
+    let Ok(signed) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    if signed <= 1 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // SAFETY: signal 0 only checks for existence; `signed > 1`.
+        let rc = unsafe { libc::kill(-signed, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(PUBLISH_POLL);
+    }
 }
 
 /// The idle-timeout firing sequence, in the ONE order it may run (D-05).
@@ -6765,9 +7036,23 @@ exit 0
             sidecar.is_some() || child.0.try_wait().ok().flatten().is_some()
         });
         let entry_log = || std::fs::read_to_string(&log).unwrap_or_default();
-        let sidecar = sidecar
-            .filter(|_| parked)
-            .unwrap_or_else(|| panic!("no sidecar within 5 s\n{}", entry_log()));
+        let Some(sidecar) = sidecar.filter(|_| parked) else {
+            // End an agent the child may already have started, by the pid
+            // file it wrote and the start time read now, before failing.
+            let _orphan = std::fs::read_to_string(crate::agent_result::agent_pid_path(
+                &fixture.root,
+                STAGE_PHASE,
+            ))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .and_then(|pid| {
+                crate::agent::process_start_time(pid).map(|start_time| LeaderGroup {
+                    pgid: pid,
+                    start_time,
+                })
+            });
+            panic!("no sidecar within 5 s\n{}", entry_log());
+        };
         let agent = LeaderGroup {
             pgid: sidecar.agent_pgid,
             start_time: sidecar.agent_start_time,
@@ -6854,8 +7139,39 @@ exit 0
 
     /// Whether non-test `monitor.rs` defines `fn monitor_test_hold(` exactly
     /// once, directly under attribute lines that include `#[cfg(test)]`.
-    fn test_hold_guard_verdict(_non_test: &str) -> Result<(), String> {
-        Ok(())
+    fn test_hold_guard_verdict(non_test: &str) -> Result<(), String> {
+        let lines: Vec<&str> = non_test
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let definitions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("fn monitor_test_hold("))
+            .map(|(at, _)| at)
+            .collect();
+        let [at] = definitions[..] else {
+            return Err(format!(
+                "expected exactly one `fn monitor_test_hold(` in non-test monitor.rs, found {}; \
+                 if the hold is removed on purpose, delete this test with it",
+                definitions.len()
+            ));
+        };
+        let guarded = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| line.trim_start().starts_with("#["))
+            .any(|line| line.trim() == "#[cfg(test)]");
+        if guarded {
+            Ok(())
+        } else {
+            Err(
+                "`fn monitor_test_hold(` is not directly under `#[cfg(test)]`, so the hold \
+                 would ship in release builds; if the hold is removed on purpose, delete this \
+                 test with it"
+                    .to_string(),
+            )
+        }
     }
 
     #[test]
