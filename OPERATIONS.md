@@ -147,6 +147,15 @@ stage is launched, and `stopped` is recorded. A supervisor parked at a gate
 clears the gate and records `stopped` rather than aborting the phase, so the
 phase stays resumable.
 
+**Platform.** Socket supervision is unverified on macOS: the 103-byte macOS
+`sun_path` limit is enforced by a constant only, and no macOS host or CI has
+run it. Off Linux the STALE backstop refuses before reading anything, so a
+STALE socket there is never torn down by `devflow stop`.
+
+**Upgrading from 2.x.** Install a 3.x binary only while no 2.x run is live;
+3.x makes no promise about a 2.x state.json, which may read as GONE or fail to
+load.
+
 ## Preflight refusals
 
 Checks `devflow start` performs, in order, before it scaffolds anything (a
