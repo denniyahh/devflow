@@ -299,3 +299,9 @@ None.
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-18*
+
+## Self-Check: PASSED
+
+- FOUND: the three modified source files and this SUMMARY.
+- FOUND: all six task commits (`3e70e04`, `9fc3d60`, `b76ee88`, `2aeadd4`, `04902d8`, `0c738d2`) and the SUMMARY commit `0088eb5` are ancestors of HEAD (`git merge-base --is-ancestor`).
+- Ledger: `git rev-list --count d846c62..0c738d2` = 6, matching `commits: 6`. A second, independent count agrees: six `test(50-23)`/`feat(50-23)` subjects in that range. Each RED `test(50-23)` commit comes before its GREEN `feat(50-23)` commit.
