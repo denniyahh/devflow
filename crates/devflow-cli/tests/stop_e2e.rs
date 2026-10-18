@@ -2102,3 +2102,131 @@ fn stop_with_a_launch_id_refuses_a_stale_socket_without_a_usable_sidecar() {
     assert!(!a.exists() && !a.with_extension("json").exists());
     assert!(alive_as(&run), "B is untouched");
 }
+
+/// Plant a STALE socket and a parsed sidecar for `(project_root, phase,
+/// id)` under `home`'s cache, recording a test child already reaped as its
+/// agent group. Returns the socket path.
+fn plant_unattached_orphan(
+    home: &common::HermeticHome,
+    project_root: &Path,
+    phase: PhaseId,
+    id: &str,
+) -> PathBuf {
+    let socket = supervisor::SocketPath::for_launch(&home.cache_dir(), project_root, phase, id)
+        .expect("the orphan socket path fits sun_path");
+    drop(supervisor::publish(&socket).expect("publish the orphan socket"));
+    let mut reaped = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn a child to reap");
+    let start = devflow_core::agent::process_start_time(reaped.id()).expect("its start time");
+    common::kill_and_reap(&mut reaped);
+    let sidecar = serde_json::json!({
+        "launch_id": id,
+        "project_root": project_root,
+        "phase": phase,
+        "stage": "code",
+        "agent": "claude",
+        "launch": "stream",
+        "agent_pid": reaped.id(),
+        "agent_pgid": reaped.id(),
+        "agent_start_time": start,
+        "boot_id": supervisor::boot_id().expect("a readable boot id"),
+        "supervisor_pid": 1,
+        "supervisor_start_time": 0,
+        "created_at": "2026-10-18T00:00:00Z",
+    });
+    std::fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
+    supervisor::read_sidecar(&socket.sidecar_path()).expect("the planted sidecar parses");
+    socket.as_path().to_path_buf()
+}
+
+/// 50-12's repair for a deleted root's orphan works by launch id alone,
+/// from any directory, with no project state: `devflow doctor` prints
+/// `devflow stop --phase N --launch <id>` for it, and that line, run from an
+/// unrelated directory, tears it down. Control: an orphan whose sidecar
+/// names another project that still exists is refused there and kept.
+#[test]
+fn stop_with_a_launch_id_reaches_a_deleted_roots_orphan_from_any_directory() {
+    let home = common::HermeticHome::new();
+    let dirs = tempfile::tempdir().unwrap();
+    let base = dirs.path().canonicalize().unwrap();
+    let (gone_root, other_root, elsewhere) = (
+        base.join("gone"),
+        base.join("other"),
+        base.join("elsewhere"),
+    );
+    for dir in [&gone_root, &other_root, &elsewhere] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let phase = PhaseId::new(154);
+    let deleted = plant_unattached_orphan(&home, &gone_root, phase, "orphan-x");
+    let foreign = plant_unattached_orphan(&home, &other_root, phase, "orphan-y");
+    std::fs::remove_dir(&gone_root).unwrap();
+    let repair = format!("devflow stop --phase {phase} --launch orphan-x");
+
+    let doctor = common::hermetic_devflow(&home)
+        .arg("doctor")
+        .current_dir(&elsewhere)
+        .output()
+        .expect("run devflow doctor");
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains(&repair),
+        "doctor prints `{repair}` for the deleted root's orphan: {}",
+        describe(&doctor)
+    );
+
+    let refused = common::hermetic_devflow(&home)
+        .args([
+            "stop",
+            "--phase",
+            &phase.to_string(),
+            "--launch",
+            "orphan-y",
+        ])
+        .current_dir(&elsewhere)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("belongs to project"),
+        "another existing project's orphan is refused: {}",
+        describe(&refused)
+    );
+    assert!(launch_files_present(&foreign), "the refused orphan is kept");
+
+    let args: Vec<&str> = repair.split_whitespace().skip(1).collect();
+    let output = common::hermetic_devflow(&home)
+        .args(&args)
+        .current_dir(&elsewhere)
+        .output()
+        .expect("run the doctor's repair");
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(
+        !deleted.exists() && !deleted.with_extension("json").exists(),
+        "the deleted root's orphan is torn down: {}",
+        describe(&output)
+    );
+}
+
+/// `--launch` with the launch the state itself records runs the plain stop,
+/// every arm included: the run is stopped through its socket and the plain
+/// stop's own reason is recorded beside the supervisor's, which a targeted
+/// stop (it writes no state) never adds.
+#[test]
+fn stop_with_the_recorded_launch_id_runs_the_plain_stop() {
+    let run = LiveRun::start(PhaseId::new(155));
+    let output = run.stop(&["--launch", &run.record.launch_id]);
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(run.probe(), Liveness::Gone, "the recorded run is stopped");
+    let state = devflow_core::workflow::load_state(&run.root, run.phase).unwrap();
+    assert!(state.stopped, "the run is recorded stopped");
+    assert!(
+        state
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("stopped via `devflow stop`")),
+        "the plain stop's own reason is recorded: {:?}",
+        state.stop_reason
+    );
+}
