@@ -8815,6 +8815,15 @@ mod tests {
         fn doctor_reports_an_unlistable_socket_dir_instead_of_nothing() {
             use std::os::unix::fs::PermissionsExt as _;
             let cache = tempfile::tempdir().unwrap();
+            // Root lists a 0o000 directory (the pinned container runs as
+            // uid 0), so the fixture cannot produce its precondition there;
+            // skip rather than assert it (the 999.113 pattern, 50-16).
+            if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(cache.path()).unwrap()) == 0 {
+                eprintln!(
+                    "skipping doctor_reports_an_unlistable_socket_dir_instead_of_nothing: running as root, which bypasses the 0o000 fixture"
+                );
+                return;
+            }
             assert_eq!(socket_dir_unlistable(cache.path()), None, "absent");
             assert_eq!(render_orphan_supervisors_text(&[], None), "");
             let sock = registry::socket_dir_in(cache.path());
@@ -10949,6 +10958,15 @@ mod tests {
             let phase = PhaseId::new(1501);
             let root = root_with_an_unloadable_state(phase);
             let cache = tempfile::tempdir().unwrap();
+            // Root lists a 0o000 directory (the pinned container runs as
+            // uid 0), so the fixture cannot produce its precondition there;
+            // skip rather than assert it (the 999.113 pattern, 50-16).
+            if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(cache.path()).unwrap()) == 0 {
+                eprintln!(
+                    "skipping the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state: running as root, which bypasses the 0o000 fixture"
+                );
+                return;
+            }
             let sock = registry::socket_dir_in(cache.path());
             std::fs::create_dir_all(&sock).unwrap();
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
