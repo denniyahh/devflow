@@ -666,3 +666,185 @@ fn census_never_sees_a_live_supervisor(supervisor_pid: u32) {
     );
     drop(wrapper);
 }
+
+// ---------------------------------------------------------------------------
+// 50-15 (R-1, V-12): two `devflow start` launches racing for one phase yield
+// exactly one live supervisor and one agent group.
+// ---------------------------------------------------------------------------
+
+/// Bounds any gate a launched run parks at, as the 48-19 refusal tests do.
+const RACE_GATE_TIMEOUT_SECS: &str = "15";
+
+/// A spawned `devflow start` for `phase` with the arguments the 48-19
+/// live-run refusal tests use (supervise mode, `--no-worktree`, the capture
+/// shape), so a loser fails only at the per-phase lock or at the live-run
+/// guard, never at an earlier refusal.
+fn spawn_start(
+    home: &common::HermeticHome,
+    root: &Path,
+    phase: PhaseId,
+    fake_bin: &common::FakeBin,
+) -> std::process::Child {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
+    common::hermetic_devflow(home)
+        .args([
+            "start",
+            "--phase",
+            &phase.to_string(),
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
+            "--no-worktree",
+            "--legacy-claude-launch",
+        ])
+        .arg(root)
+        .current_dir(root)
+        .env("PATH", path)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", RACE_GATE_TIMEOUT_SECS)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn devflow start")
+}
+
+/// What a sweep of `home`'s socket directory sees: the ALIVE sockets, and the
+/// distinct agent pgids its parsed sidecars name.
+fn live_supervisors(home: &common::HermeticHome) -> (Vec<std::path::PathBuf>, Vec<u32>) {
+    let entries = supervisor::sweep_in(&home.cache_dir());
+    let alive = entries
+        .iter()
+        .filter(|entry| matches!(entry.liveness, Ok(Liveness::Alive(_))))
+        .map(|entry| entry.socket_path.clone())
+        .collect();
+    let mut pgids: Vec<u32> = entries
+        .iter()
+        .filter_map(|entry| entry.sidecar.as_ref().map(|sidecar| sidecar.agent_pgid))
+        .collect();
+    pgids.sort_unstable();
+    pgids.dedup();
+    (alive, pgids)
+}
+
+#[test]
+fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(63);
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let first = spawn_start(&home, &root, phase, &fake_bin);
+    let second = spawn_start(&home, &root, phase, &fake_bin);
+    let outputs = [
+        first.wait_with_output().expect("wait for the first start"),
+        second
+            .wait_with_output()
+            .expect("wait for the second start"),
+    ];
+
+    let report = |output: &Output| {
+        format!(
+            "status {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let winners = outputs
+        .iter()
+        .filter(|output| output.status.success())
+        .count();
+    assert_eq!(
+        winners,
+        1,
+        "exactly one racing start must succeed\nfirst: {}\nsecond: {}",
+        report(&outputs[0]),
+        report(&outputs[1])
+    );
+    let loser = outputs
+        .iter()
+        .find(|output| !output.status.success())
+        .expect("one start lost");
+    let stderr = String::from_utf8_lossy(&loser.stderr);
+    let lock_refusal = stderr.contains("holds the per-phase lock");
+    let live_refusal = stderr.contains(&format!("devflow stop --phase {phase}"))
+        && stderr.contains("a run is still live");
+    assert!(
+        lock_refusal || live_refusal,
+        "the loser must be refused at the lock or at the live-run guard, nothing else\n{}",
+        report(loser)
+    );
+    println!(
+        "V-12 loser refusal: {}",
+        if lock_refusal {
+            "per-phase lock"
+        } else {
+            "live-supervisor guard"
+        }
+    );
+
+    let (alive, pgids) = live_supervisors(&home);
+    assert_eq!(
+        alive.len(),
+        1,
+        "exactly one socket may probe ALIVE: {alive:?}\nloser: {}",
+        report(loser)
+    );
+    assert_eq!(
+        pgids.len(),
+        1,
+        "the sidecars must name exactly one agent group: {pgids:?}"
+    );
+    assert!(
+        !group_members(pgids[0]).is_empty(),
+        "the one agent group {} must be live",
+        pgids[0]
+    );
+}
+
+#[test]
+fn two_starts_for_different_phases_yield_two_live_supervisors() {
+    let home = common::HermeticHome::new();
+    let repos = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let roots: Vec<std::path::PathBuf> = repos
+        .iter()
+        .map(|repo| repo.path().canonicalize().unwrap())
+        .collect();
+    let phases = [PhaseId::new(64), PhaseId::new(65)];
+    for (root, phase) in roots.iter().zip(phases) {
+        init_repo(root, phase);
+    }
+    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let _reapers: Vec<common::LaunchedRunReaper> = roots
+        .iter()
+        .zip(phases)
+        .map(|(root, phase)| common::LaunchedRunReaper::new(root, phase, vec![]))
+        .collect();
+
+    let first = spawn_start(&home, &roots[0], phases[0], &fake_bin);
+    let second = spawn_start(&home, &roots[1], phases[1], &fake_bin);
+    for (child, phase) in [first, second].into_iter().zip(phases) {
+        let output = child.wait_with_output().expect("wait for start");
+        assert!(
+            output.status.success(),
+            "phase {phase}: a start with no rival for its phase must succeed\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let (alive, pgids) = live_supervisors(&home);
+    assert_eq!(
+        alive.len(),
+        2,
+        "the counting must see both live supervisors: {alive:?}"
+    );
+    assert_eq!(
+        pgids.len(),
+        2,
+        "the sidecars must name two distinct agent groups: {pgids:?}"
+    );
+}
