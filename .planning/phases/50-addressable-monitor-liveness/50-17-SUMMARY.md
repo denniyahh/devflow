@@ -276,3 +276,10 @@ None.
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-18*
+
+## Self-Check: PASSED
+
+- FOUND: all five modified docs/source files and this SUMMARY.
+- FOUND: `e42651a`, `b629cd0`, `4479785` (task commits) and `43a1934` (SUMMARY commit) are ancestors of HEAD.
+- Ledger: `git rev-list --count a7d918a..4479785` = 3, matching `commits: 3`.
+- Both new test functions exist in `doc_check.rs`; `OPERATIONS.md` contains `unverified on macOS`.
