@@ -208,7 +208,7 @@ impl BackstopDecision {
                      left the group. The leader is gone, so these may be the original agent's \
                      children or an unrelated group that reused the id; nothing was signalled, \
                      and {files} are kept. Inspect the group with: ps -o \
-                     pid,pgid,sid,lstart,args -g {pgid}",
+                     pid,pgid,sid,lstart,args -p \"$(pgrep -d, -g {pgid})\"",
                     members.len()
                 );
                 for member in members {
@@ -1161,7 +1161,10 @@ mod tests {
 
         let text = decision.describe(&socket, &sidecar);
         assert!(
-            text.contains(&format!("ps -o pid,pgid,sid,lstart,args -g {}", group.pgid)),
+            text.contains(&format!(
+                "ps -o pid,pgid,sid,lstart,args -p \"$(pgrep -d, -g {})\"",
+                group.pgid
+            )),
             "{text}"
         );
         assert!(
@@ -1362,7 +1365,7 @@ mod tests {
         let gone = BackstopDecision::RefuseLeaderGone(vec![member]).describe(&socket, &sidecar);
         assert!(!gone.contains("cannot prove process group"), "{gone}");
         assert!(
-            gone.contains("ps -o pid,pgid,sid,lstart,args -g 4242"),
+            gone.contains(r#"ps -o pid,pgid,sid,lstart,args -p "$(pgrep -d, -g 4242)""#),
             "{gone}"
         );
     }

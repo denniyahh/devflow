@@ -706,7 +706,7 @@ const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
     "ALIVE",
     "devflow stop --phase N",
     "devflow resume --phase N",
-    "ps -o pid,pgid,sid,lstart,args -g",
+    "ps -o pid,pgid,sid,lstart,args -p \"$(pgrep -d, -g",
     "DEVFLOW_CACHE_DIR",
 ];
 
