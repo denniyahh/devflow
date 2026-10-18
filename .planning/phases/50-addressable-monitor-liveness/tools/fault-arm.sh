@@ -38,7 +38,17 @@ SELF="$T/$(basename "${BASH_SOURCE[0]}")"
 CHECKOUT="$(git -C "$T" rev-parse --show-toplevel)"
 SCAFFOLD="$CHECKOUT/scripts/scratch-dogfood-repo.sh"
 CRATE_PATHS=(crates Cargo.toml Cargo.lock rust-toolchain.toml)
-KNOWN_CASES=(alive-stop-stream)
+KNOWN_CASES=(alive-stop-stream alive-stop-capture kill9-stale-stop kill9-at-gate stop-races-completion
+    publish-unlink-window)
+# R-10's publish/unlink window cannot be hit live by timing; its record points
+# at the fixture that reaches it deterministically.
+WINDOW_FIXTURE=pipeline_launch::tests::a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor
+GATE_REL=.devflow/gates/01-define.json
+GATE_RESPONSE_REL=.devflow/gates/01-define.response.json
+LOCK_REL=.devflow/lock-01
+EXIT_REL=.devflow/phase-01-exit
+KILL_WAIT=30
+GATE_WAIT=60
 PHASE=1
 STATE_REL=.devflow/state-01.json
 EVENTS_REL=.devflow/events.jsonl
@@ -234,7 +244,6 @@ state_field() {
 RELEASE_SUCCEEDS='git commit -q --allow-empty -m "fake stage work"
 printf '"'"'work done\nDEVFLOW_RESULT: {"status":"success","commits":1}\n'"'"'
 exit 0'
-# shellcheck disable=SC2034 # used by the gate case
 RELEASE_FAILS_TO_A_GATE='printf '"'"'DEVFLOW_RESULT: {"status":"failed","reason":"gate fixture"}\n'"'"'
 exit 0'
 
@@ -321,6 +330,14 @@ alive_agents_json() {
     } | jq -R 'tonumber' | jq -s -c .
 }
 
+# `devflow stop` for the current case; its output with ANSI colour removed.
+stop_case() {
+    local out rc=0
+    out="$(devflow_in "$P" "$F" stop --phase "$PHASE" "$P" 2>&1)" || rc=$?
+    printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g'
+    return "$rc"
+}
+
 # ---------------------------------------------------------------------------
 # records
 # ---------------------------------------------------------------------------
@@ -363,7 +380,7 @@ case_alive_stop() {
     launch "$name" "$RELEASE_SUCCEEDS" "$@" || return 1
     probe_before="$(probe "$P" "$F")"
     members_before="$(members_json "$PGID")"
-    stop_out="$(devflow_in "$P" "$F" stop --phase "$PHASE" "$P" 2>&1)" || stop_rc=$?
+    stop_out="$(stop_case)" || stop_rc=$?
     wait_until "$STOP_WAIT" group_empty "$PGID" || true
     sleep "$SETTLE_SECS"
     remember_agents "$AGENTS"
@@ -411,9 +428,192 @@ record_case() {
     fi
 }
 
+# The per-phase lock's holder: none (no lock file, unparsable, or its pid is not
+# running), live (running with the recorded start time), recycled (running
+# with another start time) or unconfirmable (running, no start time recorded).
+lock_status() {
+    local file="$1/$LOCK_REL" pid="" start="" now
+    [ -f "$file" ] || { echo none; return 0; }
+    { read -r pid; read -r start; } <"$file" || true
+    case "$pid" in '' | *[!0-9]*) echo none; return 0 ;; esac
+    is_running "$pid" || { echo none; return 0; }
+    [ -n "$start" ] || { echo unconfirmable; return 0; }
+    now="$(start_time "$pid")" || { echo none; return 0; }
+    if [ "$now" = "$start" ]; then echo live; else echo recycled; fi
+}
+
+supervisor_gone() {
+    ! same_process "$SUP_PID" "$SUP_START"
+}
+
+probe_is() {
+    [ "$(probe "$P" "$F")" = "$1" ]
+}
+
+gate_parked() {
+    [ -f "$P/$GATE_REL" ] && [ "$(lock_status "$P")" = live ]
+}
+
+# SIGKILL the case's supervisor by the pid its sidecar records, after the
+# start-time check, and wait until it is gone and its socket reads STALE.
+kill_supervisor() {
+    signal_recorded KILL "$SUP_PID" "$SUP_START" || return 1
+    wait_until "$KILL_WAIT" supervisor_gone || return 1
+    wait_until "$STOP_WAIT" probe_is STALE || true
+}
+
+# kill9-stale-stop: SIGKILL the supervisor → STALE → `stop` (the backstop) →
+# GONE with the orphaned agent group ended.
+case_kill9_stale_stop() {
+    local name=kill9-stale-stop probe_before members_before killed=true probe_after_kill members_after_kill
+    local stop_out stop_rc=0 probe_after members_after launched stopped advance unmet=()
+    launch "$name" "$RELEASE_SUCCEEDS" || return 1
+    probe_before="$(probe "$P" "$F")"
+    members_before="$(members_json "$PGID")"
+    kill_supervisor || killed=false
+    probe_after_kill="$(probe "$P" "$F")"
+    members_after_kill="$(members_json "$PGID")"
+    stop_out="$(stop_case)" || stop_rc=$?
+    wait_until "$STOP_WAIT" group_empty "$PGID" || true
+    sleep "$SETTLE_SECS"
+    remember_agents "$AGENTS"
+    probe_after="$(probe "$P" "$F")"
+    members_after="$(members_json "$PGID")"
+    launched="$(event_count "$P" stage_launched)"
+    stopped="$(state_field "$P" '.stopped')"
+    advance="$(advance_ran "$P")"
+    [ "$probe_before" = ALIVE ] || unmet+=("probe before the kill $probe_before")
+    [ "$members_before" != '[]' ] || unmet+=("no agent group member before the kill")
+    [ "$killed" = true ] || unmet+=("the supervisor was not killed or did not exit")
+    [ "$probe_after_kill" = STALE ] || unmet+=("probe after the kill $probe_after_kill")
+    [ "$members_after_kill" != '[]' ] || unmet+=("the agent group did not outlive its supervisor")
+    [ "$stop_rc" -eq 0 ] || unmet+=("devflow stop exited $stop_rc")
+    [ "$probe_after" = GONE ] || unmet+=("probe after stop $probe_after")
+    [ "$members_after" = '[]' ] || unmet+=("agent group member survived the backstop")
+    [ "$launched" -eq 1 ] || unmet+=("$launched stage_launched events, expected 1")
+    [ "$stopped" = true ] || unmet+=("state.stopped is $stopped")
+    record_case "$name" "$(jq -n --arg pb "$probe_before" --arg pk "$probe_after_kill" --arg pa "$probe_after" \
+        --argjson mb "$members_before" --argjson mk "$members_after_kill" --argjson ma "$members_after" \
+        --argjson adv "$advance" --argjson n "$launched" --arg st "$stopped" --argjson rc "$stop_rc" \
+        --arg out "$stop_out" --argjson killed "$killed" '{
+            probe_before: $pb, supervisor_killed: $killed, probe_after_kill: $pk,
+            members_after_kill: $mk, probe_after: $pa, members_before: $mb, members_after: $ma,
+            advance_ran: $adv, next_stage_launched: ($n > 1), stage_launched_count: $n,
+            state_stopped: ($st == "true"), stop_exit: $rc, stop_output: $out
+        }')" "${unmet[@]+"${unmet[@]}"}"
+}
+
+# kill9-at-gate: a supervise-mode Define that fails parks at its gate holding
+# the per-phase lock; SIGKILL the supervisor → STALE → `stop` → GONE, with no
+# gate response written and the lock holder gone or recycled.
+case_kill9_at_gate() {
+    local name=kill9-at-gate gate_open=false lock_before probe_before members_before killed=true
+    local probe_after_kill stop_out stop_rc=0 probe_after members_after lock_after response=false
+    local launched advance unmet=()
+    launch "$name" "$RELEASE_FAILS_TO_A_GATE" || return 1
+    : >"$TRIG"
+    wait_until "$GATE_WAIT" gate_parked || true
+    [ ! -f "$P/$GATE_REL" ] || gate_open=true
+    lock_before="$(lock_status "$P")"
+    probe_before="$(probe "$P" "$F")"
+    members_before="$(members_json "$PGID")"
+    kill_supervisor || killed=false
+    probe_after_kill="$(probe "$P" "$F")"
+    stop_out="$(stop_case)" || stop_rc=$?
+    wait_until "$STOP_WAIT" group_empty "$PGID" || true
+    sleep "$SETTLE_SECS"
+    remember_agents "$AGENTS"
+    probe_after="$(probe "$P" "$F")"
+    members_after="$(members_json "$PGID")"
+    lock_after="$(lock_status "$P")"
+    [ ! -e "$P/$GATE_RESPONSE_REL" ] || response=true
+    launched="$(event_count "$P" stage_launched)"
+    advance="$(advance_ran "$P")"
+    [ "$gate_open" = true ] || unmet+=("the Define gate never opened")
+    [ "$lock_before" = live ] || unmet+=("the per-phase lock holder before the kill was $lock_before")
+    [ "$killed" = true ] || unmet+=("the supervisor was not killed or did not exit")
+    [ "$probe_after_kill" = STALE ] || unmet+=("probe after the kill $probe_after_kill")
+    [ "$stop_rc" -eq 0 ] || unmet+=("devflow stop exited $stop_rc")
+    [ "$probe_after" = GONE ] || unmet+=("probe after stop $probe_after")
+    [ "$members_after" = '[]' ] || unmet+=("agent group member survived")
+    case "$lock_after" in none | recycled) ;; *) unmet+=("lock holder after stop is $lock_after") ;; esac
+    [ "$response" = false ] || unmet+=("a gate response was written with no live waiter")
+    [ "$launched" -eq 1 ] || unmet+=("$launched stage_launched events, expected 1")
+    record_case "$name" "$(jq -n --argjson go "$gate_open" --arg lb "$lock_before" --arg pb "$probe_before" \
+        --arg pk "$probe_after_kill" --arg pa "$probe_after" --argjson mb "$members_before" \
+        --argjson ma "$members_after" --arg la "$lock_after" --argjson resp "$response" \
+        --argjson adv "$advance" --argjson n "$launched" --argjson rc "$stop_rc" --arg out "$stop_out" \
+        --argjson killed "$killed" '{
+            gate_open_before: $go, lock_holder_before: $lb, lock_held_before: ($lb == "live"),
+            probe_before: $pb, supervisor_killed: $killed, probe_after_kill: $pk, probe_after: $pa,
+            members_before: $mb, members_after: $ma, lock_holder_after: $la,
+            gate_response_written: $resp, advance_ran: $adv, next_stage_launched: ($n > 1),
+            stage_launched_count: $n, stop_exit: $rc, stop_output: $out
+        }')" "${unmet[@]+"${unmet[@]}"}"
+}
+
+state_stopped() {
+    [ "$(state_field "$P" '.stopped')" = true ]
+}
+
+# stop-races-completion: release the agent and run `stop` at once. Either the
+# stop or the completion wins; afterwards the state is stopped and no fake
+# agent (this stage's or a next stage's) is alive. Whether the advance ran and
+# a next stage launched is recorded, not required.
+case_stop_races_completion() {
+    local name=stop-races-completion probe_before members_before stop_out stop_rc=0 probe_after
+    local members_after alive launched advance stopped exit_code unmet=()
+    launch "$name" "$RELEASE_SUCCEEDS" || return 1
+    probe_before="$(probe "$P" "$F")"
+    members_before="$(members_json "$PGID")"
+    : >"$TRIG"
+    stop_out="$(stop_case)" || stop_rc=$?
+    wait_until "$KILL_WAIT" state_stopped || true
+    wait_until "$STOP_WAIT" group_empty "$PGID" || true
+    sleep "$SETTLE_SECS"
+    remember_agents "$AGENTS"
+    probe_after="$(probe "$P" "$F")"
+    members_after="$(members_json "$PGID")"
+    alive="$(alive_agents_json "$AGENTS")"
+    launched="$(event_count "$P" stage_launched)"
+    advance="$(advance_ran "$P")"
+    stopped="$(state_field "$P" '.stopped')"
+    exit_code="$(cat -- "$P/$EXIT_REL" 2>/dev/null || echo ABSENT)"
+    [ "$probe_before" = ALIVE ] || unmet+=("probe before the race $probe_before")
+    [ "$stop_rc" -eq 0 ] || unmet+=("devflow stop exited $stop_rc")
+    [ "$stopped" = true ] || unmet+=("state.stopped is $stopped")
+    [ "$probe_after" = GONE ] || unmet+=("probe after the race $probe_after")
+    [ "$members_after" = '[]' ] || unmet+=("agent group member survived")
+    [ "$alive" = '[]' ] || unmet+=("fake agent still alive: $alive")
+    record_case "$name" "$(jq -n --arg pb "$probe_before" --arg pa "$probe_after" \
+        --argjson mb "$members_before" --argjson ma "$members_after" --argjson alive "$alive" \
+        --argjson adv "$advance" --argjson n "$launched" --arg st "$stopped" --argjson rc "$stop_rc" \
+        --arg out "$stop_out" --arg exit "$exit_code" '{
+            probe_before: $pb, probe_after: $pa, members_before: $mb, members_after: $ma,
+            next_agents_alive: $alive, advance_ran: $adv, next_stage_launched: ($n > 1),
+            stage_launched_count: $n, state_stopped: ($st == "true"), first_agent_exit: $exit,
+            stop_exit: $rc, stop_output: $out
+        }')" "${unmet[@]+"${unmet[@]}"}"
+}
+
+# publish-unlink-window: not reachable live (R-10 allows fixture coverage);
+# the record names the fixture and is judged `ok pointer`, never `ok live`.
+record_window_pointer() {
+    jq -n --arg sha "$BIN_SHA" --arg fixture "$WINDOW_FIXTURE" '{
+        case: "publish-unlink-window", live: false, bin_sha256: $sha, fixture: $fixture,
+        reason: "a SIGKILL between the next supervisor publish and the old one unlinking cannot be placed by timing from outside the binary; the fixture reaches the window deterministically"
+    }' >"$OUT/case-publish-unlink-window.json"
+    echo "fault-arm: case publish-unlink-window: recorded as a pointer to $WINDOW_FIXTURE"
+}
+
 run_case() {
     case "$1" in
         alive-stop-stream) case_alive_stop alive-stop-stream stream ;;
+        alive-stop-capture) case_alive_stop alive-stop-capture capture --legacy-claude-launch ;;
+        kill9-stale-stop) case_kill9_stale_stop ;;
+        kill9-at-gate) case_kill9_at_gate ;;
+        stop-races-completion) case_stop_races_completion ;;
+        publish-unlink-window) record_window_pointer ;;
         *) die "no runner for case $1" ;;
     esac
 }

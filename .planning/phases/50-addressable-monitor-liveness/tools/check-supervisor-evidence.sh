@@ -9,7 +9,16 @@
 # Usage:
 #   check-supervisor-evidence.sh --fault <fault dir> [--require-all]
 #   check-supervisor-evidence.sh --src-check <fault dir> [--repo <checkout>]
+#   check-supervisor-evidence.sh --fault-current <P50 home> [--repo <checkout>]
+#   check-supervisor-evidence.sh collect-sidecars <EV> --project <dir> [--bin <devflow>]
+#   check-supervisor-evidence.sh --attempt <EV> [--p49-check <script>]
+#   check-supervisor-evidence.sh --attempt-gate <P50 home> [--p49-check <script>]
 #   check-supervisor-evidence.sh --selftest
+#
+# <P50 home> is $HOME/.cache/devflow-phase50 in the runbook: Phase 49's tools
+# write attempt-<N>/ there (--home), fault-arm.sh writes fault-<M>/.
+# --p49-check replaces Phase 49's check-evidence.sh; only the selftest passes
+# it (a stub), so its attempt cases need no Phase 49 evidence tree.
 #
 # --fault judges the per-case records `fault-arm.sh run` wrote. Each record
 # prints exactly one of:
@@ -27,6 +36,32 @@
 # prints nothing; print `SRC tree_is_head=yes|no recorded_matches=<value|ABSENT>
 # expected_matches=true|false`; pass only when <dir>/src_tree holds exactly
 # those four ids and <dir>/src_matches_checkout equals the expected value.
+#
+# --require-all (R5-W2) also prints `FAULT complete=yes`, or `FAULT
+# complete=no [missing=<names>] [duplicate=<names>]` and fails, unless each of
+# the five live cases (alive-stop-stream, alive-stop-capture, kill9-stale-stop,
+# kill9-at-gate, stop-races-completion) printed `ok live` and
+# publish-unlink-window printed `ok pointer`, each in exactly one record.
+#
+# --fault-current (RV-07, R5-W1): fails on any uncommitted change under the
+# crate paths (`FAULT_CURRENT uncommitted_crate_source=<n>`); otherwise selects
+# the newest `fault-*` directory in version order that passes --src-check with
+# `src_matches_checkout` true (`FAULT_CURRENT dir=<name|ABSENT>`) and judges
+# that one directory with --fault --require-all, so an older passing directory
+# never stands in for a failing newer one.
+#
+# --attempt runs Phase 49's `check-evidence.sh --arm positive <EV>`, then
+# checks every collected stage_launched event: socket_path at most 107 bytes,
+# a launch label, a non-empty launch_id its socket file name ends with as
+# `-<launch_id>.sock`, both `stream` and `capture` present, no monitor_pid key.
+# It prints `ATTEMPT sidecars_left=<n>` as information only (RV-02) and
+# `ATTEMPT verdict=pass|fail`.
+#
+# --attempt-gate prints `ATTEMPT_GATE verdict=shipped|cap_reached|not_ready`
+# with Phase 49's semantics; shipped also needs a fault-* directory that
+# --fault --require-all passes recording the attempt's bin_sha256 (D-17;
+# `ATTEMPT_GATE fault=<dir> bin_sha256=<hex>`). Exit 0 for shipped and
+# cap_reached, 1 for not_ready.
 #
 # What this tool does not establish: it judges records, it does not re-run
 # anything. A pass means the records say what the fault arm saw; the fault
@@ -246,6 +281,277 @@ src_check() {
 default_repo() {
     git -C "$T" rev-parse --show-toplevel
 }
+
+# ---------------------------------------------------------------------------
+# --fault-current (RV-07, R5-W1): the fault directory recorded from the current
+# crate source, judged with --require-all
+# ---------------------------------------------------------------------------
+fault_current() {
+    local home="$1" repo="$2" status count=0 name chosen=""
+    if ! status="$(crate_status "$repo" 2>/dev/null)"; then
+        echo "FAULT_CURRENT git_failed=yes repo=$repo"
+        echo "FAULT_CURRENT verdict=fail"
+        return 1
+    fi
+    [ -z "$status" ] || count="$(printf '%s\n' "$status" | wc -l)"
+    echo "FAULT_CURRENT uncommitted_crate_source=$count"
+    if [ "$count" -gt 0 ]; then
+        echo "FAULT_CURRENT verdict=fail"
+        return 1
+    fi
+    if [ -d "$home" ]; then
+        while IFS= read -r name; do
+            if src_check "$home/$name" "$repo" >/dev/null; then
+                chosen="$name"
+                break
+            fi
+        done < <(find "$home" -mindepth 1 -maxdepth 1 -type d -name 'fault-*' -printf '%f\n' | sort -V -r)
+    fi
+    echo "FAULT_CURRENT dir=${chosen:-ABSENT}"
+    if [ -z "$chosen" ]; then
+        echo "FAULT_CURRENT verdict=fail"
+        return 1
+    fi
+    if fault_judge "$home/$chosen" 1; then
+        echo "FAULT_CURRENT verdict=pass"
+    else
+        echo "FAULT_CURRENT verdict=fail"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# collect-sidecars: copy the leftover sidecars of <project> and its `devflow
+# status` into <EV>/supervisor/. Evidence only: a run to Ship leaves none,
+# because finish() removes each finished launch's socket and sidecar (50-07).
+# ---------------------------------------------------------------------------
+
+# registry::cache_dir(): DEVFLOW_CACHE_DIR, else XDG_CACHE_HOME/devflow, else
+# HOME/.cache/devflow.
+devflow_cache_dir() {
+    if [ -n "${DEVFLOW_CACHE_DIR+set}" ]; then
+        printf '%s\n' "$DEVFLOW_CACHE_DIR"
+    elif [ -n "${XDG_CACHE_HOME+set}" ]; then
+        printf '%s\n' "$XDG_CACHE_HOME/devflow"
+    else
+        printf '%s\n' "$HOME/.cache/devflow"
+    fi
+}
+
+collect_sidecars() {
+    local ev="$1" project="$2" bin="$3" cache root sidecar recorded copied=0 status_rc=0
+    [ -d "$ev" ] || { echo "COLLECT ev=ABSENT $ev" >&2; return 1; }
+    [ -d "$project" ] || { echo "COLLECT project=ABSENT $project" >&2; return 1; }
+    root="$(cd "$project" && pwd -P)"
+    if [ -z "$bin" ]; then
+        bin="$(jq -r '.bin // empty' "$ev/attempt.json" 2>/dev/null || true)"
+        [ -n "$bin" ] || bin=devflow
+    fi
+    cache="$(devflow_cache_dir)"
+    mkdir -p "$ev/supervisor"
+    for sidecar in "$cache"/sock/*.json; do
+        [ -f "$sidecar" ] || continue
+        recorded="$(jq -r '.project_root // empty' "$sidecar" 2>/dev/null || true)"
+        if [ -n "$recorded" ] && { [ "$recorded" = "$project" ] || [ "$recorded" = "$root" ]; }; then
+            cp -p -- "$sidecar" "$ev/supervisor/"
+            copied=$((copied + 1))
+        fi
+    done
+    "$bin" status "$project" >"$ev/supervisor/status.txt" 2>&1 || status_rc=$?
+    echo "COLLECT sidecars=$copied status_exit=$status_rc dir=$ev/supervisor"
+}
+
+# ---------------------------------------------------------------------------
+# --attempt: Phase 49's positive-arm check plus the Phase 50 launch checks on
+# the collected stage_launched events. No sidecar is required (RV-02).
+# ---------------------------------------------------------------------------
+p49_check_default() {
+    local dir="$T/../../49-live-unattended-run-the-milestone-s-instrument/tools"
+    printf '%s\n' "$(cd "$dir" && pwd)/check-evidence.sh"
+}
+
+# The Phase 50 half of --attempt: every stage_launched event carries a socket
+# path of at most 107 bytes, a launch label and a non-empty launch id that the
+# socket's file name ends with (`-<launch_id>.sock`); both labels appear; no
+# event carries a monitor_pid key. Prints ATTEMPT lines, no verdict.
+attempt_launch_checks() {
+    python3 - "$1" <<'PY'
+import json, pathlib, sys
+
+ev = pathlib.Path(sys.argv[1])
+failed = False
+
+
+def report(name, problem):
+    global failed
+    if problem:
+        failed = True
+        print(f'ATTEMPT check={name} FAIL {problem}')
+    else:
+        print(f'ATTEMPT check={name} ok')
+
+
+rows = []
+try:
+    text = (ev / 'collected' / 'devflow' / 'events.jsonl').read_text()
+    for line in text.splitlines():
+        if line.strip():
+            row = json.loads(line)
+            if not isinstance(row, dict) or 'event' not in row:
+                raise ValueError('an event line has no event field')
+            rows.append(row)
+    report('events readable', '')
+except (OSError, ValueError) as error:
+    text = ''
+    report('events readable', f'ABSENT or malformed: {error}'.replace('\n', ' '))
+
+launches = [row for row in rows if row['event'] == 'stage_launched']
+report('stage_launched present', '' if launches else 'no stage_launched event')
+problems = []
+labels = set()
+for index, row in enumerate(launches):
+    where = f'stage_launched #{index + 1}'
+    for key in ('socket_path', 'launch', 'launch_id'):
+        if key not in row:
+            problems.append(f'{where} missing {key}')
+    if any(key not in row for key in ('socket_path', 'launch', 'launch_id')):
+        continue
+    socket, label, launch_id = row['socket_path'], row['launch'], row['launch_id']
+    if not isinstance(socket, str) or not socket:
+        problems.append(f'{where} socket_path is not a path')
+        continue
+    if len(socket.encode()) > 107:
+        problems.append(f'{where} socket_path is {len(socket.encode())} bytes')
+    if label not in ('stream', 'capture'):
+        problems.append(f'{where} launch label {json.dumps(label)}')
+    else:
+        labels.add(label)
+    if not isinstance(launch_id, str) or not launch_id:
+        problems.append(f'{where} launch_id is empty')
+    elif not socket.rsplit('/', 1)[-1].endswith(f'-{launch_id}.sock'):
+        problems.append(f'{where} socket file name does not end with -{launch_id}.sock')
+report('every launch names its socket, label and id', '; '.join(problems))
+missing = [label for label in ('stream', 'capture') if label not in labels]
+report('both launch shapes', 'missing ' + ','.join(missing) if missing else '')
+report('no monitor_pid key', 'an event carries monitor_pid' if '"monitor_pid"' in text else '')
+print('ATTEMPT launches={} stream={} capture={}'.format(
+    len(launches), sum(1 for r in launches if r.get('launch') == 'stream'),
+    sum(1 for r in launches if r.get('launch') == 'capture')))
+sys.exit(1 if failed else 0)
+PY
+}
+
+attempt_check() {
+    local ev="$1" p49="$2" out rc=0 p49_ok=no launch_ok=no left=0
+    out="$(bash "$p49" --arm positive "$ev" 2>&1)" || rc=$?
+    printf '%s\n' "$out"
+    if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | rg -q -x -e 'CHECK passed=[1-9][0-9]* failed=0'; then
+        p49_ok=yes
+    fi
+    echo "ATTEMPT p49_positive=$([ "$p49_ok" = yes ] && echo pass || echo fail)"
+    if attempt_launch_checks "$ev"; then launch_ok=yes; fi
+    if [ -d "$ev/supervisor" ]; then
+        left="$(find "$ev/supervisor" -maxdepth 1 -type f -name '*.json' | wc -l)"
+    fi
+    echo "ATTEMPT sidecars_left=$left"
+    if [ "$p49_ok" = yes ] && [ "$launch_ok" = yes ]; then
+        echo "ATTEMPT verdict=pass"
+    else
+        echo "ATTEMPT verdict=fail"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# --attempt-gate: Phase 49's verdict semantics (shipped | cap_reached |
+# not_ready, exit 0 for the first two and 1 for not_ready), with shipped
+# judged by --attempt and D-17's same-binary rule: a fault directory that
+# `--fault --require-all` passes must record the attempt's bin_sha256.
+# ---------------------------------------------------------------------------
+attempt_gate() {
+    python3 - "$SELF" "$1" "$2" <<'PY'
+import json, pathlib, re, subprocess, sys
+
+script, home, p49 = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
+number = 'ABSENT'
+
+
+def version_key(path):
+    return [int(part) if part.isdigit() else part for part in re.split(r'(\d+)', path.name)]
+
+
+try:
+    number = (home / 'current-attempt').read_text().strip()
+    if not re.fullmatch('[1-9]', number):
+        raise ValueError('current-attempt must be one digit 1-9')
+    attempt = home / f'attempt-{number}'
+    collected = attempt / 'collected'
+    if not (collected / 'DONE').is_file():
+        raise FileNotFoundError('collected/DONE')
+    verdict = json.loads((attempt / 'verdict.json').read_text())
+    lines = (collected / 'MANIFEST.sha256').read_text().splitlines()
+    if not lines:
+        raise ValueError('manifest empty')
+    for line in lines:
+        if not re.fullmatch(r'[0-9a-f]{64} [ *].+', line):
+            raise ValueError('manifest malformed')
+        path = pathlib.Path(line[66:])
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError('manifest path outside collection')
+    result = subprocess.run(['sha256sum', '--quiet', '-c', 'MANIFEST.sha256'], cwd=collected,
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise ValueError('manifest mismatch')
+    rows = [json.loads(line) for line in (collected / 'devflow' / 'events.jsonl').read_text().splitlines() if line.strip()]
+    shipped = any(row['event'] == 'workflow_shipped' and str(row['phase']) == '1' for row in rows)
+    if (verdict['outcome'] not in ('shipped', 'stopped') or (verdict['outcome'] == 'shipped') != shipped
+            or verdict['workflow_shipped'] is not shipped):
+        raise ValueError('verdict/events disagreement')
+    if shipped:
+        result = subprocess.run(['bash', script, '--attempt', str(attempt), '--p49-check', p49],
+                                capture_output=True, text=True, timeout=300)
+        print(result.stdout, end='')
+        if result.returncode != 0:
+            failures = [line for line in result.stdout.splitlines()
+                        if ' FAIL ' in line or line.startswith('  FAIL ')]
+            raise ValueError('attempt check failed: ' + ('; '.join(failures) or 'ATTEMPT verdict=fail'))
+        expected = json.loads((attempt / 'attempt.json').read_text())['bin_sha256']
+        if not (isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected)):
+            raise ValueError('attempt.json bin_sha256 is not 64 hex')
+        match = None
+        for fault in sorted((p for p in home.glob('fault-*') if p.is_dir()), key=version_key):
+            try:
+                recorded = (fault / 'bin_sha256').read_text().strip()
+            except OSError:
+                continue
+            if recorded != expected:
+                continue
+            judged = subprocess.run(['bash', script, '--fault', str(fault), '--require-all'],
+                                    capture_output=True, text=True, timeout=60)
+            if judged.returncode == 0:
+                match = fault
+        if match is None:
+            print(f"ATTEMPT_GATE verdict=not_ready attempt={number} reason=no passing fault arm on attempt {number}'s binary")
+            sys.exit(1)
+        print(f'ATTEMPT_GATE fault={match.name} bin_sha256={expected}')
+        print(f'ATTEMPT_GATE verdict=shipped attempt={number}')
+    else:
+        stopped = 0
+        for path in home.glob('attempt-*/verdict.json'):
+            value = json.loads(path.read_text())
+            if value['outcome'] == 'stopped' and isinstance(value['stop_note'], str) and value['stop_note'].strip():
+                stopped += 1
+        if stopped < 3:
+            raise ValueError(f'{stopped} of 3 stopped attempts have a note')
+        print(f'ATTEMPT_GATE verdict=cap_reached stopped_attempts={stopped}')
+except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+    absent = 'ABSENT ' if isinstance(error, (OSError, KeyError)) else ''
+    reason = str(error).replace('\n', ' ')
+    print(f'ATTEMPT_GATE verdict=not_ready attempt={number} reason={absent}{reason}')
+    sys.exit(1)
+PY
+}
+
 
 # ---------------------------------------------------------------------------
 # --selftest: one `  ok   <case>` or `  FAIL <case> — <why>` line per planted
@@ -497,6 +803,328 @@ st_src_inverted_dirty() {
         st_git_env bash "$SELF" --src-check "$dir" --repo "$repo"
 }
 
+# --- Task 2 fixtures --------------------------------------------------------
+ST_LIVE_CASES=(alive-stop-stream alive-stop-capture kill9-stale-stop kill9-at-gate stop-races-completion)
+
+# A fault dir holding the full D-17/R-10 case set with bin_sha256 <sha>; in
+# directory <dir> when given, else a fresh one. Prints its path.
+st_full_fault_dir() {
+    local sha="$1" dir="${2:-}" name
+    if [ -z "$dir" ]; then
+        dir="$(st_fault_dir "$sha")"
+    else
+        mkdir -p "$dir"
+        printf '%s\n' "$sha" >"$dir/bin_sha256"
+    fi
+    for name in "${ST_LIVE_CASES[@]}"; do
+        st_record "$name" "$sha" >"$dir/case-$name.json"
+    done
+    st_pointer "$sha" >"$dir/case-publish-unlink-window.json"
+    printf '%s\n' "$dir"
+}
+
+st_fault_unmet() {
+    local dir
+    dir="$(st_fault_dir "$ST_SHA")"
+    st_record alive-stop-stream "$ST_SHA" '.expected_met = false' >"$dir/case-alive-stop-stream.json"
+    expect 1 'FAULT verdict=fail' bash "$SELF" --fault "$dir" &&
+        expect_re 1 'FAULT case=alive-stop-stream FAIL .*expectation not met.*' bash "$SELF" --fault "$dir"
+}
+
+st_require_all_window_live() {
+    local dir
+    dir="$(st_full_fault_dir "$ST_SHA")"
+    expect 0 'FAULT complete=yes' bash "$SELF" --fault "$dir" --require-all || return 1
+    st_record publish-unlink-window "$ST_SHA" >"$dir/case-publish-unlink-window.json"
+    expect 1 'FAULT verdict=fail' bash "$SELF" --fault "$dir" --require-all &&
+        expect_re 1 'FAULT complete=no missing=publish-unlink-window' bash "$SELF" --fault "$dir" --require-all &&
+        expect 1 'FAULT case=publish-unlink-window ok live' bash "$SELF" --fault "$dir" --require-all
+}
+
+st_require_all_twice() {
+    local dir
+    dir="$(st_full_fault_dir "$ST_SHA")"
+    expect 0 'FAULT complete=yes' bash "$SELF" --fault "$dir" --require-all || return 1
+    cp -- "$dir/case-alive-stop-stream.json" "$dir/case-alive-stop-stream-again.json"
+    expect 1 'FAULT complete=no duplicate=alive-stop-stream' bash "$SELF" --fault "$dir" --require-all &&
+        expect 1 'FAULT verdict=fail' bash "$SELF" --fault "$dir" --require-all
+}
+
+st_require_all_partial() {
+    local dir
+    dir="$(st_fault_dir "$ST_SHA")"
+    st_record alive-stop-stream "$ST_SHA" >"$dir/case-alive-stop-stream.json"
+    expect 0 'FAULT verdict=pass' bash "$SELF" --fault "$dir" &&
+        expect_re 1 'FAULT complete=no( .*)?' bash "$SELF" --fault "$dir" --require-all &&
+        expect 1 'FAULT verdict=fail' bash "$SELF" --fault "$dir" --require-all
+}
+
+st_pointer_not_live() {
+    local dir
+    dir="$(st_fault_dir "$ST_SHA")"
+    st_pointer "$ST_SHA" >"$dir/case-publish-unlink-window.json"
+    expect 0 'FAULT case=publish-unlink-window ok pointer' bash "$SELF" --fault "$dir" &&
+        expect_absent 'FAULT case=publish-unlink-window ok live' bash "$SELF" --fault "$dir"
+}
+
+st_pointer_no_fixture() {
+    local dir
+    dir="$(st_fault_dir "$ST_SHA")"
+    st_pointer "$ST_SHA" | jq '.fixture = ""' >"$dir/case-publish-unlink-window.json"
+    expect 1 'FAULT verdict=fail' bash "$SELF" --fault "$dir" &&
+        expect_re 1 'FAULT case=publish-unlink-window FAIL .*names no fixture.*' bash "$SELF" --fault "$dir"
+}
+
+# --- attempt fixtures -------------------------------------------------------
+
+# One stage_launched event line: <label> <launch id> [<socket path>].
+st_launch_event() {
+    local label="$1" id="$2" socket="${3:-/tmp/df50f.AAAAAA/c/sock/0123456789abcdef-01-$2.sock}"
+    jq -n -c --arg l "$label" --arg id "$id" --arg s "$socket" '{v: 1, ts: 1, phase: 1,
+        event: "stage_launched", stage: "define", agent: "claude", supervisor_pid: 42,
+        socket_path: $s, launch_id: $id, launch: $l}'
+}
+
+# An attempt dir whose collected events are stdin; an empty supervisor/.
+st_attempt_ev() {
+    local ev
+    ev="$(mktemp -d "$ST_TMP/attempt.XXXXXX")"
+    mkdir -p "$ev/collected/devflow" "$ev/supervisor"
+    cat >"$ev/collected/devflow/events.jsonl"
+    printf '%s\n' "$ev"
+}
+
+st_good_events() {
+    printf '%s\n' '{"v":1,"ts":1,"phase":1,"event":"workflow_started","commit":"x"}'
+    st_launch_event stream 1111111111111111
+    st_launch_event capture 2222222222222222
+}
+
+st_attempt() {
+    bash "$SELF" --attempt "$1" --p49-check "$ST_TMP/p49-pass.sh"
+}
+
+st_attempt_zero_sidecars() {
+    local ev
+    ev="$(st_good_events | st_attempt_ev)"
+    [ -z "$(ls -A "$ev/supervisor")" ] || { echo "fixture broken: supervisor/ is not empty"; return 1; }
+    expect 0 'ATTEMPT verdict=pass' st_attempt "$ev" &&
+        expect 0 'ATTEMPT sidecars_left=0' st_attempt "$ev"
+}
+
+st_attempt_no_capture() {
+    local ev
+    ev="$({ st_launch_event stream 1111111111111111; st_launch_event stream 3333333333333333; } | st_attempt_ev)"
+    expect 1 'ATTEMPT verdict=fail' st_attempt "$ev" &&
+        expect 1 'ATTEMPT check=both launch shapes FAIL missing capture' st_attempt "$ev"
+}
+
+st_attempt_monitor_pid() {
+    local ev
+    ev="$({ st_good_events; printf '%s\n' '{"v":1,"ts":2,"phase":1,"event":"stage_launched","stage":"plan","monitor_pid":7,"socket_path":"/tmp/x/sock/a-01-4444444444444444.sock","launch_id":"4444444444444444","launch":"stream"}'; } | st_attempt_ev)"
+    expect 1 'ATTEMPT verdict=fail' st_attempt "$ev" &&
+        expect 1 'ATTEMPT check=no monitor_pid key FAIL an event carries monitor_pid' st_attempt "$ev"
+}
+
+# A socket path of exactly <bytes> bytes whose file name ends with -<id>.sock.
+st_socket_of() {
+    local bytes="$1" id="$2" pad
+    pad="$(printf 'x%.0s' $(seq 1 $((bytes - 27))))"
+    printf '/tmp/%s-%s.sock\n' "$pad" "$id"
+}
+
+st_attempt_108() {
+    local id=5555555555555555 ok_ev bad_ev s107 s108
+    s107="$(st_socket_of 107 "$id")"
+    s108="$(st_socket_of 108 "$id")"
+    [ "${#s107}" -eq 107 ] && [ "${#s108}" -eq 108 ] || { echo "fixture broken: ${#s107}/${#s108} bytes"; return 1; }
+    ok_ev="$({ st_launch_event stream "$id" "$s107"; st_launch_event capture 2222222222222222; } | st_attempt_ev)"
+    bad_ev="$({ st_launch_event stream "$id" "$s108"; st_launch_event capture 2222222222222222; } | st_attempt_ev)"
+    expect 0 'ATTEMPT verdict=pass' st_attempt "$ok_ev" &&
+        expect 1 'ATTEMPT verdict=fail' st_attempt "$bad_ev" &&
+        expect_re 1 'ATTEMPT check=every launch names its socket, label and id FAIL .*108 bytes.*' st_attempt "$bad_ev"
+}
+
+st_attempt_id_not_in_socket() {
+    local ev
+    ev="$({ st_launch_event stream 1111111111111111 /tmp/df50f.AAAAAA/c/sock/0123456789abcdef-01-9999999999999999.sock
+        st_launch_event capture 2222222222222222; } | st_attempt_ev)"
+    expect 1 'ATTEMPT verdict=fail' st_attempt "$ev" &&
+        expect_re 1 'ATTEMPT check=every launch names its socket, label and id FAIL .*does not end with -1111111111111111.sock.*' st_attempt "$ev"
+}
+
+# --- attempt-gate fixtures --------------------------------------------------
+
+# Attempt <n> under <home>: outcome shipped|stopped, collected events, DONE,
+# MANIFEST.sha256, attempt.json (bin_sha256 ST_SHA) and verdict.json.
+st_gate_attempt() {
+    local home="$1" n="$2" outcome="$3" note="${4-fixture stop}" ev
+    ev="$home/attempt-$n"
+    mkdir -p "$ev/collected/devflow" "$ev/supervisor"
+    {
+        st_good_events
+        [ "$outcome" != shipped ] || printf '%s\n' '{"v":1,"ts":9,"phase":1,"event":"workflow_shipped"}'
+    } >"$ev/collected/devflow/events.jsonl"
+    (cd "$ev/collected" && find . -type f ! -name MANIFEST.sha256 -printf '%P\n' | sort | xargs sha256sum >../manifest.tmp)
+    mv -- "$ev/manifest.tmp" "$ev/collected/MANIFEST.sha256"
+    printf 'done\n' >"$ev/collected/DONE"
+    jq -n --argjson n "$n" --arg s "$ST_SHA" '{attempt: $n, bin_sha256: $s}' >"$ev/attempt.json"
+    if [ "$outcome" = shipped ]; then
+        jq -n --argjson n "$n" '{attempt: $n, outcome: "shipped", workflow_shipped: true, stop_note: null, state_present: false}' >"$ev/verdict.json"
+    else
+        jq -n --argjson n "$n" --arg note "$note" '{attempt: $n, outcome: "stopped", workflow_shipped: false, stop_note: $note, state_present: false}' >"$ev/verdict.json"
+    fi
+    printf '%s\n' "$n" >"$home/current-attempt"
+}
+
+st_gate() {
+    bash "$SELF" --attempt-gate "$1" --p49-check "$ST_TMP/p49-pass.sh"
+}
+
+st_gate_ships() {
+    local home
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_gate_attempt "$home" 1 shipped
+    st_full_fault_dir "$ST_SHA" "$home/fault-1" >/dev/null
+    expect 0 'ATTEMPT_GATE verdict=shipped attempt=1' st_gate "$home" &&
+        expect 0 "ATTEMPT_GATE fault=fault-1 bin_sha256=$ST_SHA" st_gate "$home"
+}
+
+st_gate_other_binary() {
+    local home
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_gate_attempt "$home" 1 shipped
+    st_full_fault_dir "$ST_OTHER_SHA" "$home/fault-1" >/dev/null
+    expect 0 'FAULT verdict=pass' bash "$SELF" --fault "$home/fault-1" --require-all &&
+        expect 1 "ATTEMPT_GATE verdict=not_ready attempt=1 reason=no passing fault arm on attempt 1's binary" st_gate "$home"
+}
+
+st_gate_partial() {
+    local home
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_gate_attempt "$home" 1 shipped
+    mkdir -p "$home/fault-1"
+    printf '%s\n' "$ST_SHA" >"$home/fault-1/bin_sha256"
+    st_record alive-stop-stream "$ST_SHA" >"$home/fault-1/case-alive-stop-stream.json"
+    expect 0 'FAULT verdict=pass' bash "$SELF" --fault "$home/fault-1" &&
+        expect 1 "ATTEMPT_GATE verdict=not_ready attempt=1 reason=no passing fault arm on attempt 1's binary" st_gate "$home"
+}
+
+st_gate_cap() {
+    local home
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_gate_attempt "$home" 1 stopped
+    st_gate_attempt "$home" 2 stopped
+    expect 1 'ATTEMPT_GATE verdict=not_ready attempt=2 reason=2 of 3 stopped attempts have a note' st_gate "$home" || return 1
+    # Control: a third stop without a note does not count toward the cap.
+    st_gate_attempt "$home" 3 stopped ''
+    expect 1 'ATTEMPT_GATE verdict=not_ready attempt=3 reason=2 of 3 stopped attempts have a note' st_gate "$home" || return 1
+    st_gate_attempt "$home" 3 stopped
+    expect 0 'ATTEMPT_GATE verdict=cap_reached stopped_attempts=3' st_gate "$home"
+}
+
+# --- fault-current fixtures -------------------------------------------------
+
+# Fault dir <home>/<name>: the full case set, src_tree = <repo>'s HEAD ids,
+# src_matches_checkout = <flag>.
+st_fc_dir() {
+    local home="$1" name="$2" repo="$3" flag="$4"
+    st_full_fault_dir "$ST_SHA" "$home/$name" >/dev/null
+    st_git -C "$repo" rev-parse HEAD:crates HEAD:Cargo.toml HEAD:Cargo.lock HEAD:rust-toolchain.toml \
+        >"$home/$name/src_tree"
+    printf '%s\n' "$flag" >"$home/$name/src_matches_checkout"
+}
+
+st_fc() {
+    st_git_env bash "$SELF" --fault-current "$1" --repo "$2"
+}
+
+st_fc_picks_current() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-1 "$repo" true
+    cp -r -- "$home/fault-1" "$home/fault-2"
+    cp -- "$repo/.git/old-ids" "$home/fault-2/src_tree"
+    expect 0 'FAULT_CURRENT dir=fault-1' st_fc "$home" "$repo" &&
+        expect 0 'FAULT_CURRENT verdict=pass' st_fc "$home" "$repo"
+}
+
+st_fc_only_other() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-1 "$repo" true
+    cp -- "$repo/.git/old-ids" "$home/fault-1/src_tree"
+    expect 1 'FAULT_CURRENT dir=ABSENT' st_fc "$home" "$repo" &&
+        expect 1 'FAULT_CURRENT verdict=fail' st_fc "$home" "$repo"
+}
+
+st_fc_newest_only() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-9 "$repo" true
+    st_fc_dir "$home" fault-10 "$repo" true
+    rm -- "$home/fault-10/case-kill9-at-gate.json"
+    expect 1 'FAULT_CURRENT dir=fault-10' st_fc "$home" "$repo" &&
+        expect 1 'FAULT_CURRENT verdict=fail' st_fc "$home" "$repo"
+}
+
+st_fc_uncommitted() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-1 "$repo" true
+    # fault-2 records a dirty checkout (flag false): --src-check alone would
+    # accept it once the tree is dirty, so only the refusal can fail the run.
+    st_fc_dir "$home" fault-2 "$repo" false
+    expect 0 'FAULT_CURRENT dir=fault-1' st_fc "$home" "$repo" || return 1
+    st_dirty "$repo"
+    expect 0 'SRC tree_is_head=yes recorded_matches=false expected_matches=false' \
+        st_git_env bash "$SELF" --src-check "$home/fault-2" --repo "$repo" || return 1
+    expect 1 'FAULT_CURRENT uncommitted_crate_source=1' st_fc "$home" "$repo" &&
+        expect 1 'FAULT_CURRENT verdict=fail' st_fc "$home" "$repo"
+}
+
+st_fc_planning_commit() {
+    local repo home before
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-1 "$repo" true
+    before="$(st_git -C "$repo" rev-parse HEAD)"
+    mkdir -p "$repo/.planning"
+    printf 'note\n' >"$repo/.planning/notes.md"
+    st_git -C "$repo" add .planning/notes.md
+    st_git -C "$repo" commit -q -m 'docs: planning only'
+    printf 'scratch\n' >"$repo/untracked.txt"
+    [ "$(st_git -C "$repo" rev-parse HEAD)" != "$before" ] || { echo "fixture broken: HEAD did not move"; return 1; }
+    expect 0 'FAULT_CURRENT dir=fault-1' st_fc "$home" "$repo" &&
+        expect 0 'FAULT_CURRENT verdict=pass' st_fc "$home" "$repo"
+}
+
+st_fc_mismatching_checkout() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-1 "$repo" false
+    expect 1 'FAULT_CURRENT dir=ABSENT' st_fc "$home" "$repo" &&
+        expect 1 'FAULT_CURRENT verdict=fail' st_fc "$home" "$repo"
+}
+
+st_fc_partial() {
+    local repo home name
+    repo="$(st_src_repo)"
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_fc_dir "$home" fault-1 "$repo" true
+    for name in alive-stop-capture kill9-stale-stop kill9-at-gate stop-races-completion publish-unlink-window; do
+        rm -- "$home/fault-1/case-$name.json"
+    done
+    expect 1 'FAULT_CURRENT dir=fault-1' st_fc "$home" "$repo" &&
+        expect_re 1 'FAULT complete=no( .*)?' st_fc "$home" "$repo" &&
+        expect 1 'FAULT_CURRENT verdict=fail' st_fc "$home" "$repo"
+}
+
 run_selftest() {
     ST_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$ST_TMP"' EXIT
@@ -512,6 +1140,30 @@ run_selftest() {
     st_case 'src check fails a src_tree from an older commit' st_src_older
     st_case 'src check fails an inverted flag on a clean tree' st_src_inverted_clean
     st_case 'src check fails an inverted flag on a dirty tree' st_src_inverted_dirty
+
+    printf '#!/usr/bin/env bash\necho "CHECK passed=11 failed=0"\n' >"$ST_TMP/p49-pass.sh"
+    st_case 'attempt fails without a capture launch' st_attempt_no_capture
+    st_case 'attempt fails a monitor_pid key' st_attempt_monitor_pid
+    st_case 'attempt fails a 108-byte socket path' st_attempt_108
+    st_case 'fault fails a record whose expectation was not met' st_fault_unmet
+    st_case 'attempt gate is not ready on a fault directory from another binary' st_gate_other_binary
+    st_case 'attempt gate ships with a full fault directory on its binary' st_gate_ships
+    st_case 'attempt gate reports cap reached after three noted stops' st_gate_cap
+    st_case 'fault require-all fails a window record marked live' st_require_all_window_live
+    st_case 'fault require-all fails a case recorded twice' st_require_all_twice
+    st_case 'attempt passes with zero leftover sidecars' st_attempt_zero_sidecars
+    st_case 'attempt fails when a launch id is not in its socket name' st_attempt_id_not_in_socket
+    st_case 'fault pointer is not counted as live' st_pointer_not_live
+    st_case 'fault pointer without its fixture fails' st_pointer_no_fixture
+    st_case 'fault require-all fails a partial directory' st_require_all_partial
+    st_case 'attempt gate refuses a partial fault directory' st_gate_partial
+    st_case 'fault current picks the current-source directory over a newer other-source one' st_fc_picks_current
+    st_case 'fault current fails with only other-source directories' st_fc_only_other
+    st_case 'fault current judges only the newest current-source directory' st_fc_newest_only
+    st_case 'fault current refuses an uncommitted crate tree' st_fc_uncommitted
+    st_case 'fault current passes after a planning-only commit' st_fc_planning_commit
+    st_case 'fault current fails a directory whose run saw a mismatching checkout' st_fc_mismatching_checkout
+    st_case 'fault current fails a partial current-source directory' st_fc_partial
 
     echo "SELFTEST passed=$ST_PASS failed=$ST_FAIL"
     [ "$ST_FAIL" -eq 0 ] && [ "$ST_PASS" -gt 0 ]
@@ -555,6 +1207,55 @@ main() {
             [ -n "$dir" ] || usage
             [ -n "$repo" ] || repo="$(default_repo)"
             src_check "$dir" "$repo"
+            ;;
+        --fault-current)
+            local home="" repo=""
+            shift
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --repo) [ "$#" -ge 2 ] || usage; repo="$2"; shift ;;
+                    -*) usage ;;
+                    *) [ -z "$home" ] || usage; home="$1" ;;
+                esac
+                shift
+            done
+            [ -n "$home" ] || usage
+            [ -n "$repo" ] || repo="$(default_repo)"
+            fault_current "$home" "$repo"
+            ;;
+        collect-sidecars)
+            local ev="" project="" bin=""
+            shift
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --project) [ "$#" -ge 2 ] || usage; project="$2"; shift ;;
+                    --bin) [ "$#" -ge 2 ] || usage; bin="$2"; shift ;;
+                    -*) usage ;;
+                    *) [ -z "$ev" ] || usage; ev="$1" ;;
+                esac
+                shift
+            done
+            [ -n "$ev" ] && [ -n "$project" ] || usage
+            collect_sidecars "$ev" "$project" "$bin"
+            ;;
+        --attempt | --attempt-gate)
+            local mode="$1" target="" p49=""
+            shift
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --p49-check) [ "$#" -ge 2 ] || usage; p49="$2"; shift ;;
+                    -*) usage ;;
+                    *) [ -z "$target" ] || usage; target="$1" ;;
+                esac
+                shift
+            done
+            [ -n "$target" ] || usage
+            [ -n "$p49" ] || p49="$(p49_check_default)"
+            if [ "$mode" = --attempt ]; then
+                attempt_check "$target" "$p49"
+            else
+                attempt_gate "$target" "$p49"
+            fi
             ;;
         *) usage ;;
     esac
