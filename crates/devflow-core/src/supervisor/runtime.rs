@@ -329,6 +329,40 @@ fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
     }
 }
 
+/// How long [`stopped_outcome_test_hold`] waits for its release file: above
+/// the bounded waits of the test that uses it, combined.
+#[cfg(any(test, feature = "test-support"))]
+const STOPPED_OUTCOME_HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Test-only hold (50-23, R6-E). When `stop_requested` and
+/// `DEVFLOW_TEST_STOPPED_OUTCOME_HOLD` names a path: create `<path>.held`,
+/// then wait, polling every 20 ms and bounded by
+/// [`STOPPED_OUTCOME_HOLD_WAIT`], until `<path>` exists. [`Supervisor::wait_agent`]
+/// calls it after the agent's exit is observed and before the owner lock is
+/// taken for the exit decision, so a parked supervisor still answers pings
+/// with owner `agent_running` and its outcome is undecided: a CLI test can
+/// order that decision against the next stage's publish. Returns at once
+/// for a supervisor whose stop was not requested. Compiled only under
+/// `cfg(test)` or the `test-support` feature, together with its one call; a
+/// release build has neither.
+#[cfg(any(test, feature = "test-support"))]
+fn stopped_outcome_test_hold(stop_requested: bool) {
+    if !stop_requested {
+        return;
+    }
+    let Some(release) = std::env::var_os("DEVFLOW_TEST_STOPPED_OUTCOME_HOLD") else {
+        return;
+    };
+    let release = std::path::PathBuf::from(release);
+    let mut held = release.clone().into_os_string();
+    held.push(".held");
+    let _ = std::fs::write(&held, "");
+    let deadline = std::time::Instant::now() + STOPPED_OUTCOME_HOLD_WAIT;
+    while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// An exit status as a code: the exit code, or `128 + n` for a death by
 /// signal `n` (the `monitor` convention: SIGTERM is 143, SIGKILL 137).
 pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -514,6 +548,11 @@ impl Supervisor {
     /// (RESEARCH Pitfall 9).
     pub fn wait_agent(&self, child: &mut std::process::Child) -> io::Result<AgentOutcome> {
         wait_for_exit_without_reaping(child.id())?;
+        // Test-only (50-23, R6-E): park a stopped supervisor between the
+        // observed exit and its outcome decision. Compiled out of release
+        // builds.
+        #[cfg(any(test, feature = "test-support"))]
+        stopped_outcome_test_hold(self.token.stop_requested());
         let pgid = self.agent_pgid;
         self.token.observe_exit(|stop_requested| {
             if stop_requested {

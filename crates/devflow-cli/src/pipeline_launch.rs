@@ -1630,37 +1630,148 @@ fn spawn_agent_and_record(
 
 /// The stop reason a launcher records when the next stage's supervisor it
 /// just published had already ended (50-23, T-50-64).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "50-23 Task 2 RED scaffold; GREEN records it")
-)]
 pub(crate) const NEXT_STOPPED_BEFORE_SAVE_REASON: &str =
     "the next stage's supervisor was stopped before its record was saved";
+
+/// How long [`successor_runs_on`] keeps re-probing a STALE successor: a
+/// finishing supervisor drops its listener just before it unlinks.
+const STALE_REPROBE_WINDOW: Duration = Duration::from_millis(200);
+
+/// The interval of [`successor_runs_on`]'s STALE re-probe.
+const STALE_REPROBE_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How [`publish_record`] ended.
 enum PublishOutcome {
     /// The record is saved and the next supervisor is running it.
     HandedOff,
-    /// The record is saved, but the next supervisor had already ended.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "50-23 Task 2 RED scaffold; GREEN constructs it")
-    )]
-    #[cfg_attr(test, allow(dead_code))]
+    /// The record is saved, but the next supervisor had already ended, so
+    /// the run is recorded `stopped`.
     SuccessorAlreadyEnded,
 }
 
-/// Record the next stage's supervisor in `state` with one `save` (50-23).
-/// RED scaffold: today's behaviour, a single save whose error is returned.
+/// Record the next stage's supervisor (`published`) in `state` with one
+/// `save`, the publish (50-13, R-1 step 4; 50-23).
+///
+/// - The save fails: shut the new supervisor down through its socket
+///   (bounded by [`SUPERVISOR_STOP_WAIT`]), so no live supervisor is left
+///   unrecorded, and return the error ([`shut_down_unrecorded`]).
+/// - The save succeeds: probe the new socket once ([`successor_runs_on`]).
+///   A successor still running is handed off. One that already ended (a
+///   stop sent straight to it takes 50-13's no-write path while the state
+///   still names this launcher's run) is recorded here: `stopped` with
+///   [`NEXT_STOPPED_BEFORE_SAVE_REASON`], saved again under the per-phase
+///   lock the caller holds.
+///
+/// A successor that has accepted a stop but is still in its kill grace
+/// answers owner `agent_running` and is handed off: this save lands before
+/// that probe, and it loads the state only after its outcome is decided, so
+/// it finds its own launch id and records its own stop.
+///
+/// Signals nothing by pid: every step goes through `published`'s socket.
 fn publish_record<E: Into<CliError>>(
     state: &mut State,
     published: monitor::Published,
     mut save: impl FnMut(&State) -> Result<(), E>,
 ) -> Result<PublishOutcome, CliError> {
+    let record = published.record;
     state.monitor_pid = Some(published.supervisor_pid);
-    state.supervisor = Some(published.record);
+    state.supervisor = Some(record.clone());
+    if let Err(err) = save(state) {
+        return Err(shut_down_unrecorded(state, &record, err.into()));
+    }
+    if successor_runs_on(&record.socket_path) {
+        return Ok(PublishOutcome::HandedOff);
+    }
+    state.stopped = true;
+    state.stop_reason = Some(NEXT_STOPPED_BEFORE_SAVE_REASON.to_string());
     save(state).map_err(Into::into)?;
-    Ok(PublishOutcome::HandedOff)
+    info!(
+        "phase {}: {NEXT_STOPPED_BEFORE_SAVE_REASON} (launch {})",
+        state.phase, record.launch_id
+    );
+    Ok(PublishOutcome::SuccessorAlreadyEnded)
+}
+
+/// After a failed publish save (`save_err`): ask the unrecorded supervisor
+/// at `record` to stop, and return the launch's error.
+///
+/// A confirmed `Stopped` clears the record (best effort) and the error says
+/// the supervisor was shut down. Anything else (RV-08: `HandedOff`,
+/// `Refused`, a probe error or a timeout) means it may still be running:
+/// nothing is cleared or saved, so the in-memory record keeps naming it and
+/// no save erases the handle the file holds, and the error names its socket,
+/// its launch id and the `devflow stop --phase N --launch <id>` repair, which
+/// finds it by its sidecar whatever the state says (50-14).
+fn shut_down_unrecorded(
+    state: &mut State,
+    record: &SupervisorRecord,
+    save_err: CliError,
+) -> CliError {
+    let failed = format!(
+        "could not save the record of the next stage's supervisor (launch {}): {save_err}",
+        record.launch_id
+    );
+    match devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT) {
+        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. }) => {
+            let cleared = record_failed_launch(state)
+                .err()
+                .map(|err| format!("; clearing its record also failed: {err}"))
+                .unwrap_or_default();
+            CliError::Message(format!(
+                "{failed}; that supervisor was shut down through its socket{cleared}"
+            ))
+        }
+        other => {
+            let outcome = match other {
+                Ok(outcome) => format!("{outcome:?}"),
+                Err(err) => err.to_string(),
+            };
+            CliError::Message(format!(
+                "{failed}; shutting it down at {} did not confirm a stop ({outcome}), so it may \
+                 still be running; run `devflow stop --phase {} --launch {}` to end it",
+                record.socket_path.display(),
+                state.phase,
+                record.launch_id
+            ))
+        }
+    }
+}
+
+/// Whether the successor whose record was just saved is still running and
+/// can be handed off: Alive with owner `agent_running`, `advancing` or
+/// `gate_wait`. Gone, or Alive with any other owner (it finished without
+/// advancing), is `false`. STALE is re-probed for
+/// [`STALE_REPROBE_WINDOW`]: Gone within it is `false`, and a socket still
+/// STALE is `true` (a crashed successor stays recorded and reads STALE, a
+/// real finding with its own repair). A probe error is `true`: the record
+/// stays and `status` reports the error.
+fn successor_runs_on(socket: &Path) -> bool {
+    use devflow_core::supervisor::{Liveness, probe};
+    let running = [
+        OwnerPhase::AgentRunning,
+        OwnerPhase::Advancing,
+        OwnerPhase::GateWait,
+    ];
+    let deadline = std::time::Instant::now() + STALE_REPROBE_WINDOW;
+    loop {
+        match probe(socket) {
+            Ok(Liveness::Alive(reply)) => {
+                return running.iter().any(|phase| phase.as_str() == reply.owner);
+            }
+            Ok(Liveness::Gone) => return false,
+            Ok(Liveness::Stale) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(STALE_REPROBE_INTERVAL);
+            }
+            Ok(Liveness::Stale) => return true,
+            Err(err) => {
+                warn!(
+                    "could not probe the next supervisor at {} after its publish: {err}",
+                    socket.display()
+                );
+                return true;
+            }
+        }
+    }
 }
 
 /// What [`spawn_next_supervisor`] hands back to [`spawn_agent_and_record`]
