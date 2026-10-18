@@ -3184,7 +3184,12 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
 /// Out of scope: the lock-free window between agent exit and `advance` taking
 /// the lock stays backlog 999.136. This check says nothing about a gate waiter.
 fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(project_root, phase, LaunchVerb::Start)
+    refuse_launch_over_a_live_run(
+        project_root,
+        phase,
+        LaunchVerb::Start,
+        registry::cache_dir().as_deref(),
+    )
 }
 
 /// Criterion 2, D-01 and D-02's `resume` half, promoted by the operator on
@@ -3212,7 +3217,12 @@ pub(crate) fn refuse_resume_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
 ) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(project_root, phase, LaunchVerb::Resume)
+    refuse_launch_over_a_live_run(
+        project_root,
+        phase,
+        LaunchVerb::Resume,
+        registry::cache_dir().as_deref(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3225,7 +3235,9 @@ fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
+    cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
+    let _ = cache_dir; // RED scaffold: GREEN sweeps it.
     let loaded = workflow::load_state(project_root, phase);
     if loaded.is_err() && !workflow::state_path(project_root, phase).exists() {
         return Ok(());
@@ -3243,6 +3255,12 @@ fn refuse_launch_over_a_live_run(
         return Ok(());
     }
     Err(CliError::Message(live_run_refusal(phase, verb, &live)))
+}
+
+/// RED scaffold for the STALE classification; GREEN implements it.
+#[cfg_attr(not(test), expect(dead_code, reason = "RED scaffold"))]
+fn stale_group_may_live(_decision: &supervisor::backstop::BackstopDecision) -> bool {
+    true
 }
 
 /// The refusal text for [`refuse_start_over_a_live_run`]. It fires while
@@ -10740,5 +10758,105 @@ mod tests {
             before,
             "nothing is recorded"
         );
+    }
+
+    /// 50-15: the start/resume guard over a state file that will not load
+    /// (D-09). These drive the guard in-process against a tempdir cache, so
+    /// nothing reads the operator's real `~/.cache/devflow`.
+    mod launch_guard {
+        use super::*;
+        use supervisor::backstop::BackstopDecision;
+
+        /// A project root whose phase state file exists and will not load.
+        fn root_with_an_unloadable_state(phase: PhaseId) -> tempfile::TempDir {
+            let root = tempfile::tempdir().unwrap();
+            let state = workflow::state_path(root.path(), phase);
+            std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+            std::fs::write(&state, b"{ this does not parse").unwrap();
+            assert!(workflow::load_state(root.path(), phase).is_err());
+            root
+        }
+
+        /// The 50-06 threat flag: `sweep_in` answers a socket directory it
+        /// cannot list with no entries, which must not read as "nothing
+        /// live" here. The guard fails closed and names the directory.
+        #[test]
+        fn the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let phase = PhaseId::new(1501);
+            let root = root_with_an_unloadable_state(phase);
+            let cache = tempfile::tempdir().unwrap();
+            let sock = registry::socket_dir_in(cache.path());
+            std::fs::create_dir_all(&sock).unwrap();
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let listable = std::fs::read_dir(&sock).is_ok();
+            let result = refuse_launch_over_a_live_run(
+                root.path(),
+                phase,
+                LaunchVerb::Start,
+                Some(cache.path()),
+            );
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                !listable,
+                "precondition: a 0o000 directory cannot be listed"
+            );
+            let Err(CliError::Message(text)) = result else {
+                panic!("an unlistable socket directory must refuse: {result:?}");
+            };
+            for fragment in [
+                sock.display().to_string(),
+                "cannot be listed".to_string(),
+                "refusing to start; nothing was written".to_string(),
+            ] {
+                assert!(text.contains(&fragment), "missing {fragment:?}: {text}");
+            }
+        }
+
+        /// Control for the test above: a socket directory that does not
+        /// exist means no launch has published a socket, so nothing is live.
+        #[test]
+        fn the_launch_guard_proceeds_over_an_unloadable_state_when_the_socket_dir_is_missing() {
+            let phase = PhaseId::new(1502);
+            let root = root_with_an_unloadable_state(phase);
+            let cache = tempfile::tempdir().unwrap();
+            assert!(!registry::socket_dir_in(cache.path()).exists());
+            let result = refuse_launch_over_a_live_run(
+                root.path(),
+                phase,
+                LaunchVerb::Resume,
+                Some(cache.path()),
+            );
+            assert!(
+                result.is_ok(),
+                "a missing socket dir is not a refusal: {result:?}"
+            );
+        }
+
+        /// T-50-40: only the three backstop decisions that prove a STALE
+        /// socket's agent group gone let a launch through; every refusal,
+        /// an unprovable identity and a live leader count as live.
+        #[test]
+        fn only_a_provably_gone_group_lets_a_stale_socket_through_the_launch_guard() {
+            for gone in [
+                BackstopDecision::PreviousBoot,
+                BackstopDecision::EmptyGroup,
+                BackstopDecision::LeaderRecycled,
+            ] {
+                assert!(
+                    !stale_group_may_live(&gone),
+                    "{gone:?} proves the group gone"
+                );
+            }
+            for live in [
+                BackstopDecision::LeaderPresentSignal,
+                BackstopDecision::RefuseLeaderGone(Vec::new()),
+                BackstopDecision::RefuseMismatch("agent_pgid".to_string()),
+                BackstopDecision::RefuseUnsafeTarget,
+                BackstopDecision::RefuseIdentityUnavailable,
+            ] {
+                assert!(stale_group_may_live(&live), "{live:?} must fail closed");
+            }
+        }
     }
 }
