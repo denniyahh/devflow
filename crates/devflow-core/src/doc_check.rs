@@ -671,3 +671,99 @@ fn no_monitor_pid_field_json_key_or_help_mention_remains() {
         findings.join("\n")
     );
 }
+
+/// `text` with every `<!--` … `-->` span removed (an unterminated one runs to
+/// the end of the text), so a fragment hidden in an HTML comment never counts
+/// as documented.
+fn strip_html_comments(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<!--") {
+        kept.push_str(&rest[..open]);
+        let after_open = &rest[open + "<!--".len()..];
+        match after_open.find("-->") {
+            Some(close) => rest = &after_open[close + "-->".len()..],
+            None => return kept,
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// The `fragments` that `text` does not contain, in the order given.
+fn missing_fragments<'a>(text: &str, fragments: &[&'a str]) -> Vec<&'a str> {
+    fragments
+        .iter()
+        .copied()
+        .filter(|fragment| !text.contains(fragment))
+        .collect()
+}
+
+/// Fragments OPERATIONS.md must hold, compared as written (50-17).
+const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
+    "GONE",
+    "STALE",
+    "ALIVE",
+    "devflow stop --phase N",
+    "devflow resume --phase N",
+    "ps -o pid,pgid,sid,lstart,args -g",
+    "DEVFLOW_CACHE_DIR",
+];
+
+/// Fragments OPERATIONS.md must hold, compared lowercased the way
+/// `source_devflow_env_vars_and_subcommands_are_documented` compares (RV-06).
+const INTERNAL_SUBCOMMAND_FRAGMENTS: &[&str] = &["devflow monitor", "devflow advance"];
+
+/// 50-17 (R6-G4): OPERATIONS.md documents run liveness as the supervisor
+/// socket answers it (GONE / STALE / ALIVE and the repair verbs), `devflow
+/// stop`'s arms including the backstop's refusal and its inspection command,
+/// the socket location's override, and both internal subcommands, outside
+/// HTML comments.
+#[test]
+fn operations_md_documents_run_liveness_and_the_stop_arms() {
+    let every: String = RUN_LIVENESS_FRAGMENTS.join("\n");
+    let all_but_stale = every.replace("STALE", "");
+    assert_eq!(
+        missing_fragments(&all_but_stale, RUN_LIVENESS_FRAGMENTS),
+        vec!["STALE"],
+        "planted control: a text missing only STALE must report exactly STALE"
+    );
+    let gone_only_in_a_comment = every.replace("GONE", "<!-- GONE -->");
+    assert!(
+        missing_fragments(&gone_only_in_a_comment, RUN_LIVENESS_FRAGMENTS).is_empty(),
+        "planted control: before stripping, the commented GONE still counts"
+    );
+    assert_eq!(
+        missing_fragments(
+            &strip_html_comments(&gone_only_in_a_comment),
+            RUN_LIVENESS_FRAGMENTS
+        ),
+        vec!["GONE"],
+        "planted control: a GONE only inside an HTML comment must be missing after stripping"
+    );
+    assert_eq!(
+        strip_html_comments("kept <!-- dropped"),
+        "kept ",
+        "planted control: an unterminated comment runs to the end of the text"
+    );
+    assert!(
+        missing_fragments(&every, RUN_LIVENESS_FRAGMENTS).is_empty(),
+        "planted control: a text holding every fragment reports none"
+    );
+
+    let path = workspace_root().join("OPERATIONS.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let text = strip_html_comments(&text);
+    let mut missing = missing_fragments(&text, RUN_LIVENESS_FRAGMENTS);
+    missing.extend(missing_fragments(
+        &text.to_ascii_lowercase(),
+        INTERNAL_SUBCOMMAND_FRAGMENTS,
+    ));
+    assert!(
+        missing.is_empty(),
+        "{} does not document run liveness and the stop arms; missing outside HTML comments:\n{}",
+        path.display(),
+        missing.join("\n")
+    );
+}
