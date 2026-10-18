@@ -1646,4 +1646,183 @@ mod tests {
         supervisor.finish();
         assert!(matches!(probe(&path), Ok(Liveness::Gone)));
     }
+
+    // ---- 50-23 (R6-E): the stopped-outcome test hold stays test-only ----
+
+    /// `source`'s non-test lines: the part before the first line that is
+    /// exactly `mod tests {`, without its whole-line `//` comments.
+    fn non_test_code_lines(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect()
+    }
+
+    /// The lines of the item whose header line starts with `header`, through
+    /// the next line starting with `closing`; `None` when no line starts with
+    /// `header`.
+    fn item_lines<'a>(lines: &[&'a str], header: &str, closing: &str) -> Option<Vec<&'a str>> {
+        let start = lines.iter().position(|line| line.starts_with(header))?;
+        let mut item = vec![lines[start]];
+        for line in &lines[start + 1..] {
+            item.push(*line);
+            if line.starts_with(closing) {
+                break;
+            }
+        }
+        Some(item)
+    }
+
+    const HOLD_NO_LITERAL_READ: &str =
+        "no literal std::env::var_os/var read of the stopped-outcome hold variable";
+    const HOLD_FN_NOT_ONCE: &str = "fn stopped_outcome_test_hold( is not defined exactly once";
+    const HOLD_NOT_GATED: &str = "stopped_outcome_test_hold is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+    const WAIT_AGENT_NOT_FOUND: &str = "Supervisor::wait_agent not found (or under 5 lines)";
+    const WAIT_AGENT_NO_HOLD: &str =
+        "Supervisor::wait_agent does not call stopped_outcome_test_hold";
+
+    /// R6-E as a pure scan over `source`'s non-test, comment-stripped code:
+    /// the hold variable is read literally (the form the doc check sees),
+    /// `stopped_outcome_test_hold` is defined once directly under the
+    /// test-support gate, and `wait_agent` calls it.
+    fn stopped_outcome_hold_violations(source: &str) -> Vec<String> {
+        let lines = non_test_code_lines(source);
+        let mut violations = Vec::new();
+        let reads = [
+            r#"std::env::var_os("DEVFLOW_TEST_STOPPED_OUTCOME_HOLD")"#,
+            r#"std::env::var("DEVFLOW_TEST_STOPPED_OUTCOME_HOLD")"#,
+        ];
+        if !lines
+            .iter()
+            .any(|line| reads.iter().any(|read| line.contains(read)))
+        {
+            violations.push(HOLD_NO_LITERAL_READ.to_string());
+        }
+        let defined: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.trim_start()
+                    .starts_with("fn stopped_outcome_test_hold(")
+            })
+            .map(|(at, _)| at)
+            .collect();
+        match defined.as_slice() {
+            [at] => {
+                let gated = at.checked_sub(1).is_some_and(|above| {
+                    lines[above].ends_with(r#"#[cfg(any(test, feature = "test-support"))]"#)
+                });
+                if !gated {
+                    violations.push(HOLD_NOT_GATED.to_string());
+                }
+            }
+            _ => violations.push(HOLD_FN_NOT_ONCE.to_string()),
+        }
+        match item_lines(&lines, "    pub fn wait_agent(", "    }").filter(|item| item.len() >= 5) {
+            None => violations.push(WAIT_AGENT_NOT_FOUND.to_string()),
+            Some(item) => {
+                if !item
+                    .iter()
+                    .any(|line| line.contains("stopped_outcome_test_hold("))
+                {
+                    violations.push(WAIT_AGENT_NO_HOLD.to_string());
+                }
+            }
+        }
+        violations
+    }
+
+    /// T-50-85 (permanent source scan, R6-G4, R6-E): a release build never
+    /// compiles the stopped-outcome hold. The real file yields no violation;
+    /// each planted source yields the violation it plants.
+    #[test]
+    fn the_stopped_outcome_hold_is_test_only_and_read_literally() {
+        let source = include_str!("runtime.rs");
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "runtime.rs must keep its `mod tests {{` line, or the scan would read its own controls"
+        );
+        let real = stopped_outcome_hold_violations(source);
+        assert!(real.is_empty(), "runtime.rs: {real:?}");
+
+        let gate = "#[cfg(any(test, feature = \"test-support\"))]\n";
+        let read = "    let _path = std::env::var_os(\"DEVFLOW_TEST_STOPPED_OUTCOME_HOLD\");\n";
+        let hold = |attribute: &str, body: &str| {
+            format!("{attribute}fn stopped_outcome_test_hold(stop_requested: bool) {{\n{body}}}\n")
+        };
+        let pad = "        let _filler = 0;\n".repeat(4);
+        let call = "        stopped_outcome_test_hold(true);\n";
+        let wait_agent = |body: &str| {
+            format!("impl Supervisor {{\n    pub fn wait_agent(&self) {{\n{pad}{body}    }}\n")
+        };
+        let other = |body: &str| format!("    pub fn token(&self) {{\n{body}    }}\n}}\n");
+        let good = format!("{}{}{}", hold(gate, read), wait_agent(call), other(""));
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            stopped_outcome_hold_violations(&good),
+            Vec::<String>::new(),
+            "a correct layout"
+        );
+        assert_eq!(
+            stopped_outcome_hold_violations(&format!(
+                "{}{}{}",
+                hold("#[cfg(test)]\n", read),
+                wait_agent(call),
+                other("")
+            )),
+            only(HOLD_NOT_GATED),
+            "gated by cfg(test) only"
+        );
+        assert_eq!(
+            stopped_outcome_hold_violations(&format!(
+                "{}{}{}",
+                hold("", read),
+                wait_agent(call),
+                other("")
+            )),
+            only(HOLD_NOT_GATED),
+            "no attribute"
+        );
+        assert_eq!(
+            stopped_outcome_hold_violations(&format!(
+                "const HOLD: &str = \"hold\";\n{}{}{}",
+                hold(gate, "    let _path = std::env::var_os(HOLD);\n"),
+                wait_agent(call),
+                other("")
+            )),
+            only(HOLD_NO_LITERAL_READ),
+            "a read through a constant"
+        );
+        assert_eq!(
+            stopped_outcome_hold_violations(&format!(
+                "{}{}{}",
+                hold(gate, read),
+                wait_agent("        // stopped_outcome_test_hold(true);\n"),
+                other("")
+            )),
+            only(WAIT_AGENT_NO_HOLD),
+            "a commented-out call"
+        );
+        assert_eq!(
+            stopped_outcome_hold_violations(&format!(
+                "{}{}{}",
+                hold(gate, read),
+                wait_agent(""),
+                other(call)
+            )),
+            only(WAIT_AGENT_NO_HOLD),
+            "the call moved to another method"
+        );
+        assert_eq!(
+            stopped_outcome_hold_violations(&format!("mod tests {{\n{good}")),
+            vec![
+                HOLD_NO_LITERAL_READ.to_string(),
+                HOLD_FN_NOT_ONCE.to_string(),
+                WAIT_AGENT_NOT_FOUND.to_string()
+            ],
+            "the read, the hold and a decoy wait_agent only after the test-module cut"
+        );
+    }
 }
