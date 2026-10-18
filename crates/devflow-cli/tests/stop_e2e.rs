@@ -169,10 +169,11 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
 
 /// T-50-38 (renamed from `stop_never_signals_the_recorded_monitor_pid`):
 /// `stop` never signals a pid read from state; it addresses the socket. The
-/// state plants a live test-owned process as `monitor_pid` and as the agent
-/// group of a `supervisor` record whose socket file does not exist, so the
-/// probe reads GONE: `stop` reports nothing running and the planted process
-/// is still alive afterwards.
+/// state plants a live test-owned process as the agent group of a
+/// `supervisor` record whose socket file does not exist, so the probe reads
+/// GONE: `stop` reports nothing running and the planted process is still
+/// alive afterwards. Also covers T-23-51's unit test (removed in 50-22): a
+/// pid recorded in state alone is never a signalling target or a blocker.
 #[test]
 fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
     let home = common::HermeticHome::new();
@@ -185,7 +186,6 @@ fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
         .expect("spawn the planted process");
     let start = devflow_core::agent::process_start_time(planted.id()).expect("start time");
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-    state.monitor_pid = Some(planted.id());
     state.supervisor = Some(SupervisorRecord::new(
         home.cache_dir().join("sock").join("missing.sock"),
         "launch-missing".to_string(),

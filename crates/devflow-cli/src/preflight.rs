@@ -2202,7 +2202,7 @@ mod tests {
         // from the constant; 34-05's widening puts it on the stream path,
         // where `canary_gate` invokes the real `ClaudeCanaryLauncher` and the
         // launch fails on a delivery refusal unrelated to launch counting.
-        // The `launches == 1` and `monitor_pid.is_some()` assertions below
+        // The `launches == 1` and `supervisor.is_some()` assertions below
         // are untouched, so a launch must still genuinely happen.
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
@@ -2245,7 +2245,7 @@ mod tests {
              exactly once, not {launches}"
         );
         assert!(
-            state.monitor_pid.is_some(),
+            state.supervisor.is_some(),
             "this test is expected to drive a real monitor::spawn_monitor \
              through run_preflight's Advance arm — None here means WR-05's \
              premise was wrong and the guard above reaped nothing"
@@ -2276,7 +2276,7 @@ mod tests {
         // (34-06); do not "simplify" this away. Same reasoning as the Advance
         // arm's sibling above: the subject is the launch COUNT through the
         // LoopBack arm, not which launch path is taken, and the `launches == 1`
-        // and `monitor_pid.is_some()` assertions below are untouched.
+        // and `supervisor.is_some()` assertions below are untouched.
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
@@ -2324,7 +2324,7 @@ mod tests {
              exactly once, not {launches}"
         );
         assert!(
-            state.monitor_pid.is_some(),
+            state.supervisor.is_some(),
             "this test is expected to drive a real monitor::spawn_monitor \
              through run_preflight's LoopBack arm — None here means WR-05's \
              premise was wrong and the guard above reaped nothing"
@@ -2436,7 +2436,7 @@ mod tests {
             "a human Advance must reset the retry counter"
         );
         assert!(
-            state.monitor_pid.is_some(),
+            state.supervisor.is_some(),
             "this test's Advance arm is expected to drive a real \
              monitor::spawn_monitor via launch_stage_inner — None here means \
              this residual finding's premise was wrong and the guard above \
