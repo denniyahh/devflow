@@ -237,26 +237,59 @@ pub(crate) fn peer_is_same_user(_stream: &UnixStream) -> bool {
     false
 }
 
+/// Why [`ping`] got no valid reply.
+#[derive(Debug)]
+pub(crate) struct PingError {
+    /// What went wrong, as a message.
+    pub(crate) message: String,
+    /// The connection was closed under the ping: the send hit a broken pipe
+    /// or the read a reset. A listener released while the connection waits
+    /// in its backlog does this, so only a fresh connect can tell whether
+    /// anything still listens.
+    pub(crate) closed: bool,
+}
+
+impl PingError {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            closed: false,
+        }
+    }
+
+    fn io(context: &str, error: &io::Error) -> Self {
+        Self {
+            message: format!("{context}: {error}"),
+            closed: matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ),
+        }
+    }
+}
+
 /// Client side: send one ping on a connected stream and parse the reply.
 /// Every failure (timeout, closed connection, oversized or malformed line,
-/// `"ok":false`) is returned as a message; a connect alone is never proof of
-/// life.
-pub(crate) fn ping(stream: UnixStream) -> Result<PingReply, String> {
-    set_timeouts(&stream).map_err(|error| format!("could not set socket timeouts: {error}"))?;
+/// `"ok":false`) is returned as a [`PingError`]; a connect alone is never
+/// proof of life.
+pub(crate) fn ping(stream: UnixStream) -> Result<PingReply, PingError> {
+    set_timeouts(&stream)
+        .map_err(|error| PingError::io("could not set socket timeouts", &error))?;
     let request = serde_json::to_string(&Request::Ping)
-        .map_err(|error| format!("could not encode ping: {error}"))?;
+        .map_err(|error| PingError::other(format!("could not encode ping: {error}")))?;
     (&stream)
         .write_all(format!("{request}\n").as_bytes())
-        .map_err(|error| format!("could not send ping: {error}"))?;
+        .map_err(|error| PingError::io("could not send ping", &error))?;
     let line = read_line(&mut BufReader::new(&stream))
-        .map_err(|error| format!("no ping reply: {error}"))?;
+        .map_err(|error| PingError::io("no ping reply", &error))?;
     let value: serde_json::Value = serde_json::from_str(&line)
-        .map_err(|error| format!("ping reply is not JSON ({error}): {line}"))?;
+        .map_err(|error| PingError::other(format!("ping reply is not JSON ({error}): {line}")))?;
     if value.get("ok") != Some(&serde_json::Value::Bool(true)) {
-        return Err(format!("ping reply is not ok: {line}"));
+        return Err(PingError::other(format!("ping reply is not ok: {line}")));
     }
-    serde_json::from_value(value)
-        .map_err(|error| format!("ping reply is missing fields ({error}): {line}"))
+    serde_json::from_value(value).map_err(|error| {
+        PingError::other(format!("ping reply is missing fields ({error}): {line}"))
+    })
 }
 
 #[cfg(test)]
@@ -323,6 +356,34 @@ mod tests {
         assert_eq!(
             read_line(&mut fits.as_bytes()).expect("a line at the cap is read"),
             "x".repeat(MAX_LINE - 1)
+        );
+    }
+
+    /// `ping` marks a send into a closed peer (a broken pipe) as `closed`,
+    /// which is what lets `probe` connect once more. The control is a peer
+    /// that reads the ping and closes without a reply: a plain missing reply,
+    /// not `closed`.
+    #[test]
+    fn ping_marks_a_broken_pipe_closed_and_a_missing_reply_not() {
+        let (client, peer) = UnixStream::pair().expect("a socket pair");
+        drop(peer);
+        let broken = ping(client).expect_err("a closed peer gives no reply");
+        assert!(
+            broken.closed,
+            "a broken pipe is a closed connection: {broken:?}"
+        );
+
+        let (client, peer) = UnixStream::pair().expect("a socket pair");
+        let reader = std::thread::spawn(move || {
+            let request = read_request(&peer).expect("the peer reads the ping");
+            drop(peer);
+            request
+        });
+        let unanswered = ping(client).expect_err("a peer that never replies gives no reply");
+        assert_eq!(reader.join().expect("reader thread"), Request::Ping);
+        assert!(
+            !unanswered.closed,
+            "a close after the ping was read is a missing reply: {unanswered:?}"
         );
     }
 }

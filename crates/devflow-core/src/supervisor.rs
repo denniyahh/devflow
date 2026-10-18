@@ -299,20 +299,33 @@ pub enum ProbeError {
 ///    the stat and the connect is reported, never guessed to be `Gone`.
 /// 4. A connect is not proof of life (a listen backlog accepts it with
 ///    nobody serving): only a valid ping reply makes it `Alive`.
+/// 5. A ping whose connection is closed under it (a reset or a broken pipe)
+///    runs steps 1 to 4 once more. A listener released while the connection
+///    waits in its backlog closes it like that (an owner whose last thread
+///    is still exiting, or a forked child dropping the last copy of the
+///    listener), and the fresh connect is then refused: `Stale`. A listener
+///    that is still up takes the fresh connect, and its answer stands; a
+///    second close is [`ProbeError::NoReply`]. `Stale` still comes only from
+///    a refused connect.
 pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
-    if !own_socket_at(path)? {
-        return Ok(Liveness::Gone);
-    }
-    let stream = match UnixStream::connect(path) {
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-            return Ok(Liveness::Stale);
+    let mut connected_again = false;
+    loop {
+        if !own_socket_at(path)? {
+            return Ok(Liveness::Gone);
         }
-        Err(error) => return Err(ProbeError::Connect(error)),
-        Ok(stream) => stream,
-    };
-    protocol::ping(stream)
-        .map(Liveness::Alive)
-        .map_err(ProbeError::NoReply)
+        let stream = match UnixStream::connect(path) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                return Ok(Liveness::Stale);
+            }
+            Err(error) => return Err(ProbeError::Connect(error)),
+            Ok(stream) => stream,
+        };
+        match protocol::ping(stream) {
+            Ok(reply) => return Ok(Liveness::Alive(reply)),
+            Err(error) if error.closed && !connected_again => connected_again = true,
+            Err(error) => return Err(ProbeError::NoReply(error.message)),
+        }
+    }
 }
 
 /// [`probe`]'s pre-connect checks, shared with [`request_shutdown`]:
