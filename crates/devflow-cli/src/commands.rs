@@ -1981,30 +1981,347 @@ fn reap_stray_candidates(
 
 type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 
-/// End a running phase cleanly (23c) — the missing primitive
-/// `23-ORPHAN-FORENSICS.md` names as the reason 54 processes accumulated
-/// with no remedy but `kill(1)`. Answers `phase`'s open gate if it has one —
-/// the primary path, since it is the only one that produces a clean final
-/// state: the target unwinds through its own `abort()` and releases its
-/// lock; otherwise signals the process recorded in `phase`'s per-phase lock
-/// file (never `state.monitor_pid` — T-23-51: the monitor shell script's
-/// `trap` closure only ever captures the **agent's** pid, never the
-/// trailing `advance` invocation, so by the time `advance` is the shell's
-/// foreground child, `monitor_pid` already names a process that exited long
-/// ago; `lock::holder`'s recorded pid is the only correct target).
+/// End a running phase cleanly (23c, D-04, D-06): the one teardown verb, at
+/// every point of a run, that never claims a stop it did not perform.
+///
+/// 1. An open gate with a confirmed live waiter is answered with an abort
+///    ([`stop_via_gate`]); the waiter unwinds through its own `abort()`.
+/// 2. Otherwise the run's supervisor socket is addressed
+///    ([`stop_via_socket`]): the state's `supervisor` record names it, or,
+///    when the state is missing or does not load, the one live sidecar-found
+///    socket for this root and phase. Its probe picks the arm: ALIVE gets a
+///    `shutdown`, which ends a run that holds no per-phase lock (999.138).
+/// 3. Only when no live socket remains (GONE, or nothing recorded) does the
+///    identity-confirmed per-phase lock holder get signalled
+///    ([`stop_via_lock`]).
+///
+/// No pid read from state is ever signalled. `stopped` is recorded only for
+/// a stop performed or confirmed not live, and never into a state file that
+/// does not load.
 pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    stop_in(project_root, phase, registry::cache_dir().as_deref())
+}
+
+/// [`stop`] with the cache dir whose `sock/` holds the sidecars it may
+/// search, so tests never sweep the operator's real cache.
+fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Result<(), CliError> {
     let (gate_answered, gate_holder) = stop_via_gate(project_root, phase)?;
-    let signal_sent = if gate_answered {
-        false
-    } else {
-        stop_via_lock(project_root, phase)?
+    if gate_answered {
+        return persist_stopped_state(project_root, phase, gate_holder, false);
+    }
+    match stop_via_socket(project_root, phase, cache_dir)? {
+        SocketStop::NoLiveSocket => {
+            let signal_sent = stop_via_lock(project_root, phase)?;
+            persist_stopped_state(project_root, phase, None, signal_sent)
+        }
+        // The supervisor may still be releasing the per-phase lock as it
+        // exits, so wait it out like a signalled holder.
+        SocketStop::Ended => persist_stopped_state(project_root, phase, None, true),
+        SocketStop::EndedStateUnloadable(state_file) => {
+            println!(
+                "stop: phase {phase}'s state file {} does not load, so `stopped` was not \
+                 recorded — repair or remove it before `devflow resume --phase {phase}`",
+                state_file.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// How long `stop` waits for a supervisor's final shutdown line: the
+/// supervisor's own terminate-and-verify wait, twice, plus time to persist.
+fn shutdown_final_timeout() -> std::time::Duration {
+    2 * agent::TERMINATE_VERIFY_WAIT + std::time::Duration::from_secs(5)
+}
+
+/// Shutdown requests `stop` sends in all when each is answered `handed_off`:
+/// the first and 3 retries, each against the record a fresh state reload
+/// names (crash row C13).
+const MAX_SHUTDOWN_REQUESTS: usize = 4;
+
+/// What [`stop_via_socket`] did.
+enum SocketStop {
+    /// No live supervisor socket: nothing recorded, or its probe says GONE.
+    NoLiveSocket,
+    /// The run was ended through its socket; record `stopped`.
+    Ended,
+    /// The run was ended through a sidecar-found socket, but the state file
+    /// at this path exists and does not load, so nothing can be recorded.
+    EndedStateUnloadable(PathBuf),
+}
+
+/// The supervisor socket `stop` addresses for a phase, and its provenance.
+struct LocatedSocket {
+    socket: PathBuf,
+    /// The state's record, when the socket came from it (the backstop
+    /// cross-checks the sidecar against it).
+    #[expect(dead_code, reason = "read by the STALE backstop arm")]
+    record: Option<SupervisorRecord>,
+    /// The state file, when it exists but does not load and the socket came
+    /// from its sidecar.
+    unloadable_state: Option<PathBuf>,
+}
+
+/// Find the socket for a bare `stop`: the loaded state's `supervisor` record
+/// (none → `None`); or, when the state is missing or does not load, the one
+/// socket of this root and phase that a sweep finds not GONE. Several such
+/// sockets are a refusal listing each, since `stop` cannot tell which is the
+/// run.
+fn locate_phase_socket(
+    project_root: &Path,
+    phase: PhaseId,
+    cache_dir: Option<&Path>,
+) -> Result<Option<LocatedSocket>, CliError> {
+    let unloadable_state = match workflow::load_state(project_root, phase) {
+        Ok(state) => {
+            return Ok(state.supervisor.map(|record| LocatedSocket {
+                socket: record.socket_path.clone(),
+                record: Some(record),
+                unloadable_state: None,
+            }));
+        }
+        Err(workflow::WorkflowError::MissingState(_)) => None,
+        Err(_) => Some(workflow::state_path(project_root, phase)),
     };
-    persist_stopped_state(
-        project_root,
-        phase,
-        gate_answered.then_some(gate_holder).flatten(),
-        signal_sent,
-    )
+    let Some(cache_dir) = cache_dir else {
+        return Ok(None);
+    };
+    let live: Vec<supervisor::SweepEntry> =
+        supervisor::sweep_for_in(cache_dir, project_root, phase)
+            .into_iter()
+            .filter(|entry| {
+                entry.socket_present && !matches!(entry.liveness, Ok(supervisor::Liveness::Gone))
+            })
+            .collect();
+    match live.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some(LocatedSocket {
+            socket: entry.socket_path.clone(),
+            record: None,
+            unloadable_state,
+        })),
+        several => Err(several_sockets_refusal(
+            phase,
+            unloadable_state.as_deref(),
+            several,
+        )),
+    }
+}
+
+/// The refusal for several live sockets of one root and phase: each with its
+/// launch id, liveness and the `devflow stop --phase N --launch <id>` form
+/// that addresses it alone. Nothing is signalled, removed or recorded.
+fn several_sockets_refusal(
+    phase: PhaseId,
+    unloadable_state: Option<&Path>,
+    entries: &[supervisor::SweepEntry],
+) -> CliError {
+    use std::fmt::Write as _;
+    let why = unloadable_state.map_or_else(
+        || "no state file names one".to_string(),
+        |path| format!("its state file {} does not load", path.display()),
+    );
+    let mut text = format!(
+        "stop: phase {phase} has {} live supervisor sockets for this project and {why}, so stop \
+         cannot tell which one is the run; nothing was signalled, removed or recorded. Stop each \
+         one by its launch id:",
+        entries.len()
+    );
+    for entry in entries {
+        let _ = write!(text, "\n  {}", sweep_entry_stop_line(phase, entry));
+    }
+    CliError::Message(text)
+}
+
+/// One line of [`several_sockets_refusal`]. A socket with no usable sidecar
+/// is named by the launch id in its file name (RV-05b); one whose name is
+/// outside the DevFlow scheme has no `--launch` form, so it is listed by its
+/// path and its ping reply's launch id.
+fn sweep_entry_stop_line(phase: PhaseId, entry: &supervisor::SweepEntry) -> String {
+    let liveness = match &entry.liveness {
+        Ok(supervisor::Liveness::Alive(_)) => "ALIVE",
+        Ok(supervisor::Liveness::Stale) => "STALE",
+        Ok(supervisor::Liveness::Gone) => "GONE",
+        Err(_) => "probe failed",
+    };
+    let sidecar_note = match (&entry.sidecar, &entry.sidecar_error) {
+        (Some(_), _) => "",
+        (None, Some(_)) => ", sidecar does not parse",
+        (None, None) => ", sidecar missing",
+    };
+    let launch_id = entry
+        .sidecar
+        .as_ref()
+        .map(|sidecar| sidecar.launch_id.clone())
+        .or_else(|| entry.launch_id_in_name.clone());
+    match launch_id {
+        Some(id) => format!(
+            "launch {id} ({liveness}{sidecar_note}): devflow stop --phase {phase} --launch {id}"
+        ),
+        None => {
+            let pinged = match &entry.liveness {
+                Ok(supervisor::Liveness::Alive(reply)) => reply.launch_id.as_str(),
+                _ => "unknown",
+            };
+            format!(
+                "socket {} ({liveness}{sidecar_note}, ping names launch {pinged}): its name is \
+                 outside the DevFlow socket scheme, so `--launch` cannot address it",
+                entry.socket_path.display()
+            )
+        }
+    }
+}
+
+/// The socket arm of [`stop`]. Probes the located socket and acts on its
+/// state: ALIVE → `shutdown`; STALE → [`stop_stale_socket`]; GONE → nothing
+/// here (the caller falls back to the lock holder); a probe error → a
+/// refusal that reaches no teardown (R-6).
+///
+/// A `handed_off` reply means the run moved to its successor: the state is
+/// reloaded and the record it names is asked, up to
+/// [`MAX_SHUTDOWN_REQUESTS`] requests in all; then `stop` fails, recording
+/// nothing (crash row C13).
+fn stop_via_socket(
+    project_root: &Path,
+    phase: PhaseId,
+    cache_dir: Option<&Path>,
+) -> Result<SocketStop, CliError> {
+    let mut handed_off = 0;
+    for _ in 0..MAX_SHUTDOWN_REQUESTS {
+        let Some(located) = locate_phase_socket(project_root, phase, cache_dir)? else {
+            return Ok(SocketStop::NoLiveSocket);
+        };
+        let ended = match supervisor::probe(&located.socket) {
+            Ok(supervisor::Liveness::Gone) => return Ok(SocketStop::NoLiveSocket),
+            Err(error) => return Err(probe_refusal(phase, &located.socket, &error)),
+            Ok(supervisor::Liveness::Stale) => stop_stale_socket(phase, &located)?,
+            Ok(supervisor::Liveness::Alive(_)) => match shutdown_supervisor(phase, &located)? {
+                ShutdownResult::Ended => true,
+                ShutdownResult::Relocate => false,
+                ShutdownResult::HandedOff => {
+                    handed_off += 1;
+                    false
+                }
+            },
+        };
+        if ended {
+            return Ok(match located.unloadable_state {
+                Some(state_file) => SocketStop::EndedStateUnloadable(state_file),
+                None => SocketStop::Ended,
+            });
+        }
+    }
+    Err(CliError::Message(format!(
+        "stop: phase {phase}'s supervisor answered `handed_off` to {handed_off} of \
+         {MAX_SHUTDOWN_REQUESTS} shutdown requests (the first and 3 retries, each against the \
+         record a fresh state reload named); nothing was stopped or recorded — run `devflow \
+         status` and `devflow stop --phase {phase}` again"
+    )))
+}
+
+/// What one shutdown attempt in [`stop_via_socket`] came to.
+enum ShutdownResult {
+    /// The supervisor (or, after it died, the backstop) ended the run.
+    Ended,
+    /// The supervisor had handed the run to its successor.
+    HandedOff,
+    /// The socket went away under the request: locate the run again.
+    Relocate,
+}
+
+/// Ask the ALIVE supervisor at `located` to stop.
+///
+/// A request that fails to reach an answer (a connect refused, a reset or a
+/// broken pipe) may have met a supervisor dying under it: its listener is
+/// released while the connection waits in the backlog, which
+/// `request_shutdown` reports as an error (6d46008 made `probe` re-connect
+/// for this, not `request_shutdown`). So the socket is probed once more:
+/// STALE goes to [`stop_stale_socket`], GONE re-locates the run, and only a
+/// supervisor that still answers, or a failed probe, makes the error stand.
+fn shutdown_supervisor(
+    phase: PhaseId,
+    located: &LocatedSocket,
+) -> Result<ShutdownResult, CliError> {
+    let error = match supervisor::request_shutdown(&located.socket, shutdown_final_timeout()) {
+        Ok(supervisor::ShutdownOutcome::Stopped {
+            exit_code,
+            advance_suppressed,
+        }) => {
+            let advance = if advance_suppressed {
+                "advance suppressed"
+            } else {
+                "advance not suppressed"
+            };
+            println!(
+                "stop: stopped phase {phase} through its supervisor (agent group ended, exit \
+                 code {exit_code}, {advance})"
+            );
+            return Ok(ShutdownResult::Ended);
+        }
+        Ok(supervisor::ShutdownOutcome::HandedOff) => return Ok(ShutdownResult::HandedOff),
+        Ok(supervisor::ShutdownOutcome::Refused(reason)) => {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s supervisor at {} refused the shutdown ({reason}); nothing \
+                 was stopped or recorded",
+                located.socket.display()
+            )));
+        }
+        Ok(other) => {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s supervisor gave an unknown shutdown answer ({other:?}); \
+                 nothing was recorded"
+            )));
+        }
+        Err(error) => error,
+    };
+    match supervisor::probe(&located.socket) {
+        Ok(supervisor::Liveness::Stale) => {
+            println!(
+                "stop: phase {phase}'s supervisor went away under the shutdown request ({error}); \
+                 its socket is now STALE"
+            );
+            stop_stale_socket(phase, located).map(|_| ShutdownResult::Ended)
+        }
+        Ok(supervisor::Liveness::Gone) => Ok(ShutdownResult::Relocate),
+        _ => Err(CliError::Message(format!(
+            "stop: phase {phase}'s supervisor at {} did not answer the shutdown ({error}); \
+             nothing was signalled or recorded",
+            located.socket.display()
+        ))),
+    }
+}
+
+/// A probe that could not answer ALIVE, STALE or GONE: refused, naming the
+/// error kind and the socket path, and never handed to the backstop (R-6).
+fn probe_refusal(phase: PhaseId, socket: &Path, error: &supervisor::ProbeError) -> CliError {
+    CliError::Message(format!(
+        "stop: could not probe phase {phase}'s supervisor socket {} ({}: {error}); nothing was \
+         signalled, removed or recorded",
+        socket.display(),
+        probe_error_kind(error)
+    ))
+}
+
+/// A short name for a [`supervisor::ProbeError`]'s kind.
+fn probe_error_kind(error: &supervisor::ProbeError) -> &'static str {
+    match error {
+        supervisor::ProbeError::Stat(_) => "stat failed",
+        supervisor::ProbeError::NotASocket(_) => "not a socket",
+        supervisor::ProbeError::ForeignOwner { .. } => "owned by another user",
+        supervisor::ProbeError::Connect(_) => "connect failed",
+        supervisor::ProbeError::NoReply(_) => "no valid ping reply",
+        _ => "probe failed",
+    }
+}
+
+/// A STALE socket: its supervisor is gone. Refused here; nothing is
+/// signalled, removed or recorded.
+fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<bool, CliError> {
+    Err(CliError::Message(format!(
+        "stop: phase {phase}'s supervisor socket {} is STALE (its supervisor is gone); nothing \
+         was signalled, removed or recorded",
+        located.socket.display()
+    )))
 }
 
 /// The primary path: answer `phase`'s open gate with a rejection whose note
@@ -2143,15 +2460,19 @@ fn stop_with_existing_response(
     }
 }
 
-/// The fallback: signal the process recorded in `phase`'s per-phase lock
-/// file — the process actually running `advance()` and holding the lock
-/// across the gate wait. Fail-closed on identity (T-23-52): a live pid that
-/// does not look like a devflow process is refused, not signalled, since
-/// the lock may be stale with a recycled pid. Never reads
-/// `state.monitor_pid` — see [`stop`]'s doc comment.
+/// The fallback once no live supervisor socket remains (GONE, or none
+/// recorded): signal the process recorded in `phase`'s per-phase lock file,
+/// such as a foreground `advance()` holding the lock. Fail-closed on
+/// identity (T-23-52): the pid is signalled only when it matches the start
+/// time the lock recorded, since the lock may be stale with a recycled pid.
+/// The lock file is the only place this reads a pid from; state is never
+/// one.
 fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
     let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
-        println!("stop: no lock held for phase {phase} — nothing is running `advance()`");
+        println!(
+            "stop: no live supervisor socket and no lock held for phase {phase} — nothing is \
+             running"
+        );
         return Ok(false);
     };
     let Ok(pid) = pid_str.parse::<u32>() else {
@@ -4979,6 +5300,13 @@ mod tests {
         );
     }
 
+    /// [`stop`] for a root with no state file, whose socket search would
+    /// otherwise sweep the operator's real cache: an empty tempdir cache.
+    fn stop_with_an_empty_cache(root: &Path, phase: PhaseId) -> Result<(), CliError> {
+        let cache = tempfile::tempdir().unwrap();
+        stop_in(root, phase, Some(cache.path()))
+    }
+
     #[test]
     fn stop_via_gate_with_no_waiter_at_a_non_ship_gate_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -6637,7 +6965,7 @@ mod tests {
              stop_via_lock's identity guard treats as unconfirmable"
         );
 
-        let err = stop(root, phase)
+        let err = stop_with_an_empty_cache(root, phase)
             .expect_err("a legacy lock with no recorded start time must be refused");
         let message = err.to_string();
         assert!(
@@ -6681,7 +7009,8 @@ mod tests {
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
 
-        let err = stop(root, phase).expect_err("a start-time mismatch must be refused");
+        let err = stop_with_an_empty_cache(root, phase)
+            .expect_err("a start-time mismatch must be refused");
         let message = err.to_string();
         assert!(
             message.contains(&pid.to_string()),
@@ -6731,7 +7060,7 @@ mod tests {
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
 
-        let result = stop(root, phase);
+        let result = stop_with_an_empty_cache(root, phase);
 
         let _ = child.kill();
         let _ = child.wait();
@@ -6788,7 +7117,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        stop(root, PhaseId::new(201)).expect("stop against nothing present must succeed");
+        stop_with_an_empty_cache(root, PhaseId::new(201))
+            .expect("stop against nothing present must succeed");
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the
