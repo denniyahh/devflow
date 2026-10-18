@@ -9550,4 +9550,268 @@ mod tests {
             "no agent of N+1 survives"
         );
     }
+
+    // ---- 50-23 Task 3: a stop after safe point 3 is forwarded (RV-04) ----
+
+    /// Names which run of the forward test a child is (`a` to `d`). Not a
+    /// DevFlow setting, so no `DEVFLOW_` prefix.
+    const FORWARD_RUN_ENV: &str = "P50_23_FORWARD_RUN";
+
+    /// The parent half of a forward test: [`run_handoff_child`] with the run
+    /// label passed to the child.
+    fn run_forward_child(name: &str, hold: &str, label: &str) {
+        let path_dir = handoff_claude_dir(SUCCESS_MARKER);
+        let hold_dir = tempfile::Builder::new()
+            .prefix("dfh")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let hold_value = std::ffi::OsString::from(format!(
+            "{hold}:{}",
+            hold_dir.path().join("release").display()
+        ));
+        let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+            (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+            ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("120")),
+            (HOLD_ENV, hold_value.as_os_str()),
+            (FORWARD_RUN_ENV, std::ffi::OsStr::new(label)),
+        ];
+        let output = run_hermetic_test_in_child(name, path_dir.path(), &env);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// RV-04 (V-35, T-50-73) and R5-I1 (V-48, T-50-83): a stop that reaches
+    /// stage N after safe point 3 (N is still `Advancing`, so it is flagged)
+    /// is forwarded by N to the successor it recorded, and N+1 stops and
+    /// records its own stop. Four runs, each a fresh child: (a) SIGTERM while
+    /// N is held at `before_record_save`; (b) at `after_publish`; (c) a
+    /// socket stop at `before_record_save`, whose caller is answered
+    /// `stopped`, not `handed_off`; (d) SIGTERM while N is held at
+    /// `before_handoff_mark`, after its advance returned and before it marks
+    /// itself handed off.
+    #[test]
+    fn a_stop_reaching_the_supervisor_after_safe_point_3_is_forwarded_to_the_next_supervisor() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_reaching_the_supervisor_after_safe_point_3_is_forwarded_to_the_next_supervisor";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            for (label, hold) in [
+                ("a", "before_record_save"),
+                ("b", "after_publish"),
+                ("c", "before_record_save"),
+                ("d", "before_handoff_mark"),
+            ] {
+                run_forward_child(NAME, hold, label);
+            }
+            return;
+        }
+        let _guard = env_lock();
+        let label = std::env::var(FORWARD_RUN_ENV).expect("the parent names the run");
+        let phase = match label.as_str() {
+            "a" => 2309,
+            "b" => 2310,
+            "c" => 2311,
+            _ => 2312,
+        };
+        let run = HandoffRun::launch(PhaseId::new(phase));
+        run.go();
+        run.wait_held();
+        if label == "c" {
+            let (accepted, last) =
+                shutdown_accepted_then(&run.n.socket_path, || run.release(), HANDOFF_STEP_WAIT);
+            assert_eq!(accepted["owner"], "advancing", "run {label}: {accepted}");
+            assert_eq!(
+                last["stopped"], true,
+                "run {label}: N answers the forwarded stop `stopped`, so its caller does not \
+                 retry: {last}"
+            );
+        } else {
+            signal_supervisor(&run, libc::SIGTERM);
+            // The control thread polls the signal pipe, so the stop is
+            // flagged well within this.
+            std::thread::sleep(Duration::from_millis(500));
+            run.release();
+        }
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "run {label}: N finishes: {}",
+            run.events()
+        );
+        let next = run
+            .state()
+            .supervisor
+            .expect("the state names a supervisor");
+        assert_ne!(
+            next.launch_id, run.n.launch_id,
+            "run {label}: the state names N+1"
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&next.socket_path)),
+            "run {label}: N+1 was stopped through the forward: {}",
+            run.events()
+        );
+        let state = run.state();
+        assert!(
+            state.stopped,
+            "run {label}: N+1 recorded its stop (stop_reason {:?}): {}",
+            state.stop_reason,
+            run.events()
+        );
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(SUPERVISOR_STOP_REASON),
+            "run {label}: N+1's own stop reason"
+        );
+        assert!(
+            poll_until(Duration::from_secs(5), || !group_alive(next.agent_pgid)),
+            "run {label}: no agent of N+1 survives"
+        );
+        let forwarded = events_named(&run.root, "stop_forwarded");
+        assert_eq!(forwarded.len(), 1, "run {label}: {}", run.events());
+        assert_eq!(forwarded[0]["confirmed"], true, "{}", forwarded[0]);
+        assert_eq!(forwarded[0]["launch_id"], next.launch_id.as_str());
+    }
+
+    /// The control for the forward test: the same `before_record_save` hold
+    /// and no stop leaves N+1 running and the run not stopped.
+    #[test]
+    fn without_a_stop_after_safe_point_3_the_next_supervisor_runs_on() {
+        const NAME: &str =
+            "pipeline_launch::tests::without_a_stop_after_safe_point_3_the_next_supervisor_runs_on";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_forward_child(NAME, "before_record_save", "control");
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(2313));
+        run.go();
+        run.wait_held();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "control: N finishes: {}",
+            run.events()
+        );
+        let state = run.state();
+        let next = state
+            .supervisor
+            .clone()
+            .expect("control: the state names N+1");
+        assert_ne!(next.launch_id, run.n.launch_id);
+        assert!(
+            !state.stopped,
+            "control: not stopped ({:?})",
+            state.stop_reason
+        );
+        assert!(probes_alive(&next.socket_path), "control: N+1 runs on");
+        assert!(
+            events_named(&run.root, "stop_forwarded").is_empty(),
+            "control: nothing was forwarded"
+        );
+        let outcome =
+            devflow_core::supervisor::request_shutdown(&next.socket_path, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "control: N+1 stops through its socket: {outcome:?}"
+        );
+    }
+
+    const ORDER_RUN_NOT_FOUND: &str = "run_monitor not found in the non-test code";
+    const ORDER_NO_TAKE: &str = "run_monitor never calls take_successor";
+    const ORDER_NO_HOLD: &str = "no before_handoff_mark hold after take_successor";
+    const ORDER_NO_MARK: &str = "no handed-off marking after the before_handoff_mark hold";
+    const ORDER_NO_CHECK: &str = "no stop_requested() check after the handed-off marking";
+
+    /// R5-I1 as a pure scan over `source`'s non-test, comment-stripped code:
+    /// in `run_monitor`, in this order, the first `take_successor(` line, a
+    /// later `test_hold("before_handoff_mark")`, a later
+    /// `OwnerPhase::HandedOff` and a later `stop_requested()`. Names the
+    /// missing function or the first step it cannot find.
+    fn handoff_order_violation(source: &str) -> Option<String> {
+        let lines = non_test_code_lines(source);
+        let Some(body) = item_lines(&lines, "pub(crate) fn run_monitor(", "}") else {
+            return Some(ORDER_RUN_NOT_FOUND.to_string());
+        };
+        let steps = [
+            ("take_successor(", ORDER_NO_TAKE),
+            ("test_hold(\"before_handoff_mark\")", ORDER_NO_HOLD),
+            ("OwnerPhase::HandedOff", ORDER_NO_MARK),
+            ("stop_requested()", ORDER_NO_CHECK),
+        ];
+        let mut from = 0;
+        for (needle, missing) in steps {
+            match body[from..].iter().position(|line| line.contains(needle)) {
+                Some(at) => from += at + 1,
+                None => return Some(missing.to_string()),
+            }
+        }
+        None
+    }
+
+    /// R5-I1 (permanent source scan, R6-G4): `run_monitor` checks for a stop
+    /// right after its handed-off marking, with the `before_handoff_mark`
+    /// hold just before that marking. Every planted source carries a decoy
+    /// marking before `take_successor(` and a decoy `stop_requested()` check
+    /// in another function.
+    #[test]
+    fn run_monitor_checks_for_a_stop_right_after_the_handed_off_marking() {
+        assert_eq!(
+            handoff_order_violation(include_str!("pipeline_launch.rs")),
+            None,
+            "pipeline_launch.rs"
+        );
+        let take = "    let next = take_successor();\n";
+        let hold = "    test_hold(\"before_handoff_mark\");\n";
+        let mark = "    token.enter(OwnerPhase::HandedOff);\n";
+        let check = "    if token.stop_requested() {}\n";
+        let planted = |steps: &[&str]| {
+            format!(
+                "pub(crate) fn run_monitor(\n    decoy.enter(OwnerPhase::HandedOff);\n{}}}\nfn other() {{\n    if token.stop_requested() {{}}\n}}\n",
+                steps.concat()
+            )
+        };
+        let violation = |steps: &[&str]| handoff_order_violation(&planted(steps));
+        let missing = |text: &str| Some(text.to_string());
+
+        assert_eq!(
+            violation(&[take, hold, mark, check]),
+            None,
+            "the planned layout"
+        );
+        assert_eq!(
+            violation(&[take, check, hold, mark, check]),
+            None,
+            "the hint's check-plus-re-check layout"
+        );
+        assert_eq!(
+            violation(&[take, check, mark]),
+            missing(ORDER_NO_HOLD),
+            "the pre-revision layout"
+        );
+        assert_eq!(
+            violation(&[take, hold, check, mark]),
+            missing(ORDER_NO_CHECK),
+            "a hold whose only check precedes the marking (run (d)'s RED state)"
+        );
+        assert_eq!(
+            violation(&[take, mark, hold, check]),
+            missing(ORDER_NO_MARK),
+            "a hold after the marking"
+        );
+        assert_eq!(
+            violation(&[take, hold, mark, "    // if token.stop_requested() {}\n"]),
+            missing(ORDER_NO_CHECK),
+            "a commented-out post-marking check"
+        );
+        assert_eq!(
+            violation(&[take, hold, check]),
+            missing(ORDER_NO_MARK),
+            "no marking"
+        );
+        assert_eq!(
+            handoff_order_violation(&format!("fn other() {{\n{take}{hold}{mark}{check}}}\n")),
+            missing(ORDER_RUN_NOT_FOUND),
+            "no run_monitor"
+        );
+    }
 }
