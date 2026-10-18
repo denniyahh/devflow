@@ -4167,6 +4167,9 @@ mod tests {
         // A stale pid from a prior stage's now-dead monitor — this is what
         // must be cleared, not carried forward into the new stage.
         state.monitor_pid = Some(999_999);
+        // 50-23: the prior stage's supervisor record, which must be cleared
+        // too, or `status` reads GONE-while-active and names `devflow resume`.
+        state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
         let result = launch_stage_inner(&mut state, None, None);
@@ -4180,10 +4183,18 @@ mod tests {
             "an early launch failure must clear the stale monitor_pid in-memory, not carry it \
              forward from the previous stage"
         );
+        assert_eq!(
+            state.supervisor, None,
+            "an early launch failure must clear the prior supervisor record in memory"
+        );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(
             reloaded.monitor_pid, None,
             "the monitor_pid clear must be persisted to state.json, not just in-memory"
+        );
+        assert_eq!(
+            reloaded.supervisor, None,
+            "the supervisor record clear must be persisted to state.json"
         );
     }
 
@@ -4848,6 +4859,8 @@ mod tests {
         let mut state = canary_state(root, phase);
         // The previous stage's monitor pid, as `transition()` would leave it.
         state.monitor_pid = Some(4_294_967_000);
+        // 50-23: and the previous stage's supervisor record.
+        state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
         let calls = std::cell::Cell::new(0usize);
@@ -4874,10 +4887,19 @@ mod tests {
             "a refused launch must not leave the previous stage's monitor pid standing — \
              liveness() would report Stuck and point at `devflow resume`, which cannot help"
         );
+        assert_eq!(
+            state.supervisor, None,
+            "a refused launch must not leave the previous stage's supervisor record standing: \
+             it reads GONE-while-active and sends the operator to `devflow resume`"
+        );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert!(
             reloaded.monitor_pid.is_none(),
             "the cleared pid must be persisted, not only cleared in memory"
+        );
+        assert_eq!(
+            reloaded.supervisor, None,
+            "the cleared supervisor record must be persisted, not only cleared in memory"
         );
         assert_eq!(
             reloaded.canary,
@@ -8538,5 +8560,260 @@ mod tests {
             "N's leftover sidecar names a launch other than the state's"
         );
         assert_eq!(leftover.launch_id, run.n.launch_id);
+    }
+
+    // ---- 50-23: every launch failure path has a defined end state ----
+
+    /// A previous stage's supervisor record whose socket does not exist and
+    /// whose agent pgid does not fit `pid_t`, so no reaper can signal it.
+    fn fabricated_prior_record(dir: &Path) -> SupervisorRecord {
+        SupervisorRecord::new(
+            dir.join("prior-stage-never-bound.sock"),
+            "priorstage0000000000".to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        )
+    }
+
+    /// Names which run of `a_failed_monitor_spawn_clears_the_supervisor_record`
+    /// a child is (`fail` or `ok`). Not a DevFlow setting, so it carries no
+    /// `DEVFLOW_` prefix the doc check would require documented.
+    const SPAWN_CASE_ENV: &str = "P50_23_SPAWN_CASE";
+
+    /// WR-04's supervisor equivalent (T-50-62): a launch whose
+    /// `spawn_monitor` fails before spawning anything (its socket path is
+    /// over `sun_path`, so `SocketPath::for_launch` refuses it) clears the
+    /// previous stage's record in memory and on disk, and leaves no socket or
+    /// sidecar under the cache dir. Control: the same launch under a short
+    /// cache dir records a new record with a new launch id.
+    #[test]
+    fn a_failed_monitor_spawn_clears_the_supervisor_record() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failed_monitor_spawn_clears_the_supervisor_record";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            for case in ["fail", "ok"] {
+                let path_dir = go_waiting_claude_dir();
+                let short = crate::test_support::hermetic_cache_dir();
+                let cache = if case == "fail" {
+                    let long = short.path().join("c".repeat(80));
+                    std::fs::create_dir_all(&long).unwrap();
+                    long
+                } else {
+                    short.path().to_path_buf()
+                };
+                let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+                    ("DEVFLOW_CACHE_DIR", cache.as_os_str()),
+                    (SPAWN_CASE_ENV, std::ffi::OsStr::new(case)),
+                ];
+                let output =
+                    devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let _guard = env_lock();
+        let cache = PathBuf::from(
+            std::env::var_os("DEVFLOW_CACHE_DIR").expect("the parent passes DEVFLOW_CACHE_DIR"),
+        );
+        let fail = std::env::var(SPAWN_CASE_ENV).expect("the parent names the case") == "fail";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(2301);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.legacy_claude_launch = true;
+        let prior = fabricated_prior_record(root);
+        state.supervisor = Some(prior.clone());
+        workflow::save_state(&state).unwrap();
+
+        let result = launch_stage(&mut state, None, None);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        if fail {
+            let err = result.expect_err("a socket path over sun_path cannot be bound");
+            assert!(
+                err.to_string().contains("sun_path"),
+                "the error names the socket path bound: {err}"
+            );
+            assert_eq!(
+                state.supervisor, None,
+                "the failed spawn clears the prior record in memory"
+            );
+            assert_eq!(
+                reloaded.supervisor, None,
+                "the failed spawn clears the prior record on disk"
+            );
+            let left: Vec<PathBuf> =
+                std::fs::read_dir(devflow_core::registry::socket_dir_in(&cache))
+                    .map(|entries| entries.filter_map(|e| Some(e.ok()?.path())).collect())
+                    .unwrap_or_default();
+            assert!(left.is_empty(), "no socket or sidecar is left: {left:?}");
+        } else {
+            result.expect("control: the launch succeeds under a short cache dir");
+            let record = state
+                .supervisor
+                .clone()
+                .expect("control: the launch records its supervisor");
+            assert_ne!(
+                record.launch_id, prior.launch_id,
+                "control: a new launch id replaces the prior one"
+            );
+            assert_eq!(reloaded.supervisor.as_ref(), Some(&record));
+            let outcome = devflow_core::supervisor::request_shutdown(
+                &record.socket_path,
+                SUPERVISOR_STOP_WAIT,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+                ),
+                "control: the launched supervisor stops through its socket: {outcome:?}"
+            );
+        }
+    }
+
+    /// `source`'s non-test lines: the part before the first line that is
+    /// exactly `mod tests {`, without its whole-line `//` comments. A
+    /// trailing comment stays, as part of its code line.
+    fn non_test_code_lines(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect()
+    }
+
+    /// The lines of the item whose header line starts with `header`, through
+    /// the next line starting with `closing`; `None` when no line starts with
+    /// `header`.
+    fn item_lines<'a>(lines: &[&'a str], header: &str, closing: &str) -> Option<Vec<&'a str>> {
+        let start = lines.iter().position(|line| line.starts_with(header))?;
+        let mut item = vec![lines[start]];
+        for line in &lines[start + 1..] {
+            item.push(*line);
+            if line.starts_with(closing) {
+                break;
+            }
+        }
+        Some(item)
+    }
+
+    const CLEAR_SPAWN_NOT_FOUND: &str =
+        "spawn_agent_and_record not found in the non-test code (or under 40 lines)";
+    const CLEAR_SPAWN_CLEARS: &str =
+        "spawn_agent_and_record clears the supervisor record in its own body";
+    const CLEAR_SPAWN_NO_HELPER: &str = "spawn_agent_and_record never calls record_failed_launch";
+    const CLEAR_REFUSE_NOT_FOUND: &str =
+        "refuse_launch not found in the non-test code (or under 3 lines)";
+    const CLEAR_REFUSE_NO_CLEAR: &str = "refuse_launch does not clear the supervisor record";
+
+    /// 50-13's rule as a pure scan over `source` (R6-G4): in the non-test,
+    /// comment-stripped code, `spawn_agent_and_record` never clears the
+    /// supervisor record itself (only its failure helper does) and calls
+    /// `record_failed_launch`, and `refuse_launch` clears the record.
+    fn launch_record_clear_violations(source: &str) -> Vec<String> {
+        let lines = non_test_code_lines(source);
+        let has = |item: &[&str], needle: &str| item.iter().any(|line| line.contains(needle));
+        let mut violations = Vec::new();
+        match item_lines(&lines, "fn spawn_agent_and_record(", "}").filter(|item| item.len() >= 40)
+        {
+            None => violations.push(CLEAR_SPAWN_NOT_FOUND.to_string()),
+            Some(item) => {
+                if has(&item, "supervisor = None") {
+                    violations.push(CLEAR_SPAWN_CLEARS.to_string());
+                }
+                if !has(&item, "record_failed_launch(") {
+                    violations.push(CLEAR_SPAWN_NO_HELPER.to_string());
+                }
+            }
+        }
+        match item_lines(&lines, "fn refuse_launch(", "}").filter(|item| item.len() >= 3) {
+            None => violations.push(CLEAR_REFUSE_NOT_FOUND.to_string()),
+            Some(item) if !has(&item, "supervisor = None") => {
+                violations.push(CLEAR_REFUSE_NO_CLEAR.to_string());
+            }
+            Some(_) => {}
+        }
+        violations
+    }
+
+    /// T-50-62 (permanent source scan, R6-G4): the supervisor record is
+    /// cleared only on a launch failure path. The real file yields no
+    /// violation; planted sources, each padded to the floors so it carries
+    /// one defect, yield exactly that defect's violation.
+    #[test]
+    fn the_supervisor_record_is_cleared_only_on_launch_failure_paths() {
+        let real = launch_record_clear_violations(include_str!("pipeline_launch.rs"));
+        assert!(real.is_empty(), "pipeline_launch.rs: {real:?}");
+
+        let pad = |n: usize| "    let _filler = 0;\n".repeat(n);
+        let spawn = |body: &str| format!("fn spawn_agent_and_record(\n{}{body}}}\n", pad(40));
+        let refuse = |body: &str| {
+            format!(
+                "fn refuse_launch(state: &mut State) {{\n{}{body}}}\n",
+                pad(2)
+            )
+        };
+        let good_spawn = spawn("    return Err(failed(record_failed_launch(state), err));\n");
+        let good_refuse = refuse("    state.supervisor = None;\n");
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            launch_record_clear_violations(&format!("{good_spawn}{good_refuse}")),
+            Vec::<String>::new(),
+            "a correct layout"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{}{good_refuse}",
+                spawn("    record_failed_launch(state)?;\n    state.supervisor = None;\n")
+            )),
+            only(CLEAR_SPAWN_CLEARS)
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{}{good_refuse}",
+                spawn("    record_failed_launch(state)?; // never: state.supervisor = None\n")
+            )),
+            only(CLEAR_SPAWN_CLEARS),
+            "a trailing comment is part of its code line"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "{}{good_refuse}",
+                spawn("    // record_failed_launch(state)?;\n")
+            )),
+            only(CLEAR_SPAWN_NO_HELPER),
+            "a commented-out call is not a call"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!("{good_spawn}{}", refuse(""))),
+            only(CLEAR_REFUSE_NO_CLEAR)
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!("mod tests {{\n{good_spawn}{good_refuse}")),
+            vec![
+                CLEAR_SPAWN_NOT_FOUND.to_string(),
+                CLEAR_REFUSE_NOT_FOUND.to_string()
+            ],
+            "functions only after the test-module cut are not found"
+        );
+        assert_eq!(
+            launch_record_clear_violations(&format!(
+                "fn spawn_agent_and_record(\n{}    record_failed_launch(state)?;\n}}\n{good_refuse}",
+                pad(5)
+            )),
+            only(CLEAR_SPAWN_NOT_FOUND),
+            "a body under its floor"
+        );
     }
 }
