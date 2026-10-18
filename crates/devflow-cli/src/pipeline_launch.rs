@@ -575,15 +575,14 @@ where
 
 /// Abort a launch the canary refused, leaving no half-launched stage behind.
 ///
-/// Clearing `monitor_pid` and `supervisor` applies WR-04's rationale (see
+/// Clearing `supervisor` applies WR-04's rationale (see
 /// [`record_failed_launch`]) to an aborted launch: `transition()` has already
 /// advanced `state.stage` and saved it by the time this runs, so a refusal that
-/// left the PREVIOUS stage's monitor pid or supervisor record standing would
-/// read as a run gone while active and send the operator to `devflow resume`,
-/// after the wrong problem entirely. With neither, the run reads not launched,
-/// and the right remedy is the message below.
+/// left the PREVIOUS stage's supervisor record standing would read as a run
+/// gone while active and send the operator to `devflow resume`, after the
+/// wrong problem entirely. With no record, the run reads not launched, and the
+/// right remedy is the message below.
 fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
-    state.monitor_pid = None;
     state.supervisor = None;
     workflow::save_state(state)?;
     Err(CliError::Message(message))
@@ -1573,9 +1572,8 @@ fn record_failed_launch(state: &mut State) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
-/// the agent binary, archive the prior capture, spawn the monitor, and
-/// record the launch. Extracted (28-03, Task 2) so
+/// The tail of [`launch_stage_inner`]: validate the agent binary, archive
+/// the prior capture, spawn the monitor, and record the launch. Extracted (28-03, Task 2) so
 /// [`relaunch_checkpoint_session`] can share this EXACT tail for a
 /// checkpoint auto-decide resume — a resume is a continuation of the same
 /// stage's agent run, not a fresh stage entry, so it must not duplicate this
@@ -1593,20 +1591,18 @@ fn spawn_agent_and_record(
     archived_stage: Option<Stage>,
     launch: monitor::MonitorLaunch,
 ) -> Result<(), CliError> {
-    // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
-    // any fallible step below (`ensure_agent_binary`) can return early via
-    // `?`. Without this, a failed relaunch left `state.stage` already
-    // advanced (by `transition()`, before this function was ever called)
-    // alongside a stale `monitor_pid` still naming the PREVIOUS stage's
-    // (now-dead) monitor — `liveness()` then misreports `Stuck → devflow
-    // resume`, even when the real remedy is unrelated. The real pid is set
-    // again below once `monitor::spawn_monitor` actually succeeds.
-    state.monitor_pid = None;
+    // Persist the caller's launch bookkeeping (`launch_stage_inner`'s
+    // `checkpoint_resumes` reset and Validate dispatch stamp) before
+    // anything is spawned, as this save always has. It once also cleared
+    // the previous stage's monitor pid (WR-04, 18-fix); that field is gone
+    // from the CLI (50-22), and the record keeps its own rule below.
     workflow::save_state(state)?;
 
-    // 50-23 (T-50-62): every error before the publish save ends the launch
-    // with no supervisor record (see `record_failed_launch`); the success
-    // path below never clears the record before the save that replaces it.
+    // WR-04 (18-fix, 50-23 T-50-62): every error before the publish save
+    // ends the launch with no supervisor record (see `record_failed_launch`),
+    // so a failed relaunch never leaves `state.stage` advanced beside a
+    // record naming the previous stage's supervisor; the success path below
+    // never clears the record before the save that replaces it.
     let SpawnedLaunch {
         published,
         ctx,
@@ -1628,11 +1624,9 @@ fn spawn_agent_and_record(
     let socket_path = published.record.socket_path.display().to_string();
     let launch_id = published.record.launch_id.clone();
     // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
-    // pid recorded only in memory here is lost unless it is written again
+    // record held only in memory here is lost unless it is written again
     // (18b). The ping-confirmed supervisor record replaces any previous one
-    // in this same save; it is never cleared first (WR-04's pre-clear above
-    // applies to `monitor_pid` only). `monitor_pid` names the supervisor
-    // until 50-22 removes it.
+    // in this same save; it is never cleared first.
     //
     // The handoff (50-13, R-1): this save is the publish. The previous
     // supervisor, when this launch is its advance, stays alive and
@@ -1669,7 +1663,7 @@ fn spawn_agent_and_record(
         Err(err) => warn!(phase = %state.phase, "could not consume cron instructions: {err}"),
     }
     // 23b: register this (project_root, phase) in the machine-global
-    // registry on the same code path that just recorded monitor_pid, so a
+    // registry on the same code path that just recorded the supervisor, so a
     // running phase cannot be missing from `devflow gate list --all-roots`.
     // Best-effort observability — never a reason to fail a launch.
     let _ = devflow_core::registry::register_in(&ctx.cache_dir, &state.project_root, state.phase);
@@ -1680,14 +1674,14 @@ fn spawn_agent_and_record(
         serde_json::json!({
             "stage": state.stage.to_string(),
             "agent": state.agent.to_string(),
-            "monitor_pid": pid,
+            "supervisor_pid": pid,
             "socket_path": socket_path,
             "launch_id": launch_id,
             "launch": launch_label,
         }),
     );
     println!(
-        "stage {} → launched {} (monitor pid {pid}, {launch_label} supervisor at {socket_path})",
+        "stage {} → launched {} (supervisor pid {pid}, {launch_label} supervisor at {socket_path})",
         state.stage,
         agents::driver_for(state.agent).name()
     );
@@ -1740,7 +1734,6 @@ fn publish_record<E: Into<CliError>>(
     mut save: impl FnMut(&State) -> Result<(), E>,
 ) -> Result<PublishOutcome, CliError> {
     let record = published.record;
-    state.monitor_pid = Some(published.supervisor_pid);
     state.supervisor = Some(record.clone());
     if let Err(err) = save(state) {
         return Err(shut_down_unrecorded(state, &record, err.into()));
@@ -2960,23 +2953,24 @@ mod tests {
     }
 
     /// 18b: after `launch_stage` spawns a monitor, the persisted state file
-    /// for that phase carries the monitor's pid — `transition()` saves state
-    /// BEFORE calling `launch_stage`, so the pid must be saved again inside
-    /// `launch_stage` or it is lost.
+    /// for that phase carries the published supervisor record — `transition()`
+    /// saves state BEFORE calling `launch_stage`, so the record must be saved
+    /// again inside `launch_stage` or it is lost.
     ///
     /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
     /// (34-06); do not "simplify" the opt-out away.** This test's subject is
-    /// pid persistence, not which launch path runs, so it previously relied on
+    /// record persistence, not which launch path runs, so it previously relied on
     /// its stage being ABSENT from `STREAM_JSON_STAGES` — an incidental
     /// premise that 34-05's widening destroys, at which point `canary_gate`
     /// invokes the real `ClaudeCanaryLauncher` and the launch fails on a
-    /// delivery refusal that has nothing to do with pid persistence. Pinning
+    /// delivery refusal that has nothing to do with record persistence. Pinning
     /// the legacy path via the opt-out makes the premise explicit and stable
     /// under any contents of the constant, exactly as
     /// `canary_gate_only_applies_to_the_stream_launch_path` does.
     #[test]
-    fn launch_stage_persists_monitor_pid_for_reload() {
-        const NAME: &str = "pipeline_launch::tests::launch_stage_persists_monitor_pid_for_reload";
+    fn launch_stage_persists_the_supervisor_record_for_reload() {
+        const NAME: &str =
+            "pipeline_launch::tests::launch_stage_persists_the_supervisor_record_for_reload";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("claude");
             let output =
@@ -2995,7 +2989,7 @@ mod tests {
         // legacy opt-out set below makes this a launch shape whose Code stage
         // cannot bound the chain flag's lifetime, and
         // `preflight_unattended_launch_check` refuses exactly that combination
-        // in `Mode::Auto`. This test's subject — pid persistence — is
+        // in `Mode::Auto`. This test's subject — record persistence — is
         // mode-independent, so supervise keeps the premise the 34-06 note
         // below establishes without asking the preflight to permit a launch
         // D-07 exists to refuse.
@@ -3017,23 +3011,23 @@ mod tests {
         // reap it before `dir` drops below. Bound here — this test's LAST
         // `&mut state` use — the guard outranks every panicking checkpoint
         // that follows: `result.unwrap()`, the `assert!` on
-        // `state.monitor_pid.is_some()`, `workflow::load_state(...).unwrap()`,
-        // and the `assert_eq!` on the reloaded pid. Binding here also covers
+        // `state.supervisor.is_some()`, `workflow::load_state(...).unwrap()`,
+        // and the `assert_eq!` on the reloaded record. Binding here also covers
         // the narrower case of a launch that spawned the monitor and then
         // failed a later `?` inside `launch_stage_inner` — `result` would be
-        // `Err` but the pid would nonetheless be live (G-25-2, 25-17).
+        // `Err` but the supervisor would nonetheless be live (G-25-2, 25-17).
         let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         result.unwrap();
 
         assert!(
-            state.monitor_pid.is_some(),
-            "launch_stage must record the monitor pid on the in-memory state"
+            state.supervisor.is_some(),
+            "launch_stage must record the published supervisor on the in-memory state"
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(
-            reloaded.monitor_pid, state.monitor_pid,
-            "the monitor pid recorded by launch_stage must be persisted to disk, \
+            reloaded.supervisor, state.supervisor,
+            "the supervisor record published by launch_stage must be persisted to disk, \
              since transition() saves state before launch_stage runs"
         );
     }
@@ -3148,7 +3142,7 @@ mod tests {
             root.to_path_buf(),
         );
         // The capture shape, for the same reason as
-        // `launch_stage_persists_monitor_pid_for_reload`: no delivery canary.
+        // `launch_stage_persists_the_supervisor_record_for_reload`: no delivery canary.
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
@@ -3626,8 +3620,8 @@ mod tests {
              the next time it advances past Plan"
         );
         assert!(
-            reloaded.monitor_pid.is_some(),
-            "resume() must have spawned a monitor whose pid is recorded in state — if this \
+            reloaded.supervisor.is_some(),
+            "resume() must have spawned a monitor whose supervisor is recorded in state — if this \
              fails, the reap guard above is silently reaping nothing and this test has \
              stopped covering the launch path it was written to cover"
         );
@@ -3707,7 +3701,7 @@ mod tests {
             "resume must relaunch the saved stage"
         );
         assert!(
-            reloaded.monitor_pid.is_some(),
+            reloaded.supervisor.is_some(),
             "resume must have spawned a monitor for the saved stage"
         );
         assert_eq!(
@@ -3819,7 +3813,7 @@ mod tests {
 
         let phase = PhaseId::new(67);
         // `Mode::Supervise` for the same 35.1-03 reason as
-        // `launch_stage_persists_monitor_pid_for_reload` above: the legacy
+        // `launch_stage_persists_the_supervisor_record_for_reload` above: the legacy
         // opt-out set below is refused in `Mode::Auto` by
         // `preflight_unattended_launch_check`, and this test's subject — the
         // unfired `stop_until` cap surviving a resume — is mode-independent.
@@ -3865,8 +3859,8 @@ mod tests {
             "an unfired cap must not itself flip stopped to true — resume only relaunches"
         );
         assert!(
-            reloaded.monitor_pid.is_some(),
-            "resume() must still have spawned a monitor whose pid is recorded in state"
+            reloaded.supervisor.is_some(),
+            "resume() must still have spawned a monitor whose supervisor is recorded in state"
         );
     }
 
@@ -3930,8 +3924,8 @@ mod tests {
         assert!(!reloaded.stopped);
         assert_eq!(reloaded.stop_reason, None);
         assert!(
-            reloaded.monitor_pid.is_some(),
-            "resume() must still relaunch and record a monitor pid with no cap present"
+            reloaded.supervisor.is_some(),
+            "resume() must still relaunch and record a supervisor with no cap present"
         );
     }
 
@@ -3974,7 +3968,7 @@ mod tests {
 
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Codex);
-        assert!(reloaded.monitor_pid.is_some());
+        assert!(reloaded.supervisor.is_some());
         assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
         let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
         let handoff = events
@@ -4161,8 +4155,9 @@ mod tests {
 
     /// Whole-state comparison keeps this handoff check current when State gains fields.
     #[test]
-    fn resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid() {
-        const NAME: &str = "pipeline_launch::tests::resume_with_agent_preserves_every_state_field_except_agent_and_monitor_pid";
+    fn resume_with_agent_preserves_every_state_field_except_agent() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_with_agent_preserves_every_state_field_except_agent";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_dir_with_agent_stub("codex");
             let output =
@@ -4243,7 +4238,6 @@ mod tests {
 
         for value in [&mut before, &mut after] {
             value.as_object_mut().unwrap().remove("agent");
-            value.as_object_mut().unwrap().remove("monitor_pid");
         }
         assert_eq!(before, after);
     }
@@ -4289,7 +4283,7 @@ mod tests {
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.agent, AgentKind::Codex);
         assert!(!reloaded.stopped);
-        assert!(reloaded.monitor_pid.is_some());
+        assert!(reloaded.supervisor.is_some());
         assert!(!devflow_core::ship::cron_instructions_path(root, phase).exists());
     }
 
@@ -4327,7 +4321,7 @@ mod tests {
                 "a failed resume must leave the phase marked stopped, not a false-active zombie"
             );
             assert!(reloaded.stop_reason.is_some_and(|r| r.contains("claude")));
-            assert!(reloaded.monitor_pid.is_none());
+            assert!(reloaded.supervisor.is_none());
             return;
         }
 
@@ -4425,20 +4419,24 @@ mod tests {
         });
     }
 
-    /// WR-04 (18-fix): an early failure in `launch_stage_inner` — before
-    /// `monitor::spawn_monitor` ever runs — must not leave a stale
-    /// `monitor_pid` behind. Pre-fix, `state.monitor_pid` still named the
-    /// PREVIOUS stage's (now-dead) monitor after `ensure_agent_binary`
-    /// returned early via `?`, and `liveness()`/`doctor` then misreported
-    /// `Stuck → devflow resume` — the wrong remedy for what's actually an
-    /// agent-binary/staleness failure. PATH is neutralized to a `git`-only
-    /// directory under `ENV_MUTEX`, mirroring `transition_resets_infra_failures`,
-    /// so `ensure_agent_binary("claude")` reliably fails without touching a
-    /// real agent CLI and without racing other PATH-mutating tests.
+    /// WR-04 (18-fix, 50-23): an early failure in `launch_stage_inner` —
+    /// before `monitor::spawn_monitor` ever runs — must not leave the
+    /// PREVIOUS stage's supervisor record behind. Pre-fix, the state still
+    /// named the previous stage's (now-dead) monitor after the launch
+    /// returned early via `?`, and `status`/`doctor` then misreported it as
+    /// gone while active, naming `devflow resume` — the wrong remedy for
+    /// what is actually a launch failure.
+    ///
+    /// Which early failure this reaches (checked by hand mutants, 50-22): the
+    /// child's PATH holds only `git` and an `exit 0` stub `claude`, so for an
+    /// `Auto` Code launch the delivery canary reads `Absent` and the launch
+    /// ends in [`refuse_launch`], before `ensure_agent_binary` runs. The
+    /// other early-failure path, [`record_failed_launch`], is pinned by
+    /// `a_failed_monitor_spawn_clears_the_supervisor_record`.
     #[test]
-    fn launch_stage_inner_clears_monitor_pid_on_early_failure() {
-        const NAME: &str =
-            "pipeline_launch::tests::launch_stage_inner_clears_monitor_pid_on_early_failure";
+    fn launch_stage_inner_clears_the_supervisor_record_on_early_failure() {
+        const NAME: &str = "pipeline_launch::tests::\
+                            launch_stage_inner_clears_the_supervisor_record_on_early_failure";
         enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
@@ -4447,11 +4445,9 @@ mod tests {
         let phase = PhaseId::new(93);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
-        // A stale pid from a prior stage's now-dead monitor — this is what
-        // must be cleared, not carried forward into the new stage.
-        state.monitor_pid = Some(999_999);
-        // 50-23: the prior stage's supervisor record, which must be cleared
-        // too, or `status` reads GONE-while-active and names `devflow resume`.
+        // 50-23: the prior stage's supervisor record, which must be cleared,
+        // not carried forward into the new stage, or `status` reads
+        // GONE-while-active and names `devflow resume`.
         state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
@@ -4459,22 +4455,13 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "ensure_agent_binary must fail against the neutralized, agent-free PATH"
-        );
-        assert_eq!(
-            state.monitor_pid, None,
-            "an early launch failure must clear the stale monitor_pid in-memory, not carry it \
-             forward from the previous stage"
+            "the launch must fail early: the stub `claude` cannot confirm the canary"
         );
         assert_eq!(
             state.supervisor, None,
             "an early launch failure must clear the prior supervisor record in memory"
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
-        assert_eq!(
-            reloaded.monitor_pid, None,
-            "the monitor_pid clear must be persisted to state.json, not just in-memory"
-        );
         assert_eq!(
             reloaded.supervisor, None,
             "the supervisor record clear must be persisted to state.json"
@@ -5140,9 +5127,8 @@ mod tests {
 
         let phase = PhaseId::new(122);
         let mut state = canary_state(root, phase);
-        // The previous stage's monitor pid, as `transition()` would leave it.
-        state.monitor_pid = Some(4_294_967_000);
-        // 50-23: and the previous stage's supervisor record.
+        // The previous stage's supervisor record, as `transition()` would
+        // leave it (50-23).
         state.supervisor = Some(fabricated_prior_record(root));
         workflow::save_state(&state).unwrap();
 
@@ -5165,21 +5151,12 @@ mod tests {
              got: {message}"
         );
 
-        assert!(
-            state.monitor_pid.is_none(),
-            "a refused launch must not leave the previous stage's monitor pid standing — \
-             liveness() would report Stuck and point at `devflow resume`, which cannot help"
-        );
         assert_eq!(
             state.supervisor, None,
             "a refused launch must not leave the previous stage's supervisor record standing: \
              it reads GONE-while-active and sends the operator to `devflow resume`"
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
-        assert!(
-            reloaded.monitor_pid.is_none(),
-            "the cleared pid must be persisted, not only cleared in memory"
-        );
         assert_eq!(
             reloaded.supervisor, None,
             "the cleared supervisor record must be persisted, not only cleared in memory"
@@ -5365,8 +5342,8 @@ mod tests {
         );
         assert_eq!(state.canary, Some(canary::CanaryOutcome::Absent));
         assert!(
-            state.monitor_pid.is_none(),
-            "a refused launch must record no monitor pid"
+            state.supervisor.is_none(),
+            "a refused launch must record no supervisor"
         );
         assert_eq!(
             stage_launched_count(root, phase),
@@ -6859,7 +6836,7 @@ mod tests {
         assert!(
             reloaded_for_reap
                 .as_ref()
-                .is_some_and(|reloaded| reloaded.monitor_pid.is_some()),
+                .is_some_and(|reloaded| reloaded.supervisor.is_some()),
             "the checkpoint must relaunch the session, not only record the event"
         );
         let gate_fired = events_of_kind(root, "gate_fired");

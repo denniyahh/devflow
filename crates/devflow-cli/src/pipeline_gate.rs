@@ -68,13 +68,12 @@ pub(crate) fn transition(
     if state.stop_until == Some(from) {
         state.stopped = true;
         state.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
-        // T-20-03b / doctor gap (D-09): clear monitor_pid/gate_pending so
-        // neither check_dead_agent nor check_dead_monitor misreports this
-        // intentional stop as a crashed agent or dead monitor. The supervisor
-        // record goes with monitor_pid (50-13): the supervisor running this
-        // advance finishes once it returns, so the record would otherwise
-        // name a socket that is gone.
-        state.monitor_pid = None;
+        // T-20-03b / doctor gap (D-09): clear the supervisor record and
+        // gate_pending so neither check_dead_agent nor check_dead_monitor
+        // misreports this intentional stop as a crashed agent or dead
+        // monitor (50-13): the supervisor running this advance finishes once
+        // it returns, so the record would otherwise name a socket that is
+        // gone.
         state.supervisor = None;
         state.gate_pending = false;
         workflow::save_state(state)?;
@@ -915,19 +914,17 @@ mod tests {
         assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
     }
 
-    /// 50-13: the `--until` stop clears the supervisor record together with
-    /// `monitor_pid`, because the supervisor running this advance finishes
-    /// once the advance returns. Both are set first, so a stop that clears
-    /// neither (or only the pid) fails here.
+    /// 50-13: the `--until` stop clears the supervisor record, because the
+    /// supervisor running this advance finishes once the advance returns.
+    /// The record is set first, so a stop that leaves it standing fails here.
     #[test]
-    fn until_stop_clears_the_supervisor_record_with_the_monitor_pid() {
+    fn until_stop_clears_the_supervisor_record() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(1313);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         state.stop_until = Some(Stage::Plan);
-        state.monitor_pid = Some(4242);
         state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
             root.join("until.sock"),
             "until00000000000".to_string(),
@@ -941,10 +938,9 @@ mod tests {
 
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert!(reloaded.stopped, "the --until stop marks the run stopped");
-        assert_eq!(reloaded.monitor_pid, None);
         assert_eq!(
             reloaded.supervisor, None,
-            "the supervisor record is cleared with monitor_pid"
+            "the --until stop clears the supervisor record"
         );
     }
 
