@@ -575,14 +575,16 @@ where
 
 /// Abort a launch the canary refused, leaving no half-launched stage behind.
 ///
-/// Clearing `monitor_pid` applies WR-04's rationale (see
-/// [`spawn_agent_and_record`]) to an aborted launch: `transition()` has already
+/// Clearing `monitor_pid` and `supervisor` applies WR-04's rationale (see
+/// [`record_failed_launch`]) to an aborted launch: `transition()` has already
 /// advanced `state.stage` and saved it by the time this runs, so a refusal that
-/// left the PREVIOUS stage's monitor pid standing would make `liveness()`
-/// report `Stuck → devflow resume` and send the operator after the wrong
-/// problem entirely. The right remedy is the message below.
+/// left the PREVIOUS stage's monitor pid or supervisor record standing would
+/// read as a run gone while active and send the operator to `devflow resume`,
+/// after the wrong problem entirely. With neither, the run reads not launched,
+/// and the right remedy is the message below.
 fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
     state.monitor_pid = None;
+    state.supervisor = None;
     workflow::save_state(state)?;
     Err(CliError::Message(message))
 }
@@ -1487,6 +1489,24 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
     ))
 }
 
+/// End a launch that did not happen (50-23, T-50-62): clear
+/// `state.supervisor` and save.
+///
+/// WR-04's rationale, moved from the monitor pid to the socket record:
+/// `transition()` has already advanced and saved `state.stage` by the time a
+/// launch runs, so a record still naming the previous stage's supervisor,
+/// which is ending or gone, reads GONE-while-active and sends the operator to
+/// `devflow resume`, the wrong remedy. With no record the run reads not
+/// launched, and the launch's own error message is the remedy.
+///
+/// Called only on a failure path, never before the save that records a new
+/// record (50-13's rule).
+fn record_failed_launch(state: &mut State) -> Result<(), CliError> {
+    state.supervisor = None;
+    workflow::save_state(state)?;
+    Ok(())
+}
+
 /// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
 /// the agent binary, archive the prior capture, spawn the monitor, and
 /// record the launch. Extracted (28-03, Task 2) so
@@ -1518,66 +1538,26 @@ fn spawn_agent_and_record(
     state.monitor_pid = None;
     workflow::save_state(state)?;
 
-    ensure_agent_binary(program)?;
-
-    // 17d (Task 2, D-17-D-19) originally placed the self-dogfood
-    // build-staleness gate here, before spawn_monitor. 25b (D-03) moved it
-    // out: it is now adjudicated exactly once, in `commands::start`, after
-    // `state.worktree_path` is set and before this whole launch path is ever
-    // entered — so a phase that modifies DevFlow's own source can progress
-    // past every stage boundary instead of being re-blocked at each one. See
-    // `commands::start` for the new call site and its accompanying D-04/D-05
-    // trade-off notes.
-    if let Some(stamp) = agent_result::archive_phase_files(
-        &state.project_root,
-        state
-            .worktree_path
-            .as_deref()
-            .unwrap_or(&state.project_root),
-        state.phase,
-        capture_retention(&state.project_root),
-    )
-    .map_err(|err| {
-        CliError::Message(format!(
-            "could not archive phase {} capture before rollover: {err}",
-            state.phase
-        ))
-    })? {
-        events::emit(
-            &state.project_root,
-            state.phase,
-            "capture_archived",
-            serde_json::json!({
-                "stage": archived_stage.unwrap_or(state.stage).to_string(),
-                "to_stage": state.stage.to_string(),
-                "stamp": stamp,
-            }),
-        );
-    }
-    let ctx = launch_context()?;
-    let launch_label = match &launch {
-        monitor::MonitorLaunch::PipeOwning { .. } => "stream",
-        monitor::MonitorLaunch::Legacy => "capture",
+    // 50-23 (T-50-62): every error before the publish save ends the launch
+    // with no supervisor record (see `record_failed_launch`); the success
+    // path below never clears the record before the save that replaces it.
+    let SpawnedLaunch {
+        published,
+        ctx,
+        launch_label,
+    } = match spawn_next_supervisor(state, program, args, extra_env, archived_stage, launch) {
+        Ok(Some(spawned)) => spawned,
+        // A stop honoured at safe point 2 or 3 (50-13), already recorded.
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            return Err(match record_failed_launch(state) {
+                Ok(()) => err,
+                Err(clear_err) => CliError::Message(format!(
+                    "{err}; clearing the supervisor record after it also failed: {clear_err}"
+                )),
+            });
+        }
     };
-    #[cfg(test)]
-    test_hold("before_spawn");
-    // Safe point 2 (50-13): a stop taken during the advance ends it before
-    // the next stage's supervisor is spawned.
-    if stopped_at_safe_point(state, 2)? {
-        return Ok(());
-    }
-    let published = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
-        .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
-    #[cfg(test)]
-    test_hold("before_publish");
-    // Safe point 3 (50-13): the next supervisor answered its ping but is not
-    // published. On a stop, shut it down through its socket and never save
-    // its record; the state keeps this run's record, marked stopped.
-    if with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) {
-        shut_down_unpublished(&published.record);
-        record_advance_stop(state, 3)?;
-        return Ok(());
-    }
     let pid = published.supervisor_pid;
     let socket_path = published.record.socket_path.display().to_string();
     let launch_id = published.record.launch_id.clone();
@@ -1645,6 +1625,96 @@ fn spawn_agent_and_record(
         agents::driver_for(state.agent).name()
     );
     Ok(())
+}
+
+/// What [`spawn_next_supervisor`] hands back to [`spawn_agent_and_record`]
+/// for the publish: the ping-confirmed supervisor, the launch context it
+/// was spawned under, and the launch shape's label.
+struct SpawnedLaunch {
+    published: monitor::Published,
+    ctx: monitor::LaunchContext,
+    launch_label: &'static str,
+}
+
+/// The fallible steps of [`spawn_agent_and_record`] before the publish save:
+/// validate the agent binary, archive the prior capture, resolve the launch
+/// context, and spawn the next supervisor, with 50-13's safe points 2 and 3
+/// around the spawn. `Ok(None)` when a stop was honoured at one of them (the
+/// stop is already recorded). Every `Err` is a launch that did not happen,
+/// and its caller clears the supervisor record ([`record_failed_launch`]).
+fn spawn_next_supervisor(
+    state: &mut State,
+    program: &str,
+    args: &[String],
+    extra_env: &[(String, String)],
+    archived_stage: Option<Stage>,
+    launch: monitor::MonitorLaunch,
+) -> Result<Option<SpawnedLaunch>, CliError> {
+    ensure_agent_binary(program)?;
+
+    // 17d (Task 2, D-17-D-19) originally placed the self-dogfood
+    // build-staleness gate here, before spawn_monitor. 25b (D-03) moved it
+    // out: it is now adjudicated exactly once, in `commands::start`, after
+    // `state.worktree_path` is set and before this whole launch path is ever
+    // entered — so a phase that modifies DevFlow's own source can progress
+    // past every stage boundary instead of being re-blocked at each one. See
+    // `commands::start` for the new call site and its accompanying D-04/D-05
+    // trade-off notes.
+    if let Some(stamp) = agent_result::archive_phase_files(
+        &state.project_root,
+        state
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&state.project_root),
+        state.phase,
+        capture_retention(&state.project_root),
+    )
+    .map_err(|err| {
+        CliError::Message(format!(
+            "could not archive phase {} capture before rollover: {err}",
+            state.phase
+        ))
+    })? {
+        events::emit(
+            &state.project_root,
+            state.phase,
+            "capture_archived",
+            serde_json::json!({
+                "stage": archived_stage.unwrap_or(state.stage).to_string(),
+                "to_stage": state.stage.to_string(),
+                "stamp": stamp,
+            }),
+        );
+    }
+    let ctx = launch_context()?;
+    let launch_label = match &launch {
+        monitor::MonitorLaunch::PipeOwning { .. } => "stream",
+        monitor::MonitorLaunch::Legacy => "capture",
+    };
+    #[cfg(test)]
+    test_hold("before_spawn");
+    // Safe point 2 (50-13): a stop taken during the advance ends it before
+    // the next stage's supervisor is spawned.
+    if stopped_at_safe_point(state, 2)? {
+        return Ok(None);
+    }
+    let published = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
+        .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    #[cfg(test)]
+    test_hold("before_publish");
+    // Safe point 3 (50-13): the next supervisor answered its ping but is not
+    // published. On a stop, shut it down through its socket and never save
+    // its record; the state keeps this run's record, marked stopped.
+    if with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) {
+        shut_down_unpublished(&published.record);
+        record_advance_stop(state, 3)?;
+        return Ok(None);
+    }
+    Ok(Some(SpawnedLaunch {
+        published,
+        ctx,
+        launch_label,
+    }))
 }
 
 /// Render the re-scan gate's context: which plan files carry a human-only
