@@ -1575,10 +1575,11 @@ fn spawn_agent_and_record(
     // between the two always finds a live address.
     #[cfg(test)]
     test_hold("before_record_save");
-    state.monitor_pid = Some(pid);
-    state.supervisor = Some(published.record.clone());
-    workflow::save_state(state)?;
-    record_successor(published.record);
+    let record = published.record.clone();
+    match publish_record(state, published, workflow::save_state)? {
+        PublishOutcome::HandedOff => record_successor(record),
+        PublishOutcome::SuccessorAlreadyEnded => {}
+    }
     #[cfg(test)]
     test_hold("after_publish");
     match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
@@ -1625,6 +1626,41 @@ fn spawn_agent_and_record(
         agents::driver_for(state.agent).name()
     );
     Ok(())
+}
+
+/// The stop reason a launcher records when the next stage's supervisor it
+/// just published had already ended (50-23, T-50-64).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "50-23 Task 2 RED scaffold; GREEN records it")
+)]
+pub(crate) const NEXT_STOPPED_BEFORE_SAVE_REASON: &str =
+    "the next stage's supervisor was stopped before its record was saved";
+
+/// How [`publish_record`] ended.
+enum PublishOutcome {
+    /// The record is saved and the next supervisor is running it.
+    HandedOff,
+    /// The record is saved, but the next supervisor had already ended.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "50-23 Task 2 RED scaffold; GREEN constructs it")
+    )]
+    #[cfg_attr(test, allow(dead_code))]
+    SuccessorAlreadyEnded,
+}
+
+/// Record the next stage's supervisor in `state` with one `save` (50-23).
+/// RED scaffold: today's behaviour, a single save whose error is returned.
+fn publish_record<E: Into<CliError>>(
+    state: &mut State,
+    published: monitor::Published,
+    mut save: impl FnMut(&State) -> Result<(), E>,
+) -> Result<PublishOutcome, CliError> {
+    state.monitor_pid = Some(published.supervisor_pid);
+    state.supervisor = Some(published.record);
+    save(state).map_err(Into::into)?;
+    Ok(PublishOutcome::HandedOff)
 }
 
 /// What [`spawn_next_supervisor`] hands back to [`spawn_agent_and_record`]
@@ -8884,6 +8920,523 @@ mod tests {
             )),
             only(CLEAR_SPAWN_NOT_FOUND),
             "a body under its floor"
+        );
+    }
+
+    /// A launch context's supervisor, spawned straight through
+    /// `spawn_monitor` on the supervise-only harness entry for a fake agent
+    /// that waits for `go` (never created), with a reaper for it. The state
+    /// on disk holds `prior` and is left untouched.
+    struct PublishFixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        phase: PhaseId,
+        state: State,
+        prior: SupervisorRecord,
+        published: Option<monitor::Published>,
+        reaper: Option<ReapMonitorOnDrop>,
+    }
+
+    impl PublishFixture {
+        fn spawn(phase: PhaseId) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            init_repo(&root);
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+            state.legacy_claude_launch = true;
+            let prior = fabricated_prior_record(&root);
+            state.supervisor = Some(prior.clone());
+            workflow::save_state(&state).unwrap();
+            let ctx = launch_context().expect("the parent passes DEVFLOW_CACHE_DIR");
+            let published = monitor::spawn_monitor(
+                &state,
+                "claude",
+                &[],
+                &[],
+                monitor::MonitorLaunch::Legacy,
+                &ctx,
+            )
+            .expect("the next supervisor publishes");
+            let mut holder = state.clone();
+            holder.supervisor = Some(published.record.clone());
+            let reaper = Some(ReapMonitorOnDrop::after_launch(&holder));
+            Self {
+                _dir: dir,
+                root,
+                phase,
+                state,
+                prior,
+                published: Some(published),
+                reaper,
+            }
+        }
+
+        fn take(&mut self) -> monitor::Published {
+            self.published.take().expect("published once")
+        }
+
+        fn reloaded(&self) -> State {
+            workflow::load_state(&self.root, self.phase).expect("the state loads")
+        }
+    }
+
+    impl Drop for PublishFixture {
+        fn drop(&mut self) {
+            drop(self.reaper.take());
+        }
+    }
+
+    /// A save that always fails, as a full disk would.
+    fn failing_save(_: &State) -> Result<(), CliError> {
+        Err(CliError::Workflow(
+            devflow_core::workflow::WorkflowError::Io(std::io::Error::other(
+                "injected save failure: no space left on device",
+            )),
+        ))
+    }
+
+    fn probes_alive(socket: &Path) -> bool {
+        matches!(
+            devflow_core::supervisor::probe(socket),
+            Ok(devflow_core::supervisor::Liveness::Alive(_))
+        )
+    }
+
+    fn probes_gone(socket: &Path) -> bool {
+        devflow_core::supervisor::probe(socket)
+            .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+    }
+
+    /// The parent half of a publish-save test: a child on the supervise-only
+    /// entry whose fake agent waits for `go` in its working directory.
+    fn run_publish_child(name: &str) {
+        let path_dir = go_waiting_claude_dir();
+        let output = run_hermetic_test_in_child(name, path_dir.path(), &[]);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// RV-08 (V-38, T-50-63): a failed publish save whose shutdown of the new
+    /// supervisor is not confirmed (its recorded socket refuses the connect)
+    /// keeps the new record in memory, saves nothing over the file's record,
+    /// and names `devflow stop --phase N --launch <id>`. The new supervisor
+    /// is still running. Its opposite is the next test, whose confirmed
+    /// shutdown clears the record and names no repair.
+    #[test]
+    fn a_failed_publish_save_whose_shutdown_is_not_confirmed_names_the_stop_launch_repair() {
+        const NAME: &str = "pipeline_launch::tests::a_failed_publish_save_whose_shutdown_is_not_confirmed_names_the_stop_launch_repair";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_publish_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let mut fixture = PublishFixture::spawn(PhaseId::new(2302));
+        let mut published = fixture.take();
+        let real = published.record.socket_path.clone();
+        let new_id = published.record.launch_id.clone();
+        let refused = fixture.root.join("refused.sock");
+        drop(std::os::unix::net::UnixListener::bind(&refused).expect("bind then drop"));
+        published.record.socket_path = refused.clone();
+
+        let err = publish_record(&mut fixture.state, published, failing_save)
+            .err()
+            .expect("a failed save is an error");
+        let text = err.to_string();
+        assert!(
+            text.contains("injected save failure"),
+            "names the save error: {text}"
+        );
+        let repair = format!("devflow stop --phase {} --launch {new_id}", fixture.phase);
+        assert!(text.contains(&repair), "names `{repair}`: {text}");
+        assert!(
+            text.contains(&refused.display().to_string()),
+            "names the socket: {text}"
+        );
+        assert_eq!(
+            fixture.state.supervisor.as_ref().map(|r| &r.launch_id),
+            Some(&new_id),
+            "the in-memory record still names the new launch"
+        );
+        assert_eq!(
+            fixture.reloaded().supervisor.as_ref(),
+            Some(&fixture.prior),
+            "nothing was saved over the file's record"
+        );
+        assert!(probes_alive(&real), "the new supervisor is still running");
+        let outcome = devflow_core::supervisor::request_shutdown(&real, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "the operator's handle still ends it: {outcome:?}"
+        );
+    }
+
+    /// R-1 step 4 (T-50-63): a failed publish save shuts the new supervisor
+    /// down through its socket before returning the error: its socket reads
+    /// Gone, its agent group is gone, and the record does not name it.
+    #[test]
+    fn a_failed_publish_save_shuts_the_new_supervisor_down() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_failed_publish_save_shuts_the_new_supervisor_down";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_publish_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let mut fixture = PublishFixture::spawn(PhaseId::new(2303));
+        let published = fixture.take();
+        let record = published.record.clone();
+
+        let err = publish_record(&mut fixture.state, published, failing_save)
+            .err()
+            .expect("a failed save is an error");
+        let text = err.to_string();
+        assert!(
+            text.contains("injected save failure"),
+            "names the save error: {text}"
+        );
+        assert!(
+            text.contains("shut down"),
+            "names the shutdown of the new supervisor: {text}"
+        );
+        assert!(
+            !text.contains("--launch"),
+            "a confirmed shutdown needs no repair line: {text}"
+        );
+        assert!(
+            poll_until(Duration::from_secs(5), || probes_gone(&record.socket_path)),
+            "the new supervisor's socket reads Gone"
+        );
+        assert!(
+            poll_until(Duration::from_secs(5), || !group_alive(record.agent_pgid)),
+            "the new supervisor's agent group is gone"
+        );
+        assert_ne!(
+            fixture.state.supervisor.as_ref().map(|r| &r.launch_id),
+            Some(&record.launch_id),
+            "the record does not name the shut-down supervisor"
+        );
+    }
+
+    /// The control for the failed-save pair: with `workflow::save_state` the
+    /// publish hands off, the reloaded state names the new launch and the
+    /// new supervisor probes Alive.
+    #[test]
+    fn a_successful_publish_save_records_and_keeps_the_new_supervisor() {
+        const NAME: &str = "pipeline_launch::tests::a_successful_publish_save_records_and_keeps_the_new_supervisor";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_publish_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let mut fixture = PublishFixture::spawn(PhaseId::new(2304));
+        let published = fixture.take();
+        let record = published.record.clone();
+
+        let outcome = publish_record(&mut fixture.state, published, workflow::save_state)
+            .expect("control: the save succeeds");
+        assert!(
+            matches!(outcome, PublishOutcome::HandedOff),
+            "control: a running successor is handed off"
+        );
+        assert_eq!(
+            fixture.reloaded().supervisor.as_ref(),
+            Some(&record),
+            "control: the reloaded state names the new launch"
+        );
+        assert!(!fixture.reloaded().stopped, "control: not stopped");
+        assert!(
+            probes_alive(&record.socket_path),
+            "control: the new supervisor is running"
+        );
+        let shutdown =
+            devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                shutdown,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "{shutdown:?}"
+        );
+    }
+
+    /// The next supervisor a held stage N spawned: the one sweep entry whose
+    /// launch id is not N's, with its sidecar.
+    fn next_supervisor(run: &HandoffRun) -> (PathBuf, devflow_core::supervisor::Sidecar) {
+        let found: Vec<_> = devflow_core::supervisor::sweep_in(&run.cache)
+            .into_iter()
+            .filter_map(|entry| {
+                let sidecar = entry.sidecar?;
+                (sidecar.launch_id != run.n.launch_id).then_some((entry.socket_path, sidecar))
+            })
+            .collect();
+        match <[_; 1]>::try_from(found) {
+            Ok([one]) => one,
+            Err(other) => panic!("exactly one next supervisor at the hold: {other:?}"),
+        }
+    }
+
+    /// Release N, then wait for its socket to read Gone (its save, probe and
+    /// `finish` are done).
+    fn release_and_wait_for_n(run: &HandoffRun) {
+        run.release();
+        assert!(
+            poll_until(SUPERVISOR_STOP_WAIT, || probes_gone(&run.n.socket_path)),
+            "N finishes once released: {}",
+            run.events()
+        );
+    }
+
+    /// T-50-64: a stop sent straight to N+1 while N is held before its
+    /// publish save (so N+1 ends on 50-13's no-write path, the state still
+    /// naming N) is recorded by N's post-save re-probe: `stopped` with this
+    /// plan's reason, the state naming N+1, which reads Gone with no agent
+    /// left.
+    #[test]
+    fn a_stop_sent_straight_to_the_next_supervisor_before_its_record_is_saved_is_recorded() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_sent_straight_to_the_next_supervisor_before_its_record_is_saved_is_recorded";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_publish"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(2305));
+        run.go();
+        run.wait_held();
+        let (next_socket, next) = next_supervisor(&run);
+        let outcome =
+            devflow_core::supervisor::request_shutdown(&next_socket, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "N+1 stops: {outcome:?}"
+        );
+        release_and_wait_for_n(&run);
+
+        let state = run.state();
+        assert_eq!(
+            state.supervisor.as_ref().map(|r| &r.launch_id),
+            Some(&next.launch_id),
+            "the state names N+1"
+        );
+        assert!(
+            state.stopped,
+            "the stop is recorded (stop_reason {:?})",
+            state.stop_reason
+        );
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(NEXT_STOPPED_BEFORE_SAVE_REASON)
+        );
+        assert!(probes_gone(&next_socket), "N+1 reads Gone");
+        assert!(
+            poll_until(Duration::from_secs(5), || !group_alive(next.agent_pgid)),
+            "no agent of N+1 survives"
+        );
+    }
+
+    /// The control: the same held publish with no stop hands off, so the
+    /// state names a running N+1 and is not stopped.
+    #[test]
+    fn without_a_stop_to_the_next_supervisor_the_held_publish_hands_off() {
+        const NAME: &str = "pipeline_launch::tests::without_a_stop_to_the_next_supervisor_the_held_publish_hands_off";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_publish"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(2306));
+        run.go();
+        run.wait_held();
+        let (next_socket, next) = next_supervisor(&run);
+        release_and_wait_for_n(&run);
+
+        let state = run.state();
+        assert_eq!(
+            state.supervisor.as_ref().map(|r| &r.launch_id),
+            Some(&next.launch_id),
+            "control: the state names N+1"
+        );
+        assert!(
+            !state.stopped,
+            "control: not stopped ({:?})",
+            state.stop_reason
+        );
+        assert!(probes_alive(&next_socket), "control: N+1 runs on");
+    }
+
+    /// The stopped-outcome hold variable (R-6E): the path a stopped
+    /// supervisor waits on between its agent's exit and its outcome decision.
+    const STOPPED_OUTCOME_HOLD_ENV: &str = "DEVFLOW_TEST_STOPPED_OUTCOME_HOLD";
+
+    /// Names which run of the kill-grace test a child is (`a` or `b`). Not a
+    /// DevFlow setting, so no `DEVFLOW_` prefix.
+    const KILL_GRACE_RUN_ENV: &str = "P50_23_KILL_GRACE_RUN";
+
+    /// The marker N+1's fake agent leaves when SIGTERM reaches it.
+    const TERM_SEEN: &str = "term-seen";
+
+    /// [`handoff_claude_dir`] with a stage N+1 agent that traps SIGTERM by
+    /// leaving [`TERM_SEEN`] in its working directory and running on, so its
+    /// supervisor's kill grace ends in SIGKILL.
+    fn term_trapping_handoff_claude_dir() -> tempfile::TempDir {
+        let path_dir = handoff_claude_dir(SUCCESS_MARKER);
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+             if [ ! -e first-done ]; then\n  : > first-done\n  gate=go\n\
+             else\n  trap ': > {TERM_SEEN}' TERM\n  gate=go2\nfi\n\
+             i=0\nwhile [ ! -e \"$gate\" ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             printf '%s\\n' '{SUCCESS_MARKER}'\nexit 0\n"
+        );
+        std::fs::write(path_dir.path().join("claude"), script).unwrap();
+        path_dir
+    }
+
+    /// Creates its path when dropped, so a failing kill-grace run never
+    /// leaves N+1 parked at the stopped-outcome hold.
+    struct ReleaseOnDrop(PathBuf);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "");
+        }
+    }
+
+    /// Wait (bounded) for `path` to exist.
+    fn wait_for_file(path: &Path, within: Duration) -> bool {
+        poll_until(within, || path.exists())
+    }
+
+    /// R6-E (V-50, T-50-64): a stop N+1 has accepted but not carried out
+    /// when N saves its record is recorded by N+1 itself. Ordered only by
+    /// events: N held at `before_publish`, the stop sent to N+1, N+1's
+    /// agent marker, N+1 parked at the stopped-outcome hold (owner still
+    /// `agent_running`), then the two releases. Run (a) releases N first:
+    /// N saves, probes N+1 (running) and hands off with no stop written,
+    /// then N+1 records its own stop. Run (b), the in-test control, releases
+    /// N+1 first: it ends on the no-write path and N's re-probe records this
+    /// plan's reason. The release order alone selects the end state.
+    #[test]
+    fn a_next_supervisor_still_in_its_kill_grace_at_publish_records_its_own_stop() {
+        const NAME: &str = "pipeline_launch::tests::a_next_supervisor_still_in_its_kill_grace_at_publish_records_its_own_stop";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            for run in ["a", "b"] {
+                let path_dir = term_trapping_handoff_claude_dir();
+                let hold_dir = tempfile::Builder::new()
+                    .prefix("dfh")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let n_hold = std::ffi::OsString::from(format!(
+                    "before_publish:{}",
+                    hold_dir.path().join("release").display()
+                ));
+                let k_file = hold_dir.path().join("k-release");
+                let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+                    (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("120")),
+                    (HOLD_ENV, n_hold.as_os_str()),
+                    (STOPPED_OUTCOME_HOLD_ENV, k_file.as_os_str()),
+                    (KILL_GRACE_RUN_ENV, std::ffi::OsStr::new(run)),
+                ];
+                let output = run_hermetic_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let _guard = env_lock();
+        let release_first_n = std::env::var(KILL_GRACE_RUN_ENV).expect("the run") == "a";
+        let k_file = PathBuf::from(
+            std::env::var_os(STOPPED_OUTCOME_HOLD_ENV).expect("the parent passes the hold"),
+        );
+        let k_held = PathBuf::from(format!("{}.held", k_file.display()));
+        let step = SUPERVISOR_STOP_WAIT;
+        let run = HandoffRun::launch(PhaseId::new(if release_first_n { 2307 } else { 2308 }));
+        let _release_k = ReleaseOnDrop(k_file.clone());
+        run.go();
+        run.wait_held();
+        let (next_socket, next) = next_supervisor(&run);
+        let stopper = {
+            let socket = next_socket.clone();
+            std::thread::spawn(move || {
+                devflow_core::supervisor::request_shutdown(&socket, Duration::from_secs(60))
+            })
+        };
+        assert!(
+            wait_for_file(&run.root.join(TERM_SEEN), Duration::from_secs(5)),
+            "N+1 accepted the stop and signalled its agent group"
+        );
+        assert!(
+            wait_for_file(&k_held, step),
+            "stopped-outcome hold never reached"
+        );
+        let mut owner = None;
+        let answered = poll_until(step, || {
+            match devflow_core::supervisor::probe(&next_socket) {
+                Ok(devflow_core::supervisor::Liveness::Alive(reply)) => {
+                    owner = Some(reply.owner);
+                    true
+                }
+                Ok(other) => panic!("N+1 must be Alive at the hold, found {other:?}"),
+                Err(_) => false,
+            }
+        });
+        assert!(answered, "N+1 answers a ping while parked at the hold");
+        assert_eq!(
+            owner.as_deref(),
+            Some("agent_running"),
+            "expected owner agent_running, found {owner:?}"
+        );
+
+        let ended = |socket: &Path| poll_until(step, || probes_gone(socket));
+        if release_first_n {
+            release_and_wait_for_n(&run);
+            let state = run.state();
+            assert_eq!(
+                state.supervisor.as_ref().map(|r| &r.launch_id),
+                Some(&next.launch_id),
+                "N saved N+1's record"
+            );
+            assert!(
+                !state.stopped,
+                "N handed off and wrote no stop: found stopped {} with stop_reason {:?}",
+                state.stopped, state.stop_reason
+            );
+            std::fs::write(&k_file, "").unwrap();
+            assert!(ended(&next_socket), "N+1 finishes once released");
+        } else {
+            std::fs::write(&k_file, "").unwrap();
+            assert!(ended(&next_socket), "N+1 finishes once released");
+            release_and_wait_for_n(&run);
+        }
+        let outcome = stopper.join().expect("the stopper thread");
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "the stop sent to N+1 reads Stopped: {outcome:?}"
+        );
+        let state = run.state();
+        assert_eq!(
+            state.supervisor.as_ref().map(|r| &r.launch_id),
+            Some(&next.launch_id),
+            "the state names N+1"
+        );
+        assert!(state.stopped, "the stop is recorded");
+        let expected = if release_first_n {
+            SUPERVISOR_STOP_REASON
+        } else {
+            NEXT_STOPPED_BEFORE_SAVE_REASON
+        };
+        assert_eq!(state.stop_reason.as_deref(), Some(expected));
+        assert!(
+            poll_until(Duration::from_secs(5), || !group_alive(next.agent_pgid)),
+            "no agent of N+1 survives"
         );
     }
 }
