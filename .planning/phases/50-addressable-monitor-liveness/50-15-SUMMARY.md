@@ -153,7 +153,7 @@ status: complete
 ## Needs awareness
 
 - **No test drives a STALE socket through the guard.** The STALE arms (record and sweep) and the probe-error arm are read-verified only. The unit test covers the mapping from each backstop decision to live/not live, nothing more. An e2e would need a SIGKILLed supervisor whose agent group outlives it, with the agent pid file removed (otherwise the pid half refuses first).
-- **V-12's loser always lost at the per-phase lock in normal runs** (8 of 8, counting the gate runs). The guard path for a racing loser ran only under mutant MA, which made the lock blocking (2 of 2, guard refusal printed). With the guard also disabled (MB), the test failed at its stderr check: the loser hit "branch exists". The one-socket count was therefore not the assertion that caught MB.
+- **V-12's loser always lost at the per-phase lock in normal runs.** I saw this in 7 of 7 runs that printed the loser's refusal. The gate runs and the `check.sh` run did not show which refusal the loser got. The guard path for a racing loser ran only under mutant MA, which made the lock blocking (2 of 2, guard refusal printed). With the guard also disabled (MB), the test failed at its stderr check: the loser hit "branch exists". The one-socket count was therefore not the assertion that caught MB.
 - **`cleanup`'s live-run refusal still names `devflow resume` where `stop` is right.** This plan does not touch that path (50-12 and 50-14 noted it too).
 - **T-50-90/T-50-91 stay open as accepted.** A loaded state with no record (or a GONE record) over a live, unrecorded supervisor is not refused. Phase 50.1 owns it.
 - **Commit `b464aec`'s subject is 76 characters.** The commit-msg hook warned and the commit landed; per instructions it was not amended.
@@ -251,7 +251,7 @@ Each mutant was applied to `commands.rs` and then restored from a saved copy. `c
 - **Tracer gate** (interactive, `end-of-phase`, automated-only verify): Task 1's verify was re-run and passed before Task 2 began.
 - **Task 2 gate 1** (two named tests, verbatim): rc 0, two `1 passed`. Earlier I also ran the pair 6 more times, 6 of 6 passing.
 - **Task 2 gate 2 (sentinel-HOME `scripts/check.sh all`), verbatim, at `58579de`:** `==> check.sh: all OK`, `check_all_exit=0 leaked_entries=0`, gate rc 0.
-- **All `devflow` package tests at GREEN** (`b464aec` plus uncommitted Task 2 tests absent): `685 tests run: 685 passed (3 leaky), 2 skipped`.
+- **All `devflow` package tests on the GREEN code, before the Task 2 tests existed:** `685 tests run: 685 passed (3 leaky), 2 skipped`.
 - **`cargo clippy -p devflow --all-targets -- -D warnings`:** rc 0 at RED, at GREEN and before the Task 2 commit.
 - **Semver:** no `devflow-core` file changed, so the 50-01 semver gate was not run. This plan adds or changes no `pub` item.
 - **What these checks do not establish:**
