@@ -189,11 +189,6 @@ fn start_publishes_for(shape: Shape, phase: PhaseId) {
         "{shape:?}: socket path is {} bytes",
         socket.as_os_str().len()
     );
-    assert!(
-        state.monitor_pid.is_some(),
-        "{shape:?}: monitor_pid stays populated until 50-22"
-    );
-
     let reply = match supervisor::probe(&socket).expect("probe the recorded socket") {
         Liveness::Alive(reply) => reply,
         other => panic!("{shape:?}: the recorded socket must answer ALIVE, got {other:?}"),
@@ -201,17 +196,16 @@ fn start_publishes_for(shape: Shape, phase: PhaseId) {
     assert_eq!(reply.launch, shape.label(), "{shape:?}: launch label");
     assert_eq!(reply.launch_id, record.launch_id, "{shape:?}: launch id");
     assert_eq!(reply.agent_pgid, record.agent_pgid, "{shape:?}: agent pgid");
-    assert_eq!(
-        Some(reply.supervisor_pid),
-        state.monitor_pid,
-        "{shape:?}: monitor_pid names the supervisor"
-    );
 
     let sidecar_path = socket.with_extension("json");
     let sidecar = supervisor::read_sidecar(&sidecar_path).expect("read the sidecar");
     assert_eq!(sidecar.project_root, root, "{shape:?}: sidecar root");
     assert_eq!(sidecar.phase, phase, "{shape:?}: sidecar phase");
     assert_eq!(sidecar.launch, shape.label(), "{shape:?}: sidecar launch");
+    assert_eq!(
+        sidecar.supervisor_pid, reply.supervisor_pid,
+        "{shape:?}: the recorded socket answers for the supervisor its sidecar names"
+    );
 
     match supervisor::request_shutdown(&socket, SHUTDOWN_WAIT).expect("shutdown the run") {
         ShutdownOutcome::Stopped { .. } => {}

@@ -621,14 +621,14 @@ fn start_until_plan_halts_cleanly() {
     );
     assert!(state.stopped, "stop marker must be set");
     assert_eq!(
-        state.monitor_pid, None,
-        "the stop path must clear monitor_pid so no monitor is left behind"
+        state.supervisor, None,
+        "the stop path must clear the supervisor record so no monitor is left behind"
     );
     assert!(
         state.stop_reason.is_some(),
         "a human-readable stop_reason must be recorded"
     );
-    // The stop path cleared monitor_pid; the guard still binds (no-op) so
+    // The stop path cleared the supervisor record; the guard still binds (no-op) so
     // every monitor-spawning test in this file follows the same teardown
     // shape (41-02 Task 1 systematic pass).
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -1005,8 +1005,8 @@ fn start_codex_without_context_fails_preflight() {
 
 /// 20b instance 1 (D-06, review: Codex HIGH fail-closed-on-live-agent):
 /// `cleanup --force` must refuse to remove a worktree whose agent pid is
-/// genuinely alive, even when the persisted `State` carries `monitor_pid =
-/// None` — a classification `liveness()` reports as `Unknown`, NOT `Healthy`.
+/// genuinely alive, even when the persisted `State` carries no supervisor
+/// record — a run with no addressable monitor, NOT a healthy one.
 /// A guard that only refuses on `Healthy`/`BetweenStages` would still delete
 /// this worktree out from under a live agent. Against unmodified `cleanup`
 /// (no liveness check at all today) this test FAILS: cleanup removes the
@@ -1032,7 +1032,7 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
     fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-    // Persist a State with monitor_pid = None (Unknown liveness) and
+    // Persist a State with no supervisor record (no addressable monitor) and
     // worktree_path pointing at the created worktree (the worktree->phase
     // join key, review: Codex MEDIUM).
     let mut state = devflow_core::state::State::new(
@@ -1056,7 +1056,7 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     assert!(
         !output.status.success(),
         "cleanup --force must refuse to remove a live agent's worktree even \
-         under Unknown liveness (monitor_pid = None)"
+         with no supervisor record"
     );
     let combined = format!(
         "{}{}",
@@ -1098,8 +1098,8 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
     fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
     fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-    // Persist a State with a DEAD monitor pid (`liveness()` classifies this
-    // Stuck, since monitor_alive is false), plus worktree_path.
+    // Persist a State whose supervisor record names a socket that does not
+    // exist (a dead monitor: the probe reads GONE), plus worktree_path.
     let mut state = devflow_core::state::State::new(
         phase,
         devflow_core::state::AgentKind::Claude,
@@ -1107,7 +1107,13 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
         root.to_path_buf(),
     );
     state.worktree_path = Some(wt_path.clone());
-    state.monitor_pid = Some(0x7FFF_FFFE); // essentially never a live pid
+    state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+        root.join("dead-monitor-never-bound.sock"),
+        "deadmonitor00000".to_string(),
+        0x7FFF_FFFE, // essentially never a live process group
+        1,
+        String::new(),
+    ));
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
@@ -1140,7 +1146,7 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
 }
 
 /// CR-02 (phase 20 review): a phase halted via `devflow start --until
-/// <stage>` clears `monitor_pid` and its agent has already exited by
+/// <stage>` clears the supervisor record and its agent has already exited by
 /// design — `Liveness::Unknown` with `agent_alive == false` sails straight
 /// through the live-agent refusal, so an ordinary `devflow cleanup` (no
 /// `--force`) must not delete the worktree of a phase the operator parked
@@ -1163,7 +1169,7 @@ fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     // No agent pid file (the stage's agent has already exited normally) and
-    // monitor_pid = None (cleared by the --until stop path) — Unknown
+    // no supervisor record (cleared by the --until stop path) — Unknown
     // liveness, agent_alive == false. Only `state.stopped` distinguishes
     // this from a genuinely dead, safe-to-remove phase.
     let mut state = devflow_core::state::State::new(
@@ -1272,8 +1278,9 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
-    // Dead agent, dead monitor (Stuck liveness) — a genuinely dead phase,
-    // safe for cleanup to proceed.
+    // Dead agent, dead monitor (a supervisor record whose socket does not
+    // exist, so the probe reads GONE) — a genuinely dead phase, safe for
+    // cleanup to proceed.
     let mut state = devflow_core::state::State::new(
         phase,
         devflow_core::state::AgentKind::Claude,
@@ -1281,7 +1288,13 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         root.to_path_buf(),
     );
     state.worktree_path = Some(wt_path.clone());
-    state.monitor_pid = Some(0x7FFF_FFFE);
+    state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+        root.join("dead-monitor-never-bound.sock"),
+        "deadmonitor00000".to_string(),
+        0x7FFF_FFFE,
+        1,
+        String::new(),
+    ));
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
@@ -1336,7 +1349,7 @@ fn pi_stub(launch: &str) -> String {
 /// Wait until a phase's chain settles in a state the tests can reap from:
 /// either the never-silent gate fired (`gate_pending`) or the machine
 /// stopped (`--until` / completion). Returns that state — whose
-/// `monitor_pid` is the LAST monitor the chain spawned, the one a
+/// `supervisor` record names the LAST monitor the chain spawned, the one a
 /// `MonitorReapGuard` must capture (a guard bound to an early state read
 /// reaps an already-exited pid and leaks the gate-waiting monitor, HYG-01).
 fn wait_for_settled(root: &Path, phase: PhaseId) -> devflow_core::state::State {
@@ -1573,10 +1586,23 @@ enum StubMode {
 /// of the binary crate's `ReapMonitorOnDrop`, built on the PUBLIC
 /// `devflow_core::agent` surface (integration tests cannot reach
 /// `devflow-cli`'s test_support). TERM->KILL escalation with VERIFIED death,
-/// keyed to `state.monitor_pid`, bound strictly after the final
+/// keyed to the pid of the supervisor `state.supervisor` records (read from
+/// its socket by [`live_supervisor_pid`]), bound strictly after the final
 /// `&mut State` use. 41-02 Task 1 turns this into the systematic pass.
 struct MonitorReapGuard {
     pid: Option<u32>,
+}
+
+/// The pid of the supervisor `state` records, from its socket's ping reply.
+/// The state carries no monitor pid (50-22); before that field went, it held
+/// this same pid. `None` when the state has no record or its socket does not
+/// answer as alive: nothing is left for a guard to reap.
+fn live_supervisor_pid(state: &devflow_core::state::State) -> Option<u32> {
+    let record = state.supervisor.as_ref()?;
+    match devflow_core::supervisor::probe(&record.socket_path) {
+        Ok(devflow_core::supervisor::Liveness::Alive(reply)) => Some(reply.supervisor_pid),
+        _ => None,
+    }
 }
 
 impl MonitorReapGuard {
@@ -1584,15 +1610,15 @@ impl MonitorReapGuard {
         // Register the pid THIS guard is responsible for (the settled-state
         // monitor it will reap), and mark a guard in flight for the audit's
         // ordering barrier. `state` must be the SETTLED state
-        // (`wait_for_settled` / `wait_for_gate`), whose `monitor_pid` is the
-        // chain's LAST monitor — the one that would leak if not reaped.
-        if let Some(pid) = state.monitor_pid {
+        // (`wait_for_settled` / `wait_for_gate`), whose supervisor record
+        // names the chain's LAST monitor — the one that would leak if not
+        // reaped.
+        let pid = live_supervisor_pid(state);
+        if let Some(pid) = pid {
             registry().lock().unwrap().insert(pid);
             ACTIVE_GUARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        Self {
-            pid: state.monitor_pid,
-        }
+        Self { pid }
     }
 }
 
@@ -1847,9 +1873,8 @@ fn unguarded_monitor_is_detected_by_the_registry() {
     let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = load_state(root, PhaseId::new(7)).expect("load state");
-    let pid = state
-        .monitor_pid
-        .expect("a launched stage must record a monitor pid");
+    let pid = live_supervisor_pid(&state)
+        .expect("a launched stage must record a supervisor that answers its socket");
     assert!(
         devflow_core::agent::agent_running(pid),
         "premise: with no guard the monitor stays alive — nothing reaps it"

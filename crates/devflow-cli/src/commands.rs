@@ -3252,9 +3252,8 @@ impl LaunchVerb {
 ///   liveness, not identity: a recycled pid gives a fail-closed false
 ///   refusal (Option A, 2026-09-22).
 ///
-/// No `monitor_pid` is read. A loaded state with no record over a live
-/// supervisor (a launcher that died before saving it, T-50-90/T-50-91) is
-/// accepted until Phase 50.1.
+/// A loaded state with no record over a live supervisor (a launcher that
+/// died before saving it, T-50-90/T-50-91) is accepted until Phase 50.1.
 fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
@@ -5370,12 +5369,19 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
     }
 }
 
-/// The set of pids that a live registry entry still reaches: every
-/// [`devflow_core::state::State::monitor_pid`] recorded under any of
-/// `roots` (via [`workflow::list_states`]) plus every lock holder pid for
-/// those same roots' phases (via [`lock::holder_identity`]). A pid in this
-/// set is by definition not a stray (CR-01, 25-15-PLAN.md) — a live
-/// registry entry, lock file, or state file still names it.
+/// The set of pids that a live registry entry still reaches: every lock
+/// holder pid for the phases of `roots` (listed via
+/// [`workflow::list_states`], read via [`lock::holder_identity`]). A pid in
+/// this set is by definition not a stray (CR-01, 25-15-PLAN.md) — a live
+/// lock file still names it.
+///
+/// Lock holders only (50-22). A 3.x supervisor needs no entry: the `/proc`
+/// census this set filters ([`agent::discover_stray_devflow_processes`])
+/// matches only the 2.x monitor-wrapper and `devflow advance` argv shapes
+/// and cannot match a supervisor's (50-12, pinned by
+/// `agent::tests::the_stray_census_matches_only_the_2x_process_shapes` and
+/// by `census_never_sees_a_live_supervisor` in the supervisor e2e), so a
+/// supervisor's pid can never reach a reap through this filter.
 ///
 /// Deliberately excludes the per-phase agent pid file: the `/proc` census
 /// this set filters ([`agent::discover_stray_devflow_processes`]) can only
@@ -5390,8 +5396,8 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
 /// read-only path).
 ///
 /// RESIDUAL (T-25-15-08, not eliminated): this is a point-in-time read. A
-/// root registered, or a `monitor_pid` written, between this read and a
-/// caller's later signal is not covered by it. The untouched
+/// root registered, or a lock taken, between this read and a caller's later
+/// signal is not covered by it. The untouched
 /// `agent::is_same_process` identity re-confirmation and
 /// [`agent::STRAY_MIN_AGE`] age floor downstream remain the last line of
 /// defence in that window.
@@ -5406,9 +5412,6 @@ pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
             continue;
         }
         for state in workflow::list_states(root) {
-            if let Some(pid) = state.monitor_pid {
-                reachable.insert(pid);
-            }
             if let Some((pid, _start_time)) = lock::holder_identity(root, state.phase) {
                 reachable.insert(pid);
             }
@@ -6837,10 +6840,10 @@ mod tests {
         assert!(!agent::agent_running(u32::MAX));
     }
 
-    /// 18b: persisting `monitor_pid` for one phase must not disturb a
-    /// concurrently-active sibling phase's `monitor_pid` (concurrency edge).
+    /// 18b: persisting the supervisor record for one phase must not disturb
+    /// a concurrently-active sibling phase's record (concurrency edge).
     #[test]
-    fn monitor_pid_persisted_for_one_phase_does_not_disturb_a_sibling() {
+    fn supervisor_record_persisted_for_one_phase_does_not_disturb_a_sibling() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -6850,7 +6853,14 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        phase7.monitor_pid = Some(111);
+        let record7 = devflow_core::state::SupervisorRecord::new(
+            root.join("seven.sock"),
+            "seven00000000000".to_string(),
+            111,
+            1,
+            String::new(),
+        );
+        phase7.supervisor = Some(record7.clone());
         workflow::save_state(&phase7).unwrap();
 
         let mut phase8 = State::new(
@@ -6859,28 +6869,41 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        phase8.monitor_pid = Some(222);
+        let record8 = devflow_core::state::SupervisorRecord::new(
+            root.join("eight.sock"),
+            "eight00000000000".to_string(),
+            222,
+            2,
+            String::new(),
+        );
+        phase8.supervisor = Some(record8.clone());
         workflow::save_state(&phase8).unwrap();
 
         let reloaded7 = workflow::load_state(root, PhaseId::new(7)).unwrap();
         let reloaded8 = workflow::load_state(root, PhaseId::new(8)).unwrap();
-        assert_eq!(reloaded7.monitor_pid, Some(111));
-        assert_eq!(reloaded8.monitor_pid, Some(222));
+        assert_eq!(reloaded7.supervisor, Some(record7));
+        assert_eq!(reloaded8.supervisor, Some(record8));
     }
 
     /// 18b (idempotency edge): running `devflow status` twice must produce
-    /// byte-identical `.devflow/` state — the new monitor liveness probe is
+    /// byte-identical `.devflow/` state — the supervisor liveness probe is
     /// purely a read, same as the existing agent liveness probe it sits
-    /// beside. Also exercises the `u32::MAX` boundary pid (precision edge,
-    /// via `agent::agent_running`'s existing hardening) so the probe can
-    /// only ever report `Stuck`, never a false `Healthy`.
+    /// beside. The planted record names a socket that does not exist and the
+    /// `u32::MAX` boundary agent group (precision edge), so the probe can
+    /// only read it GONE, never a false ALIVE.
     #[test]
     fn status_reading_monitor_liveness_writes_no_state_and_no_event() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(66);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.monitor_pid = Some(u32::MAX);
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            root.join("never-bound.sock"),
+            "statusidem000000".to_string(),
+            u32::MAX,
+            1,
+            String::new(),
+        ));
         workflow::save_state(&state).unwrap();
 
         let state_path = workflow::state_path(root, phase);
@@ -7630,24 +7653,6 @@ mod tests {
         stop(root, phase).expect("stop against a stale lock must succeed, not error");
     }
 
-    /// T-23-51: a live `monitor_pid` recorded in `State` — with no open gate
-    /// and no lock file — must never be treated as a signalling target.
-    /// `stop` only ever looks at the lock file.
-    #[test]
-    fn stop_never_treats_monitor_pid_as_a_signalling_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(203);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.monitor_pid = Some(std::process::id());
-        workflow::save_state(&state).unwrap();
-
-        stop(root, phase).expect(
-            "stop must succeed — a recorded monitor_pid alone must never be signalled or \
-             treated as a blocker",
-        );
-    }
-
     /// Task 3 behavior: no open gate, no lock file, and no persisted state
     /// at all — a phase that was never started — is a successful no-op.
     #[test]
@@ -8313,7 +8318,7 @@ mod tests {
             root,
             PhaseId::new(7),
             "stage_launched",
-            serde_json::json!({"stage": "code", "agent": "claude", "monitor_pid": 1}),
+            serde_json::json!({"stage": "code", "agent": "claude", "supervisor_pid": 1}),
         );
         // events::emit always stamps `ts` with the current time; rewrite it
         // to a fixed, known-past value so the assertion is deterministic
@@ -9734,18 +9739,20 @@ mod tests {
     }
 
     /// Task 1's tracer (CR-01, 999.44/DEN-68): one discovery pass names
-    /// a live `monitor_pid`-recorded pid, a live lock-holder pid, and a
-    /// genuine orphan under no registered root at all. Only the orphan
-    /// may survive `unreachable_stray_candidates`'s filter. All three
-    /// pids are real, spawned processes crossed through
+    /// a live lock-holder pid and a genuine orphan under no registered root
+    /// at all. Only the orphan may survive `unreachable_stray_candidates`'s
+    /// filter. Both pids are real, spawned processes crossed through
     /// `wait_for_exec_visibility` — not synthesised numbers — so the
     /// census and the filter are both exercised for real, in one pass.
+    ///
+    /// A third, state-recorded fixture (a pid in the state's monitor-pid
+    /// field) was removed with that input (50-22): lock holders are the
+    /// only reachable source, because the census cannot match a 3.x
+    /// supervisor (`agent::tests::the_stray_census_matches_only_the_2x_process_shapes`).
     #[test]
     fn reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates() {
-        let mut state_child = spawn_wrapper_shaped_fixture();
         let mut lock_child = spawn_wrapper_shaped_fixture();
         let mut orphan_child = spawn_wrapper_shaped_fixture();
-        let state_pid = state_child.id();
         let lock_pid = lock_child.id();
         let orphan_pid = orphan_child.id();
 
@@ -9753,22 +9760,19 @@ mod tests {
         let project_root_guard = tempfile::tempdir().unwrap();
         let project_root = project_root_guard.path().to_path_buf();
 
-        // Phase 1: a real `State` naming `state_pid` as its monitor.
-        let mut state = State::new(
+        // Phase 1: a real `State` with no lock, the registered phase.
+        let state = State::new(
             PhaseId::new(1),
             AgentKind::Claude,
             Mode::Auto,
             project_root.clone(),
         );
-        state.monitor_pid = Some(state_pid);
         workflow::save_state(&state).unwrap();
 
         // Phase 2: a real `State` (so `list_states` enumerates the
         // phase at all — mirrors real operation, where a phase with an
-        // active lock also has a persisted state), deliberately with NO
-        // `monitor_pid`, so this phase's only path into the reachable
-        // set is the lock file below, not the monitor_pid path Phase 1
-        // already exercises.
+        // active lock also has a persisted state), whose only path into
+        // the reachable set is the lock file below.
         let state_2 = State::new(
             PhaseId::new(2),
             AgentKind::Claude,
@@ -9807,10 +9811,6 @@ mod tests {
 
         let reachable = registry_reachable_pids(&registered_roots);
         assert!(
-            reachable.contains(&state_pid),
-            "state_pid must be reachable via its recorded monitor_pid"
-        );
-        assert!(
             reachable.contains(&lock_pid),
             "lock_pid must be reachable via the lock file's holder_identity"
         );
@@ -9823,11 +9823,7 @@ mod tests {
         // Without this, the test could pass vacuously because the
         // census never saw the fixtures at all (T-25-15-11).
         let census = agent::discover_stray_devflow_processes();
-        for (pid, label) in [
-            (state_pid, "state"),
-            (lock_pid, "lock"),
-            (orphan_pid, "orphan"),
-        ] {
+        for (pid, label) in [(lock_pid, "lock"), (orphan_pid, "orphan")] {
             assert!(
                 census.iter().any(|p| p.pid == pid),
                 "the {label} fixture (pid {pid}) must be part of the real /proc census"
@@ -9840,10 +9836,6 @@ mod tests {
             "the orphan must survive the filter"
         );
         assert!(
-            !retained.iter().any(|p| p.pid == state_pid),
-            "the state-named pid must be filtered out"
-        );
-        assert!(
             !retained.iter().any(|p| p.pid == lock_pid),
             "the lock-held pid must be filtered out"
         );
@@ -9854,25 +9846,20 @@ mod tests {
             "the orphan must produce a finding"
         );
         assert!(
-            !findings.iter().any(|f| f.pid == state_pid),
-            "the state-named pid must produce no finding"
-        );
-        assert!(
             !findings.iter().any(|f| f.pid == lock_pid),
             "the lock-held pid must produce no finding"
         );
 
-        // Reap all three with a VERIFIED signal, never a bare one
+        // Reap both with a VERIFIED signal, never a bare one
         // (mirrors `reap_strays_e2e.rs:202-223`'s own teardown), plus a
         // final `wait()` on each to reclaim the zombie regardless.
-        for pid in [state_pid, lock_pid, orphan_pid] {
+        for pid in [lock_pid, orphan_pid] {
             agent::terminate_and_verify(
                 pid,
                 agent::TERMINATE_VERIFY_WAIT,
                 agent::TERMINATE_VERIFY_POLL,
             );
         }
-        let _ = state_child.wait();
         let _ = lock_child.wait();
         let _ = orphan_child.wait();
     }
@@ -9893,13 +9880,21 @@ mod tests {
         let mut child = spawn_wrapper_shaped_fixture();
         let pid = child.id();
 
-        let mut state = State::new(PhaseId::new(1), AgentKind::Claude, Mode::Auto, root.clone());
-        state.monitor_pid = Some(pid);
+        let state = State::new(PhaseId::new(1), AgentKind::Claude, Mode::Auto, root.clone());
         workflow::save_state(&state).unwrap();
+        // The pid's path into the reachable set: a lock file naming it as
+        // holder, in the `.devflow/lock-{phase:02}` shape (pid, start time).
+        let start_time = agent::process_start_time(pid)
+            .expect("must read the lock fixture's own recorded start time");
+        std::fs::write(
+            root.join(".devflow").join("lock-01"),
+            format!("{pid}\n{start_time}"),
+        )
+        .unwrap();
 
         assert!(
             registry_reachable_pids(std::slice::from_ref(&root)).contains(&pid),
-            "the pid must be reachable while its root and state file still exist"
+            "the pid must be reachable while its root, state file and lock file still exist"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
