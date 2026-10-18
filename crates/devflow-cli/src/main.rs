@@ -26,7 +26,7 @@ mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
     logs, recover_cmd, reference, release_check, release_verify, resolve_gate_target, start,
-    status, stop, test_cmd,
+    status, stop, stop_launch, test_cmd,
 };
 use devflow_core::phase_id::PhaseId;
 
@@ -352,18 +352,22 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// End a running phase cleanly (23c): answers its open gate with a
-    /// rejection if one is open — the target unwinds through its own abort
-    /// path, no signal sent — otherwise signals the process recorded in its
-    /// per-phase lock file (`.devflow/lock-{phase:02}`), never
-    /// `state.monitor_pid` (the PID `devflow status` displays, and the
-    /// wrong one — see `commands::stop`'s doc comment). Idempotent: safe to
+    /// End a running phase cleanly: answers its open gate with a rejection
+    /// when a live waiter holds it; otherwise addresses the run's supervisor
+    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE, the
+    /// per-phase lock holder when GONE. `--launch <id>` tears down only the
+    /// socket with that launch id (the form `devflow doctor` prints for an
+    /// orphan). Never signals a pid recorded in state. Idempotent: safe to
     /// run against an already-stopped, never-started, or already-dead
     /// phase.
     Stop {
         /// Phase to stop.
         #[arg(long)]
         phase: PhaseId,
+        /// Tear down only the supervisor socket with this launch id; answers
+        /// no gate, signals no lock holder and writes no state.
+        #[arg(long)]
+        launch: Option<String>,
         /// Project root. Overrides the positional argument when supplied.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -740,9 +744,16 @@ fn run() -> Result<(), CliError> {
         } => ship_override(&project_root(project)?, phase, force),
         Command::Stop {
             phase,
+            launch,
             root,
             project,
-        } => stop(&project_root(root.unwrap_or(project))?, phase),
+        } => {
+            let root = project_root(root.unwrap_or(project))?;
+            match launch {
+                Some(launch_id) => stop_launch(&root, phase, &launch_id),
+                None => stop(&root, phase),
+            }
+        }
         Command::Evidence {
             phase,
             json,

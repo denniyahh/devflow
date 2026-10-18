@@ -2028,6 +2028,223 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
     }
 }
 
+/// `devflow stop --phase N --launch <id>` (D-06): tear down only the
+/// supervisor socket with that launch id, the form `devflow doctor` prints
+/// for an orphan. The launch id is the address, so a deleted root's orphan
+/// is reachable from any directory.
+///
+/// The socket is the one whose sidecar carries `<id>`, or, when its sidecar
+/// is missing or does not parse, whose file name carries it (RV-05b). If this
+/// project's state loads and records that same launch, the plain [`stop`]
+/// runs. Otherwise only that socket is acted on: no gate is answered, no
+/// lock holder signalled and no state written.
+pub(crate) fn stop_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+) -> Result<(), CliError> {
+    let cache_dir = registry::cache_dir().ok_or_else(|| {
+        CliError::Message(
+            "stop: no cache directory (set HOME, XDG_CACHE_HOME or DEVFLOW_CACHE_DIR), so no \
+             supervisor socket can be found by launch id"
+                .to_string(),
+        )
+    })?;
+    stop_launch_in(project_root, phase, launch_id, &cache_dir)
+}
+
+/// [`stop_launch`] against the sockets under `cache_dir`.
+fn stop_launch_in(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    cache_dir: &Path,
+) -> Result<(), CliError> {
+    let Some(entry) = find_launch(cache_dir, launch_id)? else {
+        println!("stop: no supervisor socket with launch id {launch_id}; nothing to stop");
+        return Ok(());
+    };
+    check_launch_belongs(project_root, phase, launch_id, &entry, cache_dir)?;
+    let recorded = workflow::load_state(project_root, phase).is_ok_and(|state| {
+        state
+            .supervisor
+            .is_some_and(|record| record.launch_id == launch_id)
+    });
+    if recorded {
+        return stop_in(project_root, phase, Some(cache_dir));
+    }
+    stop_one_launch(launch_id, &entry)
+}
+
+/// The one socket under `cache_dir` whose sidecar carries `launch_id`, or,
+/// with no usable sidecar, whose file name does. Two such sockets are a
+/// refusal: the id no longer names one launch.
+fn find_launch(
+    cache_dir: &Path,
+    launch_id: &str,
+) -> Result<Option<supervisor::SweepEntry>, CliError> {
+    let mut matches: Vec<supervisor::SweepEntry> = supervisor::sweep_in(cache_dir)
+        .into_iter()
+        .filter(|entry| match &entry.sidecar {
+            Some(sidecar) => sidecar.launch_id == launch_id,
+            None => entry.launch_id_in_name.as_deref() == Some(launch_id),
+        })
+        .collect();
+    if matches.len() > 1 {
+        let paths: Vec<String> = matches
+            .iter()
+            .map(|entry| entry.socket_path.display().to_string())
+            .collect();
+        return Err(CliError::Message(format!(
+            "stop: launch id {launch_id} names {} sockets ({}); nothing was changed",
+            matches.len(),
+            paths.join(", ")
+        )));
+    }
+    Ok(matches.pop())
+}
+
+/// Refuse a launch that is not this project's phase `phase`, changing
+/// nothing. A parsed sidecar decides: its phase must be `phase`, and its
+/// project root must be this one or no longer exist (a deleted root's
+/// orphan). With no usable sidecar, the socket must be one
+/// [`supervisor::sweep_for_in`] attributes to this root and phase by its
+/// file name.
+fn check_launch_belongs(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    entry: &supervisor::SweepEntry,
+    cache_dir: &Path,
+) -> Result<(), CliError> {
+    let refuse = |why: String| {
+        Err(CliError::Message(format!(
+            "stop: launch {launch_id} {why}; nothing was changed"
+        )))
+    };
+    match &entry.sidecar {
+        Some(sidecar) if sidecar.phase != phase => {
+            refuse(format!("belongs to phase {}, not {phase}", sidecar.phase))
+        }
+        Some(sidecar) if sidecar.project_root != project_root && sidecar.project_root.is_dir() => {
+            refuse(format!(
+                "belongs to project {}, not {}; run stop from that project",
+                sidecar.project_root.display(),
+                project_root.display()
+            ))
+        }
+        Some(_) => Ok(()),
+        None => {
+            let ours = supervisor::sweep_for_in(cache_dir, project_root, phase)
+                .iter()
+                .any(|candidate| candidate.socket_path == entry.socket_path);
+            if ours {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "has no usable sidecar, and its socket file name {} names another project \
+                     or phase than {} phase {phase}",
+                    entry.socket_path.display(),
+                    project_root.display()
+                ))
+            }
+        }
+    }
+}
+
+/// Act on one launch's socket alone: ALIVE → `shutdown` (a `handed_off`
+/// answer is reported, never retried against the successor); STALE → the
+/// backstop with its parsed sidecar and no state record, or a refusal when
+/// it has none; GONE → nothing to stop; a probe error → a refusal.
+fn stop_one_launch(launch_id: &str, entry: &supervisor::SweepEntry) -> Result<(), CliError> {
+    let subject = format!("launch {launch_id}");
+    let socket = &entry.socket_path;
+    match supervisor::probe(socket) {
+        Ok(supervisor::Liveness::Gone) => {
+            println!(
+                "stop: {subject}: socket {} is gone; nothing to stop",
+                socket.display()
+            );
+            Ok(())
+        }
+        Err(error) => Err(CliError::Message(format!(
+            "stop: {subject}: could not probe socket {} ({}: {error}); nothing was signalled, \
+             removed or recorded",
+            socket.display(),
+            probe_error_kind(&error)
+        ))),
+        Ok(supervisor::Liveness::Stale) => stop_stale_launch(&subject, entry),
+        Ok(supervisor::Liveness::Alive(_)) => shutdown_one_launch(&subject, entry),
+    }
+}
+
+/// [`stop_one_launch`]'s ALIVE arm. A request that errors is probed once
+/// more, as [`shutdown_supervisor`] does: STALE goes to the backstop, GONE
+/// leaves nothing to stop.
+fn shutdown_one_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<(), CliError> {
+    let socket = &entry.socket_path;
+    let error = match supervisor::request_shutdown(socket, shutdown_final_timeout()) {
+        Ok(supervisor::ShutdownOutcome::Stopped {
+            exit_code,
+            advance_suppressed,
+        }) => {
+            let advance = if advance_suppressed {
+                "advance suppressed"
+            } else {
+                "advance not suppressed"
+            };
+            println!(
+                "stop: stopped {subject} through its supervisor (agent group ended, exit code \
+                 {exit_code}, {advance})"
+            );
+            return Ok(());
+        }
+        Ok(supervisor::ShutdownOutcome::HandedOff) => {
+            println!("stop: {subject} already handed off to its successor; nothing stopped");
+            return Ok(());
+        }
+        Ok(other) => {
+            return Err(CliError::Message(format!(
+                "stop: {subject}: the supervisor did not stop ({other:?}); nothing was recorded"
+            )));
+        }
+        Err(error) => error,
+    };
+    match supervisor::probe(socket) {
+        Ok(supervisor::Liveness::Stale) => stop_stale_launch(subject, entry),
+        Ok(supervisor::Liveness::Gone) => {
+            println!(
+                "stop: {subject}: socket {} went away under the shutdown request ({error}); \
+                 nothing left to stop",
+                socket.display()
+            );
+            Ok(())
+        }
+        _ => Err(CliError::Message(format!(
+            "stop: {subject}: the supervisor at {} did not answer the shutdown ({error}); \
+             nothing was signalled or recorded",
+            socket.display()
+        ))),
+    }
+}
+
+/// [`stop_one_launch`]'s STALE arm: the backstop with the sidecar the sweep
+/// parsed and no state record, or, with no usable sidecar, a refusal that
+/// signals and removes nothing (RV-05b): there is no pgid, start time or
+/// boot id to validate.
+fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<(), CliError> {
+    let Some(sidecar) = &entry.sidecar else {
+        let why = entry.sidecar_error.as_ref().map_or_else(
+            || "its sidecar is missing".to_string(),
+            |error| format!("its sidecar is unusable ({error})"),
+        );
+        return Err(stale_refusal(subject, &entry.socket_path, &why));
+    };
+    let socket = supervisor::SocketPath::new(entry.socket_path.clone())
+        .map_err(|error| stale_refusal(subject, &entry.socket_path, &error.to_string()))?;
+    run_backstop(subject, &socket, sidecar, None, None)
+}
+
 /// How long `stop` waits for a supervisor's final shutdown line: the
 /// supervisor's own terminate-and-verify wait, twice, plus time to persist.
 fn shutdown_final_timeout() -> std::time::Duration {
@@ -2326,7 +2543,13 @@ fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<(), CliE
     let socket = supervisor::SocketPath::new(located.socket.clone())
         .map_err(|error| stale_refusal(&subject, &located.socket, &error.to_string()))?;
     let sidecar = read_stale_sidecar(&subject, &socket)?;
-    run_backstop(phase, &subject, &socket, &sidecar, located.record.as_ref())
+    run_backstop(
+        &subject,
+        &socket,
+        &sidecar,
+        located.record.as_ref(),
+        Some(phase),
+    )
 }
 
 /// The sidecar of a STALE socket, or the refusal that names why it cannot be
@@ -2361,14 +2584,16 @@ fn stale_refusal(subject: &str, socket: &Path, why: &str) -> CliError {
 
 /// Run the backstop on a STALE socket and report what it did. A group it
 /// ended, or one it proved gone (previous boot, empty group, recycled
-/// leader, R-8), is a stop; a refusal prints the backstop's own text (the
+/// leader), is a stop; a refusal prints the backstop's own text (the
 /// members, the residual F1 limit, the inspection command) and fails.
+/// `resumable` names the phase a teardown that signalled nothing leaves
+/// resumable (R-8); a targeted stop of a superseded launch passes `None`.
 fn run_backstop(
-    phase: PhaseId,
     subject: &str,
     socket: &supervisor::SocketPath,
     sidecar: &supervisor::Sidecar,
     record: Option<&SupervisorRecord>,
+    resumable: Option<PhaseId>,
 ) -> Result<(), CliError> {
     use supervisor::backstop::{BackstopDecision, BackstopOutcome};
     let outcome =
@@ -2398,9 +2623,12 @@ fn run_backstop(
                 BackstopDecision::LeaderRecycled => "recycled leader",
                 _ => "nothing to signal",
             };
+            let resume = resumable.map_or_else(String::new, |phase| {
+                format!("; the phase is resumable: run `devflow resume --phase {phase}`")
+            });
             println!(
-                "stop: {subject}: nothing was running ({why}); removed the stale socket {}; the \
-                 phase is resumable: run `devflow resume --phase {phase}`",
+                "stop: {subject}: nothing was running ({why}); removed the stale socket {} and its \
+                 sidecar{resume}",
                 socket.as_path().display()
             );
             Ok(())
@@ -3255,6 +3483,37 @@ fn print_open_branches(project_root: &Path) {
     }
 }
 
+/// `recover --clean --phase N` is a file cleaner, not a teardown (D-06): it
+/// refuses while the phase's supervisor answers ALIVE, found through the
+/// state's record, or, when the state is missing or does not load, through
+/// the sidecars of this root and phase. Nothing is deleted.
+fn refuse_a_live_supervisor(
+    project_root: &Path,
+    phase: PhaseId,
+    cache_dir: Option<&Path>,
+) -> Result<(), CliError> {
+    let is_alive = |liveness: &Result<supervisor::Liveness, supervisor::ProbeError>| {
+        matches!(liveness, Ok(supervisor::Liveness::Alive(_)))
+    };
+    let alive = match workflow::load_state(project_root, phase) {
+        Ok(state) => state
+            .supervisor
+            .is_some_and(|record| is_alive(&supervisor::probe(&record.socket_path))),
+        Err(_) => cache_dir.is_some_and(|cache_dir| {
+            supervisor::sweep_for_in(cache_dir, project_root, phase)
+                .iter()
+                .any(|entry| is_alive(&entry.liveness))
+        }),
+    };
+    if alive {
+        return Err(CliError::Message(format!(
+            "phase {phase} has a live supervisor; run `devflow stop --phase {phase}` first — \
+             recover --clean deleted nothing"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn recover_cmd(
     project_root: &Path,
     do_clean: bool,
@@ -3267,6 +3526,7 @@ pub(crate) fn recover_cmd(
             // recorded, 999.128). A live, identity-confirmed holder still
             // refuses, so a wedged live run needs `devflow stop` first.
             Some(phase) => {
+                refuse_a_live_supervisor(project_root, phase, registry::cache_dir().as_deref())?;
                 let report = match recover::clean_phase_report(project_root, phase) {
                     Ok(report) => report,
                     Err(recover::RecoverError::Lock(lock::LockError::Contended {
