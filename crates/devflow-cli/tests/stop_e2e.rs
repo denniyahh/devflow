@@ -1750,3 +1750,355 @@ fn stop_reports_a_probe_error_and_never_runs_the_backstop() {
     common::signal_group(pgid, libc::SIGKILL);
     let _ = group.wait();
 }
+
+/// What a planted orphan socket has beside it.
+enum OrphanSidecar {
+    /// The live run's sidecar, round-tripped through serde with this launch
+    /// id and the identity of a test child already reaped.
+    Parsed,
+    /// A sidecar file that does not parse.
+    Broken,
+    /// No sidecar file.
+    Missing,
+}
+
+/// Plant a STALE socket for the run's root and phase with launch id `id`
+/// (a listener bound and dropped) and the sidecar `kind` describes. Returns
+/// the socket path.
+fn plant_stale_orphan(run: &LiveRun, id: &str, kind: OrphanSidecar) -> PathBuf {
+    let socket =
+        supervisor::SocketPath::for_launch(&run.home.cache_dir(), &run.root, run.phase, id)
+            .expect("the orphan socket path fits sun_path");
+    drop(supervisor::publish(&socket).expect("publish the orphan socket"));
+    let path = socket.as_path().to_path_buf();
+    assert!(
+        matches!(supervisor::probe(&path), Ok(Liveness::Stale)),
+        "the planted orphan {id} is STALE"
+    );
+    match kind {
+        OrphanSidecar::Parsed => {
+            let mut reaped = Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a child to reap");
+            let start =
+                devflow_core::agent::process_start_time(reaped.id()).expect("its start time");
+            common::kill_and_reap(&mut reaped);
+            let live = supervisor::read_sidecar(&run.record.socket_path.with_extension("json"))
+                .expect("the live run's sidecar");
+            let mut value = serde_json::to_value(&live).unwrap();
+            value["launch_id"] = serde_json::json!(id);
+            value["agent_pid"] = serde_json::json!(reaped.id());
+            value["agent_pgid"] = serde_json::json!(reaped.id());
+            value["agent_start_time"] = serde_json::json!(start);
+            std::fs::write(socket.sidecar_path(), value.to_string()).unwrap();
+            supervisor::read_sidecar(&socket.sidecar_path()).expect("the planted sidecar parses");
+        }
+        OrphanSidecar::Broken => std::fs::write(socket.sidecar_path(), "{").unwrap(),
+        OrphanSidecar::Missing => {}
+    }
+    path
+}
+
+/// The socket and sidecar of `socket` both exist.
+fn launch_files_present(socket: &Path) -> bool {
+    socket.exists() && socket.with_extension("json").exists()
+}
+
+/// The run's supervisor answers ping with its own launch id.
+fn alive_as(run: &LiveRun) -> bool {
+    matches!(run.probe(), Liveness::Alive(reply) if reply.launch_id == run.record.launch_id)
+}
+
+/// D-06 / T-50-53: `stop --launch <id>` tears down exactly the socket with
+/// that launch id. A non-matching id and a phase mismatch change nothing;
+/// the matching id removes the superseded orphan A and leaves the live run B
+/// running, its state unstopped and no gate answered.
+#[test]
+fn stop_with_a_launch_id_tears_down_only_that_socket() {
+    let run = LiveRun::start(PhaseId::new(146));
+    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let other_phase = PhaseId::new(147).to_string();
+
+    let nope = run.stop(&["--launch", "nope"]);
+    assert!(nope.status.success(), "{}", describe(&nope));
+    assert!(
+        String::from_utf8_lossy(&nope.stdout).contains("nothing to stop"),
+        "a non-matching id says nothing matched: {}",
+        describe(&nope)
+    );
+    assert!(launch_files_present(&orphan) && alive_as(&run));
+
+    let mismatch = common::hermetic_devflow(&run.home)
+        .args(["stop", "--phase", &other_phase, "--launch", "orphan-a"])
+        .current_dir(&run.root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        !mismatch.status.success(),
+        "a phase mismatch is refused: {}",
+        describe(&mismatch)
+    );
+    assert!(launch_files_present(&orphan) && alive_as(&run));
+
+    let output = run.stop(&["--launch", "orphan-a"]);
+    let text = describe(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("launch orphan-a"),
+        "stop names the launch it tore down: {text}"
+    );
+    assert!(
+        !orphan.exists() && !orphan.with_extension("json").exists(),
+        "A's socket and sidecar are removed: {text}"
+    );
+    assert!(alive_as(&run), "B still answers with its own launch id");
+    assert!(
+        !group_members(run.record.agent_pgid).is_empty(),
+        "B's agent group is alive"
+    );
+    let state = devflow_core::workflow::load_state(&run.root, run.phase).unwrap();
+    assert!(!state.stopped, "a targeted stop records nothing");
+    assert!(
+        !Gates::response_path(&run.root, run.phase, Stage::Define).exists(),
+        "a targeted stop answers no gate"
+    );
+}
+
+/// The control for the targeted form: the same fixture with a bare
+/// `devflow stop --phase N` stops the run the state records (B) and leaves
+/// the superseded socket A, so the two forms address different sockets.
+#[test]
+fn bare_stop_addresses_the_state_record_and_leaves_a_superseded_socket() {
+    let run = LiveRun::start(PhaseId::new(148));
+    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+
+    let output = run.stop(&[]);
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(run.probe(), Liveness::Gone, "B is stopped");
+    assert!(
+        devflow_core::workflow::load_state(&run.root, run.phase)
+            .unwrap()
+            .stopped
+    );
+    assert!(
+        launch_files_present(&orphan),
+        "the superseded socket A is untouched"
+    );
+}
+
+/// D-06: `recover --clean` is a file cleaner and refuses a run whose
+/// supervisor is ALIVE, deleting nothing.
+#[test]
+fn recover_clean_refuses_while_the_supervisor_is_alive() {
+    let run = LiveRun::start(PhaseId::new(149));
+    let gate =
+        devflow_core::gates::Gates::write_gate(&run.root, run.phase, Stage::Define, "planted gate")
+            .expect("plant a gate file");
+    let gate_bytes = std::fs::read(&gate).unwrap();
+    let state_bytes = std::fs::read(run.state_file()).unwrap();
+
+    let output = common::hermetic_devflow(&run.home)
+        .args(["recover", "--clean", "--phase", &run.phase.to_string()])
+        .current_dir(&run.root)
+        .output()
+        .expect("run devflow recover");
+    let text = describe(&output);
+    assert!(!output.status.success(), "a live run is refused: {text}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("devflow stop --phase {}", run.phase)),
+        "the refusal names the stop verb: {text}"
+    );
+    assert_eq!(std::fs::read(run.state_file()).unwrap(), state_bytes);
+    assert_eq!(std::fs::read(&gate).unwrap(), gate_bytes);
+    assert!(alive_as(&run), "the run is untouched");
+}
+
+/// The `devflow stop ... --launch <id>` line `stop` printed for `id`, as
+/// arguments after the program name.
+fn printed_launch_line(output: &std::process::Output, id: &str) -> Vec<String> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let wanted = format!("--launch {id}");
+    let line = stderr
+        .lines()
+        .find(|line| line.trim_end().ends_with(&wanted))
+        .unwrap_or_else(|| panic!("no printed line ends with `{wanted}`:\n{stderr}"));
+    let command = &line[line
+        .find("devflow stop")
+        .expect("the line holds the command")..];
+    command
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// T-50-65: several live sockets of one root and phase with a state file
+/// that does not load are a refusal listing each `--launch` form, acting on
+/// neither. The printed line for B, run as printed, then stops B and leaves
+/// the corrupt state bytes unchanged.
+#[test]
+fn stop_refuses_several_sockets_when_the_state_will_not_load() {
+    let run = LiveRun::start(PhaseId::new(150));
+    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    std::fs::write(run.state_file(), b"{ this is not json").unwrap();
+    let corrupt = std::fs::read(run.state_file()).unwrap();
+    let b_id = run.record.launch_id.clone();
+
+    let refused = run.stop(&[]);
+    let text = describe(&refused);
+    assert!(!refused.status.success(), "several sockets: {text}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    for id in [b_id.as_str(), "orphan-a"] {
+        assert!(
+            stderr.contains(&format!("devflow stop --phase {} --launch {id}", run.phase)),
+            "the refusal lists the --launch form for {id}: {text}"
+        );
+    }
+    assert!(alive_as(&run) && launch_files_present(&orphan), "{text}");
+
+    let args = printed_launch_line(&refused, &b_id);
+    let output = common::hermetic_devflow(&run.home)
+        .args(&args)
+        .current_dir(&run.root)
+        .output()
+        .expect("run the printed line");
+    assert!(
+        output.status.success(),
+        "the printed repair works: {args:?}\n{}",
+        describe(&output)
+    );
+    assert_eq!(run.probe(), Liveness::Gone, "B is stopped");
+    assert!(launch_files_present(&orphan), "A is untouched");
+    assert_eq!(std::fs::read(run.state_file()).unwrap(), corrupt);
+}
+
+/// RV-05b (V-39): with both the state and B's sidecar unparseable, the
+/// refusal names B by the launch id in its file name; a non-matching id and
+/// a wrong phase change nothing; the printed `--launch` line stops B and its
+/// agent group, leaving A and the corrupt state bytes alone.
+#[test]
+fn stop_with_a_launch_id_stops_a_live_socket_whose_sidecar_will_not_parse() {
+    let run = LiveRun::start(PhaseId::new(151));
+    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let sidecar_path = run.record.socket_path.with_extension("json");
+    let sidecar = supervisor::read_sidecar(&sidecar_path).expect("B's sidecar");
+    let (pgid, start) = (sidecar.agent_pgid, sidecar.agent_start_time);
+    let b_id = run.record.launch_id.clone();
+    assert!(
+        run.record
+            .socket_path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|stem| stem.ends_with(&format!("-{b_id}"))),
+        "B's launch id is the last segment of its file name"
+    );
+    std::fs::write(run.state_file(), b"{ this is not json").unwrap();
+    std::fs::write(&sidecar_path, b"{ nor is this").unwrap();
+    let corrupt = std::fs::read(run.state_file()).unwrap();
+
+    let refused = run.stop(&[]);
+    let text = describe(&refused);
+    assert!(!refused.status.success(), "{text}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let b_line = format!("devflow stop --phase {} --launch {b_id}", run.phase);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains(&b_line) && line.contains("sidecar does not parse")),
+        "B is listed by its file name's launch id, marked unparseable: {text}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "devflow stop --phase {} --launch orphan-a",
+            run.phase
+        )),
+        "{text}"
+    );
+    assert!(alive_as(&run) && launch_files_present(&orphan));
+
+    let nope = run.stop(&["--launch", "nope"]);
+    assert!(nope.status.success(), "{}", describe(&nope));
+    assert!(String::from_utf8_lossy(&nope.stdout).contains("nothing to stop"));
+    assert!(alive_as(&run), "a non-matching id leaves B running");
+
+    let wrong_phase = common::hermetic_devflow(&run.home)
+        .args([
+            "stop",
+            "--phase",
+            &PhaseId::new(152).to_string(),
+            "--launch",
+            &b_id,
+        ])
+        .current_dir(&run.root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        !wrong_phase.status.success(),
+        "B's file name names phase {}: {}",
+        run.phase,
+        describe(&wrong_phase)
+    );
+    assert!(alive_as(&run), "a wrong phase leaves B running");
+
+    assert!(
+        devflow_core::agent::is_same_process(pgid, start),
+        "precondition: B's agent leader {pgid} is the recorded process"
+    );
+    let args = printed_launch_line(&refused, &b_id);
+    let output = common::hermetic_devflow(&run.home)
+        .args(&args)
+        .current_dir(&run.root)
+        .output()
+        .expect("run the printed line");
+    assert!(output.status.success(), "{args:?}\n{}", describe(&output));
+    assert_eq!(run.probe(), Liveness::Gone, "B is stopped");
+    let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
+    assert!(
+        holds_within(Duration::from_secs(5), || {
+            // SAFETY: signal 0 checks for existence and sends nothing.
+            let rc = unsafe { libc::kill(-signed, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }),
+        "B's agent group {pgid} is gone"
+    );
+    assert!(launch_files_present(&orphan), "A is untouched");
+    assert_eq!(std::fs::read(run.state_file()).unwrap(), corrupt);
+}
+
+/// RV-05b (V-40): a STALE socket with no usable sidecar has no identity to
+/// validate, so `--launch` refuses it with nothing signalled or removed,
+/// for a sidecar that does not parse and for a missing one. Control: a STALE
+/// socket whose sidecar parses, in the same fixture, is torn down.
+#[test]
+fn stop_with_a_launch_id_refuses_a_stale_socket_without_a_usable_sidecar() {
+    let run = LiveRun::start(PhaseId::new(153));
+    let a = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let c = plant_stale_orphan(&run, "orphan-c", OrphanSidecar::Broken);
+    let d = plant_stale_orphan(&run, "orphan-d", OrphanSidecar::Missing);
+
+    for (id, socket, why) in [
+        ("orphan-c", &c, "does not parse"),
+        ("orphan-d", &d, "missing"),
+    ] {
+        let output = run.stop(&["--launch", id]);
+        let text = describe(&output);
+        assert!(!output.status.success(), "{id} is refused: {text}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("STALE") && stderr.contains(why) && stderr.contains("signals nothing"),
+            "{id}: the refusal says STALE, why the sidecar is unusable, and that nothing is \
+             signalled: {text}"
+        );
+        assert!(socket.exists(), "{id}'s socket is kept");
+        assert!(alive_as(&run), "B is untouched");
+    }
+    assert_eq!(std::fs::read(c.with_extension("json")).unwrap(), b"{");
+    assert!(!d.with_extension("json").exists());
+
+    let output = run.stop(&["--launch", "orphan-a"]);
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(!a.exists() && !a.with_extension("json").exists());
+    assert!(alive_as(&run), "B is untouched");
+}
