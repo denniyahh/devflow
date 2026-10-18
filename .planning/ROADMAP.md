@@ -1859,8 +1859,20 @@ reach any other test. That deletes the class outright and makes the enumeration 
    in one shared process and assert no monitors leaked. Under per-test isolation it runs alone,
    sees `alive=[], in_flight=0, registered=0`, and reports a false leak. It needs redesigning, and
    simply excluding it would delete a real leak check the repo relies on.
+   *Update 2026-10-17 (Phase 50, `5a63052`, operator decision):* the audit now returns early when
+   `NEXTEST` is set and still runs under `cargo test`; run alone under `cargo test` it still fails
+   at its deadline, so the check is kept. Redesigning it for per-test isolation is still open.
 2. **6 tests are flagged "leaky"** by nextest (processes outliving the test). Untraced. Each is
    either a latent defect nextest surfaces and `cargo test` hides, or noise — nobody has looked.
+   *Evidence 2026-10-17/18 (Phase 50, operator asked to backlog it here):* they are real, not
+   noise. Every full `cargo test` run in Phase 50 left 1-4 orphaned `sleep 30` processes
+   reparented to systemd, each carrying this repo's `CARGO_MANIFEST_DIR` (devflow-core and
+   devflow) in `/proc/<pid>/environ`; they were killed by recorded PID after each wave. Tests
+   nextest named as leaky in that time:
+   `commands::tests::reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates`
+   (left four `sleep 30` once), `commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`,
+   and `agent::tests::discover_stray_devflow_processes_finds_a_monitor_wrapper`. Not traced
+   further: which fixture spawns them without a reap guard.
 
 **Also in scope:** adopting it changes the gate itself (`scripts/check.sh:19,48` and the four
 `.github/workflows/ci.yml` jobs), so it needs a flag-parity audit (`--no-fail-fast` semantics, CI
