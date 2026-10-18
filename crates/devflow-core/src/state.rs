@@ -24,8 +24,9 @@ use crate::stage::Stage;
 /// state files written by older binaries still load.
 ///
 /// This exists because `State` accumulates a field roughly every phase that
-/// adds a run-scoped concept (`worktree_path`, `monitor_pid`, `stop_until`,
-/// `yes_ship`, and — in phase 28 — `session_id` and `checkpoint_resumes`).
+/// adds a run-scoped concept (`worktree_path`, `stop_until`, `yes_ship`, in
+/// phase 28 `session_id` and `checkpoint_resumes`, and in phase 50
+/// `supervisor`).
 /// Without `non_exhaustive`, each of those additions is a semver-breaking
 /// change for any consumer that used a struct literal, which would force a
 /// major bump for what is really an internal bookkeeping change. Paying that
@@ -279,13 +280,6 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
-    /// PID of the detached monitor process that owns the agent for the
-    /// current stage, recorded by `launch_stage` at spawn time. `None` means
-    /// no monitor has been spawned for this state yet, OR the state was
-    /// written by a binary predating this field — in both cases the
-    /// liveness probe reports Unknown, never Stuck.
-    #[serde(default)]
-    pub monitor_pid: Option<u32>,
     /// The published, ping-confirmed address of the supervisor that owns the
     /// current stage (D-04): its socket path, launch id, and the agent
     /// identity the stale-socket backstop validates. Written by the launcher,
@@ -642,7 +636,6 @@ impl State {
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
-            monitor_pid: None,
             supervisor: None,
             session_id: None,
             checkpoint_resumes: 0,
@@ -726,7 +719,7 @@ mod tests {
         assert_eq!(state.preflight_retries, 0);
         assert_eq!(state.phase_validate_failures, 0);
         assert!(!state.started_at.is_empty());
-        assert_eq!(state.monitor_pid, None);
+        assert_eq!(state.supervisor, None);
         assert_eq!(state.stop_until, None);
         assert!(!state.stopped);
         assert_eq!(state.stop_reason, None);
@@ -1226,26 +1219,41 @@ mod tests {
         assert_eq!(loaded_absent.preflight_retries, 0);
     }
 
-    /// `monitor_pid` round-trips through serde as an exact `u32` (18b).
+    /// The persisted JSON carries the `supervisor` record and no key for the
+    /// monitor pid field 50-16 removed (R-9): the socket record is the only
+    /// liveness source a state file holds. The removed key is built from
+    /// pieces so this file holds no quoted copy of it (T-50-43).
     #[test]
-    fn monitor_pid_round_trips_through_serde() {
+    fn persisted_state_carries_the_supervisor_and_no_monitor_pid_key() {
         let mut state = State::new(
             PhaseId::new(1),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        state.monitor_pid = Some(4242);
+        let record = SupervisorRecord::new(
+            PathBuf::from("/c/sock/0123456789abcdef-1-00000000000000ab.sock"),
+            "00000000000000ab".to_string(),
+            4242,
+            123_456,
+            "boot-id".to_string(),
+        );
+        state.supervisor = Some(record.clone());
         let json = serde_json::to_string(&state).unwrap();
         assert!(
-            json.contains("monitor_pid"),
-            "monitor_pid must appear in persisted JSON"
+            json.contains("\"supervisor\""),
+            "the supervisor key must appear in persisted JSON"
+        );
+        let removed_key = ["\"", concat!("monitor", "_pid"), "\""].concat();
+        assert!(
+            !json.contains(&removed_key),
+            "the removed monitor pid key must not appear in persisted JSON: {json}"
         );
         let loaded: State = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            loaded.monitor_pid,
-            Some(4242),
-            "monitor_pid must round-trip through serde"
+            loaded.supervisor,
+            Some(record),
+            "the supervisor record must round-trip through serde"
         );
     }
 
@@ -1290,25 +1298,8 @@ mod tests {
         assert_eq!(loaded.supervisor, None, "an absent key reads as None");
     }
 
-    /// A serde-absent `monitor_pid` (state written by a pre-18b binary) must
-    /// deserialize to `None`, not `Some(0)` — a `Some(0)` default would let a
-    /// pre-18b state file render as a monitor at pid 0.
-    #[test]
-    fn monitor_pid_absent_from_json_defaults_to_none() {
-        let json = r#"{
-            "stage": "code",
-            "phase": 1,
-            "agent": "claude",
-            "mode": "auto",
-            "started_at": "0",
-            "project_root": "/repo"
-        }"#;
-        let loaded: State = serde_json::from_str(json).unwrap();
-        assert_eq!(loaded.monitor_pid, None);
-    }
-
     /// `session_id` round-trips through serde as an exact `Option<String>`
-    /// (D-04, 28-02) — mirrors the `monitor_pid` pair above.
+    /// (D-04, 28-02) — mirrors the `supervisor` round-trip above.
     #[test]
     fn session_id_round_trips_through_serde() {
         let mut state = State::new(
@@ -1388,7 +1379,7 @@ mod tests {
 
     /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`
     /// — its own key appears in the persisted JSON, and a fresh deserialize
-    /// recovers the value set, mirroring the `monitor_pid` pair above.
+    /// recovers the value set, mirroring the `supervisor` round-trip above.
     #[test]
     fn yes_ship_round_trips_through_serde() {
         let mut state = State::new(

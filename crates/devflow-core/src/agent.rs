@@ -405,9 +405,9 @@ const ADVANCE_SUBCOMMAND: &str = "advance";
 /// found through its socket instead — `doctor`'s supervisor findings,
 /// including the deleted-root class this census used to cover — and ended
 /// with `devflow stop --phase N --launch <id>`. Do not add a `__monitor`
-/// matcher: a live supervisor's pid is in no reachability safety set once
-/// `monitor_pid` leaves it (50-22), so `--reap-strays` would treat every
-/// live run as a stray.
+/// matcher: a live supervisor's pid is in no reachability safety set, since
+/// the state records no monitor pid (50-22, 50-16), so `--reap-strays` would
+/// treat every live run as a stray.
 ///
 /// This is a pure, read-only survey: it never signals a process. Deciding
 /// whether to act on a result, and re-confirming identity immediately

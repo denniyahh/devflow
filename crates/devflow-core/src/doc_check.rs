@@ -78,6 +78,12 @@ fn read_files(paths: impl IntoIterator<Item = PathBuf>) -> String {
 }
 
 fn rust_source() -> String {
+    read_files(rust_file_paths())
+}
+
+/// Every `.rs` file under `<workspace>/crates`, both crates, src and tests,
+/// in sorted order.
+fn rust_file_paths() -> Vec<PathBuf> {
     fn visit(dir: &Path, files: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -95,7 +101,7 @@ fn rust_source() -> String {
     let mut files = Vec::new();
     visit(&workspace_root().join("crates"), &mut files);
     files.sort();
-    read_files(files)
+    files
 }
 
 fn extract_tokens(text: &str, prefix: &str, allowed: impl Fn(char) -> bool) -> Vec<String> {
@@ -497,5 +503,171 @@ fn devflow_core_dependency_pin_matches_workspace_version() {
     assert_eq!(
         parsed.workspace.dependencies.devflow_core.version, parsed.workspace.package.version,
         "workspace.dependencies.devflow-core's pinned version must match workspace.package.version"
+    );
+}
+
+/// The `State` field 50-16 removed (R-9), assembled from pieces so this file
+/// never holds the name contiguously and the scan below cannot flag itself.
+const REMOVED_STATE_FIELD: &str = concat!("monitor", "_pid");
+
+/// Lines that survive comment stripping, numbered from 1: a line whose trimmed
+/// start is `//` (doc comments included) is dropped.
+fn uncommented_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with("//"))
+        .map(|(index, line)| (index + 1, line))
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// True when `line`'s trimmed start is `pub ` plus `field`, followed by a
+/// non-identifier character (or nothing): the declaration, not a longer name.
+fn declares_pub_field(line: &str, field: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("pub ")
+        .and_then(|rest| rest.strip_prefix(field))
+        .is_some_and(|after| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_identifier_char(ch))
+        })
+}
+
+/// True when `line` holds `field` wrapped in double quotes — a JSON or event
+/// key — whether the closing quote is bare (`"k"`, raw strings, `json!`) or
+/// escaped inside an ordinary string literal (`"{\"k\": 1}"`).
+fn holds_quoted_key(line: &str, field: &str) -> bool {
+    let opened = ["\"", field].concat();
+    line.match_indices(&opened).any(|(start, _)| {
+        let after = &line[start + opened.len()..];
+        after.starts_with('"') || after.starts_with("\\\"")
+    })
+}
+
+/// Every place the removed field survives (T-50-43): (a) its `pub`
+/// declaration on an uncommented line of state.rs, (b) its quoted key on an
+/// uncommented line of any Rust file, (c) any mention in a snapshot file.
+fn removed_field_findings(
+    state_source: &str,
+    rust_files: &[(PathBuf, String)],
+    snapshots: &[(PathBuf, String)],
+) -> Vec<String> {
+    let field = REMOVED_STATE_FIELD;
+    let mut findings = Vec::new();
+    for (number, line) in uncommented_lines(state_source) {
+        if declares_pub_field(line, field) {
+            findings.push(format!("state.rs:{number}: declaration: {}", line.trim()));
+        }
+    }
+    for (path, text) in rust_files {
+        for (number, line) in uncommented_lines(text) {
+            if holds_quoted_key(line, field) {
+                findings.push(format!(
+                    "{}:{number}: quoted key: {}",
+                    path.display(),
+                    line.trim()
+                ));
+            }
+        }
+    }
+    for (path, text) in snapshots {
+        if text.contains(field) {
+            findings.push(format!("{}: snapshot mention", path.display()));
+        }
+    }
+    findings
+}
+
+fn read_labelled(paths: Vec<PathBuf>) -> Vec<(PathBuf, String)> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            (path, text)
+        })
+        .collect()
+}
+
+/// T-50-43: the socket is the only liveness source once `State`'s monitor
+/// pid field is gone (R-9, 50-16). The compiler proves no Rust code reads or
+/// writes the field; this scan covers what it cannot see — the declaration
+/// itself, a JSON or event key of that name in either crate, and a mention in
+/// the CLI's help snapshot. Planted controls prove each check decides.
+#[test]
+fn no_monitor_pid_field_json_key_or_help_mention_remains() {
+    let field = REMOVED_STATE_FIELD;
+    let none: &[(PathBuf, String)] = &[];
+    let planted = |text: String| vec![(PathBuf::from("planted.rs"), text)];
+
+    // (a) declaration: flagged; a longer name and a commented one are not.
+    let declared = ["    pub ", field, ": Option<u32>,"].concat();
+    assert_eq!(removed_field_findings(&declared, none, none).len(), 1);
+    let longer = ["    pub ", field, "_launch: Option<u32>,"].concat();
+    assert!(removed_field_findings(&longer, none, none).is_empty());
+    let commented = ["    // pub ", field, ": Option<u32>,"].concat();
+    let doc_commented = ["    /// pub ", field, ": Option<u32>,"].concat();
+    assert!(removed_field_findings(&commented, none, none).is_empty());
+    assert!(removed_field_findings(&doc_commented, none, none).is_empty());
+
+    // (b) quoted key: flagged on a code line, bare or escaped.
+    let raw_key = ["    let json = r#\"{\"", field, "\": 4242}\"#;"].concat();
+    assert_eq!(removed_field_findings("", &planted(raw_key), none).len(), 1);
+    let escaped_key = ["    let json = \"{\\\"", field, "\\\": 4242}\";"].concat();
+    assert_eq!(
+        removed_field_findings("", &planted(escaped_key), none).len(),
+        1
+    );
+    // ...and not on a comment line, as a local, in a helper's name, or as a
+    // prefix of a longer quoted string.
+    for clean in [
+        ["    // json.contains(\"", field, "\")"].concat(),
+        ["    let ", field, " = 4242;"].concat(),
+        ["    fn wait_for_", field, "_exit() {}"].concat(),
+        ["    let message = \"", field, " must not appear\";"].concat(),
+    ] {
+        assert!(
+            removed_field_findings("", &planted(clean.clone()), none).is_empty(),
+            "planted clean line was flagged: {clean}"
+        );
+    }
+
+    // (c) snapshot mention: flagged.
+    let snapshot = vec![(
+        PathBuf::from("planted-help.txt"),
+        ["      --", field, "  <PID>\n"].concat(),
+    )];
+    assert_eq!(removed_field_findings("", none, &snapshot).len(), 1);
+
+    // The real scan: state.rs, every Rust file under crates/, every snapshot.
+    let root = workspace_root();
+    let state_source = std::fs::read_to_string(root.join("crates/devflow-core/src/state.rs"))
+        .expect("state.rs must be readable");
+    let rust_files = read_labelled(rust_file_paths());
+    assert!(!rust_files.is_empty(), "the walker must find Rust sources");
+    let snapshot_dir = root.join("crates/devflow-cli/tests/snapshots");
+    let mut snapshot_paths: Vec<PathBuf> = std::fs::read_dir(&snapshot_dir)
+        .unwrap_or_else(|error| panic!("{} must exist: {error}", snapshot_dir.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    snapshot_paths.sort();
+    assert!(
+        !snapshot_paths.is_empty(),
+        "{} must hold at least one snapshot",
+        snapshot_dir.display()
+    );
+    let snapshots = read_labelled(snapshot_paths);
+
+    let findings = removed_field_findings(&state_source, &rust_files, &snapshots);
+    assert!(
+        findings.is_empty(),
+        "the removed State field survives (T-50-43):\n{}",
+        findings.join("\n")
     );
 }
