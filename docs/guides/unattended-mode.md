@@ -55,17 +55,20 @@ malformed. Fix the file, or run in supervise mode.
 
 ### 2. The Code stage would launch on the pipe-owning arm
 
-The guard that bounds the flag's lifetime lives inside DevFlow's pipe-owning
-monitor, and only the Claude launch path starts one. So two launch shapes are
-refused in auto mode:
+Every stage runs under the same DevFlow supervisor process, in one of two
+launch shapes. The guard that bounds the flag's lifetime is engaged only by a
+supervisor on the stream shape, which Claude and Antigravity `stream-json`
+launches use; a supervisor on the capture shape never engages it, so a Code
+stage launched that way would have nothing bounding the flag. So two
+capture-shape launches are refused in auto mode:
 
-- **A non-Claude agent.** `--agent codex` and `--agent opencode` cannot run
-  `--mode auto`. This is a real capability removal introduced with this
-  feature; those agents still work in supervise mode.
+- **A non-Claude agent.** `--agent codex` and `--agent opencode` launch on the
+  capture shape and cannot run `--mode auto`. This is a real capability
+  removal introduced with this feature; those agents still work in supervise
+  mode. (Antigravity launches on the stream shape and is allowed.)
 - **The legacy launch opt-out.** `--legacy-claude-launch` (or
-  `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) selects a detached shell monitor with no
-  process to bound the flag's lifetime. It is now mutually exclusive with
-  `--mode auto`.
+  `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) moves Claude onto the capture shape, which
+  never engages the guard. It is now mutually exclusive with `--mode auto`.
 
 The recovery for either is the same: drop the flag that caused it, or run in
 supervise mode.
@@ -199,17 +202,20 @@ stage is a no-op.
 
 ### 2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all
 
-There is no guard on those launch shapes, because the legacy arm is a detached
-shell script with no process whose lifetime could bound the flag.
+There is no guard on those launch shapes, because they run on the capture
+shape, and a supervisor on the capture shape does not engage the chain-flag
+guard.
 
-**Cause.** The guard is bound inside the pipe-owning monitor, and only the
-Claude stream launch path starts one.
+**Cause.** The guard is engaged only by a supervisor on the stream shape,
+which only the Claude and Antigravity `stream-json` launch paths use; `codex`,
+`opencode` and the legacy opt-out launch on the capture shape.
 
 **Fix owner: DevFlow, and as of this release the failure is loud rather than
 silent.** Condition 2 of the preflight now *refuses* this combination in auto
 mode instead of letting the run start and stall later. That is an improvement
-in legibility, not a removal of the limitation: `--mode auto` remains
-Claude-only, and remains incompatible with the legacy launch opt-out.
+in legibility, not a removal of the limitation: `--mode auto` remains limited
+to Claude and Antigravity, and remains incompatible with the legacy launch
+opt-out.
 
 ### 3. GSD orchestrator may block auto-approval of `gate="blocking"` checkpoints
 

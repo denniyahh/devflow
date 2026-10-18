@@ -767,3 +767,187 @@ fn operations_md_documents_run_liveness_and_the_stop_arms() {
         missing.join("\n")
     );
 }
+
+/// The lines of `text` from the line equal to `heading` up to, not
+/// including, the next line starting with `## `, or to the end. `None` when no
+/// line equals `heading`.
+fn markdown_section<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    let mut offset = 0;
+    let mut start = None;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        match start {
+            None if bare == heading => start = Some(offset),
+            Some(begin) if bare.starts_with("## ") => return Some(&text[begin..offset]),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    start.map(|begin| &text[begin..])
+}
+
+/// True when `text`, with every whitespace run (line breaks included)
+/// collapsed to one space and lowercased, describes a shell monitor or a
+/// shell script — so a phrase wrapped across lines still counts.
+fn mentions_shell_monitor(text: &str) -> bool {
+    let collapsed = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    collapsed.contains("shell monitor") || collapsed.contains("shell script")
+}
+
+/// True when some line of `text`, lowercased, claims macOS support.
+fn claims_macos_support(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.to_lowercase();
+        line.contains("supports macos") || line.contains("macos is supported")
+    })
+}
+
+/// What ARCHITECTURE.md's `## Monitor daemon` section gets wrong about the
+/// supervisor (50-17, D-02/D-03): too short to describe it, not naming its
+/// socket or its in-process advance, or still naming the forked `advance`
+/// command or a `sh -c` runner.
+fn monitor_section_problems(section: &str) -> Vec<String> {
+    const MIN_LINES: usize = 8;
+    let mut problems = Vec::new();
+    let lines = section.lines().count();
+    if lines < MIN_LINES {
+        problems.push(format!("spans {lines} lines, fewer than {MIN_LINES}"));
+    }
+    for required in ["in-process", "socket"] {
+        if !section.contains(required) {
+            problems.push(format!("does not name `{required}`"));
+        }
+    }
+    for forbidden in ["devflow advance", "sh -c"] {
+        if section.contains(forbidden) {
+            problems.push(format!("still names `{forbidden}`"));
+        }
+    }
+    problems
+}
+
+/// Every file under `dir`, recursively, skipping hidden entries and
+/// `skip_dir`, in sorted order.
+fn files_under(dir: &Path, skip_dir: &Path) -> Vec<PathBuf> {
+    fn visit(dir: &Path, skip_dir: &Path, files: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("failed to list {}: {error}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') || path == skip_dir {
+                continue;
+            }
+            if path.is_dir() {
+                visit(&path, skip_dir, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(dir, skip_dir, &mut files);
+    files.sort();
+    files
+}
+
+/// A doc's text through `workspace_root()`, HTML comments stripped; panics
+/// naming the path when it cannot be read.
+fn read_doc(relative: &str) -> String {
+    let path = workspace_root().join(relative);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    strip_html_comments(&text)
+}
+
+/// 50-17 (R6-G4, T-50-44, T-50-66): the docs describe the socket supervisor
+/// as built and claim nothing unestablished. OPERATIONS.md carries the macOS
+/// caveat and D-20's install rule; no operator doc claims macOS support;
+/// ARCHITECTURE.md's `## Monitor daemon` section describes the socket and the
+/// in-process advance, not a forked `advance` command; the unattended-mode
+/// guide gives the capture shape, not a shell monitor, as the reason for its
+/// refusals.
+#[test]
+fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
+    // Planted controls, through the same helpers as the real checks.
+    let two_sections = "# Title\n## First\none\ntwo\n## Second\nthree\n";
+    assert_eq!(
+        markdown_section(two_sections, "## First"),
+        Some("## First\none\ntwo\n")
+    );
+    assert_eq!(markdown_section(two_sections, "## Absent"), None);
+    let planted_section = [
+        "## Monitor daemon",
+        "",
+        "The supervisor publishes a socket and advances in-process.",
+        "",
+        "Then it runs `devflow advance <project> --phase N`.",
+        "",
+        "It owns the agent.",
+        "",
+        "It answers ping and shutdown.",
+    ]
+    .join("\n");
+    assert_eq!(
+        monitor_section_problems(&planted_section),
+        vec!["still names `devflow advance`".to_string()],
+        "planted control: a section naming the forked advance must fail"
+    );
+    assert!(mentions_shell_monitor("a detached shell\n  monitor"));
+    assert!(!mentions_shell_monitor("the capture shape"));
+    assert!(claims_macos_support("DevFlow supports macOS."));
+    assert!(!claims_macos_support(
+        "Socket supervision is unverified on macOS"
+    ));
+
+    let operations = read_doc("OPERATIONS.md");
+    for claim in ["unverified on macOS", "only while no 2.x run is"] {
+        assert!(
+            operations.contains(claim),
+            "OPERATIONS.md does not state `{claim}`"
+        );
+    }
+
+    let root = workspace_root();
+    let mut operator_docs = vec![(root.join("OPERATIONS.md"), operations.clone())];
+    for path in files_under(&root.join("docs"), &root.join("docs/site")) {
+        // A binary asset cannot describe the monitor.
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            operator_docs.push((path, strip_html_comments(&text)));
+        }
+    }
+    assert!(
+        operator_docs.len() > 1,
+        "the docs/ walk must find files to scan"
+    );
+    for (path, text) in &operator_docs {
+        assert!(
+            !claims_macos_support(text),
+            "{} claims macOS support, which no macOS host or CI has verified",
+            path.display()
+        );
+    }
+
+    let architecture = read_doc("ARCHITECTURE.md");
+    let section = markdown_section(&architecture, "## Monitor daemon")
+        .unwrap_or_else(|| panic!("ARCHITECTURE.md has no `## Monitor daemon` section"));
+    let problems = monitor_section_problems(section);
+    assert!(
+        problems.is_empty(),
+        "ARCHITECTURE.md's `## Monitor daemon` section does not describe the socket supervisor:\n{}",
+        problems.join("\n")
+    );
+
+    let unattended = read_doc("docs/guides/unattended-mode.md");
+    assert!(
+        unattended.contains("capture shape"),
+        "docs/guides/unattended-mode.md does not name the capture shape"
+    );
+    assert!(
+        !mentions_shell_monitor(&unattended),
+        "docs/guides/unattended-mode.md still describes a shell monitor or shell script"
+    );
+}
