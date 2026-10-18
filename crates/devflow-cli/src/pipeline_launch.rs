@@ -1246,8 +1246,20 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
             let advanced = advance_for_stage(project_root, Some(phase), stage);
             // The advance has returned and released the per-phase lock. Only
             // a run whose advance published a successor is handed off.
-            if take_successor().is_some() {
-                run.supervisor.token().enter(OwnerPhase::HandedOff);
+            if let Some(successor) = take_successor() {
+                let token = run.supervisor.token();
+                #[cfg(test)]
+                test_hold("before_handoff_mark");
+                token.enter(OwnerPhase::HandedOff);
+                // RV-04 / R5-I1 (50-23): a stop that reached this supervisor
+                // after safe point 3 was flagged (it stayed `Advancing`) and
+                // must not be dropped. The one owner mutex orders every stop
+                // request before the marking above (flagged, so seen here) or
+                // after it (answered `handed_off`, acting on nothing), so one
+                // check right after the marking drops no flagged stop.
+                if token.stop_requested() {
+                    forward_stop_to_successor(&token, project_root, phase, &successor);
+                }
             }
             drop(stop_guard);
             advanced
@@ -1266,6 +1278,60 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
     // advancing is answered `handed_off`.
     run.supervisor.finish();
     result
+}
+
+/// Forward a stop that reached this supervisor after safe point 3 to the
+/// successor its advance recorded (50-23, RV-04), through the successor's
+/// socket, bounded by [`SUPERVISOR_STOP_WAIT`]. Writes no state: the
+/// successor is the recorded supervisor and records its own stop.
+///
+/// A confirmed `Stopped` takes a safe point on `token`, which returns
+/// `StopHere`, so `finish` answers a parked shutdown caller `stopped` (the
+/// stop did happen, through the successor) and that caller does not also
+/// retry against the successor. Anything else leaves `finish` answering
+/// `handed_off`, so a socket caller retries against the state's record, and
+/// names the `devflow stop --phase N --launch <id>` repair. Both outcomes
+/// are recorded as a `stop_forwarded` event, because this process's stderr
+/// is `/dev/null` in production. The stop's source is not consulted: the
+/// token does not keep it (T-50-75).
+fn forward_stop_to_successor(
+    token: &StopToken,
+    project_root: &Path,
+    phase: PhaseId,
+    successor: &SupervisorRecord,
+) {
+    let launch_id = &successor.launch_id;
+    let outcome =
+        devflow_core::supervisor::request_shutdown(&successor.socket_path, SUPERVISOR_STOP_WAIT);
+    let confirmed = matches!(
+        outcome,
+        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+    );
+    let repair = format!("devflow stop --phase {phase} --launch {launch_id}");
+    let detail = match &outcome {
+        Ok(outcome) => format!("{outcome:?}"),
+        Err(err) => err.to_string(),
+    };
+    if confirmed {
+        let _ = token.safe_point();
+        eprintln!("forwarded a stop received after safe point 3 to launch {launch_id}: stopped");
+    } else {
+        eprintln!(
+            "a stop reached this supervisor after safe point 3 and forwarding it to launch \
+             {launch_id} did not confirm a stop ({detail}); run `{repair}`"
+        );
+    }
+    events::emit(
+        project_root,
+        phase,
+        "stop_forwarded",
+        serde_json::json!({
+            "launch_id": launch_id,
+            "confirmed": confirmed,
+            "outcome": detail,
+            "repair": (!confirmed).then_some(repair),
+        }),
+    );
 }
 
 /// The [`monitor::StageSpec`] for `invocation`: the stream shape reads its
