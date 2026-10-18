@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 5
+open_count: 6
 waived_count: 2
 fixed_count: 11
-total_count: 18
-last_updated: 2026-10-17T16:27:14.778Z
+total_count: 19
+last_updated: 2026-10-18T18:26:52.972Z
 ---
 
 # Broken Windows Ledger
@@ -33,6 +33,7 @@ last_updated: 2026-10-17T16:27:14.778Z
 | 16 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-09-PLAN.md |  | Verification regex reran with rg -e because this Ripgrep treats -E as an encoding flag. | fixed |  | 2026-09-07T01:00:07.933Z | 2026-09-07T01:00:39.341Z |
 | 17 | 49 | stub | scripts/scratch-dogfood-repo.sh | 79 | The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook) | open |  | 2026-09-29T19:39:11.821Z |  |
 | 18 | 50 | deviation | crates/devflow-cli/tests/phase7_cli.rs |  | 50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md | fixed |  | 2026-10-17T11:53:12.257Z | 2026-10-17T16:27:14.778Z |
+| 19 | 50 | skipped-test | crates/devflow-cli/src/commands.rs | 8823 | Under uid 0 (the pinned container and CI) doctor_reports_an_unlistable_socket_dir_instead_of_nothing (50-12) and the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state (50-15) skip, since root lists a 0o000 dir; their assertions run only on a non-root host (999.113 pattern, 50-16 cdb6efc) | open |  | 2026-10-18T18:26:52.972Z |  |
 
 ````json
 [
@@ -252,6 +253,19 @@ last_updated: 2026-10-17T16:27:14.778Z
     "reason": "",
     "recorded_at": "2026-10-17T11:53:12.257Z",
     "resolved_at": "2026-10-17T16:27:14.778Z",
+    "milestone": "v3.0.0"
+  },
+  {
+    "id": 19,
+    "kind": "skipped-test",
+    "phase": "50",
+    "file": "crates/devflow-cli/src/commands.rs",
+    "line": 8823,
+    "description": "Under uid 0 (the pinned container and CI) doctor_reports_an_unlistable_socket_dir_instead_of_nothing (50-12) and the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state (50-15) skip, since root lists a 0o000 dir; their assertions run only on a non-root host (999.113 pattern, 50-16 cdb6efc)",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-10-18T18:26:52.972Z",
+    "resolved_at": null,
     "milestone": "v3.0.0"
   }
 ]
