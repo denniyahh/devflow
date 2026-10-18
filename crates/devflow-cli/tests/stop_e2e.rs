@@ -167,18 +167,32 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
     common::kill_and_reap(&mut holder);
 }
 
+/// T-50-38 (renamed from `stop_never_signals_the_recorded_monitor_pid`):
+/// `stop` never signals a pid read from state; it addresses the socket. The
+/// state plants a live test-owned process as `monitor_pid` and as the agent
+/// group of a `supervisor` record whose socket file does not exist, so the
+/// probe reads GONE: `stop` reports nothing running and the planted process
+/// is still alive afterwards.
 #[test]
-fn stop_never_signals_the_recorded_monitor_pid() {
+fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(105);
-    let mut monitor = Command::new("sleep")
+    let mut planted = Command::new("sleep")
         .arg("60")
         .spawn()
-        .expect("spawn monitor");
+        .expect("spawn the planted process");
+    let start = devflow_core::agent::process_start_time(planted.id()).expect("start time");
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-    state.monitor_pid = Some(monitor.id());
+    state.monitor_pid = Some(planted.id());
+    state.supervisor = Some(SupervisorRecord::new(
+        home.cache_dir().join("sock").join("missing.sock"),
+        "launch-missing".to_string(),
+        planted.id(),
+        start,
+        supervisor::boot_id().unwrap_or_default(),
+    ));
     devflow_core::workflow::save_state(&state).unwrap();
 
     let output = common::hermetic_devflow(&home)
@@ -186,14 +200,25 @@ fn stop_never_signals_the_recorded_monitor_pid() {
         .arg(root)
         .output()
         .expect("run devflow stop");
-    assert!(output.status.success());
-    assert!(monitor.try_wait().expect("poll monitor").is_none());
+    let text = describe(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("nothing is running"),
+        "a GONE socket and no lock read as nothing running: {text}"
+    );
+    assert!(
+        planted
+            .try_wait()
+            .expect("poll the planted process")
+            .is_none(),
+        "the planted process named only by state is never signalled"
+    );
     assert!(
         devflow_core::workflow::load_state(root, phase)
             .unwrap()
             .stopped
     );
-    common::kill_and_reap(&mut monitor);
+    common::kill_and_reap(&mut planted);
 }
 
 #[test]
@@ -1218,14 +1243,22 @@ esac
     )
 }
 
-/// A fake agent that keeps running until `trigger` exists, then commits one
-/// empty commit, prints the success marker and exits 0.
-fn triggered_agent(trigger: &Path) -> String {
+/// What a [`triggered_agent`] does once released: one empty commit, the
+/// success marker, exit 0.
+const SUCCEEDS: &str = r#"git commit -q --allow-empty -m "fake stage work"
+printf 'work done\nDEVFLOW_RESULT: {"status":"success","commits":1}\n'
+exit 0"#;
+
+/// What a [`triggered_agent`] does once released: a failed Define, which the
+/// never-silent path parks at a human gate.
+const FAILS_TO_A_GATE: &str = r#"printf 'DEVFLOW_RESULT: {"status":"failed","reason":"gate fixture"}\n'
+exit 0"#;
+
+/// A fake agent that keeps running until `trigger` exists, then runs
+/// `released` ([`SUCCEEDS`] or [`FAILS_TO_A_GATE`]).
+fn triggered_agent(trigger: &Path, released: &str) -> String {
     fake_claude(&format!(
-        r#"while [ ! -e '{trigger}' ]; do sleep 0.05; done
-git commit -q --allow-empty -m "fake stage work"
-printf 'work done\nDEVFLOW_RESULT: {{"status":"success","commits":1}}\n'
-exit 0"#,
+        "while [ ! -e '{trigger}' ]; do sleep 0.05; done\n{released}",
         trigger = trigger.display()
     ))
 }
@@ -1309,13 +1342,19 @@ struct LiveRun {
 }
 
 impl LiveRun {
+    /// A run whose agent succeeds once released.
     fn start(phase: PhaseId) -> Self {
+        Self::start_with(phase, SUCCEEDS)
+    }
+
+    /// A run whose agent runs `released` once its trigger exists.
+    fn start_with(phase: PhaseId, released: &str) -> Self {
         let home = common::HermeticHome::new();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
         init_supervised_repo(&root, phase);
         let trigger = root.join(".git").join("devflow-test-trigger");
-        let fake_bin = common::fake_bin_dir(&triggered_agent(&trigger));
+        let fake_bin = common::fake_bin_dir(&triggered_agent(&trigger, released));
         let launch_reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
         let existing = std::env::var_os("PATH").unwrap_or_default();
         let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
@@ -1510,4 +1549,204 @@ fn stop_ends_a_live_run_whose_state_will_not_load() {
         before,
         "the state that will not load is left byte for byte"
     );
+}
+
+/// SIGKILL a run's supervisor by the pid in its sidecar, after confirming
+/// that pid is still the recorded process, and return once it is gone and
+/// its socket probes STALE. Returns the sidecar.
+fn kill_supervisor(run: &LiveRun) -> supervisor::Sidecar {
+    let sidecar = supervisor::read_sidecar(&run.record.socket_path.with_extension("json"))
+        .expect("read the sidecar");
+    let pid = sidecar.supervisor_pid;
+    assert!(
+        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
+        "the sidecar's supervisor {pid} is the recorded process"
+    );
+    let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    assert!(signed > 1, "refusing to signal pid {signed}");
+    // SAFETY: `signed > 1` names the supervisor just identity-checked.
+    assert_eq!(
+        unsafe { libc::kill(signed, libc::SIGKILL) },
+        0,
+        "SIGKILL {pid}"
+    );
+    assert!(
+        holds_within(RUN_WAIT, || !devflow_core::agent::agent_running(pid)),
+        "the supervisor {pid} is gone after SIGKILL"
+    );
+    assert!(
+        holds_within(Duration::from_secs(10), || matches!(
+            supervisor::probe(&run.record.socket_path),
+            Ok(Liveness::Stale)
+        )),
+        "a SIGKILLed supervisor leaves its socket STALE"
+    );
+    sidecar
+}
+
+/// A STALE socket goes through the 50-09 backstop: the supervisor of a live
+/// run is SIGKILLed, its agent group outlives it, and `stop` ends that group
+/// through the validated pidfd path, reports the members it ended, removes
+/// the socket and sidecar, and records `stopped`.
+#[test]
+fn stop_tears_down_a_stale_supervisor_through_the_backstop() {
+    let run = LiveRun::start(PhaseId::new(143));
+    let pgid = run.record.agent_pgid;
+    kill_supervisor(&run);
+    assert!(
+        !group_members(pgid).is_empty(),
+        "precondition: the orphaned agent group {pgid} outlives its supervisor"
+    );
+
+    let output = run.stop(&[]);
+    let text = describe(&output);
+    assert!(output.status.success(), "stop must succeed: {text}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ended its agent group") && stdout.contains(&pgid.to_string()),
+        "stop reports the group and the members it ended: {text}"
+    );
+    assert!(
+        holds_within(Duration::from_secs(5), || group_members(pgid).is_empty()),
+        "the agent group {pgid} is gone"
+    );
+    let socket = &run.record.socket_path;
+    assert!(
+        !socket.exists() && !socket.with_extension("json").exists(),
+        "the socket and sidecar are removed"
+    );
+    assert_eq!(run.probe(), Liveness::Gone);
+    assert!(
+        devflow_core::workflow::load_state(&run.root, run.phase)
+            .unwrap()
+            .stopped,
+        "the performed stop is recorded"
+    );
+}
+
+/// R-10: a supervise-mode run parked at a gate, holding the per-phase lock,
+/// whose supervisor is SIGKILLed. `stop` writes no gate response (no live
+/// waiter), tears the STALE socket down to GONE (the agent had already
+/// exited, so nothing is signalled), names `devflow resume --phase N` (R-8),
+/// and leaves the lock reclaimable.
+#[test]
+fn stop_after_a_supervisor_killed_at_a_gate_reaps_and_reports_gone() {
+    let run = LiveRun::start_with(PhaseId::new(144), FAILS_TO_A_GATE);
+    std::fs::write(&run.trigger, "go\n").unwrap();
+    let gate = Gates::gate_path(&run.root, run.phase, Stage::Define);
+    assert!(
+        holds_within(RUN_WAIT, || gate.exists()
+            && matches!(
+                devflow_core::lock::holder_status(&run.root, run.phase),
+                devflow_core::lock::HolderStatus::Live { .. }
+            )),
+        "precondition: the run parks at the Define gate holding the lock:\n{}",
+        std::fs::read_to_string(devflow_core::events::events_path(&run.root)).unwrap_or_default()
+    );
+    kill_supervisor(&run);
+
+    let output = run.stop(&[]);
+    let text = describe(&output);
+    assert!(output.status.success(), "stop must succeed: {text}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "the phase is resumable: run `devflow resume --phase {}`",
+            run.phase
+        )),
+        "a teardown that signalled nothing says the phase is resumable (R-8): {text}"
+    );
+    assert!(
+        !Gates::response_path(&run.root, run.phase, Stage::Define).exists(),
+        "no gate response is written without a live waiter"
+    );
+    assert_eq!(run.probe(), Liveness::Gone, "the socket is torn down");
+    assert!(
+        matches!(
+            devflow_core::lock::holder_status(&run.root, run.phase),
+            devflow_core::lock::HolderStatus::NoHolder
+                | devflow_core::lock::HolderStatus::Recycled { .. }
+        ),
+        "the dead holder's lock is reclaimable"
+    );
+    drop(
+        devflow_core::lock::acquire(&run.root, run.phase)
+            .expect("the per-phase lock can be taken after the stop"),
+    );
+}
+
+/// R-6: a probe error is reported and never reaches the backstop. The
+/// recorded socket path holds a regular file; the sidecar beside it records
+/// a live test-owned group with its real identity, which a backstop run
+/// would end. `stop` exits non-zero naming the path problem, the group is
+/// untouched, and nothing is removed or recorded.
+#[test]
+fn stop_reports_a_probe_error_and_never_runs_the_backstop() {
+    use std::os::unix::process::CommandExt as _;
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let phase = PhaseId::new(145);
+    let sock_dir = home.cache_dir().join("sock");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    let socket = sock_dir.join("not-a-socket.sock");
+    std::fs::write(&socket, "a regular file\n").unwrap();
+    let mut group = Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .expect("spawn a test-owned group");
+    let pgid = group.id();
+    let start = devflow_core::agent::process_start_time(pgid).expect("start time");
+    let boot = supervisor::boot_id().expect("a readable boot id");
+    let sidecar = serde_json::json!({
+        "launch_id": "launch-p",
+        "project_root": root,
+        "phase": phase,
+        "stage": "code",
+        "agent": "claude",
+        "launch": "stream",
+        "agent_pid": pgid,
+        "agent_pgid": pgid,
+        "agent_start_time": start,
+        "boot_id": boot,
+        "supervisor_pid": 1,
+        "supervisor_start_time": 0,
+        "created_at": "2026-10-18T00:00:00Z",
+    });
+    std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+    state.supervisor = Some(SupervisorRecord::new(
+        socket.clone(),
+        "launch-p".to_string(),
+        pgid,
+        start,
+        boot,
+    ));
+    devflow_core::workflow::save_state(&state).unwrap();
+    let state_file = devflow_core::workflow::state_path(&root, phase);
+    let before = std::fs::read(&state_file).unwrap();
+
+    let output = common::hermetic_devflow(&home)
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(&root)
+        .output()
+        .expect("run devflow stop");
+    let text = describe(&output);
+    assert!(
+        !output.status.success(),
+        "a probe error is a refusal: {text}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&socket.display().to_string()) && stderr.contains("not a socket"),
+        "the refusal names the path and its problem: {text}"
+    );
+    assert!(
+        group.try_wait().expect("poll the group").is_none(),
+        "the group the sidecar records is untouched"
+    );
+    assert!(socket.is_file() && socket.with_extension("json").is_file());
+    assert_eq!(std::fs::read(&state_file).unwrap(), before);
+    common::signal_group(pgid, libc::SIGKILL);
+    let _ = group.wait();
 }
