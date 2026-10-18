@@ -902,6 +902,95 @@ mod tests {
         );
     }
 
+    /// Wait up to `within` for `fd` to be readable (a queued connection on a
+    /// listener, data on a stream); whether it became readable.
+    fn readable_within(fd: &impl std::os::fd::AsRawFd, within: std::time::Duration) -> bool {
+        let mut entry = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+        loop {
+            // SAFETY: one initialized pollfd naming a descriptor the caller
+            // holds open for the whole call.
+            let ready = unsafe { libc::poll(&raw mut entry, 1, millis) };
+            if ready >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return ready == 1;
+            }
+        }
+    }
+
+    /// A listener released while the probe's connection waits in its backlog
+    /// resets that connection. That is what a probe meets when a supervisor's
+    /// last thread exits after its leader already reads as a zombie, or when
+    /// a child forked by another thread drops the last copy of the listener.
+    /// The reset is the moment nothing listens any more, so the probe
+    /// connects once more, is refused, and answers Stale, not NoReply.
+    #[test]
+    fn probe_answers_stale_for_a_listener_released_under_its_ping() {
+        let cache = short_cache();
+        let (socket, _, listener) = published(cache.path());
+        let releaser = thread::spawn(move || {
+            // Release the listener with the probe's connect queued in it and
+            // never accepted.
+            let queued = readable_within(&listener, std::time::Duration::from_secs(30));
+            drop(listener);
+            queued
+        });
+        let outcome = probe(socket.as_path());
+        assert!(
+            releaser.join().expect("releaser thread"),
+            "the probe's connect never reached the listener"
+        );
+        assert!(
+            matches!(outcome, Ok(Liveness::Stale)),
+            "a listener released under the ping must be Stale, got {outcome:?}"
+        );
+    }
+
+    /// Control for the re-probe: a listener that stays up but closes every
+    /// connection with the ping unread is never Stale. The probe connects
+    /// exactly twice (one more connect after the first close) and answers
+    /// NoReply.
+    #[test]
+    fn probe_never_reads_a_live_listener_that_closes_connections_as_stale() {
+        /// Stops an unbounded re-probe from hanging this test.
+        const ACCEPT_AT_MOST: usize = 3;
+        let cache = short_cache();
+        let (socket, _, listener) = published(cache.path());
+        let (stop, stopped) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let mut accepted = 0;
+            while accepted < ACCEPT_AT_MOST && stopped.try_recv().is_err() {
+                if !readable_within(&listener, std::time::Duration::from_millis(50)) {
+                    continue;
+                }
+                let (stream, _) = listener.accept().expect("accept a probe");
+                accepted += 1;
+                // Close with the ping unread, which resets the client.
+                assert!(
+                    readable_within(&stream, std::time::Duration::from_secs(30)),
+                    "the probe never sent its ping"
+                );
+                drop(stream);
+            }
+            (listener, accepted)
+        });
+        let outcome = probe(socket.as_path());
+        stop.send(()).expect("stop the server");
+        let (listener, accepted) = server.join().expect("server thread");
+        drop(listener);
+        assert!(
+            matches!(outcome, Err(ProbeError::NoReply(_))),
+            "a live listener that closes every connection is NoReply, never Stale, got {outcome:?}"
+        );
+        assert_eq!(
+            accepted, 2,
+            "the probe connects once more after a closed ping, and only once"
+        );
+    }
+
     #[test]
     fn probe_reports_gone_only_when_no_socket_file_exists() {
         let cache = short_cache();
