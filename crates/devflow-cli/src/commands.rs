@@ -3165,21 +3165,16 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     })
 }
 
-/// Refuse `start` while the phase's recorded monitor or agent is alive
-/// (criterion 2, D-01: one writer per phase). `start` calls this under the
-/// per-phase lock and before any gate cleanup, git mutation or `save_state`,
-/// so a refusal writes nothing. `--force` does not bypass it.
+/// Refuse `start` while the phase's run is live (criterion 2, D-01: one
+/// writer per phase). `start` calls this under the per-phase lock and before
+/// any gate cleanup, git mutation or `save_state`, so a refusal writes
+/// nothing. `--force` does not bypass it. See
+/// [`refuse_launch_over_a_live_run`] for what counts as live.
 ///
-/// Liveness is pid liveness through the helpers `status` uses
-/// (`agent_pid_from_file`, `agent::agent_running`), not identity: neither pid
-/// records a start time. A recycled pid gives a fail-closed false refusal,
-/// accepted by the operator with Option A (2026-09-22).
-///
-/// No-state carve-out (operator-approved 2026-09-22): without a state file this
-/// returns Ok even if the agent pid file names a live process, because
-/// `recover --clean` leaves that file behind and a recycled pid would otherwise
-/// block `start` with no DevFlow repair. A state file that does not load is
-/// checked on the agent pid file only.
+/// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12):
+/// without a state file this returns Ok even if the agent pid file names a
+/// live process, because `recover --clean` leaves that file behind and a
+/// recycled pid would otherwise block `start` with no DevFlow repair.
 ///
 /// Out of scope: the lock-free window between agent exit and `advance` taking
 /// the lock stays backlog 999.136. This check says nothing about a gate waiter.
@@ -3196,23 +3191,14 @@ fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(
 /// 2026-09-23 as backlog 999.140: `pipeline_launch::resume` calls this just
 /// after it has acquired its phase lock and before it loads or writes state.
 /// The `devflow resume` CLI arm is resume's only production caller; no monitor
-/// or advance path calls resume, so a recorded pid is never that process. An
-/// agent that runs `devflow resume` for its own phase is refused correctly.
+/// or advance path calls resume. An agent that runs `devflow resume` for its
+/// own phase is refused correctly.
 ///
-/// Liveness is shared with `start` and uses the same pid-only Option A that
-/// the operator accepted for start. A recycled pid can therefore refuse a
-/// resume; that distinct resume cost is the known limit recorded in 48-20,
-/// not an operator-approved permanent limit. Without a state file, resume
-/// still reports its own missing-state error. For an unloadable state, this
-/// checks only the agent pid file (999.139, backlog), and resume then cannot
-/// launch because its own `load_state` fails immediately afterwards.
-///
-/// Production hints remain unchanged in this plan (backlog 999.142): status
-/// and doctor for a dead monitor with a live agent, doctor's dead-agent and
-/// gate-pending findings, cleanup's worktree messages, and `no_waiter_repair`
-/// through the gate verbs, gate sweep, stop and doctor (48-20 H1-H10). The
-/// agent-exit-to-advance window remains 999.136, and this check says nothing
-/// about a gate waiter.
+/// Liveness is shared with `start` ([`refuse_launch_over_a_live_run`]).
+/// Without a state file, resume still reports its own missing-state error.
+/// For a state that will not load, the guard finds the run through its
+/// sidecar (R-12, 999.139), and resume then cannot launch anyway because its
+/// own `load_state` fails immediately afterwards.
 pub(crate) fn refuse_resume_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
@@ -3231,129 +3217,311 @@ enum LaunchVerb {
     Resume,
 }
 
+impl LaunchVerb {
+    fn label(self) -> &'static str {
+        match self {
+            LaunchVerb::Start => "start",
+            LaunchVerb::Resume => "resume",
+        }
+    }
+
+    /// The command a refusal tells the operator to run again.
+    fn rerun(self, phase: PhaseId) -> String {
+        match self {
+            LaunchVerb::Start => "devflow start".to_string(),
+            LaunchVerb::Resume => format!("devflow resume --phase {phase}"),
+        }
+    }
+}
+
+/// The shared start/resume guard (D-09, R-12, 999.139). Two halves, either of
+/// which refuses:
+///
+/// - **Supervisor.** The state loads → probe its `supervisor` record: ALIVE
+///   is live; STALE is live unless [`supervisor::backstop::assess`] proves
+///   its agent group gone ([`stale_group_may_live`]); a probe error is live
+///   (fail closed, T-50-40); GONE is not. The state exists but will not load
+///   → [`supervisor::sweep_for_in`] for this root and phase: an entry whose
+///   sidecar parsed is classified the same way (with no record); an entry
+///   with no usable sidecar, which 50-06 attributes by its file name or ping
+///   reply, is live unless it probes GONE (RV-05: nothing recorded can prove
+///   its group dead). A socket directory that exists but cannot be listed
+///   refuses (the 50-06 threat flag: the sweep reads it as empty). With no
+///   cache dir, no sweep runs, as for `stop` and `recover`.
+/// - **Agent pid file** (unchanged, D-12): a live pid there is live. Pid
+///   liveness, not identity: a recycled pid gives a fail-closed false
+///   refusal (Option A, 2026-09-22).
+///
+/// No `monitor_pid` is read. A loaded state with no record over a live
+/// supervisor (a launcher that died before saving it, T-50-90/T-50-91) is
+/// accepted until Phase 50.1.
 fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
     cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
-    let _ = cache_dir; // RED scaffold: GREEN sweeps it.
-    let loaded = workflow::load_state(project_root, phase);
-    if loaded.is_err() && !workflow::state_path(project_root, phase).exists() {
-        return Ok(());
-    }
-    let monitor = loaded
-        .ok()
-        .and_then(|state| state.monitor_pid)
-        .filter(|&pid| agent::agent_running(pid));
+    let state_file = workflow::state_path(project_root, phase);
+    let sockets: Vec<LiveSocket> = match workflow::load_state(project_root, phase) {
+        Ok(state) => state
+            .supervisor
+            .and_then(|record| recorded_live_socket(&record))
+            .into_iter()
+            .collect(),
+        Err(_) if !state_file.exists() => return Ok(()),
+        Err(_) => match cache_dir {
+            None => Vec::new(),
+            Some(cache_dir) => {
+                if let Some(why) = socket_dir_unlistable(cache_dir) {
+                    let dir = registry::socket_dir_in(cache_dir);
+                    return Err(unlistable_socket_dir_refusal(
+                        phase,
+                        verb,
+                        (&state_file, &dir),
+                        &why,
+                    ));
+                }
+                supervisor::sweep_for_in(cache_dir, project_root, phase)
+                    .iter()
+                    .filter_map(swept_live_socket)
+                    .collect()
+            }
+        },
+    };
     let agent = agent_pid_from_file(project_root, phase).filter(|&pid| agent::agent_running(pid));
-    let live: Vec<(&str, u32)> = [("monitor", monitor), ("agent", agent)]
-        .into_iter()
-        .filter_map(|(role, pid)| pid.map(|pid| (role, pid)))
-        .collect();
-    if live.is_empty() {
+    if sockets.is_empty() && agent.is_none() {
         return Ok(());
     }
-    Err(CliError::Message(live_run_refusal(phase, verb, &live)))
+    Err(CliError::Message(live_run_refusal(
+        phase, verb, &sockets, agent,
+    )))
 }
 
-/// RED scaffold for the STALE classification; GREEN implements it.
-#[cfg_attr(not(test), expect(dead_code, reason = "RED scaffold"))]
-fn stale_group_may_live(_decision: &supervisor::backstop::BackstopDecision) -> bool {
-    true
+/// A supervisor socket the launch guard counts as possibly live.
+struct LiveSocket {
+    socket: PathBuf,
+    /// The record's or sidecar's launch id; for a socket with no usable
+    /// sidecar, its file name's, else its ping reply's, else `unknown`.
+    launch_id: String,
+    /// `ALIVE`, `STALE`, or why the socket could not be probed.
+    liveness: String,
+    /// Why the sidecar cannot be used, for a socket with none that parses:
+    /// `stop --launch` cannot validate it, so the refusal names bare `stop`.
+    sidecar_problem: Option<String>,
 }
 
-/// The refusal text for [`refuse_start_over_a_live_run`]. It fires while
-/// `start` holds the lock, so no other process holds it: `stop` would signal
-/// nothing here (see `stop_via_lock`).
-fn live_run_refusal(phase: PhaseId, verb: LaunchVerb, live: &[(&str, u32)]) -> String {
-    match verb {
-        LaunchVerb::Start => start_live_run_refusal(phase, live),
-        LaunchVerb::Resume => resume_live_run_refusal(phase, live),
+impl LiveSocket {
+    /// The refusal line that names this socket's repair.
+    fn repair_line(&self, phase: PhaseId) -> String {
+        let (id, liveness, socket) = (&self.launch_id, &self.liveness, self.socket.display());
+        match &self.sidecar_problem {
+            None => format!(
+                "launch {id} ({liveness}, socket {socket}): run \
+                 `devflow stop --phase {phase} --launch {id}` first"
+            ),
+            Some(problem) => format!(
+                "socket {socket} ({liveness}, launch {id}, its sidecar {problem}): run \
+                 `devflow stop --phase {phase}` first — it shuts a supervisor that answers down \
+                 through its socket; one that does not answer cannot be validated without its \
+                 sidecar, so end its agent yourself and remove `{socket}` and `{}`",
+                self.socket.with_extension("json").display()
+            ),
+        }
     }
 }
 
-fn start_live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
-    let named = live
-        .iter()
-        .map(|(role, pid)| format!("{role} pid {pid}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let checks = live
-        .iter()
-        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"))
-        .collect::<String>();
-    let padded = phase.padded();
-    // Identity details below match the argv the monitors are spawned with:
-    // `pipe_owning_monitor_args` and the Legacy script plus `advance_tail` in
-    // devflow-core's monitor.rs (48-REVIEW CR-01). A Legacy monitor whose
-    // agent has exited runs `devflow advance` as a foreground child and
-    // defers SIGTERM until it returns (48-REVIEW WR-02).
-    format!(
-        "phase {phase}: a run is still live ({named} alive) — refusing to start; nothing was written\n\
-         No process holds the phase lock right now, so `devflow stop --phase {phase}` would only mark the \
-         state stopped: it signals nothing and does not end this run. stop ends a run through the process \
-         that holds the lock: one parked at a gate, or this run's own `devflow advance` once it takes the \
-         lock after this refusal.\n\
-         Check each pid before signalling it. `ps -p` shows only the executable name, which cannot tell \
-         phases apart; `-ww` keeps a long command line from being cut at the terminal width:{checks}\n\
-         This phase's monitor is either a `__monitor` process with this project's path and `--phase {phase}` \
-         in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` \
-         with `--phase {phase}`. This phase's agent has that monitor as its parent (`ps -o ppid= -p <pid>`); \
-         an agent whose monitor has exited cannot be tied to this phase that way, so do not signal it on the \
-         pid alone.\n\
-         To end this run now, send SIGTERM to the confirmed monitor first — signalling the agent first lets \
-         the monitor launch the next stage. If the agent has already exited, an `sh` monitor may be running \
-         `devflow advance` as a foreground child: the monitor defers SIGTERM until that child returns, and \
-         the child may take the lock as soon as this start exits. Find it with \
-         `ps -ww -o pid=,args= --ppid <monitor pid>` and signal that child, not only the monitor.\n\
-         If the named processes have exited, run `devflow start` again. If a named pid is live but is not \
-         this phase's process (a recycled pid), `start` refuses again: run \
-         `devflow recover --clean --phase {phase}` first, then `devflow start`. Do neither while this \
-         phase's processes are live: `recover --clean` clears state even while an agent runs, and a later \
-         `start` would launch a second agent beside it."
+/// The loaded state's record as a [`LiveSocket`], or `None` when its socket
+/// is GONE or STALE over a group the backstop proves gone.
+fn recorded_live_socket(record: &SupervisorRecord) -> Option<LiveSocket> {
+    let live = |liveness: &str, sidecar_problem: Option<String>| LiveSocket {
+        socket: record.socket_path.clone(),
+        launch_id: record.launch_id.clone(),
+        liveness: liveness.to_string(),
+        sidecar_problem,
+    };
+    match supervisor::probe(&record.socket_path) {
+        Ok(supervisor::Liveness::Gone) => None,
+        Ok(supervisor::Liveness::Alive(_)) => Some(live("ALIVE", None)),
+        Err(error) => Some(live(&probe_failure(&error), None)),
+        Ok(supervisor::Liveness::Stale) => {
+            match supervisor::read_sidecar(&record.socket_path.with_extension("json")) {
+                Ok(sidecar) => {
+                    let decision = supervisor::backstop::assess(&sidecar, Some(record));
+                    stale_group_may_live(&decision).then(|| live("STALE", None))
+                }
+                Err(supervisor::SidecarError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Some(live("STALE", Some("is missing".to_string())))
+                }
+                Err(error) => Some(live("STALE", Some(format!("is unusable ({error})")))),
+            }
+        }
+    }
+}
+
+/// A sweep entry for this root and phase as a [`LiveSocket`], or `None`
+/// when it is GONE, or STALE with a parsed sidecar whose group the backstop
+/// proves gone. An entry with no usable sidecar is live unless GONE (RV-05).
+fn swept_live_socket(entry: &supervisor::SweepEntry) -> Option<LiveSocket> {
+    let liveness = match &entry.liveness {
+        Ok(supervisor::Liveness::Gone) => return None,
+        Ok(supervisor::Liveness::Alive(_)) => "ALIVE".to_string(),
+        Ok(supervisor::Liveness::Stale) => "STALE".to_string(),
+        Err(error) => probe_failure(error),
+    };
+    let (launch_id, sidecar_problem) = match &entry.sidecar {
+        Some(sidecar) => {
+            let stale = matches!(entry.liveness, Ok(supervisor::Liveness::Stale));
+            if stale && !stale_group_may_live(&supervisor::backstop::assess(sidecar, None)) {
+                return None;
+            }
+            (sidecar.launch_id.clone(), None)
+        }
+        None => {
+            let pinged = match &entry.liveness {
+                Ok(supervisor::Liveness::Alive(reply)) => Some(reply.launch_id.clone()),
+                _ => None,
+            };
+            let problem = entry.sidecar_error.as_ref().map_or_else(
+                || "is missing".to_string(),
+                |error| format!("is unusable ({error})"),
+            );
+            let id = entry.launch_id_in_name.clone().or(pinged);
+            (id.unwrap_or_else(|| "unknown".to_string()), Some(problem))
+        }
+    };
+    Some(LiveSocket {
+        socket: entry.socket_path.clone(),
+        launch_id,
+        liveness,
+        sidecar_problem,
+    })
+}
+
+/// A probe error as the liveness a refusal names.
+fn probe_failure(error: &supervisor::ProbeError) -> String {
+    format!("probe failed ({}: {error})", probe_error_kind(error))
+}
+
+/// Whether a STALE socket's agent group may still run. Only the three
+/// backstop decisions that prove the group gone (a previous boot, an empty
+/// group, a recycled leader) say no; every refusal, an unprovable identity
+/// (MAC-2), a live leader and any decision added later fail closed (T-50-40).
+fn stale_group_may_live(decision: &supervisor::backstop::BackstopDecision) -> bool {
+    use supervisor::backstop::BackstopDecision;
+    !matches!(
+        decision,
+        BackstopDecision::PreviousBoot
+            | BackstopDecision::EmptyGroup
+            | BackstopDecision::LeaderRecycled
     )
 }
 
-fn resume_live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
-    let named = live
+/// The refusal for a state that will not load over a socket directory that
+/// cannot be listed: a live run may be named only by its socket there, so
+/// the launch fails closed (50-06 threat flag).
+fn unlistable_socket_dir_refusal(
+    phase: PhaseId,
+    verb: LaunchVerb,
+    (state_file, dir): (&Path, &Path),
+    why: &str,
+) -> CliError {
+    let label = verb.label();
+    CliError::Message(format!(
+        "phase {phase}: the state file {} does not load, and the supervisor socket directory {} \
+         cannot be listed ({why}) — refusing to {label}; nothing was written\n\
+         A live run of this phase may be named only by its socket there, so {label} fails \
+         closed. Make {} listable by this user (DevFlow creates it mode 0700), then run `{}` again.",
+        state_file.display(),
+        dir.display(),
+        dir.display(),
+        verb.rerun(phase)
+    ))
+}
+
+/// The refusal text for [`refuse_launch_over_a_live_run`]. It fires while the
+/// launcher holds the lock: each live socket is named with the `stop` line
+/// that ends it (50-14), and a live agent pid with the identity checks the
+/// operator must make before signalling it.
+fn live_run_refusal(
+    phase: PhaseId,
+    verb: LaunchVerb,
+    sockets: &[LiveSocket],
+    agent: Option<u32>,
+) -> String {
+    let mut named: Vec<String> = sockets
         .iter()
-        .map(|(role, pid)| format!("{role} pid {pid}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let checks = live
-        .iter()
-        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"))
-        .collect::<String>();
-    let padded = phase.padded();
+        .map(|live| format!("supervisor launch {} {}", live.launch_id, live.liveness))
+        .collect();
+    named.extend(agent.map(|pid| format!("agent pid {pid} alive")));
+    let mut text = format!(
+        "phase {phase}: a run is still live ({}) — refusing to {}; nothing was written",
+        named.join(", "),
+        verb.label()
+    );
+    if !sockets.is_empty() {
+        text.push_str(
+            "\n`devflow stop` ends a supervisor through its socket, whether or not the state \
+             file loads; on a STALE socket it signals the agent group only after proving that \
+             group is this launch's. Run each line below first:",
+        );
+        for live in sockets {
+            text.push_str("\n  ");
+            text.push_str(&live.repair_line(phase));
+        }
+    }
+    if let Some(pid) = agent {
+        text.push('\n');
+        text.push_str(&agent_refusal_guidance(phase, verb, pid));
+    }
+    text.push_str(&format!(
+        "\nOnce every supervisor and process named above is gone, run `{}` again.",
+        verb.rerun(phase)
+    ));
+    text
+}
+
+/// The live-run refusal's paragraph for a live agent its pid file names:
+/// `stop` never signals that pid, so the operator confirms its identity
+/// before signalling it, and a recycled pid has its own repair per verb.
+fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String {
+    let stopped_note = match verb {
+        LaunchVerb::Start => "",
+        LaunchVerb::Resume => {
+            " A state already marked stopped does not mean these processes have exited: \
+             `devflow status` names `devflow resume` for a phase whose supervisor is GONE even \
+             while its agent is still alive, and resume refuses until every named process has \
+             exited."
+        }
+    };
+    let recycled = match verb {
+        LaunchVerb::Start => format!(
+            "If a named pid is live but is not this phase's process (a recycled pid), `start` \
+             refuses again: run `devflow recover --clean --phase {phase}` first, then \
+             `devflow start`."
+        ),
+        LaunchVerb::Resume => format!(
+            "If a named pid is live but is not this phase's process (a recycled pid), `resume` \
+             refuses again, and no DevFlow verb clears a recorded pid while keeping the phase's \
+             work: `devflow recover --clean --phase {phase}` removes the phase state, after \
+             which `resume` has nothing to resume, and `devflow start` refuses while the \
+             phase's worktree or branch exists; `devflow start --force` recreates them from \
+             the base and discards the phase's work."
+        ),
+    };
     format!(
-        "phase {phase}: a run is still live ({named} alive) — refusing to resume; nothing was written\n\
-         No process holds the phase lock right now, so `devflow stop --phase {phase}` would only mark the \
-         state stopped: it signals nothing and does not end this run. stop ends a run through the process \
-         that holds the lock: one parked at a gate, or this run's own `devflow advance` once it takes the \
-         lock after this refusal.\n\
-         A state already marked stopped does not mean these processes have exited. `devflow status` and \
-         `devflow doctor` name `devflow resume` for a phase whose monitor is dead even while its agent is \
-         still alive; resume refuses until every named process has exited.\n\
-         Check each pid before signalling it. `ps -p` shows only the executable name, which cannot tell \
-         phases apart; `-ww` keeps a long command line from being cut at the terminal width:{checks}\n\
-         This phase's monitor is either a `__monitor` process with this project's path and `--phase {phase}` \
-         in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` \
-         with `--phase {phase}`. This phase's agent has that monitor as its parent (`ps -o ppid= -p <pid>`); \
-         an agent whose monitor has exited cannot be tied to this phase that way, so do not signal it on the \
-         pid alone.\n\
-         To end this run now, send SIGTERM to the confirmed monitor first — signalling the agent first lets \
-         the monitor launch the next stage. If the agent has already exited, an `sh` monitor may be running \
-         `devflow advance` as a foreground child: the monitor defers SIGTERM until that child returns, and \
-         the child may take the lock as soon as this resume exits. Find it with \
-         `ps -ww -o pid=,args= --ppid <monitor pid>` and signal that child, not only the monitor.\n\
-         If the named processes have exited, run `devflow resume --phase {phase}` again. If a named pid is \
-         live but is not this phase's process (a recycled pid), `resume` refuses again, and no DevFlow verb \
-         clears a recorded pid while keeping the phase's work: `devflow recover --clean --phase {phase}` \
-         removes the phase state, after which `resume` has nothing to resume, and `devflow start` refuses \
-         while the phase's worktree or branch exists; `devflow start --force` recreates them from the base \
-         and discards the phase's work. Do neither while this phase's processes are live: `recover --clean` \
-         clears state even while an agent runs, and a later `start` would launch a second agent beside it."
+        "The agent pid file names a live process, and `devflow stop` never signals a pid from \
+         the agent pid file.{stopped_note} Check each pid before signalling it. `ps -p` shows \
+         only the executable name, which cannot tell phases apart; `-ww` keeps a long command \
+         line from being cut at the terminal width:\n  \
+         agent pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}\n\
+         This phase's agent has its supervisor, a `__monitor` process with this project's path \
+         and `--phase {phase}` in its args, as its parent (`ps -o ppid= -p <pid>`); an agent \
+         whose supervisor has exited cannot be tied to this phase that way, so do not signal it \
+         on the pid alone. {recycled} Do neither while this phase's processes are live: \
+         `recover --clean` clears state even while an agent runs, and a later `start` would \
+         launch a second agent beside it."
     )
 }
 
