@@ -247,3 +247,9 @@ None. 50-19's live attempt is the operator's checkpoint and uses `50-RUNBOOK.md`
 ---
 *Phase: 50-addressable-monitor-liveness*
 *Completed: 2026-10-18*
+
+## Self-Check: PASSED
+
+- Files: `tools/fault-arm.sh`, `tools/check-supervisor-evidence.sh` (both index mode 100755), `tools/EVIDENCE-LAYOUT.md`, `50-RUNBOOK.md`, this SUMMARY and `~/.cache/devflow-phase50/fault-1/bin_sha256` all exist.
+- Commits `12dba38`, `83dac2a` and `1e7d2a5` (this SUMMARY) are ancestors of HEAD.
+- R5-W1 re-check: after the planning-only commit `1e7d2a5`, `check-supervisor-evidence.sh --fault-current "$HOME/.cache/devflow-phase50"` still exits 0 (`uncommitted_crate_source=0`, `dir=fault-1`, `complete=yes`, `FAULT_CURRENT verdict=pass`), although a binary rebuilt at this commit would hash differently.
