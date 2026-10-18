@@ -2055,7 +2055,6 @@ struct LocatedSocket {
     socket: PathBuf,
     /// The state's record, when the socket came from it (the backstop
     /// cross-checks the sidecar against it).
-    #[expect(dead_code, reason = "read by the STALE backstop arm")]
     record: Option<SupervisorRecord>,
     /// The state file, when it exists but does not load and the socket came
     /// from its sidecar.
@@ -2194,7 +2193,10 @@ fn stop_via_socket(
         let ended = match supervisor::probe(&located.socket) {
             Ok(supervisor::Liveness::Gone) => return Ok(SocketStop::NoLiveSocket),
             Err(error) => return Err(probe_refusal(phase, &located.socket, &error)),
-            Ok(supervisor::Liveness::Stale) => stop_stale_socket(phase, &located)?,
+            Ok(supervisor::Liveness::Stale) => {
+                stop_stale_socket(phase, &located)?;
+                true
+            }
             Ok(supervisor::Liveness::Alive(_)) => match shutdown_supervisor(phase, &located)? {
                 ShutdownResult::Ended => true,
                 ShutdownResult::Relocate => false,
@@ -2280,7 +2282,7 @@ fn shutdown_supervisor(
                 "stop: phase {phase}'s supervisor went away under the shutdown request ({error}); \
                  its socket is now STALE"
             );
-            stop_stale_socket(phase, located).map(|_| ShutdownResult::Ended)
+            stop_stale_socket(phase, located).map(|()| ShutdownResult::Ended)
         }
         Ok(supervisor::Liveness::Gone) => Ok(ShutdownResult::Relocate),
         _ => Err(CliError::Message(format!(
@@ -2314,14 +2316,104 @@ fn probe_error_kind(error: &supervisor::ProbeError) -> &'static str {
     }
 }
 
-/// A STALE socket: its supervisor is gone. Refused here; nothing is
-/// signalled, removed or recorded.
-fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<bool, CliError> {
-    Err(CliError::Message(format!(
-        "stop: phase {phase}'s supervisor socket {} is STALE (its supervisor is gone); nothing \
-         was signalled, removed or recorded",
-        located.socket.display()
-    )))
+/// A STALE socket: its supervisor is gone, and its agent group may not be.
+/// The sidecar beside the socket is read and handed, with the state's record
+/// when there is one, to the 50-09 backstop, which validates the group's
+/// identity before it signals anything. A sidecar that cannot be read is a
+/// refusal: nothing else can validate the group.
+fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<(), CliError> {
+    let subject = format!("phase {phase}");
+    let socket = supervisor::SocketPath::new(located.socket.clone())
+        .map_err(|error| stale_refusal(&subject, &located.socket, &error.to_string()))?;
+    let sidecar = read_stale_sidecar(&subject, &socket)?;
+    run_backstop(phase, &subject, &socket, &sidecar, located.record.as_ref())
+}
+
+/// The sidecar of a STALE socket, or the refusal that names why it cannot be
+/// used.
+fn read_stale_sidecar(
+    subject: &str,
+    socket: &supervisor::SocketPath,
+) -> Result<supervisor::Sidecar, CliError> {
+    supervisor::read_sidecar(&socket.sidecar_path()).map_err(|error| {
+        let why = match &error {
+            supervisor::SidecarError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                "is missing".to_string()
+            }
+            supervisor::SidecarError::Json(parse) => format!("does not parse: {parse}"),
+            other => format!("could not be read: {other}"),
+        };
+        stale_refusal(subject, socket.as_path(), &format!("its sidecar {why}"))
+    })
+}
+
+/// The refusal for a STALE socket whose agent group nothing can validate:
+/// nothing is signalled or removed, and the manual repair is named.
+fn stale_refusal(subject: &str, socket: &Path, why: &str) -> CliError {
+    CliError::Message(format!(
+        "stop: {subject}: socket {} is STALE and {why}; nothing recorded can validate its agent \
+         group, so stop signals nothing — end its agent yourself and remove {} and {}",
+        socket.display(),
+        socket.display(),
+        socket.with_extension("json").display()
+    ))
+}
+
+/// Run the backstop on a STALE socket and report what it did. A group it
+/// ended, or one it proved gone (previous boot, empty group, recycled
+/// leader, R-8), is a stop; a refusal prints the backstop's own text (the
+/// members, the residual F1 limit, the inspection command) and fails.
+fn run_backstop(
+    phase: PhaseId,
+    subject: &str,
+    socket: &supervisor::SocketPath,
+    sidecar: &supervisor::Sidecar,
+    record: Option<&SupervisorRecord>,
+) -> Result<(), CliError> {
+    use supervisor::backstop::{BackstopDecision, BackstopOutcome};
+    let outcome =
+        supervisor::backstop::teardown_stale(socket, sidecar, record).map_err(|error| {
+            CliError::Message(format!(
+                "stop: {subject}: the stale-socket backstop did not act ({error}); nothing was \
+             recorded"
+            ))
+        })?;
+    match outcome {
+        BackstopOutcome::Killed { members, .. } => {
+            let pids: Vec<String> = members.iter().map(|m| m.pid.to_string()).collect();
+            println!(
+                "stop: {subject}: its supervisor is gone (STALE socket); ended its agent group {} \
+                 ({} member(s): pid {}) and removed {} and its sidecar",
+                sidecar.agent_pgid,
+                members.len(),
+                pids.join(", "),
+                socket.as_path().display()
+            );
+            Ok(())
+        }
+        BackstopOutcome::RemovedNothingSignalled(decision) => {
+            let why = match decision {
+                BackstopDecision::PreviousBoot => "previous boot",
+                BackstopDecision::EmptyGroup => "empty group",
+                BackstopDecision::LeaderRecycled => "recycled leader",
+                _ => "nothing to signal",
+            };
+            println!(
+                "stop: {subject}: nothing was running ({why}); removed the stale socket {}; the \
+                 phase is resumable: run `devflow resume --phase {phase}`",
+                socket.as_path().display()
+            );
+            Ok(())
+        }
+        BackstopOutcome::Refused(decision) => Err(CliError::Message(format!(
+            "stop: {subject}: {}",
+            decision.describe(socket, sidecar)
+        ))),
+        other => Err(CliError::Message(format!(
+            "stop: {subject}: the stale-socket backstop gave an unknown outcome ({other:?}); \
+             nothing was recorded"
+        ))),
+    }
 }
 
 /// The primary path: answer `phase`'s open gate with a rejection whose note
