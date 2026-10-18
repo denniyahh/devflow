@@ -16,10 +16,11 @@ use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, State, SupervisorRecord};
+use devflow_core::supervisor::{self, Liveness};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -1165,5 +1166,348 @@ fn stop_positional_root_survives_a_non_utf8_path() {
     assert!(
         stderr.contains("project path does not exist:"),
         "a non-UTF-8 root must survive clap and reach project_root:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 50-14: `stop` addresses the run's supervisor socket (D-04, D-06).
+//
+// These tests launch real supervised runs with `devflow start --mode
+// supervise` under a `HermeticHome`, so every socket and sidecar lives under
+// the test's tempdir cache. A pid a test signals comes from a sidecar and is
+// confirmed with `agent::is_same_process` against its recorded start time.
+// ---------------------------------------------------------------------------
+
+/// How long a test waits for a supervised run to reach a state.
+const RUN_WAIT: Duration = Duration::from_secs(60);
+
+/// A repository on `develop` with a roadmap entry for `phase`, the shape
+/// `supervisor_e2e.rs` launches a real supervised run from.
+fn init_supervised_repo(root: &Path, phase: PhaseId) {
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "devflow@example.com"]);
+    git(root, &["config", "user.name", "DevFlow Tests"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    std::fs::create_dir_all(root.join(".planning")).unwrap();
+    std::fs::write(root.join("README.md"), "base\n").unwrap();
+    std::fs::write(
+        root.join(".planning/ROADMAP.md"),
+        format!("# Roadmap\n\n### Phase {phase}: stop fixture\n"),
+    )
+    .unwrap();
+    git(root, &["add", "README.md", ".planning/ROADMAP.md"]);
+    git(root, &["commit", "-q", "-m", "base"]);
+}
+
+/// The fake `claude`'s health check and delivery canary, as in
+/// `supervisor_e2e.rs`; `body` runs for the real stage turn.
+fn fake_claude(body: &str) -> String {
+    format!(
+        r#"if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi
+read -r turn
+case "$turn" in
+  *DEVFLOW_DELIVERY_CANARY_*)
+    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
+    printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}}\n' "$token"
+    exit 0
+    ;;
+esac
+{body}"#
+    )
+}
+
+/// A fake agent that keeps running until `trigger` exists, then commits one
+/// empty commit, prints the success marker and exits 0.
+fn triggered_agent(trigger: &Path) -> String {
+    fake_claude(&format!(
+        r#"while [ ! -e '{trigger}' ]; do sleep 0.05; done
+git commit -q --allow-empty -m "fake stage work"
+printf 'work done\nDEVFLOW_RESULT: {{"status":"success","commits":1}}\n'
+exit 0"#,
+        trigger = trigger.display()
+    ))
+}
+
+/// The `stage_launched` events recorded for `phase`.
+fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
+    std::fs::read_to_string(devflow_core::events::events_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            phase.matches_json(event.get("phase"))
+                && event["event"].as_str() == Some("stage_launched")
+        })
+        .count()
+}
+
+/// The pids whose process group (`/proc/<pid>/stat` field 5) is `pgid`.
+fn group_members(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let rest = &stat[stat.rfind(')')? + 1..];
+                    rest.split_whitespace().nth(2)?.parse::<u32>().ok()
+                })
+                == Some(pgid)
+        })
+        .collect()
+}
+
+/// Poll `done` every 25 ms until it holds or `within` elapses.
+fn holds_within(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Ends, on drop, the run a captured supervisor record names, whether or not
+/// its state still loads (a test may corrupt it): a socket shutdown, then a
+/// SIGKILL to the agent group when its leader is still the recorded process.
+struct RecordReaper(SupervisorRecord);
+
+impl Drop for RecordReaper {
+    fn drop(&mut self) {
+        let _ = supervisor::request_shutdown(&self.0.socket_path, Duration::from_secs(15));
+        let leader = self.0.agent_pgid;
+        if devflow_core::agent::agent_running(leader)
+            && devflow_core::agent::is_same_process(leader, self.0.agent_start_time)
+        {
+            common::signal_group(leader, libc::SIGKILL);
+        }
+    }
+}
+
+/// One live supervised run of a [`triggered_agent`], started with
+/// `devflow start --mode supervise --until plan`. Its reapers are declared
+/// first so they drop before the home and repository they need.
+struct LiveRun {
+    _record_reaper: RecordReaper,
+    _launch_reaper: common::LaunchedRunReaper,
+    home: common::HermeticHome,
+    _repo: tempfile::TempDir,
+    _fake_bin: common::FakeBin,
+    root: PathBuf,
+    phase: PhaseId,
+    trigger: PathBuf,
+    record: SupervisorRecord,
+}
+
+impl LiveRun {
+    fn start(phase: PhaseId) -> Self {
+        let home = common::HermeticHome::new();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        init_supervised_repo(&root, phase);
+        let trigger = root.join(".git").join("devflow-test-trigger");
+        let fake_bin = common::fake_bin_dir(&triggered_agent(&trigger));
+        let launch_reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
+        let output = common::hermetic_devflow(&home)
+            .args([
+                "start",
+                "--phase",
+                &phase.to_string(),
+                "--agent",
+                "claude",
+                "--mode",
+                "supervise",
+                "--no-worktree",
+                "--until",
+                "plan",
+            ])
+            .arg(&root)
+            .current_dir(&root)
+            .env("PATH", path)
+            .output()
+            .expect("run devflow start");
+        assert!(
+            output.status.success(),
+            "start failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let record = devflow_core::workflow::load_state(&root, phase)
+            .expect("start saved state")
+            .supervisor
+            .expect("start records state.supervisor");
+        Self {
+            _record_reaper: RecordReaper(record.clone()),
+            _launch_reaper: launch_reaper,
+            home,
+            _repo: repo,
+            _fake_bin: fake_bin,
+            root,
+            phase,
+            trigger,
+            record,
+        }
+    }
+
+    /// `devflow stop --phase N` plus `extra`, run from the project root.
+    fn stop(&self, extra: &[&str]) -> std::process::Output {
+        common::hermetic_devflow(&self.home)
+            .args(["stop", "--phase", &self.phase.to_string()])
+            .args(extra)
+            .current_dir(&self.root)
+            .output()
+            .expect("run devflow stop")
+    }
+
+    fn state_file(&self) -> PathBuf {
+        devflow_core::workflow::state_path(&self.root, self.phase)
+    }
+
+    fn probe(&self) -> Liveness {
+        supervisor::probe(&self.record.socket_path).expect("probe the recorded socket")
+    }
+}
+
+/// `stop`'s stdout and stderr, for an assertion message.
+fn describe(output: &std::process::Output) -> String {
+    format!(
+        "exit {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// V-17 (999.138): a live run whose agent holds no per-phase lock is ended
+/// through its supervisor's socket: the agent group is gone, the exit file
+/// reads 143, no next stage is launched, the socket is Gone, and the state
+/// records the stop.
+#[test]
+fn stop_ends_a_lock_free_live_run_through_the_socket() {
+    let run = LiveRun::start(PhaseId::new(140));
+    assert!(
+        matches!(
+            devflow_core::lock::holder_status(&run.root, run.phase),
+            devflow_core::lock::HolderStatus::NoHolder
+        ),
+        "precondition: the running agent holds no per-phase lock"
+    );
+    assert!(
+        matches!(run.probe(), Liveness::Alive(_)),
+        "precondition: the run is ALIVE"
+    );
+    let pgid = run.record.agent_pgid;
+    assert!(
+        !group_members(pgid).is_empty(),
+        "precondition: the agent group is running"
+    );
+
+    let output = run.stop(&[]);
+    let text = describe(&output);
+    assert!(output.status.success(), "stop must succeed: {text}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "stopped phase {} through its supervisor",
+            run.phase
+        )),
+        "stop says it stopped the phase through its supervisor: {text}"
+    );
+    assert!(
+        holds_within(Duration::from_secs(5), || group_members(pgid).is_empty()),
+        "the agent group {pgid} is gone"
+    );
+    let exit = std::fs::read_to_string(devflow_core::agent_result::exit_code_path(
+        &run.root, run.phase,
+    ))
+    .expect("the supervisor records the agent's exit code");
+    assert_eq!(exit.trim(), "143", "the agent ended by the stop");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        stage_launched_count(&run.root, run.phase),
+        1,
+        "no next stage is launched after the stop"
+    );
+    assert_eq!(run.probe(), Liveness::Gone, "the socket is gone");
+    let state = devflow_core::workflow::load_state(&run.root, run.phase).unwrap();
+    assert!(state.stopped, "state.stopped after the stop");
+    assert!(
+        state
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("devflow stop")),
+        "the stop reason names `devflow stop`: {:?}",
+        state.stop_reason
+    );
+}
+
+/// The V-17 control: the same fixture with no `stop`, whose agent is
+/// released by its trigger, completes and advances, so a following
+/// `stage_launched` appears. V-17's "no next stage" is therefore the stop's
+/// doing, not a fixture that never advances.
+#[test]
+fn without_stop_a_lock_free_run_completes_and_advances() {
+    let run = LiveRun::start(PhaseId::new(141));
+    assert_eq!(stage_launched_count(&run.root, run.phase), 1);
+    std::fs::write(&run.trigger, "go\n").unwrap();
+    assert!(
+        holds_within(RUN_WAIT, || stage_launched_count(&run.root, run.phase) >= 2),
+        "a released agent must complete and launch the next stage:\n{}",
+        std::fs::read_to_string(devflow_core::events::events_path(&run.root)).unwrap_or_default()
+    );
+}
+
+/// D-09's repair verb: a live run whose state file will not load is ended
+/// through its one sidecar-found socket. `stop` exits 0, says the stop was
+/// not recorded because the state does not load (naming the file), and
+/// leaves the state bytes unchanged. V-17 is its loadable-state control.
+#[test]
+fn stop_ends_a_live_run_whose_state_will_not_load() {
+    let run = LiveRun::start(PhaseId::new(142));
+    let pgid = run.record.agent_pgid;
+    assert!(
+        !group_members(pgid).is_empty(),
+        "precondition: agent running"
+    );
+    let state_file = run.state_file();
+    std::fs::write(&state_file, b"{ this is not json").unwrap();
+    let before = std::fs::read(&state_file).unwrap();
+
+    let output = run.stop(&[]);
+    let text = describe(&output);
+    assert!(output.status.success(), "stop must succeed: {text}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "stopped phase {} through its supervisor",
+            run.phase
+        )),
+        "stop says it stopped the phase: {text}"
+    );
+    assert!(
+        stdout.contains(&state_file.display().to_string())
+            && stdout.contains("does not load")
+            && stdout.contains("was not recorded"),
+        "stop says `stopped` was not recorded and names the state file: {text}"
+    );
+    assert!(
+        holds_within(Duration::from_secs(5), || group_members(pgid).is_empty()),
+        "the agent group {pgid} is gone"
+    );
+    assert_eq!(run.probe(), Liveness::Gone, "the socket is gone");
+    assert_eq!(
+        std::fs::read(&state_file).unwrap(),
+        before,
+        "the state that will not load is left byte for byte"
     );
 }

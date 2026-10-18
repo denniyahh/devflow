@@ -9635,4 +9635,428 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // 50-14: `stop` through the run's supervisor socket (crash row C13, and
+    // a supervisor that dies under its shutdown request).
+    // -----------------------------------------------------------------------
+
+    /// A 0700 socket directory under a short tempdir in `/tmp`, so every
+    /// socket path below it fits `sun_path`. The tempdir removes it on drop.
+    fn stop_socket_dir() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::Builder::new()
+            .prefix("dfs")
+            .tempdir_in("/tmp")
+            .expect("create a short socket base under /tmp");
+        let dir = base.path().join("sock");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (base, dir)
+    }
+
+    /// Bind a listener at `path` with mode 0600, as a published supervisor
+    /// socket is.
+    fn bind_supervisor_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        use std::os::unix::fs::PermissionsExt as _;
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("bind the socket");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener
+    }
+
+    /// Wait up to `within` for `fd` to be readable (a queued connection on a
+    /// listener, data on a stream); whether it became readable.
+    fn readable_within(fd: &impl std::os::fd::AsRawFd, within: std::time::Duration) -> bool {
+        let mut entry = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+        loop {
+            // SAFETY: one initialized pollfd naming a descriptor the caller
+            // holds open for the whole call.
+            let ready = unsafe { libc::poll(&raw mut entry, 1, millis) };
+            if ready >= 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return ready == 1;
+            }
+        }
+    }
+
+    /// A well-formed ping reply line for a scripted supervisor.
+    fn scripted_ping_reply(launch_id: &str, phase: PhaseId, owner: &str) -> String {
+        serde_json::json!({
+            "ok": true,
+            "launch_id": launch_id,
+            "phase": phase.to_string(),
+            "stage": "code",
+            "launch": "stream",
+            "owner": owner,
+            "agent_pid": 1,
+            "agent_pgid": 1,
+            "agent_start_time": 0,
+            "boot_id": null,
+            "supervisor_pid": 1,
+        })
+        .to_string()
+    }
+
+    /// Accept one connection on `listener` within `within`, or `None`.
+    fn accept_within(
+        listener: &std::os::unix::net::UnixListener,
+        within: std::time::Duration,
+    ) -> Option<std::os::unix::net::UnixStream> {
+        if !readable_within(listener, within) {
+            return None;
+        }
+        Some(listener.accept().expect("accept a queued connection").0)
+    }
+
+    /// Read one request line from `stream`, or `None` when none arrives
+    /// within the read timeout.
+    fn read_request_line(stream: &std::os::unix::net::UnixStream) -> Option<String> {
+        use std::io::BufRead as _;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line).ok()?;
+        (!line.is_empty()).then(|| line.trim_end().to_string())
+    }
+
+    /// The lines a scripted supervisor sends for one `shutdown` request, and
+    /// whether it then unlinks its socket and stops serving.
+    struct ShutdownScript {
+        lines: Vec<String>,
+        unlink_after: bool,
+    }
+
+    /// A scripted supervisor: serves `socket` on a thread, logs each
+    /// connection's one request line, answers `ping` with
+    /// [`scripted_ping_reply`] and the n-th `shutdown` (1-based) with
+    /// `on_shutdown(n)`. Dropping it stops the thread and removes the socket.
+    struct ScriptedSupervisor {
+        socket: PathBuf,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ScriptedSupervisor {
+        fn serve(
+            socket: &Path,
+            launch_id: &str,
+            phase: PhaseId,
+            owner: &str,
+            mut on_shutdown: impl FnMut(usize) -> ShutdownScript + Send + 'static,
+        ) -> Self {
+            use std::io::Write as _;
+            use std::sync::atomic::Ordering;
+            let listener = bind_supervisor_socket(socket);
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ping = scripted_ping_reply(launch_id, phase, owner);
+            let (thread_log, thread_done, path) = (log.clone(), done.clone(), socket.to_path_buf());
+            let thread = std::thread::spawn(move || {
+                let mut shutdowns = 0;
+                while !thread_done.load(Ordering::SeqCst) {
+                    let Some(mut stream) =
+                        accept_within(&listener, std::time::Duration::from_millis(50))
+                    else {
+                        continue;
+                    };
+                    let Some(request) = read_request_line(&stream) else {
+                        continue;
+                    };
+                    thread_log.lock().unwrap().push(request.clone());
+                    if request.contains("\"ping\"") {
+                        let _ = writeln!(stream, "{ping}");
+                        continue;
+                    }
+                    shutdowns += 1;
+                    let script = on_shutdown(shutdowns);
+                    for line in &script.lines {
+                        let _ = writeln!(stream, "{line}");
+                    }
+                    if script.unlink_after {
+                        let _ = std::fs::remove_file(&path);
+                        return;
+                    }
+                }
+            });
+            Self {
+                socket: socket.to_path_buf(),
+                log,
+                done,
+                thread: Some(thread),
+            }
+        }
+
+        /// How many `shutdown` requests this supervisor has received.
+        fn shutdowns(&self) -> usize {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("\"shutdown\""))
+                .count()
+        }
+    }
+
+    impl Drop for ScriptedSupervisor {
+        fn drop(&mut self) {
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    /// Save a state for `phase` whose supervisor record names `socket` and
+    /// `launch_id`.
+    fn save_state_naming(root: &Path, phase: PhaseId, socket: &Path, launch_id: &str) {
+        let mut state = match workflow::load_state(root, phase) {
+            Ok(state) => state,
+            Err(_) => State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf()),
+        };
+        state.supervisor = Some(SupervisorRecord::new(
+            socket.to_path_buf(),
+            launch_id.to_string(),
+            1,
+            0,
+            "boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    const HANDED_OFF_LINE: &str = r#"{"ok":false,"error":"handed_off"}"#;
+    const ACCEPTED_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"agent_running"}"#;
+    const STOPPED_LINE: &str =
+        r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true}"#;
+
+    /// Crash row C13 (V-57): the state names supervisor A; A answers the
+    /// shutdown by saving the state naming B (N+1's record is saved before N
+    /// is marked handed off) and replying `handed_off`. `stop` reloads the
+    /// state and stops B: A is asked once, B once, and `stopped` is recorded.
+    #[test]
+    fn stop_retries_a_handed_off_reply_against_the_reloaded_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1401);
+        let (_base, sock) = stop_socket_dir();
+        let (a_path, b_path) = (sock.join("a.sock"), sock.join("b.sock"));
+        save_state_naming(&root, phase, &a_path, "launch-a");
+
+        let b = ScriptedSupervisor::serve(&b_path, "launch-b", phase, "agent_running", |_| {
+            ShutdownScript {
+                lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                unlink_after: false,
+            }
+        });
+        let (a_root, a_b_path) = (root.clone(), b_path.clone());
+        let a = ScriptedSupervisor::serve(&a_path, "launch-a", phase, "handed_off", move |_| {
+            save_state_naming(&a_root, phase, &a_b_path, "launch-b");
+            ShutdownScript {
+                lines: vec![HANDED_OFF_LINE.to_string()],
+                unlink_after: false,
+            }
+        });
+
+        let result = stop(&root, phase);
+        assert!(
+            result.is_ok(),
+            "stop must reach B through the reloaded record: {result:?}"
+        );
+        assert_eq!(a.shutdowns(), 1, "A is asked exactly once");
+        assert_eq!(b.shutdowns(), 1, "B is asked exactly once");
+        let state = workflow::load_state(&root, phase).unwrap();
+        assert!(state.stopped, "the stop B performed is recorded");
+    }
+
+    /// C13 control (V-57): every reload names A again, so `stop` gives up
+    /// after the first request and 3 retries, with an error naming
+    /// `handed_off` and the attempt count, and records nothing. A unlinks its
+    /// socket after a fifth request, so a loop past the cap ends as Gone and
+    /// fails the count instead of hanging.
+    #[test]
+    fn stop_gives_up_after_three_handed_off_retries_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1402);
+        let (_base, sock) = stop_socket_dir();
+        let a_path = sock.join("a.sock");
+        save_state_naming(&root, phase, &a_path, "launch-a");
+        let state_file = workflow::state_path(&root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let a = ScriptedSupervisor::serve(&a_path, "launch-a", phase, "handed_off", |count| {
+            ShutdownScript {
+                lines: vec![HANDED_OFF_LINE.to_string()],
+                unlink_after: count >= 5,
+            }
+        });
+
+        let error = stop(&root, phase)
+            .expect_err("a supervisor that keeps answering handed_off is not a stop")
+            .to_string();
+        assert!(
+            error.contains("handed_off") && error.contains('4'),
+            "the error names handed_off and the attempt count: {error}"
+        );
+        assert_eq!(a.shutdowns(), 4, "the first request plus exactly 3 retries");
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "nothing is recorded"
+        );
+    }
+
+    /// The sidecar and state record of a launch recorded in an earlier boot:
+    /// the backstop proves its group gone without reading a process, so it
+    /// removes the files and signals nothing.
+    fn plant_previous_boot_launch(root: &Path, phase: PhaseId, socket: &Path) {
+        let sidecar = serde_json::json!({
+            "launch_id": "launch-r",
+            "project_root": root,
+            "phase": phase,
+            "stage": "code",
+            "agent": "claude",
+            "launch": "stream",
+            "agent_pid": 99_999_999,
+            "agent_pgid": 99_999_999,
+            "agent_start_time": 1,
+            "boot_id": "an-earlier-boot",
+            "supervisor_pid": 99_999_998,
+            "supervisor_start_time": 1,
+            "created_at": "2026-10-17T00:00:00Z",
+        });
+        std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = Some(SupervisorRecord::new(
+            socket.to_path_buf(),
+            "launch-r".to_string(),
+            99_999_999,
+            1,
+            "an-earlier-boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The race 6d46008 left to `stop`: the supervisor answers the probe's
+    /// ping, then its listener is released with the shutdown's connect still
+    /// queued, so `request_shutdown` reads a reset or a broken pipe. That is
+    /// a supervisor that died, not a failed stop: `stop` probes once more,
+    /// reads STALE, runs the backstop (which removes the files and signals
+    /// nothing for this earlier-boot launch) and records `stopped`.
+    #[test]
+    fn stop_acts_on_a_supervisor_that_dies_under_its_shutdown_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1403);
+        let (_base, sock) = stop_socket_dir();
+        let socket = sock.join("r.sock");
+        plant_previous_boot_launch(&root, phase, &socket);
+        let listener = bind_supervisor_socket(&socket);
+        let ping = scripted_ping_reply("launch-r", phase, "agent_running");
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let wait = std::time::Duration::from_secs(30);
+            let Some(mut first) = accept_within(&listener, wait) else {
+                return "no probe connected";
+            };
+            if read_request_line(&first).is_none_or(|line| !line.contains("\"ping\"")) {
+                return "the first request was not a ping";
+            }
+            let _ = writeln!(first, "{ping}");
+            drop(first);
+            // Release the listener with the shutdown's connect queued in it
+            // and never accepted.
+            if !readable_within(&listener, wait) {
+                return "no shutdown connect was queued";
+            }
+            drop(listener);
+            "released"
+        });
+
+        let result = stop(&root, phase);
+        assert_eq!(server.join().expect("server thread"), "released");
+        assert!(
+            result.is_ok(),
+            "a supervisor that died under the shutdown is torn down, not an error: {result:?}"
+        );
+        assert!(
+            !socket.exists() && !socket.with_extension("json").exists(),
+            "the backstop removed the stale socket and its sidecar"
+        );
+        assert!(
+            workflow::load_state(&root, phase).unwrap().stopped,
+            "the confirmed-not-live stop is recorded"
+        );
+    }
+
+    /// Control for the race: a listener that stays up but closes the
+    /// shutdown (and every later connection) with its request unread is not
+    /// a dead supervisor. `stop` fails, removes nothing and records nothing.
+    #[test]
+    fn stop_reports_a_shutdown_closed_by_a_live_listener() {
+        /// Stops an unbounded re-probe from hanging this test.
+        const ACCEPT_AT_MOST: usize = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1404);
+        let (_base, sock) = stop_socket_dir();
+        let socket = sock.join("l.sock");
+        plant_previous_boot_launch(&root, phase, &socket);
+        let state_file = workflow::state_path(&root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+        let listener = bind_supervisor_socket(&socket);
+        let ping = scripted_ping_reply("launch-r", phase, "agent_running");
+        let (stop_server, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut accepted = 0;
+            while accepted < ACCEPT_AT_MOST && stopped.try_recv().is_err() {
+                let Some(mut stream) =
+                    accept_within(&listener, std::time::Duration::from_millis(50))
+                else {
+                    continue;
+                };
+                accepted += 1;
+                if accepted == 1 {
+                    let _ = read_request_line(&stream);
+                    let _ = writeln!(stream, "{ping}");
+                    continue;
+                }
+                // Close with the request unread, which resets the client.
+                let _ = readable_within(&stream, std::time::Duration::from_secs(5));
+                drop(stream);
+            }
+            (listener, accepted)
+        });
+
+        let result = stop(&root, phase);
+        stop_server.send(()).expect("stop the server");
+        let (listener, accepted) = server.join().expect("server thread");
+        drop(listener);
+        assert!(
+            accepted >= 2,
+            "stop never sent its shutdown ({accepted} connects)"
+        );
+        assert!(
+            result.is_err(),
+            "a live listener that closes the shutdown is not a stop: {result:?}"
+        );
+        assert!(
+            socket.exists() && socket.with_extension("json").exists(),
+            "nothing is removed"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "nothing is recorded"
+        );
+    }
 }
