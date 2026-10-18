@@ -6083,11 +6083,16 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             loop {
+                // Check the response before the state. The park saves
+                // `stopped` before it removes the response, so a response the
+                // park removed is always seen with `stopped` set. Reading the
+                // state first let a whole park land between the two reads.
+                let response_gone = !writer_response_path.exists();
                 let state = workflow::load_state(&writer_root, phase);
                 if state.as_ref().is_ok_and(|state| state.stopped) {
                     return;
                 }
-                if !writer_response_path.exists() {
+                if response_gone {
                     write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
                     writer_third_gate_response_written
                         .store(true, std::sync::atomic::Ordering::SeqCst);
