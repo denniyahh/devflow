@@ -932,13 +932,14 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
 
         // Fail-closed on a live run: refuse whenever the agent is alive
         // (whatever the supervisor's liveness) OR the supervisor answers
-        // ALIVE, `--force` or not.
+        // ALIVE, `--force` or not. The verb that ends a live run is `stop`
+        // (50-14); `resume` refuses while one is live.
         if agent_alive || matches!(phase_liveness, PhaseLiveness::Alive { .. }) {
             let phase_label = phase
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
             return Err(CliError::Message(format!(
-                "refusing to remove worktree {} for phase {phase_label} ({}) — run `devflow resume --phase {phase_label}` or wait for it to finish",
+                "refusing to remove worktree {} for phase {phase_label} ({}) — run `devflow stop --phase {phase_label}` or wait for it to finish",
                 wt.path.display(),
                 phase_liveness.describe(),
             )));

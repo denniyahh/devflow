@@ -1063,9 +1063,11 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // 50-14: `stop` ends a live run; `resume` refuses while one is live.
     assert!(
-        combined.contains("devflow resume"),
-        "refusal must name `devflow resume` as the unblocking action, got:\n{combined}"
+        combined.contains("run `devflow stop --phase 8`") && !combined.contains("devflow resume"),
+        "refusal must name `devflow stop --phase 8` (not `devflow resume`) as the \
+         unblocking action, got:\n{combined}"
     );
     assert!(
         wt_path.is_dir(),
@@ -1135,9 +1137,11 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // 50-14: `stop` ends a live run; `resume` refuses while one is live.
     assert!(
-        combined.contains("devflow resume"),
-        "refusal must name `devflow resume` as the unblocking action, got:\n{combined}"
+        combined.contains("run `devflow stop --phase 9`") && !combined.contains("devflow resume"),
+        "refusal must name `devflow stop --phase 9` (not `devflow resume`) as the \
+         unblocking action, got:\n{combined}"
     );
     assert!(
         wt_path.is_dir(),
