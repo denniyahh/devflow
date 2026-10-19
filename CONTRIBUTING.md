@@ -35,6 +35,12 @@ Two things this hook does that are load-bearing:
   hooks directory wholesale, so without that shim the command above would
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
+- `pre-commit` runs its own secret scan, `gitleaks git --pre-commit --staged
+  --redact`, on every commit, so **install
+  [gitleaks](https://github.com/gitleaks/gitleaks#installing)** before
+  setting `core.hooksPath`: without it on `PATH` the hook refuses the commit
+  rather than skip the scan. A finding refuses the commit with the secret
+  redacted; a false positive goes in `.gitleaksignore` by fingerprint.
 - [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) enforces Conventional
   Commit formats (`feat:`, `fix:`, `chore:`, etc.) on every commit subject and
   warns if the subject exceeds 72 characters, keeping git history and automated
