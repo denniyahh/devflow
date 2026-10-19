@@ -455,10 +455,11 @@ pub(crate) fn rfc3339_now() -> String {
     rfc3339_from_unix(secs)
 }
 
-/// Write `sidecar` beside `socket` atomically: a uniquely named `.tmp` file
-/// in the socket directory, set to mode `0600`, then renamed onto
-/// [`SocketPath::sidecar_path`]. The sidecar is a regular file, so `rename`
-/// is safe here; only sockets must never be renamed into place. The socket
+/// Write `sidecar` beside `socket` atomically, never replacing one: a
+/// uniquely named `.tmp` file in the socket directory, set to mode `0600`,
+/// then hard-linked to [`SocketPath::sidecar_path`] and unlinked. An existing
+/// sidecar there (another launch's) fails the link with
+/// [`io::ErrorKind::AlreadyExists`] and is left as it was. The socket
 /// directory is created `0700` if absent and refused if it is unsafe, as
 /// [`publish`] does.
 pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Result<()> {
@@ -491,11 +492,18 @@ pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Resul
         .write_all(&contents)
         .and_then(|()| file.sync_all())
         .and_then(|()| std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)))
-        .and_then(|()| std::fs::rename(&temp, &target));
-    if written.is_err() {
-        // The temp name is unique to this call, so removing it touches
-        // nothing another writer owns.
-        let _ = std::fs::remove_file(&temp);
+        .and_then(|()| std::fs::hard_link(&temp, &target));
+    // The temp name is unique to this call, so removing it touches nothing
+    // another writer owns. After a link it is only a second name.
+    let cleanup = std::fs::remove_file(&temp);
+    if written.is_ok()
+        && let Err(error) = cleanup
+    {
+        tracing::warn!(
+            "wrote the sidecar {} but could not remove {}: {error}",
+            target.display(),
+            temp.display()
+        );
     }
     written
 }
@@ -1642,11 +1650,22 @@ mod tests {
             "the temporary file is gone after the write"
         );
 
-        // A second write replaces the first in place.
+        // A second write never replaces the first, and leaves no temp file.
         let mut changed = sidecar.clone();
         changed.stage = Some("verify".to_string());
-        write_sidecar(&socket, &changed).expect("rewrite the sidecar");
-        assert_eq!(read_sidecar(&path).ok(), Some(changed));
+        let rewritten = write_sidecar(&socket, &changed);
+        assert!(
+            rewritten
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+            "a second write is refused, got {rewritten:?}"
+        );
+        assert_eq!(read_sidecar(&path).ok(), Some(sidecar.clone()));
+        let after: Vec<_> = std::fs::read_dir(registry::socket_dir_in(cache.path()))
+            .expect("read sock/")
+            .map(|entry| entry.expect("sock/ entry").file_name())
+            .collect();
+        assert_eq!(after, names, "the refused write leaves no temporary file");
 
         assert_eq!(rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339_from_unix(1_700_000_000), "2023-11-14T22:13:20Z");

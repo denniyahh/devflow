@@ -1273,10 +1273,10 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    returns [`MonitorError::PgidMismatch`].
 /// 3. Hand the agent's `Child` to an `AgentGroupGuard`, which ends the
 ///    agent's group on any error or panic until `serve` succeeds. Write the
-///    agent pid file and the sidecar, then [`Supervisor::serve`]: the
-///    sidecar exists before the socket name appears (R-7), and it is the
-///    launcher's only record of the agent if this process is SIGKILLed
-///    before it publishes (RV-03; `serve` rewrites it with the same content).
+///    agent pid file and the sidecar (never over an existing one), then
+///    publish through `Supervisor::serve_written`: the sidecar exists before
+///    the socket name appears (R-7), and it is the launcher's only record of
+///    the agent if this process is SIGKILLed before it publishes (RV-03).
 /// 4. The stream shape only: drive the agent's pipes through
 ///    `drive_stream_io` (first turn, capture tee, close rule, idle
 ///    timeout). An idle-timeout group kill is a natural outcome,
@@ -1311,7 +1311,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     crate::supervisor::write_sidecar(&spec.socket, &sidecar)?;
     #[cfg(test)]
     monitor_test_hold("after_sidecar");
-    let supervisor = Supervisor::serve(spec.socket.clone(), sidecar)?;
+    let supervisor = Supervisor::serve_written(spec.socket.clone(), sidecar)?;
     let mut child = guard.disarm();
 
     let threads = match (&spec.io, stream_capture) {
@@ -6173,6 +6173,8 @@ exit 0
                 agent_start_time: sidecar.agent_start_time + 1,
                 ..sidecar.clone()
             };
+            // `write_sidecar` never replaces a sidecar, so remove it first.
+            std::fs::remove_file(socket.sidecar_path()).expect("remove the sidecar");
             crate::supervisor::write_sidecar(socket, &wrong).expect("rewrite the sidecar");
         });
         assert!(
