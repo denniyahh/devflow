@@ -107,8 +107,13 @@ How each command shows them:
   first with `devflow stop --phase N`, the line its refusal names, or wait
   for it. It keeps a STALE run's worktree, or one whose probe failed, unless
   `--force`.
-- **`devflow recover --clean --phase N`** refuses while the phase's supervisor
-  is ALIVE and deletes nothing.
+- **`devflow recover --clean --phase N`** refuses, deleting nothing, while
+  the phase's supervisor may still run, by the same rule as `start`: an ALIVE
+  socket, a STALE one unless the backstop's checks prove its agent group
+  gone, or a probe that fails, searching the socket directory when the state
+  file is missing or does not load (and refusing when that directory exists
+  but cannot be listed). It does not read the agent pid file. The refusal
+  names a `devflow stop` line for each such socket.
 - **`devflow start` / `devflow resume`** refuse while a run is live: an ALIVE
   socket, a STALE one unless the backstop's checks prove its agent group gone,
   or a probe that fails. When the state file is missing or does not load,

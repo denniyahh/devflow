@@ -3693,34 +3693,40 @@ fn print_open_branches(project_root: &Path) {
 }
 
 /// `recover --clean --phase N` is a file cleaner, not a teardown (D-06): it
-/// refuses while the phase's supervisor answers ALIVE, found through the
-/// state's record, or, when the state is missing or does not load, through
-/// the sidecars of this root and phase. Nothing is deleted.
+/// refuses while the phase's supervisor may still run, by the launch guard's
+/// supervisor rule ([`possibly_live_sockets`]): an ALIVE socket, a STALE one
+/// whose agent group the backstop does not prove gone, or a probe that
+/// fails, found through the state's record, or, when the state is missing or
+/// does not load, through a sweep of this root and phase (which refuses when
+/// the socket directory cannot be listed). The agent pid file is not read.
+/// Nothing is deleted.
 fn refuse_a_live_supervisor(
     project_root: &Path,
     phase: PhaseId,
     cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
-    let is_alive = |liveness: &Result<supervisor::Liveness, supervisor::ProbeError>| {
-        matches!(liveness, Ok(supervisor::Liveness::Alive(_)))
-    };
-    let alive = match workflow::load_state(project_root, phase) {
-        Ok(state) => state
-            .supervisor
-            .is_some_and(|record| is_alive(&supervisor::probe(&record.socket_path))),
-        Err(_) => cache_dir.is_some_and(|cache_dir| {
-            supervisor::sweep_for_in(cache_dir, project_root, phase)
-                .iter()
-                .any(|entry| is_alive(&entry.liveness))
-        }),
-    };
-    if alive {
-        return Err(CliError::Message(format!(
-            "phase {phase} has a live supervisor; run `devflow stop --phase {phase}` first — \
-             recover --clean deleted nothing"
-        )));
+    let state = workflow::load_state(project_root, phase).ok();
+    let sockets = possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir).map_err(
+        |(dir, why)| {
+            CliError::Message(format!(
+                "phase {phase}: the supervisor socket directory {} cannot be listed ({why}), so a \
+                 live supervisor cannot be ruled out — recover --clean deleted nothing",
+                dir.display()
+            ))
+        },
+    )?;
+    if sockets.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let mut text = format!(
+        "phase {phase} has a supervisor that may still run — recover --clean deleted nothing. \
+         Run each line below first:"
+    );
+    for live in &sockets {
+        text.push_str("\n  ");
+        text.push_str(&live.repair_line(phase));
+    }
+    Err(CliError::Message(text))
 }
 
 pub(crate) fn recover_cmd(
@@ -11235,6 +11241,103 @@ mod tests {
                 "the no-state carve-out ignores a live agent pid: {:?}",
                 guard()
             );
+        }
+    }
+
+    /// `recover --clean --phase N` uses the launch guard's supervisor rule:
+    /// a STALE socket whose group the backstop cannot prove gone, or a probe
+    /// that fails, refuses and deletes nothing, as an ALIVE one does.
+    mod recover_guard {
+        use super::*;
+
+        /// A loadable state for `phase` whose record names `socket`, with a
+        /// sidecar beside it that records `agent_pgid` in this boot.
+        fn plant_stale_launch(root: &Path, phase: PhaseId, socket: &Path, agent_pgid: u32) {
+            let boot = supervisor::boot_id().expect("a readable boot id");
+            let sidecar = serde_json::json!({
+                "launch_id": "aaaa0000aaaa1601",
+                "project_root": root,
+                "phase": phase,
+                "stage": "code",
+                "agent": "claude",
+                "launch": "stream",
+                "agent_pid": agent_pgid,
+                "agent_pgid": agent_pgid,
+                "agent_start_time": 1,
+                "boot_id": boot,
+                "supervisor_pid": 99_999_998,
+                "supervisor_start_time": 1,
+                "created_at": "2026-10-17T00:00:00Z",
+            });
+            std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.supervisor = Some(SupervisorRecord::new(
+                socket.to_path_buf(),
+                "aaaa0000aaaa1601".to_string(),
+                agent_pgid,
+                1,
+                boot,
+            ));
+            workflow::save_state(&state).unwrap();
+        }
+
+        /// A STALE socket over pgid 1 (the backstop refuses it as an unsafe
+        /// target, so its group is not proved gone) refuses `recover`.
+        #[test]
+        fn recover_refuses_a_stale_socket_whose_group_may_live() {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(1601);
+            let (_base, sock) = stop_socket_dir();
+            let socket = sock.join("s.sock");
+            plant_stale_launch(dir.path(), phase, &socket, 1);
+            drop(bind_supervisor_socket(&socket));
+            assert!(matches!(
+                supervisor::probe(&socket),
+                Ok(supervisor::Liveness::Stale)
+            ));
+            let result = refuse_a_live_supervisor(dir.path(), phase, None);
+            let Err(CliError::Message(text)) = result else {
+                panic!("a STALE socket whose group may live must refuse: {result:?}");
+            };
+            assert!(
+                text.contains("recover --clean deleted nothing") && text.contains("STALE"),
+                "{text}"
+            );
+        }
+
+        /// A recorded socket path whose probe fails (a regular file) refuses.
+        #[test]
+        fn recover_refuses_a_recorded_socket_whose_probe_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(1602);
+            let (_base, sock) = stop_socket_dir();
+            let socket = sock.join("f.sock");
+            plant_stale_launch(dir.path(), phase, &socket, 1);
+            std::fs::write(&socket, b"not a socket").unwrap();
+            let result = refuse_a_live_supervisor(dir.path(), phase, None);
+            let Err(CliError::Message(text)) = result else {
+                panic!("a failed probe must refuse: {result:?}");
+            };
+            assert!(
+                text.contains("recover --clean deleted nothing") && text.contains("probe failed"),
+                "{text}"
+            );
+        }
+
+        /// Controls: a GONE socket, and a STALE one whose group the backstop
+        /// proves gone (a previous boot), let `recover` through.
+        #[test]
+        fn recover_proceeds_over_a_gone_or_provably_dead_socket() {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(1603);
+            let (_base, sock) = stop_socket_dir();
+            let socket = sock.join("g.sock");
+            plant_previous_boot_launch(dir.path(), phase, &socket);
+            let gone = refuse_a_live_supervisor(dir.path(), phase, None);
+            assert!(gone.is_ok(), "a GONE socket is not live: {gone:?}");
+            drop(bind_supervisor_socket(&socket));
+            let stale = refuse_a_live_supervisor(dir.path(), phase, None);
+            assert!(stale.is_ok(), "a previous boot's group is gone: {stale:?}");
         }
     }
 }
