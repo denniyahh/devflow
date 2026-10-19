@@ -10,8 +10,9 @@
 //! 0. A recorded pgid that does not fit `pid_t`, is `<= 1`, or is the
 //!    caller's own process group is [`BackstopDecision::RefuseUnsafeTarget`],
 //!    decided before any `/proc` read.
-//! 1. Where process identity cannot be proved (off Linux, or a boot id or
-//!    process table that cannot be read), the answer is
+//! 1. Where process identity cannot be proved (off Linux, a boot id or
+//!    process table that cannot be read, or a launch that recorded 0 or ""
+//!    for the agent's start time or the boot id), the answer is
 //!    [`BackstopDecision::RefuseIdentityUnavailable`] (MAC-2).
 //! 2. The sidecar and the state record (when given) must agree on launch id,
 //!    pgid, agent start time and boot id, or it is
@@ -121,8 +122,9 @@ pub enum BackstopDecision {
     /// caller's own process group. Nothing is signalled or removed.
     RefuseUnsafeTarget,
     /// This platform gives DevFlow no process start time, group census or
-    /// boot id (off Linux; on Linux, an unreadable boot id or process table),
-    /// so the group's identity cannot be proved. Callers treat it like the
+    /// boot id (off Linux; on Linux, an unreadable boot id or process table,
+    /// or a launch that could not record them), so the group's identity
+    /// cannot be proved. Callers treat it like the
     /// other `Refuse*` decisions: signal nothing, keep the socket and
     /// sidecar, and count the run as possibly live (fail closed).
     RefuseIdentityUnavailable,
@@ -172,10 +174,10 @@ impl BackstopDecision {
                  signalled or removed"
             ),
             Self::RefuseIdentityUnavailable => format!(
-                "nothing was signalled or removed; this platform gives DevFlow no process start \
-                 time or boot id, so it cannot prove process group {pgid} is still the agent \
-                 launch {launch} started; if you have confirmed it is, end that group yourself, \
-                 then delete {files}"
+                "nothing was signalled or removed; DevFlow has no process start time or boot id \
+                 for it (this platform gives none, or the launch could not record them), so it \
+                 cannot prove process group {pgid} is still the agent launch {launch} started; if \
+                 you have confirmed it is, end that group yourself, then delete {files}"
             ),
             Self::RefuseMismatch(why) => format!(
                 "refused: the sidecar and the state record of launch {launch} disagree ({why}); \
@@ -318,6 +320,11 @@ pub(crate) fn classify(facts: &BackstopFacts) -> BackstopDecision {
         (true, Some(boot)) => boot,
         _ => return BackstopDecision::RefuseIdentityUnavailable,
     };
+    // A launch that could not read its agent's start time or the boot id
+    // records 0 or "" in their place; neither proves the group gone.
+    if recorded.start_time == 0 || recorded.boot_id.is_empty() {
+        return BackstopDecision::RefuseIdentityUnavailable;
+    }
     if let Some(why) = facts
         .state_record
         .as_ref()
@@ -1544,6 +1551,50 @@ mod tests {
             (
                 "no current boot id",
                 with(|f| f.current_boot_id = None),
+                D::RefuseIdentityUnavailable,
+            ),
+            // A launch that could not read its agent's start time or the boot
+            // id recorded 0 or "" in their place. Those placeholders prove
+            // nothing: never PreviousBoot, EmptyGroup or LeaderRecycled.
+            (
+                "recorded start time 0",
+                with(|f| {
+                    f.recorded.start_time = 0;
+                    f.state_record.as_mut().expect("record").start_time = 0;
+                }),
+                D::RefuseIdentityUnavailable,
+            ),
+            (
+                "recorded start time 0, no state record",
+                with(|f| {
+                    f.recorded.start_time = 0;
+                    f.state_record = None;
+                }),
+                D::RefuseIdentityUnavailable,
+            ),
+            (
+                "recorded start time 0 over an empty group",
+                with(|f| {
+                    f.recorded.start_time = 0;
+                    f.state_record.as_mut().expect("record").start_time = 0;
+                    f.members.clear();
+                }),
+                D::RefuseIdentityUnavailable,
+            ),
+            (
+                "recorded boot id empty",
+                with(|f| {
+                    f.recorded.boot_id = String::new();
+                    f.state_record.as_mut().expect("record").boot_id = String::new();
+                }),
+                D::RefuseIdentityUnavailable,
+            ),
+            (
+                "recorded boot id empty, no state record",
+                with(|f| {
+                    f.recorded.boot_id = String::new();
+                    f.state_record = None;
+                }),
                 D::RefuseIdentityUnavailable,
             ),
             // Step 3: previous boot, and it wins over an empty group.
