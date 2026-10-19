@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 2
-waived_count: 2
+open_count: 1
+waived_count: 3
 fixed_count: 15
 total_count: 19
-last_updated: 2026-10-19T10:55:10.630Z
+last_updated: 2026-10-19T10:57:57.127Z
 ---
 
 # Broken Windows Ledger
@@ -22,7 +22,7 @@ last_updated: 2026-10-19T10:55:10.630Z
 | 5 | 25 | deviation | crates/devflow-cli/src/pipeline_launch.rs |  | SIXTH monitor-wrapper leak site, found by gsd-verifier after round 4 and confirmed by the orchestrator: pipeline_launch.rs::tests::resume_clears_stop_marker_and_advances_past_stop_point stubs a claude binary on PATH and calls resume(root, phase), which reaches launch_stage at pipeline_launch.rs:230 and spawns a real detached monitor wrapper (verifier observed pid 852403 under --nocapture). It binds no ReapMonitorOnDrop guard, so the wrapper outlives the TempDir teardown. resume() is a FOURTH wrapping entry point that neither 25-16's call-site enumeration nor 25-18's three-function reachability grep could see, which falsifies 25-18-SUMMARY.md's claim that no path beyond launch_stage/launch_stage_inner/run_preflight exists. ENUMERATION NOW COMPLETE (orchestrator, transitive sweep over all eight launch-reaching entry points cross-referenced against both agent-stub helpers): exactly 7 tests both reach a launch path and stub an agent binary; 5 are guarded, this one is not, and preflight.rs::run_preflight_loopback_bounds_recursion provably cannot spawn because its recursive run_preflight hits the retry ceiling and aborts, after which launch_stage short-circuits at :190-193 without calling launch_stage_inner. Fix: bind ReapMonitorOnDrop::after_launch(&state) after the resume() call and before the assertions, matching the other five sites. | fixed |  | 2026-07-28T20:01:51.067Z | 2026-07-28T20:13:59.421Z |
 | 6 | 28 | unmet-truth | crates/devflow-core/src/agent_result.rs |  | HUMAN_GATE_VALUE ('blocking-human', matched by blocking_human_checkpoint_reported) is an unconfirmed default per 28-PROBE.md DIVERGENT A1 verdict, not an empirically confirmed literal against a live headless checkpoint render | fixed | A1 CLOSED by a live end-to-end run (2026-07-31). A real devflow start drove a synthetic phase declaring a gate="blocking-human" task through DevFlow own monitor. Two results: (1) the value IS blocking-human, so the constant was correct; (2) the RENDERING was not — the executor emits it as a markdown code span, **Gate:** `blocking-human`, and text_reports_human_gate trimmed only * and space, so the leading backtick left take_while yielding an empty token and the reader returned false. Genuine checkpoints fell through to the generic gate. Fixed in b22e6cf by adding the backtick to both trim sets, with three regression tests built from the verbatim capture (confirmed RED first). Retested live: the checkpoint now routes into auto-decide, emits exactly one checkpoint_auto_decided event carrying a real session_id, relaunches via --resume, and the agent resolves it; zero generic gate fires. Root cause worth keeping: RESEARCH derived the literal by reading the EMITTING source, which gave the value but not the rendering. | 2026-07-31T02:38:49.879Z | 2026-07-31T08:30:00.000Z |
 | 7 | 35.1 | unmet-truth | crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs |  | 35.1-02 D8: no test drives a chain-flag repair followed by a SUCCESSFUL stage launch; the resume step aborts at ensure_agent_binary by design | waived | 35.1-02 D8 residual: not a distinct test requirement. Repair (config.json clear+commit+emit) and launch (state-file load -> spawn_monitor) are independent paths; both halves are already covered (35.1-01 launch e2e via bounded __monitor; 35.1-02 repair e2e + gsd_config unit tests), and the repair test already exercises resume's repair->ensure_agent_binary sequencing. The full composition is additionally structurally untestable in a bounded way (resume detaches the monitor). Eliminated as a test requirement. | 2026-08-08T23:33:10.434Z | 2026-08-16T01:03:51.268Z |
-| 8 | 46 | deviation | crates/devflow-cli/src/staleness.rs | 1436 | wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks fails 2/2 under the 2-CPU container pin, passes 2/2 unpinned; spawn-time ENOENT, root cause unknown, pre-dates phase 46 (see 46 deferred-items.md D-46-01-A) | open |  | 2026-09-05T11:38:53.791Z |  |
+| 8 | 46 | deviation | crates/devflow-cli/src/staleness.rs | 1436 | wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks fails 2/2 under the 2-CPU container pin, passes 2/2 unpinned; spawn-time ENOENT, root cause unknown, pre-dates phase 46 (see 46 deferred-items.md D-46-01-A) | waived | No longer reproduces: 10/10 passes of the single test in the pinned CI image under taskset -c 0,1 (nproc=2) on 2026-10-19 at 8f256ad, and 1/1 in 50-16's full pinned container run, against 2/2 failures when recorded. Root cause never found; if it recurs, reopen as a backlog item with the full-suite pinned recipe. | 2026-09-05T11:38:53.791Z | 2026-10-19T10:57:57.127Z |
 | 9 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md |  | 46-06 Deviation 1: the plan-supplied file-wide 'set_var("PATH"' grep contradicts the prohibition against touching neutral_path sites; 46-07 must use the body-scoped form instead or its acceptance block will fail on pipeline_outcomes.rs's own unrelated PATH sites | fixed |  | 2026-09-06T11:41:33.125Z | 2026-10-19T10:55:09.941Z |
 | 10 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md |  | Task 3 fmt verification used tail exit status; measured cargo fmt with PIPESTATUS instead. | fixed |  | 2026-09-06T12:13:45.575Z | 2026-10-19T10:55:10.261Z |
 | 11 | 46 | deviation | .planning/STATE.md |  | state.advance-plan left last_activity_desc claiming NoGitPath callers survived; corrected after plan self-check. | fixed |  | 2026-09-06T12:15:27.485Z | 2026-10-19T10:55:10.442Z |
@@ -128,10 +128,10 @@ last_updated: 2026-10-19T10:55:10.630Z
     "file": "crates/devflow-cli/src/staleness.rs",
     "line": 1436,
     "description": "wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks fails 2/2 under the 2-CPU container pin, passes 2/2 unpinned; spawn-time ENOENT, root cause unknown, pre-dates phase 46 (see 46 deferred-items.md D-46-01-A)",
-    "status": "open",
-    "reason": "",
+    "status": "waived",
+    "reason": "No longer reproduces: 10/10 passes of the single test in the pinned CI image under taskset -c 0,1 (nproc=2) on 2026-10-19 at 8f256ad, and 1/1 in 50-16's full pinned container run, against 2/2 failures when recorded. Root cause never found; if it recurs, reopen as a backlog item with the full-suite pinned recipe.",
     "recorded_at": "2026-09-05T11:38:53.791Z",
-    "resolved_at": null
+    "resolved_at": "2026-10-19T10:57:57.127Z"
   },
   {
     "id": 9,
