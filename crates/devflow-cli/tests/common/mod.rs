@@ -147,6 +147,10 @@ pub fn kill_and_reap(child: &mut Child) {
 /// How long [`LaunchedRunReaper`] waits for a supervisor's final shutdown line.
 const REAP_SHUTDOWN_WAIT: Duration = Duration::from_secs(15);
 
+/// How long [`LaunchedRunReaper`] waits for the phase's supervisors to exit on
+/// their own before it ends the ones still alive.
+const REAP_EXIT_WAIT: Duration = Duration::from_secs(15);
+
 /// Ends, on drop, the run recorded in the phase state, through its
 /// supervisor's socket (D-07): a `shutdown` request first; then, if the
 /// recorded agent group's leader is still the process the record names
@@ -155,6 +159,15 @@ const REAP_SHUTDOWN_WAIT: Duration = Duration::from_secs(15);
 /// to the agent named in the agent-pid file. A pid in `spare` is never
 /// signalled. Bind it before (or right after) the spawn that launches a run,
 /// and keep the run's [`HermeticHome`] alive until this has dropped.
+///
+/// It then waits, bounded by [`REAP_EXIT_WAIT`], until no `devflow
+/// __monitor` whose argv names this root and phase is alive, and ends any
+/// still alive after that wait. The state cannot name every one: a stop that
+/// lands while an advance is launching the next stage leaves that next
+/// supervisor spawned but never recorded, with the stop flagged. It records
+/// its own stop under the per-phase lock a moment later, and taking that lock
+/// recreates `<root>/.devflow/` when the root's `TempDir` has already been
+/// removed, leaving `/tmp/.tmpXXXXXX/.devflow/.lock-NN.coord` behind.
 pub struct LaunchedRunReaper {
     root: PathBuf,
     phase: PhaseId,
@@ -169,10 +182,70 @@ impl LaunchedRunReaper {
             spare,
         }
     }
-}
 
-impl Drop for LaunchedRunReaper {
-    fn drop(&mut self) {
+    /// Every live `devflow __monitor` whose argv names this root (as given or
+    /// canonicalized) after `--project` and this phase after `--phase`, with
+    /// its start time: each supervisor this run started, recorded or not.
+    fn live_supervisors(&self) -> Vec<(u32, u64)> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let canonical = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let roots = [
+            self.root.as_os_str().as_bytes(),
+            canonical.as_os_str().as_bytes(),
+        ];
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+                let cmdline = fs::read(entry.path().join("cmdline")).ok()?;
+                let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+                let value_after = |flag: &str| {
+                    args.windows(2)
+                        .find(|pair| pair[0] == flag.as_bytes())
+                        .map(|pair| pair[1])
+                };
+                let phase = value_after("--phase")
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .and_then(|value| value.parse::<PhaseId>().ok());
+                let ours = args.contains(&b"__monitor".as_slice())
+                    && value_after("--project").is_some_and(|value| roots.contains(&value))
+                    && phase == Some(self.phase);
+                if !ours {
+                    return None;
+                }
+                let start = devflow_core::agent::process_start_time(pid)?;
+                devflow_core::agent::agent_running(pid).then_some((pid, start))
+            })
+            .collect()
+    }
+
+    /// Wait for this phase's supervisors to exit, then end any left, so none
+    /// of them writes under the root once this returns.
+    fn wait_for_supervisors_to_exit(&self) {
+        let deadline = Instant::now() + REAP_EXIT_WAIT;
+        while Instant::now() < deadline {
+            if self.live_supervisors().is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for (pid, start) in self.live_supervisors() {
+            if !self.spare.contains(&pid) && devflow_core::agent::is_same_process(pid, start) {
+                let _ = devflow_core::agent::terminate_and_verify(
+                    pid,
+                    devflow_core::agent::TERMINATE_VERIFY_WAIT,
+                    devflow_core::agent::TERMINATE_VERIFY_POLL,
+                );
+            }
+        }
+    }
+
+    /// The shutdown described on [`LaunchedRunReaper`]: the recorded
+    /// supervisor, else the agent in the agent-pid file.
+    fn end_recorded_run(&self) {
         let record = devflow_core::workflow::load_state(&self.root, self.phase)
             .ok()
             .and_then(|state| state.supervisor);
@@ -203,6 +276,13 @@ impl Drop for LaunchedRunReaper {
                 devflow_core::agent::TERMINATE_VERIFY_POLL,
             );
         }
+    }
+}
+
+impl Drop for LaunchedRunReaper {
+    fn drop(&mut self) {
+        self.end_recorded_run();
+        self.wait_for_supervisors_to_exit();
     }
 }
 
