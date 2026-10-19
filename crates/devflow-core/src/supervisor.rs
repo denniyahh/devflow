@@ -134,6 +134,34 @@ pub fn new_launch_id() -> String {
     format!("{mixed:016x}")
 }
 
+/// Whether `id` has [`new_launch_id`]'s format: 16 lowercase hex digits. A
+/// launch id read from disk (a sidecar, a socket name) is printed into
+/// copy-paste `devflow stop --launch <id>` lines, so this is the one rule
+/// every reader applies before trusting one.
+fn is_launch_id(id: &str) -> bool {
+    const LAUNCH_ID_LEN: usize = 16;
+    id.len() == LAUNCH_ID_LEN
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Deserialize [`Sidecar::launch_id`], refusing any id [`is_launch_id`]
+/// rejects, so such a sidecar reads as one that does not parse.
+fn deserialize_launch_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    if is_launch_id(&id) {
+        Ok(id)
+    } else {
+        // The id is not echoed: it is exactly the text that cannot be trusted.
+        Err(serde::de::Error::custom(
+            "the launch id is not 16 lowercase hex digits",
+        ))
+    }
+}
+
 /// The kernel boot id, trimmed, or `None` where it cannot be read.
 pub fn boot_id() -> Option<String> {
     read_boot_id(Path::new("/proc/sys/kernel/random/boot_id"))
@@ -359,6 +387,8 @@ fn own_socket_at(path: &Path) -> Result<bool, ProbeError> {
 #[non_exhaustive]
 pub struct Sidecar {
     /// The per-launch id, also the last segment of the socket's file name.
+    /// Only [`new_launch_id`]'s format deserializes.
+    #[serde(deserialize_with = "deserialize_launch_id")]
     pub launch_id: String,
     /// The project root the launch runs for.
     pub project_root: PathBuf,
@@ -492,7 +522,8 @@ pub struct SweepEntry {
     /// confused with a broken one.
     pub sidecar_error: Option<String>,
     /// The launch id segment of a stem that fits the
-    /// `<016x digest>-<padded phase>-<launch id>` scheme, else `None`.
+    /// `<016x digest>-<padded phase>-<launch id>` scheme, when it has
+    /// [`new_launch_id`]'s format; else `None`.
     pub launch_id_in_name: Option<String>,
     /// [`probe`]'s answer for a present socket; `Ok(Liveness::Gone)` for a
     /// sidecar with no socket.
@@ -561,7 +592,10 @@ fn sweep_entry(dir: &Path, stem: &str, has_socket: bool, has_sidecar: bool) -> S
         socket_present: has_socket,
         sidecar,
         sidecar_error,
-        launch_id_in_name: socket_name_parts(stem).map(|(_, _, launch_id)| launch_id.to_string()),
+        launch_id_in_name: socket_name_parts(stem)
+            .map(|(_, _, launch_id)| launch_id)
+            .filter(|launch_id| is_launch_id(launch_id))
+            .map(str::to_string),
         liveness,
     }
 }
@@ -2074,6 +2108,83 @@ mod tests {
         assert!(
             matches!(not_a_socket, Err(ProbeError::NotASocket(_))),
             "a regular file is NotASocket, got {not_a_socket:?}"
+        );
+    }
+
+    /// A launch id read from disk is printed into copy-paste `devflow stop
+    /// --phase N --launch <id>` lines, so only [`new_launch_id`]'s format is
+    /// accepted: a sidecar carrying any other id reads like one that does not
+    /// parse, and a socket name carrying one yields no launch id. Control: a
+    /// well-formed id in both places is read.
+    #[test]
+    fn a_malformed_launch_id_reads_as_an_unusable_sidecar_and_no_name_id() {
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let phase = PhaseId::new(7);
+        let plant = |name_id: &str, sidecar_id: &str| {
+            let socket = SocketPath::for_launch(cache.path(), root, phase, name_id)
+                .expect("socket path fits sun_path");
+            write_sidecar(&socket, &sample_sidecar(sidecar_id, root, phase))
+                .expect("write a sidecar");
+            socket
+        };
+        let good_id = new_launch_id();
+        let good = plant(&good_id, &good_id);
+        let hostile = "x;touch${IFS}pwned";
+        let bad_sidecar = plant(&new_launch_id(), hostile);
+        let bad_name = plant("a$(id)", &new_launch_id());
+
+        for id in [
+            hostile,
+            "",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdef0",
+        ] {
+            let socket = plant(&new_launch_id(), id);
+            assert!(
+                matches!(
+                    read_sidecar(&socket.sidecar_path()),
+                    Err(SidecarError::Json(_))
+                ),
+                "a sidecar launch id {id:?} must not parse"
+            );
+        }
+        assert_eq!(
+            read_sidecar(&good.sidecar_path())
+                .expect("a well-formed sidecar parses")
+                .launch_id,
+            good_id
+        );
+
+        let entries = sweep_in(cache.path());
+        let entry = |socket: &SocketPath| {
+            entries
+                .iter()
+                .find(|entry| entry.socket_path == socket.as_path())
+                .expect("entry present")
+        };
+        let bad = entry(&bad_sidecar);
+        assert!(
+            bad.sidecar.is_none() && bad.sidecar_error.is_some(),
+            "a malformed sidecar launch id is an unusable sidecar: {bad:?}"
+        );
+        assert_eq!(
+            entry(&bad_name).launch_id_in_name,
+            None,
+            "a malformed launch id in a socket name is not read"
+        );
+        let good_entry = entry(&good);
+        assert_eq!(
+            good_entry
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.launch_id.as_str()),
+            Some(good_id.as_str())
+        );
+        assert_eq!(
+            good_entry.launch_id_in_name.as_deref(),
+            Some(good_id.as_str())
         );
     }
 }

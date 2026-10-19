@@ -8151,8 +8151,10 @@ mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let phase = PhaseId::new(1302);
-        let (sup_n, rec_n) = fake_supervisor(sock_dir.path(), root, phase, "obsn");
-        let (sup_next, rec_next) = fake_supervisor(sock_dir.path(), root, phase, "obsnext");
+        // Launch ids in `new_launch_id`'s format, the only one a sidecar takes.
+        let (obs_n, obs_next) = ("0000000000000b5a", "0000000000000b5b");
+        let (sup_n, rec_n) = fake_supervisor(sock_dir.path(), root, phase, obs_n);
+        let (sup_next, rec_next) = fake_supervisor(sock_dir.path(), root, phase, obs_next);
         let save = |record: Option<&devflow_core::state::SupervisorRecord>| {
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
             state.supervisor = record.cloned();
@@ -8171,7 +8173,7 @@ mod tests {
             save(Some(&rec_next));
             std::thread::sleep(hold);
             let seen = observer.finish();
-            let gaps = handoff_gaps(&seen, "obsn", "obsnext")
+            let gaps = handoff_gaps(&seen, obs_n, obs_next)
                 .unwrap_or_else(|why| panic!("observer: {why}: {seen:?}"));
             if pre_clear {
                 assert!(

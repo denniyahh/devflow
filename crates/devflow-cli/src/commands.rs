@@ -10885,7 +10885,7 @@ mod tests {
     /// removes the files and signals nothing.
     fn plant_previous_boot_launch(root: &Path, phase: PhaseId, socket: &Path) {
         let sidecar = serde_json::json!({
-            "launch_id": "launch-r",
+            "launch_id": "aaaa0000aaaa000f",
             "project_root": root,
             "phase": phase,
             "stage": "code",
@@ -10903,7 +10903,7 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.supervisor = Some(SupervisorRecord::new(
             socket.to_path_buf(),
-            "launch-r".to_string(),
+            "aaaa0000aaaa000f".to_string(),
             99_999_999,
             1,
             "an-earlier-boot".to_string(),
@@ -10926,7 +10926,7 @@ mod tests {
         let socket = sock.join("r.sock");
         plant_previous_boot_launch(&root, phase, &socket);
         let listener = bind_supervisor_socket(&socket);
-        let ping = scripted_ping_reply("launch-r", phase, "agent_running");
+        let ping = scripted_ping_reply("aaaa0000aaaa000f", phase, "agent_running");
         let server = std::thread::spawn(move || {
             use std::io::Write as _;
             let wait = std::time::Duration::from_secs(30);
@@ -10979,7 +10979,7 @@ mod tests {
         let state_file = workflow::state_path(&root, phase);
         let before = std::fs::read(&state_file).unwrap();
         let listener = bind_supervisor_socket(&socket);
-        let ping = scripted_ping_reply("launch-r", phase, "agent_running");
+        let ping = scripted_ping_reply("aaaa0000aaaa000f", phase, "agent_running");
         let (stop_server, stopped) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             use std::io::Write as _;
@@ -11242,6 +11242,50 @@ mod tests {
                 guard()
             );
         }
+    }
+
+    /// A sidecar whose launch id is not `new_launch_id`'s format is read as
+    /// unusable, so no copy-paste `--launch` line ever carries that id: the
+    /// stop line names the id from the socket's file name instead.
+    #[test]
+    fn a_hostile_sidecar_launch_id_never_reaches_a_stop_line() {
+        let (base, _sock) = stop_socket_dir();
+        let root = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1506);
+        let name_id = "aaaa0000aaaa1506";
+        let hostile = "x;touch${IFS}pwned";
+        let socket = supervisor::SocketPath::for_launch(base.path(), root.path(), phase, name_id)
+            .expect("socket path fits sun_path");
+        drop(bind_supervisor_socket(socket.as_path()));
+        let sidecar = serde_json::json!({
+            "launch_id": hostile,
+            "project_root": root.path(),
+            "phase": phase,
+            "stage": "code",
+            "agent": "claude",
+            "launch": "stream",
+            "agent_pid": 1,
+            "agent_pgid": 1,
+            "agent_start_time": 1,
+            "boot_id": "boot",
+            "supervisor_pid": 1,
+            "supervisor_start_time": 1,
+            "created_at": "2026-10-17T00:00:00Z",
+        });
+        std::fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
+        let entries = supervisor::sweep_for_in(base.path(), root.path(), phase);
+        let [entry] = entries.as_slice() else {
+            panic!("one entry for this root and phase: {entries:?}");
+        };
+        let line = sweep_entry_stop_line(phase, entry);
+        assert!(!line.contains(hostile), "{line}");
+        assert!(
+            line.contains(&format!("--launch {name_id}")) && line.contains("does not parse"),
+            "{line}"
+        );
+        let live = swept_live_socket(entry).expect("a STALE socket without a usable sidecar");
+        let repair = live.repair_line(phase);
+        assert!(!repair.contains(hostile), "{repair}");
     }
 
     /// `recover --clean --phase N` uses the launch guard's supervisor rule:
