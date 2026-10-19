@@ -1989,9 +1989,10 @@ type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 ///    ([`stop_via_gate`]); the waiter unwinds through its own `abort()`.
 /// 2. Otherwise the run's supervisor socket is addressed
 ///    ([`stop_via_socket`]): the state's `supervisor` record names it, or,
-///    when the state is missing or does not load, the one live sidecar-found
-///    socket for this root and phase. Its probe picks the arm: ALIVE gets a
-///    `shutdown`, which ends a run that holds no per-phase lock (999.138).
+///    when the state records none, is missing or does not load, the one live
+///    sidecar-found socket for this root and phase. Its probe picks the arm:
+///    ALIVE gets a `shutdown`, which ends a run that holds no per-phase lock
+///    (999.138).
 /// 3. Only when no live socket remains (GONE, or nothing recorded) does the
 ///    identity-confirmed per-phase lock holder get signalled
 ///    ([`stop_via_lock`]).
@@ -2285,24 +2286,33 @@ struct LocatedSocket {
     unloadable_state: Option<PathBuf>,
 }
 
-/// Find the socket for a bare `stop`: the loaded state's `supervisor` record
-/// (none → `None`); or, when the state is missing or does not load, the one
+/// Find the socket for a bare `stop`: the loaded state's `supervisor` record;
+/// or, when the state records none, is missing or does not load, the one
 /// socket of this root and phase that a sweep finds not GONE. Several such
 /// sockets are a refusal listing each, since `stop` cannot tell which is the
 /// run.
+///
+/// A loaded state with no record is swept because a `start` launcher saves
+/// the record only after its spawned supervisor has published: a stop in
+/// that window must end the supervisor through its socket, not signal the
+/// launcher (the lock holder), whose death would leave the supervisor and
+/// its agent running unrecorded.
 fn locate_phase_socket(
     project_root: &Path,
     phase: PhaseId,
     cache_dir: Option<&Path>,
 ) -> Result<Option<LocatedSocket>, CliError> {
     let unloadable_state = match workflow::load_state(project_root, phase) {
-        Ok(state) => {
-            return Ok(state.supervisor.map(|record| LocatedSocket {
-                socket: record.socket_path.clone(),
-                record: Some(record),
-                unloadable_state: None,
-            }));
-        }
+        Ok(state) => match state.supervisor {
+            Some(record) => {
+                return Ok(Some(LocatedSocket {
+                    socket: record.socket_path.clone(),
+                    record: Some(record),
+                    unloadable_state: None,
+                }));
+            }
+            None => None,
+        },
         Err(workflow::WorkflowError::MissingState(_)) => None,
         Err(_) => Some(workflow::state_path(project_root, phase)),
     };
@@ -11030,6 +11040,129 @@ mod tests {
             before,
             "nothing is recorded"
         );
+    }
+
+    /// A `sleep` child recorded as the holder of `root`'s lock for `phase`,
+    /// with its own pid and start time: the identity `stop_via_lock`
+    /// signals. Returns the child and the lock file.
+    fn hold_lock_by_a_child(root: &Path, phase: PhaseId) -> (std::process::Child, PathBuf) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut start = None;
+        for _ in 0..100 {
+            start = agent::process_start_time(pid);
+            if start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let start = start.expect("read the child's start time");
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{padded}", padded = phase.padded()));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{pid}\n{start}")).unwrap();
+        (child, lock_path)
+    }
+
+    /// `stop` during a `start` launcher's publish wait: the state loads but
+    /// records no supervisor yet, the spawned supervisor already serves its
+    /// socket, and the launcher holds the lock. `stop` must end that
+    /// supervisor through its socket, not signal the launcher (which would
+    /// die and leave the supervisor and its agent running unrecorded). The
+    /// scripted supervisor drops the lock as it stops, as the launcher does
+    /// once its supervisor is gone.
+    #[test]
+    fn stop_ends_an_unrecorded_supervisor_through_its_socket_not_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1405);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let (base, _sock) = stop_socket_dir();
+        let launch_id = "aaaa0000aaaa1405";
+        let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
+            .expect("socket path fits sun_path");
+        let (mut launcher, lock_path) = hold_lock_by_a_child(&root, phase);
+        let released = lock_path.clone();
+        let unrecorded =
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", {
+                move |_| {
+                    let _ = std::fs::remove_file(&released);
+                    ShutdownScript {
+                        lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                        unlink_after: true,
+                    }
+                }
+            });
+
+        let result = stop_in(&root, phase, Some(base.path()));
+        let launcher_alive = launcher.try_wait().unwrap().is_none();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+        assert_eq!(
+            unrecorded.shutdowns(),
+            1,
+            "stop must shut the unrecorded supervisor down through its socket: {result:?}"
+        );
+        assert!(launcher_alive, "the launcher must not be signalled");
+        assert!(result.is_ok(), "the stop happened: {result:?}");
+        assert!(
+            workflow::load_state(&root, phase).unwrap().stopped,
+            "the stop is recorded"
+        );
+    }
+
+    /// The several-sockets refusal also covers a loaded state with no
+    /// record: with two live sockets for the phase, `stop` cannot tell which
+    /// is the run, so it asks neither and signals no lock holder.
+    #[test]
+    fn stop_refuses_several_unrecorded_sockets_and_signals_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1406);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let (base, _sock) = stop_socket_dir();
+        let serve = |launch_id: &str| {
+            let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
+                .expect("socket path fits sun_path");
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", |_| {
+                ShutdownScript {
+                    lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                    unlink_after: true,
+                }
+            })
+        };
+        let (a, b) = (serve("aaaa0000aaaa140a"), serve("aaaa0000aaaa140b"));
+        let (mut launcher, _lock_path) = hold_lock_by_a_child(&root, phase);
+
+        let result = stop_in(&root, phase, Some(base.path()));
+        let launcher_alive = launcher.try_wait().unwrap().is_none();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+        let Err(CliError::Message(text)) = &result else {
+            panic!("several live sockets must refuse: {result:?}");
+        };
+        assert!(
+            text.contains("2 live supervisor sockets") && text.contains("no state file names one"),
+            "{text}"
+        );
+        assert_eq!((a.shutdowns(), b.shutdowns()), (0, 0), "neither is asked");
+        assert!(launcher_alive, "no lock holder is signalled");
     }
 
     /// 50-15: the start/resume guard over a state file that will not load
