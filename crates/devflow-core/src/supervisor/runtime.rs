@@ -502,15 +502,25 @@ impl Supervisor {
     /// socket name appears, R-7), and start the control thread. The run
     /// starts in [`OwnerPhase::AgentRunning`]: call this after the agent is
     /// spawned, with the agent's identity in `sidecar`.
+    ///
+    /// An existing sidecar at the name is never replaced: the write fails
+    /// with [`io::ErrorKind::AlreadyExists`] and nothing is published.
     pub fn serve(socket: SocketPath, sidecar: Sidecar) -> Result<Self, PublishError> {
         super::write_sidecar(&socket, &sidecar)?;
+        Self::serve_written(socket, sidecar)
+    }
+
+    /// [`serve`](Self::serve) for a caller that has already written
+    /// `sidecar` beside `socket` itself with `write_sidecar`, which never
+    /// replaces one, so the sidecar there is this launch's. A publish that
+    /// fails removes it, the name being taken included: left beside another
+    /// socket, it would name this launch's agent as that socket's.
+    pub(crate) fn serve_written(
+        socket: SocketPath,
+        sidecar: Sidecar,
+    ) -> Result<Self, PublishError> {
         let listener = match super::publish(&socket) {
             Ok(listener) => listener,
-            // Another launch's live socket holds the name: its sidecar is
-            // not ours to remove.
-            Err(PublishError::AlreadyExists(path)) => {
-                return Err(PublishError::AlreadyExists(path));
-            }
             Err(error) => {
                 let _ = std::fs::remove_file(socket.sidecar_path());
                 return Err(error);
@@ -1624,6 +1634,62 @@ mod tests {
         let path = socket.as_path().to_path_buf();
         let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
         (supervisor, path)
+    }
+
+    /// A launch never replaces an existing sidecar at its socket's name, and
+    /// leaves none of its own beside a socket it could not publish. Without
+    /// this, `serve` overwrote another launch's sidecar and only then found
+    /// the name taken, so `stop` would validate that launch's group against
+    /// this one's identity.
+    #[test]
+    fn serve_never_replaces_an_existing_sidecar_at_its_name() {
+        let cache = short_cache();
+        let socket_for = || {
+            SocketPath::for_launch(
+                cache.path(),
+                Path::new("/project/runtime"),
+                PhaseId::new(50),
+                &new_launch_id(),
+            )
+            .expect("socket path fits sun_path")
+        };
+
+        // Another launch's socket and sidecar hold the name.
+        let taken = socket_for();
+        let theirs = test_sidecar(&taken, std::process::id());
+        crate::supervisor::write_sidecar(&taken, &theirs).expect("plant their sidecar");
+        let their_bytes =
+            std::fs::read_to_string(taken.sidecar_path()).expect("read their sidecar");
+        let _their_listener = crate::supervisor::publish(&taken).expect("plant their socket");
+        let mut ours = theirs.clone();
+        ours.agent_pgid = 0;
+        ours.agent_start_time += 1;
+        let result = Supervisor::serve(taken.clone(), ours.clone());
+        assert!(result.is_err(), "the name is taken: {result:?}");
+        assert_eq!(
+            std::fs::read_to_string(taken.sidecar_path()).expect("their sidecar survives"),
+            their_bytes,
+            "their sidecar is unchanged"
+        );
+
+        // A socket with no sidecar holds the name: no sidecar of ours is
+        // left beside it to misattribute it.
+        let bare = socket_for();
+        let _bare_listener = crate::supervisor::publish(&bare).expect("plant a bare socket");
+        let result = Supervisor::serve(bare.clone(), ours);
+        assert!(
+            matches!(result, Err(PublishError::AlreadyExists(_))),
+            "the name is taken: {result:?}"
+        );
+        assert!(
+            !bare.sidecar_path().exists(),
+            "no sidecar of ours is left beside a socket we did not publish"
+        );
+
+        // Control: a free name serves, with the sidecar written.
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        assert!(path.with_extension("json").exists());
+        supervisor.finish();
     }
 
     #[test]
