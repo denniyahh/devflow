@@ -2247,9 +2247,15 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
 }
 
 /// How long `stop` waits for a supervisor's final shutdown line: the
-/// supervisor's own terminate-and-verify wait, twice, plus time to persist.
+/// supervisor's own terminate-and-verify wait, twice, then its wait for the
+/// per-phase lock before it records its stop and answers
+/// ([`crate::pipeline_launch::SUPERVISOR_STOP_WAIT`]), plus time to persist.
+/// Shorter, and a busy lock reads a supervisor that did stop as one that did
+/// not answer.
 fn shutdown_final_timeout() -> std::time::Duration {
-    2 * agent::TERMINATE_VERIFY_WAIT + std::time::Duration::from_secs(5)
+    2 * agent::TERMINATE_VERIFY_WAIT
+        + crate::pipeline_launch::SUPERVISOR_STOP_WAIT
+        + std::time::Duration::from_secs(5)
 }
 
 /// Shutdown requests `stop` sends in all when each is answered `handed_off`:

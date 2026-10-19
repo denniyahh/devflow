@@ -958,8 +958,9 @@ pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor dur
 /// (50-13, T-50-54): a stopped supervisor's wait for the per-phase lock
 /// before it records its stop, and safe point 3's wait for an unpublished
 /// next supervisor's final `stopped` line. `2 × TERMINATE_VERIFY_WAIT + 5 s`:
-/// the next supervisor's kill grace plus margin.
-const SUPERVISOR_STOP_WAIT: Duration =
+/// the next supervisor's kill grace plus margin. `stop`'s own wait for a
+/// final line covers it (`commands::shutdown_final_timeout`).
+pub(crate) const SUPERVISOR_STOP_WAIT: Duration =
     Duration::from_secs(2 * devflow_core::agent::TERMINATE_VERIFY_WAIT.as_secs() + 5);
 
 /// What a supervisor's advance reads on this thread (50-13): its stop token,
