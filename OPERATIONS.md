@@ -104,9 +104,9 @@ How each command shows them:
   `doctor`'s repair is `devflow status`, `stop` refuses and signals nothing,
   and `cleanup` keeps the worktree unless `--force`.
 - **`devflow cleanup`** refuses an ALIVE run even with `--force` — end it
-  first with `devflow stop --phase N`, or wait for it (the refusal's own text
-  still says `devflow resume`, which does not end a live run). It keeps a
-  STALE run's worktree, or one whose probe failed, unless `--force`.
+  first with `devflow stop --phase N`, the line its refusal names, or wait
+  for it. It keeps a STALE run's worktree, or one whose probe failed, unless
+  `--force`.
 - **`devflow recover --clean --phase N`** refuses while the phase's supervisor
   is ALIVE and deletes nothing.
 - **`devflow start` / `devflow resume`** refuse while a run is live: an ALIVE
