@@ -3,6 +3,7 @@ status: investigating
 trigger: "agents::opencode::tests::spawn_with_timeout_kills_a_hung_child failed once in the pinned CI container: the stub's sleep descendant was still alive 2s after spawn_with_timeout SIGKILLed the probe's process group."
 created: 2026-09-22
 updated: 2026-09-22
+tracked_in: backlog 999.151, "Related" note (recorded 2026-10-19)
 ---
 
 # Debug: Probe Sleep Survives the Group Kill

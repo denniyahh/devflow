@@ -919,6 +919,14 @@ failure rate only.
 **Fix shape (not decided):** reproduce under load (for example `cargo test` with `--test-threads` above the core
 count, repeated), then make the reap wait on a condition instead of on timing.
 
+*Related, recorded 2026-10-19 (operator request):* a sibling in the same module,
+`agents::opencode::tests::spawn_with_timeout_kills_a_hung_child`, failed once in the pinned CI container (2026-09-22):
+the stub's backgrounded `sleep` was still alive 2 s after `spawn_with_timeout` SIGKILLed the probe's process group.
+Not reproduced in 40 pinned-container runs of the core library; root cause not found
+(`.planning/debug/probe-sleep-survives-group-kill.md`). Same class as this entry (group-reap timing in
+`opencode.rs`), so fix them together. Phase 50's `6d46008` (a listener mid-close under load) and `96b457b` (a
+two-read observer race) are the patterns to check first; Phase 50 showed 30 loaded runs cannot see a ~0.3% flake.
+
 ### Phase 999.152: Phase 49 Live-Run Tooling Robustness Findings, to Fix Before the Tools Are Reused (BACKLOG)
 
 **Found:** 2026-10-09, Phase 49 deep code review (`49-REVIEW.md` WR-04, WR-05, WR-06, IN-03, IN-04, IN-05).
@@ -1125,6 +1133,50 @@ cold build on the first commit-hook run.
 
 **Done when:** each moved tool's two-direction selftest is a Rust test that passes, plus a negative control that fails
 on a planted wrong input; the shell versions are deleted, with their callers updated in the same change.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.162: A Gate Response Written During Cleanup Can Outlive Its Gate (BACKLOG)
+
+**Found:** 2026-10-18, by code reading during the Phase 50 flake hunt (`96b457b`'s debugger); confirmed by reading
+`crates/devflow-core/src/gates.rs` on 2026-10-19. **Not reproduced.** Pre-dates Phase 50; applies to every gate.
+
+**Defect (by reading):** `Gates::respond` checks that the gate file exists, then that no response exists, then writes the
+response with an exclusive create. `Gates::cleanup` removes the gate, then the response, then the ack, one `remove_file`
+at a time. A respond whose existence checks run before cleanup's first removal and whose write lands after cleanup's
+response removal leaves a response file with no gate. `write_gate` does not remove a leftover response, and
+`poll_response` returns any response file it finds, so a later gate for the same phase and stage could read that
+leftover as its answer.
+
+**Not traced:** whether every production path that fires a gate clears a leftover response before `write_gate`; if one
+does, the window is closed in practice and only the library API is exposed.
+
+**Fix shape (not decided):** reproduce first (a test that interleaves `respond` and `cleanup` at the two points, as
+`96b457b`'s delay test did for the park), then either clear a leftover response in `write_gate` or make the response
+carry the gate's timestamp so `poll_response` rejects an answer to an older gate.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.163: GSD's Codex Adapter Ignores `workflow.subagent_timeout` and Gives the Stall Watcher No Output File (BACKLOG)
+
+**Found:** 2026-09-15, Phase 48 replan; diagnosed in `.planning/debug/planner-wait-observability.md`. Recorded here
+2026-10-19 (operator request) so the diagnosis is tracked outside an open debug session. **Upstream (gsd-core), not
+DevFlow code.**
+
+**Defect:** on the Codex collaboration path, GSD's Task-to-`spawn_agent` conversion binds neither the configured
+`workflow.subagent_timeout` (300000 ms here) nor an output-file handle, so a long planner run has no deadline and
+`gsd_stall_watch` has nothing to watch. Planner and revision agents ran past ten minutes in the Phase 48 replan.
+
+**Done when:** an upstream gsd-core issue exists for it (check open issues first), or a DevFlow-side workaround is
+decided. No DevFlow code change is implied.
 
 **Requirements:** TBD
 **Plans:** 0 plans
