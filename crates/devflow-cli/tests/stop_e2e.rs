@@ -1699,7 +1699,7 @@ fn stop_reports_a_probe_error_and_never_runs_the_backstop() {
     let start = devflow_core::agent::process_start_time(pgid).expect("start time");
     let boot = supervisor::boot_id().expect("a readable boot id");
     let sidecar = serde_json::json!({
-        "launch_id": "launch-p",
+        "launch_id": "aaaa0000aaaa000e",
         "project_root": root,
         "phase": phase,
         "stage": "code",
@@ -1717,7 +1717,7 @@ fn stop_reports_a_probe_error_and_never_runs_the_backstop() {
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
     state.supervisor = Some(SupervisorRecord::new(
         socket.clone(),
-        "launch-p".to_string(),
+        "aaaa0000aaaa000e".to_string(),
         pgid,
         start,
         boot,
@@ -1817,7 +1817,7 @@ fn alive_as(run: &LiveRun) -> bool {
 #[test]
 fn stop_with_a_launch_id_tears_down_only_that_socket() {
     let run = LiveRun::start(PhaseId::new(146));
-    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let orphan = plant_stale_orphan(&run, "0000000000000aaa", OrphanSidecar::Parsed);
     let other_phase = PhaseId::new(147).to_string();
 
     let nope = run.stop(&["--launch", "nope"]);
@@ -1830,7 +1830,13 @@ fn stop_with_a_launch_id_tears_down_only_that_socket() {
     assert!(launch_files_present(&orphan) && alive_as(&run));
 
     let mismatch = common::hermetic_devflow(&run.home)
-        .args(["stop", "--phase", &other_phase, "--launch", "orphan-a"])
+        .args([
+            "stop",
+            "--phase",
+            &other_phase,
+            "--launch",
+            "0000000000000aaa",
+        ])
         .current_dir(&run.root)
         .output()
         .expect("run devflow stop");
@@ -1841,11 +1847,11 @@ fn stop_with_a_launch_id_tears_down_only_that_socket() {
     );
     assert!(launch_files_present(&orphan) && alive_as(&run));
 
-    let output = run.stop(&["--launch", "orphan-a"]);
+    let output = run.stop(&["--launch", "0000000000000aaa"]);
     let text = describe(&output);
     assert!(output.status.success(), "{text}");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("launch orphan-a"),
+        String::from_utf8_lossy(&output.stdout).contains("launch 0000000000000aaa"),
         "stop names the launch it tore down: {text}"
     );
     assert!(
@@ -1871,7 +1877,7 @@ fn stop_with_a_launch_id_tears_down_only_that_socket() {
 #[test]
 fn bare_stop_addresses_the_state_record_and_leaves_a_superseded_socket() {
     let run = LiveRun::start(PhaseId::new(148));
-    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let orphan = plant_stale_orphan(&run, "0000000000000aaa", OrphanSidecar::Parsed);
 
     let output = run.stop(&[]);
     assert!(output.status.success(), "{}", describe(&output));
@@ -1941,7 +1947,7 @@ fn printed_launch_line(output: &std::process::Output, id: &str) -> Vec<String> {
 #[test]
 fn stop_refuses_several_sockets_when_the_state_will_not_load() {
     let run = LiveRun::start(PhaseId::new(150));
-    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let orphan = plant_stale_orphan(&run, "0000000000000aaa", OrphanSidecar::Parsed);
     std::fs::write(run.state_file(), b"{ this is not json").unwrap();
     let corrupt = std::fs::read(run.state_file()).unwrap();
     let b_id = run.record.launch_id.clone();
@@ -1950,7 +1956,7 @@ fn stop_refuses_several_sockets_when_the_state_will_not_load() {
     let text = describe(&refused);
     assert!(!refused.status.success(), "several sockets: {text}");
     let stderr = String::from_utf8_lossy(&refused.stderr);
-    for id in [b_id.as_str(), "orphan-a"] {
+    for id in [b_id.as_str(), "0000000000000aaa"] {
         assert!(
             stderr.contains(&format!("devflow stop --phase {} --launch {id}", run.phase)),
             "the refusal lists the --launch form for {id}: {text}"
@@ -1981,7 +1987,7 @@ fn stop_refuses_several_sockets_when_the_state_will_not_load() {
 #[test]
 fn stop_with_a_launch_id_stops_a_live_socket_whose_sidecar_will_not_parse() {
     let run = LiveRun::start(PhaseId::new(151));
-    let orphan = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
+    let orphan = plant_stale_orphan(&run, "0000000000000aaa", OrphanSidecar::Parsed);
     let sidecar_path = run.record.socket_path.with_extension("json");
     let sidecar = supervisor::read_sidecar(&sidecar_path).expect("B's sidecar");
     let (pgid, start) = (sidecar.agent_pgid, sidecar.agent_start_time);
@@ -2011,7 +2017,7 @@ fn stop_with_a_launch_id_stops_a_live_socket_whose_sidecar_will_not_parse() {
     );
     assert!(
         stderr.contains(&format!(
-            "devflow stop --phase {} --launch orphan-a",
+            "devflow stop --phase {} --launch 0000000000000aaa",
             run.phase
         )),
         "{text}"
@@ -2074,13 +2080,13 @@ fn stop_with_a_launch_id_stops_a_live_socket_whose_sidecar_will_not_parse() {
 #[test]
 fn stop_with_a_launch_id_refuses_a_stale_socket_without_a_usable_sidecar() {
     let run = LiveRun::start(PhaseId::new(153));
-    let a = plant_stale_orphan(&run, "orphan-a", OrphanSidecar::Parsed);
-    let c = plant_stale_orphan(&run, "orphan-c", OrphanSidecar::Broken);
-    let d = plant_stale_orphan(&run, "orphan-d", OrphanSidecar::Missing);
+    let a = plant_stale_orphan(&run, "0000000000000aaa", OrphanSidecar::Parsed);
+    let c = plant_stale_orphan(&run, "0000000000000ccc", OrphanSidecar::Broken);
+    let d = plant_stale_orphan(&run, "0000000000000ddd", OrphanSidecar::Missing);
 
     for (id, socket, why) in [
-        ("orphan-c", &c, "does not parse"),
-        ("orphan-d", &d, "missing"),
+        ("0000000000000ccc", &c, "does not parse"),
+        ("0000000000000ddd", &d, "missing"),
     ] {
         let output = run.stop(&["--launch", id]);
         let text = describe(&output);
@@ -2097,7 +2103,7 @@ fn stop_with_a_launch_id_refuses_a_stale_socket_without_a_usable_sidecar() {
     assert_eq!(std::fs::read(c.with_extension("json")).unwrap(), b"{");
     assert!(!d.with_extension("json").exists());
 
-    let output = run.stop(&["--launch", "orphan-a"]);
+    let output = run.stop(&["--launch", "0000000000000aaa"]);
     assert!(output.status.success(), "{}", describe(&output));
     assert!(!a.exists() && !a.with_extension("json").exists());
     assert!(alive_as(&run), "B is untouched");
@@ -2160,10 +2166,10 @@ fn stop_with_a_launch_id_reaches_a_deleted_roots_orphan_from_any_directory() {
         std::fs::create_dir(dir).unwrap();
     }
     let phase = PhaseId::new(154);
-    let deleted = plant_unattached_orphan(&home, &gone_root, phase, "orphan-x");
-    let foreign = plant_unattached_orphan(&home, &other_root, phase, "orphan-y");
+    let deleted = plant_unattached_orphan(&home, &gone_root, phase, "0000000000000eee");
+    let foreign = plant_unattached_orphan(&home, &other_root, phase, "0000000000000fff");
     std::fs::remove_dir(&gone_root).unwrap();
-    let repair = format!("devflow stop --phase {phase} --launch orphan-x");
+    let repair = format!("devflow stop --phase {phase} --launch 0000000000000eee");
 
     let doctor = common::hermetic_devflow(&home)
         .arg("doctor")
@@ -2182,7 +2188,7 @@ fn stop_with_a_launch_id_reaches_a_deleted_roots_orphan_from_any_directory() {
             "--phase",
             &phase.to_string(),
             "--launch",
-            "orphan-y",
+            "0000000000000fff",
         ])
         .current_dir(&elsewhere)
         .output()
