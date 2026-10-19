@@ -8358,6 +8358,72 @@ mod tests {
         );
     }
 
+    /// Run `body` on a new thread without `CAP_DAC_OVERRIDE` and
+    /// `CAP_DAC_READ_SEARCH` in its effective set (WINDOWS.md #19). Either
+    /// lets uid 0 list a mode-0o000 directory, so the pinned container (root)
+    /// could not produce an unlistable socket directory; without them root is
+    /// refused like any other owner. Capabilities are per-thread and
+    /// `capset(2)` changes only the calling thread's, so the harness keeps
+    /// its own, and they end with the thread. A non-root thread holds neither
+    /// capability, so nothing changes there.
+    fn without_dac_override<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    drop_dac_override_on_this_thread();
+                    body()
+                })
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    /// Clear `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` from the calling
+    /// thread's effective capability set; the permitted set is kept.
+    #[cfg(target_os = "linux")]
+    fn drop_dac_override_on_this_thread() {
+        // `<linux/capability.h>`, version 3: one header, two data structs.
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: libc::c_int,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+        const CAP_DAC_OVERRIDE: u32 = 1;
+        const CAP_DAC_READ_SEARCH: u32 = 2;
+
+        let mut header = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: `header` and `data` have capget(2)'s version-3 layout (one
+        // header, two data structs); pid 0 is the calling thread.
+        let got = unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) };
+        assert_eq!(got, 0, "capget: {}", std::io::Error::last_os_error());
+        data[0].effective &= !((1 << CAP_DAC_OVERRIDE) | (1 << CAP_DAC_READ_SEARCH));
+        // SAFETY: as above; capset(2) with pid 0 changes only this thread.
+        let set = unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr()) };
+        assert_eq!(set, 0, "capset: {}", std::io::Error::last_os_error());
+    }
+
+    /// No per-thread capabilities to drop off Linux: there a root run still
+    /// lists a 0o000 directory, and the tests that use this fail their own
+    /// precondition rather than pass without asserting.
+    #[cfg(not(target_os = "linux"))]
+    fn drop_dac_override_on_this_thread() {}
+
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
     /// builds a `PhaseFacts` directly — no repository, no I/O — proving
     /// `reconcile_phase` is a predicate over facts alone.
@@ -8815,15 +8881,6 @@ mod tests {
         fn doctor_reports_an_unlistable_socket_dir_instead_of_nothing() {
             use std::os::unix::fs::PermissionsExt as _;
             let cache = tempfile::tempdir().unwrap();
-            // Root lists a 0o000 directory (the pinned container runs as
-            // uid 0), so the fixture cannot produce its precondition there;
-            // skip rather than assert it (the 999.113 pattern, 50-16).
-            if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(cache.path()).unwrap()) == 0 {
-                eprintln!(
-                    "skipping doctor_reports_an_unlistable_socket_dir_instead_of_nothing: running as root, which bypasses the 0o000 fixture"
-                );
-                return;
-            }
             assert_eq!(socket_dir_unlistable(cache.path()), None, "absent");
             assert_eq!(render_orphan_supervisors_text(&[], None), "");
             let sock = registry::socket_dir_in(cache.path());
@@ -8831,9 +8888,16 @@ mod tests {
             assert_eq!(socket_dir_unlistable(cache.path()), None, "listable");
 
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let unlistable = socket_dir_unlistable(cache.path());
+            // Without DAC override, so uid 0 (the pinned container) is
+            // refused too (WINDOWS.md #19).
+            let unlistable = without_dac_override(|| socket_dir_unlistable(cache.path()));
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
             let why = unlistable.expect("a directory without read permission is unlistable");
+            assert_eq!(
+                why,
+                std::io::ErrorKind::PermissionDenied.to_string(),
+                "the 0o000 directory itself refuses the listing"
+            );
             assert!(!why.contains('/'), "path-free: {why}");
             let text = render_orphan_supervisors_text(&[], Some(&why));
             assert!(
@@ -10958,25 +11022,22 @@ mod tests {
             let phase = PhaseId::new(1501);
             let root = root_with_an_unloadable_state(phase);
             let cache = tempfile::tempdir().unwrap();
-            // Root lists a 0o000 directory (the pinned container runs as
-            // uid 0), so the fixture cannot produce its precondition there;
-            // skip rather than assert it (the 999.113 pattern, 50-16).
-            if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(cache.path()).unwrap()) == 0 {
-                eprintln!(
-                    "skipping the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state: running as root, which bypasses the 0o000 fixture"
-                );
-                return;
-            }
             let sock = registry::socket_dir_in(cache.path());
             std::fs::create_dir_all(&sock).unwrap();
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let listable = std::fs::read_dir(&sock).is_ok();
-            let result = refuse_launch_over_a_live_run(
-                root.path(),
-                phase,
-                LaunchVerb::Start,
-                Some(cache.path()),
-            );
+            // Both reads run without DAC override, so uid 0 (the pinned
+            // container) is refused too (WINDOWS.md #19).
+            let (listable, result) = without_dac_override(|| {
+                (
+                    std::fs::read_dir(&sock).is_ok(),
+                    refuse_launch_over_a_live_run(
+                        root.path(),
+                        phase,
+                        LaunchVerb::Start,
+                        Some(cache.path()),
+                    ),
+                )
+            });
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(
                 !listable,
@@ -10987,7 +11048,10 @@ mod tests {
             };
             for fragment in [
                 sock.display().to_string(),
-                "cannot be listed".to_string(),
+                format!(
+                    "cannot be listed ({})",
+                    std::io::ErrorKind::PermissionDenied
+                ),
                 "refusing to start; nothing was written".to_string(),
             ] {
                 assert!(text.contains(&fragment), "missing {fragment:?}: {text}");
