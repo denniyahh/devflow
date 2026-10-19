@@ -220,12 +220,27 @@ files per gated stage, all written atomically (temp file + rename):
   (`Gates::ack()`) once the response is consumed, so a poller knows to clean
   up.
 
-`run_gate()` (`crates/devflow-cli/src/main.rs`) writes the gate, fires the
-notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD` via
-`sh -c` with gate metadata as environment variables, never interpolated
+`run_gate()` (`crates/devflow-cli/src/pipeline_gate.rs`) writes the gate,
+fires the notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD`
+via `sh -c` with gate metadata as environment variables, never interpolated
 into the command string; a silent no-op when the variable is unset), then
-blocks in `Gates::poll_response()` with exponential backoff (1s → 2s → …
-capped at 60s) until a response appears or `DEVFLOW_GATE_TIMEOUT_SECS`
+waits in `wait_for_gate_response()` (`crates/devflow-cli/src/pipeline_launch.rs`),
+which polls the response file one of two ways:
+
+- **Inside a supervisor's advance** (its stop token is engaged, 50-13): the
+  run's owner reads `gate_wait` in a `ping` reply for the length of the wait,
+  and `Gates::poll_response_cancellable()` reads the response file about once
+  a second (every sleep is capped at 1s) and checks the stop token before each
+  sleep. A stop — a `shutdown` request on the supervisor's socket, or
+  SIGTERM/SIGINT to the supervisor — ends the wait within about a second: the
+  gate's files are removed, `stopped` is recorded in the state, which is kept
+  for `devflow resume` (not an abort), and the advance unwinds without acting
+  on the gate. A response already on disk wins over a stop.
+- **Anywhere else** (no stop token: the hidden `devflow advance` run from a
+  shell, or a gate a foreground command fires): `Gates::poll_response()` with
+  exponential backoff (1s → 2s → … capped at 60s), which nothing cancels.
+
+Either wait ends when a response appears or `DEVFLOW_GATE_TIMEOUT_SECS`
 (default 259200 = 3 days, held equal to
 `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` so `devflow gate sweep` cannot reap a
 gate this poll is still watching) elapses. `GateAction::from_response()` turns an
