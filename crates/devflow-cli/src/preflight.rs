@@ -1008,11 +1008,13 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// C2: the Code stage would launch on the pipe-owning arm AND the driver has
 /// a real dogfooded run (round-3 F5/D-04).
 ///
-/// The chain-flag guard lives in a Rust process's stack frame; the legacy arm
-/// is a detached shell script with no frame to hang a `Drop` on
-/// (`35.1-RESEARCH.md` Pitfall 4). This turns that accepted gap from a silent
-/// stall hours into an unattended run into a refusal before the first agent is
-/// spawned.
+/// The chain-flag guard is engaged by the stage supervisor (`run_monitor`)
+/// for a stream launch only, the one shape that bounds the flag's lifetime to
+/// the agent's. Since 50-11 a capture launch runs under the same Rust
+/// supervisor but never engages it (before that the legacy arm was a detached
+/// shell script with no frame to hang a `Drop` on, `35.1-RESEARCH.md`
+/// Pitfall 4). This turns that accepted gap from a silent stall hours into an
+/// unattended run into a refusal before the first agent is spawned.
 ///
 /// Asks [`stream_launch_enabled`] — the launch path's OWN predicate —
 /// rather than re-deriving the answer, so the preflight and the launch cannot
@@ -1048,8 +1050,8 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     // The reason names the CAUSE that applied, and then the consequence in
     // terms true of every cause.
     ConditionState::DoesNotHold(format!(
-        "{} — the chain-flag guard binds only inside the pipe-owning monitor, which this \
-         launch shape never starts",
+        "{} — so Code would launch on the capture shape, whose supervisor never engages the \
+         chain-flag guard (only a stream-shape supervisor does)",
         causes.join(" and ")
     ))
 }
@@ -4656,5 +4658,41 @@ mod tests {
             "agy",
             "the driver still resolves the agy program (unchanged path)"
         );
+    }
+
+    /// Since 50-11 both launch shapes run under the same Rust supervisor,
+    /// and only a stream launch engages the chain-flag guard. The refusal
+    /// says so, for every cause, and no longer says the capture shape
+    /// "never starts" a pipe-owning monitor.
+    #[test]
+    fn unattended_launch_shape_refusal_names_the_capture_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = State::new(
+            PhaseId::new(43),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        legacy.legacy_claude_launch = true;
+        let codex = State::new(
+            PhaseId::new(44),
+            AgentKind::Codex,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        for state in [legacy, codex] {
+            let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state)
+            else {
+                panic!("{} --mode auto must be refused", state.agent);
+            };
+            assert!(
+                reason.ends_with(
+                    " — so Code would launch on the capture shape, whose supervisor never \
+                     engages the chain-flag guard (only a stream-shape supervisor does)"
+                ),
+                "{reason}"
+            );
+            assert!(!reason.contains("never starts"), "{reason}");
+        }
     }
 }
