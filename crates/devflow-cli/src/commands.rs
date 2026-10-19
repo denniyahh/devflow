@@ -3173,9 +3173,10 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
 /// [`refuse_launch_over_a_live_run`] for what counts as live.
 ///
 /// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12):
-/// without a state file this returns Ok even if the agent pid file names a
-/// live process, because `recover --clean` leaves that file behind and a
-/// recycled pid would otherwise block `start` with no DevFlow repair.
+/// without a state file the agent pid file is not read, so a live process it
+/// names does not refuse, because `recover --clean` leaves that file behind
+/// and a recycled pid would otherwise block `start` with no DevFlow repair.
+/// The supervisor sockets of this root and phase are still swept.
 ///
 /// Out of scope: the lock-free window between agent exit and `advance` taking
 /// the lock stays backlog 999.136. This check says nothing about a gate waiter.
@@ -3238,11 +3239,12 @@ impl LaunchVerb {
 /// The shared start/resume guard (D-09, R-12, 999.139). Two halves, either of
 /// which refuses:
 ///
-/// - **Supervisor.** The state loads → probe its `supervisor` record: ALIVE
-///   is live; STALE is live unless [`supervisor::backstop::assess`] proves
-///   its agent group gone ([`stale_group_may_live`]); a probe error is live
-///   (fail closed, T-50-40); GONE is not. The state exists but will not load
-///   → [`supervisor::sweep_for_in`] for this root and phase: an entry whose
+/// - **Supervisor** ([`possibly_live_sockets`]). The state loads → probe its
+///   `supervisor` record: ALIVE is live; STALE is live unless
+///   [`supervisor::backstop::assess`] proves its agent group gone
+///   ([`stale_group_may_live`]); a probe error is live (fail closed,
+///   T-50-40); GONE is not. The state is missing or will not load →
+///   [`supervisor::sweep_for_in`] for this root and phase: an entry whose
 ///   sidecar parsed is classified the same way (with no record); an entry
 ///   with no usable sidecar, which 50-06 attributes by its file name or ping
 ///   reply, is live unless it probes GONE (RV-05: nothing recorded can prove
@@ -3251,7 +3253,8 @@ impl LaunchVerb {
 ///   cache dir, no sweep runs, as for `stop` and `recover`.
 /// - **Agent pid file** (unchanged, D-12): a live pid there is live. Pid
 ///   liveness, not identity: a recycled pid gives a fail-closed false
-///   refusal (Option A, 2026-09-22).
+///   refusal (Option A, 2026-09-22). Not read without a state file (the
+///   no-state carve-out on [`refuse_start_over_a_live_run`]).
 ///
 /// A loaded state with no record over a live supervisor (a launcher that
 /// died before saving it, T-50-90/T-50-91) is accepted until Phase 50.1.
@@ -3262,39 +3265,55 @@ fn refuse_launch_over_a_live_run(
     cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
     let state_file = workflow::state_path(project_root, phase);
-    let sockets: Vec<LiveSocket> = match workflow::load_state(project_root, phase) {
-        Ok(state) => state
-            .supervisor
-            .and_then(|record| recorded_live_socket(&record))
-            .into_iter()
-            .collect(),
-        Err(_) if !state_file.exists() => return Ok(()),
-        Err(_) => match cache_dir {
-            None => Vec::new(),
-            Some(cache_dir) => {
-                if let Some(why) = socket_dir_unlistable(cache_dir) {
-                    let dir = registry::socket_dir_in(cache_dir);
-                    return Err(unlistable_socket_dir_refusal(
-                        phase,
-                        verb,
-                        (&state_file, &dir),
-                        &why,
-                    ));
-                }
-                supervisor::sweep_for_in(cache_dir, project_root, phase)
-                    .iter()
-                    .filter_map(swept_live_socket)
-                    .collect()
-            }
+    let state = workflow::load_state(project_root, phase).ok();
+    let no_state = state.is_none() && !state_file.exists();
+    let sockets = possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir).map_err(
+        |(dir, why)| {
+            unlistable_socket_dir_refusal(phase, verb, (&state_file, no_state, &dir), &why)
         },
-    };
-    let agent = agent_pid_from_file(project_root, phase).filter(|&pid| agent::agent_running(pid));
+    )?;
+    let agent = (!no_state)
+        .then(|| agent_pid_from_file(project_root, phase))
+        .flatten()
+        .filter(|&pid| agent::agent_running(pid));
     if sockets.is_empty() && agent.is_none() {
         return Ok(());
     }
     Err(CliError::Message(live_run_refusal(
         phase, verb, &sockets, agent,
     )))
+}
+
+/// The supervisor half of [`refuse_launch_over_a_live_run`], shared with
+/// `recover --clean --phase N` ([`refuse_a_live_supervisor`]): the sockets of
+/// this root and phase that may still run. `state` is the loaded state, or
+/// `None` when it is missing or does not load, which sweeps the socket
+/// directory under `cache_dir` instead. `Err` names that directory and why
+/// it cannot be listed.
+fn possibly_live_sockets(
+    project_root: &Path,
+    phase: PhaseId,
+    state: Option<&State>,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<LiveSocket>, (PathBuf, String)> {
+    if let Some(state) = state {
+        return Ok(state
+            .supervisor
+            .as_ref()
+            .and_then(recorded_live_socket)
+            .into_iter()
+            .collect());
+    }
+    let Some(cache_dir) = cache_dir else {
+        return Ok(Vec::new());
+    };
+    if let Some(why) = socket_dir_unlistable(cache_dir) {
+        return Err((registry::socket_dir_in(cache_dir), why));
+    }
+    Ok(supervisor::sweep_for_in(cache_dir, project_root, phase)
+        .iter()
+        .filter_map(swept_live_socket)
+        .collect())
 }
 
 /// A supervisor socket the launch guard counts as possibly live.
@@ -3418,22 +3437,26 @@ fn stale_group_may_live(decision: &supervisor::backstop::BackstopDecision) -> bo
     )
 }
 
-/// The refusal for a state that will not load over a socket directory that
-/// cannot be listed: a live run may be named only by its socket there, so
-/// the launch fails closed (50-06 threat flag).
+/// The refusal for a state that is missing (`no_state`) or will not load
+/// over a socket directory that cannot be listed: a live run may be named
+/// only by its socket there, so the launch fails closed (50-06 threat flag).
 fn unlistable_socket_dir_refusal(
     phase: PhaseId,
     verb: LaunchVerb,
-    (state_file, dir): (&Path, &Path),
+    (state_file, no_state, dir): (&Path, bool, &Path),
     why: &str,
 ) -> CliError {
     let label = verb.label();
+    let state = if no_state {
+        format!("there is no state file {}", state_file.display())
+    } else {
+        format!("the state file {} does not load", state_file.display())
+    };
     CliError::Message(format!(
-        "phase {phase}: the state file {} does not load, and the supervisor socket directory {} \
-         cannot be listed ({why}) — refusing to {label}; nothing was written\n\
+        "phase {phase}: {state}, and the supervisor socket directory {} cannot be listed ({why}) \
+         — refusing to {label}; nothing was written\n\
          A live run of this phase may be named only by its socket there, so {label} fails \
          closed. Make {} listable by this user (DevFlow creates it mode 0700), then run `{}` again.",
-        state_file.display(),
         dir.display(),
         dir.display(),
         verb.rerun(phase)
@@ -11103,6 +11126,115 @@ mod tests {
             ] {
                 assert!(stale_group_may_live(&live), "{live:?} must fail closed");
             }
+        }
+
+        /// An ALIVE scripted supervisor at this root and phase's socket under
+        /// `cache`, with no sidecar, so the sweep attributes it by file name.
+        fn serve_unrecorded(cache: &Path, root: &Path, phase: PhaseId) -> ScriptedSupervisor {
+            let launch_id = "aaaa0000aaaa1503";
+            let socket = supervisor::SocketPath::for_launch(cache, root, phase, launch_id)
+                .expect("socket path fits sun_path");
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", |_| {
+                ShutdownScript {
+                    lines: Vec::new(),
+                    unlink_after: false,
+                }
+            })
+        }
+
+        /// A launch whose state file is missing is still found through its
+        /// socket, as `stop` finds it: `recover --clean` leaves a live
+        /// supervisor's socket behind without a state file.
+        #[test]
+        fn the_launch_guard_finds_a_live_socket_when_the_state_file_is_missing() {
+            let phase = PhaseId::new(1503);
+            let root = tempfile::tempdir().unwrap();
+            assert!(!workflow::state_path(root.path(), phase).exists());
+            let (base, _sock) = stop_socket_dir();
+            let _alive = serve_unrecorded(base.path(), root.path(), phase);
+            let result = refuse_launch_over_a_live_run(
+                root.path(),
+                phase,
+                LaunchVerb::Start,
+                Some(base.path()),
+            );
+            let Err(CliError::Message(text)) = result else {
+                panic!("a live socket with no state file must refuse: {result:?}");
+            };
+            for fragment in [
+                "supervisor launch aaaa0000aaaa1503 ALIVE",
+                "refusing to start; nothing was written",
+            ] {
+                assert!(text.contains(fragment), "missing {fragment:?}: {text}");
+            }
+        }
+
+        /// The unlistable-directory refusal also covers a missing state file:
+        /// with neither a state nor a listing, nothing can rule a run out.
+        #[test]
+        fn the_launch_guard_refuses_an_unlistable_socket_dir_when_the_state_file_is_missing() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let phase = PhaseId::new(1504);
+            let root = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let sock = registry::socket_dir_in(cache.path());
+            std::fs::create_dir_all(&sock).unwrap();
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (listable, result) = without_dac_override(|| {
+                (
+                    std::fs::read_dir(&sock).is_ok(),
+                    refuse_launch_over_a_live_run(
+                        root.path(),
+                        phase,
+                        LaunchVerb::Start,
+                        Some(cache.path()),
+                    ),
+                )
+            });
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                !listable,
+                "precondition: a 0o000 directory cannot be listed"
+            );
+            let Err(CliError::Message(text)) = result else {
+                panic!("an unlistable socket directory must refuse: {result:?}");
+            };
+            for fragment in [
+                "there is no state file".to_string(),
+                sock.display().to_string(),
+                "refusing to start; nothing was written".to_string(),
+            ] {
+                assert!(text.contains(&fragment), "missing {fragment:?}: {text}");
+            }
+        }
+
+        /// Controls for the two tests above: a fresh start (no state, and no
+        /// socket directory or an empty one) proceeds, and the no-state
+        /// carve-out still ignores a live pid in the agent pid file.
+        #[test]
+        fn the_launch_guard_proceeds_with_no_state_and_no_live_socket() {
+            let phase = PhaseId::new(1505);
+            let root = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let guard = || {
+                refuse_launch_over_a_live_run(
+                    root.path(),
+                    phase,
+                    LaunchVerb::Start,
+                    Some(cache.path()),
+                )
+            };
+            assert!(guard().is_ok(), "no socket directory: {:?}", guard());
+            std::fs::create_dir_all(registry::socket_dir_in(cache.path())).unwrap();
+            assert!(guard().is_ok(), "an empty socket directory: {:?}", guard());
+            let pid_file = agent_result::agent_pid_path(root.path(), phase);
+            std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+            std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+            assert!(
+                guard().is_ok(),
+                "the no-state carve-out ignores a live agent pid: {:?}",
+                guard()
+            );
         }
     }
 }

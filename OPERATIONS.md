@@ -111,9 +111,9 @@ How each command shows them:
   is ALIVE and deletes nothing.
 - **`devflow start` / `devflow resume`** refuse while a run is live: an ALIVE
   socket, a STALE one unless the backstop's checks prove its agent group gone,
-  or a probe that fails. When the state file exists but does not load, they
-  search the socket directory for this project and phase instead, and refuse
-  when that directory exists but cannot be listed. The refusal names a
+  or a probe that fails. When the state file is missing or does not load,
+  they search the socket directory for this project and phase instead, and
+  refuse when that directory exists but cannot be listed. The refusal names a
   `devflow stop` line for each live socket.
 
 **Orphan sockets.** `devflow doctor` also lists, read-only, under
