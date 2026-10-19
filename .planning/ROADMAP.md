@@ -1184,6 +1184,52 @@ decided. No DevFlow code change is implied.
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.164: Supervisor Residuals From the Phase 50 External Review (BACKLOG)
+
+**Found:** 2026-10-19, external review of Phase 50's crate diff (agy and DeepSeek lanes, adversarial and security
+lenses; reports and triage in `.planning/phases/50-addressable-monitor-liveness/reviews/`). Each item was checked by
+reading the code at `0048fdb`, not reproduced. The operator chose to backlog these and fix the rest before the live run.
+
+**Defects:**
+1. `devflow doctor`'s orphan list (`collect_orphan_supervisors`, `commands.rs`) skips a swept socket whose probe
+   errors (`_ => continue`), so an unrecorded socket that cannot be probed is reported nowhere.
+2. A supervisor's control thread waits out the stop kill grace (`TERMINATE_VERIFY_WAIT`, 3 s) inline after answering
+   `accepted`, so any other connection's ping times out (`IO_TIMEOUT`, 2 s): `status`/`doctor` read UNKNOWN during a
+   stop, and a second concurrent `stop` errors.
+3. A SIGKILL between `bind` of `<stem>.part` and its `hard_link` leaves the `.part` file in `sock/`; nothing
+   (`publish` cleanup, `remove_launch_files`, `sweep_in`, `doctor`) lists or removes it.
+4. Connections are served one at a time on the control thread, each bounded by `IO_TIMEOUT`, and the client's
+   `connect` has no timeout: a same-uid process holding many connections can make `stop` fail or hang.
+5. On a normal completion only the agent leader is reaped; members it left in its group keep running, and
+   `finish` removes the socket and sidecar, the only record of the group (behaviour predates Phase 50).
+
+**Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.165: A State File's `gate_notify_cmd` Runs as a Shell Command (BACKLOG)
+
+**Found:** 2026-10-19, Phase 50 external review (security lens); predates Phase 50. Checked by reading the code, not
+reproduced.
+
+**Defect:** `State::gate_notify_cmd` is persisted in `.devflow/state-NN.json` and, when `DEVFLOW_GATE_NOTIFY_CMD` is
+unset, used as the gate notification command, run through `sh -c` (`gates.rs` `run_notify_command`). `.devflow/` is
+gitignored, but a repository that commits a state file anyway hands its author a shell command that runs at the next
+gate. Low practical weight: running an agent in a hostile repository already runs its code.
+
+**Done when:** a persisted notify command is either no longer executed from the state file, or the risk is
+explicitly accepted with a reason.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
