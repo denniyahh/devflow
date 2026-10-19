@@ -1428,6 +1428,64 @@ fn describe(output: &std::process::Output) -> String {
     )
 }
 
+/// The agent's work once released: ignore SIGTERM (its `sleep` children
+/// inherit that), mark that it does, then idle about 60 s.
+const IGNORES_TERM: &str = "trap '' TERM
+: > .git/devflow-test-ignores-term
+i=0
+while [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+exit 0";
+
+/// A stopped supervisor records its stop under the per-phase lock, waiting
+/// up to 11 s for it, before it sends the final `stopped` line, and its kill
+/// of an agent that ignores SIGTERM first takes the 3 s SIGTERM grace. So
+/// `stop`'s wait for that line must cover both: here this test holds the
+/// lock for 12.5 s after the shutdown is sent, past an 11 s wait and within
+/// the supervisor's 14 s. A wait too short reads the still-answering
+/// supervisor as one that "did not answer the shutdown" although it stopped.
+#[test]
+fn stop_waits_out_a_supervisor_whose_stop_record_waits_on_the_lock() {
+    const HOLD_AFTER_SHUTDOWN: Duration = Duration::from_millis(12_500);
+    let run = LiveRun::start_with(PhaseId::new(156), IGNORES_TERM);
+    std::fs::write(&run.trigger, "").unwrap();
+    assert!(
+        holds_within(Duration::from_secs(10), || run
+            .root
+            .join(".git/devflow-test-ignores-term")
+            .exists()),
+        "precondition: the agent ignores SIGTERM"
+    );
+    let lock = devflow_core::lock::acquire(&run.root, run.phase).expect("hold the phase lock");
+    let stop = common::hermetic_devflow(&run.home)
+        .args(["stop", "--phase", &run.phase.to_string()])
+        .current_dir(&run.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn devflow stop");
+    std::thread::sleep(HOLD_AFTER_SHUTDOWN);
+    drop(lock);
+    let output = stop.wait_with_output().expect("wait for devflow stop");
+    let text = describe(&output);
+    assert!(
+        output.status.success(),
+        "stop must report the stop that happened: {text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "stopped phase {} through its supervisor",
+            run.phase
+        )),
+        "{text}"
+    );
+    assert!(
+        devflow_core::workflow::load_state(&run.root, run.phase)
+            .expect("the state loads")
+            .stopped,
+        "the stop is recorded: {text}"
+    );
+}
+
 /// V-17 (999.138): a live run whose agent holds no per-phase lock is ended
 /// through its supervisor's socket: the agent group is gone, the exit file
 /// reads 143, no next stage is launched, the socket is Gone, and the state
