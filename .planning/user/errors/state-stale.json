@@ -1,5 +1,5 @@
 {
-  "stale_since_commit": "c2aaf22",
-  "summaries_landed": [".planning/phases/50-addressable-monitor-liveness/50-25-SUMMARY.md"],
+  "stale_since_commit": "4be616d",
+  "summaries_landed": [".planning/phases/50-addressable-monitor-liveness/50-20-SUMMARY.md"],
   "state_status_at_detection": "executing"
 }

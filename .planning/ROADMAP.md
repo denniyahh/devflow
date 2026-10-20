@@ -388,7 +388,7 @@ former criterion 4 (detect and report a 2.x state as incompatible) is retired;
 the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 24/25 plans executed (17 waves); 50-19 is the single operator checkpoint for the live attempt
+**Plans**: 25/25 plans executed (17 waves); 50-19 is the single operator checkpoint for the live attempt
 
 **Wave 1**
 
@@ -464,7 +464,7 @@ the milestone's major-version call.
 
 **Wave 17**
 
-- [ ] 50-20-PLAN.md *(depends on 50-19, 50-25)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
+- [x] 50-20-PLAN.md *(depends on 50-19, 50-25)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
 
 **Cross-cutting constraints:**
 
@@ -676,7 +676,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 24/25 | In Progress | — |
+| 50 | 25/25 | In Progress | — |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
