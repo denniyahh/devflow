@@ -55,6 +55,11 @@ What is committed, and how it got there (D-18, after Phase 49's D-26):
 - The GitHub user name still appears in the published tree (the throwaway repository's `owner/name`, `responded_by`,
   `ls -l` owner columns). The sanitizer does not redact a bare user name by design, and Phase 49's committed evidence
   carries it the same way. It is not a home path or a credential.
+- **One redaction by hand after sanitizing (operator decision 2026-10-20).** The live agent's own leak search, echoed in
+  `attempt-1/collected/devflow/phase-01-stdout` and its copy `attempt-1/gates/003-ship/devflow/phase-01-stdout`, spelled
+  out fragments of the operator's account email (never the full address, so the sanitizer's email rule did not match).
+  Those fragments were replaced with `REDACTED-EMAIL-LOCAL` and `REDACTED-EMAIL-DOMAIN` in the published copies only
+  (3 occurrences each); the raw tree is unchanged. `--published` and the sanitizer scan were re-run afterwards.
 
 ### Attempts
 
