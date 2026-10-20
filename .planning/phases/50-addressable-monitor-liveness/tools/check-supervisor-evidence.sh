@@ -13,6 +13,7 @@
 #   check-supervisor-evidence.sh collect-sidecars <EV> --project <dir> [--bin <devflow>]
 #   check-supervisor-evidence.sh --attempt <EV> [--p49-check <script>]
 #   check-supervisor-evidence.sh --attempt-gate <P50 home> [--p49-check <script>]
+#   check-supervisor-evidence.sh --published <dir>
 #   check-supervisor-evidence.sh --selftest
 #
 # <P50 home> is $HOME/.cache/devflow-phase50 in the runbook: Phase 49's tools
@@ -62,6 +63,13 @@
 # --fault --require-all passes recording the attempt's bin_sha256 (D-17;
 # `ATTEMPT_GATE fault=<dir> bin_sha256=<hex>`). Exit 0 for shipped and
 # cap_reached, 1 for not_ready.
+#
+# --published (50-25, D-18) judges the sanitized tree 50-20 commits: at least
+# one fault-* and one attempt-* directory, a fault-*/verdict-*.txt line
+# starting `FAULT verdict=pass`, a line anywhere starting `ATTEMPT_GATE
+# verdict=shipped` or `cap_reached`, no file naming the value of $HOME (rg
+# -uuu: hidden, ignored and binary files are read; an empty $HOME or an rg
+# error fails) and no symlink. Prints `PUBLISHED verdict=pass|fail`.
 #
 # What this tool does not establish: it judges records, it does not re-run
 # anything. A pass means the records say what the fault arm saw; the fault
@@ -550,6 +558,82 @@ except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as 
     print(f'ATTEMPT_GATE verdict=not_ready attempt={number} reason={absent}{reason}')
     sys.exit(1)
 PY
+}
+
+# ---------------------------------------------------------------------------
+# --published (50-25, D-18): judge a sanitized evidence tree before it is
+# committed. One `PUBLISHED <problem>` line per problem, then
+# `PUBLISHED verdict=pass|fail`. Every rg call here passes --no-config so a
+# user ripgrep config cannot narrow the search.
+# ---------------------------------------------------------------------------
+
+# Some directory (not a symlink, not a file) directly under <dir> named <glob>.
+published_has_dir() {
+    [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -type d -name "$2" -print -quit)" ]
+}
+
+published_check() {
+    local dir="$1" home="${HOME:-}" bad=0 rc found line file fault_pass=0
+    if [ -L "$dir" ]; then
+        echo "PUBLISHED symlink=$dir"
+        echo "PUBLISHED verdict=fail"
+        return 1
+    fi
+    if [ ! -d "$dir" ]; then
+        echo "PUBLISHED dir=ABSENT $dir"
+        echo "PUBLISHED verdict=fail"
+        return 1
+    fi
+    published_has_dir "$dir" 'fault-*' || { echo "PUBLISHED missing=fault-dir"; bad=1; }
+    published_has_dir "$dir" 'attempt-*' || { echo "PUBLISHED missing=attempt-dir"; bad=1; }
+
+    for file in "$dir"/fault-*/verdict-*.txt; do
+        [ -f "$file" ] && [ ! -L "$file" ] || continue
+        if rg --no-config -q -e '^FAULT verdict=pass' -- "$file"; then
+            fault_pass=1
+        fi
+    done
+    [ "$fault_pass" -eq 1 ] || { echo "PUBLISHED missing=fault-pass-verdict"; bad=1; }
+
+    rc=0
+    rg --no-config -uuu -q -e '^ATTEMPT_GATE verdict=(shipped|cap_reached)' -- "$dir" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) echo "PUBLISHED missing=attempt-gate-verdict"; bad=1 ;;
+        *) echo "PUBLISHED rg_error=$rc search=attempt-gate-verdict"; bad=1 ;;
+    esac
+
+    # -uuu: hidden, ignored and binary files are read too (T-50-92).
+    if [ -z "$home" ]; then
+        echo "PUBLISHED home=EMPTY"
+        bad=1
+    else
+        rc=0
+        found="$(rg --no-config -uuu -l -F -e "$home" -- "$dir")" || rc=$?
+        case "$rc" in
+            0 | 1) ;;
+            *) echo "PUBLISHED rg_error=$rc search=home-path"; bad=1 ;;
+        esac
+        if [ -n "$found" ]; then
+            while IFS= read -r line; do echo "PUBLISHED names_home=$line"; done <<<"$found"
+            bad=1
+        fi
+    fi
+
+    rc=0
+    found="$(find "$dir" -type l)" || rc=$?
+    [ "$rc" -eq 0 ] || { echo "PUBLISHED find_error=$rc search=symlink"; bad=1; }
+    if [ -n "$found" ]; then
+        while IFS= read -r line; do echo "PUBLISHED symlink=$line"; done <<<"$found"
+        bad=1
+    fi
+
+    if [ "$bad" -eq 0 ]; then
+        echo "PUBLISHED verdict=pass"
+    else
+        echo "PUBLISHED verdict=fail"
+        return 1
+    fi
 }
 
 
@@ -1125,6 +1209,93 @@ st_fc_partial() {
         expect 1 'FAULT_CURRENT verdict=fail' st_fc "$home" "$repo"
 }
 
+# --published cases (50-25). Each call runs with HOME set to ST_PUB_HOME, a
+# value no planted file names unless the case plants it.
+ST_PUB_HOME=/nonexistent/df50-selftest-home
+
+st_pub() {
+    env HOME="$ST_PUB_HOME" bash "$SELF" --published "$1"
+}
+
+# A sanitized published tree; prints its path. fault-1/case-notes.txt holds a
+# `FAULT verdict=pass` line outside any verdict-*.txt file, so only the
+# verdict file's own line can satisfy the fault check.
+st_pub_tree() {
+    local dir
+    dir="$(mktemp -d "$ST_TMP/pub.XXXXXX")"
+    mkdir -p "$dir/fault-1" "$dir/attempt-1"
+    st_record alive-stop-stream "$ST_SHA" >"$dir/fault-1/case-alive-stop-stream.json"
+    printf 'FAULT case=alive-stop-stream ok live\nFAULT bin_sha256=%s\nFAULT verdict=pass\n' "$ST_SHA" \
+        >"$dir/fault-1/verdict-fault.txt"
+    printf 'quoted from an older run: FAULT verdict=pass\nFAULT verdict=pass\n' >"$dir/fault-1/case-notes.txt"
+    printf 'ATTEMPT sidecars_left=0\nATTEMPT verdict=pass\n' >"$dir/attempt-1/verdict-attempt.txt"
+    printf 'ATTEMPT_GATE fault=fault-1 bin_sha256=%s\nATTEMPT_GATE verdict=shipped attempt=1\n' "$ST_SHA" \
+        >"$dir/attempt-1/verdict-attempt-gate.txt"
+    printf 'project=<HOME>/.cache/devflow-phase50/attempt-1/project\n' >"$dir/attempt-1/.redacted-env"
+    printf '%s\n' "$dir"
+}
+
+st_pub_pass() {
+    local dir
+    dir="$(st_pub_tree)"
+    expect 0 'PUBLISHED verdict=pass' st_pub "$dir"
+}
+
+st_pub_home_file() {
+    local dir
+    dir="$(st_pub_tree)"
+    printf 'project=%s/.cache/devflow-phase50/attempt-1/project\n' "$ST_PUB_HOME" >"$dir/attempt-1/start.stderr"
+    expect 1 'PUBLISHED verdict=fail' st_pub "$dir" &&
+        expect 1 "PUBLISHED names_home=$dir/attempt-1/start.stderr" st_pub "$dir"
+}
+
+# The leak is hidden, listed in an .ignore file and binary (a NUL byte before
+# the path), so dropping any one of rg's three -u flags misses it.
+st_pub_home_hidden() {
+    local dir
+    dir="$(st_pub_tree)"
+    printf 'x\0%s/.cache\n' "$ST_PUB_HOME" >"$dir/attempt-1/.leak"
+    printf '.leak\n' >"$dir/attempt-1/.ignore"
+    expect 1 'PUBLISHED verdict=fail' st_pub "$dir" &&
+        expect 1 "PUBLISHED names_home=$dir/attempt-1/.leak" st_pub "$dir"
+}
+
+st_pub_symlink() {
+    local dir
+    dir="$(st_pub_tree)"
+    ln -s verdict-attempt.txt "$dir/attempt-1/link"
+    expect 1 'PUBLISHED verdict=fail' st_pub "$dir" &&
+        expect 1 "PUBLISHED symlink=$dir/attempt-1/link" st_pub "$dir"
+}
+
+st_pub_no_fault_pass() {
+    local dir
+    dir="$(st_pub_tree)"
+    printf 'FAULT case=alive-stop-stream FAIL surviving member\nFAULT verdict=fail\n' >"$dir/fault-1/verdict-fault.txt"
+    expect 1 'PUBLISHED verdict=fail' st_pub "$dir" &&
+        expect 1 'PUBLISHED missing=fault-pass-verdict' st_pub "$dir"
+}
+
+st_pub_no_shipped() {
+    local dir
+    dir="$(st_pub_tree)"
+    printf 'ATTEMPT_GATE verdict=not_ready attempt=1 reason=no fault directory\n' \
+        >"$dir/attempt-1/verdict-attempt-gate.txt"
+    expect 1 'PUBLISHED verdict=fail' st_pub "$dir" &&
+        expect 1 'PUBLISHED missing=attempt-gate-verdict' st_pub "$dir"
+}
+
+# The attempt directory is renamed, so its gate line stays in the tree, and an
+# `attempt-notes` file (not a directory) must not stand in for it.
+st_pub_no_attempt_dir() {
+    local dir
+    dir="$(st_pub_tree)"
+    mv -- "$dir/attempt-1" "$dir/run-1"
+    printf 'notes\n' >"$dir/attempt-notes"
+    expect 1 'PUBLISHED verdict=fail' st_pub "$dir" &&
+        expect 1 'PUBLISHED missing=attempt-dir' st_pub "$dir"
+}
+
 run_selftest() {
     ST_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$ST_TMP"' EXIT
@@ -1164,6 +1335,13 @@ run_selftest() {
     st_case 'fault current passes after a planning-only commit' st_fc_planning_commit
     st_case 'fault current fails a directory whose run saw a mismatching checkout' st_fc_mismatching_checkout
     st_case 'fault current fails a partial current-source directory' st_fc_partial
+    st_case 'published passes a sanitized tree' st_pub_pass
+    st_case 'published fails a file naming the home path' st_pub_home_file
+    st_case 'published fails a hidden file naming the home path' st_pub_home_hidden
+    st_case 'published fails a symlink' st_pub_symlink
+    st_case 'published fails without a passing fault verdict' st_pub_no_fault_pass
+    st_case 'published fails without a shipped or cap_reached verdict' st_pub_no_shipped
+    st_case 'published fails without an attempt directory' st_pub_no_attempt_dir
 
     echo "SELFTEST passed=$ST_PASS failed=$ST_FAIL"
     [ "$ST_FAIL" -eq 0 ] && [ "$ST_PASS" -gt 0 ]
@@ -1256,6 +1434,10 @@ main() {
             else
                 attempt_gate "$target" "$p49"
             fi
+            ;;
+        --published)
+            [ "$#" -eq 2 ] || usage
+            published_check "$2"
             ;;
         *) usage ;;
     esac
