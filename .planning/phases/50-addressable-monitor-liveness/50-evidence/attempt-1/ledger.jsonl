@@ -1,0 +1,3 @@
+{"seq":1,"stage":"define","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50/attempt-1/gates/001-define","manifest_sha256":"5aedd8ec309076bb56352c5c3edd028ed123bf7e7d5ac725e02a3c547c442629","t":1792522301}
+{"seq":2,"stage":"code","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50/attempt-1/gates/002-code","manifest_sha256":"f21af7fcbdc537bf6824e3ac41f2c504c15affb526cdb65d7789adf52092e356","t":1792522762}
+{"seq":3,"stage":"ship","phase":"1","non_silent":"0","dir":"~/.cache/devflow-phase50/attempt-1/gates/003-ship","manifest_sha256":"7d54becd7c3d98b6b37e4b252274f2d50387aeb9826df66bc89a9b267246a7ed","t":1792524389}

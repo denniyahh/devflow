@@ -1,0 +1,28 @@
+{
+  "case": "kill9-stale-stop",
+  "live": true,
+  "bin_sha256": "9b0ec70c7190301067b6e8438e27ed7fb8ae2f00de90638de3608b1391c098f6",
+  "launch_shape": "stream",
+  "socket_path": "/tmp/df50f.js5r6Z/c/sock/c74ca9d89ea4efb1-01-18e0517cdef5e9eb.sock",
+  "launch_id": "18e0517cdef5e9eb",
+  "supervisor_pid": 877962,
+  "probe_before": "ALIVE",
+  "supervisor_killed": true,
+  "probe_after_kill": "STALE",
+  "members_after_kill": [
+    " 877963  877963   20821 Tue Oct 20 14:50:47 2026 /bin/sh /tmp/df50f.js5r6Z/f-kill9-stale-stop/claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions"
+  ],
+  "probe_after": "GONE",
+  "members_before": [
+    " 877963  877963   20821 Tue Oct 20 14:50:47 2026 /bin/sh /tmp/df50f.js5r6Z/f-kill9-stale-stop/claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions"
+  ],
+  "members_after": [],
+  "advance_ran": false,
+  "next_stage_launched": false,
+  "stage_launched_count": 1,
+  "state_stopped": true,
+  "stop_exit": 0,
+  "stop_output": "stop: phase 1: its supervisor is gone (STALE socket); ended its agent group 877963 (1 member(s): pid 877963) and removed /tmp/df50f.js5r6Z/c/sock/c74ca9d89ea4efb1-01-18e0517cdef5e9eb.sock and its sidecar",
+  "expected_met": true,
+  "unmet": []
+}

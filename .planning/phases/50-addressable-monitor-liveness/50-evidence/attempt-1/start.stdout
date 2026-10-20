@@ -1,0 +1,11 @@
+note: base branch is `integration` (from devflow.toml (base_branch)) — phase worktrees fork from it and phase work merges back into it (D-01, 45-CONTEXT.md)
+created worktree: ~/.cache/devflow-phase50/attempt-1/project/.worktrees/phase-01 (branch feature/phase-01)
+warning: build provenance staleness check did not confirm a fresh build for stage define — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)
+unattended-launch prerequisites — phase 1, stage define, mode auto:
+  [holds] GSD config can hold the chain flag
+  [holds] Code would launch on the pipe-owning arm
+  [DOES NOT HOLD] no plan declares a human-only checkpoint — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6)
+gate written: .devflow/gates/01-define.json — awaiting response
+stage define → launched Claude Code (supervisor pid 899617, stream supervisor at ~/.cache/devflow/sock/b42190c734d0b40c-01-18e051ef6de593d6.sock)
+started phase 1 in auto mode at 1792522300 — monitor will auto-advance
+  watch live: devflow logs -f --phase 1

@@ -1,0 +1,8 @@
+build_commit=1deaa4d8a29f3a843834fe4c3187c2a70faeba9e
+build_dirty=false
+bin_sha256=9b0ec70c7190301067b6e8438e27ed7fb8ae2f00de90638de3608b1391c098f6
+claude_version=2.1.304 (Claude Code)
+gh_version=gh version 2.102.0 (2026-09-30)
+gsd_version=1.18.0
+python3_version=Python 3.15.0
+git_version=git version 2.56.0
