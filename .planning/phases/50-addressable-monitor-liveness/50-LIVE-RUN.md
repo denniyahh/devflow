@@ -205,6 +205,14 @@ Already filed this phase by the 2026-10-19 external review (`reviews/2026-10-19-
 backlog 999.164 (`doctor`'s orphan list, probe timeouts in a stop's grace, `.part` leaks, connection flooding, members
 left after a normal completion) and 999.165 (`gate_notify_cmd` through `sh -c`).
 
+## Phase-end macOS compile gate (V-56, MAC-3)
+
+Run 2026-10-20 on `97b5def` (crate sources unchanged since `1deaa4d`), rustc 1.97.1:
+`cargo check --target aarch64-apple-darwin -p devflow-core --all-targets && cargo check --target aarch64-apple-darwin -p devflow --all-targets`
+exited 0, with no `warning` or `error` line in its output. So no plan after 50-05 and 50-09 left an ungated
+Linux-only `libc` item (`E0425`) in either package. This is a compile check only: nothing was linked or run on macOS
+(see "What this evidence does not establish").
+
 ## Release handoff (3.0.0)
 
 **1. Merge the phase PR into `develop` with a merge commit, never squash it and never use auto-merge.**
