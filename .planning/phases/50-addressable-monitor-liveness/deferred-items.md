@@ -77,3 +77,7 @@
   status: open
   **What:** `sanitize-evidence.py` redacts whole email addresses, home paths and session ids, but not the parts of an address on their own. The live agent's leak search in `attempt-1/collected/devflow/phase-01-stdout` (and its ship-gate copy) spelled out the local part and the domain of the operator's account email, and both survived sanitizing and both scans. They were redacted by hand in the published copies (`eb7ba4a`, operator decision); the raw tree still has them.
   **Done when:** the sanitizer takes the operator's identity tokens (the email's local part and domain, beside `--user`) and redacts or refuses them, with a selftest case planting each fragment; or the operator decides the hand redaction is enough.
+- `stop`'s socket sweeps do not check that `sock/` is listable (found 2026-10-20 by the phase security audit, outside the threat register)
+  status: open
+  **What:** the 50-06 fail-open-enumeration flag is closed for the launch guard and `recover --clean` (`possibly_live_sockets` calls `socket_dir_unlistable` first). `stop --launch` (`commands.rs` ~2088) and the corrupt-state `stop` (~2323) call the sweep without that check; on an unlistable `sock/`, `stop --launch` prints "nothing to stop" and returns Ok. What the corrupt-state path prints was not checked.
+  **Impact:** low; a relaunch is still refused by the launch guard. **Done when:** both stop paths refuse on an unlistable `sock/`, each with a test that drops DAC override as the launch-guard tests do; or this is filed as backlog.
