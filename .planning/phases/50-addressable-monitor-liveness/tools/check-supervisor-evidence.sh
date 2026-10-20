@@ -14,6 +14,9 @@
 #   check-supervisor-evidence.sh --attempt <EV> [--p49-check <script>]
 #   check-supervisor-evidence.sh --attempt-gate <P50 home> [--p49-check <script>]
 #   check-supervisor-evidence.sh --published <dir>
+#   check-supervisor-evidence.sh --live-run <50-LIVE-RUN.md>
+#   check-supervisor-evidence.sh --handoff <50-LIVE-RUN.md> --plan <50-20-PLAN.md>
+#   check-supervisor-evidence.sh --defects <50-LIVE-RUN.md> --roadmap <ROADMAP.md>
 #   check-supervisor-evidence.sh --selftest
 #
 # <P50 home> is $HOME/.cache/devflow-phase50 in the runbook: Phase 49's tools
@@ -70,6 +73,22 @@
 # verdict=shipped` or `cap_reached`, no file naming the value of $HOME (rg
 # -uuu: hidden, ignored and binary files are read; an empty $HOME or an rg
 # error fails) and no symlink. Prints `PUBLISHED verdict=pass|fail`.
+#
+# --live-run (50-25) passes a record holding each of `does not establish`,
+# `verdict=`, `stream`, `capture`, `unverified on macOS`, `V-28`, `V-29`,
+# `bin_sha256` and, for each criterion N in 1-8, a line matching
+# `^\| *(criterion )?N *\|`. Prints `LIVE_RUN verdict=pass|fail`.
+#
+# --handoff (50-25, R6-D) passes when <plan> holds exactly one line matching
+# `^    bash -c .R=.*changelog_3_0_0_lines=.*$`, the record holds that line
+# without its four-space indent verbatim, and the record holds every release
+# handoff fragment. Prints `HANDOFF verdict=pass|fail`.
+#
+# --defects (50-25) reads `git diff --unified=0 HEAD -- <roadmap>` in the
+# repository holding <roadmap> (a git failure, or a roadmap absent at HEAD,
+# fails): each added `### Phase 999.N:` heading's id must appear in the record
+# (not as part of a longer number); with none added the record must say "no
+# non-blocking defect found" (any case). Prints `DEFECTS verdict=pass|fail`.
 #
 # What this tool does not establish: it judges records, it does not re-run
 # anything. A pass means the records say what the fault arm saw; the fault
@@ -634,6 +653,141 @@ published_check() {
         echo "PUBLISHED verdict=fail"
         return 1
     fi
+}
+
+# ---------------------------------------------------------------------------
+# --live-run, --handoff, --defects (50-25): judge 50-20's phase record
+# (50-LIVE-RUN.md). Each prints one `<LABEL> <problem>` line per problem, then
+# `<LABEL> verdict=pass|fail`, and exits 0 only on pass.
+# ---------------------------------------------------------------------------
+LIVE_RUN_FRAGMENTS=('does not establish' 'verdict=' 'stream' 'capture' 'unverified on macOS' 'V-28' 'V-29' 'bin_sha256')
+LIVE_RUN_CRITERIA=8
+HANDOFF_CHECK_RE='^    bash -c .R=.*changelog_3_0_0_lines=.*$'
+HANDOFF_INDENT='    '
+HANDOFF_FRAGMENTS=('## Release handoff (3.0.0)' 'gh pr merge' '--merge' 'never squash'
+    'docs(50-17): state socket supervision is unverified on macOS' 'gh release edit v3.0.0')
+DEFECTS_NONE='no non-blocking defect found'
+
+# judge_found <label> <rg exit code> <what>: 0 when rg found <what>; otherwise
+# prints `<label> missing=<what>` (rg 1) or `<label> rg_error=<rc> ...` and
+# returns 1.
+judge_found() {
+    case "$2" in
+        0) return 0 ;;
+        1) echo "$1 missing=$3" ;;
+        *) echo "$1 rg_error=$2 search=$3" ;;
+    esac
+    return 1
+}
+
+# judge_verdict <label> <bad>: print the verdict line; exit status is the verdict.
+judge_verdict() {
+    if [ "$2" -eq 0 ]; then
+        echo "$1 verdict=pass"
+    else
+        echo "$1 verdict=fail"
+        return 1
+    fi
+}
+
+live_run_check() {
+    local file="$1" bad=0 frag n rc
+    if [ ! -f "$file" ]; then
+        echo "LIVE_RUN file=ABSENT $file"
+        echo "LIVE_RUN verdict=fail"
+        return 1
+    fi
+    for frag in "${LIVE_RUN_FRAGMENTS[@]}"; do
+        rc=0
+        rg --no-config -q -F -e "$frag" -- "$file" || rc=$?
+        judge_found LIVE_RUN "$rc" "$frag" || bad=1
+    done
+    for ((n = 1; n <= LIVE_RUN_CRITERIA; n++)); do
+        rc=0
+        rg --no-config -q -e "^\| *(criterion )?$n *\|" -- "$file" || rc=$?
+        judge_found LIVE_RUN "$rc" "criterion-row-$n" || bad=1
+    done
+    judge_verdict LIVE_RUN "$bad"
+}
+
+handoff_check() {
+    local file="$1" plan="$2" bad=0 lines="" count=0 frag rc
+    rc=0
+    lines="$(rg --no-config -e "$HANDOFF_CHECK_RE" -- "$plan")" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "HANDOFF rg_error=$rc search=check-line plan=$plan"
+        bad=1
+    else
+        [ -z "$lines" ] || count="$(printf '%s\n' "$lines" | wc -l)"
+        if [ "$count" -ne 1 ]; then
+            echo "HANDOFF check_lines=$count plan=$plan"
+            bad=1
+        fi
+    fi
+    if [ ! -f "$file" ]; then
+        echo "HANDOFF file=ABSENT $file"
+        echo "HANDOFF verdict=fail"
+        return 1
+    fi
+    if [ "$bad" -eq 0 ]; then
+        rc=0
+        rg --no-config -q -F -e "${lines#"$HANDOFF_INDENT"}" -- "$file" || rc=$?
+        judge_found HANDOFF "$rc" check-line || bad=1
+    fi
+    for frag in "${HANDOFF_FRAGMENTS[@]}"; do
+        rc=0
+        rg --no-config -q -F -e "$frag" -- "$file" || rc=$?
+        judge_found HANDOFF "$rc" "$frag" || bad=1
+    done
+    judge_verdict HANDOFF "$bad"
+}
+
+defects_check() {
+    local file="$1" roadmap="$2" bad=0 rdir rbase diff ids id rc
+    if [ ! -f "$file" ]; then
+        echo "DEFECTS file=ABSENT $file"
+        echo "DEFECTS verdict=fail"
+        return 1
+    fi
+    if [ ! -f "$roadmap" ]; then
+        echo "DEFECTS roadmap=ABSENT $roadmap"
+        echo "DEFECTS verdict=fail"
+        return 1
+    fi
+    rdir="$(dirname -- "$roadmap")"
+    rbase="$(basename -- "$roadmap")"
+    rc=0
+    diff="$(git -C "$rdir" diff --no-color --no-ext-diff --unified=0 HEAD -- "$rbase")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "DEFECTS git=FAILED rc=$rc"
+        echo "DEFECTS verdict=fail"
+        return 1
+    fi
+    # A path git does not track diffs as empty; require the roadmap at HEAD so
+    # a wrong path cannot pass as "no heading added".
+    if ! git -C "$rdir" cat-file -e "HEAD:./$rbase" 2>/dev/null; then
+        echo "DEFECTS roadmap=NOT_AT_HEAD $roadmap"
+        echo "DEFECTS verdict=fail"
+        return 1
+    fi
+    ids="$(printf '%s\n' "$diff" | sed -n 's/^+### Phase \(999\.[0-9][0-9]*\):.*/\1/p')"
+    if [ -n "$ids" ]; then
+        while IFS= read -r id; do
+            rc=0
+            rg --no-config -q -e "(^|[^0-9])${id//./\\.}([^0-9]|\$)" -- "$file" || rc=$?
+            case "$rc" in
+                0) echo "DEFECTS referenced=$id" ;;
+                1) echo "DEFECTS unreferenced=$id"; bad=1 ;;
+                *) echo "DEFECTS rg_error=$rc search=$id"; bad=1 ;;
+            esac
+        done <<<"$ids"
+    else
+        echo "DEFECTS added=0"
+        rc=0
+        rg --no-config -q -i -F -e "$DEFECTS_NONE" -- "$file" || rc=$?
+        judge_found DEFECTS "$rc" "$DEFECTS_NONE" || bad=1
+    fi
+    judge_verdict DEFECTS "$bad"
 }
 
 
@@ -1296,6 +1450,232 @@ st_pub_no_attempt_dir() {
         expect 1 'PUBLISHED missing=attempt-dir' st_pub "$dir"
 }
 
+# --live-run cases (50-25). A complete record, one fragment or row per line so
+# a case can delete exactly one. Rows use both `| N |` and `| criterion N |`,
+# and `| 17 |` must not stand in for criterion 7.
+st_lr_record() {
+    local file
+    file="$(mktemp "$ST_TMP/live-run.XXXXXX")"
+    cat >"$file" <<'MD'
+# Phase 50 live run
+Quoted: `FAULT verdict=pass`
+Recorded bin_sha256 per attempt.
+Both launch shapes ran: stream
+and capture.
+Socket supervision is unverified on macOS.
+V-28 holds.
+V-29 holds.
+## What this evidence does not establish
+| Criterion | Evidence |
+|---|---|
+| 1 | a |
+| criterion 2 | b |
+|3|c|
+| 4 | d |
+| 5 | e |
+| 6 | f |
+| 7 | g |
+| 8 | h |
+| 17 | not a criterion |
+MD
+    printf '%s\n' "$file"
+}
+
+st_lr_pass() {
+    local file
+    file="$(st_lr_record)"
+    expect 0 'LIVE_RUN verdict=pass' bash "$SELF" --live-run "$file"
+}
+
+st_lr_missing_fragment() {
+    local file
+    file="$(st_lr_record)"
+    sed -i '/^V-29 holds\.$/d' "$file"
+    expect 1 'LIVE_RUN verdict=fail' bash "$SELF" --live-run "$file" &&
+        expect 1 'LIVE_RUN missing=V-29' bash "$SELF" --live-run "$file"
+}
+
+st_lr_missing_row() {
+    local file
+    file="$(st_lr_record)"
+    sed -i '/^| 7 | g |$/d' "$file"
+    expect 1 'LIVE_RUN verdict=fail' bash "$SELF" --live-run "$file" &&
+        expect 1 'LIVE_RUN missing=criterion-row-7' bash "$SELF" --live-run "$file"
+}
+
+st_lr_absent() {
+    local file="$ST_TMP/no-such-live-run.md"
+    expect 1 'LIVE_RUN verdict=fail' bash "$SELF" --live-run "$file" &&
+        expect 1 "LIVE_RUN file=ABSENT $file" bash "$SELF" --live-run "$file"
+}
+
+# --handoff cases (50-25; R6-D). A synthetic plan holding one indented check
+# line, and a record holding that line unindented plus every handoff fragment.
+st_ho_plan() {
+    local plan
+    plan="$(mktemp "$ST_TMP/plan.XXXXXX")"
+    cat >"$plan" <<'MD'
+<context>
+Release handoff check: prints `changelog_3_0_0_lines=<N>`.
+
+    bash -c 'R="${1:-origin/main}"; n=$(git show "${R}:CHANGELOG.md" | wc -l); echo "ref=$R changelog_3_0_0_lines=$n"' _ origin/main
+</context>
+MD
+    printf '%s\n' "$plan"
+}
+
+st_ho_record() {
+    local file
+    file="$(mktemp "$ST_TMP/handoff.XXXXXX")"
+    cat >"$file" <<'MD'
+## Release handoff (3.0.0)
+Merge the phase PR with `gh pr merge <PR> --merge --match-head-commit <sha>`;
+never squash, never auto-merge.
+50-17's commit `docs(50-17): state socket supervision is unverified on macOS` carries the note.
+Run:
+```bash
+bash -c 'R="${1:-origin/main}"; n=$(git show "${R}:CHANGELOG.md" | wc -l); echo "ref=$R changelog_3_0_0_lines=$n"' _ origin/main
+```
+Repair: `gh release edit v3.0.0 --notes-file <file>`.
+MD
+    printf '%s\n' "$file"
+}
+
+st_ho() {
+    bash "$SELF" --handoff "$1" --plan "$2"
+}
+
+st_ho_pass() {
+    local plan file
+    plan="$(st_ho_plan)"
+    file="$(st_ho_record)"
+    expect 0 'HANDOFF verdict=pass' st_ho "$file" "$plan"
+}
+
+# The record copies the real 50-20 plan's check line, taken with sed (not the
+# judge's rg) and required to be exactly one line.
+st_ho_real_plan() {
+    local plan file line
+    plan="$(dirname -- "$T")/50-20-PLAN.md"
+    line="$(sed -n 's/^    \(bash -c .R=.*changelog_3_0_0_lines=.*\)$/\1/p' "$plan")"
+    [ -n "$line" ] && [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] ||
+        { echo "fixture broken: not exactly one check line in $plan"; return 1; }
+    file="$(st_ho_record)"
+    printf '%s\n' "$line" >>"$file"
+    expect 0 'HANDOFF verdict=pass' st_ho "$file" "$plan"
+}
+
+st_ho_altered() {
+    local plan file
+    plan="$(st_ho_plan)"
+    file="$(st_ho_record)"
+    sed -i 's/_ origin\/main$/_ origin\/mian/' "$file"
+    expect 1 'HANDOFF verdict=fail' st_ho "$file" "$plan" &&
+        expect 1 'HANDOFF missing=check-line' st_ho "$file" "$plan"
+}
+
+st_ho_missing_fragment() {
+    local plan file
+    plan="$(st_ho_plan)"
+    file="$(st_ho_record)"
+    sed -i '/^never squash, never auto-merge\.$/d' "$file"
+    expect 1 'HANDOFF verdict=fail' st_ho "$file" "$plan" &&
+        expect 1 'HANDOFF missing=never squash' st_ho "$file" "$plan"
+}
+
+# The check line is still in the plan, but indented by two spaces, not four.
+st_ho_plan_without() {
+    local plan file
+    plan="$(st_ho_plan)"
+    file="$(st_ho_record)"
+    sed -i 's/^    bash -c /  bash -c /' "$plan"
+    expect 1 'HANDOFF verdict=fail' st_ho "$file" "$plan" &&
+        expect 1 "HANDOFF check_lines=0 plan=$plan" st_ho "$file" "$plan"
+}
+
+st_ho_plan_twice() {
+    local plan file
+    plan="$(st_ho_plan)"
+    file="$(st_ho_record)"
+    sed -i '/^    bash -c /p' "$plan"
+    expect 1 'HANDOFF verdict=fail' st_ho "$file" "$plan" &&
+        expect 1 "HANDOFF check_lines=2 plan=$plan" st_ho "$file" "$plan"
+}
+
+st_ho_absent() {
+    local plan file="$ST_TMP/no-such-handoff.md"
+    plan="$(st_ho_plan)"
+    expect 1 'HANDOFF verdict=fail' st_ho "$file" "$plan" &&
+        expect 1 "HANDOFF file=ABSENT $file" st_ho "$file" "$plan"
+}
+
+# --defects cases (50-25). A scratch repository whose committed ROADMAP.md
+# holds backlog heading 999.66; GIT_CEILING_DIRECTORIES keeps git from
+# finding a repository above the selftest scratch.
+st_def() {
+    st_git_env env GIT_CEILING_DIRECTORIES="$ST_TMP" bash "$SELF" --defects "$1" --roadmap "$2"
+}
+
+st_def_repo() {
+    local repo
+    repo="$(mktemp -d "$ST_TMP/def.XXXXXX")"
+    st_git init -q "$repo"
+    printf '# Roadmap\n\n### Phase 999.66: Older entry (BACKLOG)\n\nFound: earlier.\n' >"$repo/ROADMAP.md"
+    st_git -C "$repo" add ROADMAP.md
+    st_git -C "$repo" commit -q -m roadmap
+    printf '%s\n' "$repo"
+}
+
+st_def_add_heading() {
+    printf '\n### Phase 999.67: New defect (BACKLOG)\n\nFound: 2026-10-20.\n' >>"$1/ROADMAP.md"
+}
+
+st_def_pass_referenced() {
+    local repo
+    repo="$(st_def_repo)"
+    st_def_add_heading "$repo"
+    printf 'Defects: non-blocking, filed as 999.67.\n' >"$repo/record.md"
+    expect 0 'DEFECTS verdict=pass' st_def "$repo/record.md" "$repo/ROADMAP.md" &&
+        expect 0 'DEFECTS referenced=999.67' st_def "$repo/record.md" "$repo/ROADMAP.md"
+}
+
+# The record names 999.675 and 999.66, neither of which is the new 999.67.
+st_def_fail_unreferenced() {
+    local repo
+    repo="$(st_def_repo)"
+    st_def_add_heading "$repo"
+    printf 'Defects: see 999.675 and 999.66.\n' >"$repo/record.md"
+    expect 1 'DEFECTS verdict=fail' st_def "$repo/record.md" "$repo/ROADMAP.md" &&
+        expect 1 'DEFECTS unreferenced=999.67' st_def "$repo/record.md" "$repo/ROADMAP.md"
+}
+
+# ROADMAP.md changes, but no backlog heading is added.
+st_def_pass_none() {
+    local repo
+    repo="$(st_def_repo)"
+    printf 'A note, not a heading.\n' >>"$repo/ROADMAP.md"
+    printf 'No non-blocking defect found.\n' >"$repo/record.md"
+    expect 0 'DEFECTS verdict=pass' st_def "$repo/record.md" "$repo/ROADMAP.md" &&
+        expect 0 'DEFECTS added=0' st_def "$repo/record.md" "$repo/ROADMAP.md"
+}
+
+st_def_fail_no_statement() {
+    local repo
+    repo="$(st_def_repo)"
+    printf 'Defects: none listed.\n' >"$repo/record.md"
+    expect 1 'DEFECTS verdict=fail' st_def "$repo/record.md" "$repo/ROADMAP.md" &&
+        expect 1 "DEFECTS missing=$DEFECTS_NONE" st_def "$repo/record.md" "$repo/ROADMAP.md"
+}
+
+st_def_outside_git() {
+    local dir
+    dir="$(mktemp -d "$ST_TMP/norepo.XXXXXX")"
+    printf '# Roadmap\n\n### Phase 999.67: New defect (BACKLOG)\n' >"$dir/ROADMAP.md"
+    printf 'No non-blocking defect found. 999.67\n' >"$dir/record.md"
+    expect 1 'DEFECTS verdict=fail' st_def "$dir/record.md" "$dir/ROADMAP.md" &&
+        expect_re 1 'DEFECTS git=FAILED rc=[0-9]+' st_def "$dir/record.md" "$dir/ROADMAP.md"
+}
+
 run_selftest() {
     ST_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$ST_TMP"' EXIT
@@ -1342,6 +1722,22 @@ run_selftest() {
     st_case 'published fails without a passing fault verdict' st_pub_no_fault_pass
     st_case 'published fails without a shipped or cap_reached verdict' st_pub_no_shipped
     st_case 'published fails without an attempt directory' st_pub_no_attempt_dir
+    st_case 'live run passes a complete record' st_lr_pass
+    st_case 'live run fails a missing fragment' st_lr_missing_fragment
+    st_case 'live run fails a missing criterion row' st_lr_missing_row
+    st_case 'live run fails an absent file' st_lr_absent
+    st_case 'handoff passes a complete section' st_ho_pass
+    st_case 'handoff passes on the check line of the 50-20 plan' st_ho_real_plan
+    st_case 'handoff fails an altered check line' st_ho_altered
+    st_case 'handoff fails a missing handoff fragment' st_ho_missing_fragment
+    st_case 'handoff fails a plan without the check line' st_ho_plan_without
+    st_case 'handoff fails a plan holding the check line twice' st_ho_plan_twice
+    st_case 'handoff fails an absent live run file' st_ho_absent
+    st_case 'defects passes a new backlog id referenced from the record' st_def_pass_referenced
+    st_case 'defects fails a new backlog id missing from the record' st_def_fail_unreferenced
+    st_case 'defects passes no new id with the no-defect statement' st_def_pass_none
+    st_case 'defects fails no new id without the statement' st_def_fail_no_statement
+    st_case 'defects fails outside a git repository' st_def_outside_git
 
     echo "SELFTEST passed=$ST_PASS failed=$ST_FAIL"
     [ "$ST_FAIL" -eq 0 ] && [ "$ST_PASS" -gt 0 ]
@@ -1438,6 +1834,28 @@ main() {
         --published)
             [ "$#" -eq 2 ] || usage
             published_check "$2"
+            ;;
+        --live-run)
+            [ "$#" -eq 2 ] || usage
+            live_run_check "$2"
+            ;;
+        --handoff | --defects)
+            local mode="$1" file="" other=""
+            shift
+            while [ "$#" -gt 0 ]; do
+                case "$mode $1" in
+                    "--handoff --plan" | "--defects --roadmap") [ "$#" -ge 2 ] || usage; other="$2"; shift ;;
+                    *" -"*) usage ;;
+                    *) [ -z "$file" ] || usage; file="$1" ;;
+                esac
+                shift
+            done
+            [ -n "$file" ] && [ -n "$other" ] || usage
+            if [ "$mode" = --handoff ]; then
+                handoff_check "$file" "$other"
+            else
+                defects_check "$file" "$other"
+            fi
             ;;
         *) usage ;;
     esac
