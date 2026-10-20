@@ -1111,6 +1111,40 @@ on a planted wrong input; the shell versions are deleted, with their callers upd
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.162: Adopt wsx for Repo Operations (BACKLOG)
+
+**Found:** 2026-10-20, operator decision while planning wsx milestone 1 (`~/Github/wsx`,
+`.planning/REQUIREMENTS.md` boundary section; `.planning/research/DEVFLOW-SETUP.md` "Overlap to retire").
+wsx manages the repo (workspace branch, sync, worktrees, PR cuts, divergence check, guards and hooks); devflow
+manages agents and GSD. devflow uses wsx for repo operations rather than reimplementing them, and neither tool
+implements what the other owns.
+
+**Gated on:** wsx milestone 1 shipping, then the wsx repo cutting over to it. Do not start before both.
+
+**Order (fixed; never steps 1 and 2 in parallel):**
+1. Repo tooling cutover: wsx replaces `scripts/cut-pr-branch.sh`, `sync-workspace.sh`, `phase-worktree.sh`,
+   `check-workspace-divergence.sh` and the personal-path policy in `scripts/hooks/pre-push`/`pre-commit`, with
+   `.workspace-divergence` migrated by `wsx migrate`. Retires 999.146.
+2. devflow's Rust code calls wsx through `--json` and its stable exit codes, one item at a time, each behind
+   devflow's existing tests:
+   - `devflow start` worktree creation → `wsx new <branch>` (also covers 999.28's `--base`)
+   - Ship's `merge --no-ff` into the base branch → `wsx land <branch>`
+   - `devflow cleanup` and recovery-ref deletion (999.43) → `wsx rm <branch>`
+   - `devflow.toml` `base_branch` and 999.110's base-branch checks → `wsx status --json`
+
+**Stays in devflow:** agent sessions, gates, Ship approval, versions and tags, STATE.md and plan lints, the
+off-worktree guard, GSD config checks, `release --check` signing probes. devflow passes branch names and the
+phase scope to wsx; wsx reads no GSD files.
+
+**Done when:** none of the replaced scripts or hook policies remain, each converted Rust path has a test that
+fails when wsx returns an error exit code, and devflow's suite passes with wsx on PATH.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
