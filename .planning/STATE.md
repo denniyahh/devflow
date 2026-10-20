@@ -4,18 +4,18 @@ milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: 50
 current_phase_name: Addressable Monitor Liveness
-current_plan: 25
+current_plan: 20
 status: executing
 stopped_at: Phase 50 planned (25 plans, 17 waves)
 last_updated: "2026-10-17T11:13:45.809Z"
 last_activity: 2026-10-20
-last_activity_desc: Phase 50 wave 15 complete (50-19 live attempt 1 shipped); next is 50-25
+last_activity_desc: Phase 50 wave 16 complete (50-25 evidence judges); next is 50-20
 state_head: d69c268aa09c5973d4fb9e8c9b0a7f078962a54e
 progress:
   total_phases: 7
   completed_phases: 4
   total_plans: 73
-  completed_plans: 71
+  completed_plans: 72
   percent: 57
 ---
 
@@ -196,9 +196,9 @@ change earns 2.0.
 
 Phase: 50 (Addressable Monitor Liveness) — EXECUTING
 Plans: 25 (50-01…50-25, 17 waves; 50-19 is the one live-attempt checkpoint) — executing via `/gsd-execute-phase 50` from `.worktrees/phase-50`
-Current Plan: 25 (wave 16: 50-25 — evidence-checker modes)
+Current Plan: 20 (wave 17: 50-20 — publish evidence, LIVE-RUN verdict, backlog disposition)
 Total Plans in Phase: 25
-Completed Plans: 23 of 25
+Completed Plans: 24 of 25
 Status: Executing Phase 50
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
@@ -209,7 +209,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-10-20 — Phase 50 wave 15 complete (50-19: live attempt 1 shipped on binary 9b0ec70c, fault-5 pass on the same binary; attempt gate verdict=shipped; throwaway repo denniyahh/p50-live-attempt-1 kept until Phase 50 verifies)
+Last activity: 2026-10-20 — Phase 50 wave 16 complete (50-25: --published, --live-run, --handoff, --defects judges; selftest 55/55, fault-arm selftest 6/6); wave 15 closed 50-19 with live attempt 1 shipped (attempt gate verdict=shipped, fault-5)
 
 Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
