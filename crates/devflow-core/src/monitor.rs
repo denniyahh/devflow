@@ -6489,4 +6489,395 @@ exit 0
             "the read and the hold only after the test-module cut"
         );
     }
+
+    /// The process a fake agent left holding its stdout, as the agent itself
+    /// recorded it while the holder was still its unreaped child
+    /// (DeepSeek-3): `<pid> <start>`, where `<start>` is `/proc/<pid>/stat`
+    /// field 22 (set at fork, unchanged by `exec`). Dropped, it SIGKILLs the
+    /// holder by that recorded pid only, and only while it is still that
+    /// process; never by a name pattern.
+    struct HeldStdout {
+        pid: u32,
+        start: u64,
+    }
+
+    impl HeldStdout {
+        /// Wait up to 10 s for the agent's holder record at `record`, and
+        /// require that it names a live process.
+        fn take(record: &Path) -> Self {
+            if !stage_wait_until(Duration::from_secs(10), || record.exists()) {
+                panic!(
+                    "FIXTURE: the agent wrote no holder record at {} within 10 s",
+                    record.display()
+                );
+            }
+            let text = std::fs::read_to_string(record)
+                .unwrap_or_else(|err| panic!("FIXTURE: read {}: {err}", record.display()));
+            let fields: Vec<&str> = text.split_whitespace().collect();
+            let parsed = match fields.as_slice() {
+                [pid, start] => pid.parse::<u32>().ok().zip(start.parse::<u64>().ok()),
+                _ => None,
+            };
+            let Some((pid, start)) = parsed else {
+                panic!("FIXTURE: the holder record is not `<pid> <start>`: {text:?}");
+            };
+            if pid <= 1 || crate::agent::process_start_time(pid) != Some(start) {
+                panic!("FIXTURE: the holder record {text:?} names no live process");
+            }
+            Self { pid, start }
+        }
+
+        /// Whether the recorded holder is still that process, against the
+        /// start time recorded before the supervisor could return.
+        fn is_alive(&self) -> bool {
+            crate::agent::is_same_process(self.pid, self.start)
+        }
+    }
+
+    impl Drop for HeldStdout {
+        fn drop(&mut self) {
+            let Ok(pid) = libc::pid_t::try_from(self.pid) else {
+                return;
+            };
+            if pid > 1 && self.is_alive() {
+                // SAFETY: `pid > 1` is the holder this test's agent recorded,
+                // confirmed by its start time to still be that process.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// The shell lines a fake agent runs right after starting its holder as
+    /// a background job: record `<pid> <start>` while the holder is still
+    /// its unreaped child, through a temp file and `mv`.
+    fn record_holder(record: &Path) -> String {
+        format!(
+            "holder=$!\n\
+             echo \"$holder $(cut -d' ' -f22 /proc/$holder/stat)\" > '{record}.tmp'\n\
+             mv '{record}.tmp' '{record}'\n",
+            record = record.display()
+        )
+    }
+
+    /// Every `stream_wait_bounded` event for `phase` in `root`'s event log,
+    /// each as its JSON object. Fields are indexed on the map, so a missing
+    /// one panics instead of reading as a default. No log is zero events.
+    fn stream_wait_events(
+        root: &Path,
+        phase: PhaseId,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let path = crate::events::events_path(root);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(err) => panic!("read {}: {err}", path.display()),
+        };
+        let phase = serde_json::json!(phase);
+        text.lines()
+            .map(
+                |line| match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(serde_json::Value::Object(map)) => map,
+                    other => panic!("an event line is not a JSON object: {line:?} ({other:?})"),
+                },
+            )
+            .filter(|map| map["event"] == "stream_wait_bounded" && map["phase"] == phase)
+            .collect()
+    }
+
+    /// Require exactly one `stream_wait_bounded` event for `phase`, naming
+    /// only the reader as unfinished, with the capture closed.
+    fn assert_one_reader_bound(root: &Path, phase: PhaseId, context: &str) {
+        let events = stream_wait_events(root, phase);
+        assert!(
+            events.len() == 1,
+            "WR-03: {context}: expected exactly one stream_wait_bounded event, found {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(
+            event["unfinished"],
+            serde_json::json!(["reader"]),
+            "{context}: {event:?}"
+        );
+        assert_eq!(
+            event["capture_closed"],
+            serde_json::json!(true),
+            "{context}: {event:?}"
+        );
+    }
+
+    /// A fake Claude stream agent: it reads its first turn, prints
+    /// [`RESULT_WITH_MARKER`], starts `holder` as a background job (it
+    /// inherits the agent's stdout unless `holder` redirects it, and stays
+    /// in the agent's group), records it at `record`, waits for `go` and
+    /// exits 0.
+    fn holder_agent(fixture: &StageFixture, holder: &str, record: &Path, go: &Path) -> PathBuf {
+        fixture.agent(
+            "claude",
+            &format!(
+                "{preamble}printf '%s\\n' '{RESULT_WITH_MARKER}'\n\
+                 {holder} &\n\
+                 {record_lines}\
+                 while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+                 exit 0",
+                preamble = Shape::Stream.preamble(),
+                record_lines = record_holder(record),
+                go = go.display(),
+            ),
+        )
+    }
+
+    /// A and B: a supervised Claude stream stage (production 120 s idle
+    /// timeout) whose agent leaves `holder` running, then exits 0. The
+    /// supervisor must exit within 20 s of the agent's exit and record a
+    /// normal completion; `stdout_held` says whether exactly one
+    /// `stream_wait_bounded` event or none is expected.
+    fn completed_run_with_a_leftover(test_name: &str, holder: &str, stdout_held: bool) {
+        let fixture = StageFixture::new();
+        let go = fixture.path("go");
+        let record = fixture.path("holder");
+        let program = holder_agent(&fixture, holder, &record, &go);
+        let mut run = launch_stage_with(
+            test_name,
+            &fixture,
+            StageLaunchArgs {
+                shape: Shape::Stream,
+                agent: AgentKind::Claude,
+                program: &program,
+                adapter_env: "",
+                args: &[],
+                extra_env: &[],
+            },
+        );
+        let held = HeldStdout::take(&record);
+        std::fs::write(&go, "").expect("let the agent exit");
+        if !stage_wait_until(Duration::from_secs(20), || run.child.try_exited()) {
+            panic!(
+                "WR-03: the supervisor still runs 20 s after its agent was released to exit; \
+                 holder {} alive: {}; socket: {:?}",
+                held.pid,
+                held.is_alive(),
+                crate::supervisor::probe(run.socket.as_path())
+            );
+        }
+        let outcome = run.finish(test_name);
+        assert_eq!(
+            outcome,
+            "Completed(0) advancing",
+            "stderr: {:?}",
+            fixture.stderr()
+        );
+        let stdout = fixture.stdout();
+        assert!(
+            stdout.lines().any(|line| line == RESULT_WITH_MARKER),
+            "the capture holds the result line: {stdout:?}"
+        );
+        assert_eq!(fixture.exit_code(), "0");
+        assert!(
+            !crate::agent_result::idle_timeout_path(&fixture.root, STAGE_PHASE).exists(),
+            "no idle-timeout verdict for a completed run"
+        );
+        assert_eq!(run.liveness(), crate::supervisor::Liveness::Gone);
+        assert!(
+            held.is_alive(),
+            "the holder still runs: the supervisor's wait ended, not the holder"
+        );
+        if stdout_held {
+            assert_one_reader_bound(&fixture.root, STAGE_PHASE, test_name);
+        } else {
+            let events = stream_wait_events(&fixture.root, STAGE_PHASE);
+            assert!(
+                events.is_empty(),
+                "a released stdout is not a bounded wait: {events:?}"
+            );
+        }
+        drop(run.group);
+    }
+
+    const HELD_STDOUT_TEST: &str = "monitor::tests::a_completed_stream_run_returns_while_a_leftover_process_holds_the_agents_stdout";
+
+    /// A (fail-first): a completed stream run whose agent left `sleep 300`
+    /// holding its stdout returns at the agent's exit, under the production
+    /// 120 s idle timeout. Before the fix the supervisor waited 120 s of
+    /// silence in `drive_stream_io` and then forever in the thread join.
+    #[test]
+    fn a_completed_stream_run_returns_while_a_leftover_process_holds_the_agents_stdout() {
+        if crate::test_support::in_child_test(HELD_STDOUT_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        completed_run_with_a_leftover(HELD_STDOUT_TEST, "sleep 300", true);
+    }
+
+    const RELEASED_STDOUT_TEST: &str = "monitor::tests::a_completed_stream_run_returns_once_its_leftover_process_released_the_agents_stdout";
+
+    /// B (control, the verifier's `/dev/null` control): the same run with a
+    /// holder on `/dev/null` returns normally on the unfixed and the fixed
+    /// code, and records no bounded wait.
+    #[test]
+    fn a_completed_stream_run_returns_once_its_leftover_process_released_the_agents_stdout() {
+        if crate::test_support::in_child_test(RELEASED_STDOUT_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        completed_run_with_a_leftover(
+            RELEASED_STDOUT_TEST,
+            "sleep 300 </dev/null >/dev/null 2>&1",
+            false,
+        );
+    }
+
+    /// Run [`supervise_stream_child`] for a Claude `sh -c <script>` (120 s
+    /// idle timeout) on its own thread, so a supervisor that never returns
+    /// fails the test instead of hanging it.
+    fn supervise_stream_on_thread(
+        root: &Path,
+        script: String,
+    ) -> mpsc::Receiver<Result<i32, String>> {
+        let (sender, receiver) = mpsc::channel();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let result = supervise_stream_child(
+                &root,
+                STAGE_PHASE,
+                &root,
+                STAGE_PROMPT,
+                Duration::from_secs(120),
+                "sh",
+                &["-c".to_string(), script],
+                &[],
+                AgentKind::Claude,
+            );
+            let _ = sender.send(result.map_err(|err| err.to_string()));
+        });
+        receiver
+    }
+
+    /// The line C's holder writes 20 s after the agent exited.
+    const LATE_HOLDER_LINE: &str = "LATE-HOLDER-LINE";
+
+    /// C (fail-first): a line a leftover writes after the bound never
+    /// reaches the capture, although the detached reader is still alive in
+    /// this process when it arrives: only the taken capture handle keeps it
+    /// out.
+    #[test]
+    fn no_line_reaches_the_capture_after_the_stdout_wait_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let record = root.join("holder");
+        let script = format!(
+            "PATH=/usr/bin:/bin\n\
+             IFS= read -r _turn || exit 91\n\
+             printf '%s\\n' '{RESULT_WITH_MARKER}'\n\
+             ( sleep 20; echo {LATE_HOLDER_LINE} ) &\n\
+             {record_lines}exit 0\n",
+            record_lines = record_holder(&record)
+        );
+        let started = std::time::Instant::now();
+        let result = supervise_stream_on_thread(root, script);
+        let held = HeldStdout::take(&record);
+        let returned = result.recv_timeout(Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        if !(matches!(returned, Ok(Ok(0))) && elapsed <= Duration::from_secs(10)) {
+            panic!(
+                "WR-03: the stream supervisor did not return 0 within 10 s while a leftover \
+                 held its agent's stdout: {returned:?} after {elapsed:?}"
+            );
+        }
+        assert!(
+            held.is_alive(),
+            "the holder still runs when the supervisor returns (the control for the cause)"
+        );
+        if !stage_wait_until(Duration::from_secs(30), || !held.is_alive()) {
+            panic!(
+                "FIXTURE: the holder {} did not exit after its 20 s sleep",
+                held.pid
+            );
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, STAGE_PHASE)).unwrap();
+        assert!(
+            capture.lines().any(|line| line == RESULT_WITH_MARKER),
+            "the capture holds the result line: {capture:?}"
+        );
+        assert!(
+            !capture.contains(LATE_HOLDER_LINE),
+            "WR-03: a line the leftover wrote after the bound reached the capture: {capture:?}"
+        );
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, STAGE_PHASE).exists(),
+            "no idle-timeout verdict for a completed run"
+        );
+        let events = stream_wait_events(root, STAGE_PHASE);
+        assert!(
+            events.len() == 1,
+            "WR-03: expected exactly one stream_wait_bounded event, found {events:?}"
+        );
+    }
+
+    /// The line F's leftover writes every 0.2 s.
+    const NOISE_LINE: &str = "NOISE-LINE";
+
+    /// F (fail-first): a leftover that keeps writing to the agent's stdout
+    /// after the agent exited no longer keeps the supervisor from returning
+    /// (before the fix every line restarted the idle wait), and it is not
+    /// killed by SIGPIPE afterwards: the read end stays open and drained,
+    /// and nothing more reaches the capture.
+    #[test]
+    fn a_stream_run_returns_while_a_leftover_process_keeps_writing_to_the_agents_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let record = root.join("holder");
+        let script = format!(
+            "PATH=/usr/bin:/bin\n\
+             IFS= read -r _turn || exit 91\n\
+             printf '%s\\n' '{RESULT_WITH_MARKER}'\n\
+             ( i=0; while [ $i -lt 1500 ]; do echo {NOISE_LINE}; sleep 0.2; i=$((i+1)); done ) &\n\
+             {record_lines}exit 0\n",
+            record_lines = record_holder(&record)
+        );
+        let started = std::time::Instant::now();
+        let result = supervise_stream_on_thread(root, script);
+        let held = HeldStdout::take(&record);
+        let returned =
+            result.recv_timeout(Duration::from_secs(20).saturating_sub(started.elapsed()));
+        let elapsed = started.elapsed();
+        if !(matches!(returned, Ok(Ok(0))) && elapsed <= Duration::from_secs(10)) {
+            // SIGKILL the writer by its recorded pid, which unblocks the
+            // reader, before failing.
+            drop(held);
+            panic!(
+                "WR-03: the stream supervisor did not return 0 within 10 s while a leftover \
+                 kept writing to its agent's stdout: {returned:?} after {elapsed:?}"
+            );
+        }
+        assert!(
+            held.is_alive(),
+            "the writer still runs when the supervisor returns"
+        );
+        let capture_path = crate::agent_result::stdout_path(root, STAGE_PHASE);
+        let size = || {
+            std::fs::metadata(&capture_path)
+                .map(|meta| meta.len())
+                .expect("stat the capture")
+        };
+        let before = size();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            held.is_alive(),
+            "WR-03: the writer died within 1.5 s of the bound (SIGPIPE: the read end closed)"
+        );
+        assert!(
+            size() == before,
+            "WR-03: the capture grew after the bound ({before} bytes before)"
+        );
+        let capture = std::fs::read_to_string(&capture_path).unwrap();
+        assert!(
+            capture.lines().any(|line| line == RESULT_WITH_MARKER),
+            "the capture holds the result line: {capture:?}"
+        );
+        assert_one_reader_bound(root, STAGE_PHASE, "F");
+    }
 }
