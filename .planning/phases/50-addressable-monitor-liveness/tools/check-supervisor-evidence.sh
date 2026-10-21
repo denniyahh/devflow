@@ -1261,6 +1261,58 @@ st_gate_cap() {
     expect 0 'ATTEMPT_GATE verdict=cap_reached stopped_attempts=3' st_gate "$home"
 }
 
+# --attempt-gate --current-source against scratch checkout <repo>.
+st_gate_cs() {
+    st_git_env bash "$SELF" --attempt-gate "$1" --p49-check "$ST_TMP/p49-pass.sh" --current-source --repo "$2"
+}
+
+# A shipped attempt 1 under a fresh home whose fault-1 records <repo>'s HEAD
+# crate tree; prints the home.
+st_gate_cs_home() {
+    local repo="$1" home
+    home="$(mktemp -d "$ST_TMP/p50.XXXXXX")"
+    st_gate_attempt "$home" 1 shipped
+    st_fc_dir "$home" fault-1 "$repo" true
+    printf '%s\n' "$home"
+}
+
+st_gate_cs_ships() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(st_gate_cs_home "$repo")"
+    expect 0 'ATTEMPT_GATE current_source=yes' st_gate_cs "$home" "$repo" &&
+        expect 0 'ATTEMPT_GATE verdict=shipped attempt=1' st_gate_cs "$home" "$repo" &&
+        expect 0 "ATTEMPT_GATE fault=fault-1 bin_sha256=$ST_SHA" st_gate_cs "$home" "$repo"
+}
+
+st_gate_cs_other_source() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(st_gate_cs_home "$repo")"
+    cp -- "$repo/.git/old-ids" "$home/fault-1/src_tree"
+    # Control: the older ids really differ from HEAD's, so the refusal below
+    # is the source check's, not a fixture that planted HEAD again.
+    if cmp -s "$home/fault-1/src_tree" <(st_git -C "$repo" rev-parse HEAD:crates HEAD:Cargo.toml HEAD:Cargo.lock HEAD:rust-toolchain.toml); then
+        echo "fixture broken: the older commit's ids equal HEAD's"
+        return 1
+    fi
+    expect 1 "ATTEMPT_GATE verdict=not_ready attempt=1 reason=no passing fault arm on attempt 1's binary from the current crate source" \
+        st_gate_cs "$home" "$repo" || return 1
+    expect_absent 'ATTEMPT_GATE current_source=yes' st_gate_cs "$home" "$repo" || return 1
+    # Control: without the flag the same home ships, so the flag is what refuses.
+    expect 0 'ATTEMPT_GATE verdict=shipped attempt=1' st_gate "$home"
+}
+
+st_gate_cs_uncommitted() {
+    local repo home
+    repo="$(st_src_repo)"
+    home="$(st_gate_cs_home "$repo")"
+    # Control: the same home ships while the crate tree is clean.
+    expect 0 'ATTEMPT_GATE verdict=shipped attempt=1' st_gate_cs "$home" "$repo" || return 1
+    st_dirty "$repo"
+    expect_re 1 'ATTEMPT_GATE verdict=not_ready attempt=1 reason=uncommitted crate source.*' st_gate_cs "$home" "$repo"
+}
+
 # --- fault-current fixtures -------------------------------------------------
 
 # Fault dir <home>/<name>: the full case set, src_tree = <repo>'s HEAD ids,
@@ -1708,6 +1760,9 @@ run_selftest() {
     st_case 'fault pointer without its fixture fails' st_pointer_no_fixture
     st_case 'fault require-all fails a partial directory' st_require_all_partial
     st_case 'attempt gate refuses a partial fault directory' st_gate_partial
+    st_case 'attempt gate with current source ships when the paired fault directory records the checkout crate tree' st_gate_cs_ships
+    st_case 'attempt gate with current source refuses a paired fault directory from other crate source' st_gate_cs_other_source
+    st_case 'attempt gate with current source refuses an uncommitted crate change' st_gate_cs_uncommitted
     st_case 'fault current picks the current-source directory over a newer other-source one' st_fc_picks_current
     st_case 'fault current fails with only other-source directories' st_fc_only_other
     st_case 'fault current judges only the newest current-source directory' st_fc_newest_only
