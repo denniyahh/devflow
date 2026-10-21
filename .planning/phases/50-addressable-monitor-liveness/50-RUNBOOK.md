@@ -13,9 +13,13 @@ Claude stages, capture for the resume.
 Before launch, the same pinned binary runs the fault arm (D-17, R-10): fake agents, no GitHub repository, a private
 cache, five live fault cases and one fixture pointer. The fault arm does not count against the attempt cap.
 
-Run every step from a plain Bash terminal outside every agent session. While the run is live, perform no manual git
-operation against its project tree. Capture, do not narrate: the tools keep the original outputs. A stall or failure
-is a result; preserve each attempt's record and never replace it with a retry.
+Attempt 1 ran every step from a plain Bash terminal outside every agent session.
+For attempt 2 the orchestrating Claude session issues these steps under the operator's 2026-10-21 delegation (see
+"D-18 rules"). It issues them from its main session and never from a subagent, a planner adaptation listed beside the
+ruling in "D-18 rules". The run itself is owned by the `p49-a<N>-*` systemd user units, not by any agent session, and
+the session waits with bounded polls (`"$BIN" status`, `"$BIN" gate list`, `tail` of `events.jsonl`). While the run is
+live, perform no manual git operation against its project tree. Capture, do not narrate: the tools keep the original
+outputs. A stall or failure is a result; preserve each attempt's record and never replace it with a retry.
 
 The live run uses the operator's real DevFlow cache (`~/.cache/devflow`), as production does: its supervisor sockets
 live under `~/.cache/devflow/sock/`. Only the fault arm uses a private cache.
@@ -24,15 +28,30 @@ live under `~/.cache/devflow/sock/`. Only the fault arm uses a private cache.
 
 - Full attempts are capped at 3. Only an attempt that ends without reaching Ship counts against the cap (49 D-11).
   The fault arm never counts.
-- Each attempt is one `checkpoint:human-action` (50-19), judged afterwards by `check-supervisor-evidence.sh
-  --attempt-gate` (49 D-18). Only `verdict=shipped` or `verdict=cap_reached` closes it.
+- Each attempt is one `checkpoint:human-action` (50-19 for attempt 1, 50-28 for attempt 2), judged afterwards by
+  `check-supervisor-evidence.sh --attempt-gate` (49 D-18), with `--current-source` from attempt 2. Only
+  `verdict=shipped` or `verdict=cap_reached` closes it.
 - A blocking defect is fixed in-phase and the attempt is repeated on a rebuilt binary. A non-blocking defect goes to
   the backlog as a ROADMAP.md `999.x` entry (49 D-10).
 - Every attempt rebuilds the binary and records its identity (`prepare` writes `attempt.json` and `identity.txt`);
   the fault arm runs on that pinned binary, never on another build.
 - Evidence enters the repository only through `sanitize-evidence.py` (49 D-26).
-- The throwaway GitHub repository is created and deleted by the operator only, and deleted only after Phase 50
-  verification.
+- The throwaway GitHub repository is created by the operator, or for attempt 2 by the orchestrating session under the
+  2026-10-21 delegation, which tells the operator before creating it. Only the operator deletes it, and only after
+  Phase 50 verification.
+- Operator ruling 2026-10-21: because CR-01 and WR-03 were fixed after live attempt 1, attempt 2 runs on the fixed
+  binary before Phase 50 verifies. The operator delegated running attempt 2 to the orchestrating Claude session
+  ("Yes, but you do the run"): preparing and pinning the binary, the fault arm, creating and pushing the private
+  repository `denniyahh/p50-live-attempt-2` after telling the operator, launching, answering the Define and Code gates
+  as section 5 says, collecting and judging. Deleting the repository stays with the operator, after verification. Any
+  attempt after attempt 2 goes back to the operator.
+- Planner adaptations (not operator decisions): the operator did not rule on these; the planner added them to keep the
+  delegation safe, and they stay in force. The session acts from its main session and never from a subagent, because
+  the run is owned by the `p49-a<N>-*` systemd user units but a subagent's turn would end while the attempt is still
+  live, leaving its gates unanswered and its polls orphaned. A deviation from this runbook, an unexpected gate (any gate
+  but Define and Code) and a credential, auth or scope problem go back to the operator, because the delegation covers
+  running this runbook as written, not deciding a departure from it, and `gh auth refresh -s repo` needs the
+  operator's browser.
 - Work stays within GSD's confines (49 D-19): no hand-made SUMMARY, no edited state.
 
 ## Before every attempt
@@ -91,9 +110,10 @@ and run the fault arm again with a new `M`. Never edit a fault record. `--attemp
 fault directory that passes `--fault --require-all` records this attempt's `bin_sha256`, so skipping this step makes
 the attempt unjudgeable, not faster.
 
-## 3. Create and push the throwaway repository (operator only)
+## 3. Create and push the throwaway repository (operator, or the orchestrating session under the 2026-10-21 delegation)
 
-These commands create external GitHub state; run them yourself after checking the account reported above.
+These commands create external GitHub state. Run them after checking the account reported above: the operator, or for
+attempt 2 the orchestrating session, which tells the operator before creating the repository.
 
 ```bash
 ACCOUNT=$(gh api user --jq .login)
@@ -164,7 +184,12 @@ bash "$T49/collect-attempt.sh" --attempt "$N" --home "$P50"
 bash "$T50/check-supervisor-evidence.sh" collect-sidecars "$EV" --project "$EV/project" --bin "$BIN"
 bash "$T50/check-supervisor-evidence.sh" --attempt "$EV"
 bash "$T50/check-supervisor-evidence.sh" --attempt-gate "$P50"
+bash "$T50/check-supervisor-evidence.sh" --attempt-gate "$P50" --current-source
 ```
+
+The `--current-source` form closes the checkpoint for an attempt after a crate fix: it refuses an attempt whose paired
+fault record was not taken from this checkout's committed crate tree, such as a binary built before the fix
+(`reason=… from the current crate source`).
 
 For an intentionally aborted stopped run, pass the actual reason to the collector:
 `--stop-note "aborted: describe the observed failure"`.
@@ -181,9 +206,11 @@ archive-and-recollect procedure (with `--home "$P50"`); never rewrite collected 
 
 ## 8. Close the checkpoint or stop the attempt
 
-Reply `done` to the 50-19 checkpoint only after `--attempt-gate` printed `verdict=shipped` or `verdict=cap_reached`.
-On `verdict=not_ready`, do not reply. If the attempt stopped below the cap, record it with `--stop-note`, end the
-execute-phase session, confirm the fix vehicle, fix, and resume with `/gsd-execute-phase 50` for the next attempt.
+For attempt 1 this was the 50-19 checkpoint, closed on the plain `--attempt-gate`. From attempt 2, reply `done`
+to the 50-28 checkpoint only after `--attempt-gate "$P50" --current-source` printed `verdict=shipped` or
+`verdict=cap_reached`. On `verdict=not_ready`, do not reply. If the attempt stopped below the cap, record it with
+`--stop-note`, end the execute-phase session, confirm the fix vehicle, fix, and resume with `/gsd-execute-phase 50` for
+the next attempt.
 
 ## If a gate you did not expect opens
 
@@ -226,8 +253,9 @@ the fault arm on the binary that `prepare` pinned.
 ## Publishing the evidence
 
 Evidence enters the repository only through `"$T49/sanitize-evidence.py"` (`sanitize <src> <dest>`, then `scan
-<dest>`), after verification. 50-20 owns what is published, where, and the publish check
-(`check-supervisor-evidence.sh --published`, added by 50-25).
+<dest>`), after verification. 50-20 owned attempt 1's publication and the publish check
+(`check-supervisor-evidence.sh --published`, added by 50-25); 50-29 owns attempt 2's, with `--identity-scan` and
+`--published --attempt <N>`.
 
 ## Cleanup (operator only, after Phase 50 verification)
 
