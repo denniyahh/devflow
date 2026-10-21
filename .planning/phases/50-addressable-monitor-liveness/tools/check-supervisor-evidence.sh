@@ -16,7 +16,7 @@
 #                                [--current-source [--repo <checkout>]]
 #   check-supervisor-evidence.sh --published <dir> [--attempt <N>]
 #   check-supervisor-evidence.sh --identity-scan <dir> [--tokens <file> | --repo <checkout>]
-#   check-supervisor-evidence.sh --live-run <50-LIVE-RUN.md>
+#   check-supervisor-evidence.sh --live-run <50-LIVE-RUN.md> [--attempt <N>]
 #   check-supervisor-evidence.sh --handoff <50-LIVE-RUN.md> --plan <50-20-PLAN.md>
 #   check-supervisor-evidence.sh --defects <50-LIVE-RUN.md> --roadmap <ROADMAP.md>
 #   check-supervisor-evidence.sh --selftest
@@ -129,6 +129,11 @@
 # `verdict=`, `stream`, `capture`, `unverified on macOS`, `V-28`, `V-29`,
 # `bin_sha256` and, for each criterion N in 1-8, a line matching
 # `^\| *(criterion )?N *\|`. Prints `LIVE_RUN verdict=pass|fail`.
+#
+# --live-run <file> --attempt <N> (50-29, T-50-109) also requires a line
+# containing `ATTEMPT_GATE verdict=shipped attempt=<N>` (N ending at a
+# non-digit) or `ATTEMPT_GATE verdict=cap_reached`; otherwise it prints
+# `LIVE_RUN missing=attempt-<N>-verdict`. Without --attempt nothing changes.
 #
 # --handoff (50-25, R6-D) passes when <plan> holds exactly one line matching
 # `^    bash -c .R=.*changelog_3_0_0_lines=.*$`, the record holds that line
@@ -964,7 +969,7 @@ judge_verdict() {
 }
 
 live_run_check() {
-    local file="$1" bad=0 frag n rc
+    local file="$1" number="${2:-}" bad=0 frag n rc
     if [ ! -f "$file" ]; then
         echo "LIVE_RUN file=ABSENT $file"
         echo "LIVE_RUN verdict=fail"
@@ -980,6 +985,14 @@ live_run_check() {
         rg --no-config -q -e "^\| *(criterion )?$n *\|" -- "$file" || rc=$?
         judge_found LIVE_RUN "$rc" "criterion-row-$n" || bad=1
     done
+    # --attempt <N> (50-29): attempt N's own gate verdict is quoted; attempt=<N>
+    # ends at a non-digit, so attempt=20 does not stand in for attempt=2.
+    if [ -n "$number" ]; then
+        rc=0
+        rg --no-config -q -e "ATTEMPT_GATE verdict=shipped attempt=$number([^0-9]|\$)" \
+            -e 'ATTEMPT_GATE verdict=cap_reached' -- "$file" || rc=$?
+        judge_found LIVE_RUN "$rc" "attempt-$number-verdict" || bad=1
+    fi
     judge_verdict LIVE_RUN "$bad"
 }
 
@@ -1834,6 +1847,26 @@ st_lr_absent() {
         expect 1 "LIVE_RUN file=ABSENT $file" bash "$SELF" --live-run "$file"
 }
 
+# --live-run --attempt cases (50-29, T-50-109). The complete record quoting
+# attempt 2's gate verdict passes `--attempt 2`; quoting only attempt 1's (or
+# attempt 20's, which must not stand in for 2) fails it.
+st_lr_attempt_pass() {
+    local file
+    file="$(st_lr_record)"
+    printf '%s\n' 'Quoted: ATTEMPT_GATE verdict=shipped attempt=2' >>"$file"
+    expect 0 'LIVE_RUN verdict=pass' bash "$SELF" --live-run "$file" --attempt 2
+}
+
+st_lr_attempt_earlier() {
+    local file
+    file="$(st_lr_record)"
+    printf '%s\n' 'Quoted: ATTEMPT_GATE verdict=shipped attempt=1' \
+        'Quoted: ATTEMPT_GATE verdict=shipped attempt=20' >>"$file"
+    expect 0 'LIVE_RUN verdict=pass' bash "$SELF" --live-run "$file" &&
+        expect 1 'LIVE_RUN verdict=fail' bash "$SELF" --live-run "$file" --attempt 2 &&
+        expect 1 'LIVE_RUN missing=attempt-2-verdict' bash "$SELF" --live-run "$file" --attempt 2
+}
+
 # --handoff cases (50-25; R6-D). A synthetic plan holding one indented check
 # line, and a record holding that line unindented plus every handoff fragment.
 st_ho_plan() {
@@ -2278,6 +2311,8 @@ run_selftest() {
     st_case 'live run fails a missing fragment' st_lr_missing_fragment
     st_case 'live run fails a missing criterion row' st_lr_missing_row
     st_case 'live run fails an absent file' st_lr_absent
+    st_case 'live run passes a record quoting the attempt gate verdict' st_lr_attempt_pass
+    st_case 'live run fails a record quoting only an earlier attempt verdict' st_lr_attempt_earlier
     st_case 'handoff passes a complete section' st_ho_pass
     st_case 'handoff passes on the check line of the 50-20 plan' st_ho_real_plan
     st_case 'handoff fails an altered check line' st_ho_altered
@@ -2437,8 +2472,14 @@ main() {
             identity_scan "$dir" "$tokens" "$repo"
             ;;
         --live-run)
-            [ "$#" -eq 2 ] || usage
-            live_run_check "$2"
+            # Two arguments keep 50-25's parsing unchanged; 50-29 appends the
+            # `<file> --attempt <N>` form only.
+            if [ "$#" -eq 2 ]; then
+                live_run_check "$2"
+            else
+                [ "$#" -eq 4 ] && [ "$3" = --attempt ] && [[ "$4" =~ ^[1-9][0-9]*$ ]] || usage
+                live_run_check "$2" "$4"
+            fi
             ;;
         --handoff | --defects)
             local mode="$1" file="" other=""
