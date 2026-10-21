@@ -277,7 +277,10 @@ The supervisor (`run_supervised_stage()`):
 3. Answers `ping` and `shutdown` on the socket, and treats SIGTERM and SIGINT
    sent to it as a `shutdown`: the agent's group is ended and no advance runs.
 4. Waits for the agent to exit and records its exit code to
-   `.devflow/phase-NN-exit`.
+   `.devflow/phase-NN-exit`. A stream supervisor stops reading when the agent
+   exits, not when its stdout closes: when a process the agent started still
+   holds that stdout, it waits at most 3 s for its pipe threads, closes the
+   capture file, records a `stream_wait_bounded` event, and signals nothing.
 5. On the agent's natural exit, runs the advance in-process. The phase is
    threaded in at spawn time, so the advance's identity never depends on a
    shared state singleton — under `devflow parallel`, each phase's supervisor
