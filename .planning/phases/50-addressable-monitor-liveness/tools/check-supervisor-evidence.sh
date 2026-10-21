@@ -14,7 +14,8 @@
 #   check-supervisor-evidence.sh --attempt <EV> [--p49-check <script>]
 #   check-supervisor-evidence.sh --attempt-gate <P50 home> [--p49-check <script>]
 #                                [--current-source [--repo <checkout>]]
-#   check-supervisor-evidence.sh --published <dir>
+#   check-supervisor-evidence.sh --published <dir> [--attempt <N>]
+#   check-supervisor-evidence.sh --identity-scan <dir> [--tokens <file> | --repo <checkout>]
 #   check-supervisor-evidence.sh --live-run <50-LIVE-RUN.md>
 #   check-supervisor-evidence.sh --handoff <50-LIVE-RUN.md> --plan <50-20-PLAN.md>
 #   check-supervisor-evidence.sh --defects <50-LIVE-RUN.md> --roadmap <ROADMAP.md>
@@ -86,6 +87,43 @@
 # verdict=shipped` or `cap_reached`, no file naming the value of $HOME (rg
 # -uuu: hidden, ignored and binary files are read; an empty $HOME or an rg
 # error fails) and no symlink. Prints `PUBLISHED verdict=pass|fail`.
+#
+# --published <dir> --attempt <N> (50-29, T-50-109) also requires
+# <dir>/attempt-<N>/ (not a symlink) with a file directly in it holding a line
+# starting `ATTEMPT_GATE verdict=shipped attempt=<N>` or `ATTEMPT_GATE
+# verdict=cap_reached`. For shipped, that same file must hold the exact line
+# `ATTEMPT_GATE current_source=yes` and one `ATTEMPT_GATE fault=<name>
+# bin_sha256=<hex>` line naming a <dir>/<name>/ whose bin_sha256 file equals
+# <hex> and which holds a verdict-*.txt line starting `FAULT verdict=pass`.
+# Prints `PUBLISHED attempt=<N> verdict_line=shipped|cap_reached|ABSENT`,
+# `PUBLISHED attempt_current_source=yes|no|n/a` and `PUBLISHED
+# attempt_fault=<name|ABSENT>` (ABSENT for cap_reached, which pairs no fault
+# directory), then the one verdict line. Without --attempt nothing changes.
+#
+# --identity-scan (50-29, T-50-107) refuses a tree holding any fragment of an
+# email address. Addresses come from <file> (one per line, blank lines
+# ignored; source `file`) or, without --tokens, from the host: the
+# `oauthAccount.emailAddress` of $HOME/.claude.json (source `account`) and
+# every `git -C <checkout> config --get-all user.email` value (source `git`;
+# <checkout> defaults to the one holding this tool). Each address, lowercased,
+# gives the full address (part `address`), the local part and every [a-z0-9]
+# run of 4 or more characters in it (part `local`), and the domain and every
+# such run in each domain label but the last (part `domain`); duplicates keep
+# their first derivation, account before git. Every file under <dir> (hidden,
+# ignored and binary included) is searched for each token with `rg --no-config
+# -uuu -i -F -l`, the token read from a pattern file in a 0700 scratch
+# directory, never from argv; every file and directory name is checked too.
+# It prints `IDENTITY tokens=<n>`, one `IDENTITY hit token=<k>
+# source=<account|git|file> part=<address|local|domain> file=<path relative to
+# dir>` per hit (` in=name` for a name hit, the token masked as `<token-k>`),
+# and `IDENTITY verdict=pass|fail`; it never prints a token's text.
+# Exit codes (R6-G6): 0 when the verdict is pass; 1 for every fail, which
+# covers any hit, zero tokens, an address without exactly one `@` (`IDENTITY
+# malformed_address=<line number>`), a missing host account email (`IDENTITY
+# source=account ABSENT`: no file, no key) and an rg error (`IDENTITY
+# rg_error=<code>`); 2 for a usage error only (a missing or unknown argument,
+# --tokens with --repo, <dir> not a directory). A gate tells a hit from the
+# other failures by the `IDENTITY hit` line, never by the exit code.
 #
 # --live-run (50-25) passes a record holding each of `does not establish`,
 # `verdict=`, `stream`, `capture`, `unverified on macOS`, `V-28`, `V-29`,
@@ -677,12 +715,217 @@ published_check() {
         bad=1
     fi
 
+    if [ -n "${2:-}" ]; then
+        published_attempt "$dir" "$2" || bad=1
+    fi
+
     if [ "$bad" -eq 0 ]; then
         echo "PUBLISHED verdict=pass"
     else
         echo "PUBLISHED verdict=fail"
         return 1
     fi
+}
+
+# --published <dir> --attempt <N> (50-29): attempt-<N>/ is published and a file
+# directly in it holds the attempt's own gate verdict. For shipped, that file
+# also holds `ATTEMPT_GATE current_source=yes` and exactly one `ATTEMPT_GATE
+# fault=<name> bin_sha256=<hex>` line whose <dir>/<name>/ records <hex> and
+# holds a verdict-*.txt line starting `FAULT verdict=pass`. Prints the
+# PUBLISHED attempt lines; no verdict line (published_check prints it).
+published_attempt() {
+    python3 - "$1" "$2" <<'PY'
+import pathlib, re, sys
+
+root, number = pathlib.Path(sys.argv[1]), sys.argv[2]
+attempt = root / f'attempt-{number}'
+shipped_re = re.compile(rf'ATTEMPT_GATE verdict=shipped attempt={number}(\s|$)')
+cap_re = re.compile(r'ATTEMPT_GATE verdict=cap_reached(\s|$)')
+fault_re = re.compile(r'ATTEMPT_GATE fault=(\S+) bin_sha256=([0-9a-f]{64})')
+
+
+def lines_of(path):
+    try:
+        return path.read_text(errors='replace').splitlines()
+    except OSError:
+        return []
+
+
+def judge_fault(lines):
+    """(name or None, problem lines) for one shipped verdict file."""
+    found = [m for m in (fault_re.fullmatch(line) for line in lines) if m]
+    if len(found) != 1:
+        return None, [f'PUBLISHED attempt_fault_lines={len(found)}']
+    name, sha = found[0].group(1), found[0].group(2)
+    if not re.fullmatch(r'fault-[A-Za-z0-9._-]+', name) or name in ('fault-.', 'fault-..'):
+        return None, ['PUBLISHED attempt_fault_name=MALFORMED']
+    fault = root / name
+    if fault.is_symlink() or not fault.is_dir():
+        return None, [f'PUBLISHED attempt_fault_dir=ABSENT name={name}']
+    sha_file = fault / 'bin_sha256'
+    recorded = '\n'.join(lines_of(sha_file)).strip() if sha_file.is_file() and not sha_file.is_symlink() else ''
+    problems = []
+    if recorded != sha:
+        problems.append(f'PUBLISHED attempt_fault_sha=MISMATCH name={name}')
+    verdicts = [p for p in sorted(fault.glob('verdict-*.txt')) if p.is_file() and not p.is_symlink()]
+    if not any(line.startswith('FAULT verdict=pass') for p in verdicts for line in lines_of(p)):
+        problems.append(f'PUBLISHED attempt_fault_pass=ABSENT name={name}')
+    return (None if problems else name), problems
+
+
+if attempt.is_symlink() or not attempt.is_dir():
+    print(f'PUBLISHED missing=attempt-{number}-dir')
+    files = []
+else:
+    files = [p for p in sorted(attempt.iterdir()) if p.is_file() and not p.is_symlink()]
+shipped = [(p, lines_of(p)) for p in files]
+shipped = [(p, lines) for p, lines in shipped if any(shipped_re.match(line) for line in lines)]
+capped = [p for p in files if any(cap_re.match(line) for line in lines_of(p))]
+
+if shipped:
+    results = []
+    for path, lines in shipped:
+        source = 'ATTEMPT_GATE current_source=yes' in lines
+        name, problems = judge_fault(lines)
+        results.append((source and name is not None, source, name, problems))
+    ok, source, name, problems = next((r for r in results if r[0]), results[0])
+    print(f'PUBLISHED attempt={number} verdict_line=shipped')
+    print(f"PUBLISHED attempt_current_source={'yes' if source else 'no'}")
+    for line in problems:
+        print(line)
+    print(f"PUBLISHED attempt_fault={name or 'ABSENT'}")
+    sys.exit(0 if ok else 1)
+if capped:
+    print(f'PUBLISHED attempt={number} verdict_line=cap_reached')
+    print('PUBLISHED attempt_current_source=n/a')
+    print('PUBLISHED attempt_fault=ABSENT')
+    sys.exit(0)
+print(f'PUBLISHED attempt={number} verdict_line=ABSENT')
+print('PUBLISHED attempt_current_source=n/a')
+print('PUBLISHED attempt_fault=ABSENT')
+sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# --identity-scan (50-29, deferred item 2026-10-20): refuse a tree holding any
+# fragment of the operator's email addresses. Prints `IDENTITY tokens=<n>`,
+# one `IDENTITY hit token=<k> source=<s> part=<p> file=<path>` per hit (a
+# file whose name holds a token adds ` in=name`, the token masked as
+# `<token-k>`), and `IDENTITY verdict=pass|fail`. A token's text is never
+# printed and never put on argv: rg reads it from a pattern file in a 0700
+# scratch directory.
+# ---------------------------------------------------------------------------
+identity_scan() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json, os, pathlib, re, subprocess, sys, tempfile
+
+directory, token_file, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+RUN = re.compile(r'[a-z0-9]{4,}')
+
+
+def fail(*lines):
+    for line in lines:
+        print(line)
+    print('IDENTITY verdict=fail')
+    sys.exit(1)
+
+
+addresses = []  # (address, source, line number within its source)
+if token_file:
+    try:
+        text = pathlib.Path(token_file).read_text()
+    except (OSError, UnicodeDecodeError):
+        fail('IDENTITY tokens_file=ABSENT')
+    addresses += [(line.strip(), 'file', n) for n, line in enumerate(text.splitlines(), 1) if line.strip()]
+else:
+    home = os.environ.get('HOME', '')
+    try:
+        if not home.startswith('/'):
+            raise KeyError('HOME')
+        account = json.loads((pathlib.Path(home) / '.claude.json').read_text())['oauthAccount']['emailAddress']
+        if not isinstance(account, str) or not account.strip():
+            raise KeyError('emailAddress')
+    except (OSError, ValueError, KeyError, TypeError):
+        fail('IDENTITY source=account ABSENT')
+    addresses.append((account.strip(), 'account', 1))
+    git = subprocess.run(['git', '-C', repo, 'config', '--get-all', 'user.email'],
+                         capture_output=True, text=True, timeout=60)
+    if git.returncode not in (0, 1):
+        fail(f'IDENTITY source=git error={git.returncode}')
+    addresses += [(line.strip(), 'git', n) for n, line in enumerate(git.stdout.splitlines(), 1) if line.strip()]
+
+tokens, seen, malformed = [], set(), []
+
+
+def add(token, source, part):
+    if token and token not in seen:
+        seen.add(token)
+        tokens.append((token, source, part))
+
+
+for address, source, number in addresses:
+    address = address.lower()
+    local, _, domain = address.partition('@')
+    if address.count('@') != 1 or not local or not domain:
+        malformed.append(f'IDENTITY malformed_address={number}' + ('' if source == 'file' else f' source={source}'))
+        continue
+    add(address, source, 'address')
+    add(local, source, 'local')
+    for run in RUN.findall(local):
+        add(run, source, 'local')
+    add(domain, source, 'domain')
+    for label in domain.split('.')[:-1]:
+        for run in RUN.findall(label):
+            add(run, source, 'domain')
+
+print(f'IDENTITY tokens={len(tokens)}')
+if malformed or not tokens:
+    fail(*malformed)
+
+by_length = sorted(range(len(tokens)), key=lambda i: -len(tokens[i][0]))
+
+
+def masked(path):
+    for i in by_length:
+        path = re.sub(re.escape(tokens[i][0]), f'<token-{i + 1}>', path, flags=re.IGNORECASE)
+    return path
+
+
+bad = False
+with tempfile.TemporaryDirectory() as scratch:
+    os.chmod(scratch, 0o700)
+    pattern = os.path.join(scratch, 'pattern')
+    for index, (token, source, part) in enumerate(tokens, 1):
+        fd = os.open(pattern, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(token + '\n')
+        result = subprocess.run(['rg', '--no-config', '-uuu', '-i', '-F', '-l', '-0', '-f', pattern, '--', directory],
+                                capture_output=True, timeout=300)
+        if result.returncode == 1:
+            continue
+        if result.returncode != 0:
+            print(f'IDENTITY rg_error={result.returncode}')
+            bad = True
+            continue
+        for path in sorted(p for p in result.stdout.split(b'\0') if p):
+            relative = os.path.relpath(os.fsdecode(path), directory)
+            print(f'IDENTITY hit token={index} source={source} part={part} file={masked(relative)}')
+            bad = True
+
+# rg -l searches contents only, so the names of every file and directory are
+# judged here.
+for parent, dirnames, filenames in os.walk(directory):
+    for name in sorted(dirnames + filenames):
+        relative = os.path.relpath(os.path.join(parent, name), directory)
+        for index, (token, source, part) in enumerate(tokens, 1):
+            if token in name.lower():
+                print(f'IDENTITY hit token={index} source={source} part={part} file={masked(relative)} in=name')
+                bad = True
+
+print(f"IDENTITY verdict={'fail' if bad else 'pass'}")
+sys.exit(1 if bad else 0)
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -1758,6 +2001,230 @@ st_def_outside_git() {
         expect_re 1 'DEFECTS git=FAILED rc=[0-9]+' st_def "$dir/record.md" "$dir/ROADMAP.md"
 }
 
+# --identity-scan cases (50-29). The fake address yields seven tokens, in
+# this order: 1 the address; 2 alpha.bravo, 3 alpha, 4 bravo (local); 5
+# charlie-delta.example, 6 charlie, 7 delta (domain). The last domain label
+# (`example`) is not a token.
+ST_ID_ADDRESS='alpha.bravo@charlie-delta.example'
+ST_ID_TOKENS_RE='alpha|bravo|charlie|delta'
+
+st_id_tokens() {
+    local file
+    file="$(mktemp "$ST_TMP/tokens.XXXXXX")"
+    printf '\n%s\n\n' "$ST_ID_ADDRESS" >"$file"
+    printf '%s\n' "$file"
+}
+
+# A tree holding none of the seven tokens (short pieces and the last domain
+# label only); prints its path.
+st_id_tree() {
+    local dir
+    dir="$(mktemp -d "$ST_TMP/id.XXXXXX")"
+    mkdir -p "$dir/sub"
+    printf 'alp bra cha del example.org\n' >"$dir/notes.txt"
+    printf 'nothing here\n' >"$dir/sub/log.txt"
+    printf '%s\n' "$dir"
+}
+
+st_id() {
+    bash "$SELF" --identity-scan "$1" --tokens "$2"
+}
+
+st_id_clean() {
+    local dir tokens
+    dir="$(st_id_tree)"
+    tokens="$(st_id_tokens)"
+    expect 0 'IDENTITY verdict=pass' st_id "$dir" "$tokens" &&
+        expect 0 'IDENTITY tokens=7' st_id "$dir" "$tokens"
+}
+
+st_id_local_case() {
+    local dir tokens
+    dir="$(st_id_tree)"
+    tokens="$(st_id_tokens)"
+    printf 'user=xxBravoyy\n' >"$dir/notes.txt"
+    expect 1 'IDENTITY verdict=fail' st_id "$dir" "$tokens" &&
+        expect 1 'IDENTITY hit token=4 source=file part=local file=notes.txt' st_id "$dir" "$tokens"
+}
+
+st_id_domain() {
+    local dir tokens
+    dir="$(st_id_tree)"
+    tokens="$(st_id_tokens)"
+    printf 'host delta.internal\n' >"$dir/sub/log.txt"
+    expect 1 'IDENTITY verdict=fail' st_id "$dir" "$tokens" &&
+        expect 1 'IDENTITY hit token=7 source=file part=domain file=sub/log.txt' st_id "$dir" "$tokens"
+}
+
+# Hidden, listed in an .ignore file and binary, so dropping any one of rg's
+# three -u flags misses it.
+st_id_hidden() {
+    local dir tokens
+    dir="$(st_id_tree)"
+    tokens="$(st_id_tokens)"
+    printf 'x\0CHARLIE\n' >"$dir/sub/.leak"
+    printf '.leak\n' >"$dir/sub/.ignore"
+    expect 1 'IDENTITY verdict=fail' st_id "$dir" "$tokens" &&
+        expect 1 'IDENTITY hit token=6 source=file part=domain file=sub/.leak' st_id "$dir" "$tokens"
+}
+
+st_id_empty() {
+    local dir tokens
+    dir="$(st_id_tree)"
+    tokens="$(mktemp "$ST_TMP/tokens.XXXXXX")"
+    printf '\n\n' >"$tokens"
+    expect 1 'IDENTITY tokens=0' st_id "$dir" "$tokens" &&
+        expect 1 'IDENTITY verdict=fail' st_id "$dir" "$tokens"
+}
+
+# A file whose name holds a token: rg -l searches contents, so the name is
+# judged separately and printed with the token masked.
+st_id_name() {
+    local dir tokens
+    dir="$(st_id_tree)"
+    tokens="$(st_id_tokens)"
+    printf 'clean\n' >"$dir/report-Bravo.txt"
+    expect 1 'IDENTITY verdict=fail' st_id "$dir" "$tokens" &&
+        expect 1 'IDENTITY hit token=4 source=file part=local file=report-<token-4>.txt in=name' st_id "$dir" "$tokens"
+}
+
+# Run the scan with HOME at <home>, git's global config at <home>/gitconfig
+# and no system config, against the scratch repository <repo>.
+st_id_host() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_CONFIG -u GIT_PREFIX \
+        HOME="$1" XDG_CONFIG_HOME="$1/.config" GIT_CONFIG_GLOBAL="$1/gitconfig" GIT_CONFIG_NOSYSTEM=1 \
+        bash "$SELF" --identity-scan "$3" --repo "$2"
+}
+
+# A scratch HOME with an empty git config; with `account`, also a
+# .claude.json naming the fake address. Prints its path.
+st_id_home() {
+    local home
+    home="$(mktemp -d "$ST_TMP/idhome.XXXXXX")"
+    : >"$home/gitconfig"
+    if [ "$1" = account ]; then
+        printf '{"oauthAccount": {"emailAddress": "%s"}}\n' "$ST_ID_ADDRESS" >"$home/.claude.json"
+    fi
+    printf '%s\n' "$home"
+}
+
+st_id_account() {
+    local home repo clean dir
+    home="$(st_id_home account)"
+    repo="$(st_src_repo)"
+    clean="$(st_id_tree)"
+    dir="$(st_id_tree)"
+    printf 'Charlie was here\n' >"$dir/notes.txt"
+    expect 0 'IDENTITY verdict=pass' st_id_host "$home" "$repo" "$clean" &&
+        expect 0 'IDENTITY tokens=7' st_id_host "$home" "$repo" "$clean" &&
+        expect 1 'IDENTITY hit token=6 source=account part=domain file=notes.txt' st_id_host "$home" "$repo" "$dir" &&
+        expect 1 'IDENTITY verdict=fail' st_id_host "$home" "$repo" "$dir"
+}
+
+st_id_no_account() {
+    local home repo dir
+    home="$(st_id_home none)"
+    repo="$(st_src_repo)"
+    dir="$(st_id_tree)"
+    expect 1 'IDENTITY source=account ABSENT' st_id_host "$home" "$repo" "$dir" &&
+        expect 1 'IDENTITY verdict=fail' st_id_host "$home" "$repo" "$dir" &&
+        expect_absent 'IDENTITY hit .*' st_id_host "$home" "$repo" "$dir"
+}
+
+# Every failing case's output, together, names no token in any case, and
+# holds hit lines (so the check is not vacuous).
+st_id_never_prints() {
+    local tokens home repo out="" dir
+    tokens="$(st_id_tokens)"
+    home="$(st_id_home account)"
+    repo="$(st_src_repo)"
+    dir="$(st_id_tree)"
+    printf 'xxBravoyy delta\n' >"$dir/notes.txt"
+    printf 'x\0CHARLIE alpha.bravo@charlie-delta.example\n' >"$dir/sub/.leak"
+    printf '.leak\n' >"$dir/sub/.ignore"
+    printf 'clean\n' >"$dir/report-Alpha-Delta.txt"
+    out+="$(st_id "$dir" "$tokens" 2>&1)" || true
+    out+="$(st_id_host "$home" "$repo" "$dir" 2>&1)" || true
+    printf '%s\n' "$out" | rg -q -e '^IDENTITY hit token=' ||
+        { echo "no hit line, so nothing was judged: $out"; return 1; }
+    if printf '%s\n' "$out" | rg -q -i -e "$ST_ID_TOKENS_RE"; then
+        echo "a token was printed"
+        return 1
+    fi
+}
+
+# --published --attempt cases (50-29). The base tree plus attempt-2, whose
+# saved gate output pairs it with fault-7 on another bin_sha256.
+st_pub_attempt() {
+    env HOME="$ST_PUB_HOME" bash "$SELF" --published "$1" --attempt "$2"
+}
+
+st_pub_attempt_tree() {
+    local dir
+    dir="$(st_pub_tree)"
+    mkdir -p "$dir/attempt-2" "$dir/fault-7"
+    printf '%s\n' "$ST_OTHER_SHA" >"$dir/fault-7/bin_sha256"
+    printf 'FAULT bin_sha256=%s\nFAULT complete=yes\nFAULT verdict=pass\n' "$ST_OTHER_SHA" \
+        >"$dir/fault-7/verdict-fault.txt"
+    printf 'ATTEMPT verdict=pass\nATTEMPT_GATE current_source=yes\nATTEMPT_GATE fault=fault-7 bin_sha256=%s\nATTEMPT_GATE verdict=shipped attempt=2\n' \
+        "$ST_OTHER_SHA" >"$dir/attempt-2/verdict-attempt-gate.txt"
+    printf '%s\n' "$dir"
+}
+
+st_pub_attempt_pass() {
+    local dir
+    dir="$(st_pub_attempt_tree)"
+    expect 0 'PUBLISHED verdict=pass' st_pub_attempt "$dir" 2 &&
+        expect 0 'PUBLISHED attempt=2 verdict_line=shipped' st_pub_attempt "$dir" 2 &&
+        expect 0 'PUBLISHED attempt_current_source=yes' st_pub_attempt "$dir" 2 &&
+        expect 0 'PUBLISHED attempt_fault=fault-7' st_pub_attempt "$dir" 2
+}
+
+# Only attempt-1 is published; the plain check passes the same tree.
+st_pub_attempt_unpublished() {
+    local dir
+    dir="$(st_pub_tree)"
+    expect 0 'PUBLISHED verdict=pass' st_pub "$dir" &&
+        expect 1 'PUBLISHED verdict=fail' st_pub_attempt "$dir" 2 &&
+        expect 1 'PUBLISHED missing=attempt-2-dir' st_pub_attempt "$dir" 2
+}
+
+st_pub_attempt_no_fault() {
+    local dir
+    dir="$(st_pub_attempt_tree)"
+    rm -r -- "$dir/fault-7"
+    expect 1 'PUBLISHED verdict=fail' st_pub_attempt "$dir" 2 &&
+        expect 1 'PUBLISHED attempt_fault_dir=ABSENT name=fault-7' st_pub_attempt "$dir" 2 &&
+        expect 1 'PUBLISHED attempt_fault=ABSENT' st_pub_attempt "$dir" 2
+}
+
+# fault-7 records the attempt-1 fixture's bin_sha256, not the one attempt-2's
+# gate line names.
+st_pub_attempt_other_sha() {
+    local dir
+    dir="$(st_pub_attempt_tree)"
+    printf '%s\n' "$ST_SHA" >"$dir/fault-7/bin_sha256"
+    expect 1 'PUBLISHED verdict=fail' st_pub_attempt "$dir" 2 &&
+        expect 1 'PUBLISHED attempt_fault_sha=MISMATCH name=fault-7' st_pub_attempt "$dir" 2
+}
+
+st_pub_attempt_other() {
+    local dir
+    dir="$(st_pub_attempt_tree)"
+    sed -i 's/^ATTEMPT_GATE verdict=shipped attempt=2$/ATTEMPT_GATE verdict=shipped attempt=1/' \
+        "$dir/attempt-2/verdict-attempt-gate.txt"
+    expect 1 'PUBLISHED verdict=fail' st_pub_attempt "$dir" 2 &&
+        expect 1 'PUBLISHED attempt=2 verdict_line=ABSENT' st_pub_attempt "$dir" 2
+}
+
+st_pub_attempt_no_source() {
+    local dir
+    dir="$(st_pub_attempt_tree)"
+    sed -i '/^ATTEMPT_GATE current_source=yes$/d' "$dir/attempt-2/verdict-attempt-gate.txt"
+    expect 1 'PUBLISHED verdict=fail' st_pub_attempt "$dir" 2 &&
+        expect 1 'PUBLISHED attempt_current_source=no' st_pub_attempt "$dir" 2
+}
+
 run_selftest() {
     ST_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$ST_TMP"' EXIT
@@ -1823,6 +2290,21 @@ run_selftest() {
     st_case 'defects passes no new id with the no-defect statement' st_def_pass_none
     st_case 'defects fails no new id without the statement' st_def_fail_no_statement
     st_case 'defects fails outside a git repository' st_def_outside_git
+    st_case 'identity passes a tree without the tokens' st_id_clean
+    st_case 'identity fails a planted local part run in another case' st_id_local_case
+    st_case 'identity fails a planted domain run' st_id_domain
+    st_case 'identity fails a token in a hidden file' st_id_hidden
+    st_case 'identity fails an empty token file' st_id_empty
+    st_case 'identity fails a token in a file name' st_id_name
+    st_case 'identity never prints a token' st_id_never_prints
+    st_case 'identity reads the host account email' st_id_account
+    st_case 'identity fails without a host account email' st_id_no_account
+    st_case 'published passes an attempt with its shipped verdict and its paired fault directory' st_pub_attempt_pass
+    st_case 'published fails an attempt that is not published' st_pub_attempt_unpublished
+    st_case 'published fails an attempt whose paired fault directory is absent' st_pub_attempt_no_fault
+    st_case 'published fails an attempt verdict naming another attempt' st_pub_attempt_other
+    st_case 'published fails an attempt whose paired fault directory records another bin_sha256' st_pub_attempt_other_sha
+    st_case 'published fails a shipped attempt verdict without the current source line' st_pub_attempt_no_source
 
     echo "SELFTEST passed=$ST_PASS failed=$ST_FAIL"
     [ "$ST_FAIL" -eq 0 ] && [ "$ST_PASS" -gt 0 ]
@@ -1922,8 +2404,37 @@ main() {
             fi
             ;;
         --published)
-            [ "$#" -eq 2 ] || usage
-            published_check "$2"
+            local dir="" number=""
+            shift
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --attempt) [ "$#" -ge 2 ] && [ -z "$number" ] || usage; number="$2"; shift ;;
+                    -*) usage ;;
+                    *) [ -z "$dir" ] || usage; dir="$1" ;;
+                esac
+                shift
+            done
+            [ -n "$dir" ] || usage
+            [ -z "$number" ] || [[ "$number" =~ ^[1-9][0-9]*$ ]] || usage
+            published_check "$dir" "$number"
+            ;;
+        --identity-scan)
+            local dir="" tokens="" repo=""
+            shift
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --tokens) [ "$#" -ge 2 ] && [ -z "$tokens" ] || usage; tokens="$2"; shift ;;
+                    --repo) [ "$#" -ge 2 ] && [ -z "$repo" ] || usage; repo="$2"; shift ;;
+                    -*) usage ;;
+                    *) [ -z "$dir" ] || usage; dir="$1" ;;
+                esac
+                shift
+            done
+            [ -n "$dir" ] && [ -d "$dir" ] || usage
+            # --tokens replaces the host's addresses; --repo names where git's are read.
+            [ -z "$tokens" ] || [ -z "$repo" ] || usage
+            [ -n "$tokens" ] || [ -n "$repo" ] || repo="$(default_repo)"
+            identity_scan "$dir" "$tokens" "$repo"
             ;;
         --live-run)
             [ "$#" -eq 2 ] || usage
