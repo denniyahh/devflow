@@ -2,21 +2,21 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: 50
-current_phase_name: Addressable Monitor Liveness
-current_plan: 29
-status: executing
-stopped_at: Phase 50 planned (25 plans, 17 waves)
-last_updated: "2026-10-17T11:13:45.809Z"
+current_phase: "50.1"
+current_phase_name: Split-Lock State-Handling Overhaul
+current_plan: Not started
+status: planning
+stopped_at: Phase 50 complete, ready to plan Phase 50.1
+last_updated: "2026-10-21T22:50:37.691Z"
 last_activity: 2026-10-21
-last_activity_desc: Phase 50 all 29 plans executed (wave 20: 50-29 attempt 2 published); next is phase re-verification
-state_head: d69c268aa09c5973d4fb9e8c9b0a7f078962a54e
+last_activity_desc: Phase 50 complete, transitioned to Phase 50.1
+state_head: cc5041183067afd58e26b2a9b3a8023fd8e72085
 progress:
   total_phases: 7
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 77
   completed_plans: 77
-  percent: 57
+  percent: 71
 ---
 
 # DevFlow — Project State
@@ -194,12 +194,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 50 (Addressable Monitor Liveness) — EXECUTING
+Phase: 50.1 — Split-Lock State-Handling Overhaul
 Plans: 25 (50-01…50-25, 17 waves; 50-19 is the one live-attempt checkpoint) — executing via `/gsd-execute-phase 50` from `.worktrees/phase-50`
-Current Plan: 29 of 29 executed — phase re-verification next
+Current Plan: Not started
 Total Plans in Phase: 25
 Completed Plans: 29 of 29
-Status: Executing Phase 50
+Status: Ready to plan
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -209,7 +209,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-10-21 — Phase 50 wave 20 complete: 50-29 published attempt 2 + fault-7 (planted-control secrets redacted in the published copy by operator decision), live-run record and validation map now on attempt 2, WR-03 recorded fixed; all 29 plans executed; next is re-verification
+Last activity: 2026-10-21 — Phase 50 complete, transitioned to Phase 50.1
 
 Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
@@ -966,7 +966,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Session
 
 **Last session:** 2026-10-11T00:56:59.545Z
-**Stopped at:** Phase 50 context gathered
+**Stopped at:** Phase 50 complete, ready to plan Phase 50.1
 **Resume file:** .planning/phases/50-addressable-monitor-liveness/50-CONTEXT.md
 
 ## Operator Next Steps

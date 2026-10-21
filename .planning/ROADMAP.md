@@ -33,7 +33,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
-| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Planned |
+| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Complete    |
 | 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | TBD | 4 (after 50) | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
@@ -388,7 +388,7 @@ former criterion 4 (detect and report a 2.x state as incompatible) is retired;
 the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 29/29 plans executed (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
+**Plans**: 29/29 plans complete (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
 
 **Wave 1**
 
@@ -689,7 +689,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 29/29 | In Progress | — |
+| 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 

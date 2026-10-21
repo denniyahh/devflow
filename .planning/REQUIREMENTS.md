@@ -119,7 +119,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
 
 ### Supervision (SUPV)
 
-- [ ] **SUPV-01**: Monitor liveness is answerable from disk state alone without a PID, in three
+- [x] **SUPV-01**: Monitor liveness is answerable from disk state alone without a PID, in three
       distinguishable states — GONE, STALE, ALIVE.
       *Traces to #185.* Design spike-proven (C1-C6); no socket exists in `crates/` today.
       **Scope correction:** `MonitorLaunch::PipeOwning` (Phase 31) is already a Rust supervisor, so
@@ -202,7 +202,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | CHKPT-02 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Complete |
-| SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Pending |
+| SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Complete |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**
