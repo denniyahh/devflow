@@ -1,0 +1,9 @@
+FAULT case=alive-stop-capture ok live
+FAULT case=alive-stop-stream ok live
+FAULT case=kill9-at-gate ok live
+FAULT case=kill9-stale-stop ok live
+FAULT case=publish-unlink-window ok pointer
+FAULT case=stop-races-completion ok live
+FAULT bin_sha256=182ab8b546a8f93c3e62b33c6516448446593bdb767e8f2ff250ec3393f5045d
+FAULT complete=yes
+FAULT verdict=pass

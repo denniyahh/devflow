@@ -1,0 +1,29 @@
+  ok   positive: base_branch is integration
+  ok   positive: base-branch note names devflow.toml
+  ok   positive: config condition holds
+NOTE fork_point base_sha=0c5758f589cd37190695dbe01edef30f0e5978a0 define_head=0c5758f589cd37190695dbe01edef30f0e5978a0 ship_merge_base=0c5758f589cd37190695dbe01edef30f0e5978a0
+  ok   positive: fork point is one value
+  ok   positive: gates fired in order define, code, ship
+  ok   positive: ship gate answered by --yes-ship
+  ok   positive: shipped
+  ok   positive: merged into integration
+  ok   positive: main untouched locally
+  ok   positive: PR targets main from the feature branch
+  ok   positive: merge_result records a merge
+NOTE gate_census count=3 stages=define,code,ship
+NOTE gate define unexpected=false
+NOTE gate code unexpected=false
+NOTE gate ship unexpected=false
+CHECK passed=11 failed=0
+ATTEMPT p49_positive=pass
+ATTEMPT check=events readable ok
+ATTEMPT check=stage_launched present ok
+ATTEMPT check=every launch names its socket, label and id ok
+ATTEMPT check=both launch shapes ok
+ATTEMPT check=no monitor_pid key ok
+ATTEMPT launches=6 stream=5 capture=1
+ATTEMPT sidecars_left=0
+ATTEMPT verdict=pass
+ATTEMPT_GATE current_source=yes
+ATTEMPT_GATE fault=fault-7 bin_sha256=182ab8b546a8f93c3e62b33c6516448446593bdb767e8f2ff250ec3393f5045d
+ATTEMPT_GATE verdict=shipped attempt=2
