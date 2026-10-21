@@ -1230,6 +1230,39 @@ explicitly accepted with a reason.
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.166: Supervisor Residuals From the Phase 50 Code Review (BACKLOG)
+
+**Found:** 2026-10-20, Phase 50's end-of-phase `/gsd-code-review` (standard depth, 53 files; report
+`.planning/phases/50-addressable-monitor-liveness/50-REVIEW.md`, ledger `50-REVIEW-DISPOSITION.md`). Each item was
+found by reading the code at `889ecea`, not reproduced. The operator chose on 2026-10-21 to fix the review's one
+Critical (CR-01, a stop not honoured before a `--yes-ship` merge) in Phase 50 and to defer these six, with Phase 50.1's
+stop-ownership work as the natural home.
+
+**Defects:**
+1. (WR-01) `devflow stop` prints "did not answer the shutdown … nothing was signalled or recorded" for a stop the
+   supervisor accepted and will still honour, when its next stop check is more than the 22 s final wait away: the
+   advance's lock wait (up to 600 s), transition hooks, preflight, the first-launch canary, Ship finalization.
+   OPERATIONS.md's "runs no advance" wording is wrong for this case.
+2. (WR-02) `recover --clean` without `--phase` ignores the supervisor socket, though OPERATIONS.md says it probes it:
+   it deletes state started more than 24 h ago with no live agent pid and no held lock, including a live supervisor
+   between its agent's exit and the advance taking the lock. The 2026-10-19 triage fix covered `--phase N` only.
+3. (WR-03) A stream supervisor whose agent completed normally can block forever in `threads.join()` (`monitor.rs`)
+   when a group member still holds the agent's stdout; it stays ALIVE in "advancing", `stop` cannot reach it, and the
+   backstop refuses because the leader was already reaped. The join predates Phase 50.
+4. (IN-01) `poll_response_cancellable` keeps a backoff that never takes effect, so a supervised gate polls every second
+   for as long as it waits.
+5. (IN-02) The control thread busy-loops on a persistent `accept` error such as EMFILE.
+6. (IN-03) `stop`'s success line says "agent group ended" for a stop honoured at a safe point, where nothing was
+   signalled.
+
+**Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted with a reason.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219

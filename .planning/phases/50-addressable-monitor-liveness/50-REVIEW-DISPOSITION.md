@@ -5,33 +5,33 @@ titles: json
 findings:
   - id: CR-01
     severity: critical
-    disposition: open
+    disposition: fixed
     title: "A stop accepted during a Ship advance does not prevent the `--yes-ship` merge and release"
   - id: WR-01
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "`stop` reports \"nothing was signalled or recorded\" for a stop the supervisor accepted and will still carry out"
   - id: WR-02
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "Implicit `recover --clean` ignores the supervisor socket, though the docs say it probes it"
   - id: WR-03
     severity: warning
-    disposition: open
+    disposition: deferred
     title: "A stream supervisor whose agent completed can hang forever in `threads.join()`, and no DevFlow verb can end it"
   - id: IN-01
     severity: info
-    disposition: open
+    disposition: deferred
     title: "`poll_response_cancellable` keeps a backoff that can never take effect"
   - id: IN-02
     severity: info
-    disposition: open
+    disposition: deferred
     title: "The control thread spins on a persistent `accept` error"
   - id: IN-03
     severity: info
-    disposition: open
+    disposition: deferred
     title: "The stop success line claims \"agent group ended\" for stops honoured at a safe point"
-open: 7
+open: 0
 total: 7
 recorded: 2026-10-20T21:36:15.055Z
 ---
@@ -40,13 +40,13 @@ recorded: 2026-10-20T21:36:15.055Z
 
 | Finding | Severity | Disposition | Source |
 |---------|----------|-------------|--------|
-| CR-01 | critical | open | - |
-| WR-01 | warning | open | - |
-| WR-02 | warning | open | - |
-| WR-03 | warning | open | - |
-| IN-01 | info | open | - |
-| IN-02 | info | open | - |
-| IN-03 | info | open | - |
+| CR-01 | critical | fixed | `8946d7d` (RED test) + `373f1e6` (safe points 5 and 6); operator chose to fix in Phase 50, 2026-10-21 |
+| WR-01 | warning | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
+| WR-02 | warning | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
+| WR-03 | warning | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
+| IN-01 | info | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
+| IN-02 | info | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
+| IN-03 | info | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
 
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
