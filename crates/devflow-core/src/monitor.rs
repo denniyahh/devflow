@@ -7072,4 +7072,88 @@ exit 0
         );
         assert_one_reader_bound(root, STAGE_PHASE, "F");
     }
+
+    const STOPPED_HELD_STDOUT_TEST: &str = "monitor::tests::a_stopped_stream_run_returns_while_a_process_outside_the_agent_group_holds_its_stdout";
+
+    /// D: a stop taken while the agent runs, with the agent's stdout also
+    /// held by a process outside the agent's group (util-linux `setsid` as
+    /// a background job: a non-interactive `sh` job is not a group leader,
+    /// so `setsid` does not fork and `$!` is the sleeper), finishes within
+    /// the stop's own wait under the production 120 s idle timeout. The
+    /// stop's group signals cannot reach the holder, so before the fix the
+    /// supervisor waited 120 s in `drive_stream_io` and then forever in the
+    /// thread join.
+    #[test]
+    fn a_stopped_stream_run_returns_while_a_process_outside_the_agent_group_holds_its_stdout() {
+        if crate::test_support::in_child_test(STOPPED_HELD_STDOUT_TEST) {
+            supervise_stage_in_child();
+            return;
+        }
+        let fixture = StageFixture::new();
+        let record = fixture.path("holder");
+        let program = fixture.agent(
+            "claude",
+            &format!(
+                "{preamble}setsid sleep 300 &\n\
+                 {record_lines}\
+                 while :; do sleep 0.05; done",
+                preamble = Shape::Stream.preamble(),
+                record_lines = record_holder(&record),
+            ),
+        );
+        let mut run = launch_stage_with(
+            STOPPED_HELD_STDOUT_TEST,
+            &fixture,
+            StageLaunchArgs {
+                shape: Shape::Stream,
+                agent: AgentKind::Claude,
+                program: &program,
+                adapter_env: "",
+                args: &[],
+                extra_env: &[],
+            },
+        );
+        let held = HeldStdout::take(&record);
+        let agent_pgid = libc::pid_t::try_from(run.reply.agent_pgid).expect("pgid fits pid_t");
+        let holder = libc::pid_t::try_from(held.pid).expect("pid fits pid_t");
+        let outside = stage_wait_until(Duration::from_secs(2), || {
+            // SAFETY: getpgid has no memory preconditions.
+            let pgid = unsafe { libc::getpgid(holder) };
+            pgid > 0 && pgid != agent_pgid
+        });
+        if !outside {
+            panic!(
+                "FIXTURE: the holder {holder} did not leave the agent's group {agent_pgid} \
+                 within 2 s"
+            );
+        }
+        let stopped =
+            crate::supervisor::request_shutdown(run.socket.as_path(), Duration::from_secs(20));
+        if !matches!(
+            stopped,
+            Ok(crate::supervisor::ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true
+            })
+        ) {
+            panic!(
+                "WR-03: a stop did not finish within 20 s while a process outside the agent's \
+                 group held its stdout: {stopped:?}"
+            );
+        }
+        assert_eq!(run.finish(STOPPED_HELD_STDOUT_TEST), "Stopped finished");
+        assert_eq!(fixture.exit_code(), "143");
+        assert!(
+            !crate::agent_result::idle_timeout_path(&fixture.root, STAGE_PHASE).exists(),
+            "no idle-timeout verdict for a stopped run"
+        );
+        assert_eq!(run.liveness(), crate::supervisor::Liveness::Gone);
+        assert!(
+            held.is_alive(),
+            "the holder outside the agent's group still runs: the stop's group signals cannot \
+             reach it, so the bounded wait is what let the stop finish"
+        );
+        assert_one_reader_bound(&fixture.root, STAGE_PHASE, STOPPED_HELD_STDOUT_TEST);
+        drop(run.group);
+    }
 }

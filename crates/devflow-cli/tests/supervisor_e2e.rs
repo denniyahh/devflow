@@ -842,3 +842,487 @@ fn two_starts_for_different_phases_yield_two_live_supervisors() {
         "the sidecars must name two distinct agent groups: {pgids:?}"
     );
 }
+
+// ---- 50-26: WR-03 on the real `devflow __monitor` binary -----------------
+//
+// A completed stream run whose agent left a process holding its stdout must
+// reach its advance, and a `devflow stop` sent while it is `advancing` must
+// end it at safe point 1. Each run is a `__monitor` started directly (no
+// launcher), over a seeded Code-stage state that halts at `--until code`.
+
+/// A repository on `develop` with `feature/phase-NN` one commit ahead of it.
+/// Named apart from [`init_repo`] (develop only, with a ROADMAP entry, used by
+/// the `start` tests): the commit ahead is what lets Layer 2 classify the
+/// Code run `Success`, so the advance reaches `transition`'s `--until` halt
+/// (as `auto_chain_flag_e2e.rs`'s `init_repo` makes it).
+fn init_repo_with_feature_branch(root: &Path, phase: PhaseId) {
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "devflow@example.com"]);
+    git(root, &["config", "user.name", "DevFlow Tests"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    fs::write(root.join("README.md"), "base\n").unwrap();
+    git(root, &["add", "README.md"]);
+    git(root, &["commit", "-q", "-m", "base"]);
+
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
+    git(root, &["checkout", "-q", "-b", &branch]);
+    fs::write(root.join("work.txt"), "agent work\n").unwrap();
+    git(root, &["add", "work.txt"]);
+    git(root, &["commit", "-q", "-m", "agent work"]);
+}
+
+/// Mirrors `pipeline_launch::ADVANCE_STOP_REASON`, as
+/// [`SUPERVISOR_STOP_REASON`] mirrors the supervisor's; `devflow stop`
+/// appends its own clause after it.
+const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
+
+/// The Claude top-level result line the held-stdout agent prints.
+const HELD_RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}"#;
+
+/// The holder record `<pid> <start>` at `record`, when it exists and parses.
+fn read_holder_record(record: &Path) -> Option<(u32, u64)> {
+    let text = fs::read_to_string(record).ok()?;
+    let mut fields = text.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let start = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((pid, start))
+}
+
+/// A `devflow __monitor` started directly over a seeded Code-stage state
+/// (`Mode::Supervise`, `stop_until = Some(Stage::Code)`), with production's
+/// 120 s idle timeout, supervising `sh <script>`: the script reads one line,
+/// prints [`HELD_RESULT_LINE`], starts its holder as a background job,
+/// records it (`<pid> <start>` while the holder is its unreaped child, as the
+/// core tests' fixture rule says) and exits 0.
+///
+/// Dropped, it SIGKILLs and reaps the monitor through its own `Child` if it
+/// still runs, then SIGKILLs the holder by its recorded pid only while
+/// [`devflow_core::agent::is_same_process`] holds. It signals nothing else.
+struct HeldStdoutRun {
+    monitor: Option<std::process::Child>,
+    root: std::path::PathBuf,
+    phase: PhaseId,
+    socket: supervisor::SocketPath,
+    record: std::path::PathBuf,
+    hold: std::path::PathBuf,
+    log: std::path::PathBuf,
+    aux_path: std::path::PathBuf,
+    _reaper: common::LaunchedRunReaper,
+    _repo: tempfile::TempDir,
+    _aux: tempfile::TempDir,
+    /// Every `devflow` child's `HOME` and cache. Declared last so it drops
+    /// after the rest of the fixture.
+    home: common::HermeticHome,
+}
+
+impl HeldStdoutRun {
+    /// Seed the repository and state for `phase`, then spawn the monitor
+    /// with `holder` as the agent's leftover. `hold` sets
+    /// `DEVFLOW_TEST_STREAM_WAIT_HOLD` on the monitor.
+    fn spawn(phase: PhaseId, holder: &str, hold: bool) -> Self {
+        let repo = tempfile::tempdir().unwrap();
+        let aux = tempfile::tempdir().unwrap();
+        // The binary canonicalizes `--project`, so the fixture must too.
+        let root = repo.path().canonicalize().unwrap();
+        init_repo_with_feature_branch(&root, phase);
+        fs::create_dir_all(root.join(".planning")).unwrap();
+        fs::write(
+            root.join(".planning/config.json"),
+            r#"{"workflow":{"_auto_chain_active":false}}"#,
+        )
+        .unwrap();
+        let mut state = devflow_core::state::State::new(
+            phase,
+            devflow_core::state::AgentKind::Claude,
+            devflow_core::mode::Mode::Supervise,
+            root.clone(),
+        );
+        state.stage = devflow_core::stage::Stage::Code;
+        state.stop_until = Some(devflow_core::stage::Stage::Code);
+        state.stopped = false;
+        devflow_core::workflow::save_state(&state).unwrap();
+
+        let aux_path = aux.path().to_path_buf();
+        let record = aux_path.join("holder");
+        let hold_path = aux_path.join("hold");
+        let log = aux_path.join("monitor.stderr");
+        let prompt = aux_path.join("prompt.txt");
+        fs::write(&prompt, "run the code stage\n").unwrap();
+        let script = aux_path.join("agent.sh");
+        fs::write(
+            &script,
+            format!(
+                "PATH=/usr/bin:/bin\n\
+                 IFS= read -r _turn || exit 91\n\
+                 printf '%s\\n' '{HELD_RESULT_LINE}'\n\
+                 {holder} &\n\
+                 holder=$!\n\
+                 echo \"$holder $(cut -d' ' -f22 /proc/$holder/stat)\" > '{record}.tmp'\n\
+                 mv '{record}.tmp' '{record}'\n\
+                 exit 0\n",
+                record = record.display()
+            ),
+        )
+        .unwrap();
+
+        let home = common::HermeticHome::new();
+        let launch_id = supervisor::new_launch_id();
+        let socket =
+            supervisor::SocketPath::for_launch(&home.cache_dir(), &root, phase, &launch_id)
+                .expect("the hermetic socket path fits sun_path");
+        let mut command = common::hermetic_devflow(&home);
+        command
+            .arg("__monitor")
+            .arg("--project")
+            .arg(&root)
+            .arg("--phase")
+            .arg(phase.to_string())
+            .arg("--workdir")
+            .arg(&root)
+            .arg("--prompt-file")
+            .arg(&prompt)
+            .arg("--idle-timeout-secs")
+            .arg("120")
+            .arg("--agent")
+            .arg("claude")
+            .arg("--launch")
+            .arg("stream")
+            .arg("--launch-id")
+            .arg(&launch_id)
+            .arg("--socket")
+            .arg(socket.as_path())
+            .arg("--")
+            .arg("sh")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&log).expect("create the monitor's stderr log"));
+        if hold {
+            command.env("DEVFLOW_TEST_STREAM_WAIT_HOLD", &hold_path);
+        }
+        let monitor = command.spawn().expect("spawn devflow __monitor");
+        let reaper = common::LaunchedRunReaper::new(&root, phase, Vec::new());
+        Self {
+            monitor: Some(monitor),
+            root,
+            phase,
+            socket,
+            record,
+            hold: hold_path,
+            log,
+            aux_path,
+            _reaper: reaper,
+            _repo: repo,
+            _aux: aux,
+            home,
+        }
+    }
+
+    /// The holder the agent recorded, waited for up to 10 s and required to
+    /// name a live process.
+    fn holder(&self) -> (u32, u64) {
+        if !holds_within(Duration::from_secs(10), || {
+            read_holder_record(&self.record).is_some()
+        }) {
+            panic!(
+                "FIXTURE: no holder record at {} within 10 s; monitor stderr: {}",
+                self.record.display(),
+                self.stderr_log()
+            );
+        }
+        let (pid, start) = read_holder_record(&self.record).expect("the record parses");
+        if pid <= 1 || devflow_core::agent::process_start_time(pid) != Some(start) {
+            panic!("FIXTURE: the holder record ({pid} {start}) names no live process");
+        }
+        (pid, start)
+    }
+
+    /// The monitor's exit status, polled for up to `within`.
+    fn wait_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let monitor = self.monitor.as_mut().expect("the monitor is still owned");
+        let mut status = None;
+        holds_within(within, || {
+            status = monitor.try_wait().expect("poll the monitor");
+            status.is_some()
+        });
+        status
+    }
+
+    /// The owner a ping reports, or what the probe saw instead.
+    fn owner(&self) -> String {
+        match supervisor::probe(self.socket.as_path()) {
+            Ok(Liveness::Alive(reply)) => reply.owner,
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn stderr_log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn state(&self) -> devflow_core::state::State {
+        devflow_core::workflow::load_state(&self.root, self.phase).expect("load the phase's state")
+    }
+
+    fn exit_file(&self) -> String {
+        fs::read_to_string(devflow_core::agent_result::exit_code_path(
+            &self.root, self.phase,
+        ))
+        .expect("read the exit file")
+        .trim()
+        .to_string()
+    }
+
+    /// Every `name` event for this phase, each as its JSON object. Fields are
+    /// indexed on the map, so a missing one panics instead of reading as a
+    /// default.
+    fn events(&self, name: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let phase = serde_json::json!(self.phase);
+        fs::read_to_string(devflow_core::events::events_path(&self.root))
+            .unwrap_or_default()
+            .lines()
+            .map(
+                |line| match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(serde_json::Value::Object(map)) => map,
+                    other => panic!("an event line is not a JSON object: {line:?} ({other:?})"),
+                },
+            )
+            .filter(|map| map["event"] == name && map["phase"] == phase)
+            .collect()
+    }
+
+    /// Exactly one `stream_wait_bounded` event, naming only the reader, with
+    /// the capture closed.
+    fn assert_one_reader_bound(&self) {
+        let bounded = self.events("stream_wait_bounded");
+        assert!(
+            bounded.len() == 1,
+            "WR-03: expected exactly one stream_wait_bounded event, found {bounded:?}"
+        );
+        assert_eq!(bounded[0]["unfinished"], serde_json::json!(["reader"]));
+        assert_eq!(bounded[0]["capture_closed"], serde_json::json!(true));
+    }
+
+    /// E1 and E2 after the monitor exited 0: the run reached its advance and
+    /// halted at `--until code`.
+    fn assert_reached_advance(&self, holder: (u32, u64), stdout_held: bool) {
+        assert!(
+            devflow_core::agent::is_same_process(holder.0, holder.1),
+            "the holder still runs: the supervisor's wait ended, not the holder"
+        );
+        assert_eq!(self.exit_file(), "0");
+        let state = self.state();
+        assert!(state.stopped, "the run halted at --until code: {state:?}");
+        assert_eq!(
+            state.stop_reason,
+            Some(format!(
+                "stopped after {} completed (--until {})",
+                devflow_core::stage::Stage::Code,
+                devflow_core::stage::Stage::Code
+            ))
+        );
+        let finished: Vec<_> = self
+            .events("workflow_finished")
+            .into_iter()
+            .filter(|event| event["reason"] == "stopped_at")
+            .collect();
+        assert_eq!(finished.len(), 1, "one stopped_at halt: {finished:?}");
+        if stdout_held {
+            self.assert_one_reader_bound();
+        } else {
+            let bounded = self.events("stream_wait_bounded");
+            assert!(
+                bounded.is_empty(),
+                "a released stdout is not a bounded wait: {bounded:?}"
+            );
+        }
+        assert!(matches!(
+            supervisor::probe(self.socket.as_path()),
+            Ok(Liveness::Gone)
+        ));
+    }
+}
+
+impl Drop for HeldStdoutRun {
+    fn drop(&mut self) {
+        if let Some(mut monitor) = self.monitor.take()
+            && matches!(monitor.try_wait(), Ok(None))
+        {
+            let _ = monitor.kill();
+            let _ = monitor.wait();
+        }
+        if let Some((pid, start)) = read_holder_record(&self.record)
+            && let Ok(signed) = libc::pid_t::try_from(pid)
+            && signed > 1
+            && devflow_core::agent::is_same_process(pid, start)
+        {
+            // SAFETY: `signed > 1` is the holder this run's agent recorded,
+            // confirmed by its start time to still be that process.
+            unsafe { libc::kill(signed, libc::SIGKILL) };
+        }
+    }
+}
+
+/// E1 (fail-first): a completed stream run whose agent left `sleep 300`
+/// holding its stdout reaches its advance on the real binary, under the
+/// production idle timeout.
+#[test]
+fn a_completed_stream_run_reaches_its_advance_while_a_leftover_process_holds_stdout() {
+    let mut run = HeldStdoutRun::spawn(PhaseId::new(72), "sleep 300", false);
+    let holder = run.holder();
+    let Some(status) = run.wait_exit(Duration::from_secs(30)) else {
+        panic!(
+            "WR-03: the __monitor still runs 30 s after its agent exited while holder {} holds \
+             its stdout; owner: {}; stderr: {}",
+            holder.0,
+            run.owner(),
+            run.stderr_log()
+        );
+    };
+    assert!(
+        status.success(),
+        "monitor exited {status:?}; stderr: {}",
+        run.stderr_log()
+    );
+    run.assert_reached_advance(holder, true);
+}
+
+/// E2 (control): with the holder on `/dev/null`, the hold before the stream
+/// thread wait is reached on the unfixed and the fixed code alike, so this
+/// proves the binary under test honours the test-support hold E3 relies on
+/// (agy-4), and the run then reaches its advance with no bounded wait.
+#[test]
+fn a_completed_stream_run_reaches_its_advance_once_its_leftover_process_released_stdout() {
+    let mut run = HeldStdoutRun::spawn(
+        PhaseId::new(73),
+        "sleep 300 </dev/null >/dev/null 2>&1",
+        true,
+    );
+    let holder = run.holder();
+    let held = run.aux_path.join("hold.held");
+    if !holds_within(Duration::from_secs(30), || held.exists()) {
+        panic!(
+            "HOLD-UNREACHABLE: the monitor never reached the stream-wait hold within 30 s, so \
+             this binary lacks the test-support hold; owner: {}; stderr: {}",
+            run.owner(),
+            run.stderr_log()
+        );
+    }
+    fs::write(&run.hold, "").expect("release the hold");
+    let Some(status) = run.wait_exit(Duration::from_secs(30)) else {
+        panic!(
+            "WR-03: the released __monitor still runs 30 s later; owner: {}; stderr: {}",
+            run.owner(),
+            run.stderr_log()
+        );
+    };
+    assert!(
+        status.success(),
+        "monitor exited {status:?}; stderr: {}",
+        run.stderr_log()
+    );
+    run.assert_reached_advance(holder, false);
+}
+
+/// E3 (fail-first): `devflow stop` sent while a completed run is `advancing`
+/// with its agent's stdout held ends the run at advance safe point 1: no
+/// `--until` halt, no next stage, the socket removed, the supervisor gone.
+/// The hold parks the supervisor in `advancing` and releases on the stop
+/// request, so the stop lands there deterministically. The exit file keeps
+/// the agent's own `0` (backlog 999.166 item 6), asserted so the record says
+/// what happened.
+#[test]
+fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1() {
+    let phase = PhaseId::new(74);
+    let mut run = HeldStdoutRun::spawn(phase, "sleep 300", true);
+    let holder = run.holder();
+    let held = run.aux_path.join("hold.held");
+    if !holds_within(Duration::from_secs(30), || held.exists()) {
+        panic!(
+            "WR-03: the supervisor did not reach its stream-thread wait within 30 s of the \
+             agent's exit; owner: {}; stderr: {}",
+            run.owner(),
+            run.stderr_log()
+        );
+    }
+    let owner = run.owner();
+    if owner != "advancing" {
+        panic!("FIXTURE: the held supervisor reports owner {owner}, not advancing");
+    }
+
+    let stop_out = run.aux_path.join("stop.stdout");
+    let stop_err = run.aux_path.join("stop.stderr");
+    let mut stop = common::hermetic_devflow(&run.home)
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(&run.root)
+        .stdin(std::process::Stdio::null())
+        .stdout(fs::File::create(&stop_out).unwrap())
+        .stderr(fs::File::create(&stop_err).unwrap())
+        .spawn()
+        .expect("spawn devflow stop");
+    let mut stop_status = None;
+    holds_within(Duration::from_secs(40), || {
+        stop_status = stop.try_wait().expect("poll devflow stop");
+        stop_status.is_some()
+    });
+    if stop_status.is_none() {
+        common::kill_and_reap(&mut stop);
+    }
+    let stop_stdout = fs::read_to_string(&stop_out).unwrap_or_default();
+    let stop_stderr = fs::read_to_string(&stop_err).unwrap_or_default();
+    if !stop_status.is_some_and(|status| status.success()) {
+        panic!(
+            "WR-03: `devflow stop` sent in advancing did not exit 0 within 40 s ({stop_status:?})\n\
+             stdout: {stop_stdout}\nstderr: {stop_stderr}\nmonitor stderr: {}",
+            run.stderr_log()
+        );
+    }
+    assert!(
+        stop_stdout.contains(&format!(
+            "stop: stopped phase {phase} through its supervisor"
+        )),
+        "stdout: {stop_stdout}\nstderr: {stop_stderr}"
+    );
+
+    let Some(status) = run.wait_exit(Duration::from_secs(20)) else {
+        panic!(
+            "WR-03: the stopped __monitor still runs 20 s after `devflow stop`; stderr: {}",
+            run.stderr_log()
+        );
+    };
+    assert!(
+        devflow_core::agent::is_same_process(holder.0, holder.1),
+        "the holder still runs at the monitor's exit (status {status:?})"
+    );
+    let state = run.state();
+    assert!(state.stopped, "{state:?}");
+    let reason = state.stop_reason.clone().unwrap_or_default();
+    assert!(
+        reason.starts_with(ADVANCE_STOP_REASON),
+        "the stop was honoured at an advance safe point: {reason:?}"
+    );
+    let advance_stopped = run.events("advance_stopped");
+    assert_eq!(advance_stopped.len(), 1, "{advance_stopped:?}");
+    assert_eq!(advance_stopped[0]["safe_point"], serde_json::json!(1));
+    let halted: Vec<_> = run
+        .events("workflow_finished")
+        .into_iter()
+        .filter(|event| event["reason"] == "stopped_at")
+        .collect();
+    assert!(
+        halted.is_empty(),
+        "a stopped advance never reaches the --until halt: {halted:?}"
+    );
+    run.assert_one_reader_bound();
+    assert!(matches!(
+        supervisor::probe(run.socket.as_path()),
+        Ok(Liveness::Gone)
+    ));
+    assert_eq!(
+        run.exit_file(),
+        "0",
+        "the exit file keeps the agent's own code (999.166 item 6)"
+    );
+}
