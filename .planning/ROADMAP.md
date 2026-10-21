@@ -388,7 +388,7 @@ former criterion 4 (detect and report a 2.x state as incompatible) is retired;
 the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 25/29 plans executed (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
+**Plans**: 27/29 plans executed (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
 
 **Wave 1**
 
@@ -468,8 +468,8 @@ the milestone's major-version call.
 
 **Wave 18** *(gap closure: verification 2026-10-21 reproduced WR-03)*
 
-- [ ] 50-26-PLAN.md *(depends on 50-20)* — WR-03 fix: the stream loop ends at the agent's exit and the reader drain is bounded; fail-first tests and a revert check
-- [ ] 50-27-PLAN.md *(depends on 50-20)* — `--attempt-gate --current-source` and the runbook's attempt-2 delegation
+- [x] 50-26-PLAN.md *(depends on 50-20)* — WR-03 fix: the stream loop ends at the agent's exit and the reader drain is bounded; fail-first tests and a revert check
+- [x] 50-27-PLAN.md *(depends on 50-20)* — `--attempt-gate --current-source` and the runbook's attempt-2 delegation
 
 **Wave 19**
 
@@ -689,7 +689,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 25/29 | In Progress | — |
+| 50 | 27/29 | In Progress | — |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
