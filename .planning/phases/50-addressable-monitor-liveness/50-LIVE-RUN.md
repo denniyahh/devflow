@@ -5,21 +5,45 @@ saved with it. Every verdict line below is quoted from a saved `verdict-*.txt` f
 anything else (the raw evidence still on disk, a test run made while writing this record, or an operator note), it
 says so.
 
+**Updated:** 2026-10-21, plan 50-29, around live attempt 2 (run by 50-28 on the fixed binary) and its fault record
+`fault-7`, both published under `50-evidence/`. Attempt 1 and `fault-5` stay below as the history of the pre-fix binary.
+
 ## Verdict
 
-**SUPV-01 live record (V-28, V-29): the attempt gate says `shipped`.**
+**SUPV-01 live record (V-28, V-29): the attempt gate says `shipped` for live attempt 2, on the fixed binary.**
 
-From `50-evidence/attempt-1/verdict-attempt-gate.txt`, saved from `check-supervisor-evidence.sh --attempt-gate` run on
-the raw evidence home before sanitizing:
+From `50-evidence/attempt-2/verdict-attempt-gate.txt`, saved from
+`check-supervisor-evidence.sh --attempt-gate <home> --current-source` run on the raw evidence home before sanitizing:
+
+```
+ATTEMPT_GATE current_source=yes
+ATTEMPT_GATE fault=fault-7 bin_sha256=182ab8b546a8f93c3e62b33c6516448446593bdb767e8f2ff250ec3393f5045d
+ATTEMPT_GATE verdict=shipped attempt=2
+```
+
+**Why attempt 2 exists.** D-18 asks for the live record on the binary the phase ships. After attempt 1, the end-of-phase
+review found CR-01 (critical: a stop accepted during a `--yes-ship` Ship advance did not stop the merge) and the phase
+verifier reproduced WR-03 (a completed stream run whose agent left a process holding its stdout never returned). Both
+were treated as blocking and fixed in-phase (CR-01: `8946d7d`, `373f1e6`; WR-03: `07e237b`, `493156b`, `5b1c417`), so
+attempt 1's binary no longer is the phase's code. Attempt 2's binary was built clean from `bca7c35`, which contains both
+fixes. `current_source=yes` says the fault directory paired with it by `bin_sha256` (`fault-7`) also records the
+checkout's committed crate tree.
+
+This rests on one live attempt and one fault-arm run on the same binary. It shows that the supervisor path *can* carry
+a full auto run to Ship and that the five fault cases behave as specified on that binary. It is one sample: it does not
+bound how often either succeeds. The limits are listed under "What this evidence does not establish" below.
+
+**Attempt 1, history on the pre-fix binary.** From `50-evidence/attempt-1/verdict-attempt-gate.txt`, saved by 50-20
+from the plain `--attempt-gate` (`--current-source` did not exist yet):
 
 ```
 ATTEMPT_GATE fault=fault-5 bin_sha256=9b0ec70c7190301067b6e8438e27ed7fb8ae2f00de90638de3608b1391c098f6
 ATTEMPT_GATE verdict=shipped attempt=1
 ```
 
-This rests on one live attempt and one fault-arm run on the same binary. It shows that the supervisor path *can* carry
-a full auto run to Ship and that the five fault cases behave as specified on that binary. It is one sample: it does not
-bound how often either succeeds. The limits are listed under "What this evidence does not establish" below.
+Attempt 1 ran on `9b0ec70c…`, built from `1deaa4d`, before the CR-01 and WR-03 fixes. It is kept as history and is not
+the phase's verdict: under `--current-source` it is refused, because its paired fault record is not from the current
+crate tree (50-27's real-data control).
 
 ## The record
 
@@ -61,14 +85,82 @@ What is committed, and how it got there (D-18, after Phase 49's D-26):
   Those fragments were replaced with `REDACTED-EMAIL-LOCAL` and `REDACTED-EMAIL-DOMAIN` in the published copies only
   (3 occurrences each); the raw tree is unchanged. `--published` and the sanitizer scan were re-run afterwards.
 
+### Attempt 2's publication (50-29)
+
+The bullets above describe 50-20's publication of attempt 1 and `fault-5`. Attempt 2 and `fault-7` went through the same
+steps, on 2026-10-21:
+
+- **Judged on the raw tree first, into new file names only.** `attempt-2/verdict-attempt.txt` (`--attempt`), one
+  `--attempt-gate <home> --current-source` run copied to `attempt-2/verdict-attempt-gate.txt` and
+  `fault-7/verdict-attempt-gate.txt`, and `fault-7/verdict-fault.txt` (`--fault fault-7 --require-all`). No file already
+  in the raw tree was overwritten. `fault-7/verdict-require-all.txt` was already there from 50-28's run and was not
+  rewritten. There is no stopped attempt between 2 and N-1 (N is 2).
+- **Which fault directory is published.** Only `fault-7`, the one the gate pairs with attempt 2 by `bin_sha256`.
+  `fault-6` (`bc862759…`, the CR-01-fixed binary before the WR-03 fix) is not paired with any attempt and stays in the
+  raw tree.
+- **Curated as for attempt 1.** Not committed: `attempt-2/project/`, `attempt-2/collected/sessions/`,
+  `attempt-2/prelaunch/agent-env-names.txt`, the empty `ledger.lock` and `collected/devflow/.gitignore`. Published:
+  82 files in `attempt-2/`, 12 in `fault-7/`.
+- **The sanitizer refused attempt 2 once, and the refusal was correct.** It printed `github_token_prefix` and
+  `credential_named_assignment` for line 171 of `collected/devflow/phase-01-stdout` and for the same line of its copy
+  `gates/003-ship/devflow/phase-01-stdout`. The throwaway project's own security review, run by the live agent, had
+  planted three made-up credentials (an AWS access key id, an AWS secret access key and a `ghp_` GitHub token) in a
+  scratch `ctl/leak.txt` as a gitleaks negative control, and the command that wrote them is in the stream transcript.
+- **Redacted by hand in the published copy (operator decision 2026-10-21, "Redact in published copy").** In the staged
+  copy only, each of the three values was replaced with `REDACTED-PLANTED-CONTROL-SECRET` in both files: one occurrence
+  of each value per file, so 3 replacements per file and 6 in all. A count of each value over every staged file found
+  them in those two files only. The raw tree is unchanged. The `ghp_` value is not the host's `gh auth token` (compared
+  by equality in a script that printed neither); whether it is valid anywhere else is not known. The values were never
+  printed. Both ways: the sanitizer refused the unredacted staged copy (exit 1, four `refused:` lines, no destination
+  left) and accepted the redacted one; gitleaks found 2 findings (`aws-access-token`, `github-pat`) in the raw file and
+  none in the published tree.
+- **No email fragment needed redacting.** `--identity-scan` (the host's Claude account address and its git
+  `user.email`, 9 tokens) printed `IDENTITY tokens=9` and `IDENTITY verdict=pass` on both sanitized copies and on the
+  whole published tree, so no `REDACTED-EMAIL-*` replacement was made for attempt 2. The raw attempt-2 tree does hold
+  the full account address and its fragments, in 16 files, all under `collected/sessions/`, which is not published. The
+  scan's real-data control: the raw attempt-1 capture fails it with two `source=account` hit lines (a `local` and a
+  `domain` run).
+- **Checks on the published tree** (after the move, before the commit): `--published 50-evidence` printed
+  `PUBLISHED verdict=pass`; `--published 50-evidence --attempt 2` printed `PUBLISHED attempt=2 verdict_line=shipped`,
+  `PUBLISHED attempt_current_source=yes`, `PUBLISHED attempt_fault=fault-7` and `PUBLISHED verdict=pass`; the Phase 49
+  sanitizer's `scan` printed nothing and exited 0; `gitleaks dir` reported no finding.
+
 ### Attempts
 
 | Attempt | Outcome | Binary `bin_sha256` | Build commit | Claude | GSD |
 |---------|---------|---------------------|--------------|--------|-----|
-| 1 | shipped (`verdict.json`: `"outcome":"shipped"`, `"workflow_shipped":true`) | `9b0ec70c7190301067b6e8438e27ed7fb8ae2f00de90638de3608b1391c098f6` | `1deaa4d` (`build_dirty=false`) | 2.1.304 | 1.18.0 |
+| 1 (history: pre-fix binary) | shipped (`verdict.json`: `"outcome":"shipped"`, `"workflow_shipped":true`) | `9b0ec70c7190301067b6e8438e27ed7fb8ae2f00de90638de3608b1391c098f6` | `1deaa4d` (`build_dirty=false`) | 2.1.304 | 1.18.0 |
+| 2 (fixed binary; the verdict) | shipped (`verdict.json`: `"outcome":"shipped"`, `"workflow_shipped":true`, `"stop_note":null`) | `182ab8b546a8f93c3e62b33c6516448446593bdb767e8f2ff250ec3393f5045d` | `bca7c35` (`build_dirty=false`) | 2.1.306 | 1.18.0 |
 
-From `50-evidence/attempt-1/identity.txt` and `verdict.json`. The run started 2026-10-20T18:51:41Z and finished
-19:26:30Z on the private throwaway repository `denniyahh/p50-live-attempt-1` (PR #1, `feature/phase-01` into `main`).
+**Attempt 2.** From `50-evidence/attempt-2/identity.txt`, `verdict.json` and `collected/devflow/events.jsonl`. The run
+started 2026-10-21T20:28:05Z and finished 20:51:15Z on the private throwaway repository `denniyahh/p50-live-attempt-2`
+(PR #1, `feature/phase-01` into `main`, open). **It was performed by the orchestrating Claude session under the
+operator's delegation of 2026-10-21 ("Yes, but you do the run")**: preparing, the fault arm, creating and pushing the
+throwaway repository, launching, answering the Define and Code gates (the seeded D-07 preflight refusals, approved at
+20:30:08Z and 20:31:18Z) and collecting. `--yes-ship` answered Ship. Deleting the throwaway repository stays with the
+operator. No attempt was stopped between attempt 1 and attempt 2.
+
+`50-evidence/attempt-2/verdict-attempt.txt`:
+
+```
+CHECK passed=11 failed=0
+ATTEMPT p49_positive=pass
+ATTEMPT check=events readable ok
+ATTEMPT check=stage_launched present ok
+ATTEMPT check=every launch names its socket, label and id ok
+ATTEMPT check=both launch shapes ok
+ATTEMPT check=no monitor_pid key ok
+ATTEMPT launches=6 stream=5 capture=1
+ATTEMPT sidecars_left=0
+ATTEMPT verdict=pass
+```
+
+It also carries `NOTE gate_census count=3 stages=define,code,ship` and `NOTE gate <stage> unexpected=false` for each
+gate, with the same two meanings of "unexpected" as attempt 1 (below).
+
+**Attempt 1.** From `50-evidence/attempt-1/identity.txt` and `verdict.json`. The run started 2026-10-20T18:51:41Z and
+finished 19:26:30Z on the private throwaway repository `denniyahh/p50-live-attempt-1` (PR #1, `feature/phase-01` into
+`main`).
 
 `50-evidence/attempt-1/verdict-attempt.txt` (the Phase 49 positive arm, then the Phase 50 launch checks):
 
@@ -93,7 +185,29 @@ purpose. Both values are correct under their own definitions; one is not to be r
 
 ### Fault arm (V-29)
 
-`50-evidence/fault-5/verdict-fault.txt` (`--fault fault-5 --require-all`, run on the raw directory):
+**On attempt 2's binary.** `50-evidence/fault-7/verdict-fault.txt` (`--fault fault-7 --require-all`, run by 50-29 on
+the raw directory):
+
+```
+FAULT case=alive-stop-capture ok live
+FAULT case=alive-stop-stream ok live
+FAULT case=kill9-at-gate ok live
+FAULT case=kill9-stale-stop ok live
+FAULT case=publish-unlink-window ok pointer
+FAULT case=stop-races-completion ok live
+FAULT bin_sha256=182ab8b546a8f93c3e62b33c6516448446593bdb767e8f2ff250ec3393f5045d
+FAULT complete=yes
+FAULT verdict=pass
+```
+
+`fault-7/src_matches_checkout` is `true`, and `fault-7/verdict-require-all.txt` (50-28's run) holds the same lines. Per
+case (from the committed `case-*.json`), as for `fault-5` below: every live case probed `ALIVE` before the stop and
+`GONE` after it, the stop exited 0, `next_stage_launched` is `false` and `members_after` is empty; both kill cases probed
+`STALE` after the SIGKILL; `kill9-at-gate` recorded `lock_holder_after: "none"` and `gate_response_written: false`;
+`stop-races-completion` recorded `first_agent_exit: "143"` and `advance_ran: false`.
+
+**On attempt 1's binary (history).** `50-evidence/fault-5/verdict-fault.txt` (`--fault fault-5 --require-all`, run on
+the raw directory):
 
 ```
 FAULT case=alive-stop-capture ok live
@@ -120,8 +234,26 @@ not a live case.
 
 ### Live launch records (V-28)
 
-The six `stage_launched` events in `50-evidence/attempt-1/collected/devflow/events.jsonl` (sanitized; `~` is the home
-directory):
+**Attempt 2.** The six `stage_launched` events in `50-evidence/attempt-2/collected/devflow/events.jsonl` (sanitized;
+`~` is the home directory):
+
+| Stage | `launch` | `launch_id` | `socket_path` |
+|-------|----------|-------------|---------------|
+| define | `stream` | `18e0a580d5f5a82e` | `~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a580d5f5a82e.sock` |
+| plan | `stream` | `18e0a5840b0e4e26` | `~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a5840b0e4e26.sock` |
+| code | `stream` | `18e0a58d55c6b722` | `~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a58d55c6b722.sock` |
+| code (resume) | `capture` | `18e0a5b5a11e0224` | `~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a5b5a11e0224.sock` |
+| validate | `stream` | `18e0a61347900216` | `~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a61347900216.sock` |
+| ship | `stream` | `18e0a61fcc71eb82` | `~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a61fcc71eb82.sock` |
+
+As in attempt 1, the capture launch follows the `checkpoint_auto_decided` event for Code. Measured by 50-29 on the
+**raw** events: every socket path is 77 bytes and its directory is `$HOME/.cache/devflow/sock`, under the 107-byte bound.
+`supervisor/status.txt` shows `stage: idle` and no supervisor line. The raw `events.jsonl` holds 43 events and **0
+`stream_wait_bounded` events** (counted two ways: parsing every event's name, and a fixed-string search that found no
+line).
+
+**Attempt 1 (history).** The six `stage_launched` events in `50-evidence/attempt-1/collected/devflow/events.jsonl`
+(sanitized; `~` is the home directory):
 
 | Stage | `launch` | `launch_id` | `socket_path` |
 |-------|----------|-------------|---------------|
@@ -146,19 +278,28 @@ record (one `cargo nextest run --no-tests=fail -E 'test(=<name>)'` per test, 26 
 `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` are unchanged since `1deaa4d`, the attempt binary's build commit:
 26 passed. A misspelled-name control in the same run failed, so a pass is not an empty filter.
 
+**Re-run for attempt 2 (50-29, 2026-10-21).** Every test row 4 cites that was added after `1deaa4d` was run again by
+exact name, one `cargo nextest run --no-tests=fail -E 'test(=<path>)'` per test (14 runs: the WR-03 tests A, B, C, D, F,
+G, E1, E2, E3, the doc check, and CR-01's four), at `2096b85`, whose `crates/`, `Cargo.toml`, `Cargo.lock` and
+`rust-toolchain.toml` are unchanged since `bca7c35`, attempt 2's build commit: 14 passed (`1 test run: 1 passed` each).
+A misspelled-name control in the same run exited 4 (`0 tests run`, `error: no tests to run`). No crate test changed
+after `1deaa4d` other than these additions (the 50-26 and CR-01 diffs append tests and change production code only), so
+the 26 tests above were not re-run.
+
 | Criterion | What it requires | Tests (V-ids) | Live record lines |
 |-----------|------------------|---------------|-------------------|
 | 1 | GONE / STALE / ALIVE from state plus socket, no PID; each fixture produces only its state | V-01, V-02, V-03, V-04 (discrimination; mutants in 50-05), V-05 | Fault arm: every live case `probe_before` `ALIVE`, `probe_after` `GONE`; both kill cases `probe_after_kill` `STALE` |
-| 2 | `PipeOwning` and `Legacy` answer liveness identically | V-08 (non-Claude adapter, both arms), V-09, V-10 | Attempt 1: `ATTEMPT launches=6 stream=5 capture=1`, `ATTEMPT check=both launch shapes ok`; the `stage_launched` table above (`stream` and `capture`). Fault arm: `alive-stop-stream` and `alive-stop-capture` both `ok live` |
-| 3 | Socket path persisted, under the cache dir, `sun_path` overflow refused by name | V-06, V-07 | Six recorded `socket_path`s under `$HOME/.cache/devflow/sock`, each 77 bytes raw (`ATTEMPT check=every launch names its socket, label and id ok`) |
-| 4 | `stop` over the socket: group killed, 143, no advance, socket removed; lock-free run; stop racing completion never launches the next stage | V-14, V-15, V-17 | Fault arm: `alive-stop-stream`, `alive-stop-capture`, `stop-races-completion` `ok live`, each `next_stage_launched: false`, `members_after: []`, `probe_after` `GONE` |
+| 2 | `PipeOwning` and `Legacy` answer liveness identically | V-08 (non-Claude adapter, both arms), V-09, V-10 | Attempt 2 (and attempt 1 before it): `ATTEMPT launches=6 stream=5 capture=1`, `ATTEMPT check=both launch shapes ok`; the `stage_launched` tables above (`stream` and `capture`). Fault arm (`fault-7`, and `fault-5` before it): `alive-stop-stream` and `alive-stop-capture` both `ok live` |
+| 3 | Socket path persisted, under the cache dir, `sun_path` overflow refused by name | V-06, V-07 | Attempt 2: six recorded `socket_path`s under `$HOME/.cache/devflow/sock`, each 77 bytes raw (`ATTEMPT check=every launch names its socket, label and id ok`); the same for attempt 1 |
+| 4 | `stop` over the socket: group killed, 143, no advance, socket removed; lock-free run; stop racing completion never launches the next stage | V-14, V-15, V-17. **CR-01** (a stop during a `--yes-ship` Ship advance): `pipeline_launch::tests::a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval` and `pipeline_launch::tests::a_stop_before_finalization_is_honoured_before_the_merge`, with their no-stop controls `pipeline_launch::tests::without_a_stop_after_safe_point_1_the_yes_ship_run_ships` and `pipeline_launch::tests::without_a_stop_before_finalization_the_run_ships`. **WR-03** (a completed stream run whose stdout a leftover process holds): A `monitor::tests::a_completed_stream_run_returns_while_a_leftover_process_holds_the_agents_stdout`, C `monitor::tests::no_line_reaches_the_capture_after_the_stdout_wait_expires`, D `monitor::tests::a_stopped_stream_run_returns_while_a_process_outside_the_agent_group_holds_its_stdout`, F `monitor::tests::a_stream_run_returns_while_a_leftover_process_keeps_writing_to_the_agents_stdout`, E1 `a_completed_stream_run_reaches_its_advance_while_a_leftover_process_holds_stdout`, E3 `a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1`; controls B `monitor::tests::a_completed_stream_run_returns_once_its_leftover_process_released_the_agents_stdout` and E2 `a_completed_stream_run_reaches_its_advance_once_its_leftover_process_released_stdout`; the revert check (`wr03-revert-check.sh run`, 50-26) printed `REVERT verdict=pass`, with A, C, D, F, E1 and E3 failing (`rc=100 marker=yes`) and B and E2 passing on the reverted fix. On the WR-03 path these clauses hold (E3): the stop sent while the supervisor is `advancing` is accepted and honoured at safe point 1 (state `stopped`, one `advance_stopped` with `safe_point` 1, no next stage), the socket is removed and `devflow stop` exits 0; D: a stop while the agent runs, its stdout also held outside its group, ends with exit file `143`, advance suppressed and the socket GONE. Two clauses do **not** hold on the completed-run path and are not claimed: no agent group is killed, because the agent had already exited and an in-group leftover keeps running (999.164 item 5); and the exit file keeps the agent's own code `0` while the `stopped` line reports 143 (999.166 item 6) | Fault arm (`fault-7`, and `fault-5` before it): `alive-stop-stream`, `alive-stop-capture`, `stop-races-completion` `ok live`, each `next_stage_launched: false`, `members_after: []`, `probe_after` `GONE`. No stop was sent in either live attempt, and attempt 2's log has 0 `stream_wait_bounded` events, so neither fix's path ran live |
 | 5 | SIGTERM / SIGINT behave like a socket `shutdown` | V-16 | None live: no signal was sent to a supervisor in the attempt or in the fault arm |
 | 6 | STALE backstop signals only a validated group; previous boot removed; leader gone refused | V-18, V-19, V-20, V-21 | Fault arm: `kill9-stale-stop` and `kill9-at-gate` `ok live` (leader-present path only; the refusal paths are fixture-only) |
-| 7 | Sockets listed and probed with no state; `doctor` reports orphans; read-only commands never kill or remove; `start`/`resume` refuse over a live sidecar when state will not load | V-22, V-23, V-36, V-37, V-49 | `ATTEMPT sidecars_left=0`: no sidecar left after a run to Ship. The refusal paths did not occur live |
+| 7 | Sockets listed and probed with no state; `doctor` reports orphans; read-only commands never kill or remove; `start`/`resume` refuse over a live sidecar when state will not load | V-22, V-23, V-36, V-37, V-49 | `ATTEMPT sidecars_left=0` (attempt 2, and attempt 1): no sidecar left after a run to Ship. The refusal paths did not occur live |
 | 8 | Recycled-pid lock reclaim by start time; e2e tests isolate `HOME`, `XDG_CACHE_HOME`, `DEVFLOW_CACHE_DIR` and reap supervisors | V-24, V-25, V-26 | None live (test-suite property) |
 
-V-28 (the live rig) is closed by attempt 1 and its saved verdicts. V-29 (the fault arm on the attempt's binary) is
-closed by `fault-5` and its saved verdicts.
+V-28 (the live rig) is closed by attempt 2 and its saved verdicts (`ATTEMPT_GATE verdict=shipped attempt=2`,
+`ATTEMPT_GATE current_source=yes`). V-29 (the fault arm on the attempt's binary) is closed by `fault-7` and its saved
+verdicts (`FAULT verdict=pass`). Attempt 1 and `fault-5` closed them on the pre-fix binary and are kept as history.
 
 ## What this evidence does not establish
 
@@ -175,11 +316,31 @@ closed by `fault-5` and its saved verdicts.
   only, and no macOS host or CI has run it.
 - **The publish/unlink window is fixture-only.** The fault arm records it as a pointer to its fixture test, never as a
   live case.
-- **Only the happy path ran live.** No stop, kill or signal was sent during attempt 1. Criteria 4-6 rest on the fault
-  arm's synthetic cases and on tests; criterion 5 (signals) and criteria 7-8 have no live record at all.
+- **Only the happy path ran live.** No stop, kill or signal was sent during attempt 1 or attempt 2. Criteria 4-6 rest on
+  the fault arm's synthetic cases and on tests; criterion 5 (signals) and criteria 7-8 have no live record at all. In
+  particular, the WR-03 and CR-01 stop paths were not exercised live in attempt 2: they rest on their tests (row 4), on
+  50-26's revert check and on the fault arm.
 - **The race case was won by the stop.** In the fault arm, `stop-races-completion` is recorded with the stop winning
-  (`first_agent_exit: "143"`, `advance_ran: false` in all five fault-arm runs, `fault-1` to `fault-5`). The branch where the agent completes first and the stop reaches the advance rests on
+  (`first_agent_exit: "143"`, `advance_ran: false` in `fault-1` to `fault-5`, and in `fault-7`). The branch where the agent completes first and the stop reaches the advance rests on
   the 50-13 and 50-23 fixtures.
+- **Attempt 2's gates were answered by the orchestrating Claude session**, under the operator's delegation of
+  2026-10-21. `responded_by` records the same user name whoever typed the answer, so the event log cannot tell the
+  session's answers from the operator's. The gates answered were the seeded D-07 refusals, not an unplanned gate.
+- **A stop honoured at a safe point after a completed run leaves the exit file with the agent's own code** (`0`) while
+  the parked caller's `stopped` line says 143. E3 asserts the `0`; it is backlog 999.166 item 6, which names this limit.
+- **WR-03's 3 s stream-wait bound is not a measured need.** It rests on reading the code and on 50-26's tests. After
+  the supervisor exits, a leftover process that writes to the agent's old stdout gets SIGPIPE or EPIPE: DevFlow sends
+  nothing, that is the pipe closing.
+- **A stream now ends at the agent leader's exit, not at stdout EOF.** A launcher whose leader exits before the children
+  it started finish writing would lose what they write more than 3 s later (50-26's limit). Checked while planning
+  50-26: `claude` is a native ELF binary with no wrapper process, and the `agy` wrapper `exec`s
+  `mise exec … -- antigravity-cli`, so it does not stay behind as a separate leader; whether `mise exec` and
+  `antigravity-cli` exec or wait on a child was not checked.
+- **WR-03's condition did not occur live.** Attempt 2's raw `events.jsonl` holds **0** `stream_wait_bounded` events, so
+  no stream wait was cut short by a held stdout in that run. That says nothing about how often the condition occurs.
+- **`--identity-scan` covers two identifiers only:** the host's Claude account email and its git `user.email` values.
+  The GitHub user name still appears in the published tree by design (see "The record"), and any other personal
+  identifier is not scanned.
 - **The run used seeded gates.** Define and Code fired on the disposable project's planted D-07 preflight refusals and
   the seeded `blocking-human` checkpoint was auto-decided by design. That shows nothing about an unplanned gate.
 - **The checks on the published tree are about content, not meaning.** `--published` and the sanitizer scan look for
