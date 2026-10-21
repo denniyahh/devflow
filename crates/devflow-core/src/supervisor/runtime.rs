@@ -304,8 +304,10 @@ fn signal_group(pgid: u32, signal: libc::c_int) -> bool {
 /// Block until `pid` (a child of this process) has exited, without reaping
 /// it: `waitid(P_PID, pid, WEXITED | WNOWAIT)`. The unreaped zombie keeps its
 /// pid and process group, so a group signal sent afterwards still reaches
-/// only that group.
-fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
+/// only that group. Its second caller is `monitor.rs`'s stream exit watch
+/// (50-26, WR-03), which ends the stream at the agent's exit without
+/// reaping it.
+pub(crate) fn wait_for_exit_without_reaping(pid: u32) -> io::Result<()> {
     let id = libc::id_t::from(pid);
     loop {
         // SAFETY: an all-zero siginfo_t is a valid out-parameter for waitid.

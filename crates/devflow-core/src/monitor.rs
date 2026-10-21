@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -937,17 +937,168 @@ pub fn user_turn_line_for(agent: AgentKind, prompt: &str) -> String {
     }
 }
 
-/// The stream shape's writer and reader threads, joined once the agent has
-/// been reaped.
+/// The capture file the stream shape's reader tees into, shared with
+/// [`StreamThreads`] so the bound in [`StreamThreads::join_within`] can take
+/// it from a reader still blocked on a held stdout. `None` once taken: the
+/// reader then discards what it reads and keeps reading to EOF.
+type SharedCapture = Arc<Mutex<Option<std::fs::File>>>;
+
+/// How long [`run_supervised_stage`] waits for a stream stage's threads once
+/// the agent has exited (WR-03). The agent's own output is already in the
+/// pipe by then and drains in milliseconds; a thread still running at the
+/// bound is blocked on a pipe end that a process the agent started still
+/// holds, which no wait would end. Waiting on it without a bound kept a
+/// completed or stopped supervisor alive forever.
+const READER_DRAIN_WAIT: Duration = crate::agent::TERMINATE_VERIFY_WAIT;
+
+/// The stream shape's writer, reader and exit-watch threads, and the capture
+/// they share, waited for once the agent has been reaped.
 struct StreamThreads {
     writer: std::thread::JoinHandle<()>,
     reader: std::thread::JoinHandle<()>,
+    exit_watch: std::thread::JoinHandle<()>,
+    capture: SharedCapture,
+}
+
+/// What [`StreamThreads::join_within`] left running at its bound.
+#[derive(Debug)]
+struct UnjoinedStreamThreads {
+    /// The detached threads: `writer`, `reader` or `exit_watch`.
+    unfinished: Vec<&'static str>,
+    /// How long the threads were waited for.
+    waited: Duration,
+    /// Whether the capture file was taken from the reader (and closed), so
+    /// nothing more reaches it.
+    capture_closed: bool,
 }
 
 impl StreamThreads {
-    fn join(self) {
-        let _ = self.writer.join();
-        let _ = self.reader.join();
+    /// Wait at most `wait` for all three threads and join each that
+    /// finished. `None` when all three were joined. Otherwise take the
+    /// capture from the reader (`try_lock`, retried for at most one more
+    /// `wait`, so a capture write blocked past both waits leaves it in
+    /// place), detach every unfinished thread by dropping its handle, and
+    /// report what was left. Nothing is signalled: a detached reader keeps
+    /// the pipe's read end open and drained until this process exits.
+    fn join_within(self, wait: Duration) -> Option<UnjoinedStreamThreads> {
+        let started = std::time::Instant::now();
+        let all_finished = |threads: &Self| {
+            threads.writer.is_finished()
+                && threads.reader.is_finished()
+                && threads.exit_watch.is_finished()
+        };
+        while !all_finished(&self) && started.elapsed() < wait {
+            std::thread::sleep(crate::agent::TERMINATE_VERIFY_POLL);
+        }
+        let waited = started.elapsed();
+        let Self {
+            writer,
+            reader,
+            exit_watch,
+            capture,
+        } = self;
+        let mut unfinished = Vec::new();
+        for (name, handle) in [
+            ("writer", writer),
+            ("reader", reader),
+            ("exit_watch", exit_watch),
+        ] {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // Dropping the handle detaches the thread.
+                unfinished.push(name);
+            }
+        }
+        if unfinished.is_empty() {
+            return None;
+        }
+        Some(UnjoinedStreamThreads {
+            unfinished,
+            waited,
+            capture_closed: close_shared_capture(&capture, wait),
+        })
+    }
+}
+
+/// Take the capture from the reader and close it: `try_lock`, retried every
+/// [`crate::agent::TERMINATE_VERIFY_POLL`] for at most `wait`. A poisoned
+/// lock is recovered, as `runtime.rs` does. `false` when the lock stayed
+/// held for the whole wait (a capture write blocked), leaving it in place.
+fn close_shared_capture(capture: &SharedCapture, wait: Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        match capture.try_lock() {
+            Ok(mut slot) => {
+                *slot = None;
+                return true;
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                *poisoned.into_inner() = None;
+                return true;
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if started.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(crate::agent::TERMINATE_VERIFY_POLL);
+    }
+}
+
+/// Wait at most [`READER_DRAIN_WAIT`] for a stream stage's threads, and when
+/// one is still running at the bound, log it and record a
+/// `stream_wait_bounded` event (`stage`, `waited_ms`, `unfinished`,
+/// `capture_closed`): a `__monitor` process's stderr is `/dev/null` in
+/// production, so the event is the only on-disk record (WR-03).
+fn finish_stream_threads(
+    threads: StreamThreads,
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Option<Stage>,
+) {
+    let Some(report) = threads.join_within(READER_DRAIN_WAIT) else {
+        return;
+    };
+    warn!(
+        "stream threads {:?} still running {:?} after the agent exited: a process the agent \
+         started still holds its stdout or stdin; detaching them (capture closed: {})",
+        report.unfinished, report.waited, report.capture_closed
+    );
+    crate::events::emit(
+        project_root,
+        phase,
+        "stream_wait_bounded",
+        serde_json::json!({
+            "stage": stage.map(|stage| stage.to_string()),
+            "waited_ms": u64::try_from(report.waited.as_millis()).unwrap_or(u64::MAX),
+            "unfinished": report.unfinished,
+            "capture_closed": report.capture_closed,
+        }),
+    );
+}
+
+/// One thing [`drive_stream_io`]'s loop hears about.
+enum StreamEvent {
+    /// A line the reader read from the agent's stdout (and teed).
+    Line(String),
+    /// The reader reached EOF (or a read error, treated as EOF).
+    Eof,
+    /// The agent process exited, seen without reaping it. Its stdout may
+    /// still be open in a process it started.
+    AgentExited,
+}
+
+/// Append `line` to the shared capture and flush, exactly as the reader
+/// always teed; discard it once the capture has been taken. The lock is
+/// released before the line is forwarded.
+fn tee_to_capture(capture: &SharedCapture, line: &str) {
+    let mut slot = capture.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(file) = slot.as_mut() {
+        if let Err(err) = writeln!(file, "{line}") {
+            warn!("could not append to the capture file: {err}");
+        }
+        let _ = file.flush();
     }
 }
 
@@ -964,8 +1115,14 @@ impl StreamThreads {
 ///   is already gone — a task-notification turn arriving after the child's
 ///   first turn would have nowhere to be delivered.
 /// - a **reader thread** owning the child's stdout: it tees each line verbatim
-///   to `capture` and forwards it to this thread. Dropping its sender at EOF
-///   is what surfaces `Disconnected`.
+///   to `capture` (shared, so the caller's bound can take it) and forwards it
+///   to this thread, then sends `Eof` at EOF. Once this loop has ended it
+///   keeps reading and teeing, so the agent's last buffered lines still reach
+///   the capture and the pipe stays drained.
+/// - an **exit-watch thread**: it blocks until the agent process exits,
+///   without reaping it (`waitid(WNOWAIT)`), then sends `AgentExited` (WR-03).
+///   A process the agent started may hold its stdout open after the agent
+///   exits, so EOF alone cannot end the stream.
 /// - this thread, which applies the close rule and the idle timeout.
 ///
 /// The write and the read MUST be on independent threads. Writing the prompt
@@ -974,13 +1131,14 @@ impl StreamThreads {
 /// context-heavy production stages that matter (the Linux pipe buffer is
 /// commonly 64KiB and a DevFlow stage prompt can exceed that in one write).
 ///
-/// Returns once stdout reaches EOF, the idle timeout has fired (after
-/// `on_idle_timeout` ran), or the stream stayed quiet after the close rule
-/// released stdin. Stdin is released before it returns, so the caller may
-/// then wait for the child. Used by [`run_supervised_stage`]'s stream shape.
+/// Returns once stdout reaches EOF, the agent process has exited, the idle
+/// timeout has fired (after `on_idle_timeout` ran), or the stream stayed
+/// quiet after the close rule released stdin. Stdin is released before it
+/// returns, so the caller may then wait for the child. Used by
+/// [`run_supervised_stage`]'s stream shape.
 fn drive_stream_io(
     child: &mut std::process::Child,
-    mut capture: std::fs::File,
+    capture: std::fs::File,
     agent: AgentKind,
     prompt: &str,
     idle_timeout: Duration,
@@ -1013,7 +1171,10 @@ fn drive_stream_io(
         drop(child_stdin);
     });
 
-    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let capture: SharedCapture = Arc::new(Mutex::new(Some(capture)));
+    let (event_tx, event_rx) = mpsc::channel::<StreamEvent>();
+    let reader_tx = event_tx.clone();
+    let reader_capture = Arc::clone(&capture);
     let reader = std::thread::spawn(move || {
         // `read_until` + `from_utf8_lossy`, NOT `BufRead::lines()` (peer review
         // 2026-08-03, CRITICAL). `lines()` yields `Err(InvalidData)` on a single
@@ -1028,6 +1189,7 @@ fn drive_stream_io(
         // I/O error still ends the loop, because that one really is EOF.
         let mut reader_buf = BufReader::new(child_stdout);
         let mut raw = Vec::new();
+        let mut forwarding = true;
         loop {
             raw.clear();
             match reader_buf.read_until(b'\n', &mut raw) {
@@ -1045,15 +1207,29 @@ fn drive_stream_io(
             // Tee VERBATIM before any interpretation: the whole Layer 1
             // cascade reads this file, and a line the close rule ignores
             // (unparseable noise, interleaved prose) must still reach it.
-            if let Err(err) = writeln!(capture, "{line}") {
-                warn!("could not append to the capture file: {err}");
-            }
-            let _ = capture.flush();
-            if line_tx.send(line).is_err() {
-                break;
+            tee_to_capture(&reader_capture, &line);
+            // A failed send means the loop below has ended. Keep reading:
+            // the agent's last buffered lines still reach the capture, and
+            // the pipe's read end stays open and drained, so a leftover
+            // writer is never killed by SIGPIPE while this process lives.
+            if forwarding && reader_tx.send(StreamEvent::Line(line)).is_err() {
+                forwarding = false;
             }
         }
-        // Dropping `line_tx` here is what surfaces `Disconnected` below.
+        let _ = reader_tx.send(StreamEvent::Eof);
+    });
+
+    // WR-03: end the stream at the agent's exit, not only at stdout EOF. A
+    // process the agent started can hold its stdout open after it exits.
+    // `waitid(WNOWAIT)` never reaps, so the caller's reap is untouched; an
+    // error (ECHILD once the caller reaped) counts as exited.
+    let watch_tx = event_tx;
+    let agent_pid = child.id();
+    let exit_watch = std::thread::spawn(move || {
+        if let Err(err) = crate::supervisor::runtime::wait_for_exit_without_reaping(agent_pid) {
+            debug!("exit watch on agent {agent_pid} ended with {err}; treating it as exited");
+        }
+        let _ = watch_tx.send(StreamEvent::AgentExited);
     });
 
     // Constraint 4's close rule lives in `CloseRule` so it can be unit-tested
@@ -1063,8 +1239,8 @@ fn drive_stream_io(
     let mut idle_extensions: u32 = 0;
 
     loop {
-        match line_rx.recv_timeout(idle_timeout) {
-            Ok(line) => {
+        match event_rx.recv_timeout(idle_timeout) {
+            Ok(StreamEvent::Line(line)) => {
                 if close_signalled {
                     continue;
                 }
@@ -1074,7 +1250,14 @@ fn drive_stream_io(
                     close_signalled = true;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(StreamEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(StreamEvent::AgentExited) => {
+                info!(
+                    "the agent exited; its stdout may still be open in a process it started, \
+                     so the stream ends here instead of at EOF"
+                );
+                break;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // AFTER a deliberate close, silence is EXPECTED, not a hang
                 // (peer review 2026-08-03, CRITICAL). The close rule fires only
@@ -1151,7 +1334,12 @@ fn drive_stream_io(
     // open stdin may never exit, and `child.wait()` would then block forever.
     drop(close_tx);
 
-    Ok(StreamThreads { writer, reader })
+    Ok(StreamThreads {
+        writer,
+        reader,
+        exit_watch,
+        capture,
+    })
 }
 
 /// How [`run_supervised_stage`] wires the agent's stdio: the two supervision
@@ -1279,10 +1467,16 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    before it publishes (RV-03; `serve` rewrites it with the same content).
 /// 4. The stream shape only: drive the agent's pipes through
 ///    `drive_stream_io` (first turn, capture tee, close rule, idle
-///    timeout). An idle-timeout group kill is a natural outcome,
-///    `Completed(128 + n)` with the idle-timeout verdict file, never a stop.
+///    timeout), which also ends when the agent process exits, even while a
+///    process it started still holds its stdout (WR-03). An idle-timeout
+///    group kill is a natural outcome, `Completed(128 + n)` with the
+///    idle-timeout verdict file, never a stop.
 /// 5. [`Supervisor::wait_agent`], then the exit file: the agent's code for
-///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`].
+///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`]. For
+///    either outcome the stream threads are then waited for at most
+///    [`READER_DRAIN_WAIT`]; at the bound the capture is closed, the
+///    unfinished threads are detached (nothing is signalled), and the bound
+///    is recorded as a `stream_wait_bounded` event.
 ///
 /// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
 /// advances only on [`AgentOutcome::Completed`].
@@ -1354,7 +1548,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         // stream threads are waited for. Compiled out of release builds.
         #[cfg(any(test, feature = "test-support"))]
         stream_wait_test_hold(&supervisor.token());
-        threads.join();
+        finish_stream_threads(threads, &spec.project_root, spec.phase, spec.stage);
     }
     info!(
         "supervised {} agent {pid} ended: {outcome:?}",
@@ -3640,7 +3834,7 @@ kill -9 $$
             crate::agent_result::exit_code_path(project_root, phase),
             format!("{code}\n"),
         )?;
-        threads.join();
+        finish_stream_threads(threads, project_root, phase, spec.stage);
         Ok(code)
     }
 
