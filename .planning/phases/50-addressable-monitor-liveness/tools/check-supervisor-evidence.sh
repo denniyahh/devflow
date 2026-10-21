@@ -13,6 +13,7 @@
 #   check-supervisor-evidence.sh collect-sidecars <EV> --project <dir> [--bin <devflow>]
 #   check-supervisor-evidence.sh --attempt <EV> [--p49-check <script>]
 #   check-supervisor-evidence.sh --attempt-gate <P50 home> [--p49-check <script>]
+#                                [--current-source [--repo <checkout>]]
 #   check-supervisor-evidence.sh --published <dir>
 #   check-supervisor-evidence.sh --live-run <50-LIVE-RUN.md>
 #   check-supervisor-evidence.sh --handoff <50-LIVE-RUN.md> --plan <50-20-PLAN.md>
@@ -66,6 +67,18 @@
 # --fault --require-all passes recording the attempt's bin_sha256 (D-17;
 # `ATTEMPT_GATE fault=<dir> bin_sha256=<hex>`). Exit 0 for shipped and
 # cap_reached, 1 for not_ready.
+#
+# --attempt-gate --current-source (50-27, operator ruling 2026-10-21) judges
+# an attempt after a crate fix: it refuses up front with `reason=uncommitted
+# crate source` when `git status --porcelain` on the crate paths in <checkout>
+# (default: the checkout holding this tool) prints anything, and a fault
+# directory counts as the attempt's match only if it also passes --src-check
+# against <checkout>. A match prints `ATTEMPT_GATE current_source=yes`; none
+# prints the not-ready reason ending `from the current crate source`. So an
+# attempt whose paired fault record was taken from another crate tree, such
+# as one built before a later fix, cannot ship. cap_reached is unchanged: it
+# counts stopped attempts, whatever source they ran. --repo is valid only
+# with --current-source.
 #
 # --published (50-25, D-18) judges the sanitized tree 50-20 commits: at least
 # one fault-* and one attempt-* directory, a fault-*/verdict-*.txt line
@@ -496,10 +509,11 @@ attempt_check() {
 # `--fault --require-all` passes must record the attempt's bin_sha256.
 # ---------------------------------------------------------------------------
 attempt_gate() {
-    python3 - "$SELF" "$1" "$2" <<'PY'
+    python3 - "$SELF" "$1" "$2" "$3" "$4" "${CRATE_PATHS[@]}" <<'PY'
 import json, pathlib, re, subprocess, sys
 
 script, home, p49 = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
+current_source, repo, crate_paths = sys.argv[4] == '1', sys.argv[5], sys.argv[6:]
 number = 'ABSENT'
 
 
@@ -511,6 +525,13 @@ try:
     number = (home / 'current-attempt').read_text().strip()
     if not re.fullmatch('[1-9]', number):
         raise ValueError('current-attempt must be one digit 1-9')
+    if current_source:
+        status = subprocess.run(['git', '-C', repo, 'status', '--porcelain', '--', *crate_paths],
+                                capture_output=True, text=True, timeout=60)
+        if status.returncode != 0:
+            raise ValueError(f'git status failed in {repo}')
+        if status.stdout.strip():
+            raise ValueError('uncommitted crate source')
     attempt = home / f'attempt-{number}'
     collected = attempt / 'collected'
     if not (collected / 'DONE').is_file():
@@ -555,11 +576,20 @@ try:
                 continue
             judged = subprocess.run(['bash', script, '--fault', str(fault), '--require-all'],
                                     capture_output=True, text=True, timeout=60)
-            if judged.returncode == 0:
-                match = fault
+            if judged.returncode != 0:
+                continue
+            if current_source:
+                source = subprocess.run(['bash', script, '--src-check', str(fault), '--repo', repo],
+                                        capture_output=True, text=True, timeout=60)
+                if source.returncode != 0:
+                    continue
+            match = fault
         if match is None:
-            print(f"ATTEMPT_GATE verdict=not_ready attempt={number} reason=no passing fault arm on attempt {number}'s binary")
+            suffix = ' from the current crate source' if current_source else ''
+            print(f"ATTEMPT_GATE verdict=not_ready attempt={number} reason=no passing fault arm on attempt {number}'s binary{suffix}")
             sys.exit(1)
+        if current_source:
+            print('ATTEMPT_GATE current_source=yes')
         print(f'ATTEMPT_GATE fault={match.name} bin_sha256={expected}')
         print(f'ATTEMPT_GATE verdict=shipped attempt={number}')
     else:
@@ -1868,22 +1898,27 @@ main() {
             collect_sidecars "$ev" "$project" "$bin"
             ;;
         --attempt | --attempt-gate)
-            local mode="$1" target="" p49=""
+            local mode="$1" target="" p49="" current_source=0 repo=""
             shift
             while [ "$#" -gt 0 ]; do
-                case "$1" in
-                    --p49-check) [ "$#" -ge 2 ] || usage; p49="$2"; shift ;;
-                    -*) usage ;;
+                case "$mode $1" in
+                    *" --p49-check") [ "$#" -ge 2 ] || usage; p49="$2"; shift ;;
+                    "--attempt-gate --current-source") current_source=1 ;;
+                    "--attempt-gate --repo") [ "$#" -ge 2 ] || usage; repo="$2"; shift ;;
+                    *" -"*) usage ;;
                     *) [ -z "$target" ] || usage; target="$1" ;;
                 esac
                 shift
             done
             [ -n "$target" ] || usage
+            # --repo names the checkout --current-source judges against; alone it means nothing.
+            [ -z "$repo" ] || [ "$current_source" -eq 1 ] || usage
             [ -n "$p49" ] || p49="$(p49_check_default)"
             if [ "$mode" = --attempt ]; then
                 attempt_check "$target" "$p49"
             else
-                attempt_gate "$target" "$p49"
+                [ "$current_source" -eq 0 ] || [ -n "$repo" ] || repo="$(default_repo)"
+                attempt_gate "$target" "$p49" "$current_source" "$repo"
             fi
             ;;
         --published)
