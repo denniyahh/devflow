@@ -388,7 +388,7 @@ former criterion 4 (detect and report a 2.x state as incompatible) is retired;
 the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 27/29 plans executed (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
+**Plans**: 28/29 plans executed (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
 
 **Wave 1**
 
@@ -473,7 +473,7 @@ the milestone's major-version call.
 
 **Wave 19**
 
-- [ ] 50-28-PLAN.md *(depends on 50-26, 50-27)* — live attempt 2 on the fixed binary: one `checkpoint:human-action` (D-18 ruling 2026-10-21)
+- [x] 50-28-PLAN.md *(depends on 50-26, 50-27)* — live attempt 2 on the fixed binary: one `checkpoint:human-action` (D-18 ruling 2026-10-21)
 
 **Wave 20**
 
@@ -689,7 +689,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 27/29 | In Progress | — |
+| 50 | 28/29 | In Progress | — |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
