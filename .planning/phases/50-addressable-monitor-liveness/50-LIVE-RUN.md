@@ -210,6 +210,17 @@ Already filed this phase by the 2026-10-19 external review (`reviews/2026-10-19-
 backlog 999.164 (`doctor`'s orphan list, probe timeouts in a stop's grace, `.part` leaks, connection flooding, members
 left after a normal completion) and 999.165 (`gate_notify_cmd` through `sh -c`).
 
+**Found after this record was written, by the end-of-phase code review (`50-REVIEW.md`, 2026-10-20):**
+- **CR-01 (critical): a stop accepted during a `--yes-ship` Ship advance did not stop the merge and release.** The
+  pre-written approval was read before the stop flag, and no safe point stood between safe point 1 and `finish_workflow`.
+  Fixed in-phase by operator decision (2026-10-21): `8946d7d` (tests that failed on the old code: the run shipped) and
+  `373f1e6` (safe point 5 before an auto-answered gate, safe point 6 at the start of finalization), each with a no-stop
+  control that ships. **Live attempt 1 ran on `9b0ec70c…`, which predates this fix**, so the live run does not exercise
+  the fixed path. The fault arm was re-run on the fixed binary: `fault-6` (`bin_sha256=bc862759f27c…`) prints
+  `FAULT verdict=pass` under `--require-all`, and `--fault-current` passes (raw tree only, not published). A copy of the
+  record holding only `fault-5` fails `--fault-current` (`dir=ABSENT`), the control.
+- The review's three warnings and three infos are deferred to backlog 999.166 (operator decision 2026-10-21).
+
 ## Phase-end macOS compile gate (V-56, MAC-3)
 
 Run 2026-10-20 on `97b5def` (crate sources unchanged since `1deaa4d`), rustc 1.97.1:
