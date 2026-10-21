@@ -1143,7 +1143,7 @@ const TEST_HOLD_WAIT: Duration = Duration::from_secs(30);
 /// window. A launch made outside an advance (the test's own first launch)
 /// never holds. Compiled out of non-test builds, together with every call.
 #[cfg(test)]
-fn test_hold(point: &str) {
+pub(crate) fn test_hold(point: &str) {
     if with_stop_token(|_| ()).is_none() {
         return;
     }
@@ -2472,6 +2472,8 @@ pub(crate) fn advance_with(
     if stopped_at_safe_point(&mut state, 1)? {
         return Ok(());
     }
+    #[cfg(test)]
+    test_hold("after_safe_point_1");
     // 999.138 residual: a stopped run never advances. `resume` clears
     // `stopped` before it launches, so no caller advances a stopped state
     // legitimately.
@@ -7796,6 +7798,12 @@ mod tests {
         /// Launch stage Define for `phase` (capture shape, Supervise mode,
         /// `--until plan`) and return once N is recorded.
         fn launch(phase: PhaseId) -> Self {
+            Self::launch_with(phase, |_, _| {})
+        }
+
+        /// [`launch`](Self::launch), with `configure` applied to the repo
+        /// and the state before it is saved and stage N launched.
+        fn launch_with(phase: PhaseId, configure: impl FnOnce(&Path, &mut State)) -> Self {
             let cache = PathBuf::from(
                 std::env::var_os("DEVFLOW_CACHE_DIR").expect("the parent passes DEVFLOW_CACHE_DIR"),
             );
@@ -7811,6 +7819,7 @@ mod tests {
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
             state.legacy_claude_launch = true;
             state.stop_until = Some(Stage::Plan);
+            configure(&root, &mut state);
             workflow::save_state(&state).unwrap();
             let launched = launch_stage(&mut state, None, None);
             let n = state.supervisor.clone();
@@ -8785,6 +8794,144 @@ mod tests {
         );
         assert_eq!(events_named(&run.root, "workflow_aborted").len(), 1);
         assert!(events_named(&run.root, "advance_stopped").is_empty());
+    }
+
+    // ---- CR-01 (50-REVIEW.md): a stop before a `--yes-ship` merge ----
+
+    /// Whether `branch` exists in the repo at `root`.
+    fn branch_exists(root: &Path, branch: &str) -> bool {
+        devflow_core::test_support::git_command(root)
+            .args(["rev-parse", "--verify", "--quiet", branch])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// The body of the `--yes-ship` pair: stage N is Ship with `--yes-ship`
+    /// and a feature branch finalization can merge, and its advance is held
+    /// at the configured point. With `stop`, a socket stop is taken there
+    /// (owner `advancing`, so it is only flagged) before the release: the
+    /// advance must ship nothing, record the stop at `safe_point` and answer
+    /// the caller `stopped`. Without it (the control) the run ships.
+    fn held_yes_ship_advance(phase: PhaseId, stop: bool, safe_point: u8) {
+        let _guard = env_lock();
+        let branch = format!("feature/phase-{}", phase.padded());
+        let run = HandoffRun::launch_with(phase, |root, state| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(["branch", &branch, "develop"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            state.stage = Stage::Ship;
+            state.yes_ship = true;
+            state.stop_until = None;
+        });
+        run.go();
+        run.wait_held();
+        if stop {
+            let (accepted, last) = shutdown_accepted_then(
+                &run.n.socket_path,
+                || run.release(),
+                Duration::from_secs(30),
+            );
+            assert_eq!(accepted["owner"], "advancing", "{accepted}");
+            assert!(
+                events_named(&run.root, "workflow_shipped").is_empty(),
+                "a stop accepted before the --yes-ship merge must ship nothing: {}",
+                run.events()
+            );
+            assert!(
+                branch_exists(&run.root, &branch),
+                "no after-ship hook may run: the feature branch is kept"
+            );
+            let state = run.state();
+            assert!(
+                state.stopped,
+                "state.stopped after a stop at safe point {safe_point}"
+            );
+            assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+            assert!(!state.gate_pending, "no gate is left pending");
+            assert!(!Gates::response_path(&run.root, run.phase, Stage::Ship).exists());
+            let stopped = events_named(&run.root, "advance_stopped");
+            assert_eq!(stopped.len(), 1, "{}", run.events());
+            assert_eq!(stopped[0]["safe_point"], safe_point, "{}", stopped[0]);
+            assert_eq!(
+                last["stopped"], true,
+                "the stop's caller reads stopped: {last}"
+            );
+        } else {
+            run.release();
+            assert!(
+                poll_until(HANDOFF_STEP_WAIT, || events_named(
+                    &run.root,
+                    "workflow_shipped"
+                )
+                .len()
+                    == 1),
+                "control: without a stop the --yes-ship run ships: {}",
+                run.events()
+            );
+            assert!(
+                !branch_exists(&run.root, &branch),
+                "control: the after-ship hooks ran (the feature branch is cleaned up)"
+            );
+            assert!(events_named(&run.root, "advance_stopped").is_empty());
+        }
+    }
+
+    /// CR-01, safe point 5: a stop accepted after safe point 1 and before
+    /// `--yes-ship` writes its approval stops the run there. The pre-written
+    /// approval would otherwise beat the stop in the gate wait and let
+    /// finalization merge, bump, tag and push.
+    #[test]
+    fn a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
+            return;
+        }
+        held_yes_ship_advance(PhaseId::new(1314), true, 5);
+    }
+
+    /// The control for safe point 5: the same hold and no stop, and the
+    /// `--yes-ship` run ships.
+    #[test]
+    fn without_a_stop_after_safe_point_1_the_yes_ship_run_ships() {
+        const NAME: &str =
+            "pipeline_launch::tests::without_a_stop_after_safe_point_1_the_yes_ship_run_ships";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
+            return;
+        }
+        held_yes_ship_advance(PhaseId::new(1315), false, 5);
+    }
+
+    /// CR-01, safe point 6: a stop accepted after the Ship gate was answered
+    /// and before finalization stops the run before the merge.
+    #[test]
+    fn a_stop_before_finalization_is_honoured_before_the_merge() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stop_before_finalization_is_honoured_before_the_merge";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
+            return;
+        }
+        held_yes_ship_advance(PhaseId::new(1316), true, 6);
+    }
+
+    /// The control for safe point 6: the same hold and no stop, and
+    /// finalization ships.
+    #[test]
+    fn without_a_stop_before_finalization_the_run_ships() {
+        const NAME: &str =
+            "pipeline_launch::tests::without_a_stop_before_finalization_the_run_ships";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
+            return;
+        }
+        held_yes_ship_advance(PhaseId::new(1317), false, 6);
     }
 
     /// R-10: a SIGKILL of N between N+1's publish and N's unlink (N parked
