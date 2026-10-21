@@ -233,6 +233,8 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     state: &mut State,
     gate_timeout_secs: u64,
 ) -> Result<(), CliError> {
+    #[cfg(test)]
+    crate::pipeline_launch::test_hold("before_finalization");
     loop {
         if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
             break;
