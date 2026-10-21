@@ -1050,6 +1050,14 @@ fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliE
     Ok(true)
 }
 
+/// The test half of an advance safe point, for a caller that must clear
+/// something before it calls [`record_advance_stop`]: `true` when the
+/// engaged supervisor's stop has been requested (the run is then marked
+/// ended as a stop), `false` with none or outside a supervisor's advance.
+pub(crate) fn stop_requested_at_safe_point() -> bool {
+    with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere)
+}
+
 /// Persist a stop an advance honoured at `safe_point`: `stopped` with
 /// [`ADVANCE_STOP_REASON`], and an `advance_stopped` event naming the point.
 pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {

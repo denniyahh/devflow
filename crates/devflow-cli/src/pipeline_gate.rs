@@ -235,6 +235,19 @@ pub(crate) fn finish_workflow_with_gate_timeout(
 ) -> Result<(), CliError> {
     #[cfg(test)]
     crate::pipeline_launch::test_hold("before_finalization");
+    // Safe point 6 (CR-01, 50-REVIEW.md): a stop taken during the advance
+    // after the Ship gate was answered is honoured before the merge, version
+    // bump, tag and push. The consumed approval is cleared with it, so a
+    // resumed run asks again. Outside a supervisor's advance (the foreground
+    // `ship_override`) no stop token is engaged and this proceeds.
+    if crate::pipeline_launch::stop_requested_at_safe_point() {
+        let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+        state.gate_pending = false;
+        crate::pipeline_launch::record_advance_stop(state, 6)?;
+        return Err(CliError::Message(format!(
+            "finalization did not run: {ADVANCE_STOP_REASON}"
+        )));
+    }
     loop {
         if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
             break;
@@ -423,6 +436,19 @@ pub(crate) fn run_gate_with_timeout(
     // `Gates::write_gate` above, and `poll_response` would never observe a
     // response written after it returns).
     if let Some(response) = auto_response {
+        // Safe point 5 (CR-01, 50-REVIEW.md): a response already on disk
+        // wins over a stop in the wait below, so a stop taken during the
+        // advance is honoured before the pre-authorized one is written. As
+        // at safe point 4, the gate is cleared, the stop recorded and an
+        // error unwinds every caller.
+        if crate::pipeline_launch::stop_requested_at_safe_point() {
+            let _ = Gates::cleanup(project_root, state.phase, stage);
+            state.gate_pending = false;
+            crate::pipeline_launch::record_advance_stop(state, 5)?;
+            return Err(CliError::Message(format!(
+                "the gate for stage {stage} was not auto-answered: {ADVANCE_STOP_REASON}"
+            )));
+        }
         match Gates::respond(project_root, state.phase, stage, response) {
             Ok(_) => {}
             // A human or 23b's stale-gate sweep may have answered first;
