@@ -1350,6 +1350,10 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     };
     std::fs::write(&exit_file, format!("{code}\n"))?;
     if let Some(threads) = threads {
+        // Test-only (50-26): park here, after the exit file and before the
+        // stream threads are waited for. Compiled out of release builds.
+        #[cfg(any(test, feature = "test-support"))]
+        stream_wait_test_hold(&supervisor.token());
         threads.join();
     }
     info!(
@@ -1432,6 +1436,37 @@ fn monitor_test_hold(point: &str) {
     let release = Path::new(path);
     let deadline = std::time::Instant::now() + MONITOR_TEST_HOLD_WAIT;
     while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How long [`stream_wait_test_hold`] waits for its release file: above the
+/// bounded waits of the CLI test that uses it, combined.
+#[cfg(any(test, feature = "test-support"))]
+const STREAM_WAIT_HOLD_WAIT: Duration = Duration::from_secs(60);
+
+/// Test-only hold (50-26). When `DEVFLOW_TEST_STREAM_WAIT_HOLD` names a
+/// path: create `<path>.held`, then wait, polling every 20 ms and bounded by
+/// [`STREAM_WAIT_HOLD_WAIT`], until `<path>` exists or a stop is requested.
+/// [`run_supervised_stage`] calls it for the stream shape after the exit
+/// file is written and before the stream threads are waited for, so a
+/// completed or stopped supervisor parks there: a CLI test can land
+/// `devflow stop` while the owner is `advancing` and the agent's stdout is
+/// still held, and the stop releases it. Returns at once when the variable
+/// is absent. Compiled only under `cfg(test)` or the `test-support` feature,
+/// together with its one call; a release build compiles neither (pinned by
+/// `monitor::tests::the_stream_wait_hold_is_test_only_and_read_literally`).
+#[cfg(any(test, feature = "test-support"))]
+fn stream_wait_test_hold(token: &crate::supervisor::runtime::StopToken) {
+    let Some(release) = std::env::var_os("DEVFLOW_TEST_STREAM_WAIT_HOLD") else {
+        return;
+    };
+    let release = PathBuf::from(release);
+    let mut held = release.clone().into_os_string();
+    held.push(".held");
+    let _ = std::fs::write(&held, "");
+    let deadline = std::time::Instant::now() + STREAM_WAIT_HOLD_WAIT;
+    while !release.exists() && !token.stop_requested() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -6307,6 +6342,149 @@ exit 0
             waits >= 2,
             "{path}: non-test code must define `wait_for_publish(` and call it from \
              `spawn_monitor`; found {waits}"
+        );
+    }
+
+    // ---- 50-26: WR-03 ---------------------------------------------------
+    //
+    // A stream supervisor whose agent exited while a process it started
+    // still holds the agent's stdout must not wait on that stdout. Every
+    // 50-26 test, guard and helper lives in this block, so the
+    // `fix(50-26):` hunks stay disjoint from later edits (agy-5b).
+
+    const STREAM_HOLD_NO_LITERAL_READ: &str =
+        "no literal std::env::var_os read of DEVFLOW_TEST_STREAM_WAIT_HOLD";
+    const STREAM_HOLD_FN_NOT_ONCE: &str = "fn stream_wait_test_hold( is not defined exactly once";
+    const STREAM_HOLD_NOT_GATED: &str = "fn stream_wait_test_hold( is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+    const STREAM_HOLD_CALL_NOT_GATED: &str = "a call to stream_wait_test_hold( is not directly under #[cfg(any(test, feature = \"test-support\"))]";
+
+    /// The stream-wait hold's layout over `source`'s non-test code (cut at
+    /// its first `mod tests {` line, whole-line `//` comments dropped): the
+    /// variable is read literally (the form the doc check sees), the hold is
+    /// defined once directly under the test-support gate, and every call is
+    /// directly under that gate too.
+    fn stream_wait_hold_violations(source: &str) -> Vec<String> {
+        const GATE: &str = r#"#[cfg(any(test, feature = "test-support"))]"#;
+        const DEFINITION: &str = "fn stream_wait_test_hold(";
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| *line != "mod tests {")
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let gated = |at: usize| {
+            at.checked_sub(1)
+                .is_some_and(|above| lines[above].trim() == GATE)
+        };
+        let mut violations = Vec::new();
+        if !lines
+            .iter()
+            .any(|line| line.contains(r#"std::env::var_os("DEVFLOW_TEST_STREAM_WAIT_HOLD")"#))
+        {
+            violations.push(STREAM_HOLD_NO_LITERAL_READ.to_string());
+        }
+        let defined: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(DEFINITION))
+            .map(|(at, _)| at)
+            .collect();
+        match defined.as_slice() {
+            [at] => {
+                if !gated(*at) {
+                    violations.push(STREAM_HOLD_NOT_GATED.to_string());
+                }
+            }
+            _ => violations.push(STREAM_HOLD_FN_NOT_ONCE.to_string()),
+        }
+        let ungated_call = lines.iter().enumerate().any(|(at, line)| {
+            line.contains("stream_wait_test_hold(")
+                && !line.trim_start().starts_with(DEFINITION)
+                && !gated(at)
+        });
+        if ungated_call {
+            violations.push(STREAM_HOLD_CALL_NOT_GATED.to_string());
+        }
+        violations
+    }
+
+    /// G (50-26, permanent source scan, T-50-101): a release build never
+    /// compiles the stream-wait hold or its call, and the hold's variable is
+    /// read literally. The real file yields no violation; each planted
+    /// source yields the violation it plants.
+    #[test]
+    fn the_stream_wait_hold_is_test_only_and_read_literally() {
+        let source = include_str!("monitor.rs");
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "monitor.rs must keep its `mod tests {{` line, or the scan would read its own controls"
+        );
+        let real = stream_wait_hold_violations(source);
+        assert!(real.is_empty(), "monitor.rs: {real:?}");
+
+        let gate = "#[cfg(any(test, feature = \"test-support\"))]\n";
+        let read = "    let _path = std::env::var_os(\"DEVFLOW_TEST_STREAM_WAIT_HOLD\");\n";
+        let hold = |attribute: &str, body: &str| {
+            format!("{attribute}fn stream_wait_test_hold(token: &StopToken) {{\n{body}}}\n")
+        };
+        let caller = |attribute: &str| {
+            format!(
+                "fn run_supervised_stage() {{\n    // Test-only.\n    {attribute}    stream_wait_test_hold(&token);\n}}\n"
+            )
+        };
+        let gated_call = format!("    {gate}");
+        let good = format!("{}{}", hold(gate, read), caller(&gated_call));
+        let only = |violation: &str| vec![violation.to_string()];
+
+        assert_eq!(
+            stream_wait_hold_violations(&good),
+            Vec::<String>::new(),
+            "a correct layout (the comment line above the gate is dropped)"
+        );
+        assert_eq!(
+            stream_wait_hold_violations(&format!("{}{}", hold("", read), caller(&gated_call))),
+            only(STREAM_HOLD_NOT_GATED),
+            "an ungated definition"
+        );
+        assert_eq!(
+            stream_wait_hold_violations(&format!(
+                "{}{}",
+                hold("#[cfg(test)]\n", read),
+                caller(&gated_call)
+            )),
+            only(STREAM_HOLD_NOT_GATED),
+            "a definition gated by cfg(test) only"
+        );
+        assert_eq!(
+            stream_wait_hold_violations(&format!("{}{}", hold(gate, read), caller(""))),
+            only(STREAM_HOLD_CALL_NOT_GATED),
+            "an ungated call"
+        );
+        assert_eq!(
+            stream_wait_hold_violations(&format!(
+                "const HOLD: &str = \"DEVFLOW_TEST_STREAM_WAIT_HOLD\";\n{}{}",
+                hold(gate, "    let _path = std::env::var_os(HOLD);\n"),
+                caller(&gated_call)
+            )),
+            only(STREAM_HOLD_NO_LITERAL_READ),
+            "a read through a constant"
+        );
+        assert_eq!(
+            stream_wait_hold_violations(&format!(
+                "{}{}{}",
+                hold(gate, read),
+                hold(gate, ""),
+                caller(&gated_call)
+            )),
+            only(STREAM_HOLD_FN_NOT_ONCE),
+            "two definitions"
+        );
+        assert_eq!(
+            stream_wait_hold_violations(&format!("mod tests {{\n{good}")),
+            vec![
+                STREAM_HOLD_NO_LITERAL_READ.to_string(),
+                STREAM_HOLD_FN_NOT_ONCE.to_string()
+            ],
+            "the read and the hold only after the test-module cut"
         );
     }
 }
