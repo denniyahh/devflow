@@ -51,3 +51,14 @@ recorded: 2026-10-20T21:36:15.055Z
 Dispositions: `open` (recorded, not yet triaged), `fixed`, `skipped`, `deferred`.
 Set `deferred` by hand and put the reason in the Source cell; both are preserved. A `|` in the reason is kept as prose and escaped on the next run.
 Re-running the gate keeps every row it can. A row the current review no longer reports is kept and its Source cell flagged, so a finding does not leave this record silently. ONE exception: when a finding id is REUSED by a different finding, the earlier decision cannot keep a row — the id is taken — and it is dropped. A RECORDED decision (anything but `open`) is named on the console when that happens; a row still at `open` is replaced silently, because `open` records no decision to lose.
+
+## Re-review (50-REVIEW-2.md, 2026-10-21)
+
+| Finding | Severity | Disposition | Source |
+|---------|----------|-------------|--------|
+| WR-01 | warning | deferred | backlog 999.166 (stop during the finalization retry loop; operator decision 2026-10-21) |
+| IN-01 | info | deferred | backlog 999.166 (notify fires before safe point 5) |
+| IN-02 | info | deferred | backlog 999.166 (ARCHITECTURE.md drain/bound wording) |
+| IN-03 | info | deferred | backlog 999.166 (safe-point-6 comment vs saved `yes_ship`) |
+
+The re-review confirms CR-01 and WR-03 closed for their reported windows.

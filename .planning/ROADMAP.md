@@ -1273,6 +1273,17 @@ Item 3 was reproduced on 2026-10-21 and fixed in Phase 50 by operator decision; 
    parked caller's `stopped` reply reports 143: the exit file keeps the code the agent exited with.
    50-26's test E3 pins this as observed (2026-10-21).
 
+7. (50-REVIEW-2 WR-01, found 2026-10-21 by the post-fix re-review, not reproduced) Safe point 6 is checked once, before the
+   finalization loop (`pipeline_gate.rs` `finish_workflow_with_gate_timeout`): if the after-ship hooks fail and the retry gate is
+   approved, the loop re-runs merge, version bump, tag and push without re-checking for a stop, and the gate poll reads a
+   response before it checks for cancellation, so a stop accepted in the same second as the retry approval is ignored. Same
+   class as CR-01; needs a failed first finalization, a retry approval and a stop together. Fix: the safe-point check at the top
+   of each loop pass. Deferred by operator decision 2026-10-21.
+8. (50-REVIEW-2 IN-01..03, info) Safe point 5 runs after the Ship gate's notify fires, so a stopped `--yes-ship` run still
+   sends a "Ship gate awaiting" message for a gate withdrawn at once; ARCHITECTURE.md says the stream reader "stops reading"
+   and "at most 3 s" while the code keeps draining and the bound can reach 6 s; the safe-point-6 comment says "a resumed run
+   asks again" although a saved `yes_ship` auto-approves the resumed Ship.
+
 **Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted with a reason.
 
 **Requirements:** TBD
