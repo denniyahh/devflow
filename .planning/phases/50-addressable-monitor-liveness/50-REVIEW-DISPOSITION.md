@@ -17,7 +17,7 @@ findings:
     title: "Implicit `recover --clean` ignores the supervisor socket, though the docs say it probes it"
   - id: WR-03
     severity: warning
-    disposition: deferred
+    disposition: fixed
     title: "A stream supervisor whose agent completed can hang forever in `threads.join()`, and no DevFlow verb can end it"
   - id: IN-01
     severity: info
@@ -43,7 +43,7 @@ recorded: 2026-10-20T21:36:15.055Z
 | CR-01 | critical | fixed | `8946d7d` (RED test) + `373f1e6` (safe points 5 and 6); operator chose to fix in Phase 50, 2026-10-21 |
 | WR-01 | warning | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
 | WR-02 | warning | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
-| WR-03 | warning | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
+| WR-03 | warning | fixed | `07e237b` (tests that failed on the old code) + `493156b` (the stream wait ends at the agent's exit; the thread join is bounded; the capture is closed at the bound) + `5b1c417` (tests pinning the fix for stopped and real-binary runs) + `60b1538` (the revert check); reproduced by the phase verifier and fixed in Phase 50 by operator decision, 2026-10-21; live attempt 2 ran on the fixed binary |
 | IN-01 | info | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
 | IN-02 | info | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |
 | IN-03 | info | deferred | backlog 999.166 (operator decision 2026-10-21; Phase 50.1's stop-ownership work is the natural home) |

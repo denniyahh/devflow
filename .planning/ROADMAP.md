@@ -1250,6 +1250,7 @@ Plans:
 found by reading the code at `889ecea`, not reproduced. The operator chose on 2026-10-21 to fix the review's one
 Critical (CR-01, a stop not honoured before a `--yes-ship` merge) in Phase 50 and to defer these six, with Phase 50.1's
 stop-ownership work as the natural home.
+Item 3 was reproduced on 2026-10-21 and fixed in Phase 50 by operator decision; the remaining five stay deferred.
 
 **Defects:**
 1. (WR-01) `devflow stop` prints "did not answer the shutdown … nothing was signalled or recorded" for a stop the
@@ -1259,7 +1260,8 @@ stop-ownership work as the natural home.
 2. (WR-02) `recover --clean` without `--phase` ignores the supervisor socket, though OPERATIONS.md says it probes it:
    it deletes state started more than 24 h ago with no live agent pid and no held lock, including a live supervisor
    between its agent's exit and the advance taking the lock. The 2026-10-19 triage fix covered `--phase N` only.
-3. (WR-03) A stream supervisor whose agent completed normally can block forever in `threads.join()` (`monitor.rs`)
+3. **Fixed in Phase 50 by 50-26** (`07e237b`, `493156b`; reproduced by the phase verifier 2026-10-21):
+   (WR-03) A stream supervisor whose agent completed normally can block forever in `threads.join()` (`monitor.rs`)
    when a group member still holds the agent's stdout; it stays ALIVE in "advancing", `stop` cannot reach it, and the
    backstop refuses because the leader was already reaped. The join predates Phase 50.
 4. (IN-01) `poll_response_cancellable` keeps a backoff that never takes effect, so a supervised gate polls every second
@@ -1267,6 +1269,9 @@ stop-ownership work as the natural home.
 5. (IN-02) The control thread busy-loops on a persistent `accept` error such as EMFILE.
 6. (IN-03) `stop`'s success line says "agent group ended" for a stop honoured at a safe point, where nothing was
    signalled.
+   The same safe-point stop also leaves the exit file with the agent's own code (`0` after a completed run) while the
+   parked caller's `stopped` reply reports 143: the exit file keeps the code the agent exited with.
+   50-26's test E3 pins this as observed (2026-10-21).
 
 **Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted with a reason.
 

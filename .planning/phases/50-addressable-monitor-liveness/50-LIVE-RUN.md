@@ -349,7 +349,7 @@ verdicts (`FAULT verdict=pass`). Attempt 1 and `fault-5` closed them on the pre-
 
 ## Defects
 
-**No non-blocking defect found** by 50-18 or 50-19, so this plan adds no backlog entry.
+**No non-blocking defect found** by 50-18, 50-19 or 50-28 (live attempt 2), so no backlog entry was added.
 
 Fixed in-phase:
 
@@ -380,9 +380,28 @@ left after a normal completion) and 999.165 (`gate_notify_cmd` through `sh -c`).
   the fixed path. The fault arm was re-run on the fixed binary: `fault-6` (`bin_sha256=bc862759f27c…`) prints
   `FAULT verdict=pass` under `--require-all`, and `--fault-current` passes (raw tree only, not published). A copy of the
   record holding only `fault-5` fails `--fault-current` (`dir=ABSENT`), the control.
-- The review's three warnings and three infos are deferred to backlog 999.166 (operator decision 2026-10-21).
+- **WR-03 (warning) was reproduced by the phase verifier on 2026-10-21** with a `/dev/null` control: a completed stream
+  run whose agent left a process holding its stdout waited one idle timeout and then forever, and `devflow stop` could
+  not end it. Fixed in-phase by operator decision (50-26): `07e237b` and `5b1c417` (tests, revert-checked by
+  `60b1538`'s `wr03-revert-check.sh`) and `493156b` (the loop ends at the agent's exit, the thread wait is bounded at
+  3 s, nothing is signalled, the capture is closed at the bound, and a `stream_wait_bounded` event records it).
+  Attempt 2 ran on the fixed binary.
+- The review's other two warnings and three infos stay deferred to backlog 999.166 (operator decision 2026-10-21),
+  whose item 6 now also names the exit-file limit (the exit file keeps the agent's code while `stopped` says 143).
+
+**Live attempt 2 (50-28).** It found no defect: no unexpected gate, no deviation from the runbook, no `deviations.txt`
+(50-28's SUMMARY), and its judges all passed. Not defects: the three made-up credentials the live agent's own security
+review planted as a gitleaks negative control in the throwaway project (the sanitizer refused them, as designed, and
+they were redacted in the published copy by operator decision, see "The record"); and `surv-watch.py analyze`
+printing nothing to the orchestrator's output tail, which 50-28 left unjudged: its report is in
+`attempt-2/surv/analysis.txt` (`writers=7`, `interleaved_windows=0`, `overflow_windows=0`, `stop_marker=present`, one
+observation of one run, as the file itself says).
 
 ## Phase-end macOS compile gate (V-56, MAC-3)
+
+**Re-run 2026-10-21 by 50-29 on the final tree** (`ae5c853` plus this plan's uncommitted record edits; crate sources
+unchanged since `bca7c35`, which holds the CR-01 and WR-03 fixes), rustc 1.97.1: the same two commands exited 0, with
+no `warning` or `error` line. Compile only, as below.
 
 Run 2026-10-20 on `97b5def` (crate sources unchanged since `1deaa4d`), rustc 1.97.1:
 `cargo check --target aarch64-apple-darwin -p devflow-core --all-targets && cargo check --target aarch64-apple-darwin -p devflow --all-targets`
