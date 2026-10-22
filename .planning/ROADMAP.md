@@ -1294,6 +1294,25 @@ Item 3 was reproduced on 2026-10-21 and fixed in Phase 50 by operator decision; 
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.167: `cut-pr-branch.sh`'s Phase Scope Filter Drops `(NN-review)` Commits (BACKLOG)
+
+**Found:** 2026-10-22, Phase 50 close-out (PR #225). Reproduced on the real cut.
+
+**Defect:** phase mode keeps a commit only when its scope matches `(NN)`, `(NN-MM)` or `(phase-NN)`
+(`SCOPE_RE` in `scripts/cut-pr-branch.sh`, `(-[0-9]+)?`). The nine `fix(50-review)`/`docs(50-review)` commits
+from Phase 50's external review were silently left out: the script's fidelity report flagged 8 paths that did not
+match the phase branch, and the commits were cherry-picked by hand. A scope written by hand during a phase (as GSD's
+review-fix flow does) is phase work the filter cannot see.
+
+**Done when:** the filter accepts any `(NN-<word>)` scope for phase NN, and a script selftest proves a
+`(NN-review)` commit is replayed while `(NNN)` and `(NN.1)` scopes for other phases are not.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
