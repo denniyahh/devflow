@@ -1208,7 +1208,9 @@ reading the code at `0048fdb`, not reproduced. The operator chose to backlog the
    errors (`_ => continue`), so an unrecorded socket that cannot be probed is reported nowhere.
 2. A supervisor's control thread waits out the stop kill grace (`TERMINATE_VERIFY_WAIT`, 3 s) inline after answering
    `accepted`, so any other connection's ping times out (`IO_TIMEOUT`, 2 s): `status`/`doctor` read UNKNOWN during a
-   stop, and a second concurrent `stop` errors.
+   stop, and a second concurrent `stop` errors. In that window `cleanup --force` also reads ProbeFailed and removes
+   the worktree of a run that is still stopping (50-12 lets `--force` override ProbeFailed like STALE). Raised by the
+   graphify-labs review of PR #225 (`commands.rs:952`); see `.planning/audits/2026-10-22-graphify-review-triage-pr225.md`.
 3. A SIGKILL between `bind` of `<stem>.part` and its `hard_link` leaves the `.part` file in `sock/`; nothing
    (`publish` cleanup, `remove_launch_files`, `sweep_in`, `doctor`) lists or removes it.
 4. Connections are served one at a time on the control thread, each bounded by `IO_TIMEOUT`, and the client's
