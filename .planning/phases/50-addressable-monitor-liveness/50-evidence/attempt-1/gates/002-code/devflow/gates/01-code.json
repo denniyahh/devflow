@@ -1,0 +1,6 @@
+{
+  "phase": 1,
+  "stage": "code",
+  "context": "[never-silent] preflight failed for stage code: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)",
+  "timestamp": "1792522762"
+}

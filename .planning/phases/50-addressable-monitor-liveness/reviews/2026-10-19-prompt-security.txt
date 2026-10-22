@@ -1,0 +1,30 @@
+CONTEXT
+You are reviewing Phase 50 ("Addressable Monitor Liveness") of DevFlow, a Rust CLI that drives AI coding agents through a staged pipeline. The repository snapshot is at: /tmp/claude-1000/-var-home-denniyahh-Github-devflow/ddf73672-4517-4429-bb90-b2320ee6b489/scratchpad/review/snapshot
+This phase replaces a pid-file-based monitor with a supervisor process per run:
+- each supervisor listens on a Unix socket under <cache_dir>/sock with a sidecar .json, and a probe classifies it Gone / Stale / Alive;
+- `devflow stop` stops a run through that socket; a backstop signals the process group via pidfd only after validating the group leader;
+- a start/resume guard refuses to launch over a live run; `devflow doctor` reports orphan supervisors;
+- State::monitor_pid was removed.
+Design decisions are in .planning/phases/50-addressable-monitor-liveness/50-CONTEXT.md. Operator procedure is in OPERATIONS.md and ARCHITECTURE.md.
+
+WHAT TO REVIEW
+The full production diff against the base branch is REVIEW/phase50-production.diff (about 1.1 MB, inline #[cfg(test)] modules included); REVIEW/phase50-diffstat.txt lists every file. Prioritize, in order:
+1. crates/devflow-core/src/supervisor.rs and supervisor/{runtime,backstop,protocol}.rs
+2. crates/devflow-core/src/monitor.rs, lock.rs, state.rs, gates.rs, agent.rs
+3. crates/devflow-cli/src/pipeline_launch.rs and commands.rs (stop, doctor, cleanup, start/resume guard), preflight.rs, main.rs
+Read the real files in the snapshot to confirm every claim. Do not just read the diff.
+
+RULES
+- Read-only. Do not modify any file, do not run cargo or any build, do not access the network beyond your own model API.
+- Every finding needs an exact file path and line number in the snapshot, plus a quoted line of code.
+- For each finding give: severity (critical/high/medium/low), a concrete failure scenario (inputs/state -> wrong outcome), and whether it is CONFIRMED (you traced it in code) or SPECULATION.
+- Prefer 5-10 sharp, reproducible findings to many vague ones. Do not praise or summarize the code.
+- End with a section "NOT REVIEWED" listing the priority files you did not actually read.
+
+LENS
+Evaluate the security posture and threat surface. This is a local single-user CLI; the realistic attacker is another local user or process on the same host, a malicious or confused agent subprocess, or a hostile repository being worked on. Find:
+1. Trust boundary violations: unvalidated data read from the socket protocol, sidecar .json files, state files, gate files, or environment variables; path traversal; symlink attacks on cache/sock/lock/state paths (TOCTOU, following attacker-planted links, world-writable dirs).
+2. Signal-delivery safety: any path where pid/pgid reuse, a spoofed sidecar or a stale pidfd could make DevFlow signal an unrelated process or group.
+3. Socket and file permission modes; whether another local user could connect, impersonate a supervisor, or inject a stop/gate response.
+4. Unsafe Rust (unsafe blocks, libc/syscall use) soundness.
+5. Subprocess spawning: argument injection, inherited file descriptors, environment leakage to agent processes.

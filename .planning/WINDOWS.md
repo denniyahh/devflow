@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 5
-waived_count: 2
-fixed_count: 10
-total_count: 17
-last_updated: 2026-09-29T19:39:11.821Z
+open_count: 0
+waived_count: 3
+fixed_count: 16
+total_count: 19
+last_updated: 2026-10-19T11:37:40.414Z
 ---
 
 # Broken Windows Ledger
@@ -22,16 +22,18 @@ last_updated: 2026-09-29T19:39:11.821Z
 | 5 | 25 | deviation | crates/devflow-cli/src/pipeline_launch.rs |  | SIXTH monitor-wrapper leak site, found by gsd-verifier after round 4 and confirmed by the orchestrator: pipeline_launch.rs::tests::resume_clears_stop_marker_and_advances_past_stop_point stubs a claude binary on PATH and calls resume(root, phase), which reaches launch_stage at pipeline_launch.rs:230 and spawns a real detached monitor wrapper (verifier observed pid 852403 under --nocapture). It binds no ReapMonitorOnDrop guard, so the wrapper outlives the TempDir teardown. resume() is a FOURTH wrapping entry point that neither 25-16's call-site enumeration nor 25-18's three-function reachability grep could see, which falsifies 25-18-SUMMARY.md's claim that no path beyond launch_stage/launch_stage_inner/run_preflight exists. ENUMERATION NOW COMPLETE (orchestrator, transitive sweep over all eight launch-reaching entry points cross-referenced against both agent-stub helpers): exactly 7 tests both reach a launch path and stub an agent binary; 5 are guarded, this one is not, and preflight.rs::run_preflight_loopback_bounds_recursion provably cannot spawn because its recursive run_preflight hits the retry ceiling and aborts, after which launch_stage short-circuits at :190-193 without calling launch_stage_inner. Fix: bind ReapMonitorOnDrop::after_launch(&state) after the resume() call and before the assertions, matching the other five sites. | fixed |  | 2026-07-28T20:01:51.067Z | 2026-07-28T20:13:59.421Z |
 | 6 | 28 | unmet-truth | crates/devflow-core/src/agent_result.rs |  | HUMAN_GATE_VALUE ('blocking-human', matched by blocking_human_checkpoint_reported) is an unconfirmed default per 28-PROBE.md DIVERGENT A1 verdict, not an empirically confirmed literal against a live headless checkpoint render | fixed | A1 CLOSED by a live end-to-end run (2026-07-31). A real devflow start drove a synthetic phase declaring a gate="blocking-human" task through DevFlow own monitor. Two results: (1) the value IS blocking-human, so the constant was correct; (2) the RENDERING was not — the executor emits it as a markdown code span, **Gate:** `blocking-human`, and text_reports_human_gate trimmed only * and space, so the leading backtick left take_while yielding an empty token and the reader returned false. Genuine checkpoints fell through to the generic gate. Fixed in b22e6cf by adding the backtick to both trim sets, with three regression tests built from the verbatim capture (confirmed RED first). Retested live: the checkpoint now routes into auto-decide, emits exactly one checkpoint_auto_decided event carrying a real session_id, relaunches via --resume, and the agent resolves it; zero generic gate fires. Root cause worth keeping: RESEARCH derived the literal by reading the EMITTING source, which gave the value but not the rendering. | 2026-07-31T02:38:49.879Z | 2026-07-31T08:30:00.000Z |
 | 7 | 35.1 | unmet-truth | crates/devflow-cli/tests/auto_chain_leak_repair_e2e.rs |  | 35.1-02 D8: no test drives a chain-flag repair followed by a SUCCESSFUL stage launch; the resume step aborts at ensure_agent_binary by design | waived | 35.1-02 D8 residual: not a distinct test requirement. Repair (config.json clear+commit+emit) and launch (state-file load -> spawn_monitor) are independent paths; both halves are already covered (35.1-01 launch e2e via bounded __monitor; 35.1-02 repair e2e + gsd_config unit tests), and the repair test already exercises resume's repair->ensure_agent_binary sequencing. The full composition is additionally structurally untestable in a bounded way (resume detaches the monitor). Eliminated as a test requirement. | 2026-08-08T23:33:10.434Z | 2026-08-16T01:03:51.268Z |
-| 8 | 46 | deviation | crates/devflow-cli/src/staleness.rs | 1436 | wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks fails 2/2 under the 2-CPU container pin, passes 2/2 unpinned; spawn-time ENOENT, root cause unknown, pre-dates phase 46 (see 46 deferred-items.md D-46-01-A) | open |  | 2026-09-05T11:38:53.791Z |  |
-| 9 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md |  | 46-06 Deviation 1: the plan-supplied file-wide 'set_var("PATH"' grep contradicts the prohibition against touching neutral_path sites; 46-07 must use the body-scoped form instead or its acceptance block will fail on pipeline_outcomes.rs's own unrelated PATH sites | open |  | 2026-09-06T11:41:33.125Z |  |
-| 10 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md |  | Task 3 fmt verification used tail exit status; measured cargo fmt with PIPESTATUS instead. | open |  | 2026-09-06T12:13:45.575Z |  |
-| 11 | 46 | deviation | .planning/STATE.md |  | state.advance-plan left last_activity_desc claiming NoGitPath callers survived; corrected after plan self-check. | open |  | 2026-09-06T12:15:27.485Z |  |
+| 8 | 46 | deviation | crates/devflow-cli/src/staleness.rs | 1436 | wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks fails 2/2 under the 2-CPU container pin, passes 2/2 unpinned; spawn-time ENOENT, root cause unknown, pre-dates phase 46 (see 46 deferred-items.md D-46-01-A) | waived | No longer reproduces: 10/10 passes of the single test in the pinned CI image under taskset -c 0,1 (nproc=2) on 2026-10-19 at 8f256ad, and 1/1 in 50-16's full pinned container run, against 2/2 failures when recorded. Root cause never found; if it recurs, reopen as a backlog item with the full-suite pinned recipe. | 2026-09-05T11:38:53.791Z | 2026-10-19T10:57:57.127Z |
+| 9 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md |  | 46-06 Deviation 1: the plan-supplied file-wide 'set_var("PATH"' grep contradicts the prohibition against touching neutral_path sites; 46-07 must use the body-scoped form instead or its acceptance block will fail on pipeline_outcomes.rs's own unrelated PATH sites | fixed |  | 2026-09-06T11:41:33.125Z | 2026-10-19T10:55:09.941Z |
+| 10 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md |  | Task 3 fmt verification used tail exit status; measured cargo fmt with PIPESTATUS instead. | fixed |  | 2026-09-06T12:13:45.575Z | 2026-10-19T10:55:10.261Z |
+| 11 | 46 | deviation | .planning/STATE.md |  | state.advance-plan left last_activity_desc claiming NoGitPath callers survived; corrected after plan self-check. | fixed |  | 2026-09-06T12:15:27.485Z | 2026-10-19T10:55:10.442Z |
 | 12 | 46 | deviation | crates/devflow-cli/tests/plan_bashism_scanner.rs | 118 | Disposable fixture commits disable inherited signing so staged-scanner controls can establish a baseline. | fixed |  | 2026-09-07T01:00:06.931Z | 2026-09-07T01:00:38.385Z |
 | 13 | 46 | deviation | crates/devflow-cli/tests/plan_bashism_scanner.rs | 333 | Staged fixture preconditions compare full index and worktree bytes rather than proxy substring presence. | fixed |  | 2026-09-07T01:00:07.188Z | 2026-09-07T01:00:38.622Z |
 | 14 | 46 | deviation | scripts/lint-plan-bashisms.sh | 89 | EXIT-trap cleanup callback has a scoped ShellCheck SC2329 suppression. | fixed |  | 2026-09-07T01:00:07.457Z | 2026-09-07T01:00:38.874Z |
 | 15 | 46 | deviation | crates/devflow-cli/tests/plan_bashism_scanner.rs | 400 | Rename status assertion uses direct slice membership to satisfy workspace Clippy. | fixed |  | 2026-09-07T01:00:07.688Z | 2026-09-07T01:00:39.114Z |
 | 16 | 46 | deviation | .planning/phases/46-ci-load-shape-and-operator-input-validation/46-09-PLAN.md |  | Verification regex reran with rg -e because this Ripgrep treats -E as an encoding flag. | fixed |  | 2026-09-07T01:00:07.933Z | 2026-09-07T01:00:39.341Z |
-| 17 | 49 | stub | scripts/scratch-dogfood-repo.sh | 79 | The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook) | open |  | 2026-09-29T19:39:11.821Z |  |
+| 17 | 49 | stub | scripts/scratch-dogfood-repo.sh | 79 | The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook) | fixed |  | 2026-09-29T19:39:11.821Z | 2026-10-19T10:55:10.630Z |
+| 18 | 50 | deviation | crates/devflow-cli/tests/phase7_cli.rs |  | 50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md | fixed |  | 2026-10-17T11:53:12.257Z | 2026-10-17T16:27:14.778Z |
+| 19 | 50 | skipped-test | crates/devflow-cli/src/commands.rs | 8823 | Under uid 0 (the pinned container and CI) doctor_reports_an_unlistable_socket_dir_instead_of_nothing (50-12) and the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state (50-15) skip, since root lists a 0o000 dir; their assertions run only on a non-root host (999.113 pattern, 50-16 cdb6efc) | fixed |  | 2026-10-18T18:26:52.972Z | 2026-10-19T11:37:40.414Z |
 
 ````json
 [
@@ -126,10 +128,10 @@ last_updated: 2026-09-29T19:39:11.821Z
     "file": "crates/devflow-cli/src/staleness.rs",
     "line": 1436,
     "description": "wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks fails 2/2 under the 2-CPU container pin, passes 2/2 unpinned; spawn-time ENOENT, root cause unknown, pre-dates phase 46 (see 46 deferred-items.md D-46-01-A)",
-    "status": "open",
-    "reason": "",
+    "status": "waived",
+    "reason": "No longer reproduces: 10/10 passes of the single test in the pinned CI image under taskset -c 0,1 (nproc=2) on 2026-10-19 at 8f256ad, and 1/1 in 50-16's full pinned container run, against 2/2 failures when recorded. Root cause never found; if it recurs, reopen as a backlog item with the full-suite pinned recipe.",
     "recorded_at": "2026-09-05T11:38:53.791Z",
-    "resolved_at": null
+    "resolved_at": "2026-10-19T10:57:57.127Z"
   },
   {
     "id": 9,
@@ -138,10 +140,10 @@ last_updated: 2026-09-29T19:39:11.821Z
     "file": ".planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md",
     "line": null,
     "description": "46-06 Deviation 1: the plan-supplied file-wide 'set_var(\"PATH\"' grep contradicts the prohibition against touching neutral_path sites; 46-07 must use the body-scoped form instead or its acceptance block will fail on pipeline_outcomes.rs's own unrelated PATH sites",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-06T11:41:33.125Z",
-    "resolved_at": null
+    "resolved_at": "2026-10-19T10:55:09.941Z"
   },
   {
     "id": 10,
@@ -150,10 +152,10 @@ last_updated: 2026-09-29T19:39:11.821Z
     "file": ".planning/phases/46-ci-load-shape-and-operator-input-validation/46-07-PLAN.md",
     "line": null,
     "description": "Task 3 fmt verification used tail exit status; measured cargo fmt with PIPESTATUS instead.",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-06T12:13:45.575Z",
-    "resolved_at": null
+    "resolved_at": "2026-10-19T10:55:10.261Z"
   },
   {
     "id": 11,
@@ -162,10 +164,10 @@ last_updated: 2026-09-29T19:39:11.821Z
     "file": ".planning/STATE.md",
     "line": null,
     "description": "state.advance-plan left last_activity_desc claiming NoGitPath callers survived; corrected after plan self-check.",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-06T12:15:27.485Z",
-    "resolved_at": null
+    "resolved_at": "2026-10-19T10:55:10.442Z"
   },
   {
     "id": 12,
@@ -234,10 +236,36 @@ last_updated: 2026-09-29T19:39:11.821Z
     "file": "scripts/scratch-dogfood-repo.sh",
     "line": 79,
     "description": "The gsd-tools option is parsed but unused until plan 49-06 adds the payload's GSD-resolution probes (plan-specified forward hook)",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-29T19:39:11.821Z",
-    "resolved_at": null,
+    "resolved_at": "2026-10-19T10:55:10.630Z",
+    "milestone": "v3.0.0"
+  },
+  {
+    "id": 18,
+    "kind": "deviation",
+    "phase": "50",
+    "file": "crates/devflow-cli/tests/phase7_cli.rs",
+    "line": null,
+    "description": "50-03 Task 1 gate runs all of phase7_cli under nextest, but suite_reap_audit always fails there (per-process REAPED counter stays 0; same on pre-migration HEAD file). Sentinel-HOME check run instead with it excluded under nextest (41/41) and all 28 under cargo test; see 50-03 deferred-items.md",
+    "status": "fixed",
+    "reason": "",
+    "recorded_at": "2026-10-17T11:53:12.257Z",
+    "resolved_at": "2026-10-17T16:27:14.778Z",
+    "milestone": "v3.0.0"
+  },
+  {
+    "id": 19,
+    "kind": "skipped-test",
+    "phase": "50",
+    "file": "crates/devflow-cli/src/commands.rs",
+    "line": 8823,
+    "description": "Under uid 0 (the pinned container and CI) doctor_reports_an_unlistable_socket_dir_instead_of_nothing (50-12) and the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state (50-15) skip, since root lists a 0o000 dir; their assertions run only on a non-root host (999.113 pattern, 50-16 cdb6efc)",
+    "status": "fixed",
+    "reason": "",
+    "recorded_at": "2026-10-18T18:26:52.972Z",
+    "resolved_at": "2026-10-19T11:37:40.414Z",
     "milestone": "v3.0.0"
   }
 ]

@@ -1008,11 +1008,13 @@ fn unattended_config_condition(launch_root: &Path) -> ConditionState {
 /// C2: the Code stage would launch on the pipe-owning arm AND the driver has
 /// a real dogfooded run (round-3 F5/D-04).
 ///
-/// The chain-flag guard lives in a Rust process's stack frame; the legacy arm
-/// is a detached shell script with no frame to hang a `Drop` on
-/// (`35.1-RESEARCH.md` Pitfall 4). This turns that accepted gap from a silent
-/// stall hours into an unattended run into a refusal before the first agent is
-/// spawned.
+/// The chain-flag guard is engaged by the stage supervisor (`run_monitor`)
+/// for a stream launch only, the one shape that bounds the flag's lifetime to
+/// the agent's. Since 50-11 a capture launch runs under the same Rust
+/// supervisor but never engages it (before that the legacy arm was a detached
+/// shell script with no frame to hang a `Drop` on, `35.1-RESEARCH.md`
+/// Pitfall 4). This turns that accepted gap from a silent stall hours into an
+/// unattended run into a refusal before the first agent is spawned.
 ///
 /// Asks [`stream_launch_enabled`] — the launch path's OWN predicate —
 /// rather than re-deriving the answer, so the preflight and the launch cannot
@@ -1048,8 +1050,8 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
     // The reason names the CAUSE that applied, and then the consequence in
     // terms true of every cause.
     ConditionState::DoesNotHold(format!(
-        "{} — the chain-flag guard binds only inside the pipe-owning monitor, which this \
-         launch shape never starts",
+        "{} — so Code would launch on the capture shape, whose supervisor never engages the \
+         chain-flag guard (only a stream-shape supervisor does)",
         causes.join(" and ")
     ))
 }
@@ -1487,7 +1489,7 @@ mod tests {
             if !devflow_core::test_support::in_child_test($name) {
                 let path_dir = $path_dir;
                 let output =
-                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                    crate::test_support::run_hermetic_test_in_child($name, path_dir.path(), &[]);
                 devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
                     &output, $name,
                 );
@@ -2202,7 +2204,7 @@ mod tests {
         // from the constant; 34-05's widening puts it on the stream path,
         // where `canary_gate` invokes the real `ClaudeCanaryLauncher` and the
         // launch fails on a delivery refusal unrelated to launch counting.
-        // The `launches == 1` and `monitor_pid.is_some()` assertions below
+        // The `launches == 1` and `supervisor.is_some()` assertions below
         // are untouched, so a launch must still genuinely happen.
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
@@ -2245,7 +2247,7 @@ mod tests {
              exactly once, not {launches}"
         );
         assert!(
-            state.monitor_pid.is_some(),
+            state.supervisor.is_some(),
             "this test is expected to drive a real monitor::spawn_monitor \
              through run_preflight's Advance arm — None here means WR-05's \
              premise was wrong and the guard above reaped nothing"
@@ -2276,7 +2278,7 @@ mod tests {
         // (34-06); do not "simplify" this away. Same reasoning as the Advance
         // arm's sibling above: the subject is the launch COUNT through the
         // LoopBack arm, not which launch path is taken, and the `launches == 1`
-        // and `monitor_pid.is_some()` assertions below are untouched.
+        // and `supervisor.is_some()` assertions below are untouched.
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
@@ -2324,7 +2326,7 @@ mod tests {
              exactly once, not {launches}"
         );
         assert!(
-            state.monitor_pid.is_some(),
+            state.supervisor.is_some(),
             "this test is expected to drive a real monitor::spawn_monitor \
              through run_preflight's LoopBack arm — None here means WR-05's \
              premise was wrong and the guard above reaped nothing"
@@ -2436,7 +2438,7 @@ mod tests {
             "a human Advance must reset the retry counter"
         );
         assert!(
-            state.monitor_pid.is_some(),
+            state.supervisor.is_some(),
             "this test's Advance arm is expected to drive a real \
              monitor::spawn_monitor via launch_stage_inner — None here means \
              this residual finding's premise was wrong and the guard above \
@@ -4656,5 +4658,41 @@ mod tests {
             "agy",
             "the driver still resolves the agy program (unchanged path)"
         );
+    }
+
+    /// Since 50-11 both launch shapes run under the same Rust supervisor,
+    /// and only a stream launch engages the chain-flag guard. The refusal
+    /// says so, for every cause, and no longer says the capture shape
+    /// "never starts" a pipe-owning monitor.
+    #[test]
+    fn unattended_launch_shape_refusal_names_the_capture_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = State::new(
+            PhaseId::new(43),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        legacy.legacy_claude_launch = true;
+        let codex = State::new(
+            PhaseId::new(44),
+            AgentKind::Codex,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        for state in [legacy, codex] {
+            let ConditionState::DoesNotHold(reason) = unattended_launch_shape_condition(&state)
+            else {
+                panic!("{} --mode auto must be refused", state.agent);
+            };
+            assert!(
+                reason.ends_with(
+                    " — so Code would launch on the capture shape, whose supervisor never \
+                     engages the chain-flag guard (only a stream-shape supervisor does)"
+                ),
+                "{reason}"
+            );
+            assert!(!reason.contains("never starts"), "{reason}");
+        }
     }
 }

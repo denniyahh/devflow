@@ -78,6 +78,12 @@ fn read_files(paths: impl IntoIterator<Item = PathBuf>) -> String {
 }
 
 fn rust_source() -> String {
+    read_files(rust_file_paths())
+}
+
+/// Every `.rs` file under `<workspace>/crates`, both crates, src and tests,
+/// in sorted order.
+fn rust_file_paths() -> Vec<PathBuf> {
     fn visit(dir: &Path, files: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -95,7 +101,7 @@ fn rust_source() -> String {
     let mut files = Vec::new();
     visit(&workspace_root().join("crates"), &mut files);
     files.sort();
-    read_files(files)
+    files
 }
 
 fn extract_tokens(text: &str, prefix: &str, allowed: impl Fn(char) -> bool) -> Vec<String> {
@@ -497,5 +503,451 @@ fn devflow_core_dependency_pin_matches_workspace_version() {
     assert_eq!(
         parsed.workspace.dependencies.devflow_core.version, parsed.workspace.package.version,
         "workspace.dependencies.devflow-core's pinned version must match workspace.package.version"
+    );
+}
+
+/// The `State` field 50-16 removed (R-9), assembled from pieces so this file
+/// never holds the name contiguously and the scan below cannot flag itself.
+const REMOVED_STATE_FIELD: &str = concat!("monitor", "_pid");
+
+/// Lines that survive comment stripping, numbered from 1: a line whose trimmed
+/// start is `//` (doc comments included) is dropped.
+fn uncommented_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with("//"))
+        .map(|(index, line)| (index + 1, line))
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// True when `line`'s trimmed start is `pub ` plus `field`, followed by a
+/// non-identifier character (or nothing): the declaration, not a longer name.
+fn declares_pub_field(line: &str, field: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("pub ")
+        .and_then(|rest| rest.strip_prefix(field))
+        .is_some_and(|after| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_identifier_char(ch))
+        })
+}
+
+/// True when `line` holds `field` wrapped in double quotes — a JSON or event
+/// key — whether the closing quote is bare (`"k"`, raw strings, `json!`) or
+/// escaped inside an ordinary string literal (`"{\"k\": 1}"`).
+fn holds_quoted_key(line: &str, field: &str) -> bool {
+    let opened = ["\"", field].concat();
+    line.match_indices(&opened).any(|(start, _)| {
+        let after = &line[start + opened.len()..];
+        after.starts_with('"') || after.starts_with("\\\"")
+    })
+}
+
+/// Every place the removed field survives (T-50-43): (a) its `pub`
+/// declaration on an uncommented line of state.rs, (b) its quoted key on an
+/// uncommented line of any Rust file, (c) any mention in a snapshot file.
+fn removed_field_findings(
+    state_source: &str,
+    rust_files: &[(PathBuf, String)],
+    snapshots: &[(PathBuf, String)],
+) -> Vec<String> {
+    let field = REMOVED_STATE_FIELD;
+    let mut findings = Vec::new();
+    for (number, line) in uncommented_lines(state_source) {
+        if declares_pub_field(line, field) {
+            findings.push(format!("state.rs:{number}: declaration: {}", line.trim()));
+        }
+    }
+    for (path, text) in rust_files {
+        for (number, line) in uncommented_lines(text) {
+            if holds_quoted_key(line, field) {
+                findings.push(format!(
+                    "{}:{number}: quoted key: {}",
+                    path.display(),
+                    line.trim()
+                ));
+            }
+        }
+    }
+    for (path, text) in snapshots {
+        if text.contains(field) {
+            findings.push(format!("{}: snapshot mention", path.display()));
+        }
+    }
+    findings
+}
+
+fn read_labelled(paths: Vec<PathBuf>) -> Vec<(PathBuf, String)> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            (path, text)
+        })
+        .collect()
+}
+
+/// T-50-43: the socket is the only liveness source once `State`'s monitor
+/// pid field is gone (R-9, 50-16). The compiler proves no Rust code reads or
+/// writes the field; this scan covers what it cannot see — the declaration
+/// itself, a JSON or event key of that name in either crate, and a mention in
+/// the CLI's help snapshot. Planted controls prove each check decides.
+#[test]
+fn no_monitor_pid_field_json_key_or_help_mention_remains() {
+    let field = REMOVED_STATE_FIELD;
+    let none: &[(PathBuf, String)] = &[];
+    let planted = |text: String| vec![(PathBuf::from("planted.rs"), text)];
+
+    // (a) declaration: flagged; a longer name and a commented one are not.
+    let declared = ["    pub ", field, ": Option<u32>,"].concat();
+    assert_eq!(removed_field_findings(&declared, none, none).len(), 1);
+    let longer = ["    pub ", field, "_launch: Option<u32>,"].concat();
+    assert!(removed_field_findings(&longer, none, none).is_empty());
+    let commented = ["    // pub ", field, ": Option<u32>,"].concat();
+    let doc_commented = ["    /// pub ", field, ": Option<u32>,"].concat();
+    assert!(removed_field_findings(&commented, none, none).is_empty());
+    assert!(removed_field_findings(&doc_commented, none, none).is_empty());
+
+    // (b) quoted key: flagged on a code line, bare or escaped.
+    let raw_key = ["    let json = r#\"{\"", field, "\": 4242}\"#;"].concat();
+    assert_eq!(removed_field_findings("", &planted(raw_key), none).len(), 1);
+    let escaped_key = ["    let json = \"{\\\"", field, "\\\": 4242}\";"].concat();
+    assert_eq!(
+        removed_field_findings("", &planted(escaped_key), none).len(),
+        1
+    );
+    // ...and not on a comment line, as a local, in a helper's name, or as a
+    // prefix of a longer quoted string.
+    for clean in [
+        ["    // json.contains(\"", field, "\")"].concat(),
+        ["    let ", field, " = 4242;"].concat(),
+        ["    fn wait_for_", field, "_exit() {}"].concat(),
+        ["    let message = \"", field, " must not appear\";"].concat(),
+    ] {
+        assert!(
+            removed_field_findings("", &planted(clean.clone()), none).is_empty(),
+            "planted clean line was flagged: {clean}"
+        );
+    }
+
+    // (c) snapshot mention: flagged.
+    let snapshot = vec![(
+        PathBuf::from("planted-help.txt"),
+        ["      --", field, "  <PID>\n"].concat(),
+    )];
+    assert_eq!(removed_field_findings("", none, &snapshot).len(), 1);
+
+    // The real scan: state.rs, every Rust file under crates/, every snapshot.
+    let root = workspace_root();
+    let state_source = std::fs::read_to_string(root.join("crates/devflow-core/src/state.rs"))
+        .expect("state.rs must be readable");
+    let rust_files = read_labelled(rust_file_paths());
+    assert!(!rust_files.is_empty(), "the walker must find Rust sources");
+    let snapshot_dir = root.join("crates/devflow-cli/tests/snapshots");
+    let mut snapshot_paths: Vec<PathBuf> = std::fs::read_dir(&snapshot_dir)
+        .unwrap_or_else(|error| panic!("{} must exist: {error}", snapshot_dir.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    snapshot_paths.sort();
+    assert!(
+        !snapshot_paths.is_empty(),
+        "{} must hold at least one snapshot",
+        snapshot_dir.display()
+    );
+    let snapshots = read_labelled(snapshot_paths);
+
+    let findings = removed_field_findings(&state_source, &rust_files, &snapshots);
+    assert!(
+        findings.is_empty(),
+        "the removed State field survives (T-50-43):\n{}",
+        findings.join("\n")
+    );
+}
+
+/// `text` with every `<!--` … `-->` span removed (an unterminated one runs to
+/// the end of the text), so a fragment hidden in an HTML comment never counts
+/// as documented.
+fn strip_html_comments(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<!--") {
+        kept.push_str(&rest[..open]);
+        let after_open = &rest[open + "<!--".len()..];
+        match after_open.find("-->") {
+            Some(close) => rest = &after_open[close + "-->".len()..],
+            None => return kept,
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// The `fragments` that `text` does not contain, in the order given.
+fn missing_fragments<'a>(text: &str, fragments: &[&'a str]) -> Vec<&'a str> {
+    fragments
+        .iter()
+        .copied()
+        .filter(|fragment| !text.contains(fragment))
+        .collect()
+}
+
+/// Fragments OPERATIONS.md must hold, compared as written (50-17).
+const RUN_LIVENESS_FRAGMENTS: &[&str] = &[
+    "GONE",
+    "STALE",
+    "ALIVE",
+    "devflow stop --phase N",
+    "devflow resume --phase N",
+    "ps -o pid,pgid,sid,lstart,args -p \"$(pgrep -d, -g",
+    "DEVFLOW_CACHE_DIR",
+];
+
+/// Fragments OPERATIONS.md must hold, compared lowercased the way
+/// `source_devflow_env_vars_and_subcommands_are_documented` compares (RV-06).
+const INTERNAL_SUBCOMMAND_FRAGMENTS: &[&str] = &["devflow monitor", "devflow advance"];
+
+/// 50-17 (R6-G4): OPERATIONS.md documents run liveness as the supervisor
+/// socket answers it (GONE / STALE / ALIVE and the repair verbs), `devflow
+/// stop`'s arms including the backstop's refusal and its inspection command,
+/// the socket location's override, and both internal subcommands, outside
+/// HTML comments.
+#[test]
+fn operations_md_documents_run_liveness_and_the_stop_arms() {
+    let every: String = RUN_LIVENESS_FRAGMENTS.join("\n");
+    let all_but_stale = every.replace("STALE", "");
+    assert_eq!(
+        missing_fragments(&all_but_stale, RUN_LIVENESS_FRAGMENTS),
+        vec!["STALE"],
+        "planted control: a text missing only STALE must report exactly STALE"
+    );
+    let gone_only_in_a_comment = every.replace("GONE", "<!-- GONE -->");
+    assert!(
+        missing_fragments(&gone_only_in_a_comment, RUN_LIVENESS_FRAGMENTS).is_empty(),
+        "planted control: before stripping, the commented GONE still counts"
+    );
+    assert_eq!(
+        missing_fragments(
+            &strip_html_comments(&gone_only_in_a_comment),
+            RUN_LIVENESS_FRAGMENTS
+        ),
+        vec!["GONE"],
+        "planted control: a GONE only inside an HTML comment must be missing after stripping"
+    );
+    assert_eq!(
+        strip_html_comments("kept <!-- dropped"),
+        "kept ",
+        "planted control: an unterminated comment runs to the end of the text"
+    );
+    assert!(
+        missing_fragments(&every, RUN_LIVENESS_FRAGMENTS).is_empty(),
+        "planted control: a text holding every fragment reports none"
+    );
+
+    let path = workspace_root().join("OPERATIONS.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let text = strip_html_comments(&text);
+    let mut missing = missing_fragments(&text, RUN_LIVENESS_FRAGMENTS);
+    missing.extend(missing_fragments(
+        &text.to_ascii_lowercase(),
+        INTERNAL_SUBCOMMAND_FRAGMENTS,
+    ));
+    assert!(
+        missing.is_empty(),
+        "{} does not document run liveness and the stop arms; missing outside HTML comments:\n{}",
+        path.display(),
+        missing.join("\n")
+    );
+}
+
+/// The lines of `text` from the line equal to `heading` up to, not
+/// including, the next line starting with `## `, or to the end. `None` when no
+/// line equals `heading`.
+fn markdown_section<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    let mut offset = 0;
+    let mut start = None;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        match start {
+            None if bare == heading => start = Some(offset),
+            Some(begin) if bare.starts_with("## ") => return Some(&text[begin..offset]),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    start.map(|begin| &text[begin..])
+}
+
+/// True when `text`, with every whitespace run (line breaks included)
+/// collapsed to one space and lowercased, describes a shell monitor or a
+/// shell script — so a phrase wrapped across lines still counts.
+fn mentions_shell_monitor(text: &str) -> bool {
+    let collapsed = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    collapsed.contains("shell monitor") || collapsed.contains("shell script")
+}
+
+/// True when some line of `text`, lowercased, claims macOS support.
+fn claims_macos_support(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.to_lowercase();
+        line.contains("supports macos") || line.contains("macos is supported")
+    })
+}
+
+/// What ARCHITECTURE.md's `## Monitor daemon` section gets wrong about the
+/// supervisor (50-17, D-02/D-03): too short to describe it, not naming its
+/// socket or its in-process advance, or still naming the forked `advance`
+/// command or a `sh -c` runner.
+fn monitor_section_problems(section: &str) -> Vec<String> {
+    const MIN_LINES: usize = 8;
+    let mut problems = Vec::new();
+    let lines = section.lines().count();
+    if lines < MIN_LINES {
+        problems.push(format!("spans {lines} lines, fewer than {MIN_LINES}"));
+    }
+    for required in ["in-process", "socket"] {
+        if !section.contains(required) {
+            problems.push(format!("does not name `{required}`"));
+        }
+    }
+    for forbidden in ["devflow advance", "sh -c"] {
+        if section.contains(forbidden) {
+            problems.push(format!("still names `{forbidden}`"));
+        }
+    }
+    problems
+}
+
+/// Every file under `dir`, recursively, skipping hidden entries and
+/// `skip_dir`, in sorted order.
+fn files_under(dir: &Path, skip_dir: &Path) -> Vec<PathBuf> {
+    fn visit(dir: &Path, skip_dir: &Path, files: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("failed to list {}: {error}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') || path == skip_dir {
+                continue;
+            }
+            if path.is_dir() {
+                visit(&path, skip_dir, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(dir, skip_dir, &mut files);
+    files.sort();
+    files
+}
+
+/// A doc's text through `workspace_root()`, HTML comments stripped; panics
+/// naming the path when it cannot be read.
+fn read_doc(relative: &str) -> String {
+    let path = workspace_root().join(relative);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    strip_html_comments(&text)
+}
+
+/// 50-17 (R6-G4, T-50-44, T-50-66): the docs describe the socket supervisor
+/// as built and claim nothing unestablished. OPERATIONS.md carries the macOS
+/// caveat and D-20's install rule; no operator doc claims macOS support;
+/// ARCHITECTURE.md's `## Monitor daemon` section describes the socket and the
+/// in-process advance, not a forked `advance` command; the unattended-mode
+/// guide gives the capture shape, not a shell monitor, as the reason for its
+/// refusals.
+#[test]
+fn docs_describe_the_socket_supervisor_not_the_shell_monitor() {
+    // Planted controls, through the same helpers as the real checks.
+    let two_sections = "# Title\n## First\none\ntwo\n## Second\nthree\n";
+    assert_eq!(
+        markdown_section(two_sections, "## First"),
+        Some("## First\none\ntwo\n")
+    );
+    assert_eq!(markdown_section(two_sections, "## Absent"), None);
+    let planted_section = [
+        "## Monitor daemon",
+        "",
+        "The supervisor publishes a socket and advances in-process.",
+        "",
+        "Then it runs `devflow advance <project> --phase N`.",
+        "",
+        "It owns the agent.",
+        "",
+        "It answers ping and shutdown.",
+    ]
+    .join("\n");
+    assert_eq!(
+        monitor_section_problems(&planted_section),
+        vec!["still names `devflow advance`".to_string()],
+        "planted control: a section naming the forked advance must fail"
+    );
+    assert!(mentions_shell_monitor("a detached shell\n  monitor"));
+    assert!(!mentions_shell_monitor("the capture shape"));
+    assert!(claims_macos_support("DevFlow supports macOS."));
+    assert!(!claims_macos_support(
+        "Socket supervision is unverified on macOS"
+    ));
+
+    let operations = read_doc("OPERATIONS.md");
+    for claim in ["unverified on macOS", "only while no 2.x run is"] {
+        assert!(
+            operations.contains(claim),
+            "OPERATIONS.md does not state `{claim}`"
+        );
+    }
+
+    let root = workspace_root();
+    let mut operator_docs = vec![(root.join("OPERATIONS.md"), operations.clone())];
+    for path in files_under(&root.join("docs"), &root.join("docs/site")) {
+        // A binary asset cannot describe the monitor.
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            operator_docs.push((path, strip_html_comments(&text)));
+        }
+    }
+    assert!(
+        operator_docs.len() > 1,
+        "the docs/ walk must find files to scan"
+    );
+    for (path, text) in &operator_docs {
+        assert!(
+            !claims_macos_support(text),
+            "{} claims macOS support, which no macOS host or CI has verified",
+            path.display()
+        );
+    }
+
+    let architecture = read_doc("ARCHITECTURE.md");
+    let section = markdown_section(&architecture, "## Monitor daemon")
+        .unwrap_or_else(|| panic!("ARCHITECTURE.md has no `## Monitor daemon` section"));
+    let problems = monitor_section_problems(section);
+    assert!(
+        problems.is_empty(),
+        "ARCHITECTURE.md's `## Monitor daemon` section does not describe the socket supervisor:\n{}",
+        problems.join("\n")
+    );
+
+    let unattended = read_doc("docs/guides/unattended-mode.md");
+    assert!(
+        unattended.contains("capture shape"),
+        "docs/guides/unattended-mode.md does not name the capture shape"
+    );
+    assert!(
+        !mentions_shell_monitor(&unattended),
+        "docs/guides/unattended-mode.md still describes a shell monitor or shell script"
     );
 }

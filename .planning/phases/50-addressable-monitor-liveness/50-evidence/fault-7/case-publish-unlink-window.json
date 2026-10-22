@@ -1,0 +1,7 @@
+{
+  "case": "publish-unlink-window",
+  "live": false,
+  "bin_sha256": "182ab8b546a8f93c3e62b33c6516448446593bdb767e8f2ff250ec3393f5045d",
+  "fixture": "pipeline_launch::tests::a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor",
+  "reason": "a SIGKILL between the next supervisor publish and the old one unlinking cannot be placed by timing from outside the binary; the fixture reaches the window deterministically"
+}

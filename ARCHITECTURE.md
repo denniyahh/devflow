@@ -220,12 +220,27 @@ files per gated stage, all written atomically (temp file + rename):
   (`Gates::ack()`) once the response is consumed, so a poller knows to clean
   up.
 
-`run_gate()` (`crates/devflow-cli/src/main.rs`) writes the gate, fires the
-notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD` via
-`sh -c` with gate metadata as environment variables, never interpolated
+`run_gate()` (`crates/devflow-cli/src/pipeline_gate.rs`) writes the gate,
+fires the notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD`
+via `sh -c` with gate metadata as environment variables, never interpolated
 into the command string; a silent no-op when the variable is unset), then
-blocks in `Gates::poll_response()` with exponential backoff (1s → 2s → …
-capped at 60s) until a response appears or `DEVFLOW_GATE_TIMEOUT_SECS`
+waits in `wait_for_gate_response()` (`crates/devflow-cli/src/pipeline_launch.rs`),
+which polls the response file one of two ways:
+
+- **Inside a supervisor's advance** (its stop token is engaged, 50-13): the
+  run's owner reads `gate_wait` in a `ping` reply for the length of the wait,
+  and `Gates::poll_response_cancellable()` reads the response file about once
+  a second (every sleep is capped at 1s) and checks the stop token before each
+  sleep. A stop — a `shutdown` request on the supervisor's socket, or
+  SIGTERM/SIGINT to the supervisor — ends the wait within about a second: the
+  gate's files are removed, `stopped` is recorded in the state, which is kept
+  for `devflow resume` (not an abort), and the advance unwinds without acting
+  on the gate. A response already on disk wins over a stop.
+- **Anywhere else** (no stop token: the hidden `devflow advance` run from a
+  shell, or a gate a foreground command fires): `Gates::poll_response()` with
+  exponential backoff (1s → 2s → … capped at 60s), which nothing cancels.
+
+Either wait ends when a response appears or `DEVFLOW_GATE_TIMEOUT_SECS`
 (default 259200 = 3 days, held equal to
 `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` so `devflow gate sweep` cannot reap a
 gate this poll is still watching) elapses. `GateAction::from_response()` turns an
@@ -237,24 +252,47 @@ skipping unparsable entries rather than failing.
 ## Monitor daemon
 
 `crates/devflow-core/src/monitor.rs` is the core automation primitive — no
-cron, no scheduler, no agent cooperation. `spawn_monitor()` spawns a
-**detached child process that owns the agent**:
+cron, no scheduler, no agent cooperation. `spawn_monitor()` re-execs the CLI
+as its hidden `__monitor` subcommand, **a detached supervisor process in its
+own process group that owns the agent**, for both launch shapes:
 
-1. Launches the agent (`program` + `args`), redirecting stdout/stderr to
-   separate phase capture files (stderr is kept out of the stdout capture so
-   it can never corrupt the `DEVFLOW_RESULT` parse) and recording the agent
-   PID.
-2. Waits for the agent to exit and records its exit code to
-   `.devflow/phase-NN-exit`.
-3. Runs `devflow advance <project> --phase N` to advance the stage machine.
-   The phase is threaded in at spawn time, so `advance`'s identity never
-   depends on a shared state singleton — under `devflow parallel`, each
-   phase's monitor advances exactly its own stage.
+- **capture** (`MonitorLaunch::Legacy`): the agent's stdin is `/dev/null` and
+  its stdout and stderr go straight to the phase capture files (stderr is kept
+  out of the stdout capture so it can never corrupt the `DEVFLOW_RESULT`
+  parse). Non-Claude adapters other than Antigravity, the legacy Claude launch
+  opt-out and a checkpoint resume use it.
+- **stream** (`MonitorLaunch::PipeOwning`): the supervisor owns the agent's
+  stdin and stdout pipes, delivers the prompt as the first turn and applies the
+  idle timeout. Claude and Antigravity `stream-json` launches use it.
 
-Because the monitor outlives the `devflow start`/`devflow advance`
-invocation that spawned it, agent stdout keeps flowing into the capture
-file and the exit code is still reaped after the CLI process returns.
-`spawn_monitor()` is the single way an agent process is spawned (23d).
+The supervisor (`run_supervised_stage()`):
+
+1. Spawns the agent (`program` + `args`) in the agent's own process group and
+   records its PID.
+2. Publishes a per-launch Unix socket under `registry::cache_dir()/sock/`,
+   with a JSON sidecar beside it naming the launch (project root, phase,
+   agent process group, start time, boot id). The socket path is recorded in
+   the phase's `state.json` as `state.supervisor`; liveness (ALIVE / STALE /
+   GONE) is answered by probing that path, never from a pid.
+3. Answers `ping` and `shutdown` on the socket, and treats SIGTERM and SIGINT
+   sent to it as a `shutdown`: the agent's group is ended and no advance runs.
+4. Waits for the agent to exit and records its exit code to
+   `.devflow/phase-NN-exit`. A stream supervisor stops reading when the agent
+   exits, not when its stdout closes: when a process the agent started still
+   holds that stdout, it waits at most 3 s for its pipe threads, closes the
+   capture file, records a `stream_wait_bounded` event, and signals nothing.
+5. On the agent's natural exit, runs the advance in-process. The phase is
+   threaded in at spawn time, so the advance's identity never depends on a
+   shared state singleton — under `devflow parallel`, each phase's supervisor
+   advances exactly its own stage. When the advance launches the next stage,
+   that stage's supervisor publishes its socket before this one unlinks its
+   own, so the hand-off leaves no gap with neither socket published.
+
+`spawn_monitor()` returns once the new supervisor answers a ping with this
+launch's id. Because the supervisor outlives the CLI process that launched
+it, agent stdout keeps flowing into the capture file and the exit code is
+still reaped after that process returns. `spawn_monitor()` is the single way
+an agent process is spawned (23d).
 
 ## Worktree model
 

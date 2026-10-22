@@ -33,7 +33,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 47 | Unattended Decision Policy Consistency | DECN-02, DECN-03 | 1 | Complete    |
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
-| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Planned |
+| 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Complete    |
 | 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | TBD | 4 (after 50) | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
@@ -346,6 +346,7 @@ rather than by diagnosis. This is the milestone's breaking change.
 that mechanism is replaced, so the reference run is not perturbed by the change it would otherwise
 be measuring.
 **Requirements**: SUPV-01
+**Folded backlog**: 999.128, 999.134, 999.138, 999.139, 999.141 (operator, 2026-10-10; 50-CONTEXT.md D-04…D-10)
 **Success Criteria** (what must be TRUE):
 
   1. Liveness resolves to exactly one of GONE / STALE / ALIVE from `state.json` plus the socket at
@@ -360,90 +361,123 @@ be measuring.
   3. The socket path is persisted in `state.json` and resolves under `~/.cache/devflow/` — not the
      project tree, and not `$XDG_RUNTIME_DIR`, which systemd deletes at logout. A path that would
      exceed `sun_path` (108 bytes on Linux, 104 on macOS) is refused at construction with a named
-     error rather than silently truncated.
+     error rather than silently truncated. The directory is resolved by `registry::cache_dir()` —
+     `DEVFLOW_CACHE_DIR`, then `$XDG_CACHE_HOME/devflow`, default `~/.cache/devflow/` — which
+     honours both exclusions above.
+  4. `devflow stop --phase N` on an ALIVE supervisor sends `shutdown` over the socket; the supervisor
+     kills its agent's process group (grace, then SIGKILL), records exit code 143, does not advance,
+     removes its socket and exits. This holds for a run that holds no per-phase lock (999.138), and a
+     stop that races the agent's natural exit never launches the next stage (D-04, R-2).
+  5. SIGTERM or SIGINT delivered to either supervisor shape behaves exactly like a socket `shutdown`
+     (D-05, closes 999.134).
+  6. On a STALE socket, `stop` signals the recorded agent group only when the group is non-empty, the
+     boot id matches and the group leader is present with the recorded start time. A previous-boot
+     socket is removed with nothing signalled; a group whose leader is gone is refused and its members
+     reported, never signalled (R-4, R-8; the residual F1 limit is documented).
+  7. Sockets and their sidecars can be listed and probed with no state file; `doctor` reports
+     orphans; no read-only command kills a process or removes a socket. `start` and `resume` refuse
+     when a state file will not load but a sidecar for that root and phase is ALIVE or STALE with a
+     live group (D-06, D-09, R-12, closes 999.139).
+  8. Lock reclaim treats a live pid with a different start time as stale (999.128), and every e2e
+     test isolates `HOME`, `XDG_CACHE_HOME` and `DEVFLOW_CACHE_DIR` per child and reaps any
+     supervisor it launches (999.141).
 **No 2.x → 3.x migration (operator, 2026-10-12).** DevFlow has no outside users, so 3.x makes no
 promise about a `state.json` written by 2.x: it may read as GONE or fail to load, and either is
 acceptable. There is no version detection, no upgrade verb and no 2.x compatibility test. The
-former criterion 4 (detect and report a 2.x state as incompatible) is retired. This does not change
+former criterion 4 (detect and report a 2.x state as incompatible) is retired;
+the criterion now numbered 4 was added by the 2026-10-10 discussion. This does not change
 the milestone's major-version call.
 
-**Plans**: 0/25 plans complete (17 waves); 50-19 is the single operator checkpoint for the live attempt
+**Plans**: 29/29 plans complete (20 waves); 50-19 and 50-28 are the operator checkpoints for live attempts 1 and 2 (gap closure 50-26..50-29 added 2026-10-21)
 
 **Wave 1**
 
-- [ ] 50-01-PLAN.md *(no plan dependencies)* — staged semver gate (`tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
-- [ ] 50-02-PLAN.md *(no plan dependencies)* — 999.141 tracer: shared hermetic test helper, V-26 with its negative control, start_lock/stop e2e migrated
+- [x] 50-01-PLAN.md *(no plan dependencies)* — staged semver gate (`tools/semver-gate.sh`); ROADMAP criteria wording, folded-backlog markers, 999.143 update
+- [x] 50-02-PLAN.md *(no plan dependencies)* — 999.141 tracer: shared hermetic test helper, V-26 with its negative control, start_lock/stop e2e migrated
 
 **Wave 2**
 
-- [ ] 50-03-PLAN.md *(depends on 50-02)* — 999.141: migrate 8 more e2e files to the hermetic helper
-- [ ] 50-04-PLAN.md *(depends on 50-01, 50-02)* — 999.128: recycled-pid lock reclaim by start time (V-24/V-25), CLI repair test
-- [ ] 50-05-PLAN.md *(depends on 50-01, 50-02)* — core socket path, sun_path bound, atomic hard-link publish, total probe, wire protocol (V-01…V-06, V-11)
+- [x] 50-03-PLAN.md *(depends on 50-02)* — 999.141: migrate 8 more e2e files to the hermetic helper
+- [x] 50-04-PLAN.md *(depends on 50-01, 50-02)* — 999.128: recycled-pid lock reclaim by start time (V-24/V-25), CLI repair test
+- [x] 50-05-PLAN.md *(depends on 50-01, 50-02)* — core socket path, sun_path bound, atomic hard-link publish, total probe, wire protocol (V-01…V-06, V-11)
 
 **Wave 3**
 
-- [ ] 50-06-PLAN.md *(depends on 50-05)* — sidecar, read-only sweep, shutdown client, `State::supervisor` (V-22)
-- [ ] 50-21-PLAN.md *(depends on 50-03)* — 999.141: migrate the last 5 e2e files to the hermetic helper
+- [x] 50-06-PLAN.md *(depends on 50-05)* — sidecar, read-only sweep, shutdown client, `State::supervisor` (V-22)
+- [x] 50-21-PLAN.md *(depends on 50-03)* — 999.141: migrate the last 5 e2e files to the hermetic helper
 
 **Wave 4**
 
-- [ ] 50-07-PLAN.md *(depends on 50-06)* — supervisor runtime: single terminal-state owner, self-pipe signals, control thread (V-14)
+- [x] 50-07-PLAN.md *(depends on 50-06)* — supervisor runtime: single terminal-state owner, self-pipe signals, control thread (V-14)
 
 **Wave 5**
 
-- [ ] 50-08-PLAN.md *(depends on 50-07)* — both launch shapes on the runtime in core (V-08, V-09, V-10, V-16)
-- [ ] 50-09-PLAN.md *(depends on 50-07)* — STALE backstop: signal only a validated live leader's group, refuse and report otherwise (V-18…V-21), mutation run
+- [x] 50-08-PLAN.md *(depends on 50-07)* — both launch shapes on the runtime in core (V-08, V-09, V-10, V-16)
+- [x] 50-09-PLAN.md *(depends on 50-07)* — STALE backstop: signal only a validated live leader's group, refuse and report otherwise (V-18…V-21), mutation run
 
 **Wave 6**
 
-- [ ] 50-10-PLAN.md *(depends on 50-04, 50-08)* — `LaunchContext` and test-binary monitor entry; every `spawn_monitor` caller named; in-crate cache isolation
+- [x] 50-10-PLAN.md *(depends on 50-04, 50-08)* — `LaunchContext` and test-binary monitor entry; every `spawn_monitor` caller named; in-crate cache isolation
 
 **Wave 7**
 
-- [ ] 50-24-PLAN.md *(depends on 50-09, 50-10)* — not-ready teardown: publish wait, agent-group guard, private /proc parent-pid parse (V-33)
+- [x] 50-24-PLAN.md *(depends on 50-09, 50-10)* — not-ready teardown: publish wait, agent-group guard, private /proc parent-pid parse (V-33)
 
 **Wave 8**
 
-- [ ] 50-11-PLAN.md *(depends on 50-03, 50-04, 50-10, 50-21, 50-24)* — one-way switch: both shapes to `__monitor`, shell monitor deleted, e2e tracer, V-07
+- [x] 50-11-PLAN.md *(depends on 50-03, 50-04, 50-10, 50-21, 50-24)* — one-way switch: both shapes to `__monitor`, shell monitor deleted, e2e tracer, V-07
 
 **Wave 9**
 
-- [ ] 50-12-PLAN.md *(depends on 50-09, 50-11)* — status/cleanup/doctor on the probe; read-only orphan-socket findings naming `stop --launch <id>`
-- [ ] 50-13-PLAN.md *(depends on 50-11)* — handoff order, stop checks during advance, cancellable gate wait, stop on an unloadable state (V-13, V-15)
+- [x] 50-12-PLAN.md *(depends on 50-09, 50-11)* — status/cleanup/doctor on the probe; read-only orphan-socket findings naming `stop --launch <id>`
+- [x] 50-13-PLAN.md *(depends on 50-11)* — handoff order, stop checks during advance, cancellable gate wait, stop on an unloadable state (V-13, V-15)
 
 **Wave 10**
 
-- [ ] 50-14-PLAN.md *(depends on 50-09, 50-12, 50-13)* — `devflow stop` through the socket incl. `--launch <id>` (V-17), STALE backstop path, recover refusal
-- [ ] 50-23-PLAN.md *(depends on 50-12, 50-13)* — launch failure paths: clear the record on refusal or failure, failed publish save, stop before the record is saved (V-30…V-32)
+- [x] 50-14-PLAN.md *(depends on 50-09, 50-12, 50-13)* — `devflow stop` through the socket incl. `--launch <id>` (V-17), STALE backstop path, recover refusal
+- [x] 50-23-PLAN.md *(depends on 50-12, 50-13)* — launch failure paths: clear the record on refusal or failure, failed publish save, stop before the record is saved (V-30…V-32)
 
 **Wave 11**
 
-- [ ] 50-15-PLAN.md *(depends on 50-14)* — 999.139 start/resume guard (V-23), concurrent starts (V-12)
+- [x] 50-15-PLAN.md *(depends on 50-14)* — 999.139 start/resume guard (V-23), concurrent starts (V-12)
 
 **Wave 12**
 
-- [ ] 50-22-PLAN.md *(depends on 50-15, 50-23)* — remove every CLI use of `State::monitor_pid`
+- [x] 50-22-PLAN.md *(depends on 50-15, 50-23)* — remove every CLI use of `State::monitor_pid`
 
 **Wave 13**
 
-- [ ] 50-16-PLAN.md *(depends on 50-22)* — remove `State::monitor_pid` from core, final semver gate (V-27), container check
+- [x] 50-16-PLAN.md *(depends on 50-22)* — remove `State::monitor_pid` from core, final semver gate (V-27), container check
 
 **Wave 14**
 
-- [ ] 50-17-PLAN.md *(depends on 50-16)* — OPERATIONS, ARCHITECTURE and guides: liveness, stop, macOS caveat, D-20 install rule
-- [ ] 50-18-PLAN.md *(depends on 50-16)* — fault arm and attempt judge (same-binary rule), runbook; run the fault arm (V-29)
+- [x] 50-17-PLAN.md *(depends on 50-16)* — OPERATIONS, ARCHITECTURE and guides: liveness, stop, macOS caveat, D-20 install rule
+- [x] 50-18-PLAN.md *(depends on 50-16)* — fault arm and attempt judge (same-binary rule), runbook; run the fault arm (V-29)
 
 **Wave 15**
 
-- [ ] 50-19-PLAN.md *(depends on 50-17, 50-18)* — live attempt to Ship: one `checkpoint:human-action` (V-28)
+- [x] 50-19-PLAN.md *(depends on 50-17, 50-18)* — live attempt to Ship: one `checkpoint:human-action` (V-28)
 
 **Wave 16**
 
-- [ ] 50-25-PLAN.md *(depends on 50-18, 50-19)* — evidence-checker modes for the published record: `--published`, `--live-run`, `--handoff`, `--defects`
+- [x] 50-25-PLAN.md *(depends on 50-18, 50-19)* — evidence-checker modes for the published record: `--published`, `--live-run`, `--handoff`, `--defects`
 
 **Wave 17**
 
-- [ ] 50-20-PLAN.md *(depends on 50-19, 50-25)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
+- [x] 50-20-PLAN.md *(depends on 50-19, 50-25)* — sanitized evidence, 50-LIVE-RUN.md verdict, backlog disposition
+
+**Wave 18** *(gap closure: verification 2026-10-21 reproduced WR-03)*
+
+- [x] 50-26-PLAN.md *(depends on 50-20)* — WR-03 fix: the stream loop ends at the agent's exit and the reader drain is bounded; fail-first tests and a revert check
+- [x] 50-27-PLAN.md *(depends on 50-20)* — `--attempt-gate --current-source` and the runbook's attempt-2 delegation
+
+**Wave 19**
+
+- [x] 50-28-PLAN.md *(depends on 50-26, 50-27)* — live attempt 2 on the fixed binary: one `checkpoint:human-action` (D-18 ruling 2026-10-21)
+
+**Wave 20**
+
+- [x] 50-29-PLAN.md *(depends on 50-28)* — attempt 2's sanitized evidence, LIVE-RUN and VALIDATION updates, WR-03 recorded fixed
 
 **Cross-cutting constraints:**
 
@@ -655,7 +689,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 47 | 7/7 | Complete   | 2026-09-13 |
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
-| 50 | 0/24 | Planned | — |
+| 50 | 29/29 | Complete | 2026-10-21 |
 | 50.1 | — | Not started | — |
 | 51 | — | Not started | — |
 
@@ -898,6 +932,14 @@ failure rate only.
 **Fix shape (not decided):** reproduce under load (for example `cargo test` with `--test-threads` above the core
 count, repeated), then make the reap wait on a condition instead of on timing.
 
+*Related, recorded 2026-10-19 (operator request):* a sibling in the same module,
+`agents::opencode::tests::spawn_with_timeout_kills_a_hung_child`, failed once in the pinned CI container (2026-09-22):
+the stub's backgrounded `sleep` was still alive 2 s after `spawn_with_timeout` SIGKILLed the probe's process group.
+Not reproduced in 40 pinned-container runs of the core library; root cause not found
+(`.planning/debug/probe-sleep-survives-group-kill.md`). Same class as this entry (group-reap timing in
+`opencode.rs`), so fix them together. Phase 50's `6d46008` (a listener mid-close under load) and `96b457b` (a
+two-read observer race) are the patterns to check first; Phase 50 showed 30 loaded runs cannot see a ~0.3% flake.
+
 ### Phase 999.152: Phase 49 Live-Run Tooling Robustness Findings, to Fix Before the Tools Are Reused (BACKLOG)
 
 **Found:** 2026-10-09, Phase 49 deep code review (`49-REVIEW.md` WR-04, WR-05, WR-06, IN-03, IN-04, IN-05).
@@ -1111,7 +1153,167 @@ on a planted wrong input; the shell versions are deleted, with their callers upd
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.162: Adopt wsx for Repo Operations (BACKLOG)
+### Phase 999.162: A Gate Response Written During Cleanup Can Outlive Its Gate (BACKLOG)
+
+**Found:** 2026-10-18, by code reading during the Phase 50 flake hunt (`96b457b`'s debugger); confirmed by reading
+`crates/devflow-core/src/gates.rs` on 2026-10-19. **Not reproduced.** Pre-dates Phase 50; applies to every gate.
+
+**Defect (by reading):** `Gates::respond` checks that the gate file exists, then that no response exists, then writes the
+response with an exclusive create. `Gates::cleanup` removes the gate, then the response, then the ack, one `remove_file`
+at a time. A respond whose existence checks run before cleanup's first removal and whose write lands after cleanup's
+response removal leaves a response file with no gate. `write_gate` does not remove a leftover response, and
+`poll_response` returns any response file it finds, so a later gate for the same phase and stage could read that
+leftover as its answer.
+
+**Not traced:** whether every production path that fires a gate clears a leftover response before `write_gate`; if one
+does, the window is closed in practice and only the library API is exposed.
+
+**Fix shape (not decided):** reproduce first (a test that interleaves `respond` and `cleanup` at the two points, as
+`96b457b`'s delay test did for the park), then either clear a leftover response in `write_gate` or make the response
+carry the gate's timestamp so `poll_response` rejects an answer to an older gate.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.163: GSD's Codex Adapter Ignores `workflow.subagent_timeout` and Gives the Stall Watcher No Output File (BACKLOG)
+
+**Found:** 2026-09-15, Phase 48 replan; diagnosed in `.planning/debug/planner-wait-observability.md`. Recorded here
+2026-10-19 (operator request) so the diagnosis is tracked outside an open debug session. **Upstream (gsd-core), not
+DevFlow code.**
+
+**Defect:** on the Codex collaboration path, GSD's Task-to-`spawn_agent` conversion binds neither the configured
+`workflow.subagent_timeout` (300000 ms here) nor an output-file handle, so a long planner run has no deadline and
+`gsd_stall_watch` has nothing to watch. Planner and revision agents ran past ten minutes in the Phase 48 replan.
+
+**Done when:** an upstream gsd-core issue exists for it (check open issues first), or a DevFlow-side workaround is
+decided. No DevFlow code change is implied.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.164: Supervisor Residuals From the Phase 50 External Review (BACKLOG)
+
+**Found:** 2026-10-19, external review of Phase 50's crate diff (agy and DeepSeek lanes, adversarial and security
+lenses; reports and triage in `.planning/phases/50-addressable-monitor-liveness/reviews/`). Each item was checked by
+reading the code at `0048fdb`, not reproduced. The operator chose to backlog these and fix the rest before the live run.
+
+**Defects:**
+1. `devflow doctor`'s orphan list (`collect_orphan_supervisors`, `commands.rs`) skips a swept socket whose probe
+   errors (`_ => continue`), so an unrecorded socket that cannot be probed is reported nowhere.
+2. A supervisor's control thread waits out the stop kill grace (`TERMINATE_VERIFY_WAIT`, 3 s) inline after answering
+   `accepted`, so any other connection's ping times out (`IO_TIMEOUT`, 2 s): `status`/`doctor` read UNKNOWN during a
+   stop, and a second concurrent `stop` errors. In that window `cleanup --force` also reads ProbeFailed and removes
+   the worktree of a run that is still stopping (50-12 lets `--force` override ProbeFailed like STALE). Raised by the
+   graphify-labs review of PR #225 (`commands.rs:952`); see `.planning/audits/2026-10-22-graphify-review-triage-pr225.md`.
+3. A SIGKILL between `bind` of `<stem>.part` and its `hard_link` leaves the `.part` file in `sock/`; nothing
+   (`publish` cleanup, `remove_launch_files`, `sweep_in`, `doctor`) lists or removes it.
+4. Connections are served one at a time on the control thread, each bounded by `IO_TIMEOUT`, and the client's
+   `connect` has no timeout: a same-uid process holding many connections can make `stop` fail or hang.
+5. On a normal completion only the agent leader is reaped; members it left in its group keep running, and
+   `finish` removes the socket and sidecar, the only record of the group (behaviour predates Phase 50).
+
+**Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.165: A State File's `gate_notify_cmd` Runs as a Shell Command (BACKLOG)
+
+**Found:** 2026-10-19, Phase 50 external review (security lens); predates Phase 50. Checked by reading the code, not
+reproduced.
+
+**Defect:** `State::gate_notify_cmd` is persisted in `.devflow/state-NN.json` and, when `DEVFLOW_GATE_NOTIFY_CMD` is
+unset, used as the gate notification command, run through `sh -c` (`gates.rs` `run_notify_command`). `.devflow/` is
+gitignored, but a repository that commits a state file anyway hands its author a shell command that runs at the next
+gate. Low practical weight: running an agent in a hostile repository already runs its code.
+
+**Done when:** a persisted notify command is either no longer executed from the state file, or the risk is
+explicitly accepted with a reason.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.166: Supervisor Residuals From the Phase 50 Code Review (BACKLOG)
+
+**Found:** 2026-10-20, Phase 50's end-of-phase `/gsd-code-review` (standard depth, 53 files; report
+`.planning/phases/50-addressable-monitor-liveness/50-REVIEW.md`, ledger `50-REVIEW-DISPOSITION.md`). Each item was
+found by reading the code at `889ecea`, not reproduced. The operator chose on 2026-10-21 to fix the review's one
+Critical (CR-01, a stop not honoured before a `--yes-ship` merge) in Phase 50 and to defer these six, with Phase 50.1's
+stop-ownership work as the natural home.
+Item 3 was reproduced on 2026-10-21 and fixed in Phase 50 by operator decision; the remaining five stay deferred.
+
+**Defects:**
+1. (WR-01) `devflow stop` prints "did not answer the shutdown … nothing was signalled or recorded" for a stop the
+   supervisor accepted and will still honour, when its next stop check is more than the 22 s final wait away: the
+   advance's lock wait (up to 600 s), transition hooks, preflight, the first-launch canary, Ship finalization.
+   OPERATIONS.md's "runs no advance" wording is wrong for this case.
+2. (WR-02) `recover --clean` without `--phase` ignores the supervisor socket, though OPERATIONS.md says it probes it:
+   it deletes state started more than 24 h ago with no live agent pid and no held lock, including a live supervisor
+   between its agent's exit and the advance taking the lock. The 2026-10-19 triage fix covered `--phase N` only.
+3. **Fixed in Phase 50 by 50-26** (`07e237b`, `493156b`; reproduced by the phase verifier 2026-10-21):
+   (WR-03) A stream supervisor whose agent completed normally can block forever in `threads.join()` (`monitor.rs`)
+   when a group member still holds the agent's stdout; it stays ALIVE in "advancing", `stop` cannot reach it, and the
+   backstop refuses because the leader was already reaped. The join predates Phase 50.
+4. (IN-01) `poll_response_cancellable` keeps a backoff that never takes effect, so a supervised gate polls every second
+   for as long as it waits.
+5. (IN-02) The control thread busy-loops on a persistent `accept` error such as EMFILE.
+6. (IN-03) `stop`'s success line says "agent group ended" for a stop honoured at a safe point, where nothing was
+   signalled.
+   The same safe-point stop also leaves the exit file with the agent's own code (`0` after a completed run) while the
+   parked caller's `stopped` reply reports 143: the exit file keeps the code the agent exited with.
+   50-26's test E3 pins this as observed (2026-10-21).
+
+7. (50-REVIEW-2 WR-01, found 2026-10-21 by the post-fix re-review, not reproduced) Safe point 6 is checked once, before the
+   finalization loop (`pipeline_gate.rs` `finish_workflow_with_gate_timeout`): if the after-ship hooks fail and the retry gate is
+   approved, the loop re-runs merge, version bump, tag and push without re-checking for a stop, and the gate poll reads a
+   response before it checks for cancellation, so a stop accepted in the same second as the retry approval is ignored. Same
+   class as CR-01; needs a failed first finalization, a retry approval and a stop together. Fix: the safe-point check at the top
+   of each loop pass. Deferred by operator decision 2026-10-21.
+8. (50-REVIEW-2 IN-01..03, info) Safe point 5 runs after the Ship gate's notify fires, so a stopped `--yes-ship` run still
+   sends a "Ship gate awaiting" message for a gate withdrawn at once; ARCHITECTURE.md says the stream reader "stops reading"
+   and "at most 3 s" while the code keeps draining and the bound can reach 6 s; the safe-point-6 comment says "a resumed run
+   asks again" although a saved `yes_ship` auto-approves the resumed Ship.
+
+**Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted with a reason.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.167: `cut-pr-branch.sh`'s Phase Scope Filter Drops `(NN-review)` Commits (BACKLOG)
+
+**Found:** 2026-10-22, Phase 50 close-out (PR #225). Reproduced on the real cut.
+
+**Defect:** phase mode keeps a commit only when its scope matches `(NN)`, `(NN-MM)` or `(phase-NN)`
+(`SCOPE_RE` in `scripts/cut-pr-branch.sh`, `(-[0-9]+)?`). The nine `fix(50-review)`/`docs(50-review)` commits
+from Phase 50's external review were silently left out: the script's fidelity report flagged 8 paths that did not
+match the phase branch, and the commits were cherry-picked by hand. A scope written by hand during a phase (as GSD's
+review-fix flow does) is phase work the filter cannot see.
+
+**Done when:** the filter accepts any `(NN-<word>)` scope for phase NN, and a script selftest proves a
+`(NN-review)` commit is replayed while `(NNN)` and `(NN.1)` scopes for other phases are not.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.168: Adopt wsx for Repo Operations (BACKLOG)
 
 **Found:** 2026-10-20, operator decision while planning wsx milestone 1 (`~/Github/wsx`,
 `.planning/REQUIREMENTS.md` boundary section; `.planning/research/DEVFLOW-SETUP.md` "Overlap to retire").
@@ -1207,6 +1409,8 @@ guard placed just before `launch_stage`, and passes at HEAD.
 
 ### Phase 999.143: A Recycled Recorded Pid Leaves `resume` No Work-Preserving Way Out (BACKLOG)
 
+**Phase 50 removes the monitor-pid half** by construction (`50-CONTEXT.md` D-12): liveness is socket-addressed and `State::monitor_pid` is removed. The agent-pid identity and the work-preserving repair stay in this entry.
+
 **Found:** 2026-09-23 while planning 48-20 (48-20-PLAN.md Known limits, T-48-20-05). **Reasoned from source
 only — not reproduced; no test covers it.** **Filed by operator decision 2026-09-23:** defer to a later
 phase rather than accept it inside 48-20.
@@ -1257,6 +1461,8 @@ and name the repair that works there, as the 48-19/48-20 refusal text does, inst
 
 ### Phase 999.141: E2E Tests Write Real `~/.cache/devflow/roots` and Leak Monitors (BACKLOG)
 
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-07). This entry stays as the evidence record; the work is tracked there.
+
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-05); cache count verified
 by the orchestrator the same day.
 
@@ -1300,6 +1506,8 @@ the lock; decide whether `status` should stop suggesting `resume` while the agen
 
 ### Phase 999.139: A State File That Will Not Load Hides a Live Monitor From `start`'s Guard (BACKLOG)
 
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-09). This entry stays as the evidence record; the work is tracked there.
+
 **Found:** 2026-09-23 by the Phase 48 gap-closure code review (48-REVIEW.md WR-03). **Reproduced
 2026-09-23 by the Phase 48 re-verification** (HEAD `5eb3a61`): corrupt state + dead agent + live stand-in
 monitor → `start --force` exited 0, overwrote the state and launched a second agent. `resume` is not
@@ -1321,6 +1529,8 @@ but will not load (fail closed, pointing at `recover --clean`), or recover the m
 recorded monitor.
 
 ### Phase 999.138: `devflow stop` Cannot End a Run That Holds No Lock (BACKLOG)
+
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-04 and D-10). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** 2026-09-22 by the Phase 48 gap planner while wording 48-19's refusal message.
 **Reasoned from source only — not reproduced.**
@@ -1430,6 +1640,8 @@ from the next natural full-gate failure, or force it with ~15 repeated full-gate
 **Acceptance:** not decided; set at promotion.
 
 ### Phase 999.134: PipeOwning Monitor Orphans Its Agent on TERM (BACKLOG)
+
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-05 and D-10). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** 2026-09-22, while debugging the Legacy monitor's lost-TERM flake
 (`.planning/debug/resolved/monitor-sigterm-orphans-agent.md`). The operator decided to backlog it and
@@ -1570,6 +1782,8 @@ then `devflow ship --phase N`.
 **Acceptance:** not decided; set at promotion.
 
 ### Phase 999.128: Lock Reclaim Ignores the Holder's Start Time (BACKLOG)
+
+**Folded 2026-10-10 into Phase 50** (operator decision, `50-CONTEXT.md` D-08). This entry stays as the evidence record; the work is tracked there.
 
 **Found:** Phase 48 D-05 limits and `<deferred>` (`48-CONTEXT.md`), which defer it to Phase 50's
 liveness work. Phase 50's roadmap entry does not carry it, so it is filed here. The operator decided
@@ -1859,8 +2073,20 @@ reach any other test. That deletes the class outright and makes the enumeration 
    in one shared process and assert no monitors leaked. Under per-test isolation it runs alone,
    sees `alive=[], in_flight=0, registered=0`, and reports a false leak. It needs redesigning, and
    simply excluding it would delete a real leak check the repo relies on.
+   *Update 2026-10-17 (Phase 50, `5a63052`, operator decision):* the audit now returns early when
+   `NEXTEST` is set and still runs under `cargo test`; run alone under `cargo test` it still fails
+   at its deadline, so the check is kept. Redesigning it for per-test isolation is still open.
 2. **6 tests are flagged "leaky"** by nextest (processes outliving the test). Untraced. Each is
    either a latent defect nextest surfaces and `cargo test` hides, or noise — nobody has looked.
+   *Evidence 2026-10-17/18 (Phase 50, operator asked to backlog it here):* they are real, not
+   noise. Every full `cargo test` run in Phase 50 left 1-4 orphaned `sleep 30` processes
+   reparented to systemd, each carrying this repo's `CARGO_MANIFEST_DIR` (devflow-core and
+   devflow) in `/proc/<pid>/environ`; they were killed by recorded PID after each wave. Tests
+   nextest named as leaky in that time:
+   `commands::tests::reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates`
+   (left four `sleep 30` once), `commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`,
+   and `agent::tests::discover_stray_devflow_processes_finds_a_monitor_wrapper`. Not traced
+   further: which fixture spawns them without a reap guard.
 
 **Also in scope:** adopting it changes the gate itself (`scripts/check.sh:19,48` and the four
 `.github/workflows/ci.yml` jobs), so it needs a flag-parity audit (`--no-fail-fast` semantics, CI

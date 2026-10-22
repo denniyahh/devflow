@@ -43,6 +43,14 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
+      # --init: a job container's PID 1 is otherwise `tail -f /dev/null`, which
+      # never reaps orphans, so a killed agent's orphaned children stay
+      # zombies for the whole job. scripts/check-in-container.sh's PID 1 is
+      # bash, which reaps, and so does any real host. Without this the suite
+      # runs under a PID 1 neither of them has (PR #225: 18 failures, all
+      # zombies). The tests' liveness probes skip zombies too; this keeps CI
+      # matching the local gate rather than relying on that alone.
+      options: --init
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -96,6 +104,8 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
+      # --init: see the Test job.
+      options: --init
     timeout-minutes: 45
     # REQUIRED, not stylistic. A `run:` step in a CONTAINER job defaults to
     # `sh -e {0}`, not `bash -e {0}` as it would on a bare runner — and this

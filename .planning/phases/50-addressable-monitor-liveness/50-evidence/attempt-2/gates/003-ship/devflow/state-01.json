@@ -1,0 +1,44 @@
+{
+  "stage": "ship",
+  "phase": 1,
+  "agent": "claude",
+  "mode": "auto",
+  "gate_pending": true,
+  "consecutive_failures": 0,
+  "infra_failures": 0,
+  "preflight_retries": 0,
+  "last_validate_failure_commit_count": null,
+  "phase_validate_failures": 0,
+  "last_verification_fingerprint": 10958618132380540863,
+  "verification_baseline_captured": true,
+  "last_verification_mtime_nanos": 1792615189989802061,
+  "verification_run_nonce": 1,
+  "started_at": "1792614484",
+  "project_root": "~/.cache/devflow-phase50/attempt-2/project",
+  "worktree_path": "~/.cache/devflow-phase50/attempt-2/project/.worktrees/phase-01",
+  "supervisor": {
+    "socket_path": "~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a61fcc71eb82.sock",
+    "launch_id": "18e0a61fcc71eb82",
+    "agent_pgid": 2882070,
+    "agent_start_time": 11333431,
+    "boot_id": "uuid-707"
+  },
+  "session_id": "uuid-3",
+  "checkpoint_resumes": 0,
+  "stop_until": null,
+  "stopped": false,
+  "stop_reason": null,
+  "yes_ship": true,
+  "base_branch": "integration",
+  "canary": "confirmed",
+  "legacy_claude_launch": false,
+  "checkpoint_approval": {
+    "recorded": [
+      {
+        "plan_file": "01-01-PLAN.md",
+        "element": "<task type=\"checkpoint:decision\" gate=\"blocking-human\">\n  <name>Task 1: Choose the default retry budget</name>\n  <decision>Which value should `probe.budget.DEFAULT_RETRY_BUDGET_SECS` hold, in seconds?</decision>\n  <context>\nThe probe retries calls to an upstream service until the budget runs out. The upstream's documented failover\ncompletes within 90 seconds; a budget shorter than that turns every failover into a hard failure. The on-call pager\nescalates a stalled job after 4 minutes, so a budget longer than 240 seconds lets a dead upstream page someone before\nthe probe reports its own failure. A longer budget also holds a worker slot for longer.\n  </context>\n  <options>\n    <option id=\"budget-30\">\n      <name>30 seconds</name>\n      <pros>Fails fast and frees worker slots quickly.</pros>\n      <cons>Shorter than the 90-second failover window, so every failover becomes a hard failure.</cons>\n    </option>\n    <option id=\"budget-120\">\n      <name>120 seconds</name>\n      <pros>Covers the 90-second failover window and reports before the 4-minute page.</pros>\n      <cons>Holds a worker slot for up to two minutes per stalled call.</cons>\n    </option>\n    <option id=\"budget-300\">\n      <name>300 seconds</name>\n      <pros>Survives even a slow failover with margin.</pros>\n      <cons>Longer than the 4-minute pager threshold, so a dead upstream pages someone first.</cons>\n    </option>\n  </options>\n  <resume-signal>Select: budget-30, budget-120, or budget-300</resume-signal>\n</task>"
+      }
+    ]
+  },
+  "gate_notify_cmd": "timeout 60 bash ~/Github/devflow/.worktrees/phase-50/.planning/phases/49-live-unattended-run-the-milestone-s-instrument/tools/snapshot-hook.sh ~/.cache/devflow-phase50/attempt-2/project ~/.cache/devflow-phase50/attempt-2"
+}

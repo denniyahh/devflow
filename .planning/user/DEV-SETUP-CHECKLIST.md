@@ -261,6 +261,14 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   in `crates/devflow-cli/tests/ci_parity_guards.rs`; a file-scoped check would pass with the
   declaration sitting on the wrong job. Same false-green family as the zsh `${PIPESTATUS[0]}`
   hazard in CLAUDE.md.
+- [ ] **[PATTERN]** **A container job that runs the suite declares `options: --init`** (`Test` and
+  `Sequential 2-CPU check`). A job container's PID 1 is otherwise `tail -f /dev/null`, which never
+  reaps orphans, so a killed agent's orphaned children stay zombies for the whole job, and any
+  `kill(-pgid, 0)` "group gone?" probe reads them as alive. The pre-push gate's PID 1 is
+  `check.sh`'s bash, which reaps, so it passed the same SHA that failed 18 tests on PR #225
+  (2026-10-22). The liveness probes now skip zombies too (`test_support::live_group_members`,
+  the rule `supervisor::backstop`'s census already used); `--init` keeps CI's PID 1 matching the
+  gate's instead of relying on that alone.
 - [ ] **[PATTERN]** **A workflow guard must be a FUNCTION over text, driven by fixtures — not a
   `contains` search over the live file.** A guard that can only ever run against the real workflow
   cannot be made to fail on demand, so it is only ever observed passing, which is not evidence.
@@ -320,6 +328,12 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   explicitly (never a floating tag), persists cargo registry + `target/` as named Docker volumes.
 - [ ] **[PROJECT]** `rust-toolchain.toml` — pins an **exact** rustc version (`1.97.1`), not a
   floating `channel = "stable"`, for the same drift-prevention reason as the image pin.
+- [ ] **[PROJECT]** the `aarch64-apple-darwin` rustup target — needed by the macOS compile gate
+  (`cargo check --target aarch64-apple-darwin` for `devflow-core` and `devflow` with `--all-targets`,
+  Phase 50 MAC-1). Install it with `rustup target add aarch64-apple-darwin`; it is per toolchain, so
+  add it again after a `rust-toolchain.toml` bump. Without it the gate fails with
+  `error[E0463]: can't find crate for core`. The gate compiles only: it never links or runs anything
+  for macOS.
 - [ ] **[PATTERN]** `scripts/check.sh` (runs fmt/clippy/tests) and
   `scripts/check-in-container.sh` (the same, but launched inside the pinned image) — the single
   source of truth CI, the pre-push hook, and a developer's manual check all call into.

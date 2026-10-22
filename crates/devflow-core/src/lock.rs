@@ -245,18 +245,37 @@ fn acquire_after_existing(
     let Some(record) = read_holder_record(&path) else {
         return Err(contended(path));
     };
-    if crate::agent::agent_running(record.pid) {
-        return Err(LockError::Contended {
-            pid: record.pid.to_string(),
-            path,
-        });
+    // 999.128 (D-08): reclaim through the same holder classifier `holder_status`
+    // uses, so a live pid whose start time differs from the recorded one (the
+    // recorded holder exited and its pid was reused) counts as stale. Only an
+    // identity-confirmed live holder, or one whose identity cannot be checked,
+    // keeps the lock.
+    let is_running = crate::agent::agent_running(record.pid);
+    let observed_start_time = crate::agent::process_start_time(record.pid);
+    match classify_holder_record(record, is_running, observed_start_time) {
+        HolderStatus::Live { .. } | HolderStatus::Unconfirmable { .. } => {
+            return Err(LockError::Contended {
+                pid: record.pid.to_string(),
+                path,
+            });
+        }
+        HolderStatus::NoHolder => tracing::warn!(
+            "reclaiming stale devflow lock at {} (holder pid {} is not alive)",
+            path.display(),
+            record.pid
+        ),
+        HolderStatus::Recycled { pid } => {
+            let show =
+                |start: Option<u64>| start.map_or_else(|| "unknown".into(), |s| s.to_string());
+            tracing::warn!(
+                "reclaiming devflow lock at {}: holder pid {pid} is alive but its start time {} \
+                 differs from the recorded {} — reclaiming a recycled pid",
+                path.display(),
+                show(observed_start_time),
+                show(record.recorded_start_time)
+            );
+        }
     }
-
-    tracing::warn!(
-        "reclaiming stale devflow lock at {} (holder pid {} is not alive)",
-        path.display(),
-        record.pid
-    );
     before_reclaim();
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -913,6 +932,92 @@ mod tests {
         let (pid, _) = holder(dir.path(), PhaseId::new(1)).expect("holder present");
         assert_eq!(pid, std::process::id().to_string());
         drop(guard);
+    }
+
+    /// Write a lock record naming this test process's own (live) pid, with
+    /// `recorded_start` as its second line when given. Returns the pid, the
+    /// observed start time of this process, and the lock path.
+    fn write_own_pid_lock(
+        dir: &Path,
+        phase: PhaseId,
+        recorded_start: impl FnOnce(u64) -> Option<u64>,
+    ) -> (u32, u64, PathBuf) {
+        let path = lock_path(dir, phase);
+        let pid = std::process::id();
+        let observed = crate::agent::process_start_time(pid)
+            .expect("the test process must expose its start time");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = match recorded_start(observed) {
+            Some(start) => format!("{pid}\n{start}"),
+            None => pid.to_string(),
+        };
+        fs::write(&path, record).unwrap();
+        (pid, observed, path)
+    }
+
+    /// 999.128 (D-08): a live pid whose start time differs from the recorded
+    /// one is a recycled pid, not the holder — the recorded holder exited.
+    /// Reclaim must treat it like a dead holder.
+    #[test]
+    fn acquire_reclaims_a_lock_whose_live_pid_has_a_different_start_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let (pid, observed, path) =
+            write_own_pid_lock(dir.path(), phase, |start| Some(start.saturating_add(1)));
+
+        let guard = acquire(dir.path(), phase).expect("a recycled-pid lock must be reclaimed");
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{pid}\n{observed}"),
+            "the reclaimed lock must name the caller with its real start time"
+        );
+        assert_eq!(holder_status(dir.path(), phase), HolderStatus::Live { pid });
+        drop(guard);
+    }
+
+    /// Phase 48 D-02 one-writer rule: a live holder whose start time matches
+    /// the recorded one is the holder, and is never reclaimed.
+    #[test]
+    fn acquire_never_reclaims_a_live_holder_whose_start_time_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let (pid, _, path) = write_own_pid_lock(dir.path(), phase, Some);
+        let before = fs::read(&path).unwrap();
+
+        let err = acquire(dir.path(), phase).expect_err("a live matched holder must contend");
+
+        match err {
+            LockError::Contended { pid: holder, .. } => assert_eq!(holder, pid.to_string()),
+            other => panic!("expected Contended, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the lock must be untouched"
+        );
+    }
+
+    /// A live pid with no recorded start time cannot be identity-checked
+    /// (Unconfirmable), so reclaim stays conservative and contends.
+    #[test]
+    fn acquire_never_reclaims_a_live_holder_with_no_recorded_start_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        let (pid, _, path) = write_own_pid_lock(dir.path(), phase, |_| None);
+        let before = fs::read(&path).unwrap();
+
+        let err = acquire(dir.path(), phase).expect_err("an unconfirmable holder must contend");
+
+        match err {
+            LockError::Contended { pid: holder, .. } => assert_eq!(holder, pid.to_string()),
+            other => panic!("expected Contended, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the lock must be untouched"
+        );
     }
 
     #[test]

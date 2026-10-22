@@ -1,0 +1,8 @@
+stage: idle
+project_root: ~/.cache/devflow-phase50/attempt-2/project
+
+open branches:
+  feature/phase-01 — 0 ahead (2 behind integration)
+
+active worktrees:
+  ~/.cache/devflow-phase50/attempt-2/project/.worktrees/phase-01 [feature/phase-01] — phase 1

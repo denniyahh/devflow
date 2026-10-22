@@ -3,6 +3,7 @@ status: diagnosed
 trigger: "GSD planner and revision agents repeatedly exceeded the manual ten-minute wait threshold during the Phase 48 review replan."
 created: 2026-09-15
 updated: 2026-09-15
+tracked_in: backlog 999.163 (upstream gsd-core; recorded 2026-10-19)
 ---
 
 # Debug: Planner Wait Observability

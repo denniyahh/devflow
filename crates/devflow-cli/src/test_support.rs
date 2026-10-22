@@ -15,7 +15,7 @@
 
 use devflow_core::agents;
 use devflow_core::phase_id::PhaseId;
-use devflow_core::state::State;
+use devflow_core::state::{State, SupervisorRecord};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -372,6 +372,9 @@ pub(crate) fn child_no_git_root() -> Option<PathBuf> {
 pub(crate) fn run_test_without_git(test_name: &str, root: &Path) -> std::process::Output {
     // Deliberately empty. Nothing is written into it, by design.
     let empty = tempfile::tempdir().unwrap();
+    // 50-10 (D-07): a launch inside this child registers here, never under
+    // the developer's real HOME.
+    let cache = hermetic_cache_dir();
     let exe = std::env::current_exe().expect("current_exe for child test re-invocation");
     let output = std::process::Command::new(&exe)
         .arg(test_name)
@@ -379,10 +382,42 @@ pub(crate) fn run_test_without_git(test_name: &str, root: &Path) -> std::process
         .arg("--test-threads=1")
         .env("PATH", empty.path())
         .env(CHILD_NO_GIT_ROOT, root)
+        .env("DEVFLOW_CACHE_DIR", cache.path())
         .output()
         .expect("spawn child test process with an empty PATH");
-    // Explicit, not incidental: the empty directory must outlive the child.
+    // Explicit, not incidental: both directories must outlive the child.
     drop(empty);
+    drop(cache);
+    output
+}
+
+/// A parent-owned DevFlow cache dir for one child test process (50-10, D-07):
+/// short and under `/tmp`, so 50-11's socket paths inside it stay under the
+/// 107-byte `sun_path` limit.
+pub(crate) fn hermetic_cache_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("dfu")
+        .tempdir_in("/tmp")
+        .expect("create a hermetic DevFlow cache dir under /tmp")
+}
+
+/// [`devflow_core::test_support::run_test_in_child`] with a fresh
+/// [`hermetic_cache_dir`] passed as the child's `DEVFLOW_CACHE_DIR` (50-10,
+/// D-07). Every in-crate test that may launch a stage runs its child through
+/// this, so the launch registers (and, from 50-11, binds its socket) inside
+/// that dir and never under the developer's real HOME. The cache dir lives
+/// until the child has exited. A `DEVFLOW_CACHE_DIR` in `extra_env` wins.
+pub(crate) fn run_hermetic_test_in_child(
+    test_name: &str,
+    path_dir: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let cache = hermetic_cache_dir();
+    let mut env: Vec<(&str, &std::ffi::OsStr)> =
+        vec![("DEVFLOW_CACHE_DIR", cache.path().as_os_str())];
+    env.extend_from_slice(extra_env);
+    let output = devflow_core::test_support::run_test_in_child(test_name, path_dir, &env);
+    drop(cache);
     output
 }
 
@@ -496,28 +531,60 @@ pub(crate) fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
         .count()
 }
 
-/// The single reap mechanism: escalate through `terminate_and_verify`
-/// (bounded TERM-then-KILL — 999.44 measured 15 of 15 orphaned monitor
-/// wrappers surviving a bare `SIGTERM` against this exact process shape, so
-/// an unescalated signal would leave the leak in place while appearing to
-/// fix it), then return a VERIFIED liveness answer.
+/// How long a reaper waits for a supervisor's final shutdown line.
+const REAP_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The single reap mechanism (D-07): end a launched run through its
+/// supervisor's socket, then return a VERIFIED answer about its agent group.
+///
+/// 1. `supervisor::request_shutdown` on the recorded socket, bounded by
+///    [`REAP_SHUTDOWN_WAIT`]. A supervisor that answers ends its agent group
+///    itself.
+/// 2. If the recorded agent group's leader is still the process the record
+///    names (`agent::is_same_process` against its start time), SIGKILL the
+///    whole group. This covers a socket that does not answer (a SIGKILLed
+///    supervisor, or a record whose socket never existed); the identity
+///    check keeps a recycled pid from ever being signalled.
+/// 3. Poll until the leader is gone (a zombie counts as gone) or
+///    `agent::TERMINATE_VERIFY_WAIT` passes.
 ///
 /// Asserts nothing and panics on no path — the caller decides what a `false`
-/// means. This matters because one of its two callers
-/// ([`ReapMonitorOnDrop::drop`]) may run during a stack unwind, where a
-/// panic would call `abort()` and kill the whole test binary instead of
-/// merely failing the one test in flight.
-fn reap_monitor_pid(pid: u32) -> bool {
-    devflow_core::agent::terminate_and_verify(
-        pid,
-        devflow_core::agent::TERMINATE_VERIFY_WAIT,
-        devflow_core::agent::TERMINATE_VERIFY_POLL,
-    );
-    !devflow_core::agent::agent_running(pid)
+/// means. This matters because one of its callers ([`ReapMonitorOnDrop::drop`])
+/// may run during a stack unwind, where a panic would call `abort()` and kill
+/// the whole test binary instead of merely failing the one test in flight.
+fn reap_supervised_run(record: &SupervisorRecord) -> bool {
+    let _ = devflow_core::supervisor::request_shutdown(&record.socket_path, REAP_SHUTDOWN_WAIT);
+    let leader = record.agent_pgid;
+    let alive = || {
+        devflow_core::agent::agent_running(leader)
+            && devflow_core::agent::is_same_process(leader, record.agent_start_time)
+    };
+    if alive() {
+        signal_group(leader, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + devflow_core::agent::TERMINATE_VERIFY_WAIT;
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(devflow_core::agent::TERMINATE_VERIFY_POLL);
+    }
+    !alive()
 }
 
-/// Reap the detached monitor wrapper a real `launch_stage_inner` call just
-/// spawned, verifying its death rather than assuming it (WR-03, 999.46).
+/// Send `signal` to process group `pgid`. Refuses pgid 0 or 1, a value that
+/// does not fit `pid_t`, and this process's own group.
+fn signal_group(pgid: u32, signal: libc::c_int) {
+    let Ok(signed) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    if signed > 1 && signed != unsafe { libc::getpgrp() } {
+        // SAFETY: `signed > 1` and not our own group: this names one process
+        // group whose leader the caller has just identity-checked.
+        unsafe { libc::kill(-signed, signal) };
+    }
+}
+
+/// Reap the supervised run a real `launch_stage_inner` call just launched,
+/// verifying its agent group's end rather than assuming it (WR-03, 999.46).
 ///
 /// This plain-call form runs ONLY if every preceding statement in its caller
 /// returned normally — a panic anywhere between the launch and this call
@@ -529,61 +596,47 @@ fn reap_monitor_pid(pid: u32) -> bool {
 /// `tests::trailing_reap_call_is_skipped_when_a_later_assertion_panics`,
 /// which exists precisely to demonstrate this failure mode.
 ///
-/// Any test that drives a real `launch_stage_inner` causes it to spawn a
-/// detached monitor wrapper (`monitor::spawn_monitor`) that is DESIGNED to
-/// outlive the call that spawned it — that is exactly what lets a real
-/// `devflow start` invocation return while the monitor keeps watching the
-/// agent. A test that drives the same call path gets the same detached
-/// wrapper, and since nothing else in a test's lifetime ever signals it, the
-/// TEST is the only thing that ever could — so the test owns reaping it.
+/// Any test that drives a real `launch_stage_inner` causes it to start a
+/// detached supervisor that is DESIGNED to outlive the call that started it;
+/// the TEST is the only thing that ever could end it, so the test owns
+/// reaping it.
 ///
-/// The pid to reap comes from `state.monitor_pid` on the same `&mut State`
-/// the caller handed to `launch_stage_inner` — the only on-disk-free handle a
-/// test has on what it just caused to exist (`pipeline_launch.rs` writes the
-/// spawned pid there immediately after `monitor::spawn_monitor` returns).
-/// This function never scans `/proc`, never guesses, and never signals a pid
-/// it did not read from that same handle.
+/// The handle comes from `state.supervisor` on the same `&State` the caller
+/// handed to the launch (`spawn_agent_and_record` records the ping-confirmed
+/// record there). This function never scans `/proc`, never guesses, and
+/// signals only the group that record names, after its identity check.
 ///
-/// Must be called BEFORE the caller's `TempDir` guard drops — reaping after
-/// the project root has already been deleted is 999.44's reproduction shape
-/// with extra steps, not a fix for it.
-///
-/// Tolerates `state.monitor_pid == None` by returning quietly, with no
-/// `unwrap`, no `expect` and no panic: an early-failing `launch_stage_inner`
-/// clears the field before any fallible step (`pipeline_launch.rs:70`), and a
-/// teardown helper that panics on that path would mask the launch's own
-/// failure rather than merely fail to clean up after it.
+/// Must be called BEFORE the caller's `TempDir` guard drops. Tolerates a
+/// state with no supervisor record by returning quietly: an early-failing
+/// launch never recorded one, and a teardown helper that panics on that path
+/// would mask the launch's own failure.
 pub(crate) fn reap_spawned_monitor(state: &State) {
-    let Some(pid) = state.monitor_pid else {
+    let Some(record) = state.supervisor.as_ref() else {
         return;
     };
     assert!(
-        reap_monitor_pid(pid),
-        "monitor wrapper pid {pid}, spawned by this test's own launch_stage_inner call, must be \
-         verified dead after reaping — not merely assumed dead"
+        reap_supervised_run(record),
+        "agent group {}, launched by this test's own launch_stage_inner call, must be \
+         verified gone after reaping through {} — not merely assumed gone",
+        record.agent_pgid,
+        record.socket_path.display()
     );
 }
 
-/// RAII guard that reaps a spawned monitor wrapper on EVERY exit path of the
-/// scope it is bound in — including a path on which a later assertion
-/// panics. This is the fix for G-25-2 / WINDOWS.md item 3: a plain trailing
-/// call to [`reap_spawned_monitor`] only runs on the success path, since Rust
+/// RAII guard that reaps a launched run on EVERY exit path of the scope it
+/// is bound in — including a path on which a later assertion panics. This is
+/// the fix for G-25-2 / WINDOWS.md item 3: a plain trailing call to
+/// [`reap_spawned_monitor`] only runs on the success path, since Rust
 /// abandons the rest of a function's statements the instant a panic begins
 /// unwinding, so it is the language's own `Drop` guarantee — not a call
 /// ordering convention — that makes the reap unconditional.
 pub(crate) struct ReapMonitorOnDrop {
-    pid: Option<u32>,
+    record: Option<SupervisorRecord>,
 }
 
 impl ReapMonitorOnDrop {
-    /// Capture `state.monitor_pid` BY VALUE, not `&'a State`.
-    ///
-    /// By value: at every call site this guard is bound strictly AFTER the
-    /// test's final `&mut state` use, so a borrow would not conflict with
-    /// anything at that point — but a `&'a State` guard would still tie the
-    /// guard's lifetime to the `State` binding's own scope, which is exactly
-    /// the kind of incidental coupling a teardown guard should not have. A
-    /// bare `Option<u32>` keeps the guard independent of `State` entirely.
+    /// Capture `state.supervisor` BY VALUE, not `&'a State`, so the guard
+    /// stays independent of the `State` binding's own scope.
     ///
     /// Named `after_launch`, not `new`: bound before the launch call
     /// returns, it captures `None` and silently does nothing — the
@@ -591,17 +644,17 @@ impl ReapMonitorOnDrop {
     /// rather than leaving it to a doc comment alone.
     pub(crate) fn after_launch(state: &State) -> Self {
         Self {
-            pid: state.monitor_pid,
+            record: state.supervisor.clone(),
         }
     }
 }
 
 impl Drop for ReapMonitorOnDrop {
     fn drop(&mut self) {
-        let Some(pid) = self.pid else {
+        let Some(record) = self.record.as_ref() else {
             return;
         };
-        if !reap_monitor_pid(pid) {
+        if !reap_supervised_run(record) {
             // The check below is the double-panic interlock — the ONLY
             // thing standing between "an assertion failed" and "the whole
             // test binary aborted". A `Drop` that panics while an unwind is
@@ -622,17 +675,95 @@ impl Drop for ReapMonitorOnDrop {
                 use std::io::Write as _;
                 let _ = writeln!(
                     std::io::stderr(),
-                    "ReapMonitorOnDrop: monitor wrapper pid {pid} still alive after reap \
-                     during an unwind — not re-panicking because a panic is already in flight"
+                    "ReapMonitorOnDrop: agent group {} still alive after reap \
+                     during an unwind — not re-panicking because a panic is already in flight",
+                    record.agent_pgid
                 );
             } else {
                 panic!(
-                    "monitor wrapper pid {pid}, spawned by this test's own launch call, must be \
-                     verified dead after reaping — not merely assumed dead"
+                    "agent group {}, launched by this test's own launch call, must be \
+                     verified gone after reaping through {} — not merely assumed gone",
+                    record.agent_pgid,
+                    record.socket_path.display()
                 );
             }
         }
     }
+}
+
+/// Parse the `__monitor` argv a [`MonitorExec::HarnessEntry`] re-exec put in
+/// [`MONITOR_ARGV_ENV`] and run it as `main` dispatches `__monitor`, with or
+/// without the advance tail. Returns without doing anything when the variable
+/// is absent, so a run of ignored tests that reaches an entry is a no-op.
+///
+/// [`MonitorExec::HarnessEntry`]: devflow_core::monitor::MonitorExec::HarnessEntry
+/// [`MONITOR_ARGV_ENV`]: devflow_core::monitor::MONITOR_ARGV_ENV
+fn run_monitor_harness_entry(advance: bool) {
+    use clap::Parser as _;
+    let Some(encoded) = std::env::var_os(devflow_core::monitor::MONITOR_ARGV_ENV) else {
+        return;
+    };
+    let encoded = encoded
+        .into_string()
+        .expect("the monitor argv must be UTF-8 JSON");
+    let after_subcommand: Vec<String> =
+        serde_json::from_str(&encoded).expect("the monitor argv must be a JSON array of strings");
+    let argv = ["devflow", "__monitor"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(after_subcommand);
+    let cli = crate::Cli::try_parse_from(argv).expect("the monitor argv must parse as __monitor");
+    let crate::Command::Monitor {
+        project,
+        phase,
+        stage,
+        workdir,
+        agent,
+        launch,
+        socket,
+        launch_id,
+        keep_env,
+        prompt_file,
+        idle_timeout_secs,
+        argv,
+    } = cli.command
+    else {
+        panic!("the monitor argv parsed as a command other than __monitor");
+    };
+    let invocation = crate::pipeline_launch::MonitorInvocation {
+        project_root: crate::project_root(project).expect("monitor project root"),
+        phase,
+        stage,
+        workdir,
+        agent,
+        launch,
+        socket,
+        launch_id,
+        keep_env,
+        prompt_file,
+        idle_timeout_secs,
+        argv,
+    };
+    crate::pipeline_launch::run_monitor(&invocation, advance)
+        .expect("the harness-entry monitor must supervise its agent");
+}
+
+/// The test build's full monitor entry (50-10): `run_monitor` exactly as the
+/// `__monitor` subcommand runs it, advance tail included. Selected by
+/// `pipeline_launch::launch_context` when `DEVFLOW_TEST_MONITOR_FULL=1`.
+#[test]
+#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
+fn monitor_entry_full() {
+    run_monitor_harness_entry(true);
+}
+
+/// The test build's default monitor entry (50-10): `run_monitor`'s
+/// supervision without its advance tail, so an in-crate launch supervises its
+/// fake agent and leaves the stage machine where the test put it.
+#[test]
+#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
+fn monitor_entry_supervise_only() {
+    run_monitor_harness_entry(false);
 }
 
 #[cfg(test)]
@@ -755,9 +886,13 @@ mod tests {
 
     impl ChildGuard {
         fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            // Its own process group, as a launched agent is (R-3), so the
+            // reapers' identity-confirmed group fallback has a real subject.
             Self(
                 Command::new("sleep")
                     .arg("300")
+                    .process_group(0)
                     .spawn()
                     .expect("sleep must be spawnable to run this test"),
             )
@@ -775,9 +910,11 @@ mod tests {
         }
     }
 
-    /// A `State` whose only relevant field is `monitor_pid`. No I/O occurs —
-    /// the project root is never read, since nothing in the reap path
-    /// touches disk.
+    /// A `State` whose only relevant field is `supervisor`: a record whose
+    /// socket does not exist, naming `pid` (its own group leader) with its
+    /// real start time, so the reapers' shutdown finds nothing to ask and
+    /// they reach the identity-confirmed group fallback. No I/O occurs
+    /// beyond reading `pid`'s start time and boot id.
     fn state_holding(pid: u32) -> State {
         let mut state = State::new(
             PhaseId::new(0),
@@ -785,7 +922,13 @@ mod tests {
             Mode::Auto,
             PathBuf::from("/nonexistent"),
         );
-        state.monitor_pid = Some(pid);
+        state.supervisor = Some(SupervisorRecord::new(
+            PathBuf::from("/nonexistent/reap-fixture.sock"),
+            "reapfixture00000".to_string(),
+            pid,
+            devflow_core::agent::process_start_time(pid).expect("the subject's start time"),
+            devflow_core::supervisor::boot_id().unwrap_or_default(),
+        ));
         state
     }
 

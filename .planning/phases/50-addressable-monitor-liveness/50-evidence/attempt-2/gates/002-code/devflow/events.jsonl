@@ -1,0 +1,14 @@
+{"v":1,"ts":1792614485,"phase":1,"event":"workflow_started","agent":"claude","mode":"auto","worktree":"~/.cache/devflow-phase50/attempt-2/project/.worktrees/phase-01","version":"2.12.0","commit":"bca7c3583b39db702f929855e27b5b5ab19bda22","dirty":"false","exe_path":"devflow-182ab8b546a8"}
+{"v":1,"ts":1792614485,"phase":1,"event":"gate_fired","stage":"define","unexpected":true,"context":"[never-silent] preflight failed for stage define: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1792614485,"phase":1,"event":"notify_fired","stage":"define","unexpected":true}
+{"v":1,"ts":1792614555,"phase":1,"event":"gate_response_written","stage":"define","approved":true,"via":"cli"}
+{"v":1,"ts":1792614608,"phase":1,"event":"gate_resolved","stage":"define","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1792614624,"phase":1,"event":"claude_delivery_canary_confirmed","stage":"define","token_prefix":"DEVFLOW_DELIVERY_CANARY_","cli_version":"2.1.306 (Claude Code)","reason":null}
+{"v":1,"ts":1792614624,"phase":1,"event":"stage_launched","stage":"define","agent":"claude","supervisor_pid":2789653,"socket_path":"~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a580d5f5a82e.sock","launch_id":"18e0a580d5f5a82e","launch":"stream"}
+{"v":1,"ts":1792614638,"phase":1,"event":"advance_evaluated","stage":"define","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1792614638,"phase":1,"event":"transition","from":"define","to":"plan"}
+{"v":1,"ts":1792614638,"phase":1,"event":"capture_archived","stage":"define","to_stage":"plan","stamp":"1792614638231218565-0"}
+{"v":1,"ts":1792614638,"phase":1,"event":"stage_launched","stage":"plan","agent":"claude","supervisor_pid":2791444,"socket_path":"~/.cache/devflow/sock/14dce5a1c1366f6d-01-18e0a5840b0e4e26.sock","launch_id":"18e0a5840b0e4e26","launch":"stream"}
+{"v":1,"ts":1792614649,"phase":1,"event":"advance_evaluated","stage":"plan","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1792614649,"phase":1,"event":"transition","from":"plan","to":"code"}
+{"v":1,"ts":1792614649,"phase":1,"event":"gate_fired","stage":"code","unexpected":true,"context":"[never-silent] preflight failed for stage code: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}

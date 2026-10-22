@@ -1,0 +1,5 @@
+[2m2026-10-20T18:51:41.155247Z[0m [32m INFO[0m [2mdevflow_core::gates[0m[2m:[0m writing gate define for phase 1
+[2m2026-10-20T18:51:41.155435Z[0m [32m INFO[0m [2mdevflow::pipeline_gate[0m[2m:[0m never-silent gate: define failed in Auto mode — surfacing an unattended gate this mode would not normally fire
+[2m2026-10-20T18:59:00.476400Z[0m [32m INFO[0m [2mdevflow_core::monitor[0m[2m:[0m spawning monitor for phase 1: claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
+[2m2026-10-20T18:59:00.477050Z[0m [32m INFO[0m [2mdevflow_core::monitor[0m[2m:[0m monitor spawned with pid 899617; waiting for its socket
+[2m2026-10-20T18:59:00.497601Z[0m [32m INFO[0m [2mdevflow_core::monitor[0m[2m:[0m supervisor 899617 published ~/.cache/devflow/sock/b42190c734d0b40c-01-18e051ef6de593d6.sock (stream)
