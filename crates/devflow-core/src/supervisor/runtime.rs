@@ -884,14 +884,11 @@ mod tests {
         }
     }
 
-    /// Whether any member of process group `pgid` still exists (zombies
-    /// included). `EPERM` means a member exists that we may not signal.
+    /// Whether any live member of process group `pgid` still exists. A zombie
+    /// is not one: an orphaned member is PID 1's to reap, and a CI job
+    /// container's PID 1 never reaps (`test_support::live_group_members`).
     fn group_exists(pgid: u32) -> bool {
-        let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
-        assert!(signed > 1, "refusing to probe process group {signed}");
-        // SAFETY: `signed > 1`; signal 0 only checks for existence.
-        let rc = unsafe { libc::kill(-signed, 0) };
-        rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        !crate::test_support::live_group_members(pgid).is_empty()
     }
 
     /// Kills and reaps a child process on every exit path.

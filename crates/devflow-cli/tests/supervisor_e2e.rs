@@ -261,23 +261,11 @@ fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
         .count()
 }
 
-/// The pids whose process group (`/proc/<pid>/stat` field 5) is `pgid`.
+/// The pids of the live members of process group `pgid`. Zombies do not
+/// count: a CI job container's PID 1 never reaps an orphaned one
+/// (`test_support::live_group_members`).
 fn group_members(pgid: u32) -> Vec<u32> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    let rest = &stat[stat.rfind(')')? + 1..];
-                    rest.split_whitespace().nth(2)?.parse::<u32>().ok()
-                })
-                == Some(pgid)
-        })
-        .collect()
+    devflow_core::test_support::live_group_members(pgid)
 }
 
 /// Poll `done` every 25 ms until it holds or `within` elapses.

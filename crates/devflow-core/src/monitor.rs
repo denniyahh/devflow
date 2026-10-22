@@ -2130,9 +2130,12 @@ fn group_member_count(pgid: u32) -> usize {
         .count()
 }
 
-/// Poll until no process is left in group `pgid` (`kill(-pgid, 0)` fails
-/// with ESRCH), up to `wait`. A pgid that is not a safe group target never
-/// counts as empty.
+/// Poll until no live process is left in group `pgid`, up to `wait`, by the
+/// backstop's census: own-uid members that are not zombies. A zombie has
+/// exited; an orphaned one is PID 1's to reap, and a PID 1 that never reaps
+/// (a CI job container's `tail -f /dev/null`) would otherwise keep the group
+/// "occupied" forever. A pgid that is not a safe group target, or an
+/// unlistable `/proc`, never counts as empty.
 fn group_empties_within(pgid: u32, wait: Duration) -> bool {
     let Ok(signed) = libc::pid_t::try_from(pgid) else {
         return false;
@@ -2142,9 +2145,9 @@ fn group_empties_within(pgid: u32, wait: Duration) -> bool {
     }
     let deadline = std::time::Instant::now() + wait;
     loop {
-        // SAFETY: signal 0 only checks for existence; `signed > 1`.
-        let rc = unsafe { libc::kill(-signed, 0) };
-        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if crate::supervisor::backstop::group_members(signed)
+            .is_some_and(|members| members.is_empty())
+        {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -5438,14 +5441,11 @@ exit 0
         assert!(failures.is_empty(), "rows that probed wrong: {failures:#?}");
     }
 
-    /// Whether any member of process group `pgid` still exists (zombies
-    /// included). `EPERM` means a member exists that we may not signal.
+    /// Whether any live member of process group `pgid` still exists. A zombie
+    /// is not one: an orphaned member is PID 1's to reap, and a CI job
+    /// container's PID 1 never reaps (`test_support::live_group_members`).
     fn stage_group_exists(pgid: u32) -> bool {
-        let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
-        assert!(signed > 1, "refusing to probe process group {signed}");
-        // SAFETY: `signed > 1`; signal 0 only checks for existence.
-        let rc = unsafe { libc::kill(-signed, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        !crate::test_support::live_group_members(pgid).is_empty()
     }
 
     /// A fake agent for `shape` that leaves a second group member running
@@ -5942,15 +5942,12 @@ exit 0
         }
     }
 
-    /// Whether no process is left in group `pgid` (`kill(-pgid, 0)` fails
-    /// with ESRCH), polled every 20 ms up to `within`.
+    /// Whether no live process is left in group `pgid` (zombies do not
+    /// count, `test_support::live_group_members`), polled every 20 ms up to
+    /// `within`.
     fn group_gone_within(pgid: u32, within: Duration) -> bool {
-        let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
-        assert!(signed > 1, "refusing to probe group {signed}");
         stage_wait_until(within, || {
-            // SAFETY: signal 0 only checks for existence; `signed > 1`.
-            let rc = unsafe { libc::kill(-signed, 0) };
-            rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            crate::test_support::live_group_members(pgid).is_empty()
         })
     }
 
@@ -6723,8 +6720,11 @@ exit 0
 
         /// Whether the recorded holder is still that process, against the
         /// start time recorded before the supervisor could return.
+        /// A zombie holder has exited: it is not alive, though its `/proc`
+        /// entry keeps the recorded start time until something reaps it.
         fn is_alive(&self) -> bool {
             crate::agent::is_same_process(self.pid, self.start)
+                && crate::test_support::process_is_live(self.pid)
         }
     }
 
