@@ -1265,13 +1265,11 @@ fn run_printed_stop(home: &common::HermeticHome, root: &Path, words: &[String]) 
         .expect("run the printed devflow stop")
 }
 
-/// Whether process group `pgid` has no member left (`kill(-pgid, 0)` fails
-/// with ESRCH).
+/// Whether process group `pgid` has no live member left. Zombies do not
+/// count: a CI job container's PID 1 never reaps an orphaned one
+/// (`test_support::live_group_members`).
 fn group_is_gone(pgid: u32) -> bool {
-    let pgid = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
-    // SAFETY: signal 0 only checks for existence; nothing is delivered.
-    let status = unsafe { libc::kill(-pgid, 0) };
-    status == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    devflow_core::test_support::live_group_members(pgid).is_empty()
 }
 
 #[test]

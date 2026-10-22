@@ -148,6 +148,34 @@ pub fn in_child_test(test_name: &str) -> bool {
     std::env::var_os(CHILD_TEST_ENV).is_some_and(|value| value == std::ffi::OsStr::new(test_name))
 }
 
+/// The pids of the live members of process group `pgid`: every `/proc/<pid>`
+/// whose group is `pgid` and whose state is not `Z`.
+///
+/// A zombie has exited and only waits to be reaped, and an orphan is reaped
+/// by PID 1. A GitHub Actions job container's PID 1 is `tail -f /dev/null`,
+/// which never reaps, so there a killed agent's orphaned children stay
+/// zombies for the life of the job and `kill(-pgid, 0)` keeps reporting the
+/// group. "Is the group gone?" must ask this, never `kill(-pgid, 0)`. It is
+/// the rule `supervisor::backstop`'s census applies.
+pub fn live_group_members(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            crate::agent::process_stat_fields(pid)
+                .is_some_and(|stat| i64::from(stat.pgrp) == i64::from(pgid) && stat.state != 'Z')
+        })
+        .collect()
+}
+
+/// Whether `pid` is a live process: `/proc/<pid>` exists and is not a
+/// zombie. See [`live_group_members`] for why a zombie never counts.
+pub fn process_is_live(pid: u32) -> bool {
+    crate::agent::process_stat_fields(pid).is_some_and(|stat| stat.state != 'Z')
+}
+
 /// Re-invokes this test binary for exactly `test_name` with a child-local
 /// `PATH` and environment. The caller owns `path_dir` for the duration of the
 /// child invocation.
@@ -481,5 +509,45 @@ mod tests {
             "a self-match on unchanged cmdline must never report exec-visible, even though \
              argv[0]'s basename matches by construction"
         );
+    }
+
+    /// An unreaped zombie is not a live group member, though `kill(-pgid, 0)`
+    /// still finds its group: the case a non-reaping PID 1 leaves behind.
+    /// Control: the same process counts while it runs.
+    #[test]
+    fn a_zombie_is_not_a_live_group_member() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(live_group_members(pid), vec![pid], "control: it runs");
+        assert!(process_is_live(pid), "control: it runs");
+
+        child.kill().expect("SIGKILL the sleeper");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_live(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "it is a zombie, not gone: nothing has reaped it"
+        );
+        let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: signal 0 only checks for existence; `signed` is our child's
+        // own group, never 0, 1 or ours.
+        assert_eq!(
+            unsafe { libc::kill(-signed, 0) },
+            0,
+            "kill(-pgid, 0) still reports the zombie's group"
+        );
+        assert!(
+            live_group_members(pid).is_empty(),
+            "a zombie is not a member"
+        );
+        assert!(!process_is_live(pid), "a zombie is not live");
+        child.wait().expect("reap the sleeper");
     }
 }

@@ -1276,23 +1276,11 @@ fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
         .count()
 }
 
-/// The pids whose process group (`/proc/<pid>/stat` field 5) is `pgid`.
+/// The pids of the live members of process group `pgid`. Zombies do not
+/// count: a CI job container's PID 1 never reaps an orphaned one
+/// (`test_support::live_group_members`).
 fn group_members(pgid: u32) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    let rest = &stat[stat.rfind(')')? + 1..];
-                    rest.split_whitespace().nth(2)?.parse::<u32>().ok()
-                })
-                == Some(pgid)
-        })
-        .collect()
+    devflow_core::test_support::live_group_members(pgid)
 }
 
 /// Poll `done` every 25 ms until it holds or `within` elapses.
@@ -2118,13 +2106,8 @@ fn stop_with_a_launch_id_stops_a_live_socket_whose_sidecar_will_not_parse() {
         .expect("run the printed line");
     assert!(output.status.success(), "{args:?}\n{}", describe(&output));
     assert_eq!(run.probe(), Liveness::Gone, "B is stopped");
-    let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
     assert!(
-        holds_within(Duration::from_secs(5), || {
-            // SAFETY: signal 0 checks for existence and sends nothing.
-            let rc = unsafe { libc::kill(-signed, 0) };
-            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        }),
+        holds_within(Duration::from_secs(5), || group_members(pgid).is_empty()),
         "B's agent group {pgid} is gone"
     );
     assert!(launch_files_present(&orphan), "A is untouched");

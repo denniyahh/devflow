@@ -408,7 +408,7 @@ fn own_process_stat(pid: u32) -> Option<ProcStat> {
 /// The owner uid is checked before anything else is read (the
 /// `discover_stray_devflow_processes` rule). `None` when `/proc` cannot be
 /// listed, which is "cannot tell", never "empty".
-fn group_members(pgid: libc::pid_t) -> Option<Vec<GroupMember>> {
+pub(crate) fn group_members(pgid: libc::pid_t) -> Option<Vec<GroupMember>> {
     let entries = std::fs::read_dir("/proc").ok()?;
     let my_uid = super::protocol::euid();
     let mut members = Vec::new();

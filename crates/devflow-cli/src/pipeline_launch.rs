@@ -8370,15 +8370,11 @@ mod tests {
         (accepted, last)
     }
 
-    /// Whether any process is left in group `pgid` (`kill(-pgid, 0)`).
+    /// Whether any live process is left in group `pgid`. Zombies do not
+    /// count: a CI job container's PID 1 never reaps an orphaned one
+    /// (`test_support::live_group_members`).
     fn group_alive(pgid: u32) -> bool {
-        let Ok(signed) = libc::pid_t::try_from(pgid) else {
-            return false;
-        };
-        assert!(signed > 1, "refusing to probe group {signed}");
-        // SAFETY: signal 0 only checks for existence; `-signed < -1` names
-        // one process group, never our own (0) or every process (-1).
-        unsafe { libc::kill(-signed, 0) == 0 }
+        !devflow_core::test_support::live_group_members(pgid).is_empty()
     }
 
     /// The body of the held-advance pair: N parks at `before_spawn` (safe
