@@ -19,17 +19,14 @@
 //! Tests below now assert log lines on stderr and assert their absence from
 //! stdout.
 
+mod common;
+
 use devflow_core::gates::Gates;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::path::PathBuf;
-use std::process::Command;
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Set up a project dir with a legacy `.devflow/state.json` (phase 1, no
 /// matching per-phase file), so `devflow status` triggers the migration's
@@ -57,8 +54,13 @@ fn project_with_legacy_state() -> tempfile::TempDir {
     dir
 }
 
-fn run_status(dir: &PathBuf, log_format: Option<&str>, rust_log: Option<&str>) -> (String, String) {
-    let mut cmd = Command::new(devflow_bin());
+fn run_status(
+    home: &common::HermeticHome,
+    dir: &PathBuf,
+    log_format: Option<&str>,
+    rust_log: Option<&str>,
+) -> (String, String) {
+    let mut cmd = common::hermetic_devflow(home);
     cmd.arg("status").arg(dir);
 
     // Start from a clean env so ambient RUST_LOG/DEVFLOW_LOG_FORMAT from the
@@ -85,8 +87,14 @@ fn run_status(dir: &PathBuf, log_format: Option<&str>, rust_log: Option<&str>) -
 
 #[test]
 fn rust_log_debug_is_honored_under_json_log_format() {
+    let home = common::HermeticHome::new();
     let dir = project_with_legacy_state();
-    let (stdout, stderr) = run_status(&dir.path().to_path_buf(), Some("json"), Some("debug"));
+    let (stdout, stderr) = run_status(
+        &home,
+        &dir.path().to_path_buf(),
+        Some("json"),
+        Some("debug"),
+    );
 
     assert!(
         stderr.contains("migrated legacy state.json"),
@@ -104,12 +112,13 @@ fn rust_log_debug_is_honored_under_json_log_format() {
 
 #[test]
 fn rust_log_default_suppresses_debug_under_json_log_format() {
+    let home = common::HermeticHome::new();
     let dir = project_with_legacy_state();
     // No RUST_LOG set — tracing-subscriber's EnvFilter::from_default_env()
     // defaults to ERROR-level-only when the env var is absent, so this DEBUG
     // line must NOT appear. If it does, RUST_LOG is being ignored (i.e. a
     // fixed, too-verbose level is hardcoded again), the exact WR-01 bug class.
-    let (stdout, stderr) = run_status(&dir.path().to_path_buf(), Some("json"), None);
+    let (stdout, stderr) = run_status(&home, &dir.path().to_path_buf(), Some("json"), None);
 
     assert!(
         !stderr.contains("migrated legacy state.json"),
@@ -145,9 +154,10 @@ fn project_with_open_gate(phase: PhaseId, stage: Stage) -> tempfile::TempDir {
 
 #[test]
 fn rust_log_unset_still_shows_info_level_logs_by_default() {
+    let home = common::HermeticHome::new();
     let dir = project_with_open_gate(PhaseId::new(15), Stage::Ship);
 
-    let mut cmd = Command::new(devflow_bin());
+    let mut cmd = common::hermetic_devflow(&home);
     cmd.arg("gate")
         .arg("approve")
         .arg("15")

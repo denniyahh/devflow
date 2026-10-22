@@ -27,7 +27,6 @@ use devflow_core::ship;
 use devflow_core::workflow;
 use devflow_core::{AgentKind, Mode, Stage, State};
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 /// `true` iff `root/.devflow/.gitignore` exists with trimmed content `*`.
 fn gitignore_is_star(root: &Path) -> bool {
@@ -36,52 +35,36 @@ fn gitignore_is_star(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Poll `path` until it exists (or `timeout` elapses, at which point this
-/// panics naming the path — a monitor that never writes its exit-code
-/// capture file is itself a bug, not a thing to silently tolerate).
-fn wait_for_file(path: &Path, timeout: Duration) {
-    let start = Instant::now();
-    while !path.exists() {
-        assert!(
-            start.elapsed() < timeout,
-            "expected {} to appear within {timeout:?}",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Reap `pid`, then poll until it is no longer a live process (or `timeout`
-/// elapses).
-///
-/// Codex review: `monitor::spawn_monitor` returns only a detached child's
-/// `u32` pid, not a `Child` handle the test could `.wait()` on. But this test
-/// binary is still the OS-level parent of that process (it called
-/// `Command::spawn()` internally), so it never gets reparented to init —
-/// without an explicit `waitpid`, the exited monitor shell would sit as a
-/// zombie (which still answers `kill(pid, 0)` successfully) for the rest of
-/// the test binary's lifetime.
-fn wait_for_pid_to_die(pid: u32, timeout: Duration) {
-    unsafe {
-        let mut status: libc::c_int = 0;
-        libc::waitpid(pid as libc::pid_t, &mut status, 0);
-    }
-    let start = Instant::now();
-    while devflow_core::agent::agent_running(pid) {
-        assert!(
-            start.elapsed() < timeout,
-            "monitor process pid {pid} did not terminate within {timeout:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// Every one of the 7 production `.devflow/`-creating entry points, driven
 /// through its real public API (not `ensure_devflow_dir` directly — that
 /// would prove nothing about whether the site was actually converted),
 /// against its own fresh temp project root. Failures accumulate into a
 /// vector so one regressed site doesn't hide another (mirrors the
 /// accumulate-then-assert shape `gitignore_coverage.rs` already uses).
+/// The launch context case 3 passes `spawn_monitor` (50-11): a monitor
+/// executable that exits at once (a 0755 `#!/bin/sh` / `exit 0` script) and
+/// a short cache dir under `/tmp`, both in a tempdir the case owns.
+struct ExitingMonitor {
+    _dir: tempfile::TempDir,
+    context: monitor::LaunchContext,
+}
+
+fn launch_context() -> ExitingMonitor {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix("dfs")
+        .tempdir_in("/tmp")
+        .expect("create a short monitor tempdir under /tmp");
+    let exe = dir.path().join("monitor");
+    std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let context = monitor::LaunchContext::new(
+        dir.path().join("cache"),
+        monitor::MonitorExec::Subcommand { exe },
+    );
+    ExitingMonitor { _dir: dir, context }
+}
+
 #[test]
 fn all_seven_devflow_constructors_produce_the_gitignore() {
     let mut failures: Vec<&str> = Vec::new();
@@ -116,20 +99,12 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     //    creates the capture directory without going through save_state —
     //    the state passed here is synthetic and never persisted, D-14).
     //
-    //    spawn_monitor appends a `devflow advance` tail that the deleted
-    //    no-advance variant omitted (23-08). That tail's `binary` resolves
-    //    via `std::env::current_exe()`, which inside `cargo test` is this
-    //    test binary itself, not the real `devflow` CLI — invoking it with
-    //    `advance <root> --phase 1` hits the Rust test harness's own
-    //    argument parser, which rejects the unrecognized `--phase` flag and
-    //    exits immediately (~milliseconds; independently confirmed via a
-    //    direct invocation of the built test binary). It never reaches
-    //    `devflow advance`'s real state-loading or gate logic, so there is
-    //    no risk of blocking on a multi-day gate wait here — the same
-    //    fail-fast tail already runs, unbounded and unremarked, in every
-    //    other `spawn_monitor`-based test in `monitor.rs`. No additional
-    //    timeout override is needed; `wait_for_file` and `wait_for_pid_to_die`
-    //    below are the test's real (and sufficient) synchronisation points.
+    //    The monitor executable is a `#!/bin/sh` script that exits at once:
+    //    a core test binary has no `__monitor` subcommand to re-exec, so no
+    //    supervisor can publish here. `spawn_monitor` therefore reports
+    //    `NotReady` once the script has exited, and the case proves the
+    //    capture directory (and its `.gitignore`) was created BEFORE the
+    //    spawn, so it exists even when the launch fails.
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -139,20 +114,19 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
             Mode::Auto,
             root.to_path_buf(),
         );
-        let pid = monitor::spawn_monitor(
+        let ctx = launch_context();
+        let result = monitor::spawn_monitor(
             &state,
             "sh",
             &["-c".to_string(), "exit 0".to_string()],
             &[],
             monitor::MonitorLaunch::Legacy,
-        )
-        .expect("spawn_monitor");
-
-        wait_for_file(
-            &agent_result::exit_code_path(root, PhaseId::new(1)),
-            Duration::from_secs(5),
+            &ctx.context,
         );
-        wait_for_pid_to_die(pid, Duration::from_secs(5));
+        assert!(
+            matches!(result, Err(monitor::MonitorError::NotReady(_))),
+            "a monitor executable that exits at once must be reported NotReady, got {result:?}"
+        );
 
         if !gitignore_is_star(root) {
             failures.push("monitor::spawn_monitor (monitor.rs)");

@@ -21,7 +21,7 @@
 
 use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
-use crate::pipeline_launch::launch_stage;
+use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, launch_stage};
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
@@ -68,10 +68,13 @@ pub(crate) fn transition(
     if state.stop_until == Some(from) {
         state.stopped = true;
         state.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
-        // T-20-03b / doctor gap (D-09): clear monitor_pid/gate_pending so
-        // neither check_dead_agent nor check_dead_monitor misreports this
-        // intentional stop as a crashed agent or dead monitor.
-        state.monitor_pid = None;
+        // T-20-03b / doctor gap (D-09): clear the supervisor record and
+        // gate_pending so neither check_dead_agent nor check_dead_monitor
+        // misreports this intentional stop as a crashed agent or dead
+        // monitor (50-13): the supervisor running this advance finishes once
+        // it returns, so the record would otherwise name a socket that is
+        // gone.
+        state.supervisor = None;
         state.gate_pending = false;
         workflow::save_state(state)?;
         events::emit(
@@ -230,6 +233,21 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     state: &mut State,
     gate_timeout_secs: u64,
 ) -> Result<(), CliError> {
+    #[cfg(test)]
+    crate::pipeline_launch::test_hold("before_finalization");
+    // Safe point 6 (CR-01, 50-REVIEW.md): a stop taken during the advance
+    // after the Ship gate was answered is honoured before the merge, version
+    // bump, tag and push. The consumed approval is cleared with it, so a
+    // resumed run asks again. Outside a supervisor's advance (the foreground
+    // `ship_override`) no stop token is engaged and this proceeds.
+    if crate::pipeline_launch::stop_requested_at_safe_point() {
+        let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+        state.gate_pending = false;
+        crate::pipeline_launch::record_advance_stop(state, 6)?;
+        return Err(CliError::Message(format!(
+            "finalization did not run: {ADVANCE_STOP_REASON}"
+        )));
+    }
     loop {
         if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
             break;
@@ -418,6 +436,19 @@ pub(crate) fn run_gate_with_timeout(
     // `Gates::write_gate` above, and `poll_response` would never observe a
     // response written after it returns).
     if let Some(response) = auto_response {
+        // Safe point 5 (CR-01, 50-REVIEW.md): a response already on disk
+        // wins over a stop in the wait below, so a stop taken during the
+        // advance is honoured before the pre-authorized one is written. As
+        // at safe point 4, the gate is cleared, the stop recorded and an
+        // error unwinds every caller.
+        if crate::pipeline_launch::stop_requested_at_safe_point() {
+            let _ = Gates::cleanup(project_root, state.phase, stage);
+            state.gate_pending = false;
+            crate::pipeline_launch::record_advance_stop(state, 5)?;
+            return Err(CliError::Message(format!(
+                "the gate for stage {stage} was not auto-answered: {ADVANCE_STOP_REASON}"
+            )));
+        }
         match Gates::respond(project_root, state.phase, stage, response) {
             Ok(_) => {}
             // A human or 23b's stale-gate sweep may have answered first;
@@ -426,8 +457,13 @@ pub(crate) fn run_gate_with_timeout(
             Err(err) => return Err(err.into()),
         }
     }
-    match Gates::poll_response(project_root, state.phase, stage, timeout_secs) {
-        Some(response) => {
+    match crate::pipeline_launch::wait_for_gate_response(
+        project_root,
+        state.phase,
+        stage,
+        timeout_secs,
+    ) {
+        GateWaitEnd::Answered(response) => {
             state.gate_pending = false;
             // WR-10 (49-REVIEW.md): the operator may have edited the run's
             // notify command on disk while this gate waited; keep that edit
@@ -455,7 +491,25 @@ pub(crate) fn run_gate_with_timeout(
             );
             Ok(action)
         }
-        None => {
+        GateWaitEnd::Stopped => {
+            // Safe point 4 (50-13, R-2): the supervisor running this advance
+            // was stopped during the wait. The gate has no waiter any more, so
+            // it is cleared (no stale request or response outlives the run),
+            // the stop is recorded, and an error unwinds every caller through
+            // `?`, which releases the per-phase lock. Deliberately not
+            // `GateAction::Abort`: `abort()` deletes the state file, and a
+            // stopped run keeps its state for `devflow resume`.
+            let _ = Gates::cleanup(project_root, state.phase, stage);
+            state.gate_pending = false;
+            if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
+                state.gate_notify_cmd = on_disk.gate_notify_cmd;
+            }
+            crate::pipeline_launch::record_advance_stop(state, 4)?;
+            Err(CliError::Message(format!(
+                "the gate wait for stage {stage} ended: {ADVANCE_STOP_REASON}"
+            )))
+        }
+        GateWaitEnd::TimedOut => {
             events::emit(
                 project_root,
                 state.phase,
@@ -727,7 +781,7 @@ mod tests {
             if !devflow_core::test_support::in_child_test($name) {
                 let path_dir = $path_dir;
                 let output =
-                    devflow_core::test_support::run_test_in_child($name, path_dir.path(), &[]);
+                    crate::test_support::run_hermetic_test_in_child($name, path_dir.path(), &[]);
                 devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
                     &output, $name,
                 );
@@ -886,6 +940,36 @@ mod tests {
         assert!(evidence.workflow_finished_seen);
         assert_eq!(evidence.finished_reason.as_deref(), Some("stopped_at"));
         assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
+    }
+
+    /// 50-13: the `--until` stop clears the supervisor record, because the
+    /// supervisor running this advance finishes once the advance returns.
+    /// The record is set first, so a stop that leaves it standing fails here.
+    #[test]
+    fn until_stop_clears_the_supervisor_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1313);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            root.join("until.sock"),
+            "until00000000000".to_string(),
+            4242,
+            1,
+            String::new(),
+        ));
+        workflow::save_state(&state).unwrap();
+
+        transition(root, &mut state, Stage::Code).unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(reloaded.stopped, "the --until stop marks the run stopped");
+        assert_eq!(
+            reloaded.supervisor, None,
+            "the --until stop clears the supervisor record"
+        );
     }
 
     #[test]

@@ -36,7 +36,8 @@ use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::ship_evidence;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, State, SupervisorRecord};
+use devflow_core::supervisor;
 use devflow_core::version;
 use devflow_core::workflow;
 use devflow_core::worktree;
@@ -871,10 +872,12 @@ fn remove_worktree_with_retry(
 /// associated feature branches, then prune and clean up merged branches.
 ///
 /// Hard-refuses (D-06, no override flag) removal of any worktree whose owning
-/// phase has a live agent (any monitor state, including Unknown/Stuck) or an
-/// active monitor (Healthy/BetweenStages) — closing the race where a real
-/// `cleanup --force` run could delete a worktree a live agent/monitor is
+/// phase has a live agent (whatever its supervisor's liveness) or a
+/// supervisor that answers ALIVE — closing the race where a real
+/// `cleanup --force` run could delete a worktree a live agent/supervisor is
 /// still writing into (review: Codex HIGH, fail-closed on a live agent).
+/// A STALE supervisor (or a failed probe) keeps the worktree unless
+/// `--force` (50-12); GONE and NotLaunched follow the rules above.
 pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
     // Project-resolved (45-01): `cleanup_merged` computes "merged" relative
     // to the trunk and treats it as protected — both must be the configured
@@ -903,19 +906,18 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         let agent_alive = phase
             .and_then(|p| agent_pid_from_file(project_root, p))
             .is_some_and(agent::agent_running);
-        let monitor_pid = matched_state.and_then(|s| s.monitor_pid);
-        let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
-        let phase_liveness = liveness(monitor_pid, monitor_alive, agent_alive);
+        // 50-12: the supervisor's liveness comes from its recorded socket,
+        // never a pid.
+        let phase_liveness = matched_state.map_or(PhaseLiveness::NotLaunched, probe_phase);
 
-        // A phase halted via `devflow start --until <stage>` (20c) clears
-        // `monitor_pid` and its agent has already exited by design — that
-        // reads as `Liveness::Unknown` with `agent_alive == false`, which
-        // would otherwise sail straight through the live-agent refusal
+        // A phase halted via `devflow start --until <stage>` (20c) has no
+        // running supervisor and its agent has already exited by design —
+        // which would otherwise sail straight through the live-agent refusal
         // below. Treat it the same way `doctor`'s `check_dead_agent`/
-        // `check_dead_monitor` were taught about `facts.stopped` in this
-        // same phase: an intentionally-parked worktree is never implicitly
-        // safe to remove — require `--force`, mirroring the `reference`
-        // worktree's own precedent above.
+        // `check_supervisor` were taught about `facts.stopped`: an
+        // intentionally-parked worktree is never implicitly safe to remove —
+        // require `--force`, mirroring the `reference` worktree's own
+        // precedent above.
         let stopped = matched_state.is_some_and(|s| s.stopped);
         if stopped && !force {
             let phase_label = phase
@@ -928,19 +930,39 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
             continue;
         }
 
-        // Fail-closed on a live agent: refuse whenever the agent is alive
-        // (regardless of monitor liveness — Unknown/Stuck included) OR the
-        // monitor is actively running the stage (Healthy/BetweenStages).
-        // Only Stuck/Unknown WITHOUT a live agent proceeds.
-        if agent_alive || matches!(phase_liveness, Liveness::Healthy | Liveness::BetweenStages) {
+        // Fail-closed on a live run: refuse whenever the agent is alive
+        // (whatever the supervisor's liveness) OR the supervisor answers
+        // ALIVE, `--force` or not. The verb that ends a live run is `stop`
+        // (50-14); `resume` refuses while one is live.
+        if agent_alive || matches!(phase_liveness, PhaseLiveness::Alive { .. }) {
             let phase_label = phase
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
             return Err(CliError::Message(format!(
-                "refusing to remove worktree {} for phase {phase_label} ({}) — run `devflow resume --phase {phase_label}` or wait for it to finish",
+                "refusing to remove worktree {} for phase {phase_label} ({}) — run `devflow stop --phase {phase_label}` or wait for it to finish",
                 wt.path.display(),
                 phase_liveness.describe(),
             )));
+        }
+
+        // 50-12: a STALE supervisor may have left its agent group running,
+        // and a failed probe proves nothing either way: keep the worktree
+        // unless `--force`, and name the verb that ends the orphaned run.
+        if !force
+            && matches!(
+                phase_liveness,
+                PhaseLiveness::Stale | PhaseLiveness::ProbeFailed(_)
+            )
+        {
+            let phase_label = phase
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "keeping worktree {} for phase {phase_label} — supervisor {}; run `devflow stop --phase {phase_label}` first, or pass --force to discard it",
+                wt.path.display(),
+                phase_liveness.describe(),
+            );
+            continue;
         }
 
         match remove_worktree_with_retry(project_root, &wt.path, force) {
@@ -981,68 +1003,164 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
     Ok(())
 }
 
-/// A phase's monitor/agent liveness, distinguishing a dead monitor (nothing
-/// will call `devflow advance` when the agent exits) from a normal
-/// between-stages moment (18b — "who watches the watcher").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Liveness {
-    /// Monitor and agent are both alive — the stage is actively running.
-    Healthy,
-    /// Monitor is alive, agent has exited — normal between-stages moment;
-    /// the monitor will advance the phase shortly.
-    BetweenStages,
-    /// The recorded monitor is dead. Whether or not the agent is also dead,
-    /// nothing will call `devflow advance` for this phase — it needs a
-    /// manual `devflow resume`.
-    Stuck,
-    /// No monitor PID has been recorded for this state — either none has
-    /// been spawned yet, or the state was written by a binary predating
-    /// this field. Never reported as a problem.
-    Unknown,
+/// A phase's supervisor liveness as `status`, `cleanup` and `doctor` report
+/// it (50-12): answered from the socket recorded in `state.supervisor`
+/// through [`supervisor::probe`], never from a pid. Three parts, like the
+/// 18b presentation it replaces: this enum, [`PhaseLiveness::describe`], and
+/// the pure mapping [`phase_liveness`], which `doctor`'s `check_supervisor`
+/// reuses so the two can never drift.
+///
+/// A supervisor runs its own advance in-process, so a moment between stages
+/// is ALIVE (its owner reads `advancing`), not a separate state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PhaseLiveness {
+    /// The recorded socket answered a ping.
+    Alive {
+        /// Who owns the run right now, from the ping reply.
+        owner: String,
+        /// The launch shape (`capture` or `stream`), from the ping reply.
+        launch: String,
+    },
+    /// The socket file remains but nothing listens on it: the supervisor
+    /// died without cleaning up, and its agent group may still run.
+    Stale,
+    /// No socket at the recorded path, and the phase is stopped: a normal
+    /// end.
+    Gone,
+    /// No socket at the recorded path while the phase is not stopped:
+    /// nothing will advance it. A finding, not a normal state.
+    GoneWhileActive,
+    /// The state records no supervisor: nothing has been launched yet, or the
+    /// state predates the record. Never a finding.
+    NotLaunched,
+    /// The probe could not answer; a path-free summary of why (see
+    /// [`probe_error_summary`]). Neither ALIVE nor GONE is guessed.
+    ProbeFailed(String),
 }
 
-impl Liveness {
-    pub(crate) fn describe(self) -> &'static str {
+impl PhaseLiveness {
+    /// The operator-facing text. The three states the operator acts on lead
+    /// with `ALIVE`, `STALE` and `GONE`.
+    pub(crate) fn describe(&self) -> String {
         match self {
-            Liveness::Healthy => "healthy",
-            Liveness::BetweenStages => "between stages",
-            Liveness::Stuck => "stuck — needs devflow resume",
-            Liveness::Unknown => "unknown (no monitor recorded)",
+            PhaseLiveness::Alive { owner, launch } => {
+                format!("ALIVE (owner: {owner}, launch: {launch})")
+            }
+            PhaseLiveness::Stale => {
+                "STALE — the socket remains but no supervisor answers".to_string()
+            }
+            PhaseLiveness::Gone => {
+                "GONE — the supervisor has exited and the phase is stopped".to_string()
+            }
+            PhaseLiveness::GoneWhileActive => {
+                "GONE — no supervisor runs this phase, but it is not stopped".to_string()
+            }
+            PhaseLiveness::NotLaunched => "not launched (no supervisor recorded)".to_string(),
+            PhaseLiveness::ProbeFailed(why) => format!("UNKNOWN — the probe failed: {why}"),
+        }
+    }
+
+    /// A stable machine label for `doctor --json`.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            PhaseLiveness::Alive { .. } => "alive",
+            PhaseLiveness::Stale => "stale",
+            PhaseLiveness::Gone => "gone",
+            PhaseLiveness::GoneWhileActive => "gone_while_active",
+            PhaseLiveness::NotLaunched => "not_launched",
+            PhaseLiveness::ProbeFailed(_) => "probe_failed",
         }
     }
 }
 
-/// Pure liveness predicate — no I/O. `monitor_pid` is matched `None` first
-/// so a state written by a pre-18b binary (carrying no `monitor_pid`) can
-/// never be misclassified as `Stuck` (T-18-11).
-fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) -> Liveness {
-    match monitor_pid {
-        None => Liveness::Unknown,
-        Some(_) => match (monitor_alive, agent_alive) {
-            (true, true) => Liveness::Healthy,
-            (true, false) => Liveness::BetweenStages,
-            (false, _) => Liveness::Stuck,
+/// Pure mapping from a phase's supervisor record and its probe result to a
+/// [`PhaseLiveness`]. No I/O. No record (or no probe) is `NotLaunched`; GONE
+/// splits on `stopped`; a probe error is `ProbeFailed`, never a guess.
+fn phase_liveness(
+    record: Option<&SupervisorRecord>,
+    probe: Option<Result<supervisor::Liveness, supervisor::ProbeError>>,
+    stopped: bool,
+) -> PhaseLiveness {
+    let (Some(_), Some(probe)) = (record, probe) else {
+        return PhaseLiveness::NotLaunched;
+    };
+    match probe {
+        Ok(supervisor::Liveness::Alive(reply)) => PhaseLiveness::Alive {
+            owner: reply.owner,
+            launch: reply.launch,
         },
+        Ok(supervisor::Liveness::Stale) => PhaseLiveness::Stale,
+        Ok(supervisor::Liveness::Gone) if stopped => PhaseLiveness::Gone,
+        Ok(supervisor::Liveness::Gone) => PhaseLiveness::GoneWhileActive,
+        Err(error) => PhaseLiveness::ProbeFailed(probe_error_summary(&error)),
     }
 }
 
-/// Recovery verbs discoverable from a phase's liveness (21a, D-03) — the
-/// pure, testable counterpart to `status`'s old inline Stuck `println!`.
-/// Always includes `devflow resume` for `Stuck`; additionally includes
-/// `devflow advance` when the phase is gate-pending (the operator answers
-/// the gate then advances — the primary footgun this closes; widening the
-/// predicate further risks suggesting `advance` where nothing proves it is
-/// right, per 21-CONTEXT.md's Review Incorporation). Empty for any other
-/// liveness, so a healthy/between-stages/unknown phase prints nothing new.
-fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
-    if liveness != Liveness::Stuck {
-        return Vec::new();
+/// A [`supervisor::ProbeError`] as a path-free kind and cause (T-18-01):
+/// `NotASocket`'s own text names the path, and a `NoReply` text may quote
+/// whatever the peer sent, so neither is passed through.
+fn probe_error_summary(error: &supervisor::ProbeError) -> String {
+    match error {
+        supervisor::ProbeError::Stat(cause) => {
+            format!("could not stat the socket ({})", cause.kind())
+        }
+        supervisor::ProbeError::NotASocket(_) => "the recorded path is not a socket".to_string(),
+        supervisor::ProbeError::ForeignOwner { uid } => {
+            format!("the socket is owned by uid {uid}, not this user")
+        }
+        supervisor::ProbeError::Connect(cause) => {
+            format!("could not connect to the socket ({})", cause.kind())
+        }
+        supervisor::ProbeError::NoReply(_) => "no valid ping reply".to_string(),
+        _ => "the probe failed".to_string(),
     }
-    let mut hints = vec![format!("devflow resume --phase {}", state.phase)];
-    if state.gate_pending {
-        hints.push(format!("devflow advance --phase {}", state.phase));
+}
+
+/// Probe the socket `state.supervisor` records, once, and map the answer.
+/// The only I/O half of [`phase_liveness`]; reads no pid.
+fn probe_phase(state: &State) -> PhaseLiveness {
+    let record = state.supervisor.as_ref();
+    let probe = record.map(|record| supervisor::probe(&record.socket_path));
+    phase_liveness(record, probe, state.stopped)
+}
+
+/// Recovery verbs discoverable from a phase's liveness (21a, D-03; 50-12) —
+/// the pure, testable counterpart to `status`'s hints. STALE names
+/// `devflow stop` (it ends the orphaned agent group and removes the socket)
+/// and then `devflow resume`; GONE while active names `devflow resume`, plus
+/// `devflow advance` when the phase is gate-pending (answer the gate, then
+/// advance — widening that predicate risks suggesting `advance` where
+/// nothing proves it is right, per 21-CONTEXT.md's Review Incorporation); a
+/// failed probe names the socket to inspect. Empty for ALIVE, a stopped
+/// GONE and NotLaunched.
+fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+    let phase = state.phase;
+    match liveness {
+        PhaseLiveness::Stale => vec![
+            format!("devflow stop --phase {phase}"),
+            format!("devflow resume --phase {phase}"),
+        ],
+        PhaseLiveness::GoneWhileActive => {
+            let mut hints = vec![format!("devflow resume --phase {phase}")];
+            if state.gate_pending {
+                hints.push(format!("devflow advance --phase {phase}"));
+            }
+            hints
+        }
+        PhaseLiveness::ProbeFailed(why) => {
+            let socket = state
+                .supervisor
+                .as_ref()
+                .map(|record| record.socket_path.display().to_string())
+                .unwrap_or_default();
+            vec![format!(
+                "the probe failed ({why}); inspect the socket at {socket}"
+            )]
+        }
+        PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
+            Vec::new()
+        }
     }
-    hints
 }
 
 /// `status`'s in-stage progress line: real elapsed time since the phase's
@@ -1114,19 +1232,15 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 }
                 None => println!("  agent_pid: none"),
             }
-            match state.monitor_pid {
-                Some(pid) => {
-                    println!(
-                        "  monitor_pid: {pid} (running: {})",
-                        agent::agent_running(pid)
-                    );
-                }
-                None => println!("  monitor_pid: none"),
-            }
-            let agent_alive = agent_pid.is_some_and(agent::agent_running);
-            let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
-            let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
-            println!("  liveness: {}", phase_liveness.describe());
+            // 50-12: liveness comes from the recorded socket, never a pid.
+            // `status` speaks only about the operator's own project, so it
+            // names the socket path (doctor does not, T-18-01).
+            let phase_liveness = probe_phase(state);
+            let socket = state.supervisor.as_ref().map_or_else(
+                || "none".to_string(),
+                |record| record.socket_path.display().to_string(),
+            );
+            println!("  supervisor: {socket} — {}", phase_liveness.describe());
             let phase_summary = last_events.remove(&state.phase);
             println!(
                 "{}",
@@ -1135,7 +1249,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                     phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
-            for hint in recovery_hints(state, phase_liveness) {
+            for hint in recovery_hints(state, &phase_liveness) {
                 println!("    → {hint}");
             }
             if let Some(summary) = phase_summary {
@@ -1868,30 +1982,683 @@ fn reap_stray_candidates(
 
 type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 
-/// End a running phase cleanly (23c) — the missing primitive
-/// `23-ORPHAN-FORENSICS.md` names as the reason 54 processes accumulated
-/// with no remedy but `kill(1)`. Answers `phase`'s open gate if it has one —
-/// the primary path, since it is the only one that produces a clean final
-/// state: the target unwinds through its own `abort()` and releases its
-/// lock; otherwise signals the process recorded in `phase`'s per-phase lock
-/// file (never `state.monitor_pid` — T-23-51: the monitor shell script's
-/// `trap` closure only ever captures the **agent's** pid, never the
-/// trailing `advance` invocation, so by the time `advance` is the shell's
-/// foreground child, `monitor_pid` already names a process that exited long
-/// ago; `lock::holder`'s recorded pid is the only correct target).
+/// End a running phase cleanly (23c, D-04, D-06): the one teardown verb, at
+/// every point of a run, that never claims a stop it did not perform.
+///
+/// 1. An open gate with a confirmed live waiter is answered with an abort
+///    ([`stop_via_gate`]); the waiter unwinds through its own `abort()`.
+/// 2. Otherwise the run's supervisor socket is addressed
+///    ([`stop_via_socket`]): the state's `supervisor` record names it, or,
+///    when the state records none, is missing or does not load, the one live
+///    sidecar-found socket for this root and phase. Its probe picks the arm:
+///    ALIVE gets a `shutdown`, which ends a run that holds no per-phase lock
+///    (999.138).
+/// 3. Only when no live socket remains (GONE, or nothing recorded) does the
+///    identity-confirmed per-phase lock holder get signalled
+///    ([`stop_via_lock`]).
+///
+/// No pid read from state is ever signalled. `stopped` is recorded only for
+/// a stop performed or confirmed not live, and never into a state file that
+/// does not load.
 pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    stop_in(project_root, phase, registry::cache_dir().as_deref())
+}
+
+/// [`stop`] with the cache dir whose `sock/` holds the sidecars it may
+/// search, so tests never sweep the operator's real cache.
+fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Result<(), CliError> {
     let (gate_answered, gate_holder) = stop_via_gate(project_root, phase)?;
-    let signal_sent = if gate_answered {
-        false
-    } else {
-        stop_via_lock(project_root, phase)?
+    if gate_answered {
+        return persist_stopped_state(project_root, phase, gate_holder, false);
+    }
+    match stop_via_socket(project_root, phase, cache_dir)? {
+        SocketStop::NoLiveSocket => {
+            let signal_sent = stop_via_lock(project_root, phase)?;
+            persist_stopped_state(project_root, phase, None, signal_sent)
+        }
+        // The supervisor may still be releasing the per-phase lock as it
+        // exits, so wait it out like a signalled holder.
+        SocketStop::Ended => persist_stopped_state(project_root, phase, None, true),
+        SocketStop::EndedStateUnloadable(state_file) => {
+            println!(
+                "stop: phase {phase}'s state file {} does not load, so `stopped` was not \
+                 recorded — repair or remove it before `devflow resume --phase {phase}`",
+                state_file.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `devflow stop --phase N --launch <id>` (D-06): tear down only the
+/// supervisor socket with that launch id, the form `devflow doctor` prints
+/// for an orphan. The launch id is the address, so a deleted root's orphan
+/// is reachable from any directory.
+///
+/// The socket is the one whose sidecar carries `<id>`, or, when its sidecar
+/// is missing or does not parse, whose file name carries it (RV-05b). If this
+/// project's state loads and records that same launch, the plain [`stop`]
+/// runs. Otherwise only that socket is acted on: no gate is answered, no
+/// lock holder signalled and no state written.
+pub(crate) fn stop_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+) -> Result<(), CliError> {
+    let cache_dir = registry::cache_dir().ok_or_else(|| {
+        CliError::Message(
+            "stop: no cache directory (set HOME, XDG_CACHE_HOME or DEVFLOW_CACHE_DIR), so no \
+             supervisor socket can be found by launch id"
+                .to_string(),
+        )
+    })?;
+    stop_launch_in(project_root, phase, launch_id, &cache_dir)
+}
+
+/// [`stop_launch`] against the sockets under `cache_dir`.
+fn stop_launch_in(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    cache_dir: &Path,
+) -> Result<(), CliError> {
+    let Some(entry) = find_launch(cache_dir, launch_id)? else {
+        println!("stop: no supervisor socket with launch id {launch_id}; nothing to stop");
+        return Ok(());
     };
-    persist_stopped_state(
-        project_root,
-        phase,
-        gate_answered.then_some(gate_holder).flatten(),
-        signal_sent,
+    check_launch_belongs(project_root, phase, launch_id, &entry, cache_dir)?;
+    let recorded = workflow::load_state(project_root, phase).is_ok_and(|state| {
+        state
+            .supervisor
+            .is_some_and(|record| record.launch_id == launch_id)
+    });
+    if recorded {
+        return stop_in(project_root, phase, Some(cache_dir));
+    }
+    stop_one_launch(launch_id, &entry)
+}
+
+/// The one socket under `cache_dir` whose sidecar carries `launch_id`, or,
+/// with no usable sidecar, whose file name does. Two such sockets are a
+/// refusal: the id no longer names one launch.
+fn find_launch(
+    cache_dir: &Path,
+    launch_id: &str,
+) -> Result<Option<supervisor::SweepEntry>, CliError> {
+    let mut matches: Vec<supervisor::SweepEntry> = supervisor::sweep_in(cache_dir)
+        .into_iter()
+        .filter(|entry| match &entry.sidecar {
+            Some(sidecar) => sidecar.launch_id == launch_id,
+            None => entry.launch_id_in_name.as_deref() == Some(launch_id),
+        })
+        .collect();
+    if matches.len() > 1 {
+        let paths: Vec<String> = matches
+            .iter()
+            .map(|entry| entry.socket_path.display().to_string())
+            .collect();
+        return Err(CliError::Message(format!(
+            "stop: launch id {launch_id} names {} sockets ({}); nothing was changed",
+            matches.len(),
+            paths.join(", ")
+        )));
+    }
+    Ok(matches.pop())
+}
+
+/// Refuse a launch that is not this project's phase `phase`, changing
+/// nothing. A parsed sidecar decides: its phase must be `phase`, and its
+/// project root must be this one or no longer exist (a deleted root's
+/// orphan). With no usable sidecar, the socket must be one
+/// [`supervisor::sweep_for_in`] attributes to this root and phase by its
+/// file name.
+fn check_launch_belongs(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    entry: &supervisor::SweepEntry,
+    cache_dir: &Path,
+) -> Result<(), CliError> {
+    let refuse = |why: String| {
+        Err(CliError::Message(format!(
+            "stop: launch {launch_id} {why}; nothing was changed"
+        )))
+    };
+    match &entry.sidecar {
+        Some(sidecar) if sidecar.phase != phase => {
+            refuse(format!("belongs to phase {}, not {phase}", sidecar.phase))
+        }
+        Some(sidecar) if sidecar.project_root != project_root && sidecar.project_root.is_dir() => {
+            refuse(format!(
+                "belongs to project {}, not {}; run stop from that project",
+                sidecar.project_root.display(),
+                project_root.display()
+            ))
+        }
+        Some(_) => Ok(()),
+        None => {
+            let ours = supervisor::sweep_for_in(cache_dir, project_root, phase)
+                .iter()
+                .any(|candidate| candidate.socket_path == entry.socket_path);
+            if ours {
+                Ok(())
+            } else {
+                refuse(format!(
+                    "has no usable sidecar, and its socket file name {} names another project \
+                     or phase than {} phase {phase}",
+                    entry.socket_path.display(),
+                    project_root.display()
+                ))
+            }
+        }
+    }
+}
+
+/// Act on one launch's socket alone: ALIVE → `shutdown` (a `handed_off`
+/// answer is reported, never retried against the successor); STALE → the
+/// backstop with its parsed sidecar and no state record, or a refusal when
+/// it has none; GONE → nothing to stop; a probe error → a refusal.
+fn stop_one_launch(launch_id: &str, entry: &supervisor::SweepEntry) -> Result<(), CliError> {
+    let subject = format!("launch {launch_id}");
+    let socket = &entry.socket_path;
+    match supervisor::probe(socket) {
+        Ok(supervisor::Liveness::Gone) => {
+            println!(
+                "stop: {subject}: socket {} is gone; nothing to stop",
+                socket.display()
+            );
+            Ok(())
+        }
+        Err(error) => Err(CliError::Message(format!(
+            "stop: {subject}: could not probe socket {} ({}: {error}); nothing was signalled, \
+             removed or recorded",
+            socket.display(),
+            probe_error_kind(&error)
+        ))),
+        Ok(supervisor::Liveness::Stale) => stop_stale_launch(&subject, entry),
+        Ok(supervisor::Liveness::Alive(_)) => shutdown_one_launch(&subject, entry),
+    }
+}
+
+/// [`stop_one_launch`]'s ALIVE arm. A request that errors is probed once
+/// more, as [`shutdown_supervisor`] does: STALE goes to the backstop, GONE
+/// leaves nothing to stop.
+fn shutdown_one_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<(), CliError> {
+    let socket = &entry.socket_path;
+    let error = match supervisor::request_shutdown(socket, shutdown_final_timeout()) {
+        Ok(supervisor::ShutdownOutcome::Stopped {
+            exit_code,
+            advance_suppressed,
+        }) => {
+            let advance = if advance_suppressed {
+                "advance suppressed"
+            } else {
+                "advance not suppressed"
+            };
+            println!(
+                "stop: stopped {subject} through its supervisor (agent group ended, exit code \
+                 {exit_code}, {advance})"
+            );
+            return Ok(());
+        }
+        Ok(supervisor::ShutdownOutcome::HandedOff) => {
+            println!("stop: {subject} already handed off to its successor; nothing stopped");
+            return Ok(());
+        }
+        Ok(other) => {
+            return Err(CliError::Message(format!(
+                "stop: {subject}: the supervisor did not stop ({other:?}); nothing was recorded"
+            )));
+        }
+        Err(error) => error,
+    };
+    match supervisor::probe(socket) {
+        Ok(supervisor::Liveness::Stale) => stop_stale_launch(subject, entry),
+        Ok(supervisor::Liveness::Gone) => {
+            println!(
+                "stop: {subject}: socket {} went away under the shutdown request ({error}); \
+                 nothing left to stop",
+                socket.display()
+            );
+            Ok(())
+        }
+        _ => Err(CliError::Message(format!(
+            "stop: {subject}: the supervisor at {} did not answer the shutdown ({error}); \
+             nothing was signalled or recorded",
+            socket.display()
+        ))),
+    }
+}
+
+/// [`stop_one_launch`]'s STALE arm: the backstop with the sidecar the sweep
+/// parsed and no state record, or, with no usable sidecar, a refusal that
+/// signals and removes nothing (RV-05b): there is no pgid, start time or
+/// boot id to validate.
+fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<(), CliError> {
+    let Some(sidecar) = &entry.sidecar else {
+        let why = entry.sidecar_error.as_ref().map_or_else(
+            || "its sidecar is missing".to_string(),
+            |error| format!("its sidecar is unusable ({error})"),
+        );
+        return Err(stale_refusal(subject, &entry.socket_path, &why));
+    };
+    let socket = supervisor::SocketPath::new(entry.socket_path.clone())
+        .map_err(|error| stale_refusal(subject, &entry.socket_path, &error.to_string()))?;
+    run_backstop(subject, &socket, sidecar, None, None)
+}
+
+/// How long `stop` waits for a supervisor's final shutdown line: the
+/// supervisor's own terminate-and-verify wait, twice, then its wait for the
+/// per-phase lock before it records its stop and answers
+/// ([`crate::pipeline_launch::SUPERVISOR_STOP_WAIT`]), plus time to persist.
+/// Shorter, and a busy lock reads a supervisor that did stop as one that did
+/// not answer.
+fn shutdown_final_timeout() -> std::time::Duration {
+    2 * agent::TERMINATE_VERIFY_WAIT
+        + crate::pipeline_launch::SUPERVISOR_STOP_WAIT
+        + std::time::Duration::from_secs(5)
+}
+
+/// Shutdown requests `stop` sends in all when each is answered `handed_off`:
+/// the first and 3 retries, each against the record a fresh state reload
+/// names (crash row C13).
+const MAX_SHUTDOWN_REQUESTS: usize = 4;
+
+/// What [`stop_via_socket`] did.
+enum SocketStop {
+    /// No live supervisor socket: nothing recorded, or its probe says GONE.
+    NoLiveSocket,
+    /// The run was ended through its socket; record `stopped`.
+    Ended,
+    /// The run was ended through a sidecar-found socket, but the state file
+    /// at this path exists and does not load, so nothing can be recorded.
+    EndedStateUnloadable(PathBuf),
+}
+
+/// The supervisor socket `stop` addresses for a phase, and its provenance.
+struct LocatedSocket {
+    socket: PathBuf,
+    /// The state's record, when the socket came from it (the backstop
+    /// cross-checks the sidecar against it).
+    record: Option<SupervisorRecord>,
+    /// The state file, when it exists but does not load and the socket came
+    /// from its sidecar.
+    unloadable_state: Option<PathBuf>,
+}
+
+/// Find the socket for a bare `stop`: the loaded state's `supervisor` record;
+/// or, when the state records none, is missing or does not load, the one
+/// socket of this root and phase that a sweep finds not GONE. Several such
+/// sockets are a refusal listing each, since `stop` cannot tell which is the
+/// run.
+///
+/// A loaded state with no record is swept because a `start` launcher saves
+/// the record only after its spawned supervisor has published: a stop in
+/// that window must end the supervisor through its socket, not signal the
+/// launcher (the lock holder), whose death would leave the supervisor and
+/// its agent running unrecorded.
+fn locate_phase_socket(
+    project_root: &Path,
+    phase: PhaseId,
+    cache_dir: Option<&Path>,
+) -> Result<Option<LocatedSocket>, CliError> {
+    let unloadable_state = match workflow::load_state(project_root, phase) {
+        Ok(state) => match state.supervisor {
+            Some(record) => {
+                return Ok(Some(LocatedSocket {
+                    socket: record.socket_path.clone(),
+                    record: Some(record),
+                    unloadable_state: None,
+                }));
+            }
+            None => None,
+        },
+        Err(workflow::WorkflowError::MissingState(_)) => None,
+        Err(_) => Some(workflow::state_path(project_root, phase)),
+    };
+    let Some(cache_dir) = cache_dir else {
+        return Ok(None);
+    };
+    let live: Vec<supervisor::SweepEntry> =
+        supervisor::sweep_for_in(cache_dir, project_root, phase)
+            .into_iter()
+            .filter(|entry| {
+                entry.socket_present && !matches!(entry.liveness, Ok(supervisor::Liveness::Gone))
+            })
+            .collect();
+    match live.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some(LocatedSocket {
+            socket: entry.socket_path.clone(),
+            record: None,
+            unloadable_state,
+        })),
+        several => Err(several_sockets_refusal(
+            phase,
+            unloadable_state.as_deref(),
+            several,
+        )),
+    }
+}
+
+/// The refusal for several live sockets of one root and phase: each with its
+/// launch id, liveness and the `devflow stop --phase N --launch <id>` form
+/// that addresses it alone. Nothing is signalled, removed or recorded.
+fn several_sockets_refusal(
+    phase: PhaseId,
+    unloadable_state: Option<&Path>,
+    entries: &[supervisor::SweepEntry],
+) -> CliError {
+    use std::fmt::Write as _;
+    let why = unloadable_state.map_or_else(
+        || "no state file names one".to_string(),
+        |path| format!("its state file {} does not load", path.display()),
+    );
+    let mut text = format!(
+        "stop: phase {phase} has {} live supervisor sockets for this project and {why}, so stop \
+         cannot tell which one is the run; nothing was signalled, removed or recorded. Stop each \
+         one by its launch id:",
+        entries.len()
+    );
+    for entry in entries {
+        let _ = write!(text, "\n  {}", sweep_entry_stop_line(phase, entry));
+    }
+    CliError::Message(text)
+}
+
+/// One line of [`several_sockets_refusal`]. A socket with no usable sidecar
+/// is named by the launch id in its file name (RV-05b); one whose name is
+/// outside the DevFlow scheme has no `--launch` form, so it is listed by its
+/// path and its ping reply's launch id.
+fn sweep_entry_stop_line(phase: PhaseId, entry: &supervisor::SweepEntry) -> String {
+    let liveness = match &entry.liveness {
+        Ok(supervisor::Liveness::Alive(_)) => "ALIVE",
+        Ok(supervisor::Liveness::Stale) => "STALE",
+        Ok(supervisor::Liveness::Gone) => "GONE",
+        Err(_) => "probe failed",
+    };
+    let sidecar_note = match (&entry.sidecar, &entry.sidecar_error) {
+        (Some(_), _) => "",
+        (None, Some(_)) => ", sidecar does not parse",
+        (None, None) => ", sidecar missing",
+    };
+    let launch_id = entry
+        .sidecar
+        .as_ref()
+        .map(|sidecar| sidecar.launch_id.clone())
+        .or_else(|| entry.launch_id_in_name.clone());
+    match launch_id {
+        Some(id) => format!(
+            "launch {id} ({liveness}{sidecar_note}): devflow stop --phase {phase} --launch {id}"
+        ),
+        None => {
+            let pinged = match &entry.liveness {
+                Ok(supervisor::Liveness::Alive(reply)) => reply.launch_id.as_str(),
+                _ => "unknown",
+            };
+            format!(
+                "socket {} ({liveness}{sidecar_note}, ping names launch {pinged}): its name is \
+                 outside the DevFlow socket scheme, so `--launch` cannot address it",
+                entry.socket_path.display()
+            )
+        }
+    }
+}
+
+/// The socket arm of [`stop`]. Probes the located socket and acts on its
+/// state: ALIVE → `shutdown`; STALE → [`stop_stale_socket`]; GONE → nothing
+/// here (the caller falls back to the lock holder); a probe error → a
+/// refusal that reaches no teardown (R-6).
+///
+/// A `handed_off` reply means the run moved to its successor: the state is
+/// reloaded and the record it names is asked, up to
+/// [`MAX_SHUTDOWN_REQUESTS`] requests in all; then `stop` fails, recording
+/// nothing (crash row C13).
+fn stop_via_socket(
+    project_root: &Path,
+    phase: PhaseId,
+    cache_dir: Option<&Path>,
+) -> Result<SocketStop, CliError> {
+    let mut handed_off = 0;
+    for _ in 0..MAX_SHUTDOWN_REQUESTS {
+        let Some(located) = locate_phase_socket(project_root, phase, cache_dir)? else {
+            return Ok(SocketStop::NoLiveSocket);
+        };
+        let ended = match supervisor::probe(&located.socket) {
+            Ok(supervisor::Liveness::Gone) => return Ok(SocketStop::NoLiveSocket),
+            Err(error) => return Err(probe_refusal(phase, &located.socket, &error)),
+            Ok(supervisor::Liveness::Stale) => {
+                stop_stale_socket(phase, &located)?;
+                true
+            }
+            Ok(supervisor::Liveness::Alive(_)) => match shutdown_supervisor(phase, &located)? {
+                ShutdownResult::Ended => true,
+                ShutdownResult::Relocate => false,
+                ShutdownResult::HandedOff => {
+                    handed_off += 1;
+                    false
+                }
+            },
+        };
+        if ended {
+            return Ok(match located.unloadable_state {
+                Some(state_file) => SocketStop::EndedStateUnloadable(state_file),
+                None => SocketStop::Ended,
+            });
+        }
+    }
+    Err(CliError::Message(format!(
+        "stop: phase {phase}'s supervisor answered `handed_off` to {handed_off} of \
+         {MAX_SHUTDOWN_REQUESTS} shutdown requests (the first and 3 retries, each against the \
+         record a fresh state reload named); nothing was stopped or recorded — run `devflow \
+         status` and `devflow stop --phase {phase}` again"
+    )))
+}
+
+/// What one shutdown attempt in [`stop_via_socket`] came to.
+enum ShutdownResult {
+    /// The supervisor (or, after it died, the backstop) ended the run.
+    Ended,
+    /// The supervisor had handed the run to its successor.
+    HandedOff,
+    /// The socket went away under the request: locate the run again.
+    Relocate,
+}
+
+/// Ask the ALIVE supervisor at `located` to stop.
+///
+/// A request that fails to reach an answer (a connect refused, a reset or a
+/// broken pipe) may have met a supervisor dying under it: its listener is
+/// released while the connection waits in the backlog, which
+/// `request_shutdown` reports as an error (6d46008 made `probe` re-connect
+/// for this, not `request_shutdown`). So the socket is probed once more:
+/// STALE goes to [`stop_stale_socket`], GONE re-locates the run, and only a
+/// supervisor that still answers, or a failed probe, makes the error stand.
+fn shutdown_supervisor(
+    phase: PhaseId,
+    located: &LocatedSocket,
+) -> Result<ShutdownResult, CliError> {
+    let error = match supervisor::request_shutdown(&located.socket, shutdown_final_timeout()) {
+        Ok(supervisor::ShutdownOutcome::Stopped {
+            exit_code,
+            advance_suppressed,
+        }) => {
+            let advance = if advance_suppressed {
+                "advance suppressed"
+            } else {
+                "advance not suppressed"
+            };
+            println!(
+                "stop: stopped phase {phase} through its supervisor (agent group ended, exit \
+                 code {exit_code}, {advance})"
+            );
+            return Ok(ShutdownResult::Ended);
+        }
+        Ok(supervisor::ShutdownOutcome::HandedOff) => return Ok(ShutdownResult::HandedOff),
+        Ok(supervisor::ShutdownOutcome::Refused(reason)) => {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s supervisor at {} refused the shutdown ({reason}); nothing \
+                 was stopped or recorded",
+                located.socket.display()
+            )));
+        }
+        Ok(other) => {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s supervisor gave an unknown shutdown answer ({other:?}); \
+                 nothing was recorded"
+            )));
+        }
+        Err(error) => error,
+    };
+    match supervisor::probe(&located.socket) {
+        Ok(supervisor::Liveness::Stale) => {
+            println!(
+                "stop: phase {phase}'s supervisor went away under the shutdown request ({error}); \
+                 its socket is now STALE"
+            );
+            stop_stale_socket(phase, located).map(|()| ShutdownResult::Ended)
+        }
+        Ok(supervisor::Liveness::Gone) => Ok(ShutdownResult::Relocate),
+        _ => Err(CliError::Message(format!(
+            "stop: phase {phase}'s supervisor at {} did not answer the shutdown ({error}); \
+             nothing was signalled or recorded",
+            located.socket.display()
+        ))),
+    }
+}
+
+/// A probe that could not answer ALIVE, STALE or GONE: refused, naming the
+/// error kind and the socket path, and never handed to the backstop (R-6).
+fn probe_refusal(phase: PhaseId, socket: &Path, error: &supervisor::ProbeError) -> CliError {
+    CliError::Message(format!(
+        "stop: could not probe phase {phase}'s supervisor socket {} ({}: {error}); nothing was \
+         signalled, removed or recorded",
+        socket.display(),
+        probe_error_kind(error)
+    ))
+}
+
+/// A short name for a [`supervisor::ProbeError`]'s kind.
+fn probe_error_kind(error: &supervisor::ProbeError) -> &'static str {
+    match error {
+        supervisor::ProbeError::Stat(_) => "stat failed",
+        supervisor::ProbeError::NotASocket(_) => "not a socket",
+        supervisor::ProbeError::ForeignOwner { .. } => "owned by another user",
+        supervisor::ProbeError::Connect(_) => "connect failed",
+        supervisor::ProbeError::NoReply(_) => "no valid ping reply",
+        _ => "probe failed",
+    }
+}
+
+/// A STALE socket: its supervisor is gone, and its agent group may not be.
+/// The sidecar beside the socket is read and handed, with the state's record
+/// when there is one, to the 50-09 backstop, which validates the group's
+/// identity before it signals anything. A sidecar that cannot be read is a
+/// refusal: nothing else can validate the group.
+fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<(), CliError> {
+    let subject = format!("phase {phase}");
+    let socket = supervisor::SocketPath::new(located.socket.clone())
+        .map_err(|error| stale_refusal(&subject, &located.socket, &error.to_string()))?;
+    let sidecar = read_stale_sidecar(&subject, &socket)?;
+    run_backstop(
+        &subject,
+        &socket,
+        &sidecar,
+        located.record.as_ref(),
+        Some(phase),
     )
+}
+
+/// The sidecar of a STALE socket, or the refusal that names why it cannot be
+/// used.
+fn read_stale_sidecar(
+    subject: &str,
+    socket: &supervisor::SocketPath,
+) -> Result<supervisor::Sidecar, CliError> {
+    supervisor::read_sidecar(&socket.sidecar_path()).map_err(|error| {
+        let why = match &error {
+            supervisor::SidecarError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                "is missing".to_string()
+            }
+            supervisor::SidecarError::Json(parse) => format!("does not parse: {parse}"),
+            other => format!("could not be read: {other}"),
+        };
+        stale_refusal(subject, socket.as_path(), &format!("its sidecar {why}"))
+    })
+}
+
+/// The refusal for a STALE socket whose agent group nothing can validate:
+/// nothing is signalled or removed, and the manual repair is named.
+fn stale_refusal(subject: &str, socket: &Path, why: &str) -> CliError {
+    CliError::Message(format!(
+        "stop: {subject}: socket {} is STALE and {why}; nothing recorded can validate its agent \
+         group, so stop signals nothing — end its agent yourself and remove {} and {}",
+        socket.display(),
+        socket.display(),
+        socket.with_extension("json").display()
+    ))
+}
+
+/// Run the backstop on a STALE socket and report what it did. A group it
+/// ended, or one it proved gone (previous boot, empty group, recycled
+/// leader), is a stop; a refusal prints the backstop's own text (the
+/// members, the residual F1 limit, the inspection command) and fails.
+/// `resumable` names the phase a teardown that signalled nothing leaves
+/// resumable (R-8); a targeted stop of a superseded launch passes `None`.
+fn run_backstop(
+    subject: &str,
+    socket: &supervisor::SocketPath,
+    sidecar: &supervisor::Sidecar,
+    record: Option<&SupervisorRecord>,
+    resumable: Option<PhaseId>,
+) -> Result<(), CliError> {
+    use supervisor::backstop::{BackstopDecision, BackstopOutcome};
+    let outcome =
+        supervisor::backstop::teardown_stale(socket, sidecar, record).map_err(|error| {
+            CliError::Message(format!(
+                "stop: {subject}: the stale-socket backstop did not act ({error}); nothing was \
+             recorded"
+            ))
+        })?;
+    match outcome {
+        BackstopOutcome::Killed { members, .. } => {
+            let pids: Vec<String> = members.iter().map(|m| m.pid.to_string()).collect();
+            println!(
+                "stop: {subject}: its supervisor is gone (STALE socket); ended its agent group {} \
+                 ({} member(s): pid {}) and removed {} and its sidecar",
+                sidecar.agent_pgid,
+                members.len(),
+                pids.join(", "),
+                socket.as_path().display()
+            );
+            Ok(())
+        }
+        BackstopOutcome::RemovedNothingSignalled(decision) => {
+            let why = match decision {
+                BackstopDecision::PreviousBoot => "previous boot",
+                BackstopDecision::EmptyGroup => "empty group",
+                BackstopDecision::LeaderRecycled => "recycled leader",
+                _ => "nothing to signal",
+            };
+            let resume = resumable.map_or_else(String::new, |phase| {
+                format!("; the phase is resumable: run `devflow resume --phase {phase}`")
+            });
+            println!(
+                "stop: {subject}: nothing was running ({why}); removed the stale socket {} and its \
+                 sidecar{resume}",
+                socket.as_path().display()
+            );
+            Ok(())
+        }
+        BackstopOutcome::Refused(decision) => Err(CliError::Message(format!(
+            "stop: {subject}: {}",
+            decision.describe(socket, sidecar)
+        ))),
+        other => Err(CliError::Message(format!(
+            "stop: {subject}: the stale-socket backstop gave an unknown outcome ({other:?}); \
+             nothing was recorded"
+        ))),
+    }
 }
 
 /// The primary path: answer `phase`'s open gate with a rejection whose note
@@ -2030,15 +2797,19 @@ fn stop_with_existing_response(
     }
 }
 
-/// The fallback: signal the process recorded in `phase`'s per-phase lock
-/// file — the process actually running `advance()` and holding the lock
-/// across the gate wait. Fail-closed on identity (T-23-52): a live pid that
-/// does not look like a devflow process is refused, not signalled, since
-/// the lock may be stale with a recycled pid. Never reads
-/// `state.monitor_pid` — see [`stop`]'s doc comment.
+/// The fallback once no live supervisor socket remains (GONE, or none
+/// recorded): signal the process recorded in `phase`'s per-phase lock file,
+/// such as a foreground `advance()` holding the lock. Fail-closed on
+/// identity (T-23-52): the pid is signalled only when it matches the start
+/// time the lock recorded, since the lock may be stale with a recycled pid.
+/// The lock file is the only place this reads a pid from; state is never
+/// one.
 fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
     let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
-        println!("stop: no lock held for phase {phase} — nothing is running `advance()`");
+        println!(
+            "stop: no live supervisor socket and no lock held for phase {phase} — nothing is \
+             running"
+        );
         return Ok(false);
     };
     let Ok(pid) = pid_str.parse::<u32>() else {
@@ -2411,54 +3182,51 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     })
 }
 
-/// Refuse `start` while the phase's recorded monitor or agent is alive
-/// (criterion 2, D-01: one writer per phase). `start` calls this under the
-/// per-phase lock and before any gate cleanup, git mutation or `save_state`,
-/// so a refusal writes nothing. `--force` does not bypass it.
+/// Refuse `start` while the phase's run is live (criterion 2, D-01: one
+/// writer per phase). `start` calls this under the per-phase lock and before
+/// any gate cleanup, git mutation or `save_state`, so a refusal writes
+/// nothing. `--force` does not bypass it. See
+/// [`refuse_launch_over_a_live_run`] for what counts as live.
 ///
-/// Liveness is pid liveness through the helpers `status` uses
-/// (`agent_pid_from_file`, `agent::agent_running`), not identity: neither pid
-/// records a start time. A recycled pid gives a fail-closed false refusal,
-/// accepted by the operator with Option A (2026-09-22).
-///
-/// No-state carve-out (operator-approved 2026-09-22): without a state file this
-/// returns Ok even if the agent pid file names a live process, because
-/// `recover --clean` leaves that file behind and a recycled pid would otherwise
-/// block `start` with no DevFlow repair. A state file that does not load is
-/// checked on the agent pid file only.
+/// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12):
+/// without a state file the agent pid file is not read, so a live process it
+/// names does not refuse, because `recover --clean` leaves that file behind
+/// and a recycled pid would otherwise block `start` with no DevFlow repair.
+/// The supervisor sockets of this root and phase are still swept.
 ///
 /// Out of scope: the lock-free window between agent exit and `advance` taking
 /// the lock stays backlog 999.136. This check says nothing about a gate waiter.
 fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(project_root, phase, LaunchVerb::Start)
+    refuse_launch_over_a_live_run(
+        project_root,
+        phase,
+        LaunchVerb::Start,
+        registry::cache_dir().as_deref(),
+    )
 }
 
 /// Criterion 2, D-01 and D-02's `resume` half, promoted by the operator on
 /// 2026-09-23 as backlog 999.140: `pipeline_launch::resume` calls this just
 /// after it has acquired its phase lock and before it loads or writes state.
 /// The `devflow resume` CLI arm is resume's only production caller; no monitor
-/// or advance path calls resume, so a recorded pid is never that process. An
-/// agent that runs `devflow resume` for its own phase is refused correctly.
+/// or advance path calls resume. An agent that runs `devflow resume` for its
+/// own phase is refused correctly.
 ///
-/// Liveness is shared with `start` and uses the same pid-only Option A that
-/// the operator accepted for start. A recycled pid can therefore refuse a
-/// resume; that distinct resume cost is the known limit recorded in 48-20,
-/// not an operator-approved permanent limit. Without a state file, resume
-/// still reports its own missing-state error. For an unloadable state, this
-/// checks only the agent pid file (999.139, backlog), and resume then cannot
-/// launch because its own `load_state` fails immediately afterwards.
-///
-/// Production hints remain unchanged in this plan (backlog 999.142): status
-/// and doctor for a dead monitor with a live agent, doctor's dead-agent and
-/// gate-pending findings, cleanup's worktree messages, and `no_waiter_repair`
-/// through the gate verbs, gate sweep, stop and doctor (48-20 H1-H10). The
-/// agent-exit-to-advance window remains 999.136, and this check says nothing
-/// about a gate waiter.
+/// Liveness is shared with `start` ([`refuse_launch_over_a_live_run`]).
+/// Without a state file, resume still reports its own missing-state error.
+/// For a state that will not load, the guard finds the run through its
+/// sidecar (R-12, 999.139), and resume then cannot launch anyway because its
+/// own `load_state` fails immediately afterwards.
 pub(crate) fn refuse_resume_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
 ) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(project_root, phase, LaunchVerb::Resume)
+    refuse_launch_over_a_live_run(
+        project_root,
+        phase,
+        LaunchVerb::Resume,
+        registry::cache_dir().as_deref(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2467,121 +3235,332 @@ enum LaunchVerb {
     Resume,
 }
 
+impl LaunchVerb {
+    fn label(self) -> &'static str {
+        match self {
+            LaunchVerb::Start => "start",
+            LaunchVerb::Resume => "resume",
+        }
+    }
+
+    /// The command a refusal tells the operator to run again.
+    fn rerun(self, phase: PhaseId) -> String {
+        match self {
+            LaunchVerb::Start => "devflow start".to_string(),
+            LaunchVerb::Resume => format!("devflow resume --phase {phase}"),
+        }
+    }
+}
+
+/// The shared start/resume guard (D-09, R-12, 999.139). Two halves, either of
+/// which refuses:
+///
+/// - **Supervisor** ([`possibly_live_sockets`]). The state loads → probe its
+///   `supervisor` record: ALIVE is live; STALE is live unless
+///   [`supervisor::backstop::assess`] proves its agent group gone
+///   ([`stale_group_may_live`]); a probe error is live (fail closed,
+///   T-50-40); GONE is not. The state is missing or will not load →
+///   [`supervisor::sweep_for_in`] for this root and phase: an entry whose
+///   sidecar parsed is classified the same way (with no record); an entry
+///   with no usable sidecar, which 50-06 attributes by its file name or ping
+///   reply, is live unless it probes GONE (RV-05: nothing recorded can prove
+///   its group dead). A socket directory that exists but cannot be listed
+///   refuses (the 50-06 threat flag: the sweep reads it as empty). With no
+///   cache dir, no sweep runs, as for `stop` and `recover`.
+/// - **Agent pid file** (unchanged, D-12): a live pid there is live. Pid
+///   liveness, not identity: a recycled pid gives a fail-closed false
+///   refusal (Option A, 2026-09-22). Not read without a state file (the
+///   no-state carve-out on [`refuse_start_over_a_live_run`]).
+///
+/// A loaded state with no record over a live supervisor (a launcher that
+/// died before saving it, T-50-90/T-50-91) is accepted until Phase 50.1.
 fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
+    cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
-    let loaded = workflow::load_state(project_root, phase);
-    if loaded.is_err() && !workflow::state_path(project_root, phase).exists() {
-        return Ok(());
-    }
-    let monitor = loaded
-        .ok()
-        .and_then(|state| state.monitor_pid)
+    let state_file = workflow::state_path(project_root, phase);
+    let state = workflow::load_state(project_root, phase).ok();
+    let no_state = state.is_none() && !state_file.exists();
+    let sockets = possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir).map_err(
+        |(dir, why)| {
+            unlistable_socket_dir_refusal(phase, verb, (&state_file, no_state, &dir), &why)
+        },
+    )?;
+    let agent = (!no_state)
+        .then(|| agent_pid_from_file(project_root, phase))
+        .flatten()
         .filter(|&pid| agent::agent_running(pid));
-    let agent = agent_pid_from_file(project_root, phase).filter(|&pid| agent::agent_running(pid));
-    let live: Vec<(&str, u32)> = [("monitor", monitor), ("agent", agent)]
-        .into_iter()
-        .filter_map(|(role, pid)| pid.map(|pid| (role, pid)))
-        .collect();
-    if live.is_empty() {
+    if sockets.is_empty() && agent.is_none() {
         return Ok(());
     }
-    Err(CliError::Message(live_run_refusal(phase, verb, &live)))
+    Err(CliError::Message(live_run_refusal(
+        phase, verb, &sockets, agent,
+    )))
 }
 
-/// The refusal text for [`refuse_start_over_a_live_run`]. It fires while
-/// `start` holds the lock, so no other process holds it: `stop` would signal
-/// nothing here (see `stop_via_lock`).
-fn live_run_refusal(phase: PhaseId, verb: LaunchVerb, live: &[(&str, u32)]) -> String {
-    match verb {
-        LaunchVerb::Start => start_live_run_refusal(phase, live),
-        LaunchVerb::Resume => resume_live_run_refusal(phase, live),
+/// The supervisor half of [`refuse_launch_over_a_live_run`], shared with
+/// `recover --clean --phase N` ([`refuse_a_live_supervisor`]): the sockets of
+/// this root and phase that may still run. `state` is the loaded state, or
+/// `None` when it is missing or does not load, which sweeps the socket
+/// directory under `cache_dir` instead. `Err` names that directory and why
+/// it cannot be listed.
+fn possibly_live_sockets(
+    project_root: &Path,
+    phase: PhaseId,
+    state: Option<&State>,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<LiveSocket>, (PathBuf, String)> {
+    if let Some(state) = state {
+        return Ok(state
+            .supervisor
+            .as_ref()
+            .and_then(recorded_live_socket)
+            .into_iter()
+            .collect());
+    }
+    let Some(cache_dir) = cache_dir else {
+        return Ok(Vec::new());
+    };
+    if let Some(why) = socket_dir_unlistable(cache_dir) {
+        return Err((registry::socket_dir_in(cache_dir), why));
+    }
+    Ok(supervisor::sweep_for_in(cache_dir, project_root, phase)
+        .iter()
+        .filter_map(swept_live_socket)
+        .collect())
+}
+
+/// A supervisor socket the launch guard counts as possibly live.
+struct LiveSocket {
+    socket: PathBuf,
+    /// The record's or sidecar's launch id; for a socket with no usable
+    /// sidecar, its file name's, else its ping reply's, else `unknown`.
+    launch_id: String,
+    /// `ALIVE`, `STALE`, or why the socket could not be probed.
+    liveness: String,
+    /// Why the sidecar cannot be used, for a socket with none that parses:
+    /// `stop --launch` cannot validate it, so the refusal names bare `stop`.
+    sidecar_problem: Option<String>,
+}
+
+impl LiveSocket {
+    /// The refusal line that names this socket's repair.
+    fn repair_line(&self, phase: PhaseId) -> String {
+        let (id, liveness, socket) = (&self.launch_id, &self.liveness, self.socket.display());
+        match &self.sidecar_problem {
+            None => format!(
+                "launch {id} ({liveness}, socket {socket}): run \
+                 `devflow stop --phase {phase} --launch {id}` first"
+            ),
+            Some(problem) => format!(
+                "socket {socket} ({liveness}, launch {id}, its sidecar {problem}): run \
+                 `devflow stop --phase {phase}` first — it shuts a supervisor that answers down \
+                 through its socket; one that does not answer cannot be validated without its \
+                 sidecar, so end its agent yourself and remove `{socket}` and `{}`",
+                self.socket.with_extension("json").display()
+            ),
+        }
     }
 }
 
-fn start_live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
-    let named = live
-        .iter()
-        .map(|(role, pid)| format!("{role} pid {pid}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let checks = live
-        .iter()
-        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"))
-        .collect::<String>();
-    let padded = phase.padded();
-    // Identity details below match the argv the monitors are spawned with:
-    // `pipe_owning_monitor_args` and the Legacy script plus `advance_tail` in
-    // devflow-core's monitor.rs (48-REVIEW CR-01). A Legacy monitor whose
-    // agent has exited runs `devflow advance` as a foreground child and
-    // defers SIGTERM until it returns (48-REVIEW WR-02).
-    format!(
-        "phase {phase}: a run is still live ({named} alive) — refusing to start; nothing was written\n\
-         No process holds the phase lock right now, so `devflow stop --phase {phase}` would only mark the \
-         state stopped: it signals nothing and does not end this run. stop ends a run through the process \
-         that holds the lock: one parked at a gate, or this run's own `devflow advance` once it takes the \
-         lock after this refusal.\n\
-         Check each pid before signalling it. `ps -p` shows only the executable name, which cannot tell \
-         phases apart; `-ww` keeps a long command line from being cut at the terminal width:{checks}\n\
-         This phase's monitor is either a `__monitor` process with this project's path and `--phase {phase}` \
-         in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` \
-         with `--phase {phase}`. This phase's agent has that monitor as its parent (`ps -o ppid= -p <pid>`); \
-         an agent whose monitor has exited cannot be tied to this phase that way, so do not signal it on the \
-         pid alone.\n\
-         To end this run now, send SIGTERM to the confirmed monitor first — signalling the agent first lets \
-         the monitor launch the next stage. If the agent has already exited, an `sh` monitor may be running \
-         `devflow advance` as a foreground child: the monitor defers SIGTERM until that child returns, and \
-         the child may take the lock as soon as this start exits. Find it with \
-         `ps -ww -o pid=,args= --ppid <monitor pid>` and signal that child, not only the monitor.\n\
-         If the named processes have exited, run `devflow start` again. If a named pid is live but is not \
-         this phase's process (a recycled pid), `start` refuses again: run \
-         `devflow recover --clean --phase {phase}` first, then `devflow start`. Do neither while this \
-         phase's processes are live: `recover --clean` clears state even while an agent runs, and a later \
-         `start` would launch a second agent beside it."
+/// The loaded state's record as a [`LiveSocket`], or `None` when its socket
+/// is GONE or STALE over a group the backstop proves gone.
+fn recorded_live_socket(record: &SupervisorRecord) -> Option<LiveSocket> {
+    let live = |liveness: &str, sidecar_problem: Option<String>| LiveSocket {
+        socket: record.socket_path.clone(),
+        launch_id: record.launch_id.clone(),
+        liveness: liveness.to_string(),
+        sidecar_problem,
+    };
+    match supervisor::probe(&record.socket_path) {
+        Ok(supervisor::Liveness::Gone) => None,
+        Ok(supervisor::Liveness::Alive(_)) => Some(live("ALIVE", None)),
+        Err(error) => Some(live(&probe_failure(&error), None)),
+        Ok(supervisor::Liveness::Stale) => {
+            match supervisor::read_sidecar(&record.socket_path.with_extension("json")) {
+                Ok(sidecar) => {
+                    let decision = supervisor::backstop::assess(&sidecar, Some(record));
+                    stale_group_may_live(&decision).then(|| live("STALE", None))
+                }
+                Err(supervisor::SidecarError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Some(live("STALE", Some("is missing".to_string())))
+                }
+                Err(error) => Some(live("STALE", Some(format!("is unusable ({error})")))),
+            }
+        }
+    }
+}
+
+/// A sweep entry for this root and phase as a [`LiveSocket`], or `None`
+/// when it is GONE, or STALE with a parsed sidecar whose group the backstop
+/// proves gone. An entry with no usable sidecar is live unless GONE (RV-05).
+fn swept_live_socket(entry: &supervisor::SweepEntry) -> Option<LiveSocket> {
+    let liveness = match &entry.liveness {
+        Ok(supervisor::Liveness::Gone) => return None,
+        Ok(supervisor::Liveness::Alive(_)) => "ALIVE".to_string(),
+        Ok(supervisor::Liveness::Stale) => "STALE".to_string(),
+        Err(error) => probe_failure(error),
+    };
+    let (launch_id, sidecar_problem) = match &entry.sidecar {
+        Some(sidecar) => {
+            let stale = matches!(entry.liveness, Ok(supervisor::Liveness::Stale));
+            if stale && !stale_group_may_live(&supervisor::backstop::assess(sidecar, None)) {
+                return None;
+            }
+            (sidecar.launch_id.clone(), None)
+        }
+        None => {
+            let pinged = match &entry.liveness {
+                Ok(supervisor::Liveness::Alive(reply)) => Some(reply.launch_id.clone()),
+                _ => None,
+            };
+            let problem = entry.sidecar_error.as_ref().map_or_else(
+                || "is missing".to_string(),
+                |error| format!("is unusable ({error})"),
+            );
+            let id = entry.launch_id_in_name.clone().or(pinged);
+            (id.unwrap_or_else(|| "unknown".to_string()), Some(problem))
+        }
+    };
+    Some(LiveSocket {
+        socket: entry.socket_path.clone(),
+        launch_id,
+        liveness,
+        sidecar_problem,
+    })
+}
+
+/// A probe error as the liveness a refusal names.
+fn probe_failure(error: &supervisor::ProbeError) -> String {
+    format!("probe failed ({}: {error})", probe_error_kind(error))
+}
+
+/// Whether a STALE socket's agent group may still run. Only the three
+/// backstop decisions that prove the group gone (a previous boot, an empty
+/// group, a recycled leader) say no; every refusal, an unprovable identity
+/// (MAC-2), a live leader and any decision added later fail closed (T-50-40).
+fn stale_group_may_live(decision: &supervisor::backstop::BackstopDecision) -> bool {
+    use supervisor::backstop::BackstopDecision;
+    !matches!(
+        decision,
+        BackstopDecision::PreviousBoot
+            | BackstopDecision::EmptyGroup
+            | BackstopDecision::LeaderRecycled
     )
 }
 
-fn resume_live_run_refusal(phase: PhaseId, live: &[(&str, u32)]) -> String {
-    let named = live
+/// The refusal for a state that is missing (`no_state`) or will not load
+/// over a socket directory that cannot be listed: a live run may be named
+/// only by its socket there, so the launch fails closed (50-06 threat flag).
+fn unlistable_socket_dir_refusal(
+    phase: PhaseId,
+    verb: LaunchVerb,
+    (state_file, no_state, dir): (&Path, bool, &Path),
+    why: &str,
+) -> CliError {
+    let label = verb.label();
+    let state = if no_state {
+        format!("there is no state file {}", state_file.display())
+    } else {
+        format!("the state file {} does not load", state_file.display())
+    };
+    CliError::Message(format!(
+        "phase {phase}: {state}, and the supervisor socket directory {} cannot be listed ({why}) \
+         — refusing to {label}; nothing was written\n\
+         A live run of this phase may be named only by its socket there, so {label} fails \
+         closed. Make {} listable by this user (DevFlow creates it mode 0700), then run `{}` again.",
+        dir.display(),
+        dir.display(),
+        verb.rerun(phase)
+    ))
+}
+
+/// The refusal text for [`refuse_launch_over_a_live_run`]. It fires while the
+/// launcher holds the lock: each live socket is named with the `stop` line
+/// that ends it (50-14), and a live agent pid with the identity checks the
+/// operator must make before signalling it.
+fn live_run_refusal(
+    phase: PhaseId,
+    verb: LaunchVerb,
+    sockets: &[LiveSocket],
+    agent: Option<u32>,
+) -> String {
+    let mut named: Vec<String> = sockets
         .iter()
-        .map(|(role, pid)| format!("{role} pid {pid}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let checks = live
-        .iter()
-        .map(|(role, pid)| format!("\n  {role} pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}"))
-        .collect::<String>();
-    let padded = phase.padded();
+        .map(|live| format!("supervisor launch {} {}", live.launch_id, live.liveness))
+        .collect();
+    named.extend(agent.map(|pid| format!("agent pid {pid} alive")));
+    let mut text = format!(
+        "phase {phase}: a run is still live ({}) — refusing to {}; nothing was written",
+        named.join(", "),
+        verb.label()
+    );
+    if !sockets.is_empty() {
+        text.push_str(
+            "\n`devflow stop` ends a supervisor through its socket, whether or not the state \
+             file loads; on a STALE socket it signals the agent group only after proving that \
+             group is this launch's. Run each line below first:",
+        );
+        for live in sockets {
+            text.push_str("\n  ");
+            text.push_str(&live.repair_line(phase));
+        }
+    }
+    if let Some(pid) = agent {
+        text.push('\n');
+        text.push_str(&agent_refusal_guidance(phase, verb, pid));
+    }
+    text.push_str(&format!(
+        "\nOnce every supervisor and process named above is gone, run `{}` again.",
+        verb.rerun(phase)
+    ));
+    text
+}
+
+/// The live-run refusal's paragraph for a live agent its pid file names:
+/// `stop` never signals that pid, so the operator confirms its identity
+/// before signalling it, and a recycled pid has its own repair per verb.
+fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String {
+    let stopped_note = match verb {
+        LaunchVerb::Start => "",
+        LaunchVerb::Resume => {
+            " A state already marked stopped does not mean these processes have exited: \
+             `devflow status` names `devflow resume` for a phase whose supervisor is GONE even \
+             while its agent is still alive, and resume refuses until every named process has \
+             exited."
+        }
+    };
+    let recycled = match verb {
+        LaunchVerb::Start => format!(
+            "If a named pid is live but is not this phase's process (a recycled pid), `start` \
+             refuses again: run `devflow recover --clean --phase {phase}` first, then \
+             `devflow start`."
+        ),
+        LaunchVerb::Resume => format!(
+            "If a named pid is live but is not this phase's process (a recycled pid), `resume` \
+             refuses again, and no DevFlow verb clears a recorded pid while keeping the phase's \
+             work: `devflow recover --clean --phase {phase}` removes the phase state, after \
+             which `resume` has nothing to resume, and `devflow start` refuses while the \
+             phase's worktree or branch exists; `devflow start --force` recreates them from \
+             the base and discards the phase's work."
+        ),
+    };
     format!(
-        "phase {phase}: a run is still live ({named} alive) — refusing to resume; nothing was written\n\
-         No process holds the phase lock right now, so `devflow stop --phase {phase}` would only mark the \
-         state stopped: it signals nothing and does not end this run. stop ends a run through the process \
-         that holds the lock: one parked at a gate, or this run's own `devflow advance` once it takes the \
-         lock after this refusal.\n\
-         A state already marked stopped does not mean these processes have exited. `devflow status` and \
-         `devflow doctor` name `devflow resume` for a phase whose monitor is dead even while its agent is \
-         still alive; resume refuses until every named process has exited.\n\
-         Check each pid before signalling it. `ps -p` shows only the executable name, which cannot tell \
-         phases apart; `-ww` keeps a long command line from being cut at the terminal width:{checks}\n\
-         This phase's monitor is either a `__monitor` process with this project's path and `--phase {phase}` \
-         in its args, or an `sh -c` script that names `.devflow/phase-{padded}-` files and ends in `advance` \
-         with `--phase {phase}`. This phase's agent has that monitor as its parent (`ps -o ppid= -p <pid>`); \
-         an agent whose monitor has exited cannot be tied to this phase that way, so do not signal it on the \
-         pid alone.\n\
-         To end this run now, send SIGTERM to the confirmed monitor first — signalling the agent first lets \
-         the monitor launch the next stage. If the agent has already exited, an `sh` monitor may be running \
-         `devflow advance` as a foreground child: the monitor defers SIGTERM until that child returns, and \
-         the child may take the lock as soon as this resume exits. Find it with \
-         `ps -ww -o pid=,args= --ppid <monitor pid>` and signal that child, not only the monitor.\n\
-         If the named processes have exited, run `devflow resume --phase {phase}` again. If a named pid is \
-         live but is not this phase's process (a recycled pid), `resume` refuses again, and no DevFlow verb \
-         clears a recorded pid while keeping the phase's work: `devflow recover --clean --phase {phase}` \
-         removes the phase state, after which `resume` has nothing to resume, and `devflow start` refuses \
-         while the phase's worktree or branch exists; `devflow start --force` recreates them from the base \
-         and discards the phase's work. Do neither while this phase's processes are live: `recover --clean` \
-         clears state even while an agent runs, and a later `start` would launch a second agent beside it."
+        "The agent pid file names a live process, and `devflow stop` never signals a pid from \
+         the agent pid file.{stopped_note} Check each pid before signalling it. `ps -p` shows \
+         only the executable name, which cannot tell phases apart; `-ww` keeps a long command \
+         line from being cut at the terminal width:\n  \
+         agent pid {pid}: ps -ww -o pid=,lstart=,args= -p {pid}\n\
+         This phase's agent has its supervisor, a `__monitor` process with this project's path \
+         and `--phase {phase}` in its args, as its parent (`ps -o ppid= -p <pid>`); an agent \
+         whose supervisor has exited cannot be tied to this phase that way, so do not signal it \
+         on the pid alone. {recycled} Do neither while this phase's processes are live: \
+         `recover --clean` clears state even while an agent runs, and a later `start` would \
+         launch a second agent beside it."
     )
 }
 
@@ -2729,6 +3708,43 @@ fn print_open_branches(project_root: &Path) {
     }
 }
 
+/// `recover --clean --phase N` is a file cleaner, not a teardown (D-06): it
+/// refuses while the phase's supervisor may still run, by the launch guard's
+/// supervisor rule ([`possibly_live_sockets`]): an ALIVE socket, a STALE one
+/// whose agent group the backstop does not prove gone, or a probe that
+/// fails, found through the state's record, or, when the state is missing or
+/// does not load, through a sweep of this root and phase (which refuses when
+/// the socket directory cannot be listed). The agent pid file is not read.
+/// Nothing is deleted.
+fn refuse_a_live_supervisor(
+    project_root: &Path,
+    phase: PhaseId,
+    cache_dir: Option<&Path>,
+) -> Result<(), CliError> {
+    let state = workflow::load_state(project_root, phase).ok();
+    let sockets = possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir).map_err(
+        |(dir, why)| {
+            CliError::Message(format!(
+                "phase {phase}: the supervisor socket directory {} cannot be listed ({why}), so a \
+                 live supervisor cannot be ruled out — recover --clean deleted nothing",
+                dir.display()
+            ))
+        },
+    )?;
+    if sockets.is_empty() {
+        return Ok(());
+    }
+    let mut text = format!(
+        "phase {phase} has a supervisor that may still run — recover --clean deleted nothing. \
+         Run each line below first:"
+    );
+    for live in &sockets {
+        text.push_str("\n  ");
+        text.push_str(&live.repair_line(phase));
+    }
+    Err(CliError::Message(text))
+}
+
 pub(crate) fn recover_cmd(
     project_root: &Path,
     do_clean: bool,
@@ -2736,9 +3752,12 @@ pub(crate) fn recover_cmd(
 ) -> Result<(), CliError> {
     if do_clean {
         match phase {
-            // Explicit phase: clear it regardless of staleness (14-CR-01's
-            // escape hatch for a wedged-but-fresh run).
+            // Explicit phase: cleaned when its lock holder is dead or its pid
+            // was recycled (a live pid whose start time differs from the one
+            // recorded, 999.128). A live, identity-confirmed holder still
+            // refuses, so a wedged live run needs `devflow stop` first.
             Some(phase) => {
+                refuse_a_live_supervisor(project_root, phase, registry::cache_dir().as_deref())?;
                 let report = match recover::clean_phase_report(project_root, phase) {
                     Ok(report) => report,
                     Err(recover::RecoverError::Lock(lock::LockError::Contended {
@@ -3091,6 +4110,14 @@ fn doctor_checks() -> Vec<Check> {
 
 /// Audit the environment and report what's installed, missing, or broken.
 pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
+    doctor_in(project_root, json, registry::cache_dir().as_deref())
+}
+
+/// [`doctor`] against an explicit cache dir, whose `sock/` directory the
+/// read-only supervisor sweep lists (50-12); `None` (no cache dir can be
+/// resolved) skips the sweep without an error. Split out so tests sweep a
+/// tempdir, never the operator's real cache.
+fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Result<(), CliError> {
     let checks = doctor_checks();
 
     let facts = collect_phase_facts(project_root);
@@ -3100,6 +4127,12 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     // scan, which never signals anything (T-25-62, doctor's read-only
     // contract).
     let stray_findings = collect_stray_process_findings(project_root);
+    // 50-12 (D-06): the read-only socket sweep — orphaned, superseded and
+    // deleted-root supervisors. It removes nothing and signals nothing.
+    let orphans = cache_dir
+        .map(|cache| collect_orphan_supervisors(project_root, cache))
+        .unwrap_or_default();
+    let sweep_unlistable = cache_dir.and_then(socket_dir_unlistable);
 
     if json {
         // WR-01 (18-fix): a single top-level JSON document —
@@ -3113,7 +4146,13 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         // planning-doc check (D-05) and this plan's stray-process finding
         // (999.44) each extend this SAME object with one more key rather
         // than forking a second array.
-        let body = doctor_json_body(&checks, &facts, &doc_findings, &stray_findings);
+        let body = doctor_json_body(
+            &checks,
+            &facts,
+            &doc_findings,
+            &stray_findings,
+            (&orphans, sweep_unlistable.as_deref()),
+        );
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -3139,6 +4178,10 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         print!("{}", render_reconciliation_text(&facts));
         print!("{}", render_planning_doc_text(&doc_findings));
         print!("{}", render_stray_process_text(&stray_findings));
+        print!(
+            "{}",
+            render_orphan_supervisors_text(&orphans, sweep_unlistable.as_deref())
+        );
     }
 
     Ok(())
@@ -3700,11 +4743,13 @@ pub(crate) struct PhaseFacts {
     pub(crate) waiter: lock::HolderStatus,
     pub(crate) agent_pid: Option<u32>,
     pub(crate) agent_alive: bool,
-    /// The monitor pid recorded in `State.monitor_pid` (18b). `None` means
-    /// no monitor has been spawned for this state yet, or the state was
-    /// written by a binary predating the field — never treated as a problem.
-    pub(crate) monitor_pid: Option<u32>,
-    pub(crate) monitor_alive: bool,
+    /// The supervisor's liveness, from one probe of the socket
+    /// `state.supervisor` records (50-12) — never a pid.
+    pub(crate) supervisor: PhaseLiveness,
+    /// The launch id `state.supervisor` records; `None` when no supervisor
+    /// is recorded. It identifies the supervisor in findings in place of its
+    /// socket path (T-18-01).
+    pub(crate) supervisor_launch_id: Option<String>,
     /// The most recent event's `event` field value, for display context.
     pub(crate) last_event: Option<String>,
     /// The `stage` field of the most recent `stage_launched` event; `None`
@@ -3714,8 +4759,8 @@ pub(crate) struct PhaseFacts {
     pub(crate) feature_branch_exists: bool,
     /// Whether this phase was intentionally halted by `devflow start --until
     /// <stage>` (20c) — `State.stopped`. A stopped phase's dead agent
-    /// pid/stale monitor pid are expected, not a crash; both
-    /// `check_dead_agent` and `check_dead_monitor` must recognize this
+    /// pid/exited supervisor are expected, not a crash; both
+    /// `check_dead_agent` and `check_supervisor` must recognize this
     /// marker instead of reporting a `Problem` (review: Codex HIGH — the
     /// doctor gap is bigger than `check_dead_agent` alone).
     pub(crate) stopped: bool,
@@ -3808,28 +4853,38 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
     })
 }
 
-/// The recorded monitor pid is dead — nothing will call `devflow advance`
-/// for this phase, whether or not the agent is also dead (an agent that
-/// outlived its monitor is orphaned too, since nothing will advance it when
-/// it exits either). Reuses `liveness` rather than re-deriving the matrix,
-/// so the two copies can never drift (18b, T-18-11's `Unknown` guard applies
-/// here transitively — an unrecorded monitor is silently `Unknown`, never a
-/// finding).
-fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.stopped
-        || liveness(facts.monitor_pid, facts.monitor_alive, facts.agent_alive) != Liveness::Stuck
-    {
-        return None;
-    }
-    let pid = facts.monitor_pid?;
+/// The supervisor's liveness needs a repair (50-12): STALE (its socket
+/// remains, nothing answers, its agent group may still run), GONE while the
+/// phase is not stopped (nothing will advance it), or a probe that could not
+/// answer. Reuses [`phase_liveness`]'s result from the facts rather than
+/// re-deriving it, so `status` and `doctor` cannot drift. ALIVE, a stopped
+/// GONE and NotLaunched are never findings (T-18-11: an unrecorded
+/// supervisor is never a problem). Identifies the supervisor by phase and
+/// launch id, never by its socket path (T-18-01).
+fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let phase = facts.phase;
+    let repair = match &facts.supervisor {
+        PhaseLiveness::Stale => {
+            format!("devflow stop --phase {phase} && devflow resume --phase {phase}")
+        }
+        PhaseLiveness::GoneWhileActive => format!("devflow resume --phase {phase}"),
+        // `status` prints the operator's own socket path, which doctor
+        // must not.
+        PhaseLiveness::ProbeFailed(_) => "devflow status".to_string(),
+        PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
+            return None;
+        }
+    };
+    let launch = facts.supervisor_launch_id.as_deref().unwrap_or("?");
     Some(PhaseFinding {
-        phase: facts.phase,
+        phase,
         severity: Severity::Problem,
         detail: format!(
-            "phase {}: monitor pid {pid} recorded but not running at stage {}",
-            facts.phase, facts.stage
+            "phase {phase}: supervisor launch {launch} at stage {} is {}",
+            facts.stage,
+            facts.supervisor.describe()
         ),
-        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+        repair: Some(repair),
     })
 }
 
@@ -3884,7 +4939,7 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
         check_open_gate_without_waiter(facts),
         check_orphan_gate(facts),
         check_dead_agent(facts),
-        check_dead_monitor(facts),
+        check_supervisor(facts),
         check_stage_event_drift(facts),
         check_missing_branch(facts),
     ]
@@ -3928,8 +4983,11 @@ fn build_phase_facts(
     let waiter = lock::holder_status(project_root, phase);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
-    let monitor_pid = state.monitor_pid;
-    let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
+    let supervisor = probe_phase(&state);
+    let supervisor_launch_id = state
+        .supervisor
+        .as_ref()
+        .map(|record| record.launch_id.clone());
     let last_event = last_events.remove(&phase).map(|summary| summary.event);
     let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
     let last_event_name = last_event
@@ -3953,8 +5011,8 @@ fn build_phase_facts(
         waiter,
         agent_pid,
         agent_alive,
-        monitor_pid,
-        monitor_alive,
+        supervisor,
+        supervisor_launch_id,
         last_event: last_event_name,
         last_launched_stage,
         open_gate_stages,
@@ -4037,10 +5095,27 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
                     "detail": finding.detail,
                     "repair": finding.repair,
                     "last_event": phase_facts.last_event,
+                    "supervisor": supervisor_json(phase_facts),
                 })
             })
             .collect(),
     )
+}
+
+/// A phase's supervisor facts for `doctor --json` (50-12): its liveness
+/// label, the owner and launch shape an ALIVE ping reported, and the
+/// recorded launch id. Never the socket path (T-18-01, T-50-32).
+fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
+    let (owner, launch) = match &facts.supervisor {
+        PhaseLiveness::Alive { owner, launch } => (Some(owner), Some(launch)),
+        _ => (None, None),
+    };
+    serde_json::json!({
+        "liveness": facts.supervisor.label(),
+        "owner": owner,
+        "launch": launch,
+        "launch_id": facts.supervisor_launch_id,
+    })
 }
 
 /// Build `doctor --json`'s `"environment"` array from the pre-existing
@@ -4073,17 +5148,24 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// [...], "planning_doc_staleness": [...]}` — 21b's addition (D-05) extends
 /// this SAME object with a third key rather than forking a second reporter
 /// or printing a second top-level array.
+/// 50-12 adds `"orphan_supervisors"` (the socket sweep's findings) and
+/// `"orphan_supervisor_sweep_error"` (`null`, or why the socket directory
+/// could not be listed, so an empty array is never mistaken for a clean
+/// sweep).
 fn doctor_json_body(
     checks: &[Check],
     facts: &[PhaseFacts],
     doc_findings: &[PlanningDocFinding],
     stray_findings: &[StrayProcessFinding],
+    (orphans, sweep_unlistable): (&[OrphanSupervisorFinding], Option<&str>),
 ) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
         "reconciliation": render_reconciliation_json(facts),
         "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
         "stray_processes": render_stray_process_findings_json(stray_findings),
+        "orphan_supervisors": render_orphan_supervisors_json(orphans),
+        "orphan_supervisor_sweep_error": sweep_unlistable,
     })
 }
 
@@ -4333,12 +5415,19 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
     }
 }
 
-/// The set of pids that a live registry entry still reaches: every
-/// [`devflow_core::state::State::monitor_pid`] recorded under any of
-/// `roots` (via [`workflow::list_states`]) plus every lock holder pid for
-/// those same roots' phases (via [`lock::holder_identity`]). A pid in this
-/// set is by definition not a stray (CR-01, 25-15-PLAN.md) — a live
-/// registry entry, lock file, or state file still names it.
+/// The set of pids that a live registry entry still reaches: every lock
+/// holder pid for the phases of `roots` (listed via
+/// [`workflow::list_states`], read via [`lock::holder_identity`]). A pid in
+/// this set is by definition not a stray (CR-01, 25-15-PLAN.md) — a live
+/// lock file still names it.
+///
+/// Lock holders only (50-22). A 3.x supervisor needs no entry: the `/proc`
+/// census this set filters ([`agent::discover_stray_devflow_processes`])
+/// matches only the 2.x monitor-wrapper and `devflow advance` argv shapes
+/// and cannot match a supervisor's (50-12, pinned by
+/// `agent::tests::the_stray_census_matches_only_the_2x_process_shapes` and
+/// by `census_never_sees_a_live_supervisor` in the supervisor e2e), so a
+/// supervisor's pid can never reach a reap through this filter.
 ///
 /// Deliberately excludes the per-phase agent pid file: the `/proc` census
 /// this set filters ([`agent::discover_stray_devflow_processes`]) can only
@@ -4353,8 +5442,8 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
 /// read-only path).
 ///
 /// RESIDUAL (T-25-15-08, not eliminated): this is a point-in-time read. A
-/// root registered, or a `monitor_pid` written, between this read and a
-/// caller's later signal is not covered by it. The untouched
+/// root registered, or a lock taken, between this read and a caller's later
+/// signal is not covered by it. The untouched
 /// `agent::is_same_process` identity re-confirmation and
 /// [`agent::STRAY_MIN_AGE`] age floor downstream remain the last line of
 /// defence in that window.
@@ -4369,9 +5458,6 @@ pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
             continue;
         }
         for state in workflow::list_states(root) {
-            if let Some(pid) = state.monitor_pid {
-                reachable.insert(pid);
-            }
             if let Some((pid, _start_time)) = lock::holder_identity(root, state.phase) {
                 reachable.insert(pid);
             }
@@ -4489,6 +5575,13 @@ pub(crate) fn build_stray_process_findings(
 /// into the reachable set via [`unreachable_stray_candidates`] so a project
 /// the machine registry has not recorded still has its own live monitors
 /// protected from being reported as orphans.
+///
+/// The census matches only the two 2.x process shapes (the `sh -c` monitor
+/// wrapper and its `devflow advance` child), which a 3.x binary never
+/// starts, so this finding covers 2.x leftovers only (50-12). A 3.x
+/// supervisor is found through its socket by [`check_supervisor`] and
+/// [`collect_orphan_supervisors`] (which also takes over the deleted-root
+/// class) and ended with `devflow stop --phase N --launch <id>`.
 fn collect_stray_process_findings(project_root: &Path) -> Vec<StrayProcessFinding> {
     build_stray_process_findings(&unreachable_stray_candidates(&[project_root.to_path_buf()]))
 }
@@ -4534,6 +5627,245 @@ fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
     out
 }
 
+/// One supervisor socket `doctor`'s read-only sweep reports (50-12, D-06).
+pub(crate) struct OrphanSupervisorFinding {
+    /// The path-free finding: detail and `devflow stop --phase N --launch
+    /// <id>` repair.
+    pub(crate) finding: PhaseFinding,
+    /// The launch id that addresses exactly this socket.
+    pub(crate) launch_id: String,
+    /// `alive` or `stale`.
+    pub(crate) liveness: &'static str,
+    /// Whether the project root the socket names still exists. `true` for a
+    /// sidecar-less socket, which is attributed to this (existing) root.
+    pub(crate) root_exists: bool,
+}
+
+/// Every ALIVE or STALE supervisor socket under `cache_dir` that nothing
+/// claims (50-12, D-06): (1) this root's sockets whose phase has no loadable
+/// state, or whose state records no supervisor or another launch
+/// (superseded); (2) machine-wide, sockets whose sidecar names a project
+/// root that no longer exists (the 999.44 deleted-root class the 2.x `/proc`
+/// census used to cover); (3) (R5-I3) sockets of this root whose sidecar is
+/// missing or does not parse, attributed by file name through
+/// [`supervisor::sweep_for_in`] so 50-06's digest rule stays in one place.
+///
+/// Not listed, by design: a socket named outside the 50-05 scheme (it
+/// carries no launch id, so no verb addresses it), and a sidecar-less socket
+/// of a deleted root (only the digest survives, so nothing attributes it).
+///
+/// Read-only (D-06, T-50-31): it sweeps, probes and loads state, and removes
+/// nothing and signals nothing. Every finding's repair is `devflow stop
+/// --phase N --launch <id>` (50-14), never the bare stop, which addresses
+/// the state's own record and would stop a live successor (T-50-51).
+fn collect_orphan_supervisors(
+    project_root: &Path,
+    cache_dir: &Path,
+) -> Vec<OrphanSupervisorFinding> {
+    let mut findings = Vec::new();
+    for entry in supervisor::sweep_in(cache_dir) {
+        let liveness = match &entry.liveness {
+            Ok(supervisor::Liveness::Alive(_)) => "alive",
+            Ok(supervisor::Liveness::Stale) => "stale",
+            _ => continue,
+        };
+        if let Some(sidecar) = &entry.sidecar {
+            // A root that cannot be examined counts as present: only a
+            // proven-missing root is the deleted-root class.
+            let root_exists = sidecar.project_root.try_exists().unwrap_or(true);
+            let reason = if !root_exists {
+                Some(OrphanReason::RootDeleted)
+            } else if sidecar.project_root == project_root {
+                unclaimed_by_state(project_root, sidecar.phase, &sidecar.launch_id)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let launch = (sidecar.phase, sidecar.launch_id.as_str());
+                findings.push(orphan_finding(launch, liveness, root_exists, &reason));
+            }
+            continue;
+        }
+        // R5-I3: no usable sidecar, so the file name is the only address.
+        let (Some(launch_id), Some(phase)) = (
+            entry.launch_id_in_name.as_deref(),
+            phase_in_socket_name(&entry.socket_path),
+        ) else {
+            continue;
+        };
+        let ours = supervisor::sweep_for_in(cache_dir, project_root, phase)
+            .iter()
+            .any(|candidate| candidate.socket_path == entry.socket_path);
+        let Some(unclaimed) = ours
+            .then(|| unclaimed_by_state(project_root, phase, launch_id))
+            .flatten()
+        else {
+            continue;
+        };
+        let reason = OrphanReason::NoUsableSidecar {
+            broken: entry.sidecar_error.is_some(),
+            unclaimed: Box::new(unclaimed),
+        };
+        findings.push(orphan_finding((phase, launch_id), liveness, true, &reason));
+    }
+    findings
+}
+
+/// Why [`collect_orphan_supervisors`] lists a socket.
+enum OrphanReason {
+    /// This root's phase has no state file.
+    NoState,
+    /// This root's phase has a state file that does not load.
+    StateUnloadable,
+    /// The phase's state records no supervisor.
+    NoRecord,
+    /// The phase's state records another launch (the R-10 aftermath).
+    Superseded,
+    /// The sidecar names a project root that no longer exists.
+    RootDeleted,
+    /// The sidecar is missing (`broken: false`) or does not parse, and the
+    /// state does not claim the launch for `unclaimed`'s reason.
+    NoUsableSidecar {
+        broken: bool,
+        unclaimed: Box<OrphanReason>,
+    },
+}
+
+impl OrphanReason {
+    /// Path-free text for the finding's detail (T-18-01).
+    fn describe(&self) -> String {
+        match self {
+            OrphanReason::NoState => "its phase has no state".to_string(),
+            OrphanReason::StateUnloadable => "its phase's state does not load".to_string(),
+            OrphanReason::NoRecord => "its phase's state records no supervisor".to_string(),
+            OrphanReason::Superseded => {
+                "its phase's state records another launch (superseded)".to_string()
+            }
+            OrphanReason::RootDeleted => "its project root no longer exists".to_string(),
+            OrphanReason::NoUsableSidecar { broken, unclaimed } => format!(
+                "its sidecar {}, and {}",
+                if *broken {
+                    "does not parse"
+                } else {
+                    "is missing"
+                },
+                unclaimed.describe()
+            ),
+        }
+    }
+}
+
+/// Whether this root's state for `phase` claims `launch_id`; the reason
+/// when it does not. Reads the state file only.
+fn unclaimed_by_state(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+) -> Option<OrphanReason> {
+    match workflow::load_state(project_root, phase) {
+        Err(workflow::WorkflowError::MissingState(_)) => Some(OrphanReason::NoState),
+        Err(_) => Some(OrphanReason::StateUnloadable),
+        Ok(state) => match state.supervisor {
+            None => Some(OrphanReason::NoRecord),
+            Some(record) if record.launch_id != launch_id => Some(OrphanReason::Superseded),
+            Some(_) => None,
+        },
+    }
+}
+
+/// The phase segment of a socket file name in the 50-05 scheme
+/// (`<016x digest>-<padded phase>-<launch id>.sock`): the text between the
+/// first and second `-`. `None` when it does not parse as a phase.
+fn phase_in_socket_name(socket: &Path) -> Option<PhaseId> {
+    let stem = socket.file_stem()?.to_str()?;
+    stem.split('-').nth(1)?.parse().ok()
+}
+
+/// One orphan finding for `(phase, launch_id)`, path-free, with the
+/// `--launch` repair that tears down exactly that socket.
+fn orphan_finding(
+    (phase, launch_id): (PhaseId, &str),
+    liveness: &'static str,
+    root_exists: bool,
+    reason: &OrphanReason,
+) -> OrphanSupervisorFinding {
+    OrphanSupervisorFinding {
+        finding: PhaseFinding {
+            phase,
+            severity: Severity::Problem,
+            detail: format!(
+                "phase {phase}: supervisor launch {launch_id} is {} but {}",
+                liveness.to_uppercase(),
+                reason.describe()
+            ),
+            repair: Some(format!("devflow stop --phase {phase} --launch {launch_id}")),
+        },
+        launch_id: launch_id.to_string(),
+        liveness,
+        root_exists,
+    }
+}
+
+/// Whether doctor's socket sweep could look (50-12): `None` when the socket
+/// directory is absent or listable, else why it cannot be listed.
+/// [`supervisor::sweep_in`] answers an unlistable directory with no entries,
+/// so without this check doctor would report "nothing" when it saw nothing.
+fn socket_dir_unlistable(cache_dir: &Path) -> Option<String> {
+    match std::fs::read_dir(registry::socket_dir_in(cache_dir)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Some(error.kind().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Build `doctor --json`'s `"orphan_supervisors"` array (50-12).
+fn render_orphan_supervisors_json(findings: &[OrphanSupervisorFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|orphan| {
+                serde_json::json!({
+                    "phase": orphan.finding.phase,
+                    "launch_id": orphan.launch_id,
+                    "liveness": orphan.liveness,
+                    "root_exists": orphan.root_exists,
+                    "severity": orphan.finding.severity.label(),
+                    "detail": orphan.finding.detail,
+                    "repair": orphan.finding.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor`'s text section for the socket sweep (50-12). Like
+/// [`render_stray_process_text`] it prints nothing when there is nothing to
+/// report, but a socket directory it could not list is reported, never
+/// shown as "nothing".
+fn render_orphan_supervisors_text(
+    findings: &[OrphanSupervisorFinding],
+    unlistable: Option<&str>,
+) -> String {
+    if findings.is_empty() && unlistable.is_none() {
+        return String::new();
+    }
+    let mut out = String::from("\nsupervisor sockets no state claims:\n");
+    if let Some(why) = unlistable {
+        out.push_str(&format!(
+            "  warn: the socket directory could not be listed ({why}); its sockets are not \
+             reported\n"
+        ));
+    }
+    for orphan in findings {
+        out.push_str(&format!("  {}\n", orphan.finding.detail));
+        if let Some(repair) = &orphan.finding.repair {
+            out.push_str(&format!("    repair: {repair}\n"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4553,6 +5885,13 @@ mod tests {
             !gone.contains("will pick this up"),
             "no-holder message: {gone}"
         );
+    }
+
+    /// [`stop`] for a root with no state file, whose socket search would
+    /// otherwise sweep the operator's real cache: an empty tempdir cache.
+    fn stop_with_an_empty_cache(root: &Path, phase: PhaseId) -> Result<(), CliError> {
+        let cache = tempfile::tempdir().unwrap();
+        stop_in(root, phase, Some(cache.path()))
     }
 
     #[test]
@@ -5450,30 +6789,91 @@ mod tests {
         assert!(default_logs_phase(dir.path()).is_err());
     }
 
-    /// 18b: a state with no recorded monitor is never reported as stuck,
-    /// regardless of the (unreliable, since no monitor was ever recorded)
-    /// liveness bits passed alongside it.
-    #[test]
-    fn liveness_unknown_when_no_monitor_recorded() {
-        assert_eq!(liveness(None, false, false), Liveness::Unknown);
-        assert_eq!(liveness(None, false, true), Liveness::Unknown);
-        assert_eq!(liveness(None, true, false), Liveness::Unknown);
-        assert_eq!(liveness(None, true, true), Liveness::Unknown);
+    /// A ping reply as a supervisor sends it; built through serde because
+    /// `PingReply` is `#[non_exhaustive]`.
+    fn ping_reply(owner: &str, launch: &str) -> devflow_core::supervisor::protocol::PingReply {
+        serde_json::from_value(serde_json::json!({
+            "launch_id": "0123456789abcdef",
+            "phase": "7",
+            "stage": "code",
+            "launch": launch,
+            "owner": owner,
+            "agent_pid": 10,
+            "agent_pgid": 10,
+            "agent_start_time": 20,
+            "boot_id": null,
+            "supervisor_pid": 11,
+        }))
+        .expect("a complete ping reply")
     }
 
-    /// 18b: the full four-row matrix for a recorded monitor pid. A dead
-    /// agent with a dead monitor OR a live monitor with a dead agent are
-    /// different states — only the former is `Stuck` (nothing will call
-    /// `devflow advance`); the latter is a normal between-stages moment. An
-    /// agent that outlived its monitor is also `Stuck` — orphaned, since
-    /// nothing will advance it when it exits either.
+    /// 50-12: the pure mapping over every probe outcome, with and without
+    /// `stopped`. Each row of one `stopped` value is a distinct answer, and
+    /// GONE splits by `stopped`: an abandoned active phase is not a stopped
+    /// one.
     #[test]
-    fn liveness_matrix_covers_all_four_rows() {
-        let pid = Some(4242);
-        assert_eq!(liveness(pid, true, true), Liveness::Healthy);
-        assert_eq!(liveness(pid, true, false), Liveness::BetweenStages);
-        assert_eq!(liveness(pid, false, false), Liveness::Stuck);
-        assert_eq!(liveness(pid, false, true), Liveness::Stuck);
+    fn liveness_matrix_covers_every_probe_outcome() {
+        use devflow_core::supervisor::{Liveness as Probe, ProbeError};
+        let record = devflow_core::state::SupervisorRecord::new(
+            PathBuf::from("/cache/sock/x.sock"),
+            "0123456789abcdef".to_string(),
+            10,
+            20,
+            "boot".to_string(),
+        );
+        for stopped in [false, true] {
+            let rows = [
+                phase_liveness(None, None, stopped),
+                phase_liveness(Some(&record), Some(Ok(Probe::Gone)), stopped),
+                phase_liveness(Some(&record), Some(Ok(Probe::Stale)), stopped),
+                phase_liveness(
+                    Some(&record),
+                    Some(Ok(Probe::Alive(ping_reply("agent_running", "stream")))),
+                    stopped,
+                ),
+                phase_liveness(
+                    Some(&record),
+                    Some(Err(ProbeError::NoReply("timed out".to_string()))),
+                    stopped,
+                ),
+            ];
+            assert_eq!(rows[0], PhaseLiveness::NotLaunched, "stopped={stopped}");
+            let gone = if stopped {
+                PhaseLiveness::Gone
+            } else {
+                PhaseLiveness::GoneWhileActive
+            };
+            assert_eq!(rows[1], gone, "stopped={stopped}");
+            assert_eq!(rows[2], PhaseLiveness::Stale, "stopped={stopped}");
+            assert_eq!(
+                rows[3],
+                PhaseLiveness::Alive {
+                    owner: "agent_running".to_string(),
+                    launch: "stream".to_string(),
+                },
+                "stopped={stopped}"
+            );
+            match &rows[4] {
+                PhaseLiveness::ProbeFailed(why) => assert!(
+                    why.contains("no valid ping reply") && !why.contains('/'),
+                    "a path-free probe failure, got {why:?}"
+                ),
+                other => panic!("a probe error must be ProbeFailed, got {other:?}"),
+            }
+            for (at, row) in rows.iter().enumerate() {
+                for other in &rows[at + 1..] {
+                    assert_ne!(
+                        row, other,
+                        "stopped={stopped}: two outcomes share one answer"
+                    );
+                }
+            }
+        }
+        assert_ne!(
+            phase_liveness(Some(&record), Some(Ok(Probe::Gone)), true),
+            phase_liveness(Some(&record), Some(Ok(Probe::Gone)), false),
+            "GONE while stopped must differ from GONE while active"
+        );
     }
 
     /// 18b: a corrupt pid (0, or above `i32::MAX`) must never read as alive
@@ -5486,10 +6886,10 @@ mod tests {
         assert!(!agent::agent_running(u32::MAX));
     }
 
-    /// 18b: persisting `monitor_pid` for one phase must not disturb a
-    /// concurrently-active sibling phase's `monitor_pid` (concurrency edge).
+    /// 18b: persisting the supervisor record for one phase must not disturb
+    /// a concurrently-active sibling phase's record (concurrency edge).
     #[test]
-    fn monitor_pid_persisted_for_one_phase_does_not_disturb_a_sibling() {
+    fn supervisor_record_persisted_for_one_phase_does_not_disturb_a_sibling() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -5499,7 +6899,14 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        phase7.monitor_pid = Some(111);
+        let record7 = devflow_core::state::SupervisorRecord::new(
+            root.join("seven.sock"),
+            "seven00000000000".to_string(),
+            111,
+            1,
+            String::new(),
+        );
+        phase7.supervisor = Some(record7.clone());
         workflow::save_state(&phase7).unwrap();
 
         let mut phase8 = State::new(
@@ -5508,28 +6915,41 @@ mod tests {
             Mode::Auto,
             root.to_path_buf(),
         );
-        phase8.monitor_pid = Some(222);
+        let record8 = devflow_core::state::SupervisorRecord::new(
+            root.join("eight.sock"),
+            "eight00000000000".to_string(),
+            222,
+            2,
+            String::new(),
+        );
+        phase8.supervisor = Some(record8.clone());
         workflow::save_state(&phase8).unwrap();
 
         let reloaded7 = workflow::load_state(root, PhaseId::new(7)).unwrap();
         let reloaded8 = workflow::load_state(root, PhaseId::new(8)).unwrap();
-        assert_eq!(reloaded7.monitor_pid, Some(111));
-        assert_eq!(reloaded8.monitor_pid, Some(222));
+        assert_eq!(reloaded7.supervisor, Some(record7));
+        assert_eq!(reloaded8.supervisor, Some(record8));
     }
 
     /// 18b (idempotency edge): running `devflow status` twice must produce
-    /// byte-identical `.devflow/` state — the new monitor liveness probe is
+    /// byte-identical `.devflow/` state — the supervisor liveness probe is
     /// purely a read, same as the existing agent liveness probe it sits
-    /// beside. Also exercises the `u32::MAX` boundary pid (precision edge,
-    /// via `agent::agent_running`'s existing hardening) so the probe can
-    /// only ever report `Stuck`, never a false `Healthy`.
+    /// beside. The planted record names a socket that does not exist and the
+    /// `u32::MAX` boundary agent group (precision edge), so the probe can
+    /// only read it GONE, never a false ALIVE.
     #[test]
     fn status_reading_monitor_liveness_writes_no_state_and_no_event() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(66);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.monitor_pid = Some(u32::MAX);
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            root.join("never-bound.sock"),
+            "statusidem000000".to_string(),
+            u32::MAX,
+            1,
+            String::new(),
+        ));
         workflow::save_state(&state).unwrap();
 
         let state_path = workflow::state_path(root, phase);
@@ -6152,7 +7572,7 @@ mod tests {
              stop_via_lock's identity guard treats as unconfirmable"
         );
 
-        let err = stop(root, phase)
+        let err = stop_with_an_empty_cache(root, phase)
             .expect_err("a legacy lock with no recorded start time must be refused");
         let message = err.to_string();
         assert!(
@@ -6196,7 +7616,8 @@ mod tests {
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
 
-        let err = stop(root, phase).expect_err("a start-time mismatch must be refused");
+        let err = stop_with_an_empty_cache(root, phase)
+            .expect_err("a start-time mismatch must be refused");
         let message = err.to_string();
         assert!(
             message.contains(&pid.to_string()),
@@ -6246,7 +7667,7 @@ mod tests {
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
 
-        let result = stop(root, phase);
+        let result = stop_with_an_empty_cache(root, phase);
 
         let _ = child.kill();
         let _ = child.wait();
@@ -6278,24 +7699,6 @@ mod tests {
         stop(root, phase).expect("stop against a stale lock must succeed, not error");
     }
 
-    /// T-23-51: a live `monitor_pid` recorded in `State` — with no open gate
-    /// and no lock file — must never be treated as a signalling target.
-    /// `stop` only ever looks at the lock file.
-    #[test]
-    fn stop_never_treats_monitor_pid_as_a_signalling_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(203);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.monitor_pid = Some(std::process::id());
-        workflow::save_state(&state).unwrap();
-
-        stop(root, phase).expect(
-            "stop must succeed — a recorded monitor_pid alone must never be signalled or \
-             treated as a blocker",
-        );
-    }
-
     /// Task 3 behavior: no open gate, no lock file, and no persisted state
     /// at all — a phase that was never started — is a successful no-op.
     #[test]
@@ -6303,7 +7706,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        stop(root, PhaseId::new(201)).expect("stop against nothing present must succeed");
+        stop_with_an_empty_cache(root, PhaseId::new(201))
+            .expect("stop against nothing present must succeed");
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the
@@ -6832,11 +8236,13 @@ mod tests {
         assert!(row.contains('?'), "row must render the unknown age: {row}");
     }
 
-    /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
-    /// additionally an `advance` hint when the phase is gate-pending
-    /// (answer the gate, then advance), and nothing for a non-stuck phase.
+    /// 21a / 50-12: `recovery_hints` returns a `resume` hint for a phase
+    /// whose supervisor is GONE while it is not stopped, additionally an
+    /// `advance` hint when the phase is gate-pending (answer the gate, then
+    /// advance), `stop` then `resume` for a STALE socket, and nothing for an
+    /// ALIVE, stopped or unlaunched phase.
     #[test]
-    fn recovery_hints_includes_resume_for_stuck() {
+    fn recovery_hints_includes_resume_for_gone_while_active() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
             PhaseId::new(7),
@@ -6845,13 +8251,13 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        let hints = recovery_hints(&state, Liveness::Stuck);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
 
     #[test]
-    fn recovery_hints_includes_advance_when_stuck_and_gate_pending() {
+    fn recovery_hints_includes_advance_when_gone_while_active_and_gate_pending() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::new(
             PhaseId::new(7),
@@ -6861,7 +8267,7 @@ mod tests {
         );
         state.gate_pending = true;
 
-        let hints = recovery_hints(&state, Liveness::Stuck);
+        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
         assert_eq!(
             hints,
@@ -6873,7 +8279,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_hints_empty_for_healthy() {
+    fn recovery_hints_names_stop_then_resume_for_stale() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
             PhaseId::new(7),
@@ -6882,7 +8288,35 @@ mod tests {
             dir.path().to_path_buf(),
         );
 
-        assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::Stale),
+            vec![
+                "devflow stop --phase 7".to_string(),
+                "devflow resume --phase 7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_hints_empty_for_alive_stopped_and_unlaunched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        let alive = PhaseLiveness::Alive {
+            owner: "agent_running".to_string(),
+            launch: "stream".to_string(),
+        };
+
+        for liveness in [alive, PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+            assert!(
+                recovery_hints(&state, &liveness).is_empty(),
+                "{liveness:?} needs no repair"
+            );
+        }
     }
 
     /// 21a / 999.30 IN-01: the shared one-pass event summary's
@@ -6930,7 +8364,7 @@ mod tests {
             root,
             PhaseId::new(7),
             "stage_launched",
-            serde_json::json!({"stage": "code", "agent": "claude", "monitor_pid": 1}),
+            serde_json::json!({"stage": "code", "agent": "claude", "supervisor_pid": 1}),
         );
         // events::emit always stamps `ts` with the current time; rewrite it
         // to a fixed, known-past value so the assertion is deterministic
@@ -6970,12 +8404,646 @@ mod tests {
         );
     }
 
+    /// Run `body` on a new thread without `CAP_DAC_OVERRIDE` and
+    /// `CAP_DAC_READ_SEARCH` in its effective set (WINDOWS.md #19). Either
+    /// lets uid 0 list a mode-0o000 directory, so the pinned container (root)
+    /// could not produce an unlistable socket directory; without them root is
+    /// refused like any other owner. Capabilities are per-thread and
+    /// `capset(2)` changes only the calling thread's, so the harness keeps
+    /// its own, and they end with the thread. A non-root thread holds neither
+    /// capability, so nothing changes there.
+    fn without_dac_override<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    drop_dac_override_on_this_thread();
+                    body()
+                })
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    /// Clear `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` from the calling
+    /// thread's effective capability set; the permitted set is kept.
+    #[cfg(target_os = "linux")]
+    fn drop_dac_override_on_this_thread() {
+        // `<linux/capability.h>`, version 3: one header, two data structs.
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: libc::c_int,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+        const CAP_DAC_OVERRIDE: u32 = 1;
+        const CAP_DAC_READ_SEARCH: u32 = 2;
+
+        let mut header = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: `header` and `data` have capget(2)'s version-3 layout (one
+        // header, two data structs); pid 0 is the calling thread.
+        let got = unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) };
+        assert_eq!(got, 0, "capget: {}", std::io::Error::last_os_error());
+        data[0].effective &= !((1 << CAP_DAC_OVERRIDE) | (1 << CAP_DAC_READ_SEARCH));
+        // SAFETY: as above; capset(2) with pid 0 changes only this thread.
+        let set = unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr()) };
+        assert_eq!(set, 0, "capset: {}", std::io::Error::last_os_error());
+    }
+
+    /// No per-thread capabilities to drop off Linux: there a root run still
+    /// lists a 0o000 directory, and the tests that use this fail their own
+    /// precondition rather than pass without asserting.
+    #[cfg(not(target_os = "linux"))]
+    fn drop_dac_override_on_this_thread() {}
+
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
     /// builds a `PhaseFacts` directly — no repository, no I/O — proving
     /// `reconcile_phase` is a predicate over facts alone.
     #[cfg(test)]
     mod doctor_reconciliation {
         use super::*;
+
+        /// The launch id every fixture's supervisor record carries.
+        const SUPERVISOR_LAUNCH_ID: &str = "0123456789abcdef";
+
+        /// Every string anywhere inside `value`.
+        fn strings_in(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => out.push(text.clone()),
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| strings_in(item, out));
+                }
+                serde_json::Value::Object(map) => {
+                    map.values().for_each(|item| strings_in(item, out));
+                }
+                _ => {}
+            }
+        }
+
+        /// 50-12: a STALE supervisor, one GONE while its phase is not
+        /// stopped, and a failed probe are each a `Problem` naming the
+        /// launch, never its socket path; STALE's repair stops then resumes,
+        /// GONE's resumes, and a failed probe points at `devflow status`
+        /// (which prints the operator's own socket path).
+        #[test]
+        fn check_supervisor_reports_stale_and_gone_while_active() {
+            let stale = check_supervisor(&PhaseFacts {
+                supervisor: PhaseLiveness::Stale,
+                ..agreeing_facts(PhaseId::new(21))
+            })
+            .expect("a STALE supervisor is a finding");
+            assert_eq!(stale.severity, Severity::Problem);
+            assert_eq!(
+                stale.repair.as_deref(),
+                Some("devflow stop --phase 21 && devflow resume --phase 21")
+            );
+            assert!(
+                stale.detail.contains("STALE") && stale.detail.contains(SUPERVISOR_LAUNCH_ID),
+                "{}",
+                stale.detail
+            );
+
+            let gone = check_supervisor(&PhaseFacts {
+                supervisor: PhaseLiveness::GoneWhileActive,
+                ..agreeing_facts(PhaseId::new(22))
+            })
+            .expect("GONE while active is a finding");
+            assert_eq!(gone.severity, Severity::Problem);
+            assert_eq!(gone.repair.as_deref(), Some("devflow resume --phase 22"));
+            assert!(gone.detail.contains("GONE"), "{}", gone.detail);
+
+            let record = devflow_core::state::SupervisorRecord::new(
+                PathBuf::from("/home/someone/.cache/devflow/sock/x.sock"),
+                SUPERVISOR_LAUNCH_ID.to_string(),
+                10,
+                20,
+                "boot".to_string(),
+            );
+            let failed = phase_liveness(
+                Some(&record),
+                Some(Err(devflow_core::supervisor::ProbeError::NotASocket(
+                    record.socket_path.clone(),
+                ))),
+                false,
+            );
+            let failed = check_supervisor(&PhaseFacts {
+                supervisor: failed,
+                ..agreeing_facts(PhaseId::new(23))
+            })
+            .expect("a failed probe is a finding");
+            assert_eq!(failed.severity, Severity::Problem);
+            assert!(
+                failed.detail.contains("not a socket") && !failed.detail.contains('/'),
+                "a failed probe names its kind and no path: {}",
+                failed.detail
+            );
+            assert_eq!(failed.repair.as_deref(), Some("devflow status"));
+
+            let reconciled = reconcile_phase(&PhaseFacts {
+                supervisor: PhaseLiveness::Stale,
+                ..agreeing_facts(PhaseId::new(21))
+            });
+            assert!(
+                reconciled.iter().any(|f| f.detail == stale.detail),
+                "reconcile_phase runs check_supervisor"
+            );
+        }
+
+        /// 50-12 control: ALIVE, GONE while stopped, and NotLaunched are not
+        /// findings, so the checks above can only fire for the three states
+        /// that need a repair.
+        #[test]
+        fn check_supervisor_is_silent_when_alive_or_stopped() {
+            let alive = agreeing_facts(PhaseId::new(24));
+            assert!(check_supervisor(&alive).is_none());
+            assert!(reconcile_phase(&alive).is_empty());
+            let stopped = PhaseFacts {
+                supervisor: PhaseLiveness::Gone,
+                stopped: true,
+                ..agreeing_facts(PhaseId::new(25))
+            };
+            assert!(check_supervisor(&stopped).is_none());
+            let unlaunched = PhaseFacts {
+                supervisor: PhaseLiveness::NotLaunched,
+                supervisor_launch_id: None,
+                ..agreeing_facts(PhaseId::new(26))
+            };
+            assert!(check_supervisor(&unlaunched).is_none());
+        }
+
+        /// 50-12 (T-50-32): `doctor --json` phase facts carry the
+        /// supervisor's liveness, owner, launch and launch id, and no string
+        /// in the reconciliation section holds a path.
+        #[test]
+        fn doctor_json_reports_supervisor_liveness_without_paths() {
+            let record = devflow_core::state::SupervisorRecord::new(
+                PathBuf::from("/home/someone/.cache/devflow/sock/x.sock"),
+                SUPERVISOR_LAUNCH_ID.to_string(),
+                10,
+                20,
+                "boot".to_string(),
+            );
+            let failed = phase_liveness(
+                Some(&record),
+                Some(Err(devflow_core::supervisor::ProbeError::NotASocket(
+                    record.socket_path.clone(),
+                ))),
+                false,
+            );
+            let facts = vec![
+                agreeing_facts(PhaseId::new(27)),
+                PhaseFacts {
+                    supervisor: failed,
+                    ..agreeing_facts(PhaseId::new(28))
+                },
+            ];
+            let body = render_reconciliation_json(&facts);
+            let entries = body.as_array().expect("an array");
+            let alive = &entries[0]["supervisor"];
+            assert_eq!(alive["liveness"], "alive", "{body}");
+            assert_eq!(alive["owner"], "agent_running", "{body}");
+            assert_eq!(alive["launch"], "stream", "{body}");
+            assert_eq!(alive["launch_id"], SUPERVISOR_LAUNCH_ID, "{body}");
+            let failed = &entries
+                .iter()
+                .find(|entry| entry["phase"] == 28)
+                .expect("phase 28's finding")["supervisor"];
+            assert_eq!(failed["liveness"], "probe_failed", "{body}");
+            assert!(failed["owner"].is_null(), "{body}");
+            let mut strings = Vec::new();
+            strings_in(&body, &mut strings);
+            assert!(!strings.is_empty(), "the scan must see strings: {body}");
+            assert!(
+                strings.iter().all(|text| !text.contains('/')),
+                "no string in the reconciliation section may hold a path: {strings:?}"
+            );
+        }
+
+        /// A short cache dir directly under `/tmp`, so every socket path
+        /// below it fits `sun_path`.
+        fn short_cache() -> tempfile::TempDir {
+            tempfile::Builder::new()
+                .prefix("dfs")
+                .tempdir_in("/tmp")
+                .expect("create a short cache dir under /tmp")
+        }
+
+        /// Publish the socket for `(root, phase, launch_id)` under `cache`.
+        /// Dropping the returned listener leaves the socket STALE.
+        fn publish_launch(
+            cache: &Path,
+            root: &Path,
+            phase: u32,
+            launch_id: &str,
+        ) -> (supervisor::SocketPath, std::os::unix::net::UnixListener) {
+            let socket =
+                supervisor::SocketPath::for_launch(cache, root, PhaseId::new(phase), launch_id)
+                    .expect("socket path fits sun_path");
+            let listener = supervisor::publish(&socket).expect("publish the socket");
+            (socket, listener)
+        }
+
+        /// A complete sidecar for `(root, phase, launch_id)`, as a supervisor
+        /// writes it.
+        fn write_sidecar_for(socket: &supervisor::SocketPath, root: &Path, phase: u32, id: &str) {
+            let sidecar = serde_json::json!({
+                "launch_id": id,
+                "project_root": root,
+                "phase": PhaseId::new(phase),
+                "stage": "code",
+                "agent": "claude",
+                "launch": "stream",
+                "agent_pid": 1,
+                "agent_pgid": 1,
+                "agent_start_time": 0,
+                "boot_id": "boot",
+                "supervisor_pid": 1,
+                "supervisor_start_time": 0,
+                "created_at": "2026-10-17T00:00:00Z",
+            });
+            std::fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
+            supervisor::read_sidecar(&socket.sidecar_path()).expect("the planted sidecar parses");
+        }
+
+        /// A loadable state for `phase` whose supervisor record carries
+        /// `launch_id`.
+        fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
+            let mut state = State::new(
+                PhaseId::new(phase),
+                AgentKind::Claude,
+                Mode::Auto,
+                root.to_path_buf(),
+            );
+            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                PathBuf::from("/elsewhere.sock"),
+                launch_id.to_string(),
+                1,
+                0,
+                "boot".to_string(),
+            ));
+            workflow::save_state(&state).unwrap();
+        }
+
+        /// Answers every ping on `listener` as a supervisor would, until
+        /// [`PingResponder::stop`].
+        struct PingResponder {
+            done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            socket: PathBuf,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl PingResponder {
+            fn start(
+                socket: &supervisor::SocketPath,
+                listener: std::os::unix::net::UnixListener,
+                launch_id: &str,
+                phase: u32,
+            ) -> Self {
+                use std::io::{BufRead as _, Write as _};
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let reply = serde_json::json!({
+                    "ok": true,
+                    "launch_id": launch_id,
+                    "phase": phase.to_string(),
+                    "stage": "code",
+                    "launch": "stream",
+                    "owner": "agent_running",
+                    "agent_pid": 1,
+                    "agent_pgid": 1,
+                    "agent_start_time": 0,
+                    "boot_id": null,
+                    "supervisor_pid": 1,
+                });
+                let stop = std::sync::Arc::clone(&done);
+                let thread = std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(stream) = stream else { continue };
+                        let mut line = String::new();
+                        if std::io::BufReader::new(&stream)
+                            .read_line(&mut line)
+                            .is_ok()
+                        {
+                            let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+                        }
+                    }
+                });
+                Self {
+                    done,
+                    socket: socket.as_path().to_path_buf(),
+                    thread: Some(thread),
+                }
+            }
+
+            fn stop(&mut self) {
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Wake the blocked accept so the thread sees the flag.
+                let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+                if let Some(thread) = self.thread.take() {
+                    thread.join().expect("the ping responder thread");
+                }
+            }
+        }
+
+        impl Drop for PingResponder {
+            fn drop(&mut self) {
+                self.stop();
+            }
+        }
+
+        /// Every file under `dir` as (name, length, mtime), sorted.
+        fn snapshot(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .expect("list the socket dir")
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        meta.len(),
+                        meta.modified().unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        }
+
+        /// 50-12 (D-06, R5-I3, T-50-31, T-50-51, T-50-84): doctor's sweep
+        /// lists the ALIVE and STALE sockets that no loadable state of this
+        /// root claims — no state, an unparsable state, a superseded launch,
+        /// a missing or broken sidecar attributed by file name — and,
+        /// machine-wide, those whose project root is gone. Each names the
+        /// `--launch` teardown, never the bare stop. Another root's sockets
+        /// and the ones a state claims are not listed, and nothing under
+        /// `sock/` changes.
+        #[test]
+        fn doctor_reports_an_orphan_socket_without_removing_it() {
+            let cache = short_cache();
+            let cache = cache.path();
+            let repo = tempfile::tempdir().unwrap();
+            let root = repo.path();
+            let other = tempfile::tempdir().unwrap();
+            let other_root = other.path();
+            let deleted = tempfile::tempdir().unwrap();
+            let deleted_root = deleted.path().to_path_buf();
+
+            // (a) STALE, sidecar for phase 7, whose state file is corrupt.
+            let (a, _) = publish_launch(cache, root, 7, "aaaa0000aaaa0007");
+            write_sidecar_for(&a, root, 7, "aaaa0000aaaa0007");
+            let state7 = workflow::state_path(root, PhaseId::new(7));
+            std::fs::create_dir_all(state7.parent().unwrap()).unwrap();
+            std::fs::write(&state7, "{").unwrap();
+            // (b) STALE, superseded: phase 8's state names its successor.
+            let (b, _) = publish_launch(cache, root, 8, "aaaa0000aaaa0008");
+            write_sidecar_for(&b, root, 8, "aaaa0000aaaa0008");
+            save_state_with_launch(root, 8, "ffff0000ffff0008");
+            // (c) STALE, another root that exists: not ours.
+            let (c, _) = publish_launch(cache, other_root, 7, "aaaa0000aaaa000c");
+            write_sidecar_for(&c, other_root, 7, "aaaa0000aaaa000c");
+            // (d) STALE, a project root deleted after the launch.
+            let (d, _) = publish_launch(cache, &deleted_root, 5, "aaaa0000aaaa000d");
+            write_sidecar_for(&d, &deleted_root, 5, "aaaa0000aaaa000d");
+            drop(deleted);
+            assert!(!deleted_root.exists(), "the root of (d) is deleted");
+            // (e) ALIVE, this root's phase 9, no state, sidecar `{`.
+            let (e, listener) = publish_launch(cache, root, 9, "bbbb0000bbbb0000");
+            std::fs::write(e.sidecar_path(), "{").unwrap();
+            let mut responder = PingResponder::start(&e, listener, "bbbb0000bbbb0000", 9);
+            // (f) STALE, this root's phase 10, no sidecar, no state.
+            let (_f, _) = publish_launch(cache, root, 10, "cccc0000cccc0000");
+            // (g) control: STALE, the other root's phase 9, no sidecar.
+            let (_g, _) = publish_launch(cache, other_root, 9, "dddd0000dddd0000");
+            // (h) control: STALE, no sidecar, whose state claims it.
+            let (_h, _) = publish_launch(cache, root, 11, "eeee0000eeee0000");
+            save_state_with_launch(root, 11, "eeee0000eeee0000");
+            // (i) control: STALE with a sidecar, whose state claims it.
+            let (i, _) = publish_launch(cache, root, 12, "aaaa0000aaaa0012");
+            write_sidecar_for(&i, root, 12, "aaaa0000aaaa0012");
+            save_state_with_launch(root, 12, "aaaa0000aaaa0012");
+
+            let sock_dir = registry::socket_dir_in(cache);
+            let before = snapshot(&sock_dir);
+            let findings = collect_orphan_supervisors(root, cache);
+            assert_eq!(
+                snapshot(&sock_dir),
+                before,
+                "the sweep must change nothing under sock/"
+            );
+            responder.stop();
+
+            let mut listed: Vec<(PhaseId, &str, &str, bool)> = findings
+                .iter()
+                .map(|orphan| {
+                    (
+                        orphan.finding.phase,
+                        orphan.launch_id.as_str(),
+                        orphan.liveness,
+                        orphan.root_exists,
+                    )
+                })
+                .collect();
+            listed.sort();
+            assert_eq!(
+                listed,
+                vec![
+                    (PhaseId::new(5), "aaaa0000aaaa000d", "stale", false),
+                    (PhaseId::new(7), "aaaa0000aaaa0007", "stale", true),
+                    (PhaseId::new(8), "aaaa0000aaaa0008", "stale", true),
+                    (PhaseId::new(9), "bbbb0000bbbb0000", "alive", true),
+                    (PhaseId::new(10), "cccc0000cccc0000", "stale", true),
+                ],
+                "exactly (a), (b), (d), (e) and (f) are listed"
+            );
+            for orphan in &findings {
+                let finding = &orphan.finding;
+                let repair = finding
+                    .repair
+                    .as_deref()
+                    .expect("every orphan names a repair");
+                assert_eq!(
+                    repair,
+                    format!(
+                        "devflow stop --phase {} --launch {}",
+                        finding.phase, orphan.launch_id
+                    ),
+                    "the repair addresses exactly this socket"
+                );
+                assert!(
+                    repair.contains("--launch")
+                        && repair != format!("devflow stop --phase {}", finding.phase),
+                    "never the bare stop, which would stop the state's own record: {repair}"
+                );
+                assert!(
+                    !finding.detail.contains('/'),
+                    "a path-free detail: {}",
+                    finding.detail
+                );
+                assert_eq!(finding.severity, Severity::Problem);
+            }
+            let detail_of = |id: &str| {
+                findings
+                    .iter()
+                    .find(|orphan| orphan.launch_id == id)
+                    .map(|orphan| orphan.finding.detail.clone())
+                    .unwrap()
+            };
+            assert!(detail_of("aaaa0000aaaa000d").contains("no longer exists"));
+            assert!(detail_of("bbbb0000bbbb0000").contains("does not parse"));
+            assert!(detail_of("cccc0000cccc0000").contains("missing"));
+            assert!(detail_of("aaaa0000aaaa0008").contains("another launch"));
+
+            // Control: removing (a)'s files changes the snapshot, so the
+            // comparison above can fail.
+            supervisor::remove_launch_files(&a).unwrap();
+            assert_ne!(
+                snapshot(&sock_dir),
+                before,
+                "the snapshot must see a removal"
+            );
+        }
+
+        /// 50-12: `supervisor::sweep_in` answers a socket directory it
+        /// cannot list with no entries, so doctor checks that case itself and
+        /// reports it rather than printing nothing. Controls: an absent and a
+        /// listable directory report nothing.
+        #[test]
+        fn doctor_reports_an_unlistable_socket_dir_instead_of_nothing() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let cache = tempfile::tempdir().unwrap();
+            assert_eq!(socket_dir_unlistable(cache.path()), None, "absent");
+            assert_eq!(render_orphan_supervisors_text(&[], None), "");
+            let sock = registry::socket_dir_in(cache.path());
+            std::fs::create_dir_all(&sock).unwrap();
+            assert_eq!(socket_dir_unlistable(cache.path()), None, "listable");
+
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Without DAC override, so uid 0 (the pinned container) is
+            // refused too (WINDOWS.md #19).
+            let unlistable = without_dac_override(|| socket_dir_unlistable(cache.path()));
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let why = unlistable.expect("a directory without read permission is unlistable");
+            assert_eq!(
+                why,
+                std::io::ErrorKind::PermissionDenied.to_string(),
+                "the 0o000 directory itself refuses the listing"
+            );
+            assert!(!why.contains('/'), "path-free: {why}");
+            let text = render_orphan_supervisors_text(&[], Some(&why));
+            assert!(
+                text.contains("could not be listed") && text.contains(&why),
+                "{text}"
+            );
+            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)));
+            assert_eq!(body["orphan_supervisor_sweep_error"], why.as_str());
+        }
+
+        /// The comment-stripped body of `fn collect_orphan_supervisors(` in
+        /// `source` (cut at its first `mod tests {` line), from that line to
+        /// the next line that is exactly `}`; `None` when absent.
+        fn orphan_sweep_body(source: &str) -> Option<Vec<&str>> {
+            let lines: Vec<&str> = source
+                .lines()
+                .take_while(|line| !line.contains("mod tests {"))
+                .collect();
+            let start = lines
+                .iter()
+                .position(|line| line.contains("fn collect_orphan_supervisors("))?;
+            let end = start + lines[start..].iter().position(|line| *line == "}")?;
+            Some(
+                lines[start..=end]
+                    .iter()
+                    .copied()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect(),
+            )
+        }
+
+        /// Why `source`'s `collect_orphan_supervisors` breaks R6-G4: absent
+        /// or under 5 lines, an acting call, or no `sweep_for_in(` call.
+        fn orphan_sweep_violations(source: &str) -> Vec<String> {
+            const ACTING: [&str; 5] = [
+                "remove_launch_files",
+                "remove_file",
+                "teardown_stale",
+                "request_shutdown",
+                "kill(",
+            ];
+            let Some(body) = orphan_sweep_body(source) else {
+                return vec!["fn collect_orphan_supervisors( not found".to_string()];
+            };
+            let mut violations = Vec::new();
+            if body.len() < 5 {
+                violations.push(format!("body has {} lines, under 5", body.len()));
+            }
+            for line in &body {
+                for call in ACTING {
+                    if line.contains(call) {
+                        violations.push(format!("acting call {call}: {line}"));
+                    }
+                }
+            }
+            if !body.iter().any(|line| line.contains("sweep_for_in(")) {
+                violations.push("no sweep_for_in( call".to_string());
+            }
+            violations
+        }
+
+        /// 50-12 R6-G4 (T-50-31, T-50-84): doctor's orphan sweep only reads,
+        /// and attributes a sidecar-less socket through `sweep_for_in`, so
+        /// 50-06's digest rule stays in one place. Planted controls run the
+        /// same check.
+        #[test]
+        fn the_orphan_sweep_only_reads_and_attributes_through_sweep_for_in() {
+            let reads = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    for entry in supervisor::sweep_for_in(b, a, p) {\n        out.push(entry);\n    }\n    out\n}\n";
+            assert!(
+                orphan_sweep_violations(reads).is_empty(),
+                "a read-only fn passes"
+            );
+            let acts = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    for entry in supervisor::sweep_for_in(b, a, p) {\n        supervisor::remove_launch_files(&entry);\n        out.push(entry);\n    }\n    out\n}\n";
+            let found = orphan_sweep_violations(acts);
+            assert!(
+                found.len() == 1 && found[0].contains("remove_launch_files"),
+                "an acting call fails: {found:?}"
+            );
+            let reimplements = "fn collect_orphan_supervisors(a: &Path, b: &Path) -> Vec<X> {\n    let mut out = Vec::new();\n    // sweep_for_in(b, a, p) re-derived below\n    for entry in supervisor::sweep_in(b) {\n        out.push(entry);\n    }\n    out\n}\n";
+            let found = orphan_sweep_violations(reimplements);
+            assert!(
+                found.len() == 1 && found[0].contains("no sweep_for_in"),
+                "a commented-out sweep_for_in fails: {found:?}"
+            );
+            let absent = "fn other() {\n}\n";
+            assert_eq!(
+                orphan_sweep_violations(absent),
+                vec!["fn collect_orphan_supervisors( not found".to_string()]
+            );
+
+            let source = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+            )
+            .expect("read src/commands.rs");
+            assert_eq!(
+                orphan_sweep_violations(&source),
+                Vec::<String>::new(),
+                "collect_orphan_supervisors must only read and must call sweep_for_in"
+            );
+        }
 
         /// A fully-agreeing baseline: `reconcile_phase` over this returns
         /// zero findings. Each test overrides only the field(s) needed to
@@ -6988,8 +9056,11 @@ mod tests {
                 waiter: lock::HolderStatus::NoHolder,
                 agent_pid: Some(4242),
                 agent_alive: true,
-                monitor_pid: Some(4343),
-                monitor_alive: true,
+                supervisor: PhaseLiveness::Alive {
+                    owner: "agent_running".to_string(),
+                    launch: "stream".to_string(),
+                },
+                supervisor_launch_id: Some(SUPERVISOR_LAUNCH_ID.to_string()),
                 last_event: Some("stage_launched".into()),
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
@@ -7165,27 +9236,27 @@ mod tests {
             assert!(findings[0].repair.is_none());
         }
 
-        /// 18b: a dead monitor with a dead agent is `Stuck` — nothing will
-        /// call `devflow advance` for this phase — and reports a `Problem`
-        /// finding with a `devflow resume --phase N` repair.
+        /// 18b / 50-12: a supervisor GONE while its phase is not stopped,
+        /// with a dead agent — nothing will call `devflow advance` for this
+        /// phase — reports a `Problem` finding with a `devflow resume --phase
+        /// N` repair.
         #[test]
-        fn reconcile_reports_stuck_when_monitor_and_agent_are_both_dead() {
+        fn reconcile_reports_gone_supervisor_and_dead_agent() {
             let facts = PhaseFacts {
-                monitor_pid: Some(5150),
-                monitor_alive: false,
+                supervisor: PhaseLiveness::GoneWhileActive,
                 agent_pid: Some(4242),
                 agent_alive: false,
                 ..agreeing_facts(PhaseId::new(8))
             };
             let findings = reconcile_phase(&facts);
-            let monitor_finding = findings
+            let supervisor_finding = findings
                 .iter()
-                .find(|f| f.detail.contains("monitor pid"))
-                .expect("expected a monitor finding when monitor and agent are both dead");
-            assert_eq!(monitor_finding.severity, Severity::Problem);
-            assert!(monitor_finding.detail.contains("monitor pid 5150"));
+                .find(|f| f.detail.contains("supervisor launch"))
+                .expect("expected a supervisor finding when the supervisor is gone");
+            assert_eq!(supervisor_finding.severity, Severity::Problem);
+            assert!(supervisor_finding.detail.contains(SUPERVISOR_LAUNCH_ID));
             assert_eq!(
-                monitor_finding.repair.as_deref(),
+                supervisor_finding.repair.as_deref(),
                 Some("devflow resume --phase 8")
             );
         }
@@ -7214,17 +9285,14 @@ mod tests {
         }
 
         /// 20c (D-09 + review: Codex HIGH — the doctor gap is bigger than
-        /// `check_dead_agent`): the same stopped phase may also carry a
-        /// stale `monitor_pid` (though the stop path clears it — this
-        /// proves the guard holds even if that clear were ever bypassed).
-        /// `check_dead_monitor` must also recognize `facts.stopped` and
-        /// report ZERO findings.
+        /// `check_dead_agent`): the same stopped phase's supervisor has
+        /// exited. `check_supervisor` must also recognize `facts.stopped`
+        /// and report ZERO findings.
         #[test]
-        fn reconcile_phase_ignores_dead_monitor_when_stopped() {
+        fn reconcile_phase_ignores_gone_supervisor_when_stopped() {
             let facts = PhaseFacts {
                 stage: Stage::Plan,
-                monitor_pid: Some(5150),
-                monitor_alive: false,
+                supervisor: PhaseLiveness::Gone,
                 agent_pid: Some(4242),
                 agent_alive: false,
                 stopped: true,
@@ -7233,45 +9301,48 @@ mod tests {
             let findings = reconcile_phase(&facts);
             assert!(
                 findings.iter().all(|f| f.severity != Severity::Problem),
-                "a --until-stopped phase must yield zero Problem findings even with a \
-                 stale monitor_pid, got: {:?}",
+                "a --until-stopped phase must yield zero Problem findings even with an \
+                 exited supervisor, got: {:?}",
                 findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
             );
         }
 
-        /// 18b (T-18-11): an unrecorded monitor is unknown, not a problem —
-        /// a state file written by a pre-18b binary must never render as
-        /// stuck.
+        /// 18b (T-18-11): an unrecorded supervisor is not launched, not a
+        /// problem — a state file written before the record existed must
+        /// never render as a finding.
         #[test]
-        fn reconcile_is_silent_when_monitor_pid_is_unrecorded() {
+        fn reconcile_is_silent_when_no_supervisor_is_recorded() {
             let facts = PhaseFacts {
-                monitor_pid: None,
-                monitor_alive: false,
+                supervisor: PhaseLiveness::NotLaunched,
+                supervisor_launch_id: None,
                 ..agreeing_facts(PhaseId::new(9))
             };
             assert!(
                 reconcile_phase(&facts).is_empty(),
-                "an unrecorded monitor must never produce a finding"
+                "an unrecorded supervisor must never produce a finding"
             );
         }
 
-        /// 18b: a live monitor with a dead agent is a normal between-stages
-        /// moment (the monitor hasn't advanced the phase yet), not a monitor
-        /// finding. `check_dead_agent`'s own pre-existing finding for the
-        /// dead agent pid is unrelated to this check and out of this plan's
-        /// scope.
+        /// 18b / 50-12: an ALIVE supervisor with a dead agent is a normal
+        /// between-stages moment (the supervisor runs the advance itself),
+        /// not a supervisor finding. `check_dead_agent`'s own pre-existing
+        /// finding for the dead agent pid is unrelated to this check.
         #[test]
-        fn reconcile_is_silent_when_monitor_alive_and_agent_dead() {
+        fn reconcile_is_silent_when_supervisor_alive_and_agent_dead() {
             let facts = PhaseFacts {
-                monitor_pid: Some(5150),
-                monitor_alive: true,
+                supervisor: PhaseLiveness::Alive {
+                    owner: "advancing".to_string(),
+                    launch: "stream".to_string(),
+                },
                 agent_alive: false,
                 ..agreeing_facts(PhaseId::new(10))
             };
             let findings = reconcile_phase(&facts);
             assert!(
-                findings.iter().all(|f| !f.detail.contains("monitor pid")),
-                "a live monitor with a dead agent must not produce a monitor finding"
+                findings
+                    .iter()
+                    .all(|f| !f.detail.contains("supervisor launch")),
+                "a live supervisor with a dead agent must not produce a supervisor finding"
             );
         }
 
@@ -7284,8 +9355,7 @@ mod tests {
                 gate_pending: true,
                 agent_pid: Some(999_999),
                 agent_alive: false,
-                monitor_pid: Some(999_998),
-                monitor_alive: false,
+                supervisor: PhaseLiveness::GoneWhileActive,
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
                 feature_branch_exists: false,
@@ -7298,14 +9368,15 @@ mod tests {
                 vec![
                     Severity::Problem, // check_gate_pending_without_gate
                     Severity::Problem, // check_dead_agent
-                    Severity::Problem, // check_dead_monitor
+                    Severity::Problem, // check_supervisor
                     Severity::Warn,    // check_stage_event_drift
                     Severity::Warn,    // check_missing_branch
                 ]
             );
             assert!(findings[0].detail.contains("gate_pending is true"));
             assert!(findings[1].detail.contains("agent pid 999999"));
-            assert!(findings[2].detail.contains("monitor pid 999998"));
+            assert!(findings[2].detail.contains("supervisor launch"));
+            assert!(findings[2].detail.contains("GONE"));
             assert!(
                 findings[3]
                     .detail
@@ -7409,7 +9480,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts, &[], &[]);
+            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None));
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -7432,10 +9503,14 @@ mod tests {
                 "999.44: must carry the stray-process findings under a FOURTH key, \
                  never a second concatenated array: {reparsed}"
             );
+            assert!(
+                reparsed.get("orphan_supervisors").is_some(),
+                "50-12: must carry the socket sweep's findings under their own key: {reparsed}"
+            );
             assert_eq!(
                 reparsed.as_object().unwrap().len(),
-                4,
-                "doctor --json must have exactly four top-level keys: {reparsed}"
+                6,
+                "doctor --json must have exactly six top-level keys: {reparsed}"
             );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
@@ -7483,8 +9558,18 @@ mod tests {
                 .lines()
                 .count();
 
-            doctor(root, false).unwrap();
-            doctor(root, false).unwrap();
+            // 50-12: a hermetic cache whose STALE socket no state claims, so
+            // the run also exercises the socket sweep, which must leave it.
+            let cache = short_cache();
+            let (orphan, _) = publish_launch(cache.path(), root, 91, "aaaa0000aaaa0091");
+            write_sidecar_for(&orphan, root, 91, "aaaa0000aaaa0091");
+
+            doctor_in(root, false, Some(cache.path())).unwrap();
+            doctor_in(root, false, Some(cache.path())).unwrap();
+            assert!(
+                orphan.as_path().exists() && orphan.sidecar_path().exists(),
+                "doctor must not remove a socket or sidecar it reports"
+            );
 
             let after_len = std::fs::metadata(&state_path).unwrap().len();
             let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
@@ -7600,9 +9685,9 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &[], &stray_findings);
+            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None));
             let obj = body.as_object().unwrap();
-            assert_eq!(obj.len(), 4, "must be exactly four top-level keys: {body}");
+            assert_eq!(obj.len(), 6, "must be exactly six top-level keys: {body}");
             assert!(obj.contains_key("stray_processes"));
             let strays = obj["stray_processes"].as_array().unwrap();
             assert_eq!(strays.len(), 1);
@@ -7676,9 +9761,11 @@ mod tests {
 
             // Also exercise doctor() itself, end to end, twice — not just
             // the pure finding collector — proving the full read-only path.
-            doctor(dir.path(), false).unwrap();
+            // A hermetic, empty cache: never sweep the operator's real one.
+            let cache = tempfile::tempdir().unwrap();
+            doctor_in(dir.path(), false, Some(cache.path())).unwrap();
             assert!(agent::agent_running(pid), "doctor() itself must not signal");
-            doctor(dir.path(), false).unwrap();
+            doctor_in(dir.path(), false, Some(cache.path())).unwrap();
             assert!(
                 agent::agent_running(pid),
                 "doctor() must remain read-only across repeated runs"
@@ -7771,18 +9858,20 @@ mod tests {
     }
 
     /// Task 1's tracer (CR-01, 999.44/DEN-68): one discovery pass names
-    /// a live `monitor_pid`-recorded pid, a live lock-holder pid, and a
-    /// genuine orphan under no registered root at all. Only the orphan
-    /// may survive `unreachable_stray_candidates`'s filter. All three
-    /// pids are real, spawned processes crossed through
+    /// a live lock-holder pid and a genuine orphan under no registered root
+    /// at all. Only the orphan may survive `unreachable_stray_candidates`'s
+    /// filter. Both pids are real, spawned processes crossed through
     /// `wait_for_exec_visibility` — not synthesised numbers — so the
     /// census and the filter are both exercised for real, in one pass.
+    ///
+    /// A third, state-recorded fixture (a pid in the state's monitor-pid
+    /// field) was removed with that input (50-22): lock holders are the
+    /// only reachable source, because the census cannot match a 3.x
+    /// supervisor (`agent::tests::the_stray_census_matches_only_the_2x_process_shapes`).
     #[test]
     fn reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates() {
-        let mut state_child = spawn_wrapper_shaped_fixture();
         let mut lock_child = spawn_wrapper_shaped_fixture();
         let mut orphan_child = spawn_wrapper_shaped_fixture();
-        let state_pid = state_child.id();
         let lock_pid = lock_child.id();
         let orphan_pid = orphan_child.id();
 
@@ -7790,22 +9879,19 @@ mod tests {
         let project_root_guard = tempfile::tempdir().unwrap();
         let project_root = project_root_guard.path().to_path_buf();
 
-        // Phase 1: a real `State` naming `state_pid` as its monitor.
-        let mut state = State::new(
+        // Phase 1: a real `State` with no lock, the registered phase.
+        let state = State::new(
             PhaseId::new(1),
             AgentKind::Claude,
             Mode::Auto,
             project_root.clone(),
         );
-        state.monitor_pid = Some(state_pid);
         workflow::save_state(&state).unwrap();
 
         // Phase 2: a real `State` (so `list_states` enumerates the
         // phase at all — mirrors real operation, where a phase with an
-        // active lock also has a persisted state), deliberately with NO
-        // `monitor_pid`, so this phase's only path into the reachable
-        // set is the lock file below, not the monitor_pid path Phase 1
-        // already exercises.
+        // active lock also has a persisted state), whose only path into
+        // the reachable set is the lock file below.
         let state_2 = State::new(
             PhaseId::new(2),
             AgentKind::Claude,
@@ -7844,10 +9930,6 @@ mod tests {
 
         let reachable = registry_reachable_pids(&registered_roots);
         assert!(
-            reachable.contains(&state_pid),
-            "state_pid must be reachable via its recorded monitor_pid"
-        );
-        assert!(
             reachable.contains(&lock_pid),
             "lock_pid must be reachable via the lock file's holder_identity"
         );
@@ -7860,11 +9942,7 @@ mod tests {
         // Without this, the test could pass vacuously because the
         // census never saw the fixtures at all (T-25-15-11).
         let census = agent::discover_stray_devflow_processes();
-        for (pid, label) in [
-            (state_pid, "state"),
-            (lock_pid, "lock"),
-            (orphan_pid, "orphan"),
-        ] {
+        for (pid, label) in [(lock_pid, "lock"), (orphan_pid, "orphan")] {
             assert!(
                 census.iter().any(|p| p.pid == pid),
                 "the {label} fixture (pid {pid}) must be part of the real /proc census"
@@ -7877,10 +9955,6 @@ mod tests {
             "the orphan must survive the filter"
         );
         assert!(
-            !retained.iter().any(|p| p.pid == state_pid),
-            "the state-named pid must be filtered out"
-        );
-        assert!(
             !retained.iter().any(|p| p.pid == lock_pid),
             "the lock-held pid must be filtered out"
         );
@@ -7891,25 +9965,20 @@ mod tests {
             "the orphan must produce a finding"
         );
         assert!(
-            !findings.iter().any(|f| f.pid == state_pid),
-            "the state-named pid must produce no finding"
-        );
-        assert!(
             !findings.iter().any(|f| f.pid == lock_pid),
             "the lock-held pid must produce no finding"
         );
 
-        // Reap all three with a VERIFIED signal, never a bare one
+        // Reap both with a VERIFIED signal, never a bare one
         // (mirrors `reap_strays_e2e.rs:202-223`'s own teardown), plus a
         // final `wait()` on each to reclaim the zombie regardless.
-        for pid in [state_pid, lock_pid, orphan_pid] {
+        for pid in [lock_pid, orphan_pid] {
             agent::terminate_and_verify(
                 pid,
                 agent::TERMINATE_VERIFY_WAIT,
                 agent::TERMINATE_VERIFY_POLL,
             );
         }
-        let _ = state_child.wait();
         let _ = lock_child.wait();
         let _ = orphan_child.wait();
     }
@@ -7930,13 +9999,21 @@ mod tests {
         let mut child = spawn_wrapper_shaped_fixture();
         let pid = child.id();
 
-        let mut state = State::new(PhaseId::new(1), AgentKind::Claude, Mode::Auto, root.clone());
-        state.monitor_pid = Some(pid);
+        let state = State::new(PhaseId::new(1), AgentKind::Claude, Mode::Auto, root.clone());
         workflow::save_state(&state).unwrap();
+        // The pid's path into the reachable set: a lock file naming it as
+        // holder, in the `.devflow/lock-{phase:02}` shape (pid, start time).
+        let start_time = agent::process_start_time(pid)
+            .expect("must read the lock fixture's own recorded start time");
+        std::fs::write(
+            root.join(".devflow").join("lock-01"),
+            format!("{pid}\n{start_time}"),
+        )
+        .unwrap();
 
         assert!(
             registry_reachable_pids(std::slice::from_ref(&root)).contains(&pid),
-            "the pid must be reachable while its root and state file still exist"
+            "the pid must be reachable while its root, state file and lock file still exist"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -8368,13 +10445,13 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &doc_findings, &[]);
+            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None));
             let obj = body.as_object().unwrap();
             assert_eq!(
                 obj.len(),
-                4,
+                6,
                 "must be exactly {{environment, reconciliation, planning_doc_staleness, \
-                 stray_processes}}: {body}"
+                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error}}: {body}"
             );
             assert!(obj.contains_key("environment"));
             assert!(obj.contains_key("reconciliation"));
@@ -8538,6 +10615,912 @@ mod tests {
                 "the hint must name the hermes binary: {:?}",
                 hermes.install_hint
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 50-14: `stop` through the run's supervisor socket (crash row C13, and
+    // a supervisor that dies under its shutdown request).
+    // -----------------------------------------------------------------------
+
+    /// A 0700 socket directory under a short tempdir in `/tmp`, so every
+    /// socket path below it fits `sun_path`. The tempdir removes it on drop.
+    fn stop_socket_dir() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::Builder::new()
+            .prefix("dfs")
+            .tempdir_in("/tmp")
+            .expect("create a short socket base under /tmp");
+        let dir = base.path().join("sock");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (base, dir)
+    }
+
+    /// Bind a listener at `path` with mode 0600, as a published supervisor
+    /// socket is.
+    fn bind_supervisor_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        use std::os::unix::fs::PermissionsExt as _;
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("bind the socket");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener
+    }
+
+    /// Wait up to `within` for `fd` to be readable (a queued connection on a
+    /// listener, data on a stream); whether it became readable.
+    fn readable_within(fd: &impl std::os::fd::AsRawFd, within: std::time::Duration) -> bool {
+        let mut entry = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+        loop {
+            // SAFETY: one initialized pollfd naming a descriptor the caller
+            // holds open for the whole call.
+            let ready = unsafe { libc::poll(&raw mut entry, 1, millis) };
+            if ready >= 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return ready == 1;
+            }
+        }
+    }
+
+    /// A well-formed ping reply line for a scripted supervisor.
+    fn scripted_ping_reply(launch_id: &str, phase: PhaseId, owner: &str) -> String {
+        serde_json::json!({
+            "ok": true,
+            "launch_id": launch_id,
+            "phase": phase.to_string(),
+            "stage": "code",
+            "launch": "stream",
+            "owner": owner,
+            "agent_pid": 1,
+            "agent_pgid": 1,
+            "agent_start_time": 0,
+            "boot_id": null,
+            "supervisor_pid": 1,
+        })
+        .to_string()
+    }
+
+    /// Accept one connection on `listener` within `within`, or `None`.
+    fn accept_within(
+        listener: &std::os::unix::net::UnixListener,
+        within: std::time::Duration,
+    ) -> Option<std::os::unix::net::UnixStream> {
+        if !readable_within(listener, within) {
+            return None;
+        }
+        Some(listener.accept().expect("accept a queued connection").0)
+    }
+
+    /// Read one request line from `stream`, or `None` when none arrives
+    /// within the read timeout.
+    fn read_request_line(stream: &std::os::unix::net::UnixStream) -> Option<String> {
+        use std::io::BufRead as _;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line).ok()?;
+        (!line.is_empty()).then(|| line.trim_end().to_string())
+    }
+
+    /// The lines a scripted supervisor sends for one `shutdown` request, and
+    /// whether it then unlinks its socket and stops serving.
+    struct ShutdownScript {
+        lines: Vec<String>,
+        unlink_after: bool,
+    }
+
+    /// A scripted supervisor: serves `socket` on a thread, logs each
+    /// connection's one request line, answers `ping` with
+    /// [`scripted_ping_reply`] and the n-th `shutdown` (1-based) with
+    /// `on_shutdown(n)`. Dropping it stops the thread and removes the socket.
+    struct ScriptedSupervisor {
+        socket: PathBuf,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ScriptedSupervisor {
+        fn serve(
+            socket: &Path,
+            launch_id: &str,
+            phase: PhaseId,
+            owner: &str,
+            mut on_shutdown: impl FnMut(usize) -> ShutdownScript + Send + 'static,
+        ) -> Self {
+            use std::io::Write as _;
+            use std::sync::atomic::Ordering;
+            let listener = bind_supervisor_socket(socket);
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ping = scripted_ping_reply(launch_id, phase, owner);
+            let (thread_log, thread_done, path) = (log.clone(), done.clone(), socket.to_path_buf());
+            let thread = std::thread::spawn(move || {
+                let mut shutdowns = 0;
+                while !thread_done.load(Ordering::SeqCst) {
+                    let Some(mut stream) =
+                        accept_within(&listener, std::time::Duration::from_millis(50))
+                    else {
+                        continue;
+                    };
+                    let Some(request) = read_request_line(&stream) else {
+                        continue;
+                    };
+                    thread_log.lock().unwrap().push(request.clone());
+                    if request.contains("\"ping\"") {
+                        let _ = writeln!(stream, "{ping}");
+                        continue;
+                    }
+                    shutdowns += 1;
+                    let script = on_shutdown(shutdowns);
+                    for line in &script.lines {
+                        let _ = writeln!(stream, "{line}");
+                    }
+                    if script.unlink_after {
+                        let _ = std::fs::remove_file(&path);
+                        return;
+                    }
+                }
+            });
+            Self {
+                socket: socket.to_path_buf(),
+                log,
+                done,
+                thread: Some(thread),
+            }
+        }
+
+        /// How many `shutdown` requests this supervisor has received.
+        fn shutdowns(&self) -> usize {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("\"shutdown\""))
+                .count()
+        }
+    }
+
+    impl Drop for ScriptedSupervisor {
+        fn drop(&mut self) {
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    /// Save a state for `phase` whose supervisor record names `socket` and
+    /// `launch_id`.
+    fn save_state_naming(root: &Path, phase: PhaseId, socket: &Path, launch_id: &str) {
+        let mut state = match workflow::load_state(root, phase) {
+            Ok(state) => state,
+            Err(_) => State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf()),
+        };
+        state.supervisor = Some(SupervisorRecord::new(
+            socket.to_path_buf(),
+            launch_id.to_string(),
+            1,
+            0,
+            "boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    const HANDED_OFF_LINE: &str = r#"{"ok":false,"error":"handed_off"}"#;
+    const ACCEPTED_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"agent_running"}"#;
+    const STOPPED_LINE: &str =
+        r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true}"#;
+
+    /// Crash row C13 (V-57): the state names supervisor A; A answers the
+    /// shutdown by saving the state naming B (N+1's record is saved before N
+    /// is marked handed off) and replying `handed_off`. `stop` reloads the
+    /// state and stops B: A is asked once, B once, and `stopped` is recorded.
+    #[test]
+    fn stop_retries_a_handed_off_reply_against_the_reloaded_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1401);
+        let (_base, sock) = stop_socket_dir();
+        let (a_path, b_path) = (sock.join("a.sock"), sock.join("b.sock"));
+        save_state_naming(&root, phase, &a_path, "launch-a");
+
+        let b = ScriptedSupervisor::serve(&b_path, "launch-b", phase, "agent_running", |_| {
+            ShutdownScript {
+                lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                unlink_after: false,
+            }
+        });
+        let (a_root, a_b_path) = (root.clone(), b_path.clone());
+        let a = ScriptedSupervisor::serve(&a_path, "launch-a", phase, "handed_off", move |_| {
+            save_state_naming(&a_root, phase, &a_b_path, "launch-b");
+            ShutdownScript {
+                lines: vec![HANDED_OFF_LINE.to_string()],
+                unlink_after: false,
+            }
+        });
+
+        let result = stop(&root, phase);
+        assert!(
+            result.is_ok(),
+            "stop must reach B through the reloaded record: {result:?}"
+        );
+        assert_eq!(a.shutdowns(), 1, "A is asked exactly once");
+        assert_eq!(b.shutdowns(), 1, "B is asked exactly once");
+        let state = workflow::load_state(&root, phase).unwrap();
+        assert!(state.stopped, "the stop B performed is recorded");
+    }
+
+    /// C13 control (V-57): every reload names A again, so `stop` gives up
+    /// after the first request and 3 retries, with an error naming
+    /// `handed_off` and the attempt count, and records nothing. A unlinks its
+    /// socket after a fifth request, so a loop past the cap ends as Gone and
+    /// fails the count instead of hanging.
+    #[test]
+    fn stop_gives_up_after_three_handed_off_retries_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1402);
+        let (_base, sock) = stop_socket_dir();
+        let a_path = sock.join("a.sock");
+        save_state_naming(&root, phase, &a_path, "launch-a");
+        let state_file = workflow::state_path(&root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let a = ScriptedSupervisor::serve(&a_path, "launch-a", phase, "handed_off", |count| {
+            ShutdownScript {
+                lines: vec![HANDED_OFF_LINE.to_string()],
+                unlink_after: count >= 5,
+            }
+        });
+
+        let error = stop(&root, phase)
+            .expect_err("a supervisor that keeps answering handed_off is not a stop")
+            .to_string();
+        assert!(
+            error.contains("handed_off") && error.contains('4'),
+            "the error names handed_off and the attempt count: {error}"
+        );
+        assert_eq!(a.shutdowns(), 4, "the first request plus exactly 3 retries");
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "nothing is recorded"
+        );
+    }
+
+    /// The sidecar and state record of a launch recorded in an earlier boot:
+    /// the backstop proves its group gone without reading a process, so it
+    /// removes the files and signals nothing.
+    fn plant_previous_boot_launch(root: &Path, phase: PhaseId, socket: &Path) {
+        let sidecar = serde_json::json!({
+            "launch_id": "aaaa0000aaaa000f",
+            "project_root": root,
+            "phase": phase,
+            "stage": "code",
+            "agent": "claude",
+            "launch": "stream",
+            "agent_pid": 99_999_999,
+            "agent_pgid": 99_999_999,
+            "agent_start_time": 1,
+            "boot_id": "an-earlier-boot",
+            "supervisor_pid": 99_999_998,
+            "supervisor_start_time": 1,
+            "created_at": "2026-10-17T00:00:00Z",
+        });
+        std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = Some(SupervisorRecord::new(
+            socket.to_path_buf(),
+            "aaaa0000aaaa000f".to_string(),
+            99_999_999,
+            1,
+            "an-earlier-boot".to_string(),
+        ));
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The race 6d46008 left to `stop`: the supervisor answers the probe's
+    /// ping, then its listener is released with the shutdown's connect still
+    /// queued, so `request_shutdown` reads a reset or a broken pipe. That is
+    /// a supervisor that died, not a failed stop: `stop` probes once more,
+    /// reads STALE, runs the backstop (which removes the files and signals
+    /// nothing for this earlier-boot launch) and records `stopped`.
+    #[test]
+    fn stop_acts_on_a_supervisor_that_dies_under_its_shutdown_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1403);
+        let (_base, sock) = stop_socket_dir();
+        let socket = sock.join("r.sock");
+        plant_previous_boot_launch(&root, phase, &socket);
+        let listener = bind_supervisor_socket(&socket);
+        let ping = scripted_ping_reply("aaaa0000aaaa000f", phase, "agent_running");
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let wait = std::time::Duration::from_secs(30);
+            let Some(mut first) = accept_within(&listener, wait) else {
+                return "no probe connected";
+            };
+            if read_request_line(&first).is_none_or(|line| !line.contains("\"ping\"")) {
+                return "the first request was not a ping";
+            }
+            let _ = writeln!(first, "{ping}");
+            drop(first);
+            // Release the listener with the shutdown's connect queued in it
+            // and never accepted.
+            if !readable_within(&listener, wait) {
+                return "no shutdown connect was queued";
+            }
+            drop(listener);
+            "released"
+        });
+
+        let result = stop(&root, phase);
+        assert_eq!(server.join().expect("server thread"), "released");
+        assert!(
+            result.is_ok(),
+            "a supervisor that died under the shutdown is torn down, not an error: {result:?}"
+        );
+        assert!(
+            !socket.exists() && !socket.with_extension("json").exists(),
+            "the backstop removed the stale socket and its sidecar"
+        );
+        assert!(
+            workflow::load_state(&root, phase).unwrap().stopped,
+            "the confirmed-not-live stop is recorded"
+        );
+    }
+
+    /// Control for the race: a listener that stays up but closes the
+    /// shutdown (and every later connection) with its request unread is not
+    /// a dead supervisor. `stop` fails, removes nothing and records nothing.
+    #[test]
+    fn stop_reports_a_shutdown_closed_by_a_live_listener() {
+        /// Stops an unbounded re-probe from hanging this test.
+        const ACCEPT_AT_MOST: usize = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1404);
+        let (_base, sock) = stop_socket_dir();
+        let socket = sock.join("l.sock");
+        plant_previous_boot_launch(&root, phase, &socket);
+        let state_file = workflow::state_path(&root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+        let listener = bind_supervisor_socket(&socket);
+        let ping = scripted_ping_reply("aaaa0000aaaa000f", phase, "agent_running");
+        let (stop_server, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut accepted = 0;
+            while accepted < ACCEPT_AT_MOST && stopped.try_recv().is_err() {
+                let Some(mut stream) =
+                    accept_within(&listener, std::time::Duration::from_millis(50))
+                else {
+                    continue;
+                };
+                accepted += 1;
+                if accepted == 1 {
+                    let _ = read_request_line(&stream);
+                    let _ = writeln!(stream, "{ping}");
+                    continue;
+                }
+                // Close with the request unread, which resets the client.
+                let _ = readable_within(&stream, std::time::Duration::from_secs(5));
+                drop(stream);
+            }
+            (listener, accepted)
+        });
+
+        let result = stop(&root, phase);
+        stop_server.send(()).expect("stop the server");
+        let (listener, accepted) = server.join().expect("server thread");
+        drop(listener);
+        assert!(
+            accepted >= 2,
+            "stop never sent its shutdown ({accepted} connects)"
+        );
+        assert!(
+            result.is_err(),
+            "a live listener that closes the shutdown is not a stop: {result:?}"
+        );
+        assert!(
+            socket.exists() && socket.with_extension("json").exists(),
+            "nothing is removed"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "nothing is recorded"
+        );
+    }
+
+    /// A `sleep` child recorded as the holder of `root`'s lock for `phase`,
+    /// with its own pid and start time: the identity `stop_via_lock`
+    /// signals. Returns the child and the lock file.
+    fn hold_lock_by_a_child(root: &Path, phase: PhaseId) -> (std::process::Child, PathBuf) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut start = None;
+        for _ in 0..100 {
+            start = agent::process_start_time(pid);
+            if start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let start = start.expect("read the child's start time");
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{padded}", padded = phase.padded()));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{pid}\n{start}")).unwrap();
+        (child, lock_path)
+    }
+
+    /// `stop` during a `start` launcher's publish wait: the state loads but
+    /// records no supervisor yet, the spawned supervisor already serves its
+    /// socket, and the launcher holds the lock. `stop` must end that
+    /// supervisor through its socket, not signal the launcher (which would
+    /// die and leave the supervisor and its agent running unrecorded). The
+    /// scripted supervisor drops the lock as it stops, as the launcher does
+    /// once its supervisor is gone.
+    #[test]
+    fn stop_ends_an_unrecorded_supervisor_through_its_socket_not_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1405);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let (base, _sock) = stop_socket_dir();
+        let launch_id = "aaaa0000aaaa1405";
+        let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
+            .expect("socket path fits sun_path");
+        let (mut launcher, lock_path) = hold_lock_by_a_child(&root, phase);
+        let released = lock_path.clone();
+        let unrecorded =
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", {
+                move |_| {
+                    let _ = std::fs::remove_file(&released);
+                    ShutdownScript {
+                        lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                        unlink_after: true,
+                    }
+                }
+            });
+
+        let result = stop_in(&root, phase, Some(base.path()));
+        let launcher_alive = launcher.try_wait().unwrap().is_none();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+        assert_eq!(
+            unrecorded.shutdowns(),
+            1,
+            "stop must shut the unrecorded supervisor down through its socket: {result:?}"
+        );
+        assert!(launcher_alive, "the launcher must not be signalled");
+        assert!(result.is_ok(), "the stop happened: {result:?}");
+        assert!(
+            workflow::load_state(&root, phase).unwrap().stopped,
+            "the stop is recorded"
+        );
+    }
+
+    /// The several-sockets refusal also covers a loaded state with no
+    /// record: with two live sockets for the phase, `stop` cannot tell which
+    /// is the run, so it asks neither and signals no lock holder.
+    #[test]
+    fn stop_refuses_several_unrecorded_sockets_and_signals_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1406);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let (base, _sock) = stop_socket_dir();
+        let serve = |launch_id: &str| {
+            let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
+                .expect("socket path fits sun_path");
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", |_| {
+                ShutdownScript {
+                    lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                    unlink_after: true,
+                }
+            })
+        };
+        let (a, b) = (serve("aaaa0000aaaa140a"), serve("aaaa0000aaaa140b"));
+        let (mut launcher, _lock_path) = hold_lock_by_a_child(&root, phase);
+
+        let result = stop_in(&root, phase, Some(base.path()));
+        let launcher_alive = launcher.try_wait().unwrap().is_none();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+        let Err(CliError::Message(text)) = &result else {
+            panic!("several live sockets must refuse: {result:?}");
+        };
+        assert!(
+            text.contains("2 live supervisor sockets") && text.contains("no state file names one"),
+            "{text}"
+        );
+        assert_eq!((a.shutdowns(), b.shutdowns()), (0, 0), "neither is asked");
+        assert!(launcher_alive, "no lock holder is signalled");
+    }
+
+    /// 50-15: the start/resume guard over a state file that will not load
+    /// (D-09). These drive the guard in-process against a tempdir cache, so
+    /// nothing reads the operator's real `~/.cache/devflow`.
+    mod launch_guard {
+        use super::*;
+        use supervisor::backstop::BackstopDecision;
+
+        /// A project root whose phase state file exists and will not load.
+        fn root_with_an_unloadable_state(phase: PhaseId) -> tempfile::TempDir {
+            let root = tempfile::tempdir().unwrap();
+            let state = workflow::state_path(root.path(), phase);
+            std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+            std::fs::write(&state, b"{ this does not parse").unwrap();
+            assert!(workflow::load_state(root.path(), phase).is_err());
+            root
+        }
+
+        /// The 50-06 threat flag: `sweep_in` answers a socket directory it
+        /// cannot list with no entries, which must not read as "nothing
+        /// live" here. The guard fails closed and names the directory.
+        #[test]
+        fn the_launch_guard_refuses_an_unlistable_socket_dir_over_an_unloadable_state() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let phase = PhaseId::new(1501);
+            let root = root_with_an_unloadable_state(phase);
+            let cache = tempfile::tempdir().unwrap();
+            let sock = registry::socket_dir_in(cache.path());
+            std::fs::create_dir_all(&sock).unwrap();
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Both reads run without DAC override, so uid 0 (the pinned
+            // container) is refused too (WINDOWS.md #19).
+            let (listable, result) = without_dac_override(|| {
+                (
+                    std::fs::read_dir(&sock).is_ok(),
+                    refuse_launch_over_a_live_run(
+                        root.path(),
+                        phase,
+                        LaunchVerb::Start,
+                        Some(cache.path()),
+                    ),
+                )
+            });
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                !listable,
+                "precondition: a 0o000 directory cannot be listed"
+            );
+            let Err(CliError::Message(text)) = result else {
+                panic!("an unlistable socket directory must refuse: {result:?}");
+            };
+            for fragment in [
+                sock.display().to_string(),
+                format!(
+                    "cannot be listed ({})",
+                    std::io::ErrorKind::PermissionDenied
+                ),
+                "refusing to start; nothing was written".to_string(),
+            ] {
+                assert!(text.contains(&fragment), "missing {fragment:?}: {text}");
+            }
+        }
+
+        /// Control for the test above: a socket directory that does not
+        /// exist means no launch has published a socket, so nothing is live.
+        #[test]
+        fn the_launch_guard_proceeds_over_an_unloadable_state_when_the_socket_dir_is_missing() {
+            let phase = PhaseId::new(1502);
+            let root = root_with_an_unloadable_state(phase);
+            let cache = tempfile::tempdir().unwrap();
+            assert!(!registry::socket_dir_in(cache.path()).exists());
+            let result = refuse_launch_over_a_live_run(
+                root.path(),
+                phase,
+                LaunchVerb::Resume,
+                Some(cache.path()),
+            );
+            assert!(
+                result.is_ok(),
+                "a missing socket dir is not a refusal: {result:?}"
+            );
+        }
+
+        /// T-50-40: only the three backstop decisions that prove a STALE
+        /// socket's agent group gone let a launch through; every refusal,
+        /// an unprovable identity and a live leader count as live.
+        #[test]
+        fn only_a_provably_gone_group_lets_a_stale_socket_through_the_launch_guard() {
+            for gone in [
+                BackstopDecision::PreviousBoot,
+                BackstopDecision::EmptyGroup,
+                BackstopDecision::LeaderRecycled,
+            ] {
+                assert!(
+                    !stale_group_may_live(&gone),
+                    "{gone:?} proves the group gone"
+                );
+            }
+            for live in [
+                BackstopDecision::LeaderPresentSignal,
+                BackstopDecision::RefuseLeaderGone(Vec::new()),
+                BackstopDecision::RefuseMismatch("agent_pgid".to_string()),
+                BackstopDecision::RefuseUnsafeTarget,
+                BackstopDecision::RefuseIdentityUnavailable,
+            ] {
+                assert!(stale_group_may_live(&live), "{live:?} must fail closed");
+            }
+        }
+
+        /// An ALIVE scripted supervisor at this root and phase's socket under
+        /// `cache`, with no sidecar, so the sweep attributes it by file name.
+        fn serve_unrecorded(cache: &Path, root: &Path, phase: PhaseId) -> ScriptedSupervisor {
+            let launch_id = "aaaa0000aaaa1503";
+            let socket = supervisor::SocketPath::for_launch(cache, root, phase, launch_id)
+                .expect("socket path fits sun_path");
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", |_| {
+                ShutdownScript {
+                    lines: Vec::new(),
+                    unlink_after: false,
+                }
+            })
+        }
+
+        /// A launch whose state file is missing is still found through its
+        /// socket, as `stop` finds it: `recover --clean` leaves a live
+        /// supervisor's socket behind without a state file.
+        #[test]
+        fn the_launch_guard_finds_a_live_socket_when_the_state_file_is_missing() {
+            let phase = PhaseId::new(1503);
+            let root = tempfile::tempdir().unwrap();
+            assert!(!workflow::state_path(root.path(), phase).exists());
+            let (base, _sock) = stop_socket_dir();
+            let _alive = serve_unrecorded(base.path(), root.path(), phase);
+            let result = refuse_launch_over_a_live_run(
+                root.path(),
+                phase,
+                LaunchVerb::Start,
+                Some(base.path()),
+            );
+            let Err(CliError::Message(text)) = result else {
+                panic!("a live socket with no state file must refuse: {result:?}");
+            };
+            for fragment in [
+                "supervisor launch aaaa0000aaaa1503 ALIVE",
+                "refusing to start; nothing was written",
+            ] {
+                assert!(text.contains(fragment), "missing {fragment:?}: {text}");
+            }
+        }
+
+        /// The unlistable-directory refusal also covers a missing state file:
+        /// with neither a state nor a listing, nothing can rule a run out.
+        #[test]
+        fn the_launch_guard_refuses_an_unlistable_socket_dir_when_the_state_file_is_missing() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let phase = PhaseId::new(1504);
+            let root = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let sock = registry::socket_dir_in(cache.path());
+            std::fs::create_dir_all(&sock).unwrap();
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (listable, result) = without_dac_override(|| {
+                (
+                    std::fs::read_dir(&sock).is_ok(),
+                    refuse_launch_over_a_live_run(
+                        root.path(),
+                        phase,
+                        LaunchVerb::Start,
+                        Some(cache.path()),
+                    ),
+                )
+            });
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                !listable,
+                "precondition: a 0o000 directory cannot be listed"
+            );
+            let Err(CliError::Message(text)) = result else {
+                panic!("an unlistable socket directory must refuse: {result:?}");
+            };
+            for fragment in [
+                "there is no state file".to_string(),
+                sock.display().to_string(),
+                "refusing to start; nothing was written".to_string(),
+            ] {
+                assert!(text.contains(&fragment), "missing {fragment:?}: {text}");
+            }
+        }
+
+        /// Controls for the two tests above: a fresh start (no state, and no
+        /// socket directory or an empty one) proceeds, and the no-state
+        /// carve-out still ignores a live pid in the agent pid file.
+        #[test]
+        fn the_launch_guard_proceeds_with_no_state_and_no_live_socket() {
+            let phase = PhaseId::new(1505);
+            let root = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let guard = || {
+                refuse_launch_over_a_live_run(
+                    root.path(),
+                    phase,
+                    LaunchVerb::Start,
+                    Some(cache.path()),
+                )
+            };
+            assert!(guard().is_ok(), "no socket directory: {:?}", guard());
+            std::fs::create_dir_all(registry::socket_dir_in(cache.path())).unwrap();
+            assert!(guard().is_ok(), "an empty socket directory: {:?}", guard());
+            let pid_file = agent_result::agent_pid_path(root.path(), phase);
+            std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+            std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+            assert!(
+                guard().is_ok(),
+                "the no-state carve-out ignores a live agent pid: {:?}",
+                guard()
+            );
+        }
+    }
+
+    /// A sidecar whose launch id is not `new_launch_id`'s format is read as
+    /// unusable, so no copy-paste `--launch` line ever carries that id: the
+    /// stop line names the id from the socket's file name instead.
+    #[test]
+    fn a_hostile_sidecar_launch_id_never_reaches_a_stop_line() {
+        let (base, _sock) = stop_socket_dir();
+        let root = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1506);
+        let name_id = "aaaa0000aaaa1506";
+        let hostile = "x;touch${IFS}pwned";
+        let socket = supervisor::SocketPath::for_launch(base.path(), root.path(), phase, name_id)
+            .expect("socket path fits sun_path");
+        drop(bind_supervisor_socket(socket.as_path()));
+        let sidecar = serde_json::json!({
+            "launch_id": hostile,
+            "project_root": root.path(),
+            "phase": phase,
+            "stage": "code",
+            "agent": "claude",
+            "launch": "stream",
+            "agent_pid": 1,
+            "agent_pgid": 1,
+            "agent_start_time": 1,
+            "boot_id": "boot",
+            "supervisor_pid": 1,
+            "supervisor_start_time": 1,
+            "created_at": "2026-10-17T00:00:00Z",
+        });
+        std::fs::write(socket.sidecar_path(), sidecar.to_string()).unwrap();
+        let entries = supervisor::sweep_for_in(base.path(), root.path(), phase);
+        let [entry] = entries.as_slice() else {
+            panic!("one entry for this root and phase: {entries:?}");
+        };
+        let line = sweep_entry_stop_line(phase, entry);
+        assert!(!line.contains(hostile), "{line}");
+        assert!(
+            line.contains(&format!("--launch {name_id}")) && line.contains("does not parse"),
+            "{line}"
+        );
+        let live = swept_live_socket(entry).expect("a STALE socket without a usable sidecar");
+        let repair = live.repair_line(phase);
+        assert!(!repair.contains(hostile), "{repair}");
+    }
+
+    /// `recover --clean --phase N` uses the launch guard's supervisor rule:
+    /// a STALE socket whose group the backstop cannot prove gone, or a probe
+    /// that fails, refuses and deletes nothing, as an ALIVE one does.
+    mod recover_guard {
+        use super::*;
+
+        /// A loadable state for `phase` whose record names `socket`, with a
+        /// sidecar beside it that records `agent_pgid` in this boot.
+        fn plant_stale_launch(root: &Path, phase: PhaseId, socket: &Path, agent_pgid: u32) {
+            let boot = supervisor::boot_id().expect("a readable boot id");
+            let sidecar = serde_json::json!({
+                "launch_id": "aaaa0000aaaa1601",
+                "project_root": root,
+                "phase": phase,
+                "stage": "code",
+                "agent": "claude",
+                "launch": "stream",
+                "agent_pid": agent_pgid,
+                "agent_pgid": agent_pgid,
+                "agent_start_time": 1,
+                "boot_id": boot,
+                "supervisor_pid": 99_999_998,
+                "supervisor_start_time": 1,
+                "created_at": "2026-10-17T00:00:00Z",
+            });
+            std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.supervisor = Some(SupervisorRecord::new(
+                socket.to_path_buf(),
+                "aaaa0000aaaa1601".to_string(),
+                agent_pgid,
+                1,
+                boot,
+            ));
+            workflow::save_state(&state).unwrap();
+        }
+
+        /// A STALE socket over pgid 1 (the backstop refuses it as an unsafe
+        /// target, so its group is not proved gone) refuses `recover`.
+        #[test]
+        fn recover_refuses_a_stale_socket_whose_group_may_live() {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(1601);
+            let (_base, sock) = stop_socket_dir();
+            let socket = sock.join("s.sock");
+            plant_stale_launch(dir.path(), phase, &socket, 1);
+            drop(bind_supervisor_socket(&socket));
+            assert!(matches!(
+                supervisor::probe(&socket),
+                Ok(supervisor::Liveness::Stale)
+            ));
+            let result = refuse_a_live_supervisor(dir.path(), phase, None);
+            let Err(CliError::Message(text)) = result else {
+                panic!("a STALE socket whose group may live must refuse: {result:?}");
+            };
+            assert!(
+                text.contains("recover --clean deleted nothing") && text.contains("STALE"),
+                "{text}"
+            );
+        }
+
+        /// A recorded socket path whose probe fails (a regular file) refuses.
+        #[test]
+        fn recover_refuses_a_recorded_socket_whose_probe_fails() {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(1602);
+            let (_base, sock) = stop_socket_dir();
+            let socket = sock.join("f.sock");
+            plant_stale_launch(dir.path(), phase, &socket, 1);
+            std::fs::write(&socket, b"not a socket").unwrap();
+            let result = refuse_a_live_supervisor(dir.path(), phase, None);
+            let Err(CliError::Message(text)) = result else {
+                panic!("a failed probe must refuse: {result:?}");
+            };
+            assert!(
+                text.contains("recover --clean deleted nothing") && text.contains("probe failed"),
+                "{text}"
+            );
+        }
+
+        /// Controls: a GONE socket, and a STALE one whose group the backstop
+        /// proves gone (a previous boot), let `recover` through.
+        #[test]
+        fn recover_proceeds_over_a_gone_or_provably_dead_socket() {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(1603);
+            let (_base, sock) = stop_socket_dir();
+            let socket = sock.join("g.sock");
+            plant_previous_boot_launch(dir.path(), phase, &socket);
+            let gone = refuse_a_live_supervisor(dir.path(), phase, None);
+            assert!(gone.is_ok(), "a GONE socket is not live: {gone:?}");
+            drop(bind_supervisor_socket(&socket));
+            let stale = refuse_a_live_supervisor(dir.path(), phase, None);
+            assert!(stale.is_ok(), "a previous boot's group is gone: {stale:?}");
         }
     }
 }

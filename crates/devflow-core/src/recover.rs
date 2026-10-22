@@ -1113,8 +1113,11 @@ mod tests {
         drop(guard);
     }
 
+    /// 999.128 (D-08): a lock whose recorded pid is alive with a different
+    /// start time names a holder that exited and whose pid was reused, so the
+    /// explicit clean reclaims it and cleans the phase.
     #[test]
-    fn clean_phase_returns_without_cleanup_for_a_recycled_pid_lock() {
+    fn clean_phase_reclaims_a_recycled_pid_lock_and_cleans() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(50);
@@ -1131,23 +1134,56 @@ mod tests {
             crate::lock::holder_status(root, phase),
             crate::lock::HolderStatus::Recycled { .. }
         ));
+
+        clean_phase(root, phase).expect("a recycled-pid lock must be reclaimed and cleaned");
+
+        for path in paths {
+            assert!(
+                !path.exists(),
+                "cleaning at a recycled-pid lock must remove {}",
+                path.display()
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "the reclaimed lock must be released when the clean's guard drops"
+        );
+    }
+
+    /// Control for the reclaim above: the same hand-written record with the
+    /// observed start time names this live process, so classification (not the
+    /// coordination flock — no guard is held here) must refuse the clean.
+    #[test]
+    fn clean_phase_refuses_a_live_pid_lock_and_cleans_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(50);
+        let paths = write_phase_artifacts(root, phase);
+        let lock_path = crate::lock::lock_path(root, phase);
+        let observed =
+            crate::agent::process_start_time(std::process::id()).expect("test pid start time");
+        std::fs::write(&lock_path, format!("{}\n{}", std::process::id(), observed)).unwrap();
+        assert!(matches!(
+            crate::lock::holder_status(root, phase),
+            crate::lock::HolderStatus::Live { .. }
+        ));
         let mut before = artifact_bytes(&paths);
         before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
 
-        let err = clean_phase(root, phase).expect_err("a recycled-pid lock must be refused");
+        let err = clean_phase(root, phase).expect_err("a live identity-matched lock must refuse");
 
         assert!(
             matches!(
                 err,
                 RecoverError::Lock(crate::lock::LockError::Contended { .. })
             ),
-            "acquisition contention, not read-only classification, controls cleanup: {err:?}"
+            "a live holder must be reported as a lock refusal: {err:?}"
         );
         for (path, contents) in before {
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 contents,
-                "a recycled-pid lock must preserve {}",
+                "a live-pid lock must preserve {}",
                 path.display()
             );
         }

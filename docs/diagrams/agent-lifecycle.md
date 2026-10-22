@@ -1,24 +1,32 @@
 # Agent Lifecycle
 
-Each phase uses a detached monitor so the agent can finish after the invoking
-terminal exits.
+Each stage of a phase runs under a detached supervisor (the hidden `__monitor`
+process) so the agent can finish after the invoking terminal exits. The
+supervisor owns the agent, answers liveness and stop requests on its own
+socket, and when the agent exits runs the advance in-process: no separate
+command is started to advance the phase.
 
 ```mermaid
 sequenceDiagram
     actor User
     participant CLI as devflow
-    participant Monitor
+    participant Sup as Supervisor
     participant Agent
     participant Files as .devflow
+    participant Next as Next supervisor
 
     User->>CLI: start phase 16
     CLI->>Files: write state-16.json
-    CLI->>Monitor: spawn with phase identity
-    Monitor->>Agent: launch stage prompt
-    Agent-->>Monitor: exit
-    Monitor->>Files: stdout, stderr, exit, PID state
-    Monitor->>CLI: advance --phase 16
-    CLI->>Files: archive prior evidence
+    CLI->>Sup: re-exec as __monitor with phase identity
+    Sup->>Agent: launch stage prompt (own process group)
+    Sup-->>CLI: socket published, answers ping
+    CLI->>Files: record the socket in state-16.json
+    Agent-->>Sup: exit
+    Sup->>Files: stdout, stderr, exit, PID state
+    Sup->>Sup: advance in-process, archive prior evidence
+    Sup->>Next: launch the next stage
+    Next-->>Sup: socket published
+    Sup->>Files: record the next socket, then unlink its own
 ```
 
 ## Completion Evidence

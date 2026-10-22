@@ -3,19 +3,17 @@
 //! exits non-zero, and a sweep that cleared nothing does not claim a cleanup.
 //! Each refusal test has a control that must still clean and say so.
 
+mod common;
+
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::state::{AgentKind, State};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A PID that is essentially certain not to map to a live process.
 const DEAD_PID: u32 = 0x7FFF_FFFE;
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 fn init_repo(root: &Path) {
     let output = devflow_core::test_support::git_command(root)
@@ -45,7 +43,8 @@ fn save_state_aged(root: &Path, phase: PhaseId, age_secs: u64) {
 }
 
 fn recover_clean(root: &Path, phase: Option<PhaseId>) -> Output {
-    let mut command = Command::new(devflow_bin());
+    let home = common::HermeticHome::new();
+    let mut command = common::hermetic_devflow(&home);
     command.args(["recover", "--clean"]);
     if let Some(phase) = phase {
         command.args(["--phase", &phase.to_string()]);
@@ -112,6 +111,54 @@ fn explicit_clean_without_a_lock_holder_cleans_and_says_so() {
         "a real clean must say what it cleaned: {text}"
     );
     assert!(!devflow_core::workflow::state_path(root, phase).exists());
+}
+
+/// 999.128 (D-08), R-13: the repair `stop`/`doctor` name at a recycled-pid
+/// gate must work. A lock record naming a live pid whose start time differs
+/// from the recorded one belongs to a holder that exited, so an explicit clean
+/// reclaims it and cleans the phase.
+/// `explicit_clean_with_a_held_phase_lock_fails_and_cleans_nothing` is the
+/// live-holder control.
+#[test]
+fn explicit_clean_at_a_recycled_lock_holder_reclaims_and_cleans() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let phase = PhaseId::new(65);
+    save_state_aged(root, phase, 60);
+    let gate = devflow_core::gates::Gates::write_gate(
+        root,
+        phase,
+        devflow_core::stage::Stage::Code,
+        "wedged at a recycled pid",
+    )
+    .unwrap();
+    // This test process is alive; recording a start time one tick off its
+    // real one makes the record name a process instance that no longer exists.
+    let pid = std::process::id();
+    let start = devflow_core::agent::process_start_time(pid).expect("test pid start time");
+    let lock_path = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    std::fs::write(&lock_path, format!("{pid}\n{}", start.saturating_add(1))).unwrap();
+    assert_eq!(
+        devflow_core::lock::holder_status(root, phase),
+        devflow_core::lock::HolderStatus::Recycled { pid }
+    );
+
+    let output = recover_clean(root, Some(phase));
+
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "a clean at a recycled-pid lock must succeed: {text}"
+    );
+    assert!(
+        text.contains("cleaned up workflow state for phase 65"),
+        "the clean must say what it cleaned: {text}"
+    );
+    assert!(!devflow_core::workflow::state_path(root, phase).exists());
+    assert!(!gate.exists(), "the phase's gate file must be removed");
 }
 
 /// Fix-review finding C-3: `clean_phase` is idempotent, so an explicit clean

@@ -1509,7 +1509,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::validate_gaps_does_not_advance_to_ship";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -1540,7 +1540,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::validate_missing_verdict_does_not_advance";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -1573,7 +1573,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::validate_pass_advances";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -1607,7 +1607,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::external_verify_agreement_advances_to_ship";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -1672,7 +1672,7 @@ mod tests {
             "pipeline_outcomes::tests::external_verify_disagreement_gates_immediately";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -1725,7 +1725,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::external_verify_no_verdict_gates_immediately";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2024,7 +2024,7 @@ mod tests {
             "pipeline_outcomes::tests::grafted_failure_shape_gates_instead_of_shipping";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2100,7 +2100,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::resource_killed_on_code_bumps_infra_failures_not_consecutive_failures";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2147,7 +2147,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::resource_killed_on_validate_bumps_infra_not_consecutive_failures";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2239,7 +2239,7 @@ mod tests {
             "pipeline_outcomes::tests::consecutive_failures_reaches_ceiling_across_cycles";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2306,7 +2306,7 @@ mod tests {
             "pipeline_outcomes::tests::healthy_multi_wave_progress_does_not_reach_the_ceiling";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2375,7 +2375,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::repeated_failure_without_new_commits_still_reaches_the_ceiling";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2566,7 +2566,7 @@ mod tests {
         // CYCLE 2 — `git` runs again and reports the same real count as
         // before. Nothing was committed in between, so this is not progress.
         let path_dir = agent_free_git_only_path_dir();
-        let out = devflow_core::test_support::run_test_in_child(
+        let out = crate::test_support::run_hermetic_test_in_child(
             NAME,
             path_dir.path(),
             &[(ROOT_ENV, root.as_os_str())],
@@ -2638,7 +2638,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::phase_validate_failure_ceiling_gates_despite_trivial_commit_progress";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2722,7 +2722,7 @@ mod tests {
             "pipeline_outcomes::tests::validate_gate_message_leads_with_the_per_phase_total";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2812,7 +2812,7 @@ mod tests {
                 .expect("sh must be resolvable on the parent PATH");
             std::os::unix::fs::symlink(real_sh, path_dir.path().join("sh"))
                 .expect("add sh to the isolated child PATH");
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2879,7 +2879,7 @@ mod tests {
             "pipeline_outcomes::tests::loop_back_reason_is_distinct_when_no_commit_baseline_exists";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -2946,7 +2946,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3035,7 +3035,7 @@ mod tests {
             "pipeline_outcomes::tests::a_passing_validate_at_the_ceiling_explains_why_it_gated";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3122,7 +3122,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::the_ceiling_reset_records_the_total_it_spent";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3209,7 +3209,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::phase_validate_failures_increment_saturates";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3575,7 +3575,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::evaluate_agent_result_with_real_git_and_empty_branch_still_reports_failed";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3631,7 +3631,7 @@ mod tests {
             "pipeline_outcomes::tests::mid_arc_loop_back_issues_plain_execute_command";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3672,7 +3672,7 @@ mod tests {
             "pipeline_outcomes::tests::genuine_gaps_loop_back_still_issues_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3737,7 +3737,7 @@ mod tests {
             "pipeline_outcomes::tests::worktree_mode_genuine_gaps_loop_back_issues_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3814,7 +3814,7 @@ mod tests {
             "pipeline_outcomes::tests::worktree_mode_mid_arc_loop_back_issues_plain_execute";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3870,7 +3870,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -3934,7 +3934,7 @@ mod tests {
             "pipeline_outcomes::tests::stale_verification_artifact_dispatches_full_execute";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4012,7 +4012,7 @@ mod tests {
             "pipeline_outcomes::tests::verification_written_this_run_dispatches_gaps_only";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4273,7 +4273,7 @@ mod tests {
             "pipeline_outcomes::tests::an_uncaptured_baseline_does_not_claim_an_inherited_artifact";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4376,7 +4376,7 @@ mod tests {
             "pipeline_outcomes::tests::an_idempotent_rewrite_is_authored_not_inherited";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4473,7 +4473,7 @@ mod tests {
             "pipeline_outcomes::tests::ambiguous_gate_loop_back_respects_the_mid_arc_check";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4530,7 +4530,7 @@ mod tests {
             "pipeline_outcomes::tests::failure_gate_loop_back_respects_the_mid_arc_check";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4587,7 +4587,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::ship_loop_back_still_issues_gaps_only_when_verification_absent";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4640,7 +4640,7 @@ mod tests {
             "pipeline_outcomes::tests::external_verify_cycles_reach_ceiling_without_unbounded_loop";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4755,7 +4755,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::consecutive_failures_increment_saturates";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -4872,7 +4872,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -5007,7 +5007,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::ship_agent_failed_fires_gate";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -5229,7 +5229,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::handle_ship_outcome_without_yes_ship_writes_gate_but_no_response";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }
@@ -5332,7 +5332,7 @@ mod tests {
             };
             std::os::unix::fs::symlink(resolve("sh"), path_dir.path().join("sh")).unwrap();
             let touch = resolve("touch");
-            let out = devflow_core::test_support::run_test_in_child(
+            let out = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
                 &[(TOUCH_ENV, touch.as_os_str())],
@@ -5419,7 +5419,7 @@ mod tests {
         const NAME: &str = "pipeline_outcomes::tests::stage_failure_retry_cleans_stale_response";
         if !devflow_core::test_support::in_child_test(NAME) {
             let path_dir = agent_free_git_only_path_dir();
-            let out = devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &[]);
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
             return;
         }

@@ -220,6 +220,48 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
+/// The `/proc/<pid>/stat` fields the stale-socket backstop decides on
+/// ([`crate::supervisor::backstop`]): one read gives state, process group,
+/// session and start time together, so they describe the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcStat {
+    /// Field 3, the one-letter state (`R`, `S`, `Z`, ...).
+    pub(crate) state: char,
+    /// Field 5, the process group id.
+    pub(crate) pgrp: i32,
+    /// Field 6, the session id.
+    pub(crate) session: i32,
+    /// Field 22, the start time in clock ticks since boot, as
+    /// [`process_start_time`] reads it.
+    pub(crate) start_time: u64,
+}
+
+/// Read [`ProcStat`] for `pid` from one read of `/proc/<pid>/stat`. `None`
+/// when the file cannot be read or parsed (the process is gone, or this is
+/// not Linux): the fail-closed direction, as for [`process_start_time`].
+pub(crate) fn process_stat_fields(pid: u32) -> Option<ProcStat> {
+    parse_stat_fields(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// [`process_stat_fields`]'s parser. Splits after the FINAL `)`, because
+/// field 2 (comm) may contain spaces and parentheses; after that point field
+/// 3 is index 0, so field 5 is 2, field 6 is 3 and field 22 is 19.
+fn parse_stat_fields(stat: &str) -> Option<ProcStat> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let mut state_chars = fields.first()?.chars();
+    let state = state_chars.next()?;
+    if state_chars.next().is_some() {
+        return None;
+    }
+    Some(ProcStat {
+        state,
+        pgrp: fields.get(2)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
 /// Whether `pid` is the same process instance that recorded `expected_start`.
 ///
 /// The identity check `devflow stop` and friends should use. See
@@ -297,8 +339,15 @@ pub fn process_age(pid: u32) -> Option<std::time::Duration> {
 /// cleanup — cleared on the next invocation — never a missed one.
 pub const STRAY_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Which structural layer of a DevFlow-spawned process tree
+/// Which structural layer of a DevFlow 2.x process tree
 /// [`discover_stray_devflow_processes`] matched a candidate against.
+///
+/// Both layers are 2.x process shapes, and a 3.x binary starts neither
+/// (50-11 deleted the `sh` monitor wrapper and its `devflow advance` child):
+/// the census is kept for 2.x leftovers only. A 3.x supervisor is a
+/// `devflow __monitor` process that this census never matches; `doctor`
+/// finds it through its socket (its supervisor findings), and `devflow stop
+/// --phase N --launch <id>` ends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrayLayer {
     /// The monitor wrapper shell spawned by `monitor::spawn_monitor` — the
@@ -328,12 +377,11 @@ pub struct StrayProcess {
     pub layer: StrayLayer,
 }
 
-/// The monitor wrapper's trap-installation line, copied byte-for-byte from
-/// `monitor::spawn_monitor_inner`'s literal script text (see
-/// `crates/devflow-core/src/monitor.rs`) — not paraphrased or reduced to a
-/// single word, so a reader can grep both files for this exact string to
-/// confirm they still agree. If the wrapper script's text ever changes, this
-/// constant must change with it in the same commit.
+/// The 2.x monitor wrapper's trap-installation line, as its `sh -c` script
+/// carried it. That script no longer exists in this source tree: 50-11
+/// replaced it with the Rust `__monitor` supervisor, so nothing a 3.x binary
+/// starts carries this marker. It is kept, unchanged, so the census can
+/// still recognise a 2.x wrapper left running from before the upgrade.
 const MONITOR_WRAPPER_MARKER: &str = "trap cleanup TERM INT";
 
 /// The devflow CLI binary's name — `crates/devflow-cli/Cargo.toml`'s
@@ -345,10 +393,21 @@ const DEVFLOW_BINARY_NAME: &str = "devflow";
 /// `devflow-cli/src/main.rs`), matched against argv[1] for Layer 2.
 const ADVANCE_SUBCOMMAND: &str = "advance";
 
-/// Census both of DevFlow's orphan-prone process layers directly from the OS
-/// process table — the only remaining discovery surface once a project root
-/// has been deleted off disk, taking every registry entry, lock file and
-/// state file with it (999.44).
+/// Census both of DevFlow 2.x's orphan-prone process layers directly from
+/// the OS process table — for 2.x, the only remaining discovery surface once
+/// a project root has been deleted off disk, taking every registry entry,
+/// lock file and state file with it (999.44).
+///
+/// **2.x-only.** Both matchers name 2.x process shapes (the `sh -c` monitor
+/// wrapper and its trailing `devflow advance` child) that 50-11 deleted, so
+/// this census never matches a process a 3.x binary starts. It is kept for
+/// 2.x leftovers (D-20 keeps none live at install). A 3.x supervisor is
+/// found through its socket instead — `doctor`'s supervisor findings,
+/// including the deleted-root class this census used to cover — and ended
+/// with `devflow stop --phase N --launch <id>`. Do not add a `__monitor`
+/// matcher: a live supervisor's pid is in no reachability safety set, since
+/// the state records no monitor pid (50-22, 50-16), so `--reap-strays` would
+/// treat every live run as a stray.
 ///
 /// This is a pure, read-only survey: it never signals a process. Deciding
 /// whether to act on a result, and re-confirming identity immediately
@@ -543,6 +602,154 @@ pub fn looks_like_devflow_process(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    /// 50-12 (T-50-52): the `/proc` stray census matches only the two 2.x
+    /// shapes 50-11 deleted. Its two matchers still fire (the control), and
+    /// the 3.x supervisor's argv — both launch shapes, laid out as
+    /// `monitor::monitor_args` builds it — matches neither.
+    #[test]
+    fn the_stray_census_matches_only_the_2x_process_shapes() {
+        let wrapper_script = format!("cleanup() {{ :; }}\n{MONITOR_WRAPPER_MARKER}\nclaude -p");
+        assert_eq!(
+            classify_stray_layer(&argv(&["sh", "-c", &wrapper_script])),
+            Some(StrayLayer::MonitorWrapper)
+        );
+        assert_eq!(
+            classify_stray_layer(&argv(&["/x/devflow", "advance", "--phase", "7"])),
+            Some(StrayLayer::AdvanceChild)
+        );
+
+        let plan_shape = argv(&[
+            "/x/devflow",
+            "__monitor",
+            "--project",
+            "/p",
+            "--phase",
+            "7",
+            "--launch",
+            "stream",
+            "--launch-id",
+            "abc",
+        ]);
+        let stream = argv(&[
+            "/x/devflow",
+            "__monitor",
+            "--project",
+            "/p",
+            "--phase",
+            "7",
+            "--stage",
+            "code",
+            "--workdir",
+            "/w",
+            "--agent",
+            "claude",
+            "--launch",
+            "stream",
+            "--socket",
+            "/c/sock/x.sock",
+            "--launch-id",
+            "0123456789abcdef",
+            "--keep-env",
+            "GIT_CONFIG_COUNT",
+            "--prompt-file",
+            "/w/prompt",
+            "--idle-timeout-secs",
+            "60",
+            "--",
+            "claude",
+            "-p",
+        ]);
+        let capture = argv(&[
+            "/x/devflow",
+            "__monitor",
+            "--project",
+            "/p",
+            "--phase",
+            "7",
+            "--stage",
+            "code",
+            "--workdir",
+            "/w",
+            "--agent",
+            "claude",
+            "--launch",
+            "capture",
+            "--socket",
+            "/c/sock/x.sock",
+            "--launch-id",
+            "0123456789abcdef",
+            "--",
+            "claude",
+            "-p",
+        ]);
+        for supervisor in [plan_shape, stream, capture] {
+            assert_eq!(
+                classify_stray_layer(&supervisor),
+                None,
+                "a 3.x supervisor is never a stray: {supervisor:?}"
+            );
+        }
+    }
+
+    /// The doc block directly above the line in `source` (cut at its first
+    /// `mod tests {` line) that starts with `item`: the contiguous `///` and
+    /// `#[` lines above it. `None` when the item is absent.
+    fn doc_block_above(source: &str, item: &str) -> Option<String> {
+        let lines: Vec<&str> = source
+            .lines()
+            .take_while(|line| !line.contains("mod tests {"))
+            .collect();
+        let at = lines.iter().position(|line| line.starts_with(item))?;
+        let block: Vec<&str> = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| {
+                let line = line.trim_start();
+                line.starts_with("///") || line.starts_with("#[")
+            })
+            .copied()
+            .collect();
+        Some(block.into_iter().rev().collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Whether the doc block above `item` in `source` says the census is
+    /// 2.x-only; the reason when it does not.
+    fn census_doc_names_2x(source: &str, item: &str) -> Result<(), String> {
+        let doc = doc_block_above(source, item).ok_or_else(|| format!("{item} not found"))?;
+        if doc.contains("2.x") {
+            Ok(())
+        } else {
+            Err(format!("the doc above {item} does not name 2.x:\n{doc}"))
+        }
+    }
+
+    /// 50-12 R6-G4 (T-50-52): while the 2.x census exists, its docs must say
+    /// it matches only 2.x processes, so nobody reads it as covering 3.x.
+    /// The planted controls run the same extractor.
+    #[test]
+    fn the_stray_census_docs_say_it_is_2x_only() {
+        let planted = "/// Lists strays.\n#[derive(Debug)]\npub enum StrayLayer {";
+        assert!(census_doc_names_2x(planted, "pub enum StrayLayer").is_err());
+        let named = "/// Lists 2.x strays.\n#[derive(Debug)]\npub enum StrayLayer {";
+        assert_eq!(census_doc_names_2x(named, "pub enum StrayLayer"), Ok(()));
+        assert!(census_doc_names_2x("fn other() {}", "pub enum StrayLayer").is_err());
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent.rs"),
+        )
+        .expect("read src/agent.rs");
+        for item in [
+            "pub enum StrayLayer",
+            "pub fn discover_stray_devflow_processes",
+        ] {
+            assert_eq!(census_doc_names_2x(&source, item), Ok(()));
+        }
+    }
 
     #[test]
     fn agent_running_detects_self() {
@@ -1023,5 +1230,34 @@ mod tests {
             second >= first,
             "age must grow monotonically across a sleep, never shrink"
         );
+    }
+
+    #[test]
+    fn stat_fields_parse_after_the_last_paren_and_reject_a_short_line() {
+        // comm carries spaces and a ") (" so a naive split would misread
+        // every field after it. Fields after comm: state R, ppid 1, pgrp
+        // 4242, session 4100, then 15 filler fields, then start time 98765.
+        let filler = "0 ".repeat(15);
+        let line = format!("4242 (a) (b c) R 1 4242 4100 {filler}98765 0 0");
+        assert_eq!(
+            parse_stat_fields(&line),
+            Some(ProcStat {
+                state: 'R',
+                pgrp: 4242,
+                session: 4100,
+                start_time: 98_765,
+            })
+        );
+        // Control: a line cut before field 22 is not a stat.
+        assert_eq!(parse_stat_fields("4242 (a) R 1 4242 4100 0 0"), None);
+        // And the live file agrees with process_start_time for this process.
+        #[cfg(target_os = "linux")]
+        {
+            let me = std::process::id();
+            let stat = process_stat_fields(me).expect("read this process's own stat");
+            assert_eq!(Some(stat.start_time), process_start_time(me));
+            // SAFETY: getpgrp has no preconditions and cannot fail.
+            assert_eq!(stat.pgrp, unsafe { libc::getpgrp() });
+        }
     }
 }

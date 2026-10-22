@@ -49,3 +49,28 @@ reason = "Named in the unattended-mode guide as a flag that does NOT exist (D-09
 kind = "docs_to_source"
 token = "DEVFLOW_ALLOW_OFF_WORKTREE"
 reason = "Read by scripts/lint-phase-worktree.sh (the pre-commit phase-worktree guard), not by Rust source."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_MONITOR_ARGV"
+reason = "Test-only: carries the __monitor argv to the CLI #[cfg(test)] monitor harness entries (set by MonitorExec::HarnessEntry, test-support feature only); no release build reads it, so it is not an operator setting (Phase 50, plan 50-10)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_MONITOR_FULL"
+reason = "Test-only: selects the advance-running monitor harness entry for #[cfg(test)] stage launches in the CLI own unit tests; no release build reads it, so it is not an operator setting (Phase 50, plan 50-10)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_HOLD"
+reason = "Test-only: #[cfg(test)] hold points in the devflow-core monitor (50-24) and the CLI stage handoff (50-13, 50-23) wait while it names <point>:<path> and that path does not exist, so tests can land a fault in a chosen window; compiled out of release builds, so it is not an operator setting."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_STOPPED_OUTCOME_HOLD"
+reason = "Test-only: under the devflow-core test-support feature, Supervisor::wait_agent waits while it names a path that does not exist, after a stopped agent exits and before the stopped outcome is decided, so a CLI test can order that decision against the next stage's publish; compiled out of release builds, so it is not an operator setting (Phase 50, plan 50-23)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_STREAM_WAIT_HOLD"
+reason = "Test-only: under the devflow-core test-support feature, run_supervised_stage waits while it names a path that does not exist, or until a stop is requested, after a stream agent's exit is recorded and before its stream threads are waited for; compiled out of release builds, so it is not an operator setting (Phase 50, plan 50-26)."

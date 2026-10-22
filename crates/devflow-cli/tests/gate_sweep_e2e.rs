@@ -9,18 +9,15 @@
 //! `release_check.rs`) — this drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
+mod common;
+
 use devflow_core::gates::{GateAction, GateFile, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Hermetic `git` invocation for fixture setup (999.37) — never a bare
 /// `Command::new("git")`.
@@ -162,6 +159,7 @@ const AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
 /// it up and resolves to `GateAction::Abort`.
 #[test]
 fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(91);
@@ -184,7 +182,7 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     std::thread::scope(|scope| {
         let poller = scope.spawn(move || Gates::poll_response(root, phase, stage, 30));
 
-        let output = Command::new(devflow_bin())
+        let output = common::hermetic_devflow(&home)
             .args(["gate", "sweep", "--root"])
             .arg(root)
             .output()
@@ -216,6 +214,7 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
 /// change.
 #[test]
 fn sweep_leaves_a_fresh_gate_untouched() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(92);
@@ -224,7 +223,7 @@ fn sweep_leaves_a_fresh_gate_untouched() {
     // Freshly written — `unix_now()`'s age is ~0s, well under the 6h default.
     Gates::write_gate(root, phase, stage, "review gaps").unwrap();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["gate", "sweep", "--root"])
         .arg(root)
         .output()
@@ -254,7 +253,8 @@ fn sweep_leaves_a_fresh_gate_untouched() {
 /// in the subcommand's own `--help`.
 #[test]
 fn sweep_help_documents_max_age_and_dry_run() {
-    let output = Command::new(devflow_bin())
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
         .args(["gate", "sweep", "--help"])
         .output()
         .expect("run devflow gate sweep --help");
@@ -283,6 +283,7 @@ fn sweep_help_documents_max_age_and_dry_run() {
 /// OS process via `Command::new`, not driven in-process on a thread.
 #[test]
 fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
@@ -300,7 +301,7 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     // block for `gate_timeout_secs()`'s multi-day production default.
     // Set per-`Command` via `.env(...)`, not via a process-global env
     // mutation (999.37) — so this cannot race any other test.
-    let mut child = Command::new(devflow_bin())
+    let mut child = common::hermetic_devflow(&home)
         .args(["advance", "--phase", &phase.to_string()])
         .arg(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
@@ -370,4 +371,222 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     // mechanically by this file's own acceptance grep for signalling call
     // forms (must be zero), not asserted at runtime — there is no API
     // surface here that could send one.
+}
+
+// ---------------------------------------------------------------------------
+// 50-03 (999.141, T-50-05): the machine-wide stray pass stays dry-run in every
+// suite on the hermetic builder.
+//
+// `gate sweep --reap-strays` scans the whole machine's `/proc` and reaps every
+// DevFlow-shaped process the caller owns, sparing only the ones the registry
+// knows about. On `common::hermetic_devflow` the registry holds nothing but
+// the test's own roots, so a real (non-dry-run) pass from a test would treat
+// every live run on the developer's machine as a stray. This scan refuses one.
+// ---------------------------------------------------------------------------
+
+/// The `"--reap-strays"` argument literal, quotes included. Spelled through
+/// `concat!` split inside the token so this file's own source never holds it.
+const REAP_STRAYS_LITERAL: &str = concat!("\"--reap-", "strays\"");
+
+/// The `"--dry-run"` argument literal, quotes included, spelled the same way.
+const DRY_RUN_LITERAL: &str = concat!("\"--dry-", "run\"");
+
+/// `src` with every `//` comment (line, doc and trailing) removed. A `//`
+/// inside a string, raw string or char literal is not a comment. A local copy
+/// of `test_home_isolation.rs`'s scanner: integration test binaries cannot
+/// share private helpers, and `common/mod.rs` holds no scan code.
+fn code_only(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut index = 0;
+    while index < chars.len() {
+        index = match chars[index] {
+            '/' if chars.get(index + 1) == Some(&'/') => skip_to_line_end(&chars, index),
+            '"' => copy_string(&chars, index, &mut out),
+            'r' if raw_string_hashes(&chars, index).is_some() => {
+                copy_raw_string(&chars, index, &mut out)
+            }
+            '\'' => copy_char_or_lifetime(&chars, index, &mut out),
+            other => {
+                out.push(other);
+                index + 1
+            }
+        };
+    }
+    out
+}
+
+fn skip_to_line_end(chars: &[char], mut index: usize) -> usize {
+    while index < chars.len() && chars[index] != '\n' {
+        index += 1;
+    }
+    index
+}
+
+/// Copies a `"…"` literal starting at `start`, honouring `\` escapes.
+fn copy_string(chars: &[char], start: usize, out: &mut String) -> usize {
+    out.push('"');
+    let mut index = start + 1;
+    while index < chars.len() {
+        out.push(chars[index]);
+        match chars[index] {
+            '\\' if index + 1 < chars.len() => {
+                out.push(chars[index + 1]);
+                index += 2;
+            }
+            '"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The `#` count of a raw string (`r"`, `r#"`, `br"`…) starting at the `r` at
+/// `index`, or `None` when that `r` is part of an identifier or not followed
+/// by `#*"`.
+fn raw_string_hashes(chars: &[char], index: usize) -> Option<usize> {
+    let before = index.checked_sub(1).map(|i| chars[i]);
+    let prefix_ok = match before {
+        None => true,
+        Some('b') => index < 2 || !is_ident_char(chars[index - 2]),
+        Some(c) => !is_ident_char(c),
+    };
+    if !prefix_ok {
+        return None;
+    }
+    let hashes = chars[index + 1..].iter().take_while(|&&c| c == '#').count();
+    (chars.get(index + 1 + hashes) == Some(&'"')).then_some(hashes)
+}
+
+fn copy_raw_string(chars: &[char], start: usize, out: &mut String) -> usize {
+    let hashes = raw_string_hashes(chars, start).expect("caller checked the raw-string opener");
+    let body = start + 2 + hashes;
+    out.extend(&chars[start..body]);
+    let mut index = body;
+    while index < chars.len() {
+        let closes = chars[index] == '"'
+            && chars[index + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|&&c| c == '#')
+                .count()
+                == hashes;
+        if closes {
+            out.extend(&chars[index..=index + hashes]);
+            return index + hashes + 1;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    index
+}
+
+/// Copies a char literal (`'x'`, `'\''`, `'\u{1F600}'`) or, for a lifetime
+/// or label, only its quote.
+fn copy_char_or_lifetime(chars: &[char], start: usize, out: &mut String) -> usize {
+    let end = if chars.get(start + 1) == Some(&'\\') {
+        chars
+            .get(start + 2..)
+            .unwrap_or_default()
+            .iter()
+            .position(|&c| c == '\'')
+            .map(|offset| start + 2 + offset)
+    } else if chars.get(start + 2) == Some(&'\'') {
+        Some(start + 2)
+    } else {
+        None
+    };
+    match end {
+        Some(end) => {
+            out.extend(&chars[start..=end]);
+            end + 1
+        }
+        None => {
+            out.push('\'');
+            start + 1
+        }
+    }
+}
+
+/// The `;`-separated statements of comment-stripped `code` that pass
+/// `"--reap-strays"` without `"--dry-run"`, trimmed. A test that adds
+/// `--dry-run` in a separate statement is flagged too: the conservative
+/// direction.
+fn real_reap_strays_statements(code: &str) -> Vec<String> {
+    code.split(';')
+        .filter(|statement| {
+            statement.contains(REAP_STRAYS_LITERAL) && !statement.contains(DRY_RUN_LITERAL)
+        })
+        .map(|statement| statement.trim().to_string())
+        .collect()
+}
+
+#[test]
+fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
+    // (1) Planted controls: a real pass is flagged, a dry-run pass and a
+    // commented-out real pass are not.
+    let planted = concat!(
+        "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
+        "strays\"]).output();"
+    );
+    assert_eq!(
+        real_reap_strays_statements(&code_only(planted)).len(),
+        1,
+        "a planted real --reap-strays pass must be flagged"
+    );
+    let planted_dry_run = concat!(
+        "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
+        "strays\", \"--dry-",
+        "run\"]).output();"
+    );
+    assert_eq!(
+        real_reap_strays_statements(&code_only(planted_dry_run)),
+        Vec::<String>::new(),
+        "a planted --reap-strays pass with --dry-run must pass"
+    );
+    let commented = format!("// {planted}\n");
+    assert_eq!(
+        real_reap_strays_statements(&code_only(&commented)),
+        Vec::<String>::new(),
+        "a commented-out real --reap-strays pass must pass"
+    );
+
+    // (2) Every suite directly under `tests/` that declares `mod common;`;
+    // this file always does.
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut paths: Vec<_> = std::fs::read_dir(&tests_dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", tests_dir.display()))
+        .map(|entry| entry.expect("read tests dir entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    paths.sort();
+    let mut scanned = 0;
+    let mut offenders = Vec::new();
+    for path in paths {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let code = code_only(&source);
+        if !code.lines().any(|line| line.trim() == "mod common;") {
+            continue;
+        }
+        scanned += 1;
+        for statement in real_reap_strays_statements(&code) {
+            offenders.push(format!("{}: {statement}", path.display()));
+        }
+    }
+    assert!(
+        scanned > 0,
+        "no suite under {} declares `mod common;`, so the scan checked nothing",
+        tests_dir.display()
+    );
+    assert!(
+        offenders.is_empty(),
+        "a suite on the hermetic builder runs a real (non-dry-run) --reap-strays pass, \
+         whose safety set would shrink to the test's own roots:\n{}",
+        offenders.join("\n")
+    );
 }
