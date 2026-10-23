@@ -504,6 +504,15 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
      launch proceeds.
   2. In both cases, neither `status` nor `stop` suggests `devflow resume` while that supervisor is
      live; each names the repair that addresses it.
+  3. Every state write goes through one durable helper: a short flock, a re-read, the change, then fsync of the
+     file and of its directory. A source-scan test fails on any other write path, and no gate wait holds a lock.
+  4. A gate answer decides only the gate it names. An answer with a missing id, or another gate's id, is refused
+     loudly and left on disk. `resume` re-opens a still-pending gate under the same id, so a late answer still
+     works. Each stale-answer path (AR-48-04, the T-48-12-05 caveat) has a failing-then-passing test. A Supervise
+     re-scan rejection waits for its own follow-on answer.
+  5. A supervisor whose launch id is not the recorded one writes no state and logs why.
+  6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
+     Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
 **Plans:** 0 plans
 
