@@ -1346,6 +1346,26 @@ fails when wsx returns an error exit code, and devflow's suite passes with wsx o
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.169: The Plan Bashism Linter Cuts Its Report Off Under a Long Checkout Path (BACKLOG)
+
+**Found:** 2026-10-22, testing the `chore(lint)` PR to develop from a scratch worktree. **Reproduced.**
+
+**Defect:** `scripts/lint-plan-bashisms.sh` prints each refusal through `cut -c1-200` (since `3d7f723`, 2026-09-06),
+and each line starts with the plan's absolute path. With a ~150-character checkout path the offending text is cut
+off (`${PIPESTATUS` instead of `${PIPESTATUS[0]}`), and the `unterminated … block` text disappears. The refusal still
+happens; only the report loses the part that says what to fix. The same commit passes 33/33 scanner tests from the
+main checkout and fails 2 (`double_quoted_bash_c_is_blocked`, `unterminated_block_is_reported_as_malformed`) from
+`/tmp/claude-1000/<project>/<session>/scratchpad/wt-lint`.
+
+**Done when:** the length bound applies to the reported text, not the whole line, and a scanner test running from a
+fixture copied under a 200+ character directory still finds file and offending text on one line.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
