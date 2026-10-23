@@ -1285,6 +1285,10 @@ Item 3 was reproduced on 2026-10-21 and fixed in Phase 50 by operator decision; 
    sends a "Ship gate awaiting" message for a gate withdrawn at once; ARCHITECTURE.md says the stream reader "stops reading"
    and "at most 3 s" while the code keeps draining and the bound can reach 6 s; the safe-point-6 comment says "a resumed run
    asks again" although a saved `yes_ship` auto-approves the resumed Ship.
+9. (Phase 50 re-verification, 2026-10-23, info) One zombie-blind liveness probe survived the close-out fix: the test
+   `a_supervisor_that_fails_to_publish_ends_its_agent_group` (`monitor.rs`, around line 6235) waits for `kill(agent, 0)` to
+   return ESRCH, which a zombie never does. It passed under a non-reaping PID 1 locally (2026-10-22), and CI's `--init`
+   reaps today, so it is latent. Fix: `test_support::process_is_live(agent)`, as every other probe now uses.
 
 **Done when:** each item is fixed with a test that fails before the fix, or explicitly accepted with a reason.
 
