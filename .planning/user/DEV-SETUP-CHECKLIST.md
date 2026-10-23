@@ -268,7 +268,9 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[PROJECT]** `.github/dependabot.yml`: one grouped weekly PR against `develop` for GitHub Actions
   versions only. No Cargo version-update PRs (each would run the full container CI; `cargo deny`
   covers advisories) and no devcontainer-image updates (three files must match; bumped by hand).
-  Automatic security-fix PRs are **off** (a repo setting, not a file).
+  Automatic security-fix PRs are **on** (a repo setting, not a file; enabled 2026-10-23). They always
+  target the default branch and ignore `target-branch`, which is safe only while `develop` is the
+  default (§2).
 - [ ] **[PATTERN]** **Any container job whose `run:` steps use bash syntax must declare
   `shell: bash`.** GitHub defaults a `run:` step to `bash -e {0}` only on a *bare runner*; inside
   a `container:` job it is `sh -e {0}`, and these Debian images ship dash as `/bin/sh`. So
