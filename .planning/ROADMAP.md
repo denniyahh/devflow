@@ -500,17 +500,25 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
      `devflow start` and `devflow resume` refuse over it even when the state file loads. Each case
      from Phase 50's crash table has its own fixture: the launcher dies during its publish wait
      (`50-CRASH-TABLE.md` row A7, T-50-90), and stage N's supervisor dies after spawning N+1 and
-     before saving N+1's record (row C4, T-50-91). Negative control: with no such supervisor, the
-     launch proceeds.
+     before saving N+1's record (row C4, T-50-91). In each fixture the refusal must not come from the
+     agent pid file (hold the supervisor before agent spawn, or end the agent). Negative controls: with
+     no such supervisor the launch proceeds, and an abandoned reservation (spawn failed, nothing live)
+     does not block a launch.
   2. In both cases, neither `status` nor `stop` suggests `devflow resume` while that supervisor is
-     live; each names the repair that addresses it.
-  3. Every state write goes through one durable helper: a short flock, a re-read, the change, then fsync of the
-     file and of its directory. A source-scan test fails on any other write path, and no gate wait holds a lock.
+     live; each names the repair that addresses it. Negative control: once it is GONE, `status`
+     suggests `resume`.
+  3. Every state change goes through a short flock and a re-read. State and gate files are replaced, published
+     (first-wins) or removed only through durable helpers that fsync the file and its directory. A source-scan
+     test fails on any other write, rename, link or removal, and a planted bypass must fail it. A test shows that
+     no gate wait holds the write lock, and a control that holds it across the wait must fail that test.
   4. A gate answer decides only the gate it names. An answer with a missing id, or another gate's id, is refused
-     loudly and left on disk. `resume` re-opens a still-pending gate under the same id, so a late answer still
-     works. Each stale-answer path (AR-48-04, the T-48-12-05 caveat) has a failing-then-passing test. A Supervise
-     re-scan rejection waits for its own follow-on answer.
-  5. A supervisor whose launch id is not the recorded one writes no state and logs why.
+     loudly and set aside under a quarantine name. It is never consumed and never silently deleted, and a valid
+     answer to the live gate is then accepted. A `resume` rerun opens a new gate id and reports any unused answer
+     to the old one. A late Ship answer still works through `devflow ship`. Each stale-answer path (AR-48-04, the
+     T-48-12-05 caveat) has a failing-then-passing test. A Supervise re-scan rejection waits for its own follow-on
+     answer.
+  5. A supervisor whose launch id is not the recorded one consumes no gate answer and writes no state, ack or gate
+     cleanup. It ends its agent group and logs why. Negative control: the recorded supervisor writes normally.
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
