@@ -5,5 +5,5 @@ does run under bash. A scanner that rejected this would make plan authoring impo
 and would satisfy every must-fail case here.
 
 <verify>
-  <automated>bash -c 'cargo test 2>&1 | tail -3; echo "x=${PIPESTATUS[0]}"'</automated>
+  <automated>bash -c 'cargo build 2>&1 | tail -3; echo "x=${PIPESTATUS[0]}"'</automated>
 </verify>

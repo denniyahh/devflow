@@ -488,56 +488,218 @@ fn assert_inline_accepted(file_name: &str, contents: &str) {
     );
 }
 
-/// `rg -c` prints nothing and exits 1 when nothing matches, so piping it into
-/// `rg '^0$'` can never observe the zero it claims to check.
+/// Wrap one command in a single `<automated>` block.
+fn gate(command: &str) -> String {
+    format!("<verify>\n  <automated>{command}</automated>\n</verify>\n")
+}
+
+/// `rg -c` prints nothing and exits 1 when nothing matches, so a count compared
+/// in shell misreads the zero case. The old `| rg '^0$'` shape is still caught.
 #[test]
 fn rg_count_piped_to_zero_match_is_blocked() {
     assert_inline_blocked(
         "rg-count-zero-PLAN.md",
-        "<verify>\n  <automated>rg -c needle src/lib.rs | rg '^0$'</automated>\n</verify>\n",
-        "rg -c ... | rg '^0$' trap",
+        &gate("rg -c needle src/lib.rs | rg '^0$'"),
+        "rg count flag -c",
     );
 }
 
-/// `devflow` is binary-only, so `cargo test -p devflow --lib` selects no target
-/// and verifies nothing.
 #[test]
-fn devflow_lib_target_is_blocked() {
+fn rg_count_in_a_flag_cluster_is_blocked() {
     assert_inline_blocked(
-        "devflow-lib-PLAN.md",
-        "<verify>\n  <automated>cargo test -p devflow --lib stop::tests::x</automated>\n</verify>\n",
-        "cargo test -p devflow --lib verifies nothing",
+        "rg-count-cluster-PLAN.md",
+        &gate("test \"$(rg -nc needle src/lib.rs)\" = 3"),
+        "rg count flag -nc",
     );
 }
 
-/// Negative control for the `--lib` rule: `devflow-core` has a library target,
-/// and its package name merely starts with `devflow`.
 #[test]
-fn devflow_core_lib_target_is_accepted() {
-    assert_inline_accepted(
-        "devflow-core-lib-PLAN.md",
-        "<verify>\n  <automated>cargo test -p devflow-core --lib verify::tests::parser -- --exact</automated>\n</verify>\n",
-    );
-}
-
-/// A bare name after `--exact` matches no test inside a module, and
-/// `cargo test` still exits 0.
-#[test]
-fn bare_test_name_after_exact_is_blocked() {
+fn rg_count_matches_is_blocked() {
     assert_inline_blocked(
-        "exact-bare-name-PLAN.md",
-        "<verify>\n  <automated>cargo test -p devflow-core --lib -- --exact holder_status</automated>\n</verify>\n",
-        "cargo test --exact bare-name trap",
+        "rg-count-matches-PLAN.md",
+        &gate("rg --count-matches -F needle src/lib.rs || true"),
+        "rg count flag --count-matches",
     );
 }
 
-/// Negative control for the bare-name rule: a libtest flag after `--exact` is
-/// not a test name. The rule once read `--nocapture` as one and refused
-/// correct plans.
+/// Negative control for the count rule: `-c` as the value of `-e`, inside a
+/// quoted pattern, and the context flags `-C`/`-A` are not counts.
 #[test]
-fn libtest_flag_after_exact_is_accepted() {
+fn rg_without_a_count_flag_is_accepted() {
     assert_inline_accepted(
-        "exact-then-flag-PLAN.md",
-        "<verify>\n  <automated>cargo test -p devflow --bin devflow lock::tests::holder_status -- --exact --nocapture</automated>\n</verify>\n",
+        "rg-no-count-PLAN.md",
+        &gate("rg -q -e '-c' f && ! rg -n \"bash -c\" g && rg -C 2 x f && rg -A1 -e x f"),
+    );
+}
+
+/// A `cargo test` name filter that matches nothing still exits 0, including a
+/// bare name after `--exact` and a filter on a package with no lib target.
+#[test]
+fn cargo_test_in_a_gate_is_blocked() {
+    for (file, command) in [
+        (
+            "cargo-test-suite-PLAN.md",
+            "cargo test -p devflow-core --lib",
+        ),
+        (
+            "exact-bare-name-PLAN.md",
+            "cargo test -p devflow-core --lib -- --exact holder_status",
+        ),
+        (
+            "devflow-lib-PLAN.md",
+            "cargo test -p devflow --lib stop::tests::x",
+        ),
+        (
+            "cargo-test-toolchain-PLAN.md",
+            "cargo +1.97.1 test -p devflow --bin devflow lock::tests::x",
+        ),
+    ] {
+        assert_inline_blocked(file, &gate(command), "cargo test in a verify gate");
+    }
+}
+
+#[test]
+fn nextest_without_no_tests_fail_is_blocked() {
+    assert_inline_blocked(
+        "nextest-no-fail-PLAN.md",
+        &gate("cargo nextest run -p devflow-core --lib -E 'test(=a::b)'"),
+        "without --no-tests=fail",
+    );
+}
+
+/// `-E 'test(=real) | test(=wrong)'` runs the real test, skips the wrong name
+/// silently and exits 0 (verified on cargo-nextest 0.9.148).
+#[test]
+fn nextest_filter_naming_two_tests_is_blocked() {
+    assert_inline_blocked(
+        "nextest-pipe-PLAN.md",
+        &gate(
+            "cargo nextest run -p devflow-core --lib --no-tests=fail -E 'test(=a::b) | test(=c::d)'",
+        ),
+        "filter is not exactly test(=module::path::name)",
+    );
+}
+
+#[test]
+fn nextest_with_two_filter_flags_is_blocked() {
+    assert_inline_blocked(
+        "nextest-two-e-PLAN.md",
+        &gate(
+            "cargo nextest run -p devflow-core --lib --no-tests=fail -E 'test(=a::b)' -E 'test(=c::d)'",
+        ),
+        "with 2 test filters",
+    );
+}
+
+#[test]
+fn nextest_substring_filter_is_blocked() {
+    assert_inline_blocked(
+        "nextest-substring-PLAN.md",
+        &gate("cargo nextest run -p devflow-core --lib --no-tests=fail -E 'test(a::b)'"),
+        "filter is not exactly test(=module::path::name)",
+    );
+}
+
+#[test]
+fn nextest_positional_filters_are_blocked() {
+    for (file, command) in [
+        (
+            "nextest-positional-PLAN.md",
+            "cargo nextest run -p devflow-core --lib --no-tests=fail a::b",
+        ),
+        (
+            "nextest-dashdash-PLAN.md",
+            "cargo nextest run -p devflow-core --lib --no-tests=fail -- --exact a::b",
+        ),
+    ] {
+        assert_inline_blocked(file, &gate(command), "positional test filter");
+    }
+}
+
+/// The rules read the command inside a `bash -c '...'` region too, where its
+/// own quotes are double quotes.
+#[test]
+fn nextest_inside_bash_c_without_no_tests_fail_is_blocked() {
+    assert_inline_blocked(
+        "nextest-bash-c-PLAN.md",
+        &gate(
+            "bash -c 'cargo nextest run -p devflow-core --lib -E \"test(=a::b)\" 2>&1 | tail -3; echo \"x=${PIPESTATUS[0]}\"'",
+        ),
+        "without --no-tests=fail",
+    );
+}
+
+#[test]
+fn devflow_cli_package_is_blocked() {
+    assert_inline_blocked(
+        "devflow-cli-package-PLAN.md",
+        &gate("cargo nextest run -p devflow-cli --lib --no-tests=fail -E 'test(=a::b)'"),
+        "-p devflow-cli names no package",
+    );
+}
+
+/// A quote that never closes leaves the command undecidable; refuse it.
+#[test]
+fn unparsable_command_is_blocked() {
+    assert_inline_blocked(
+        "nextest-unbalanced-PLAN.md",
+        &gate("cargo nextest run -p devflow-core --lib --no-tests=fail -E 'test(=a::b)"),
+        "cannot parse this cargo command",
+    );
+}
+
+/// An escaped quote inside double quotes does not end them, so the command is
+/// still read and its count flag found.
+#[test]
+fn escaped_quote_inside_double_quotes_is_parsed() {
+    assert_inline_blocked(
+        "rg-escaped-quote-PLAN.md",
+        &gate("bash -c 'n=$(rg -U --count-matches \"token = \\\"$t\\\"\" f || true)'"),
+        "rg count flag --count-matches",
+    );
+    assert_inline_accepted(
+        "rg-escaped-quote-ok-PLAN.md",
+        &gate("bash -c 'rg -q \"token = \\\"$t\\\"\" f'"),
+    );
+}
+
+/// The form the rules ask for: one exact test per command, chained with `&&`.
+#[test]
+fn exact_nextest_commands_chained_are_accepted() {
+    assert_inline_accepted(
+        "nextest-chain-PLAN.md",
+        &gate(
+            "cargo nextest run -p devflow --bin devflow --no-tests=fail -E 'test(=lock::tests::holder_status)' && cargo nextest run -p devflow-core --lib --no-tests=fail -E 'test(=verify::tests::parser)'",
+        ),
+    );
+}
+
+/// A whole suite with no filter, the spaced `--no-tests fail` form, and the `2`
+/// of `2>&1`, which is a file descriptor and not a positional filter.
+#[test]
+fn nextest_suite_run_is_accepted() {
+    assert_inline_accepted(
+        "nextest-suite-PLAN.md",
+        &gate("cargo nextest run -p devflow --test start_lock_e2e --no-tests fail 2>&1"),
+    );
+}
+
+#[test]
+fn exact_nextest_inside_bash_c_is_accepted() {
+    assert_inline_accepted(
+        "nextest-bash-c-ok-PLAN.md",
+        &gate(
+            "bash -c 'cargo nextest run -p devflow-core --lib --no-tests=fail -E \"test(=a::b)\" 2>&1 | tail -3; echo \"x=${PIPESTATUS[0]}\"'",
+        ),
+    );
+}
+
+/// The rules read only `<automated>` blocks: plan prose may name the shapes.
+#[test]
+fn command_shapes_in_prose_are_accepted() {
+    assert_inline_accepted(
+        "prose-PLAN.md",
+        "Prose: cargo test -p devflow-core --lib and rg -c x are refused in gates.\n\
+         <verify>\n  <automated>cargo fmt --check</automated>\n</verify>\n",
     );
 }
