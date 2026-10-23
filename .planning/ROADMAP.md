@@ -1654,6 +1654,17 @@ session file. The dump is test-only: in non-test builds the closure is never inv
 (`probe_proc_snapshot_separates_a_live_process_from_a_reaped_one`) keeps a future snapshot from silently
 reading `GONE` for everything.
 
+**First dump, 2026-10-23** (PR #227 `pull_request` run 39936879679, devcontainer job, head `b8e7a3b`; the
+`push` run of the same commit passed). Test `spawn_with_timeout_kills_a_silent_same_group_descendant_after_parent_exit`:
+`still running 19.966µs after spawn_with_timeout returned`, `polls: 0 x 20ms`; kill path = group kill reached the group;
+survivor before `State=R PPid=1 cmdline=[<empty>]`; survivor after `GONE`; leader group `<no members left>`.
+This **contradicts the leading hypothesis**: the 2-second window never ran. Zero polls means the loop's first
+`agent_running(pid)` returned false, and the re-sample a few µs later returned true, then the pid vanished. The empty
+cmdline fits a process already in exit. New lead (UNTESTED): `agent_running` returns true for any `/proc/<pid>/status`
+read error other than NotFound ("cannot tell"); a read racing the reap of a dying task may fail with such an error and
+read as alive. Separately, the assertion samples liveness twice (loop condition, then `still_running`), so a
+non-monotonic answer fails it at zero polls. Next step: log the status read's error kind in the dump.
+
 **Fix shape:** not decided — the cause is unknown. Next step is evidence, not a patch: read the dump
 from the next natural full-gate failure, or force it with ~15 repeated full-gate runs (~1 h).
 
