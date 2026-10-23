@@ -1,6 +1,6 @@
 ---
 phase: 47-unattended-decision-policy-consistency
-verified: 2026-10-23T10:29:42Z
+verified: 2026-10-23T17:30:56Z
 status: passed
 score: 39/39 must-haves verified
 covered_files:
@@ -47,7 +47,7 @@ covered_files:
   - "scripts/check.sh"
   - "scripts/lint-phase-worktree.sh"
   - "scripts/test-phase-worktree-guard.sh"
-covered_digest: "v3:sha256:c8f7c0c279032dd4b04913c59f3b7018ef09e464c6f25a5dff665f3e5a9b56a6"
+covered_digest: "v3:sha256:47886e5ad42105aaa4d3ceea3203ed6d985f91c4e02cd8d32b446feb1d35f9af"
 behavior_unverified: 0
 overrides_applied: 1
 overrides:
@@ -58,8 +58,8 @@ overrides:
 re_verification:
   previous_status: passed
   previous_score: 39/39
-  previous_verified_at: 3ff1e2a
-  reason: "stale: commit 2607591 added 16 lines to .planning/user/DEV-SETUP-CHECKLIST.md (a gitleaks repo-hook entry in section 3; scheduled-deps and Dependabot entries in section 4); no other covered file changed since 3ff1e2a. The 7-line section-3 insertion moves row 07-6's citations from :125 and :127-140 to :132 and :134-147; the cited text is unchanged"
+  previous_verified_at: 420faf1
+  reason: "stale: commit 817f4ca rewrote one line in section 4 of .planning/user/DEV-SETUP-CHECKLIST.md (Dependabot automatic security-fix PRs off -> on; line 271 became 271-273, +3/-1); no other covered file changed since 420faf1. The edit sits after every checklist line this report cites, so row 07-6's citations stay at :132 and :134-147 with unchanged text"
   gaps_closed: []
   gaps_remaining: []
   regressions: []
@@ -72,11 +72,22 @@ deferred:
 # Phase 47: Unattended Decision Policy Consistency Verification Report
 
 **Phase Goal:** An unattended agent receives the same merit-based decision instruction everywhere it is asked to make a Code-stage decision (including the claude, opencode, hermes and antigravity Validate loop-back), and is never handed two contradictory instructions about who may resolve a `blocking-human` gate inside one resumed session.
-**Verified:** 2026-10-23T10:29:42Z against HEAD `2607591` on `workspace/denniyahh` (delta re-verification of the 10:27:37Z report, committed in `3ff1e2a`)
+**Verified:** 2026-10-23T17:30:56Z against HEAD `817f4ca` on `workspace/denniyahh` (delta re-verification of the 10:29:42Z report, committed in `420faf1`)
 **Status:** passed
-**Re-verification:** Yes, three times on 2026-10-23. The 10:17:44Z report (`passed`, 39/39) re-checked every must-have against `91d7064` after phases 48-50 made the 2026-09-13 report stale. The 10:27:37Z report re-checked PR #228's test addition. It went stale again only because `2607591` edited the dev-setup checklist. This run re-checked that one change and carried every other row forward.
+**Re-verification:** Yes, four times on 2026-10-23. The 10:17:44Z report (`passed`, 39/39) re-checked every must-have against `91d7064` after phases 48-50 made the 2026-09-13 report stale. The 10:27:37Z report re-checked PR #228's test addition, and the 10:29:42Z report re-checked `2607591`'s checklist additions. It went stale again only because `817f4ca` rewrote one Dependabot line in the dev-setup checklist. This run re-checked that one change and carried every other row forward.
 
-## Delta since the 10:27:37Z report (`3ff1e2a` → `2607591`)
+## Delta since the 10:29:42Z report (`420faf1` → `817f4ca`)
+
+- **Only one covered file changed.** `git diff --stat 420faf1 817f4ca -- <all 43 covered files>` lists only `.planning/user/DEV-SETUP-CHECKLIST.md` (+3, -1). **Control:** the same diff over the other 42 covered files prints nothing, and `git diff --stat HEAD -- <covered files>` is empty, so the working tree matches HEAD.
+- **The change is outside Phase 47's scope.** It rewrites the section-4 Dependabot line: automatic security-fix PRs are now **on**, with a note that they target the default branch. No Phase 47 must-have concerns Dependabot.
+- **Every cited checklist line is unchanged and in place.** The hunk is `@@ -271 +271,3 @@`, after every line this report cites. Lines 120-160 are byte-identical at `420faf1` and `817f4ca` (`diff` empty). Line 132 still says "19 checks" (`rg '19 checks'`: one hit, at 132). Lines 134-147 still describe the cargo-test wiring, the nulled global/system config and the local isolation. The plan's old phrase `isolated from inherited hooks and commit signing` is still absent (rg rc 1).
+- **No debt markers added.** `TBD`/`FIXME`/`XXX` over the 3 added lines: 0 hits (rg rc 1). **Control:** `target-branch|default` over the same lines: 2 hits.
+- **The digest moves only because of this file.** `verification.fingerprint` over the same 43 files gives a new digest at HEAD. **Control:** the same command over a `git archive 420faf1` snapshot reproduces the previous digest (`c8f7c0c2…`) exactly.
+- **Not re-run this time:** every test, harness and scratch-copy run. No covered code, test or script changed, so all results carry forward from 10:27:37Z (`cf14451`) and 10:17:44Z (`91d7064`).
+
+## Earlier delta, 10:27:37Z → 10:29:42Z (`3ff1e2a` → `2607591`)
+
+Line numbers in this section are as of `2607591`.
 
 - **Only one covered file changed.** `git diff --stat 3ff1e2a 2607591 -- <all 43 covered files>` lists only `.planning/user/DEV-SETUP-CHECKLIST.md` (+16, 0 deletions). **Control:** the same diff over the other 42 covered files prints nothing, and `git diff --stat HEAD -- <covered files>` is empty, so the working tree matches HEAD.
 - **The change is purely additive and outside Phase 47's scope.** One 7-line entry in section 3 (the repo pre-commit hook's own `gitleaks` scan, PR #227) and two entries in section 4 (`scheduled-deps.yml`, `dependabot.yml`). No existing line is modified or removed. No Phase 47 must-have concerns secret scanning, scheduled dependency checks or Dependabot.
@@ -152,7 +163,7 @@ Roadmap criteria are rows R1-R4; plan truths are `PP-n`. All test evidence was p
 | 07-3 | The harness passes with config injected through `GIT_CONFIG_COUNT` or `GIT_CONFIG_PARAMETERS` | ✓ VERIFIED | Both injected runs: 19/0. **Control:** the same `GIT_CONFIG_PARAMETERS` hook injection made a plain scratch-repo commit exit 1. The harness unsets `git rev-parse --local-env-vars` (:15-16). |
 | 07-4 | The guard is still invoked directly | ✓ VERIFIED (count superseded) | Script blob `1485b44` is identical at `6ae0b77` and HEAD: the six original direct calls plus three added in `7400042`, with no wrapper. |
 | 07-5 | Removing the two isolation lines prints `FAIL 7c.` and exactly one failure | ✓ VERIFIED (count superseded) | Mutant in the scratch clone (diff shows exactly lines 70-71 removed): exit 1, `FAIL 7c. fixture bootstrap under hostile config -> allow  expected allow, got refuse`, `passed=18 failed=1`. Restored copy: 19/0. |
-| 07-6 | The checklist states the harness size accurately and states its isolation | ✓ VERIFIED (text superseded) | DEV-SETUP-CHECKLIST.md:132 (was :125 before `2607591`) says "19 checks", matching runtime 19. Lines 134-147 describe the cargo-test wiring, the nulled global/system config and the local isolation. `verify.artifacts` still reports the plan's old phrase `isolated from inherited hooks and commit signing` as missing. |
+| 07-6 | The checklist states the harness size accurately and states its isolation | ✓ VERIFIED (text superseded) | DEV-SETUP-CHECKLIST.md:132 (was :125 before `2607591`; unchanged at `817f4ca`) says "19 checks", matching runtime 19. Lines 134-147 describe the cargo-test wiring, the nulled global/system config and the local isolation. `verify.artifacts` still reports the plan's old phrase `isolated from inherited hooks and commit signing` as missing. |
 
 **Score:** 39/39 truths verified (0 present-but-behavior-unverified). Eight carry a superseded literal or a historical/inherited basis, as noted.
 
@@ -213,7 +224,7 @@ Roadmap criteria are rows R1-R4; plan truths are `PP-n`. All test evidence was p
 
 ### Behavioral Spot-Checks
 
-No test was run in the `2607591` pass (no covered code changed). Rows marked "re-run at `cf14451`" were run in the 10:27:37Z delta pass. All other rows are carried forward from 10:17:44Z at `91d7064`, and their inputs are unchanged. Each run used `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo nextest run --no-tests=fail` with a union of exact `test(=path)` filters. The verdict required rc 0 **and** "N tests run: N passed", where N is the number of names given.
+No test was run in the `2607591` or `817f4ca` passes (no covered code changed). Rows marked "re-run at `cf14451`" were run in the 10:27:37Z delta pass. All other rows are carried forward from 10:17:44Z at `91d7064`, and their inputs are unchanged. Each run used `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo nextest run --no-tests=fail` with a union of exact `test(=path)` filters. The verdict required rc 0 **and** "N tests run: N passed", where N is the number of names given.
 
 | Behavior | Command (abridged) | Result | Status |
 |---|---|---|---|
@@ -256,7 +267,7 @@ None. The three judgment-tier prohibitions concern execution history from 2026-0
 
 ### Gaps Summary
 
-No gaps. The `2607591` delta pass found nothing: the checklist edit only added entries outside Phase 47's scope, and moved row 07-6's citations without changing their text. The earlier `cf14451` pass found that PR #228 only added a test for a workflow outside Phase 47's scope, and the guard this report relies on still passed. At `91d7064` (carried forward, inputs unchanged at `2607591`):
+No gaps. The `817f4ca` delta pass found nothing: the checklist edit rewrote one Dependabot line outside Phase 47's scope, after every cited line. The `2607591` delta pass found nothing: the checklist edit only added entries outside Phase 47's scope, and moved row 07-6's citations without changing their text. The earlier `cf14451` pass found that PR #228 only added a test for a workflow outside Phase 47's scope, and the guard this report relies on still passed. At `91d7064` (carried forward, inputs unchanged at `817f4ca`):
 - The FullExecute loop-back carries the policy on all six adapters, and the GapsOnly/AuditFix exclusions hold with their original test unmodified.
 - A resumed Claude session gets one gate rule, in two separately built turns.
 - The last-line completion contract survives phase 49's detector rewrite.
@@ -271,5 +282,5 @@ No gaps. The `2607591` delta pass found nothing: the checklist edit only added e
 
 ---
 
-_Verified: 2026-10-23T10:29:42Z (delta over the 10:27:37Z delta and the 10:17:44Z full re-verification)_
+_Verified: 2026-10-23T17:30:56Z (delta over the 10:29:42Z and 10:27:37Z deltas and the 10:17:44Z full re-verification)_
 _Verifier: Claude (gsd-verifier)_
