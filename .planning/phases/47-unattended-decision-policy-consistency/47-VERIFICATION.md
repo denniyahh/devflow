@@ -1,6 +1,6 @@
 ---
 phase: 47-unattended-decision-policy-consistency
-verified: 2026-10-23T10:17:44Z
+verified: 2026-10-23T10:27:37Z
 status: passed
 score: 39/39 must-haves verified
 covered_files:
@@ -47,7 +47,7 @@ covered_files:
   - "scripts/check.sh"
   - "scripts/lint-phase-worktree.sh"
   - "scripts/test-phase-worktree-guard.sh"
-covered_digest: "v3:sha256:10e77006d2d6a00a8e5eee8d599ed7a0ec329c2ac07a07c858566230d7d9c24d"
+covered_digest: "v3:sha256:9f81f8a655e15a270bd38599d3f7f154022884d631888bcdf3cfcaffeffe53cc"
 behavior_unverified: 0
 overrides_applied: 1
 overrides:
@@ -58,8 +58,8 @@ overrides:
 re_verification:
   previous_status: passed
   previous_score: 39/39
-  previous_verified_at: 6ae0b77
-  reason: "stale: covered files changed by phases 48-50 (prompt.rs, agent_result.rs, pipeline_launch.rs, ci.yml, snapshots, check.sh)"
+  previous_verified_at: e74371d
+  reason: "stale: syncing develop merged PR #228, which added one test (scheduled_deps_workflow_runs_the_pinned_image) to crates/devflow-cli/tests/ci_parity_guards.rs; no other covered file changed since e74371d"
   gaps_closed: []
   gaps_remaining: []
   regressions: []
@@ -72,9 +72,16 @@ deferred:
 # Phase 47: Unattended Decision Policy Consistency Verification Report
 
 **Phase Goal:** An unattended agent receives the same merit-based decision instruction everywhere it is asked to make a Code-stage decision (including the claude, opencode, hermes and antigravity Validate loop-back), and is never handed two contradictory instructions about who may resolve a `blocking-human` gate inside one resumed session.
-**Verified:** 2026-10-23T10:17:44Z against HEAD `91d7064` on `workspace/denniyahh` (code identical to `78178f6` apart from `graphify-out/`)
+**Verified:** 2026-10-23T10:27:37Z against HEAD `cf14451` on `workspace/denniyahh` (delta re-verification of the 10:17:44Z report, committed in `e74371d`)
 **Status:** passed
-**Re-verification:** Yes. The 2026-09-13 report (`passed`, 39/39, HEAD `6ae0b77`) went stale because phases 48-50 changed 22 covered files. Every must-have was re-checked against current code; the prior report was used only as a map.
+**Re-verification:** Yes, twice on 2026-10-23. The 10:17:44Z report (`passed`, 39/39) re-checked every must-have against `91d7064` after phases 48-50 made the 2026-09-13 report stale. It went stale again only because the develop sync merged PR #228. This run re-checked that one change and carried every other row forward.
+
+## Delta since the 10:17:44Z report (`e74371d` → `cf14451`)
+
+- **Only one covered file changed.** `git diff --stat e74371d HEAD -- <all 43 covered files>` lists only `crates/devflow-cli/tests/ci_parity_guards.rs` (+41, 0 deletions). **Control:** the same diff without the path filter lists 9 files, so the filter discriminates. Also checked against `91d7064`, the commit the earlier rows were verified at: the only other change is `DEV-SETUP-CHECKLIST.md` section 2 (default branch is now `develop`). It does not touch the 07-6 text, and line 125 still says "19 checks".
+- **The change is purely additive.** It adds one test, `scheduled_deps_workflow_runs_the_pinned_image`, inserted between existing functions. No existing line is modified or removed. That test guards `.github/workflows/scheduled-deps.yml`, which no Phase 47 must-have covers.
+- **The one guard this report relies on still passes.** `check_script_pins_snapshots_against_env_override` (rows 01-1, 01-2, key link `check.sh run_test` → CI) passes by name: `1 test run: 1 passed`. The whole binary also passes: `27 tests run: 27 passed`, rc 0, including the new test. **Control:** a wrong test name under the same `--no-tests=fail` filter exits rc 4 with "no tests to run". `check.sh:60` still carries the `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no` prefix, and `ci.yml:71` still runs `scripts/check.sh test`. Neither file changed.
+- **Not re-run this time:** the scratch-copy drift and harness runs (rows 01-1/01-2 negative control, 07-1..07-5), the core and CLI named tests, and the gitignore and harness test binaries. Their inputs are byte-identical to `e74371d`, so those results carry forward from 10:17:44Z.
 
 ## What changed since the previous verdict
 
@@ -196,13 +203,15 @@ Roadmap criteria are rows R1-R4; plan truths are `PP-n`. All test evidence was p
 
 ### Behavioral Spot-Checks
 
-Each run used `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo nextest run --no-tests=fail` with a union of exact `test(=path)` filters. The verdict required rc 0 **and** "N tests run: N passed", where N is the number of names given.
+Rows marked "re-run at `cf14451`" were run in this delta pass. All other rows are carried forward from 10:17:44Z at `91d7064`, and their inputs are unchanged. Each run used `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no cargo nextest run --no-tests=fail` with a union of exact `test(=path)` filters. The verdict required rc 0 **and** "N tests run: N passed", where N is the number of names given.
 
 | Behavior | Command (abridged) | Result | Status |
 |---|---|---|---|
 | 11 prompt + 5 agent_result tests | `-p devflow-core --lib` | 16 run, 16 passed | ✓ PASS |
 | Delivery test + audit-event test | `-p devflow --bin devflow` | 2 run, 2 passed | ✓ PASS |
-| Snapshot env pin | `--test ci_parity_guards` | 1 run, 1 passed | ✓ PASS |
+| Snapshot env pin | `--test ci_parity_guards -E 'test(=check_script_pins_snapshots_against_env_override)'` | 1 run, 1 passed (re-run at `cf14451`) | ✓ PASS |
+| Whole ci_parity_guards binary, incl. PR #228's new test | `-p devflow --test ci_parity_guards --no-tests=fail` | 27 run, 27 passed (re-run at `cf14451`) | ✓ PASS |
+| Wrong-name control for the filter | same with `test(=no_such_test_exists_47)` | rc 4, "no tests to run" | ✓ control fired |
 | Ignore split | `--test gitignore_coverage` | 1 run, 1 passed | ✓ PASS |
 | Harness in cargo test + source-order guard | `--test worktree_guard_harness` | 2 run, 2 passed | ✓ PASS |
 | Negative control for the counting | one real name + `prompt::tests::no_such_test_exists_47` | rc 0, `1 test run` → flagged MISMATCH | ✓ control fired |
@@ -237,7 +246,7 @@ None. The three judgment-tier prohibitions concern execution history from 2026-0
 
 ### Gaps Summary
 
-No gaps. At `91d7064`:
+No gaps. The delta pass found nothing: PR #228 only added a test for a workflow outside Phase 47's scope, and the guard this report relies on still passes. At `91d7064` (carried forward, inputs unchanged at `cf14451`):
 - The FullExecute loop-back carries the policy on all six adapters, and the GapsOnly/AuditFix exclusions hold with their original test unmodified.
 - A resumed Claude session gets one gate rule, in two separately built turns.
 - The last-line completion contract survives phase 49's detector rewrite.
@@ -252,5 +261,5 @@ No gaps. At `91d7064`:
 
 ---
 
-_Verified: 2026-10-23T10:17:44Z_
+_Verified: 2026-10-23T10:27:37Z (delta over the 10:17:44Z full re-verification)_
 _Verifier: Claude (gsd-verifier)_
