@@ -61,7 +61,10 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 
 ## 2. GitHub repository settings (not files — verify via `gh api`, not by reading the repo)
 
-- [ ] **[PROJECT]** Default branch: `main`.
+- [ ] **[PROJECT]** Default branch: `develop` (changed from `main` 2026-10-23). It decides where scheduled
+  workflows run (they run only from the default branch), the default base of a new PR, what `origin/HEAD`
+  points at in a fresh clone, and what the graphify-labs PR bot indexes as its health baseline. Releases still
+  go `develop` → `main` by PR. An existing clone keeps the old `origin/HEAD` until `git remote set-head origin -a`.
 - [ ] **[PROJECT]** Merge button config: squash ✓, merge-commit ✓, rebase ✗.
   `squash_merge_commit_title: PR_TITLE`. `delete_branch_on_merge: true`.
 - [ ] **[PROJECT]** GitHub Repository Rulesets govern branch protection (verified 2026-09-13; replaces classic branch protection):
