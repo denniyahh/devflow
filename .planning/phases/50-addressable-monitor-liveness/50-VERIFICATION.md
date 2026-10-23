@@ -1,9 +1,10 @@
 ---
 phase: 50-addressable-monitor-liveness
-verified: 2026-10-21T22:47:29Z
+verified: 2026-10-23T10:24:24Z
 status: passed
 score: 8/8 roadmap success criteria verified (0 present-but-behavior-unverified)
 covered_files:
+  - ".github/workflows/ci.yml"
   - ".planning/phases/50-addressable-monitor-liveness/50-01-PLAN.md"
   - ".planning/phases/50-addressable-monitor-liveness/50-01-SUMMARY.md"
   - ".planning/phases/50-addressable-monitor-liveness/50-02-PLAN.md"
@@ -122,14 +123,14 @@ covered_files:
   - "doc-check-allowlist.toml"
   - "docs/diagrams/agent-lifecycle.md"
   - "docs/guides/unattended-mode.md"
-covered_digest: "v3:sha256:45c349ebd3abef2f4a4a5dbe4288d9800368e44d5331d6fb5aaa5e9ae729f6c1"
+covered_digest: "v3:sha256:e9abee80aafea90ddc4cebf0818fa79ec68639e22a296121d07d1a5395cb3d8f"
 behavior_unverified: 0
 overrides_applied: 0
 re_verification:
-  previous_status: gaps_found
-  previous_score: 7/8
-  gaps_closed:
-    - "Roadmap criterion 4 (WR-03): a stream-shape supervisor whose agent completed while a process it started still holds the agent's stdout no longer stays ALIVE forever; it reaches its advance within about 3 s of the agent's exit, and a stop sent while it is advancing is honoured at safe point 1"
+  previous_status: passed
+  previous_score: 8/8
+  reason: "stale: the phase close-out (f6e34f2, be92c83; merged to develop in PR #225) changed 8 covered files after the 2026-10-21 verification"
+  gaps_closed: []
   gaps_remaining: []
   regressions: []
 ---
@@ -139,210 +140,161 @@ re_verification:
 **Phase Goal:** "Is this run's monitor alive?" is answerable from disk state alone without a PID, in three
 distinguishable states (GONE, STALE, ALIVE), so a stalled unattended run is recoverable by design rather than by
 diagnosis. This is the milestone's breaking change.
-**Verified:** 2026-10-21T22:47:29Z
+**Verified:** 2026-10-23T10:24:24Z
 **Status:** passed
-**Re-verification:** Yes, after gap closure (plans 50-26 to 50-29)
+**Re-verification:** Yes. The 2026-10-21 report (`cc50411`, passed 8/8) went stale when the close-out changed covered
+files. That report was used as a lead only; every criterion was re-checked against the current tree.
 
-## Previous verification
+## What changed since the previous verification
 
-2026-10-21T12:09:37Z, `gaps_found`, 7/8. Criterion 4 failed on a reproduced case (code review finding WR-03): a
-Claude or Antigravity (stream-shape) run whose agent finished while something it started still held its stdout
-left a supervisor that stayed ALIVE, accepted `devflow stop` and never carried it out. The operator chose to fix it
-in Phase 50 and to run a second live attempt on the fixed binary. That report's full text is in git at `a7d2ac0`.
+`git diff cc50411 HEAD` over `crates/`, `Cargo.*`, the docs, the allowlist, `.github/` and the phase directory
+shows exactly two commits' worth of change (`cc50411` is an ancestor of HEAD):
+
+- `f6e34f2` (8 files). Production: `monitor.rs` `group_empties_within` now asks the backstop's census
+  (`supervisor::backstop::group_members`, made `pub(crate)`) instead of `kill(-pgid, 0)`. Tests: the new
+  `test_support::live_group_members` / `process_is_live` replace every test-side `kill(-pgid, 0)` group probe in
+  `runtime.rs`, `monitor.rs`, `pipeline_launch.rs`, `stop_e2e.rs`, `supervisor_e2e.rs`, `start_lock_e2e.rs`, plus a
+  new test `test_support::tests::a_zombie_is_not_a_live_group_member`.
+- `be92c83`: `options: --init` on the CI Test and Sequential 2-CPU jobs (`ci.yml` lines 46-53, 107-108).
+
+Commits after `78178f6` change only `.planning/`, `graphify-out/` and the plan-linter test, as the brief said
+(`git diff 673e9fb 78178f6 -- crates/` touches only `plan_bashism_scanner.rs` and its fixture).
 
 ## Lead: what argues against the result
 
-1. **One narrow, code-confirmed exception to criterion 4 remains, unreproduced and deferred.** The post-fix
-   re-review (50-REVIEW-2.md, its WR-01) found that the Ship finalization retry loop checks for a stop only once,
-   before the loop. I confirmed the shape by reading `pipeline_gate.rs` (`finish_workflow_with_gate_timeout`: the
-   safe-point check sits before `loop`, and the `GateAction::Advance` arm goes straight back to
-   `run_checkout_hooks`) and `gates.rs` (`poll_response_cancellable` reads the response file before it checks
-   `cancel()`). So if the first merge/tag/push fails, and a `devflow stop` is accepted in the same second the
-   operator approves the retry gate, the merge, tag and push run anyway. It needs a failed first finalization plus
-   two contradictory human actions within about 1 s; the retry gate is never auto-answered, so an unattended run
-   cannot reach it alone. It is filed as backlog 999.166 item 7, recorded as deferred by operator decision of
-   2026-10-21. I followed the previous round's rule (an unreproduced, operator-deferred finding is a residual; a
-   reproduced one is a gap), so it is not a gap here. If you want criterion 4 held to the letter, this becomes the
-   one gap and the fix is the review's (the safe-point check at the top of each loop pass, plus a hold-point test).
-2. **Neither fix's path ran live.** Attempt 2's raw `events.jsonl` has no `stream_wait_bounded` event and no stop was
-   sent in either attempt. The WR-03 and CR-01 fixes rest on tests, the revert check, the fault arm and the
-   independent repro below, not on live evidence.
-3. **On the WR-03 path two literal clauses of criterion 4 do not apply**, and the phase does not claim them: a stop
-   that arrives after the agent has already exited kills no group (an in-group leftover keeps running, backlog
-   999.164 item 5), and the exit file keeps the agent's own code `0` while the `stopped` reply says 143 (999.166
-   item 6). The run still ends stopped, does not advance, removes its socket and exits, which is what the test E3
-   asserts.
+1. **The zombie half of the production change has never run end to end.** The census excludes zombies by the
+   same `state == 'Z'` rule the new unit test proves on a real unreaped zombie, but no test drives
+   `group_empties_within` with a group that holds only zombies. On this host PID 1 reaps, and CI on PR #225's head
+   (`673e9fb`) ran with `--init`, so it reaped too: no CI run exists for the fix commit alone (`gh run list
+   --commit a265527` is empty). "18 failures under a non-reaping PID 1 are fixed by the census" is therefore not
+   shown by any run; `--init` removed the condition rather than exercising the fix. The phase's eight criteria do not
+   depend on it, because both a reaping host and CI now reap.
+2. **The census narrows "occupied" to this uid.** Before, `kill(-pgid, 0)` answering `EPERM` (a member of another
+   uid, such as a setuid program the agent ran) counted as "not empty". The census skips other uids, so such a
+   member now reads as empty and `end_recorded_agent_group` removes the sidecar. This matches the backstop's
+   existing, deliberate rule T-50-25 (`gathering_skips_processes_of_another_uid` asserts another uid's group reads
+   empty, and it passed here), and SIGKILL from this uid could not have ended that member anyway. It is a behaviour
+   change in a rare case, not a broken guarantee.
+3. **Carried from the previous report, unchanged:** the Ship finalization retry loop checks for a stop only once,
+   before the loop (backlog 999.166 item 7, deferred by operator decision of 2026-10-21); neither the WR-03 nor the
+   CR-01 fix path ran live. The close-out did not touch `pipeline_gate.rs` or `gates.rs`.
+
+## The three guarantees the brief asked about, for the production change
+
+| Guarantee | Status | Evidence |
+|-----------|--------|----------|
+| A zombie is not a live member | ✓ VERIFIED (rule), not exercised on the production path | `backstop::group_members` skips `stat.state == 'Z'` (backstop.rs line 432). The same `process_stat_fields` parse and `!= 'Z'` filter in `test_support::live_group_members` passed `a_zombie_is_not_a_live_group_member`, which makes a real unreaped zombie, shows `kill(-pgid, 0)` still returns 0 for it (the negative control), and shows the census excludes it; its running-process control counts the same pid. See Lead 1 for the limit |
+| An empty group is still reported empty | ✓ VERIFIED | `monitor::tests::a_supervisor_killed_before_publishing_has_its_agent_group_ended_through_its_sidecar` passed. It exercises the production `end_recorded_agent_group` → `group_empties_within` path and asserts the sidecar is gone; the sidecar is kept exactly when `group_empties_within` returns false (`keep_sidecar: true`, monitor.rs lines 2081-2088 and 1987), so this assertion discriminates. Its runs 2 and 3 are the controls (no sidecar, wrong start time: nothing signalled). Note the text assertion alone would not discriminate: the "still had members" text also contains "ended the agent group … its sidecar records" |
+| An unreadable `/proc` does not read as empty | ✓ VERIFIED (code read) | `group_members` returns `None` when `read_dir("/proc")` fails (`.ok()?`, backstop.rs line 412), and `group_empties_within` returns true only on `Some(empty)` (`is_some_and`, monitor.rs lines 2148-2150). A pgid ≤ 1 or one that does not fit `pid_t` still returns false before any read. Not exercised by a test (it needs an unmountable `/proc`). Off Linux the path is unreachable: `assess` answers `RefuseIdentityUnavailable` there, so `LeaderPresentSignal` (the only caller) never fires |
+
+One test-side asymmetry is worth knowing: `test_support::live_group_members` returns an empty list (not "cannot
+tell") when `/proc` cannot be listed, so a test's "group is gone" check would pass vacuously off Linux. These tests
+are Linux-only in practice, most "gone" assertions follow a "still running" control on the same helper, and the new
+zombie test's running control proves the helper sees a live process on this host.
 
 ## Goal Achievement
 
 ### Observable Truths (roadmap contract)
 
+Every named test below was run alone in this verification with `cargo nextest run … --no-tests=fail -E
+'test(=<full path>)'`, each reporting `1 test run: 1 passed`. Control: a nonexistent name under the same command
+exits 4 with `0 tests run`.
+
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Liveness resolves to exactly one of GONE/STALE/ALIVE from `state.json` plus the socket, no PID read; each fixture produces only its state | ✓ VERIFIED (regression) | `supervisor::tests::each_fixture_produces_exactly_one_liveness_state` passed in this run; `supervisor::probe`/`probe_phase` unchanged since the previous verification (the gap-closure diff touches only `monitor.rs`, `runtime.rs` (one visibility change), `supervisor_e2e.rs`, the allowlist, ARCHITECTURE.md and phase tools) |
-| 2 | `PipeOwning` and `Legacy` answer liveness identically | ✓ VERIFIED (regression) | `monitor::tests::both_arms_answer_liveness_identically_for_each_condition` passed. Live attempt 2 re-judged today: `ATTEMPT launches=6 stream=5 capture=1`, `ATTEMPT check=both launch shapes ok` |
-| 3 | Socket path persisted in `state.json` under `registry::cache_dir()`; over-long path refused by name | ✓ VERIFIED (regression) | `socket_path_of_107_bytes_binds_and_108_is_refused_by_name` passed; code unchanged since the previous verification |
-| 4 | `stop` on an ALIVE supervisor: shutdown, group killed (grace, SIGKILL), 143, no advance, socket removed, exits; lock-free run; a stop racing natural exit never launches the next stage | ✓ VERIFIED (gap closed; see Lead 1 and 3 for the residuals) | Previously failing case now passes, three ways. (a) Tests that passed in this run: A `a_completed_stream_run_returns_while_a_leftover_process_holds_the_agents_stdout`, C `no_line_reaches_the_capture_after_the_stdout_wait_expires`, D `a_stopped_stream_run_returns_while_a_process_outside_the_agent_group_holds_its_stdout`, F `a_stream_run_returns_while_a_leftover_process_keeps_writing_to_the_agents_stdout`, G `the_stream_wait_hold_is_test_only_and_read_literally`, E1 `a_completed_stream_run_reaches_its_advance_while_a_leftover_process_holds_stdout`, E3 `a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1`, controls B and E2. (b) My own repro against the production attempt-2 binary (below): the monitor exited 3.17 s after the agent with one `stream_wait_bounded` event, against a pre-fix binary that was still ALIVE at 40 s. (c) The pre-existing criterion 4 tests still pass: `stop_ends_a_lock_free_live_run_through_the_socket`, `a_stop_racing_natural_completion_never_advances`, and the CR-01 safe-point tests `a_stop_after_safe_point_1_is_honoured_before_the_yes_ship_approval`, `a_stop_before_finalization_is_honoured_before_the_merge`. Fault arm fault-7 on attempt 2's binary: `alive-stop-*`, `stop-races-completion` `ok live` |
-| 5 | SIGTERM/SIGINT to either shape behaves like a socket `shutdown` | ✓ VERIFIED (regression) | `monitor::tests::sigterm_to_the_supervisor_kills_the_agent_group_records_143_and_does_not_advance` passed. The WR-03 fix removes the hang a signal shared with the stop in the old state |
-| 6 | STALE backstop signals only a validated group; previous boot removed; leader-gone refused | ✓ VERIFIED (regression) | `backstop::tests::classify_covers_every_rule_in_order` passed; backstop.rs unchanged since the previous verification. fault-7 `kill9-stale-stop`, `kill9-at-gate` `ok live` |
-| 7 | Sockets/sidecars listed and probed with no state; `doctor` reports orphans; read-only commands never kill or remove; `start`/`resume` refuse over a live sidecar on unloadable state | ✓ VERIFIED (regression) | `start_refuses_over_a_live_supervisor_when_the_state_will_not_load` and the rest of the criterion-7 set passed in the full run; code unchanged since the previous verification |
-| 8 | Recycled-pid lock reclaim; every e2e test isolates HOME, XDG_CACHE_HOME, DEVFLOW_CACHE_DIR and reaps its supervisors | ✓ VERIFIED (regression) | `acquire_reclaims_a_lock_whose_live_pid_has_a_different_start_time` and the negative control `a_child_writing_outside_its_tempdir_home_fails` passed. The new E1-E3 fixture uses `common::hermetic_devflow` and `LaunchedRunReaper` (code read) |
+| 1 | Liveness resolves to exactly one of GONE/STALE/ALIVE from `state.json` plus the socket, no PID read; each fixture produces only its state | ✓ VERIFIED | `supervisor::tests::each_fixture_produces_exactly_one_liveness_state` passed. `supervisor.rs` (`probe`, `probe_phase`) is not in the close-out diff |
+| 2 | `PipeOwning` and `Legacy` answer liveness identically | ✓ VERIFIED | `monitor::tests::both_arms_answer_liveness_identically_for_each_condition` passed; its group probe now goes through `live_group_members` |
+| 3 | Socket path persisted in `state.json` under `registry::cache_dir()`; over-long path refused by name | ✓ VERIFIED | `supervisor::tests::socket_path_of_107_bytes_binds_and_108_is_refused_by_name` passed; code unchanged |
+| 4 | `stop` on an ALIVE supervisor: shutdown, group killed (grace, SIGKILL), 143, no advance, socket removed, exits; lock-free run; a stop racing natural exit never launches the next stage | ✓ VERIFIED (residual in Lead 3) | Passed: `stop_e2e::stop_ends_a_lock_free_live_run_through_the_socket` (asserts the group is non-empty before and empty after), `stop_e2e::stop_with_a_launch_id_stops_a_live_socket_whose_sidecar_will_not_parse` (the probe rewritten in `f6e34f2`), `supervisor::runtime::tests::a_stop_racing_natural_completion_never_advances`, `supervisor::runtime::tests::shutdown_over_the_socket_kills_the_agent_group_and_reports_stopped`, `supervisor::runtime::tests::a_term_ignoring_group_member_is_killed_after_the_leader_exits`, `pipeline_launch::tests::a_stop_between_the_next_spawn_and_its_publish_shuts_the_next_supervisor_down` (the `group_alive` probe rewritten), `pipeline_launch::tests::a_stop_before_finalization_is_honoured_before_the_merge`, and the WR-03 pair `monitor::tests::a_completed_stream_run_returns_while_a_leftover_process_holds_the_agents_stdout` and `supervisor_e2e::a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1` |
+| 5 | SIGTERM/SIGINT to either shape behaves like a socket `shutdown` | ✓ VERIFIED | `monitor::tests::sigterm_to_the_supervisor_kills_the_agent_group_records_143_and_does_not_advance` and `supervisor_e2e::sigterm_to_a_live_supervisor_ends_the_run_without_advancing` (asserts `group_members(pgid)` is empty after, both shapes) passed |
+| 6 | STALE backstop signals only a validated group; previous boot removed; leader-gone refused | ✓ VERIFIED | `supervisor::backstop::tests::classify_covers_every_rule_in_order` and `supervisor::backstop::tests::gathering_skips_processes_of_another_uid` passed. The only backstop change is `group_members` becoming `pub(crate)`; the backstop's own `group_empties_within` already used the census before the close-out |
+| 7 | Sockets/sidecars listed and probed with no state; `doctor` reports orphans; read-only commands never kill or remove; `start`/`resume` refuse over a live sidecar on unloadable state | ✓ VERIFIED | `start_lock_e2e::start_refuses_over_a_live_supervisor_when_the_state_will_not_load` (its `group_is_gone` probe rewritten) and `supervisor_e2e::two_concurrent_starts_yield_exactly_one_live_supervisor` passed. The other criterion-7 code is not in the close-out diff, and the full suite passed in the pinned container on `78178f6` (brief; not re-run here by instruction) |
+| 8 | Recycled-pid lock reclaim; every e2e test isolates HOME, XDG_CACHE_HOME, DEVFLOW_CACHE_DIR and reaps its supervisors | ✓ VERIFIED | `lock::tests::acquire_reclaims_a_lock_whose_live_pid_has_a_different_start_time` and the negative control `test_home_isolation::a_child_writing_outside_its_tempdir_home_fails` passed; `lock.rs` and the hermetic helpers are not in the close-out diff |
 
-**Score:** 8/8 roadmap success criteria verified, 0 present-but-behavior-unverified. Criterion 4's behaviour rests
-on named tests that passed in this verifier's own full run and on a repro with a negative control.
+**Score:** 8/8 roadmap success criteria verified, 0 present-but-behavior-unverified.
 
-**Plan-level truths of the gap-closure plans (50-26 to 50-29).** Checked against code, tests and the judges:
+The plan-level truths of 50-01 to 50-29 were checked in the previous two reports. Their files are unchanged except
+for the eight close-out files above, and the phase directory itself is unchanged since `cc50411`.
 
-- 50-26: the exit-watch thread (`waitid(WNOWAIT)` via `wait_for_exit_without_reaping`, now `pub(crate)`), the
-  `StreamEvent::AgentExited` break in `drive_stream_io`, `join_within(READER_DRAIN_WAIT)` with the capture taken by
-  bounded `try_lock`, and the `stream_wait_bounded` event are all present and wired in `run_supervised_stage`, where
-  the unbounded `threads.join()` stood (`rg 'threads\.join\('` finds none). Nothing signals on the stream path: the
-  only `kill` added in the diff is in the test module (monitor.rs line 6739, inside `mod tests` from line 2507).
-  `SEMVER verdict=match`; the hold variable is allowlisted and pinned test-only by G.
-- 50-27: `--attempt-gate --current-source` prints `current_source=yes` and `shipped attempt=2`; its control
-  (`--published 50-evidence --attempt 1`) fails with `attempt_current_source=no`. The runbook states the
-  2026-10-21 delegation and keeps repository deletion with the operator (`50-RUNBOOK.md` lines 40 and 262-271).
-- 50-28: attempt 2 is a real run to Ship on `denniyahh/p50-live-attempt-2` (205 mentions in the raw tree, none
-  of this repository); gates answered: Define and Code by `denniyahh` (the session under delegation), Ship by
-  `--yes-ship`; no `deviations.txt`. The attempt-2 binary's crate tree (`fault-7/src_tree`
-  `71138b72…`) equals `HEAD:crates` and `bca7c35:crates`, and differs from the pre-fix `566c434:crates`
-  (`7ac3e575…`); `git diff bca7c35 HEAD -- crates/ Cargo.toml Cargo.lock` is empty.
-- 50-29: published verdict files are byte-identical to the raw ones (`attempt-2/verdict-attempt-gate.txt`,
-  `fault-7/verdict-fault.txt`, `fault-7/verdict-require-all.txt`); `--identity-scan` pass (`tokens=9`); `gitleaks
-  dir 50-evidence` finds no leaks while the `REDACTED-PLANTED-CONTROL-SECRET` marker is present in the two redacted
-  files; WR-03 is `fixed` in 50-REVIEW-DISPOSITION.md; 50-VALIDATION.md has V-58 to V-68 and keeps
-  `status: validated`, `nyquist_compliant: true`.
-
-The plan-level truths of 50-01 to 50-25 were covered in the previous report; their code is unchanged except where
-named above, and their named tests all passed again in the full run.
-
-### Required Artifacts (gap closure)
+### Required Artifacts (close-out)
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `crates/devflow-core/src/monitor.rs` | exit-watch thread, `READER_DRAIN_WAIT`, `join_within`, `finish_stream_threads`, shared capture, tests A-D, F, G | ✓ VERIFIED | substantive and called from `run_supervised_stage` |
-| `crates/devflow-core/src/supervisor/runtime.rs` | `pub(crate) fn wait_for_exit_without_reaping` | ✓ VERIFIED | used by `drive_stream_io`'s watch thread |
-| `crates/devflow-cli/tests/supervisor_e2e.rs` | E1, E2, E3 on the real `__monitor` | ✓ VERIFIED | all three passed |
-| `doc-check-allowlist.toml` | `DEVFLOW_TEST_STREAM_WAIT_HOLD` | ✓ VERIFIED | doc_check passed in the full run |
-| `tools/wr03-revert-check.sh` | revert check | ✓ EXISTS (not re-run, see limits) | |
-| `tools/check-supervisor-evidence.sh` | `--current-source`, `--identity-scan`, `--published/--live-run --attempt` | ✓ VERIFIED | `SELFTEST passed=75 failed=0` |
-| `50-evidence/attempt-2`, `fault-7` | sanitized evidence | ✓ VERIFIED | `PUBLISHED verdict=pass` for `--attempt 2` |
-| ARCHITECTURE.md | names the bounded stream wait | ✓ VERIFIED (wording imprecise, 999.166 item 8) | says "at most 3 s"; the capture close can take up to 3 s more |
+| `crates/devflow-core/src/monitor.rs` | `group_empties_within` on the census; test probes on `live_group_members` | ✓ VERIFIED | called from `end_recorded_agent_group` (line 2079), the only caller |
+| `crates/devflow-core/src/supervisor/backstop.rs` | `pub(crate) fn group_members` | ✓ VERIFIED | used by `gather`, its own `group_empties_within` and monitor.rs |
+| `crates/devflow-core/src/test_support.rs` | `live_group_members`, `process_is_live`, zombie test | ✓ VERIFIED | behind `#[cfg(any(test, feature = "test-support"))]` (lib.rs line 82); the CLI enables `test-support` via its dev-dependency (devflow-cli Cargo.toml line 29). Additive `pub` items behind a feature, not a published-API break |
+| `.github/workflows/ci.yml` | `--init` on Test and Sequential 2-CPU | ✓ VERIFIED | lines 53 and 108 |
+
+`rg 'kill\(-'` over `crates/` finds no `kill(-pgid, 0)` existence probe left outside the zombie test's own
+control. One single-pid probe remains: `monitor::tests::a_supervisor_that_fails_to_publish_ends_its_agent_group`
+polls `kill(agent, 0)` for ESRCH (monitor.rs line 6235), which a non-reaping PID 1 would keep failing on an orphaned
+zombie agent. With `--init` in CI it does not matter today (Info, below).
 
 ### Key Link Verification
 
 | From | To | Via | Status |
 |------|----|-----|--------|
-| `run_supervised_stage` | `StreamThreads::join_within` | `finish_stream_threads` after the exit file, for Completed and Stopped | WIRED |
-| `drive_stream_io` exit watch | `runtime::wait_for_exit_without_reaping` | `StreamEvent::AgentExited` ends the loop | WIRED |
-| reader thread | shared capture | `tee_to_capture` on `Arc<Mutex<Option<File>>>` | WIRED |
-| `run_monitor` | advance safe point 1 | `stopped_at_safe_point(&mut state, 1)` (E3 passes) | WIRED |
-| 50-28 checkpoint | `--attempt-gate --current-source` | re-run today: `current_source=yes`, `shipped attempt=2` | WIRED |
+| `end_recorded_agent_group` | `backstop::group_members` | `group_empties_within` polls it until `Some(empty)` or the deadline | WIRED (test above) |
+| `group_empties_within` result | sidecar removal | `keep_sidecar` → `remove_launch_files` vs socket-only removal | WIRED (the test asserts the sidecar is gone) |
+| CLI tests | `devflow_core::test_support::live_group_members` | `test-support` feature on the dev-dependency | WIRED (the CLI tests compiled and passed) |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| Full workspace, once | `cargo nextest run --workspace --no-fail-fast` | 1657 run, 1657 passed, 3 skipped, 4 LEAK (the same 4 known deferred items as last time) | ✓ PASS |
-| Count cross-check | 1648 last round + 9 new tests (A, B, C, D, F, G, E1, E2, E3) | 1657 | ✓ consistent |
-| Named-test lookup control | same grep with a nonexistent test name | 0 matches (rc 1) | ✓ discriminates |
-| fmt / clippy | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | rc 0 / rc 0 | ✓ PASS |
-| macOS compile (V-56) | `cargo check --target aarch64-apple-darwin -p devflow-core -p devflow --all-targets` | rc 0 | ✓ PASS (compile only) |
-| API break list | `semver-gate.sh check --through 50-16` | `SEMVER verdict=match` | ✓ PASS |
-| WR-03 repro, fixed binary | scratch `__monitor --launch stream --agent claude`, agent prints its result, backgrounds `sleep 60` on its stdout, exits; attempt 2's binary `182ab8b5…` | exited 3.17 s after start, holder still alive; one `stream_wait_bounded` (`waited_ms` 3007, `unfinished: [reader]`, `capture_closed: true`) | ✓ PASS |
-| WR-03 negative control | same script, pre-fix binary `bc862759…` (crate tree = `566c434`, the previous verification's HEAD) | still ALIVE at 40 s, ping `owner: agent_running`; no `stream_wait_bounded` | ✓ control discriminates |
-| WR-03 released-stdout control | same script, fixed binary, holder's stdio on `/dev/null` | exited after 0.27 s, no `stream_wait_bounded` | ✓ PASS |
-
-The repro's advance then failed on the scratch project's missing state (rc 1, `no active DevFlow state`), as
-intended: the repro measures whether the supervisor gets past the stream wait, not the advance.
-
-### Probe Execution (evidence judges, read-only)
-
-| Probe | Result | Status |
-|-------|--------|--------|
-| `--attempt-gate ~/.cache/devflow-phase50 --current-source` | `ATTEMPT_GATE current_source=yes`, `fault=fault-7 bin_sha256=182ab8b5…`, `verdict=shipped attempt=2` | PASS |
-| `--fault-current ~/.cache/devflow-phase50` | 4 `ok live`, window `ok pointer`, `FAULT_CURRENT verdict=pass` | PASS |
-| `--published 50-evidence --attempt 2` / `--attempt 1` (control) | `pass` / `fail` (`attempt_current_source=no`) | PASS (control discriminates) |
-| `--live-run 50-LIVE-RUN.md --attempt 2` | `LIVE_RUN verdict=pass` | PASS |
-| `--identity-scan 50-evidence --repo .` | `IDENTITY tokens=9`, `verdict=pass` | PASS |
-| `--selftest` | `SELFTEST passed=75 failed=0` | PASS |
-
-The P50 home listing (1011 entries: path, size, mtime) was identical before and after all judges and repros.
+| 13 core lib tests named above, one per command | `cargo nextest run -p devflow-core --lib --no-tests=fail -E 'test(=…)'` | each `1 passed` | ✓ PASS |
+| 8 CLI integration tests (`stop_e2e`, `supervisor_e2e`, `start_lock_e2e`, `test_home_isolation`) | `cargo nextest run -p devflow --test <name> --no-tests=fail -E 'test(=…)'` | each `1 passed` | ✓ PASS |
+| 2 CLI bin tests (`pipeline_launch::tests::…`) | `cargo nextest run -p devflow --bin devflow --no-tests=fail -E 'test(=…)'` | each `1 passed` | ✓ PASS |
+| Name-gate control | same command, nonexistent test name | rc 4, `0 tests run` | ✓ discriminates |
+| macOS compile | `cargo check --target aarch64-apple-darwin -p devflow-core -p devflow --all-targets` | finished, rc 0 | ✓ PASS (compile only) |
+| PR #225 CI | `gh pr checks 225` (head `673e9fb`) | 12 of 12 pass, including Test and Sequential 2-CPU | ✓ PASS, but with `--init` (Lead 1) |
+| Full suite | not re-run (instruction: another verifier runs concurrently) | brief reports `scripts/check.sh all` green in the pinned container on `78178f6` | not checked here |
 
 ### Requirements Coverage
 
 | Requirement | Source Plans | Description | Status | Evidence |
 |-------------|--------------|-------------|--------|----------|
-| SUPV-01 | all 29 plans (50-01 to 50-29) | Monitor liveness answerable from disk state alone without a PID, in three distinguishable states; both shapes identical; `sun_path` bound; path in `state.json` under the cache dir | ✓ SATISFIED | criteria 1-3 verified, and criterion 4 (added in the 2026-10-10 discussion) now verified |
+| SUPV-01 | all 29 plans (`requirements: [SUPV-01]`; 29 of 29 matched, control ID `SUPV-99` matched 0) | Monitor liveness answerable from disk state alone without a PID, in three distinguishable states; both shapes identical; `sun_path` bound; path in `state.json` under the cache dir | ✓ SATISFIED | criteria 1-8 verified above. REQUIREMENTS.md now shows `[x]` and `Complete` (lines 122, 205) |
 
-No orphaned requirement: REQUIREMENTS.md maps only SUPV-01 to Phase 50, and all 29 plans declare it. REQUIREMENTS.md
-still shows SUPV-01 as `[ ]` / `Pending`; ticking it is the phase-completion step, not a verification gap.
+No orphaned requirement: REQUIREMENTS.md maps only SUPV-01 to Phase 50.
 
 ### Anti-Patterns Found
 
-| File | Pattern | Severity | Impact |
-|------|---------|----------|--------|
-| lines added since `a7d2ac0` (crates, ARCHITECTURE.md, allowlist, phase tools) | `TBD`/`FIXME`/`XXX`/`TODO`/`HACK` | none | the only hits are `mktemp` `XXXXXX` templates; positive control: 23 added `WR-03` lines found by the same scan |
-| `crates/devflow-cli/src/pipeline_gate.rs` finalization loop | stop checked once before a retry loop | ⚠️ Warning (Lead 1; backlog 999.166 item 7) | narrow window, unreproduced |
-
-### Judgment-tier prohibitions of the gap-closure plans (6, settled from evidence)
-
-Nothing was found broken. These are sign-offs GSD requires by policy, not findings.
-
-| Plan | Prohibition (short) | Basis |
-|------|---------------------|-------|
-| 50-26 | nothing under `~/.cache/devflow-phase50` read or written | no reference to `devflow-phase50` in the new tests or the revert check (`rg` finds none) |
-| 50-26 | no new signal on the stream path | the only added `kill` is test-module code (above); `join_within` detaches, never signals |
-| 50-27 | no P50 writes | the tool is read-only in this run (listing identical before and after) |
-| 50-27 | repo deletion stays with the operator | runbook lines 40 and 262-271 |
-| 50-28 | no executor creates or deletes a repo; never this repo | raw evidence names only `p50-live-attempt-2`; whether the session or the operator typed the creation command is not visible on disk (limit below) |
-| 50-28 | no pre-written gate answer; only Define and Code answered | events: Define and Code `responded_by: denniyahh`, Ship `--yes-ship`; no `deviations.txt`. Timing of the response writes against `gate_fired` was not checked |
-| 50-29 | no unsanitized evidence; verdicts not from memory | `--published` pass, gitleaks clean, verdict files byte-identical to the raw ones |
-| 50-29 | only account-identity hits redacted by hand | `--identity-scan` pass with no `REDACTED-EMAIL-*` added in attempt 2; the separate redaction of three planted control credentials is recorded as an operator decision (50-29-SUMMARY lines 46, 123, 220) |
+| File | Line | Pattern | Severity | Impact |
+|------|------|---------|----------|--------|
+| lines added since `cc50411` (crates, ci.yml) | — | `TBD`/`FIXME`/`XXX`/`TODO`/`HACK` | none | zero hits; positive control: the same scan finds 16 added lines containing `zombie` |
+| `crates/devflow-core/src/monitor.rs` | 6235 | zombie-blind `kill(pid, 0)` in `a_supervisor_that_fails_to_publish_ends_its_agent_group` | ℹ️ Info | would fail under a non-reaping PID 1; masked by `--init` |
+| `crates/devflow-core/src/monitor.rs` | 2126 | `group_member_count` (refusal text only) still counts zombies | ℹ️ Info | wording in a refusal message, no decision rests on it |
+| `crates/devflow-cli/src/pipeline_gate.rs` | finalization loop | stop checked once before a retry loop | ⚠️ Warning (carried; 999.166 item 7, operator-deferred) | narrow window, unreproduced |
 
 ### Human Verification Required
 
-None. No truth needs a human test step. The one item for a decision is Lead 1 above, which the operator has
-already ruled on (deferred).
-
-### Known residuals (not gaps; recorded in the backlog)
-
-- 999.166 item 7: the finalization retry-loop stop (Lead 1).
-- 999.166 item 8: notify fires before safe point 5 for a stopped `--yes-ship` run; ARCHITECTURE.md's stream-wait
-  wording; the safe-point-6 comment overstates "a resumed run asks again".
-- 999.166 item 6: after a safe-point stop the exit file keeps the agent's code.
-- 999.164 item 5: leftover group members keep running after a normal completion.
-- 999.166 item 1 (WR-01 of the first review): long stretches where `stop` says "did not answer" for a stop it will
-  carry out later.
+None. No truth needs a human test step. The judgment-tier prohibitions of plans 50-26 to 50-29 were settled from
+evidence in the previous report, nothing was found broken, and the close-out does not touch the files they concern.
 
 ### What this verification does not establish
 
-- **The revert check was not re-run.** It creates a scratch git worktree, which is outside a read-only
-  verification. The fail-first property of A, C, D, F, E1 and E3 rests on 50-26's recorded run and on my independent
-  repro, whose negative control is a binary built from the pre-fix crate tree. That repro covers the completed-run
-  case only; the stop-while-advancing case (E3) and the stop-with-outside-holder case (D) are proved by the tests
-  alone.
-- **One full run, on one machine.** 1657/1657 passing once says nothing about the flake rate of the timing-based
-  tests (C takes 20 s and depends on a 3 s bound).
-- **Live evidence is one attempt (attempt 2) to Ship with no stop, no signal and no held stdout.** It shows the
-  fixed binary runs a full pipeline in both launch shapes, not that the stop paths work live.
-- **Operator decisions I relied on but cannot see**: the 2026-10-21 delegation of attempt 2 ("Yes, but you do the
-  run"), the redaction of the planted credentials, and the deferral of 999.166 items 7-8 are recorded in committed
-  files by the orchestrating session. `responded_by: denniyahh` cannot distinguish the operator from a process
-  running as the same user.
-- **The macOS check is compile-only.**
+- **The zombie-only production path, and any non-reaping-PID-1 run** (Lead 1). Nothing on record runs the census
+  fix without a reaping PID 1.
+- **The unreadable-`/proc` guarantee rests on code reading**, not a test.
+- **The full suite was not re-run here.** That rests on the brief's report of the pinned-container run on
+  `78178f6` and on PR #225's CI; I confirmed the CI result (12 of 12 pass on `673e9fb`) but not the container run.
+  Each named test passed once on one machine, which says nothing about timing flake rates.
+- **Live evidence is unchanged**: attempt 2 ran on a binary built before the close-out, with no stop sent. The
+  close-out's production change lies on the RV-03 path (a supervisor killed before it published), which attempt 2
+  did not exercise.
+- **macOS is compile-only.**
 
 ### Gaps Summary
 
-The previous gap is closed. The stream loop now ends at the agent's exit, the thread wait is bounded at 3 s, and
-nothing waits forever between an agent's exit and the advance. A stop sent in that window is honoured at safe point
-1. This is shown by nine new tests that pass, by a repro on the production binary that discriminates against the
-pre-fix binary, and by a live attempt 2 on the fixed binary that re-judges `shipped` with `current_source=yes`. The
-other seven criteria show no regression. One narrow exception to criterion 4 (the finalization retry loop) is
-confirmed by code reading, not reproduced, and deferred by the operator. If that deferral is withdrawn, it becomes
-the one gap.
+No gaps. The close-out's production change keeps the phase's guarantees: an empty group is still reported empty
+(tested on the production path, with a discriminating assertion), an unreadable `/proc` still never reads as empty
+(code), and a zombie no longer counts as a member (rule tested on a real zombie; the production path is not
+exercised with one). It also stops counting another uid's member as occupying the group, which matches the
+backstop's existing rule. All eight roadmap criteria hold on the current tree by named tests that passed in this
+run. The carried residual (999.166 item 7) stays deferred by operator decision.
 
 ---
 
-_Verified: 2026-10-21T22:47:29Z_
+_Verified: 2026-10-23T10:24:24Z_
 _Verifier: Claude (gsd-verifier)_
