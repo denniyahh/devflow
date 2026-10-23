@@ -154,6 +154,30 @@ if [ ! -x "$worktree_guard" ]; then
 fi
 "$worktree_guard" --staged
 
+# Secret scan: every commit's staged changes go through gitleaks.
+#
+# Until this block, a commit here was scanned only on machines whose global
+# hooks happened to run gitleaks (the chain at the bottom of this file); a
+# fresh clone, a contributor without one, or `GIT_CONFIG_GLOBAL=/dev/null`
+# committed unscanned. A missing gitleaks refuses rather than warns, like the
+# scanners above: a secret scan that silently stops running is the failure
+# this block exists to close. `--redact` keeps a found secret out of the
+# terminal and any log of it. A machine whose global hook also runs gitleaks
+# scans twice; that costs well under a second.
+#
+# Exercised by crates/devflow-cli/tests/pre_commit_secret_scan.rs.
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks is not on PATH; refusing to commit without a secret scan." >&2
+    echo "  Install it (https://github.com/gitleaks/gitleaks#installing), then commit again." >&2
+    exit 1
+fi
+if ! gitleaks git --pre-commit --staged --redact --no-banner --verbose; then
+    echo "pre-commit: gitleaks refused the staged changes (see its findings above)." >&2
+    echo "  Remove the secret from the staged files. If it is a false positive, add its" >&2
+    echo "  fingerprint to .gitleaksignore in the same commit." >&2
+    exit 1
+fi
+
 # Drop-in extension point: every file in scripts/hooks/pre-commit.d/ runs, in name
 # order, with this hook's arguments, and the first failure fails the hook.
 # develop ships none; a personal workspace branch adds its own checks here as
