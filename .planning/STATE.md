@@ -6,11 +6,11 @@ current_phase: "50.1"
 current_phase_name: Split-Lock State-Handling Overhaul
 current_plan: Not started
 status: planning
-stopped_at: Phase 50 complete, ready to plan Phase 50.1
-last_updated: "2026-10-21T22:50:37.691Z"
+stopped_at: Phase 50.1 context gathered
+last_updated: "2026-10-23T20:11:44.279Z"
 last_activity: 2026-10-21
 last_activity_desc: Phase 50 complete, transitioned to Phase 50.1
-state_head: cc5041183067afd58e26b2a9b3a8023fd8e72085
+state_head: 94b90cbc9c3e298b5fc7c7545ad909bb11996f46
 progress:
   total_phases: 7
   completed_phases: 5
@@ -211,7 +211,7 @@ backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scann
 by the scanner's staged-only scope.
 Last activity: 2026-10-21 — Phase 50 complete, transitioned to Phase 50.1
 
-Progress: [██████░░░░] 57% (4 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
+Progress: [███████░░░] 71% (5 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 
@@ -965,9 +965,9 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 
 ## Session
 
-**Last session:** 2026-10-11T00:56:59.545Z
-**Stopped at:** Phase 50 complete, ready to plan Phase 50.1
-**Resume file:** .planning/phases/50-addressable-monitor-liveness/50-CONTEXT.md
+**Last session:** 2026-10-23T20:11:43.795Z
+**Stopped at:** Phase 50.1 context gathered
+**Resume file:** .planning/phases/50.1-split-lock-state-handling-overhaul/50.1-CONTEXT.md
 
 ## Operator Next Steps
 
