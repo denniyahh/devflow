@@ -344,6 +344,47 @@ fn ci_workflow_runs_the_pinned_devcontainer_image() {
     }
 }
 
+/// The weekly dependency workflow repeats ci.yml's `Dependency checks` job
+/// outside the push/PR triggers, so it must run the same pinned image and the
+/// same `scripts/check.sh deps`, on a schedule. Nothing else compares its
+/// image with the devcontainer's, so without this a bump in the other two
+/// files would leave it silently on the old image.
+#[test]
+fn scheduled_deps_workflow_runs_the_pinned_image() {
+    let root = repo_root();
+    let workflow = read(&root.join(".github/workflows/scheduled-deps.yml"));
+    let devcontainer = read(&root.join(".devcontainer/devcontainer.json"));
+    let image = devcontainer
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("\"image\""))
+        .and_then(|l| l.split('"').nth(3))
+        .expect("read \"image\" from devcontainer.json");
+
+    let lines = code_lines(&workflow);
+    let images: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("image:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        images,
+        [image],
+        "scheduled-deps.yml must run exactly one container, the image \
+         devcontainer.json declares"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.trim() == "- run: scripts/check.sh deps"),
+        "scheduled-deps.yml must run `scripts/check.sh deps`"
+    );
+    assert!(
+        lines.iter().any(|l| l.trim() == "schedule:"),
+        "scheduled-deps.yml must run on a schedule"
+    );
+}
+
 /// `devflow test` is documented as the local mirror of CI's quality gates,
 /// so its clippy invocation must match the workflows' scope. It ran the
 /// narrow pre-Phase-17 form until this fix (17-REVIEW.md WR-10), which made
