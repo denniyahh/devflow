@@ -111,6 +111,13 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   and every assertion about that exit code passes without ever reading it. That is a green check
   over an unread result, the same class as the `rg -c` dead gate in CLAUDE.md. All three phase-46
   plans shipped with it and each executor rediscovered it independently on the clock.
+- [ ] **[PROJECT]** `scripts/hooks/pre-commit` **runs its own secret scan**, `gitleaks git --pre-commit
+  --staged --redact`, on every commit (PR #227, 2026-10-23), so a fresh clone or a machine without the
+  global hook (§3 [GLOBAL] below) no longer commits unscanned. A missing `gitleaks` refuses the commit
+  rather than skipping; a false positive goes in `.gitleaksignore` by fingerprint. Exercised by
+  `crates/devflow-cli/tests/pre_commit_secret_scan.rs`. On this machine every commit is now scanned
+  twice (repo hook + global hook); that is cheap except for the multi-MB `graphify-out/` refreshes on
+  `workspace/denniyahh` (the global scan alone took 5m20s on 18.5 MB, 2026-10-23).
 - [ ] **[PROJECT]** `scripts/hooks/pre-commit` also **refuses phase source committed outside the
   phase's own worktree**. When `.planning/STATE.md`'s `current_phase` is N and a worktree exists on
   `feature/phase-N`, a commit made from any other branch is refused if it stages `crates/**`, and
@@ -253,6 +260,15 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   rather than on a finding. `check.sh deps` refuses loudly when a tool is missing instead of
   skipping. Advisory because `cargo deny` reads the live RustSec advisory database, so a newly
   published advisory can turn it red on a PR that changed nothing.
+- [ ] **[PROJECT]** `.github/workflows/scheduled-deps.yml` runs the same `scripts/check.sh deps` every
+  Monday and on demand (`workflow_dispatch`), so a new advisory surfaces without a push (PR #228,
+  2026-10-23). GitHub runs schedules only from the **default branch** (`develop`, §2); a manual run on
+  `develop` passed the day it merged. `ci_parity_guards::scheduled_deps_workflow_runs_the_pinned_image`
+  fails if it drifts from the devcontainer's pinned image.
+- [ ] **[PROJECT]** `.github/dependabot.yml`: one grouped weekly PR against `develop` for GitHub Actions
+  versions only. No Cargo version-update PRs (each would run the full container CI; `cargo deny`
+  covers advisories) and no devcontainer-image updates (three files must match; bumped by hand).
+  Automatic security-fix PRs are **off** (a repo setting, not a file).
 - [ ] **[PATTERN]** **Any container job whose `run:` steps use bash syntax must declare
   `shell: bash`.** GitHub defaults a `run:` step to `bash -e {0}` only on a *bare runner*; inside
   a `container:` job it is `sh -e {0}`, and these Debian images ship dash as `/bin/sh`. So
