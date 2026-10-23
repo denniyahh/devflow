@@ -1,6 +1,6 @@
 ---
 phase: 49-live-unattended-run-the-milestone-s-instrument
-verified: 2026-10-09T18:35:21Z
+verified: 2026-10-23T10:24:19Z
 status: passed
 score: 5/5 must-haves verified
 covered_files:
@@ -65,174 +65,140 @@ covered_files:
   - "crates/devflow-cli/src/commands.rs"
   - "crates/devflow-cli/src/pipeline_gate.rs"
   - "crates/devflow-cli/src/pipeline_launch.rs"
+  - "crates/devflow-cli/src/pipeline_outcomes.rs"
+  - "crates/devflow-cli/src/preflight.rs"
   - "crates/devflow-cli/src/staleness.rs"
   - "crates/devflow-cli/tests/gate_notify_persist_e2e.rs"
   - "crates/devflow-core/src/agent_result.rs"
   - "crates/devflow-core/src/canary.rs"
+  - "crates/devflow-core/src/config.rs"
   - "crates/devflow-core/src/gates.rs"
   - "crates/devflow-core/src/monitor.rs"
   - "crates/devflow-core/src/prompt.rs"
   - "crates/devflow-core/src/state.rs"
   - "scripts/scratch-dogfood-repo.sh"
-covered_digest: "v3:sha256:7a2820098f10f6a58030f0fb07b77e9d55946b2b3c5255369b178a150e821bd4"
+covered_digest: "v3:sha256:7be3d925b121ec8b2940bf4c2eac31f5f8e8009e1600a319d331fb9eeddb50d2"
 behavior_unverified: 0
 overrides_applied: 0
 re_verification:
-  previous_status: human_needed
+  previous_status: passed
   previous_score: 5/5
-  gaps_closed:
-    - "WR-03 decided: fixed in c5d7d46; HEAD's Ship prompts carry no `integration` literal and a test pins both renderers"
-    - "49-LIVE-RUN.md annotated in 0978563 for the bbfe6df fix-branch merge"
-    - "Judgment-tier prohibitions ruled (UAT item 3: agent ruling at the operator's request, recorded)"
-    - "Attempt 2 quota-pause question ruled moot in 0978563 (UAT item 4)"
-    - "49-LIVE-RUN.md 'formatting only' statement (raised by this pass at 18:32Z) corrected in db18578: line 16 lists c5d7d46, af38901, 53d7d25, 9e78c83, b3f7fdf and separates code-identical observations from the two test-only surfaces; line 250 points to it"
+  gaps_closed: []
   gaps_remaining: []
   regressions: []
 ---
 
 # Phase 49: Live Unattended Run — Verification Report
 
-**Phase Goal:** Record a real `devflow start --mode auto` run against a disposable GSD project end to end, against a
-configured base: fork point, preflight, unattended progression and Ship merge target. The milestone's earlier fixes are
-then measured on a live chain, not asserted from unit evidence.
-**Verified:** 2026-10-09T18:35:21Z
+**Phase Goal:** A real `devflow start --mode auto` run against a disposable GSD project is recorded end to end against a
+configured base (fork point, preflight, unattended progression, Ship merge target), so the milestone's earlier fixes are
+measured on a live chain rather than asserted from unit evidence.
+**Verified:** 2026-10-23T10:24:19Z (tree at `e74371d`; `crates/` and `scripts/` identical to `78178f6`)
 **Status:** passed
-**Re-verification:** Yes. The previous report (status human_needed, no `gaps:`) was stale. All four of its human items
-are closed in 49-UAT.md, each with a recorded resolution.
+**Re-verification:** Yes. The 2026-10-09 report was `passed` with no `gaps:`, then went `stale` because Phase 50 changed
+10 covered crate files. Nothing under the phase directory, `scripts/scratch-dogfood-repo.sh` or `canary.rs` changed
+since that report (`git log 05a0702..HEAD` on those paths is empty).
+
+## Bottom line
+
+The live record still stands and nothing Phase 49 depends on regressed. The committed evidence is unchanged since
+`cb1bc48`, the evidence checker still derives the same verdict from it, every phase 49 tool's selftest passes, and the
+code paths behind each criterion still exist at HEAD with passing named tests.
+
+**What this does not establish:** the run measured the binary built from `084625c`. Since then the chain runtime was
+rebuilt (Phase 50's socket supervisor, `monitor.rs` +/- ~8.8k lines) and the CR-01 checkpoint detector was replaced by a
+declared `checkpoint` field in the result marker (`ab6f6f2` and follow-ups, done outside GSD after Phase 49.1 was
+removed). No live run has exercised either at HEAD. That is a property of later work, not a Phase 49 gap: Phase 49's
+contract is a recorded run, and it was recorded. The 2026-10-09 "Update" paragraph at the top of 49-LIVE-RUN.md says the
+checkpoint detector "carries to the branch by code identity"; that was true of `feature/phase-49` on that date and is no
+longer true of HEAD (see Info items).
 
 ## Goal Achievement
 
-Bottom line: the live record still holds. The committed evidence is unchanged since the last report (no commit touches
-`49-evidence/` after cb1bc48), and every criterion re-checks clean against it, the raw attempt gate and live GitHub.
-**However, the run measured the binary built from `084625c`, and HEAD is no longer that code.** 49-LIVE-RUN.md now
-says so (db18578, re-checked below). No human item remains.
+### Observable Truths (ROADMAP success criteria)
 
-### What attempt 3 does and does not establish about HEAD
+| # | Truth | Status | Evidence (this session) | Not established |
+|---|-------|--------|-------------------------|-----------------|
+| 1 | Disposable project commits `devflow.toml` with non-default `base_branch`; persisted `State::base_branch` reads it | ✓ VERIFIED | All 3 attempt-3 gate snapshots' `state-01.json` `.base_branch` = `integration`; negctl snapshot = `develop` (discriminating pair). `start.stdout:1` prints `base branch is \`integration\` (from devflow.toml (base_branch))`. HEAD: `commands.rs:421` still assigns `state.base_branch = Some(resolved_base.value.clone())` (same statement as `084625c:414`); `config::tests::base_branch_reads_devflow_toml`, `base_branch_defaults_to_develop_with_no_config`, `state::tests::base_branch_round_trips_…` pass. | No test asserts the start-to-state persistence end to end; that rests on the live snapshot plus source read. |
+| 2 | Fork point through Ship merge target; Holds; unattended apart from Define/Code; Ship by `--yes-ship`; merge target observed | ✓ VERIFIED | `start.stdout:5` `[holds] GSD config can hold the chain flag` (the `unattended_config_condition` row, `preflight.rs:1168`; function body unchanged in substance since `084625c`). Events: 3 `gate_fired`, 3 `gate_resolved` (define/code by `denniyahh`, ship by `--yes-ship` at ts 1791412415), 1 `checkpoint_auto_decided`, 0 `advance_failed`/`workflow_aborted`. `git.txt`: `integration_merge_count=1`, `main_head` unmoved. `check-evidence.sh --arm positive` on attempt-3: 11/0. HEAD: `pipeline_outcomes::tests::handle_ship_outcome_with_yes_ship_auto_approves_exactly_once_with_attribution`, `preflight::tests::unattended_check_reports_every_condition_in_both_modes`, `prompt::tests::ship_prompts_name_the_trunk_and_no_fixture_branch` pass. | The PR base came from `084625c`'s prompt wording; HEAD's wording is unit-tested only. The run went through the pre-Phase-50 monitor chain. One sample. Live PR state was not re-read this pass. |
+| 3 | Negative arm re-run with this phase's binary; both arms from one binary | ✓ VERIFIED | `negctl/bin_sha256` and `attempt.json .bin_sha256` both start `e8cf0077946f`. `negctl/start.stdout:6` `[DOES NOT HOLD] … no \`.planning/config.json\``. Checker: negative 5/0, pair 3/0. HEAD: the same refusal string is at `preflight.rs:994`; `preflight::tests::unattended_check_refuses_when_the_gsd_config_is_absent` passes. | The pinned binary cache `~/.cache/devflow-phase49` no longer exists, so the raw `--attempt-gate` cannot be re-run; this rests on the committed sanitized copy. |
+| 4 | DECN-03 answered or recorded not exercised | ✓ VERIFIED | Exactly 1 `checkpoint_auto_decided` event; 49-LIVE-RUN.md records the outcome **Followed** (unchanged file). HEAD still emits the event (`pipeline_launch.rs:2073`); `pipeline_launch::tests::relaunch_checkpoint_session_emits_exactly_one_audit_event` passes. | The answer is for `084625c`'s prose heuristic. HEAD decides the checkpoint from a declared field (`agent_result.rs:68`, `pipeline_launch.rs:2642`); `agent_result::tests::declared_checkpoint_is_read_from_the_marker_field` passes, but no live run has exercised it. One model, one sample. |
+| 5 | SURV-01 recorded without overclaiming | ✓ VERIFIED | `surv/analysis.txt` unchanged since `cb1bc48`; `surv-watch.py --selftest` 7/0. | Field observation only; it confirms nothing about concurrency. |
 
-`git diff --stat 084625c HEAD -- crates` gives 9 files, +855/-29 (5574841 rustfmt, c5d7d46, af38901, 53d7d25, 9e78c83,
-b3f7fdf). Split by criterion:
+**Score:** 5/5 truths verified (0 present, behavior-unverified). These truths are evidence of a historical run, so
+"behavior" here is the recorded run itself, re-derived by the deterministic checker; it is not a re-measurement of HEAD.
 
-- **Code byte-identical to the attempt-3 binary, apart from rustfmt:** base-branch resolution and persistence,
-  preflight / `unattended_config_condition`, fork point, gate firing and `--yes-ship` resolution, the local merge into
-  the base, and the CR-01 checkpoint detector (`agent_result.rs` has no diff since 084625c). Criteria 1, 3, 4 and 5,
-  and the DevFlow-owned half of 2, therefore carry to HEAD **by code identity**. That is an inference from the diff, not
-  a re-measurement.
-- **Changed since the run, never exercised live:**
-  1. **Ship PR instruction (c5d7d46).** Attempt 3's agent read "target base branch `main` … while DevFlow merges into
-     integration locally". HEAD's prompt reads "target base branch `main` (the repository trunk), not the base branch
-     DevFlow merges this phase into locally". So the PR-to-`main` observation in criterion 2 was produced by a different
-     prompt text. Whether HEAD's wording steers the agent the same way has not been measured. It has unit tests only
-     (`ship_prompts_name_the_trunk_and_no_fixture_branch` and `ship_prompt_instructs_pr_targeting_main`, both passing).
-  2. **Gate notify delivery (af38901, 9e78c83, b3f7fdf).** At 084625c, `State::new` captured `DEVFLOW_GATE_NOTIFY_CMD`
-     and the monitor exported it into the chain. At HEAD, `start`, `resume` and `advance` apply the variable to
-     `state.gate_notify_cmd`, every spawn strips it (`strip_notify_env`), and gates resolve it from the state file. Gate
-     snapshots are the evidence mechanism behind criteria 1 and 2, and attempt 3 took them through the **old** path.
-     At HEAD the path has 9 passing e2e tests plus unit tests. It has no live run. WR-12, WR-13 and IN-10 (deferred to
-     999.154) record known residual gaps in it, including WR-13's rate-limit cron path, which is the path that cost
-     attempt 2 its Ship snapshot.
-- **Changed, not on attempt 3's path:** the WR-10 re-read before a gate's resolution save in `pipeline_gate.rs`. That
-  path is reached only when the on-disk notify command is edited mid-gate.
+### Required Artifacts (tooling)
 
-Net: VERIFY-01 is met for the 084625c binary. For HEAD it is met on every DevFlow-owned observation through unchanged
-code. The two changed surfaces, the agent-facing PR instruction and notify-hook delivery, rest on tests alone. Phase
-49.1 will replace the checkpoint detector, so after 49.1 the auto-decide path is also unmeasured live unless 49.1
-re-runs live.
+| Artifact | Status | Details |
+|----------|--------|---------|
+| `scripts/scratch-dogfood-repo.sh` | ✓ VERIFIED | `--selftest` 26/0, rc=0 |
+| `tools/snapshot-hook.sh` | ✓ VERIFIED | `--selftest` 6/0 |
+| `tools/collect-attempt.sh` | ✓ VERIFIED | `--selftest` 11/0 |
+| `tools/surv-watch.py` | ✓ VERIFIED | `--selftest` 7/0 |
+| `tools/sanitize-evidence.py` | ✓ VERIFIED | `--selftest` 12/0; `scan` rc=0 on `49-evidence/` and 49-LIVE-RUN.md; **negative control**: a planted `ghp_` token in scratch gives rc=1 (`github_token_prefix`) |
+| `tools/check-evidence.sh` | ✓ VERIFIED | `--selftest` 34/0; attempt-3 positive 11/0, negative 5/0, pair 3/0; **negative controls**: attempt-1 positive rc=1 (4/7), attempt-2 positive rc=1 (8/3) |
+| `tools/launch-attempt.sh` | ✓ VERIFIED | `--selftest` 17/0 (fakes for cargo, systemd-run, claude, gh) |
+| `tools/negctl.sh` | ✓ VERIFIED | `--selftest` 8/0 |
 
-### Observable Truths (ROADMAP success criteria, the contract)
+All selftests ran with `TMPDIR` in the session scratch directory.
 
-| # | Truth | Status | Evidence (re-checked this session) | What it does NOT establish |
-|---|-------|--------|------------------------------------|----------------------------|
-| 1 | Disposable project commits `devflow.toml` with non-default `base_branch`; persisted `State::base_branch` reads it | ✓ VERIFIED | `state-01.json` in all three attempt-3 gate snapshots reads `base_branch` = `integration`. `start.stdout:1`: `note: base branch is \`integration\` (from devflow.toml (base_branch))`. The negative arm's `negctl/gates/001-define/devflow/state-01.json` reads `develop`, so the field discriminates. | One value. Does not show the default when `devflow.toml` exists without the key. |
-| 2 | Fork point through Ship merge target: Holds, unattended apart from Define/Code, Ship by `--yes-ship`, merge target observed | ✓ VERIFIED | `start.stdout:5` `[holds] GSD config can hold the chain flag`. Events: exactly 3 `gate_fired` (define, code, ship). Define/Code resolved by `denniyahh`; Ship resolved by `--yes-ship` in the same second (1791412415). 0 `advance_failed`/`workflow_aborted`. `git.txt`: `integration_merge_count=1`, merge `311271e` with parents fork point `0f16ce6…` and `feature_head` `f142d99…`; `main_head` `2451b5e` unmoved. Live `gh pr view 1 --repo denniyahh/p49-live-attempt-3`: base `main`, head `feature/phase-01`, OPEN. Negative control: attempt-2's live PR base is `integration`. | PR base came from the 084625c prompt literal, not HEAD's wording (see above). `responded_by: denniyahh` is the OS user, so it does not by itself prove a human typed the approvals. One run. |
-| 3 | Negative arm re-run with this phase's binary; both arms from one binary | ✓ VERIFIED | `negctl/bin_sha256` = `attempt.json` `bin_sha256` = `e8cf0077946f…`. The pinned binary `~/.cache/devflow-phase49/bin/devflow-e8cf0077946f` hashes to the same prefix. `identity.txt` records `build_commit=084625c…` with `build_dirty=false`. `negctl/start.stdout:6` has the `[DOES NOT HOLD] … no \`.planning/config.json\`` line. Checker: negative 5/0, pair 3/0. | Same binary as each other, not as HEAD. "Refuses" means the run parks at a gate that the control aborts; it is not a hard exit. |
-| 4 | DECN-03 answered or recorded not exercised | ✓ VERIFIED | Exactly 1 `checkpoint_auto_decided`. Turn-1 and resumed captures both carry only `session_id` `uuid-2`. Both verbatim quotes are found exactly once in `1791412108556407377-0-stdout` (`rg -c -F` = 1 each). 49-LIVE-RUN.md records the single outcome **Followed**. | One model (claude 2.1.292), one sample. Cannot separate recency from compliance. The turn-placement claim rests on the uncommitted transcript (999.150). |
-| 5 | SURV-01 recorded without overclaiming | ✓ VERIFIED | `surv/analysis.txt`: writers=7, temp_writes=34, interleaved_windows=0, overflow_windows=0, stop_marker=present, plus the "establishes nothing" sentence. 49-LIVE-RUN.md copies these values and names the watch gap. | One watcher run; writes before `watch_added` are unobserved. |
+### Key Links (code paths at HEAD that the record's instruments depend on)
 
-**Score:** 5/5 truths verified (0 present, behavior-unverified). The run is the behavior, but it was measured on 084625c;
-see the HEAD scope section above.
+| From | To | Status | Details |
+|------|----|--------|---------|
+| `snapshot-hook.sh` via `DEVFLOW_GATE_NOTIFY_CMD` | gate firing | ✓ WIRED | `start`/`resume`/`advance` apply the variable to `state.gate_notify_cmd` (`commands.rs:347`, `pipeline_launch.rs:2254`, `:2506`); Phase 50's `spawn_monitor` still calls `strip_notify_env` (`monitor.rs:517`); gates resolve from the state file. `gate_notify_persist_e2e`: 9/9 passed. `monitor::tests::strip_notify_env_removes_the_variable_from_the_child`, `gates::tests::notify_cmd_resolution_has_three_environment_states`, `pipeline_gate::tests::gate_resolution_keeps_a_notify_cmd_edited_during_the_wait` pass. |
+| `collect-attempt.sh` / `check-evidence.sh` | event names | ✓ WIRED | `gate_fired`, `gate_resolved`, `advance_failed`, `workflow_aborted`, `checkpoint_auto_decided` still emitted in `crates/`. |
+| Ship gate | `--yes-ship` attribution | ✓ WIRED | `pipeline_outcomes.rs:842` `responded_by: Some("--yes-ship")`, tested above. |
 
-**Not evaluated here: the post-completion integration gate.** It runs after verification and `phase.complete`
-(merge-back into `workspace/denniyahh`, sync, divergence check, push, blob compare of 49-LIVE-RUN.md). It remains an
-orchestrator obligation. The 49-LIVE-RUN.md blob it compares is now the db18578 version.
+### Behavioral Spot-Checks (named tests, count-gated)
 
-### Previous human items: closure check
+| Command | Result |
+|---------|--------|
+| `cargo nextest run -p devflow-core --lib --no-tests=fail -E` (8 named tests, union) | rc=0, `8 tests run: 8 passed` = 8 names given |
+| `cargo nextest run -p devflow --bin devflow --no-tests=fail -E` (6 named tests, union) | rc=0, `6 tests run: 6 passed` = 6 names given |
+| `cargo nextest run -p devflow --test gate_notify_persist_e2e --no-tests=fail` | rc=0, 9/9 (file has 9 `#[test]`) |
 
-| Prior item | Closure claimed | Verified |
-|---|---|---|
-| WR-03 | fixed, c5d7d46 | Yes. `rg integration crates/devflow-core/src/prompt.rs` hits only the test's own doc comment and assertion. Both renderers call `ship_pr_base_instruction()`, which interpolates `config::MAIN` (`"main"`). The new test asserts `!prompt.contains("integration")`, which 084625c's production text (prompt.rs:278, :573 there) would fail. The test passes at HEAD. |
-| LIVE-RUN.md branch-location statements | 0978563, then db18578 | 0978563's annotation went stale ("formatting only"). db18578 corrected lines 16 and 250 and changed only that file. Line 16 names exactly the five post-merge crate commits that `git log 084625c..HEAD -- crates` shows besides rustfmt. It names the two changed surfaces (PR-base wording, notify via state file) as test-only and the rest as carrying by code identity, which matches this report's diff reading. The sanitizer scan on the edited file gives rc=0. Minor imprecision, not a defect: it says the notify command is "stripped from the monitor chain and agents" and omits the canary, which is also stripped. |
-| Judgment-tier prohibitions | UAT item 3 | Ruled by the agent at the operator's explicit request ("Why can't you answer these for me?"). The ruling is recorded in UAT. The operator's later "proceeded without contesting" is not itself an acceptance; the request to rule is the delegation. |
-| Attempt 2 unattended / D-11 | moot, 0978563 | Annotation present at the three places it was undecided. The ruling is sound: attempt 2 fails the positive arm (8/3 re-run here), so the verdict does not rest on it. |
+The union filters were gated on run count equal to the number of names, so a misspelled name would show as a short
+count. The full suite was not run here; per the caller it passed in the pinned container at `78178f6`, and
+`git diff --stat 78178f6 HEAD -- crates scripts` is empty.
 
-### Plan must-haves (regression re-run, additive to the contract)
+### Probe Execution
 
-| Plan | Check | Result |
-|------|-------|--------|
-| 49-01 | `criterion 1, amended in` in REQUIREMENTS.md; no tracked `49.1-configurable-test-wait-budget/` files; `roadmap.analyze` | hold; rc=0 |
-| 49-02/06 | `scripts/scratch-dogfood-repo.sh --selftest` | 26/0 |
-| 49-03 | snapshot-hook / collect-attempt selftests | 6/0, 11/0 |
-| 49-04 | surv-watch `--selftest` | 7/0 |
-| 49-05 | sanitize-evidence `--selftest`; `scan` over `49-evidence/` and 49-LIVE-RUN.md | 12/0; rc=0 both; **negative control:** a planted `ghp_` token makes `scan` exit rc=1 |
-| 49-07/08 | check-evidence selftest; arms over the committed copies | 34/0. Attempt 3: positive 11/0, negative 5/0, pair 3/0. **Negative controls:** attempt 1 positive rc=1 (4/7), attempt 2 positive rc=1 (8/3) |
-| 49-08/11 | `--attempt-gate ~/.cache/devflow-phase49` (source read first; it only reads and runs `sha256sum -c`) | rc=0, `ATTEMPT_GATE verdict=shipped attempt=3` |
-| 49-09 | launch-attempt selftest; attempt repos | 17/0; `p49-live-attempt-1` PRIVATE (read live) |
-| 49-12 | backlog 999.147–154 and Phase 49.1 present in ROADMAP | hold |
-
-### Code since the previous report (HEAD)
-
-| Check | Result |
-|---|---|
-| Named fix/review tests (`ship_prompt*`, `blocking_human_checkpoint_reported*`, notify resolver/persist, `strip_notify_env`, `gate_notify_cmd` round-trip) | 34 passed, 0 failed |
-| `pipeline_gate::tests::gate_resolution_keeps_a_notify_cmd_edited_during_the_wait` | 1 passed |
-| `cargo test -p devflow --test gate_notify_persist_e2e` | 9 passed, 0 failed |
-| `cargo test -p devflow-core --lib` (full) | 861 passed, 0 failed |
-| `cargo test -p devflow --bin devflow` (full) | 409 passed, 0 failed |
-| `cargo fmt --all -- --check` | rc=0 (CR-02 holds) |
-| `cargo clippy --workspace --all-targets -- -D warnings` | rc=0 |
-
-What these runs do not cover: the integration tests under `crates/*/tests/` other than `gate_notify_persist_e2e` were
-not run, and neither were `scripts/check.sh all` or the container gate. `feature/phase-49` has no remote ref, so no
-pre-push gate has run on HEAD either.
+No `scripts/*/tests/probe-*.sh` is declared by this phase. The phase's runnable checks are the tool selftests and checker
+arms above, all run in this process.
 
 ### Requirements Coverage
 
 | Requirement | Source Plans | Status | Evidence |
 |-------------|--------------|--------|----------|
-| VERIFY-01 | all 12 plans | ✓ SATISFIED (084625c binary; for HEAD, see the scope section) | Criteria 1-3 above. REQUIREMENTS.md still shows Pending, which is correct: `phase.complete` owns that flip. |
+| VERIFY-01 | 49-01 … 49-12 | ✓ SATISFIED (for the `084625c` binary) | Criteria 1-3 above. REQUIREMENTS.md: `[x]`, traceability row `Complete`. |
 
-`BUDGET-01` appears only inside 49-06-PLAN.md's quoted payload plan (the throwaway project's own requirement). It is not
-a Phase 49 requirement. No orphaned IDs: REQUIREMENTS.md maps only VERIFY-01 to Phase 49.
-
-### Review, security and validation state
-
-- 49-REVIEW-DISPOSITION.md: `open: 0` of 27. CR-01 deferred to Phase 49.1, which exists in the ROADMAP. Deferred items
-  have backlog homes 999.151–154, all present.
-- 49-SECURITY.md: `status: verified`, `threats_open: 0`.
-- 49-VALIDATION.md: `status: validated`, `nyquist_compliant: false`, with 3 manual-only rows (the live attempt, the real
-  negctl launch, the real prepare/auth probe). This is the expected shape for a live-run phase and does not block.
+No orphaned IDs: REQUIREMENTS.md maps only VERIFY-01 to Phase 49 (DECN-03 and SURV-01 rows belong to 47/48 and name
+Phase 49 only as where their field arm is observed). `BUDGET-01` and `D-24` appear in plan `requirements:` text as the
+throwaway payload's requirement and a decision reference, not Phase 49 requirements.
 
 ### Anti-Patterns Found
 
-| File | Line | Pattern | Severity | Impact |
-|------|------|---------|----------|--------|
-| crates/devflow-core/src/agent_result.rs | CR-01 heuristic | Deferred to 49.1 by the operator | ⚠️ Warning (deferred) | Unchanged since the last report |
-| 49-evidence/attempt-3 | two `phase-01-stdout` | Invalid JSON from sanitizer redaction (999.147) | ℹ️ Info | Not cited by any criterion |
-
-The lines added to crate files since the previous report contain no TBD/FIXME/XXX/TODO/HACK/`todo!`/`unimplemented!`.
+| File | Pattern | Severity | Impact |
+|------|---------|----------|--------|
+| covered crate files, scratch script, `tools/` | TBD/FIXME/XXX | none found | `rg` rc=1 (no match); positive control on a planted `FIXME` line matched |
+| 49-LIVE-RUN.md line 16 ("Update 2026-10-09") | Dated claim that the checkpoint detector and chain carry "to the branch by code identity" | ℹ️ Info | True for `feature/phase-49` on 2026-10-09; not true of HEAD after the CR-01 declared-field fix and Phase 50. Does not affect the verdict, which is scoped to `084625c`. |
+| 49-REVIEW-DISPOSITION.md CR-01 row | Says "routed to inserted Phase 49.1" | ℹ️ Info | Phase 49.1 was removed (`05fb2c7`); STATE.md records the fix done outside GSD; `agent_result.rs` now reads a declared `checkpoint` field. Disposition text is stale, the defect is addressed. |
+| 49-evidence/attempt-3 two `phase-01-stdout` | Invalid JSON after redaction (999.147) | ℹ️ Info | Not cited by any criterion; unchanged. |
 
 ### Human Verification Required
 
-None. The only item this pass raised, the 49-LIVE-RUN.md "formatting only" statement, was corrected in db18578 under
-the operator's low-impact delegation and is re-checked above. The prior four UAT items are closed in 49-UAT.md. The
-judgment-tier prohibitions were ruled at the operator's request and recorded as resolved there.
+None.
 
 ### Gaps Summary
 
-No must-have truth FAILED, and the previous report had no `gaps:`. The phase delivered its goal for the binary it ran.
-The record now states its own scope at HEAD. Strength of the result is unchanged: one shipped run, the third of
-three, on claude 2.1.292, one payload, one base topology. It sets no bound on reliability.
+No gaps. All five roadmap criteria hold against unchanged committed evidence, and the code and tooling they depend on
+still exist and pass targeted tests at HEAD. Strength is unchanged: one shipped run (third of three), one model, one
+payload, one base topology, on the `084625c` binary. It sets no reliability bound, and it does not measure HEAD's
+supervisor-based chain or its declared-field checkpoint detector; only a new live run would.
 
 ---
 
-_Verified: 2026-10-09T18:35:21Z_
+_Verified: 2026-10-23T10:24:19Z_
 _Verifier: Claude (gsd-verifier)_
