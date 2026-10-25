@@ -1477,6 +1477,27 @@ fixture copied under a 200+ character directory still finds file and offending t
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.170: `stop` Cannot End an Orphaned Agent Whose Supervisor Was Killed (BACKLOG)
+
+**Found:** 2026-10-25, external adversarial review of the Phase 50.1 plan set (pi/DeepSeek lane, finding 2). **Read in
+source, not reproduced.**
+
+**Defect:** when a supervisor is SIGKILLed while its agent runs, the agent's process group survives. `stop` finds no
+socket, no pending launch and no foreground holder, and has no arm that reaches the agent; `start`/`resume` refuse over
+the agent pid (`commands.rs` ~L3289-3294) and `recover --clean` keeps the phase. Today `stop_via_lock` prints
+"nothing is running" here (`commands.rs` ~L2807-2815). Phase 50.1 (D-19, operator 2026-10-25) only makes `stop` and
+`status` name the live agent pid and the manual kill instead; the arm itself is this entry.
+
+**Done when:** `stop` ends an orphaned agent's process group after an identity check that survives pid and pgid
+reuse (Phase 50's backstop rules, `supervisor/backstop.rs`), with a dead-supervisor + live-agent fixture and a
+recycled-pgid control that must not be signalled.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 999.146: `cut-pr-branch.sh`'s Default PR Branch Name Drops the First Hyphenated Word (BACKLOG)
 
 **Found:** 2026-09-24, triaging graphify-labs' advisory review of PR #219
