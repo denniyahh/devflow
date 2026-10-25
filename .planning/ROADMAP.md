@@ -522,10 +522,100 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 0 plans
+**Plans:** 29 plans (21 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+plan-check round 1) runs in wave 14, before 50.1-20
 
-Plans:
-- [ ] TBD (run /gsd-plan-phase 50.1 to break down)
+**Wave 1**
+
+- [ ] 50.1-01-PLAN.md *(no plan dependencies)* — durable replace / exclusive publish / remove with directory fsync; state and gate writers routed; D-09 source scan (V-10, V-14)
+- [ ] 50.1-02-PLAN.md *(no plan dependencies)* — 999.166 items 5 (accept backoff) and 9 (zombie-safe probe)
+- [ ] 50.1-03-PLAN.md *(no plan dependencies)* — requirement IDs SURV-03, SURV-04, SUPV-03, SUPV-04, SUPV-05 and traceability
+
+**Wave 2**
+
+- [ ] 50.1-04-PLAN.md *(depends on 50.1-01)* — `update_state` write flock with re-read, create path, owner fence, `pending_supervisor` field
+- [ ] 50.1-05-PLAN.md *(depends on 50.1-01)* — per-launch liveness lock: hold, probe, fd-3 inheritance, adoption; sidecar fsync (V-03 core, V-06)
+
+**Wave 3**
+
+- [ ] 50.1-06-PLAN.md *(depends on 50.1-01, 50.1-05)* — gate ids, keyed answers, observed-id writers, quarantine, claim, close (V-15 core, V-16, V-18)
+- [ ] 50.1-07-PLAN.md *(depends on 50.1-05, 50.1-02, 50.1-04)* — launch reservation through `spawn_monitor` and `__monitor --liveness-fd`
+
+**Wave 4**
+
+- [ ] 50.1-08-PLAN.md *(depends on 50.1-06, 50.1-05)* — waiter registration, binding wait, 999.166 items 4 and 7 (core), test pre-answer, transition bridge
+- [ ] 50.1-09-PLAN.md *(depends on 50.1-04, 50.1-06)* — retire `migrate_legacy_state` (D-11)
+
+**Wave 5**
+
+- [ ] 50.1-10-PLAN.md *(depends on 50.1-04, 50.1-07, 50.1-08)* — gate, transition and launch writes as field deltas (V-12, V-13)
+
+**Wave 6**
+
+- [ ] 50.1-11-PLAN.md *(depends on 50.1-10, 50.1-09)* — outcome, preflight and start/stop writes; no production `save_state` scans (V-11)
+
+**Wave 7**
+
+- [ ] 50.1-12-PLAN.md *(depends on 50.1-08, 50.1-11)* — CLI tests answer gates through the pre-answer seam or the live gate id
+
+**Wave 8**
+
+- [ ] 50.1-13-PLAN.md *(depends on 50.1-12)* — CLI answer writers bind to the observed gate id; `--gate-id` (V-19)
+
+**Wave 9**
+
+- [ ] 50.1-14-PLAN.md *(depends on 50.1-13)* — gate waits open, register, await and claim; `close` everywhere; D-06/D-07 tests (V-15 CLI, V-17, V-20, V-21, V-22)
+
+**Wave 10**
+
+- [ ] 50.1-15-PLAN.md *(depends on 50.1-14)* — delete the unkeyed gate API (source-scan gate); gate id required
+
+**Wave 11**
+
+- [ ] 50.1-16-PLAN.md *(depends on 50.1-14, 50.1-15)* — start/resume check-and-reserve, pending-aware guard, no long lock (V-01, V-03, V-04, V-05)
+
+**Wave 12**
+
+- [ ] 50.1-17-PLAN.md *(depends on 50.1-16)* — stage N records N+1 as pending; C4 and the new windows (V-02)
+
+**Wave 13**
+
+- [ ] 50.1-18-PLAN.md *(depends on 50.1-17)* — `status`/`stop`/`doctor` over a pending supervisor (V-07, V-08, V-09)
+- [ ] 50.1-19-PLAN.md *(depends on 50.1-17)* — ownership fence, promotion wait, orphan self-end, no advance lock (V-23, V-24, V-27)
+
+**Wave 14**
+
+- [ ] 50.1-29-PLAN.md *(depends on 50.1-18, 50.1-19)* — D-17 per-phase foreground holder; `stop`'s third arm retargeted to it; hand-run `advance` refuses over a live supervisor (V-29, V-30, V-31, V-32)
+
+**Wave 15**
+
+- [ ] 50.1-20-PLAN.md *(depends on 50.1-18, 50.1-19, 50.1-15, 50.1-29)* — waiter liveness by registration only; no CLI per-phase lock
+
+**Wave 16**
+
+- [ ] 50.1-21-PLAN.md *(depends on 50.1-20, 50.1-15)* — `recover` on live probes (999.166 item 2); per-phase lock API deleted
+- [ ] 50.1-22-PLAN.md *(depends on 50.1-20, 50.1-29)* — 999.166 items 7 and 8; `stop`/`ship` CLI help text and snapshot (D-17)
+
+**Wave 17**
+
+- [ ] 50.1-23-PLAN.md *(depends on 50.1-21, 50.1-19)* — `resume` reports set-aside answers; quarantine in `status`/`doctor`
+
+**Wave 18**
+
+- [ ] 50.1-24-PLAN.md *(depends on 50.1-23)* — 999.166 items 1 and 6 (D-16: exit file 143) (V-28)
+
+**Wave 19**
+
+- [ ] 50.1-25-PLAN.md *(depends on 50.1-24, 50.1-22, 50.1-21, 50.1-03)* — README/OPERATIONS/ARCHITECTURE/configuration guide, `status` repair hint without `advance`, crash table, 48-SECURITY, backlog fold markers (V-33)
+- [ ] 50.1-26-PLAN.md *(depends on 50.1-24)* — rig scripts and the 50.1 runbook
+
+**Wave 20**
+
+- [ ] 50.1-27-PLAN.md *(depends on 50.1-25, 50.1-26)* — live attempt to Ship plus the fault arm: one `checkpoint:human-action` (V-26)
+
+**Wave 21**
+
+- [ ] 50.1-28-PLAN.md *(depends on 50.1-27)* — post-hoc analysis: live-run record, semver report, 999.166 closure table
 
 ### Phase 51: Rate-Limit Agent Failover
 

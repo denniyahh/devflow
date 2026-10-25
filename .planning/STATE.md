@@ -3,18 +3,18 @@ gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
 current_phase: "50.1"
-current_phase_name: Split-Lock State-Handling Overhaul
+current_phase_name: Split-Lock State-Handling Overhaul (INSERTED)
 current_plan: Not started
-status: planning
-stopped_at: Phase 50.1 context gathered
-last_updated: "2026-10-23T20:11:44.279Z"
+status: executing
+stopped_at: Phase 50.1 planned (29 plans, 21 waves)
+last_updated: "2026-10-25T13:05:16.497Z"
 last_activity: 2026-10-21
 last_activity_desc: Phase 50 complete, transitioned to Phase 50.1
-state_head: 94b90cbc9c3e298b5fc7c7545ad909bb11996f46
+state_head: 81a18f7ba7b4475fb7b6517ba8daf07dc11d293f
 progress:
   total_phases: 7
   completed_phases: 5
-  total_plans: 77
+  total_plans: 106
   completed_plans: 77
   percent: 71
 ---
@@ -194,12 +194,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 50.1 — Split-Lock State-Handling Overhaul
-Plans: 25 (50-01…50-25, 17 waves; 50-19 is the one live-attempt checkpoint) — executing via `/gsd-execute-phase 50` from `.worktrees/phase-50`
+Phase: 50.1 (Split-Lock State-Handling Overhaul (INSERTED)) — READY TO EXECUTE
+Plans: 29 (50.1-01…50.1-29, 21 waves; 50.1-27 is the one live-attempt checkpoint) — execute via `/gsd-execute-phase 50.1` from `.worktrees/phase-50.1`
 Current Plan: Not started
-Total Plans in Phase: 25
-Completed Plans: 29 of 29
-Status: Ready to plan
+Total Plans in Phase: 29
+Completed Plans: 0 of 29
+Status: Ready to execute
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
