@@ -538,7 +538,7 @@ plan-check round 1) runs in wave 14, before 50.1-20
 
 **Wave 3**
 
-- [ ] 50.1-06-PLAN.md *(depends on 50.1-01, 50.1-05)* — gate ids, keyed answers, observed-id writers, quarantine, claim, close (V-15 core, V-16, V-18)
+- [ ] 50.1-06-PLAN.md *(depends on 50.1-01, 50.1-04, 50.1-05)* — gate ids, keyed answers, observed-id writers, quarantine, claim, close (V-15 core, V-16, V-18)
 - [ ] 50.1-07-PLAN.md *(depends on 50.1-05, 50.1-02, 50.1-04)* — launch reservation through `spawn_monitor` and `__monitor --liveness-fd`
 
 **Wave 4**

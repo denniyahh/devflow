@@ -6,11 +6,11 @@ current_phase: "50.1"
 current_phase_name: Split-Lock State-Handling Overhaul (INSERTED)
 current_plan: Not started
 status: executing
-stopped_at: Phase 50.1 planned (29 plans, 21 waves)
-last_updated: "2026-10-25T13:05:16.497Z"
-last_activity: 2026-10-21
-last_activity_desc: Phase 50 complete, transitioned to Phase 50.1
-state_head: 81a18f7ba7b4475fb7b6517ba8daf07dc11d293f
+stopped_at: Phase 50.1 replanned after cross-AI review (29 plans, 21 waves)
+last_updated: "2026-10-27T00:13:22.110Z"
+last_activity: 2026-10-26
+last_activity_desc: Phase 50.1 plans revised for REVIEWS.md R-01..R-17 and operator rulings D-08/D-15/D-18
+state_head: c512ef3c1ef6e6dc9b13b075b70271124dd257d6
 progress:
   total_phases: 7
   completed_phases: 5
