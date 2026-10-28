@@ -6,15 +6,15 @@ current_phase: "50.1"
 current_phase_name: Split-Lock State-Handling Overhaul (INSERTED)
 current_plan: Not started
 status: executing
-stopped_at: Phase 50.1 replanned after cross-AI review (29 plans, 21 waves)
-last_updated: "2026-10-27T00:13:22.110Z"
-last_activity: 2026-10-26
-last_activity_desc: Phase 50.1 plans revised for REVIEWS.md R-01..R-17 and operator rulings D-08/D-15/D-18
-state_head: c512ef3c1ef6e6dc9b13b075b70271124dd257d6
+stopped_at: Phase 50.1 replanned after round-2 cross-AI review (30 plans, 22 waves)
+last_updated: "2026-10-28T00:41:56.479Z"
+last_activity: 2026-10-27
+last_activity_desc: Phase 50.1 plans revised for round-2 REVIEWS.md R2-01..R2-12; plan 50.1-30 split out of 50.1-20
+state_head: 5de86a5f788f9ab5cbeabe35d58f6edaa5edff3c
 progress:
   total_phases: 7
   completed_phases: 5
-  total_plans: 106
+  total_plans: 107
   completed_plans: 77
   percent: 71
 ---
@@ -195,10 +195,10 @@ change earns 2.0.
 ## Current Position
 
 Phase: 50.1 (Split-Lock State-Handling Overhaul (INSERTED)) — READY TO EXECUTE
-Plans: 29 (50.1-01…50.1-29, 21 waves; 50.1-27 is the one live-attempt checkpoint) — execute via `/gsd-execute-phase 50.1` from `.worktrees/phase-50.1`
+Plans: 30 (50.1-01…50.1-30, 22 waves; 50.1-27 is the one live-attempt checkpoint) — execute via `/gsd-execute-phase 50.1` from `.worktrees/phase-50.1`
 Current Plan: Not started
-Total Plans in Phase: 29
-Completed Plans: 0 of 29
+Total Plans in Phase: 30
+Completed Plans: 0 of 30
 Status: Ready to execute
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since

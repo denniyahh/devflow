@@ -522,8 +522,9 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 29 plans (21 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
-plan-check round 1) runs in wave 14, before 50.1-20
+**Plans:** 30 plans (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
+runs in wave 19
 
 **Wave 1**
 
@@ -606,14 +607,18 @@ plan-check round 1) runs in wave 14, before 50.1-20
 
 **Wave 19**
 
-- [ ] 50.1-25-PLAN.md *(depends on 50.1-24, 50.1-22, 50.1-21, 50.1-03)* — README/OPERATIONS/ARCHITECTURE/configuration guide, `status` repair hint without `advance`, crash table, 48-SECURITY, backlog fold markers (V-33)
-- [ ] 50.1-26-PLAN.md *(depends on 50.1-24)* — rig scripts and the 50.1 runbook
+- [ ] 50.1-30-PLAN.md *(depends on 50.1-20, 50.1-24)* — `doctor --json` names each phase's open-gate waiter (`gate_waiter`, R2-01) (V-89, V-90)
 
 **Wave 20**
 
-- [ ] 50.1-27-PLAN.md *(depends on 50.1-25, 50.1-26)* — live attempt to Ship plus the fault arm: one `checkpoint:human-action` (V-26)
+- [ ] 50.1-25-PLAN.md *(depends on 50.1-24, 50.1-22, 50.1-21, 50.1-03, 50.1-30)* — README/OPERATIONS/ARCHITECTURE/configuration guide, `status` repair hint without `advance`, crash table, 48-SECURITY, backlog fold markers (V-33)
+- [ ] 50.1-26-PLAN.md *(depends on 50.1-24, 50.1-30)* — rig scripts and the 50.1 runbook
 
 **Wave 21**
+
+- [ ] 50.1-27-PLAN.md *(depends on 50.1-25, 50.1-26)* — live attempt to Ship plus the fault arm: one `checkpoint:human-action` (V-26)
+
+**Wave 22**
 
 - [ ] 50.1-28-PLAN.md *(depends on 50.1-27)* — post-hoc analysis: live-run record, semver report, 999.166 closure table
 
