@@ -1038,6 +1038,29 @@ fn take_successor() -> Option<SupervisorRecord> {
     })
 }
 
+/// Commit one write site's change to the phase's state (D-08), and replace the
+/// caller's copy with the state as committed.
+///
+/// `apply` sets only the fields this site changes, on the state as it is on disk
+/// now, so what another writer changed since the caller loaded its copy is kept.
+/// Assigning a whole `State` copy in `apply` would re-create the lost update this
+/// exists to close.
+///
+/// A field changed in the caller's copy but not set in `apply` is reverted by the
+/// replace. That is on purpose: a field a site forgot to commit shows up in its
+/// tests rather than reaching disk by luck through a later write.
+///
+/// `apply` runs under the state write lock, so it never spawns a process, runs
+/// hooks, waits on a gate or takes another lock.
+pub(crate) fn commit(state: &mut State, apply: impl FnOnce(&mut State)) -> Result<(), CliError> {
+    let (committed, ()) = workflow::update_state(&state.project_root, state.phase, |s| {
+        apply(s);
+        Ok::<(), workflow::WorkflowError>(())
+    })?;
+    *state = committed;
+    Ok(())
+}
+
 /// An advance safe point (50-13, R-2): when the engaged supervisor's stop
 /// has been requested, record the stop in `state` and return `true`, so the
 /// caller returns at once without launching anything (the per-phase lock
@@ -1061,11 +1084,14 @@ pub(crate) fn stop_requested_at_safe_point() -> bool {
 }
 
 /// Persist a stop an advance honoured at `safe_point`: `stopped` with
-/// [`ADVANCE_STOP_REASON`], and an `advance_stopped` event naming the point.
+/// [`ADVANCE_STOP_REASON`] and `gate_pending` cleared in one write, and an
+/// `advance_stopped` event naming the point.
 pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
-    state.stopped = true;
-    state.stop_reason = Some(ADVANCE_STOP_REASON.to_string());
-    workflow::save_state(state)?;
+    commit(state, |s| {
+        s.stopped = true;
+        s.stop_reason = Some(ADVANCE_STOP_REASON.to_string());
+        s.gate_pending = false;
+    })?;
     events::emit(
         &state.project_root,
         state.phase,
