@@ -14,6 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Errors produced while reading or writing workflow state.
@@ -46,6 +47,28 @@ pub enum WorkflowError {
         /// The phase the returned state names.
         found: PhaseId,
     },
+    /// The bounded form could not take the phase's state write lock in time.
+    #[error(
+        "phase {phase}'s state write lock is still held after {waited:?} by {}; nothing was written",
+        write_lock_holder_phrase(*.holder)
+    )]
+    WriteLockTimeout {
+        /// The phase whose lock is held.
+        phase: PhaseId,
+        /// How long this call allowed for the lock.
+        waited: Duration,
+        /// The holder's pid, when its record names a process that is live with
+        /// the recorded start time.
+        holder: Option<u32>,
+    },
+}
+
+/// A timed-out wait's description of who holds the lock.
+fn write_lock_holder_phrase(holder: Option<u32>) -> String {
+    match holder {
+        Some(pid) => format!("pid {pid}"),
+        None => "an unknown holder".to_string(),
+    }
 }
 
 /// What [`update_state_with`] found on disk, read under the write lock.
@@ -285,14 +308,26 @@ fn state_lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
 /// the lock ends: an explicit release would drop it for every duplicate of the
 /// descriptor, including one a forked child has not closed yet.
 struct WriteLock {
-    _file: File,
+    file: Option<File>,
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.set_len(0);
+        }
+    }
 }
 
 /// Take the phase's state write lock, waiting for as long as it is held.
 ///
 /// The descriptor is close-on-exec, as std opens every file, so a process spawned
 /// while this is held does not keep the lock.
-fn lock_for_write(project_root: &Path, phase: PhaseId) -> Result<WriteLock, WorkflowError> {
+fn lock_for_write(
+    project_root: &Path,
+    phase: PhaseId,
+    _wait: Option<Duration>,
+) -> Result<WriteLock, WorkflowError> {
     ensure_devflow_dir(&devflow_dir(project_root))?;
     let file = OpenOptions::new()
         .read(true)
@@ -303,7 +338,7 @@ fn lock_for_write(project_root: &Path, phase: PhaseId) -> Result<WriteLock, Work
     // `flock` returns EINTR when a signal handler without SA_RESTART runs.
     loop {
         match file.lock() {
-            Ok(()) => return Ok(WriteLock { _file: file }),
+            Ok(()) => return Ok(WriteLock { file: Some(file) }),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error.into()),
         }
@@ -321,7 +356,7 @@ pub fn update_state_with<T, E: From<WorkflowError>>(
     phase: PhaseId,
     apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
 ) -> Result<T, E> {
-    let _lock = lock_for_write(project_root, phase)?;
+    let _lock = lock_for_write(project_root, phase, None)?;
     let existing = match load_state(project_root, phase) {
         Ok(state) => Existing::Loaded(state),
         Err(WorkflowError::MissingState(_)) => Existing::Missing,
@@ -340,6 +375,47 @@ pub fn update_state_with<T, E: From<WorkflowError>>(
         write_state_atomic(&state_path(project_root, phase), &contents)?;
     }
     Ok(value)
+}
+
+/// The bounded form of [`update_state_with`].
+pub fn update_state_with_within<T, E: From<WorkflowError>>(
+    _project_root: &Path,
+    phase: PhaseId,
+    wait: Duration,
+    _apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
+) -> Result<T, E> {
+    Err(WorkflowError::WriteLockTimeout {
+        phase,
+        waited: wait,
+        holder: None,
+    }
+    .into())
+}
+
+/// How often a bounded acquisition tries the write lock.
+pub const WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// The default wait for a repair verb.
+pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
+
+/// The state of a phase's write lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteLockStatus {
+    /// Nothing holds the lock.
+    Free,
+    /// Something holds the lock.
+    Held {
+        /// The holder, when its record names a live process.
+        pid: Option<u32>,
+    },
+}
+
+/// Read the state of a phase's write lock without waiting.
+pub fn write_lock_status(
+    _project_root: &Path,
+    _phase: PhaseId,
+) -> Result<WriteLockStatus, WorkflowError> {
+    Ok(WriteLockStatus::Free)
 }
 
 /// Change the state on disk: take the phase's write lock, re-read the state, run
@@ -476,6 +552,19 @@ pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, Workflow
     result.map(|()| removed)
 }
 
+/// The bounded form of [`clear_state`].
+pub fn clear_state_within(
+    _project_root: &Path,
+    phase: PhaseId,
+    wait: Duration,
+) -> Result<bool, WorkflowError> {
+    Err(WorkflowError::WriteLockTimeout {
+        phase,
+        waited: wait,
+        holder: None,
+    })
+}
+
 /// Clear state for recovery while retaining removals that happened before an
 /// error, including a failed orphaned-temp removal.
 pub(crate) fn clear_state_with_partial_result(
@@ -495,7 +584,7 @@ fn clear_state_with_partial_result_impl(
     if !devflow_dir(project_root).exists() {
         return (false, Ok(()));
     }
-    let _lock = match lock_for_write(project_root, phase) {
+    let _lock = match lock_for_write(project_root, phase, None) {
         Ok(lock) => lock,
         Err(error) => return (false, Err(error)),
     };
@@ -831,6 +920,342 @@ mod tests {
         assert!(
             !state_path(root, phase).exists(),
             "the writer finished first, so the clear has the last word"
+        );
+    }
+
+    /// A child killed and reaped when the test ends, however it ends.
+    struct ReapedChild(std::process::Child);
+
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn send_signal(pid: u32, signal: libc::c_int) {
+        let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: `kill` takes no pointers; `signed` is this test's own child.
+        assert_eq!(unsafe { libc::kill(signed, signal) }, 0, "kill {pid}");
+    }
+
+    /// Take the write lock, spawn `sleep 5` while holding it, and drop the handle.
+    fn spawn_sleep_holding_the_write_lock(
+        root: &Path,
+        phase: PhaseId,
+        before_spawn: impl FnOnce(&File),
+    ) -> ReapedChild {
+        let lock = lock_for_write(root, phase, None).expect("take the write lock");
+        before_spawn(lock.file.as_ref().expect("a real lock has a file"));
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        drop(lock);
+        ReapedChild(child)
+    }
+
+    #[test]
+    fn the_write_lock_is_not_inherited_by_a_spawned_child() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(50));
+
+        let plain = spawn_sleep_holding_the_write_lock(root, phase, |_| {});
+        assert!(
+            wait_for_free_write_lock(root, phase),
+            "a close-on-exec lock must not outlive its handle in a child"
+        );
+        assert!(crate::test_support::process_is_live(plain.0.id()));
+
+        // Control: the same child with close-on-exec cleared does keep the lock.
+        let leaky = spawn_sleep_holding_the_write_lock(root, phase, |file| {
+            // SAFETY: `file` is an open descriptor for the length of this call, and
+            // F_SETFD with 0 only clears its close-on-exec flag.
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+                0
+            );
+        });
+        assert!(
+            !write_lock_is_free(root, phase),
+            "control: the child with the descriptor keeps the lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !write_lock_is_free(root, phase),
+            "control: it keeps it for as long as it runs"
+        );
+        assert!(crate::test_support::process_is_live(leaky.0.id()));
+        drop(leaky);
+        assert!(
+            wait_for_free_write_lock(root, phase),
+            "control: the lock ends with the child that kept it"
+        );
+    }
+
+    #[test]
+    fn update_state_with_creates_a_missing_state_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(50));
+
+        let saw_missing = update_state_with(root, phase, |existing| {
+            Ok::<_, WorkflowError>((None, matches!(existing, Existing::Missing)))
+        })
+        .unwrap();
+        assert!(saw_missing);
+        assert!(
+            !state_path(root, phase).exists(),
+            "`None` must create nothing"
+        );
+
+        update_state_with(root, phase, |existing| {
+            assert!(matches!(existing, Existing::Missing));
+            Ok::<_, WorkflowError>((Some(state_in(root, phase, Stage::Validate)), ()))
+        })
+        .unwrap();
+        assert_eq!(load_state(root, phase).unwrap().stage, Stage::Validate);
+
+        let seen_stage = update_state_with(root, phase, |existing| {
+            let Existing::Loaded(state) = existing else {
+                panic!("the saved state must load, got {existing:?}");
+            };
+            Ok::<_, WorkflowError>((None, state.stage))
+        })
+        .unwrap();
+        assert_eq!(seen_stage, Stage::Validate);
+    }
+
+    #[test]
+    fn update_state_with_reports_an_unloadable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(50));
+        let path = state_path(root, phase);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+
+        let unloadable = update_state_with(root, phase, |existing| {
+            Ok::<_, WorkflowError>((None, matches!(existing, Existing::Unloadable(_))))
+        })
+        .unwrap();
+
+        assert!(unloadable);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn update_state_with_refuses_a_state_for_another_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(50));
+
+        let error = update_state_with(root, phase, |_| {
+            Ok::<_, WorkflowError>((Some(state_in(root, PhaseId::new(51), Stage::Code)), ()))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WorkflowError::PhaseMismatch { expected, found }
+                    if expected == phase && found == PhaseId::new(51)
+            ),
+            "got {error}"
+        );
+        assert!(!state_path(root, phase).exists());
+        assert!(!state_path(root, PhaseId::new(51)).exists());
+    }
+
+    #[test]
+    fn the_skip_seam_takes_no_lock() {
+        const NAME: &str = "workflow::tests::the_skip_seam_takes_no_lock";
+        if crate::test_support::in_child_test(NAME) {
+            let dir = tempfile::tempdir().unwrap();
+            let (root, phase) = (dir.path(), PhaseId::new(50));
+            save_state(&state_in(root, phase, Stage::Code)).unwrap();
+            update_field(root, phase, |_| {
+                assert!(
+                    write_lock_is_free(root, phase),
+                    "the seam must take no lock"
+                );
+                assert!(
+                    !state_lock_path(root, phase).exists(),
+                    "the seam must not touch the lock file"
+                );
+            });
+            return;
+        }
+
+        let empty_path = tempfile::tempdir().unwrap();
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            empty_path.path(),
+            &[("DEVFLOW_TEST_SKIP_WRITE_LOCK", std::ffi::OsStr::new("1"))],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+    }
+
+    #[test]
+    fn a_bounded_write_names_a_stopped_holder_and_returns_by_its_deadline() {
+        const NAME: &str =
+            "workflow::tests::a_bounded_write_names_a_stopped_holder_and_returns_by_its_deadline";
+        const ROOT_VAR: &str = "WRITE_LOCK_TEST_ROOT";
+        const BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+        const SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+        const READY: &str = "holder.ready";
+        let phase = PhaseId::new(50);
+
+        if crate::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os(ROOT_VAR).expect(ROOT_VAR));
+            update_field(&root, phase, |_| {
+                std::fs::write(root.join(READY), "").unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            });
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = state_path(root, phase);
+        save_state(&state_in(root, phase, Stage::Code)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        let mut holder = ReapedChild(crate::test_support::spawn_test_in_child(
+            NAME,
+            empty_path.path(),
+            &[(ROOT_VAR, root.as_os_str())],
+        ));
+        let holder_pid = holder.0.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.join(READY).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the holder never reached its closure"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        send_signal(holder_pid, libc::SIGSTOP);
+
+        let ran = std::cell::Cell::new(false);
+        let bounded_write = || {
+            update_state_with_within(root, phase, BOUND, |_| {
+                ran.set(true);
+                Ok::<_, WorkflowError>((None, ()))
+            })
+        };
+        let started = std::time::Instant::now();
+        let error = bounded_write().unwrap_err();
+        let elapsed = started.elapsed();
+        eprintln!("the bounded write returned after {elapsed:?}, deadline {BOUND:?}");
+        assert!(
+            matches!(
+                error,
+                WorkflowError::WriteLockTimeout { holder: Some(pid), .. } if pid == holder_pid
+            ),
+            "got {error}"
+        );
+        assert!(elapsed >= BOUND, "returned early, after {elapsed:?}");
+        assert!(elapsed < BOUND + SLACK, "returned late, after {elapsed:?}");
+        assert!(!ran.get(), "a timed-out write must not run its closure");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            error.to_string().contains(&format!("pid {holder_pid}")),
+            "got {error}"
+        );
+
+        let error = clear_state_within(root, phase, BOUND).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkflowError::WriteLockTimeout { holder: Some(pid), .. } if pid == holder_pid
+            ),
+            "got {error}"
+        );
+        assert!(path.exists(), "a timed-out clear must remove nothing");
+        assert_eq!(
+            write_lock_status(root, phase).unwrap(),
+            WriteLockStatus::Held {
+                pid: Some(holder_pid)
+            }
+        );
+
+        send_signal(holder_pid, libc::SIGKILL);
+        holder.0.wait().expect("reap the holder");
+
+        // A record is never reported for a free lock.
+        let lock_path = state_lock_path(root, phase);
+        assert!(
+            std::fs::read_to_string(&lock_path)
+                .unwrap()
+                .starts_with(&format!("{holder_pid} ")),
+            "the killed holder's record must still be in the file"
+        );
+        assert_eq!(
+            write_lock_status(root, phase).unwrap(),
+            WriteLockStatus::Free
+        );
+
+        // A record naming a dead process is never reported for a held lock.
+        let unrecorded_holder = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        unrecorded_holder.lock().unwrap();
+        let error = bounded_write().unwrap_err();
+        assert!(
+            matches!(error, WorkflowError::WriteLockTimeout { holder: None, .. }),
+            "got {error}"
+        );
+        assert!(error.to_string().contains("unknown holder"), "got {error}");
+        assert!(!ran.get());
+        drop(unrecorded_holder);
+
+        // The earlier timeouts were the holders'; the lock ended with them.
+        bounded_write().expect("the same call succeeds once the lock is free");
+        assert!(ran.get());
+    }
+
+    #[test]
+    fn write_lock_status_reads_free_held_and_the_recorded_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(50));
+
+        assert_eq!(
+            write_lock_status(root, phase).unwrap(),
+            WriteLockStatus::Free
+        );
+        assert!(!devflow_dir(root).exists(), "the read must create nothing");
+
+        save_state(&state_in(root, phase, Stage::Code)).unwrap();
+        update_field(root, phase, |_| {
+            assert_eq!(
+                write_lock_status(root, phase).unwrap(),
+                WriteLockStatus::Held {
+                    pid: Some(std::process::id())
+                }
+            );
+        });
+        assert!(wait_for_free_write_lock(root, phase));
+        assert_eq!(
+            write_lock_status(root, phase).unwrap(),
+            WriteLockStatus::Free
+        );
+        let lock_path = state_lock_path(root, phase);
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().len(),
+            0,
+            "the record must be cleared before release"
+        );
+
+        let unrecorded_holder = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        unrecorded_holder.lock().unwrap();
+        assert_eq!(
+            write_lock_status(root, phase).unwrap(),
+            WriteLockStatus::Held { pid: None }
         );
     }
 
