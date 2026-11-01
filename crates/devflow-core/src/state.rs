@@ -283,16 +283,21 @@ pub struct State {
     /// The published, ping-confirmed address of the supervisor that owns the
     /// current stage (D-04): its socket path, launch id, and the agent
     /// identity the stale-socket backstop validates. Written by the launcher,
-    /// under the per-phase lock, in one save that replaces the previous
-    /// record; it is never cleared ahead of that save. `None` means no
+    /// under the write lock ([`crate::workflow::update_state`]), in one save that
+    /// replaces the previous record; it is never cleared ahead of that save. `None` means no
     /// supervisor has been published for this state, OR the state was written
     /// by a binary predating this field. The socket path is the only handle a
     /// liveness question starts from: it is passed to
     /// [`crate::supervisor::probe`] as recorded, never re-derived.
     #[serde(default)]
     pub supervisor: Option<SupervisorRecord>,
-    /// The launch that has reserved this phase and has not published yet.
-    #[serde(default, skip)]
+    /// The launch that has reserved this phase and has not published yet. It is
+    /// separate from [`State::supervisor`] because both may be live at a stage
+    /// handoff (D-01). A launcher writes it under the write lock
+    /// ([`crate::workflow::update_state_with`]) before it spawns, and promotes it to
+    /// `supervisor` after the publish. `None` means none is pending, which is also
+    /// what a state file predating this field reads as.
+    #[serde(default)]
     pub pending_supervisor: Option<PendingSupervisor>,
     /// The Claude session id captured from the most recent captured stdout
     /// envelope for this phase's current stage (D-04, 28-02), read via
@@ -486,13 +491,14 @@ impl SupervisorRecord {
     }
 }
 
-/// A launch's reservation ([`State::pending_supervisor`]).
+/// A launch's reservation ([`State::pending_supervisor`]). Its socket and liveness
+/// paths are probed as recorded, never re-derived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PendingSupervisor {
     /// The per-launch id.
     pub launch_id: String,
-    /// The socket this launch will publish.
+    /// The socket this launch's supervisor will publish.
     pub socket_path: PathBuf,
     /// The liveness file this launch's supervisor holds.
     pub liveness_path: PathBuf,

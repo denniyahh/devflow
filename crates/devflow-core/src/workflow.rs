@@ -614,19 +614,49 @@ pub enum Ownership {
     },
 }
 
-/// How `state` stands to `launch_id`.
-pub fn ownership(_state: &State, _launch_id: &str) -> Ownership {
-    Ownership::Superseded { recorded: None }
+/// How `state` stands to `launch_id`. A launch that is only pending may yet become
+/// the recorded one, so a caller can wait for its publish (D-15); a superseded one
+/// never will.
+pub fn ownership(state: &State, launch_id: &str) -> Ownership {
+    let recorded = state.supervisor.as_ref().map(|record| &record.launch_id);
+    if recorded.is_some_and(|recorded| recorded == launch_id) {
+        return Ownership::Recorded;
+    }
+    let pending = state.pending_supervisor.as_ref();
+    if pending.is_some_and(|pending| pending.launch_id == launch_id) {
+        return Ownership::PendingOnly;
+    }
+    Ownership::Superseded {
+        recorded: recorded.cloned(),
+    }
 }
 
-/// [`update_state`] fenced to the launch the state records.
+/// [`update_state`] fenced to the launch the state records (D-03): unless the
+/// state records `launch_id` as its supervisor, this returns
+/// [`WorkflowError::NotOwner`] with `apply` not run and nothing written. The check
+/// is made under the write lock, on the state as it is on disk now.
 pub fn update_owned_state<T, E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
-    _launch_id: &str,
+    launch_id: &str,
     apply: impl FnOnce(&mut State) -> Result<T, E>,
 ) -> Result<(State, T), E> {
-    update_state(project_root, phase, apply)
+    update_state(project_root, phase, |state| {
+        let (recorded, pending_only) = match ownership(state, launch_id) {
+            Ownership::Recorded => return apply(state),
+            Ownership::PendingOnly => {
+                (state.supervisor.as_ref().map(|r| r.launch_id.clone()), true)
+            }
+            Ownership::Superseded { recorded } => (recorded, false),
+        };
+        Err(WorkflowError::NotOwner {
+            phase,
+            ours: launch_id.to_string(),
+            recorded,
+            pending_only,
+        }
+        .into())
+    })
 }
 
 /// Enumerate every active phase state, sorted by phase number.
