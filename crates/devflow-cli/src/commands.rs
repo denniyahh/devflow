@@ -697,7 +697,7 @@ pub(crate) fn start(
     // an in-progress state nothing would ever advance. Save first; if the
     // launch fails, clear the just-saved state so `devflow status`/`recover`
     // don't report a phantom run (the failure WR-11 originally targeted).
-    workflow::save_state(&state)?;
+    create_run_state(project_root, phase, &state)?;
     events::emit(
         project_root,
         phase,
@@ -715,6 +715,13 @@ pub(crate) fn start(
         state.phase, state.started_at
     );
     println!("  watch live: devflow logs -f --phase {phase}");
+    Ok(())
+}
+
+/// Write a fresh run's state for `start`.
+fn create_run_state(project_root: &Path, phase: PhaseId, state: &State) -> Result<(), CliError> {
+    let _ = (project_root, phase);
+    workflow::save_state(state)?;
     Ok(())
 }
 
@@ -11520,5 +11527,119 @@ mod tests {
             let stale = refuse_a_live_supervisor(dir.path(), phase, None);
             assert!(stale.is_ok(), "a previous boot's group is gone: {stale:?}");
         }
+    }
+
+    /// How long a test leaves a writer blocked on the write lock before it lets the
+    /// holder go. Long enough that a writer not taking the lock has finished.
+    const BLOCKED_WRITER_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+    const HOLDER_ENTERS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The state file as JSON, without the two fields `stop` owns.
+    fn state_file_without_stop_fields(root: &Path, phase: PhaseId) -> serde_json::Value {
+        let contents = std::fs::read_to_string(workflow::state_path(root, phase)).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("stopped").unwrap();
+        fields.remove("stop_reason");
+        value
+    }
+
+    /// D-08: `stop` appends to the reason on disk when it writes, not to one it read
+    /// earlier. A writer holds the write lock while `stop` runs, then records a
+    /// `--until` reason, so a `stop` that does not wait loses its write to that writer.
+    #[test]
+    fn persist_stopped_state_appends_its_reason_on_the_current_state() {
+        const UNTIL_REASON: &str = "stopped after code completed (--until code)";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4901);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.yes_ship = true;
+        state.infra_failures = 2;
+        workflow::save_state(&state).unwrap();
+        let others_before = state_file_without_stop_fields(root, phase);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                workflow::update_state(root, phase, |on_disk| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    on_disk.stop_reason = Some(UNTIL_REASON.to_string());
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            });
+            entered_rx.recv_timeout(HOLDER_ENTERS_WITHIN).unwrap();
+            let stopper = scope.spawn(move || {
+                persist_stopped_state(root, phase, None, false).unwrap();
+            });
+            std::thread::sleep(BLOCKED_WRITER_GRACE);
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            stopper.join().unwrap();
+        });
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(after.stopped, "stop's write landed after the writer's");
+        assert_eq!(
+            after.stop_reason.as_deref(),
+            Some("stopped after code completed (--until code); stopped via `devflow stop`")
+        );
+        assert_eq!(
+            state_file_without_stop_fields(root, phase),
+            others_before,
+            "every other field is byte-identical"
+        );
+    }
+
+    /// `start` writes a fresh run's state only while holding the write lock: with
+    /// another writer holding it, the create returns after that writer is done.
+    #[test]
+    fn start_creates_its_state_under_the_write_lock() {
+        const HOLDER_RELEASES: &str = "holder releases";
+        const CREATE_RETURNS: &str = "create returns";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4902);
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let log = std::sync::Mutex::new(Vec::new());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let log = &log;
+            let fresh = &fresh;
+            let holder = scope.spawn(move || {
+                workflow::update_state_with(root, phase, |_existing| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    log.lock().unwrap().push(HOLDER_RELEASES);
+                    Ok::<_, workflow::WorkflowError>((None, ()))
+                })
+                .unwrap();
+            });
+            entered_rx.recv_timeout(HOLDER_ENTERS_WITHIN).unwrap();
+            let creator = scope.spawn(move || {
+                create_run_state(root, phase, fresh).unwrap();
+                log.lock().unwrap().push(CREATE_RETURNS);
+            });
+            std::thread::sleep(BLOCKED_WRITER_GRACE);
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            creator.join().unwrap();
+        });
+
+        assert_eq!(
+            log.into_inner().unwrap(),
+            vec![HOLDER_RELEASES, CREATE_RETURNS]
+        );
+        assert_eq!(
+            serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "the file holds the fresh state"
+        );
     }
 }
