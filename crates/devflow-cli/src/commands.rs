@@ -307,6 +307,28 @@ fn carried_phase_failures(
     }
 }
 
+/// Clear every stage's gate files before a new run starts (scaffolding).
+fn set_aside_leftover_gates(
+    project_root: &Path,
+    phase: PhaseId,
+    warnings: &mut dyn std::io::Write,
+) {
+    for stage in [
+        Stage::Define,
+        Stage::Plan,
+        Stage::Code,
+        Stage::Validate,
+        Stage::Ship,
+    ] {
+        if let Err(err) = Gates::cleanup(project_root, phase, stage) {
+            let _ = writeln!(
+                warnings,
+                "warning: could not clear stale gate files for phase {phase} {stage}: {err}"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
@@ -379,17 +401,7 @@ pub(crate) fn start(
         Err(err) => return Err(CliError::Message(err.to_string())),
     };
     refuse_start_over_a_live_run(project_root, phase)?;
-    for stage in [
-        Stage::Define,
-        Stage::Plan,
-        Stage::Code,
-        Stage::Validate,
-        Stage::Ship,
-    ] {
-        if let Err(err) = Gates::cleanup(project_root, phase, stage) {
-            eprintln!("warning: could not clear stale gate files for phase {phase} {stage}: {err}");
-        }
-    }
+    set_aside_leftover_gates(project_root, phase, &mut std::io::stderr());
 
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
@@ -7707,6 +7719,137 @@ mod tests {
     /// 15a: `devflow gate approve` resolves the stage automatically when a
     /// phase has exactly one open gate and writes a response the workflow's
     /// poller will consume.
+    /// A saved Define-stage state with both kinds of answer an earlier run can leave:
+    /// a keyed answer for its gate, which an abort, and an unkeyed approval from before
+    /// gate ids. Returns the state and the two answers' bytes.
+    fn plant_leftover_define_answers(root: &Path, phase: PhaseId) -> (State, Vec<Vec<u8>>) {
+        let mut state = State::new(
+            phase,
+            devflow_core::state::AgentKind::Claude,
+            devflow_core::mode::Mode::Auto,
+            root.to_path_buf(),
+        );
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let old = Gates::open_gate(root, phase, Stage::Define, "the earlier run's gate").unwrap();
+        let keyed = Gates::answer(
+            root,
+            phase,
+            Stage::Define,
+            &old.gate_id,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: the earlier run".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        let unkeyed = Gates::response_path(root, phase, Stage::Define);
+        std::fs::write(
+            &unkeyed,
+            br#"{"approved":true,"note":"legacy","responded_by":"test"}"#,
+        )
+        .unwrap();
+        let bytes = vec![
+            std::fs::read(&keyed).unwrap(),
+            std::fs::read(&unkeyed).unwrap(),
+        ];
+        (state, bytes)
+    }
+
+    /// The bytes of every answer that was set aside, sorted, to compare with what was
+    /// planted.
+    fn quarantined_bytes(root: &Path) -> Vec<Vec<u8>> {
+        let mut bytes: Vec<Vec<u8>> = Gates::quarantined(root)
+            .iter()
+            .map(|answer| std::fs::read(&answer.path).unwrap())
+            .collect();
+        bytes.sort();
+        bytes
+    }
+
+    /// V-20 (D-05): with `start`'s own close skipped, as if it had failed, neither kind
+    /// of leftover decides the new run's gate. It times out and both are set aside. The
+    /// control is the same wait with an answer that does bind: it decides.
+    #[test]
+    fn a_leftover_answer_start_could_not_delete_never_decides_the_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4910);
+        let (mut state, mut planted) = plant_leftover_define_answers(root, phase);
+        planted.sort();
+
+        let err = crate::pipeline_gate::run_gate_with_timeout(
+            root,
+            &mut state,
+            Stage::Define,
+            "the new run's gate",
+            1,
+            None,
+        )
+        .expect_err("a leftover must not decide the new run's gate");
+        assert!(
+            err.to_string().contains("timed out awaiting a response"),
+            "{err}"
+        );
+        assert_eq!(quarantined_bytes(root), planted, "both leftovers set aside");
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Define),
+            Vec::<std::path::PathBuf>::new()
+        );
+
+        devflow_core::test_support::preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        );
+        let action = crate::pipeline_gate::run_gate_with_timeout(
+            root,
+            &mut state,
+            Stage::Define,
+            "control: an answer that binds",
+            1,
+            None,
+        )
+        .expect("control: an answer that binds decides the gate");
+        assert_eq!(action, GateAction::Advance);
+    }
+
+    /// D-05 / T-50.1-48: `start`'s leftover step deletes no answer, and names each one
+    /// it set aside.
+    #[test]
+    fn start_sets_leftover_answers_aside_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4911);
+        let (_state, mut planted) = plant_leftover_define_answers(root, phase);
+        planted.sort();
+
+        let mut warnings = Vec::new();
+        set_aside_leftover_gates(root, phase, &mut warnings);
+        let warnings = String::from_utf8(warnings).unwrap();
+
+        assert_eq!(quarantined_bytes(root), planted, "no leftover was deleted");
+        for answer in Gates::quarantined(root) {
+            let line = format!(
+                "warning: set aside an unused answer for phase {phase} define: {}",
+                answer.path.display()
+            );
+            assert!(warnings.contains(&line), "{line} not in: {warnings}");
+        }
+        assert!(!Gates::gate_path(root, phase, Stage::Define).exists());
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Define),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+
     #[test]
     fn gate_respond_auto_resolves_single_open_gate() {
         let dir = tempfile::tempdir().unwrap();
@@ -7723,10 +7866,14 @@ mod tests {
         )
         .unwrap();
 
-        let polled = Gates::poll_response(root, PhaseId::new(15), Stage::Ship, 1)
-            .expect("response readable");
-        assert!(polled.approved);
-        assert_eq!(polled.note.as_deref(), Some("lgtm"));
+        let gate = crate::test_support::live_gate_id(root, PhaseId::new(15), Stage::Ship);
+        let AnswerRead::Bound(answer) =
+            Gates::read_answer(root, PhaseId::new(15), Stage::Ship, &gate)
+        else {
+            panic!("the live gate holds the answer gate_respond wrote");
+        };
+        assert!(answer.response.approved);
+        assert_eq!(answer.response.note.as_deref(), Some("lgtm"));
         let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(15)).unwrap();
         assert_eq!(event["event"], "gate_response_written");
         assert_eq!(event["stage"], "ship");
