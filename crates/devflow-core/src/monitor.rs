@@ -6230,10 +6230,7 @@ exit 0
         });
         assert!(
             stage_wait_until(Duration::from_secs(2), || {
-                let signed = libc::pid_t::try_from(agent).expect("pid fits pid_t");
-                // SAFETY: signal 0 only checks for existence.
-                let rc = unsafe { libc::kill(signed, 0) };
-                rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                !crate::test_support::process_is_live(agent)
             }),
             "no agent survives a publish error: {agent} is alive\n{entry_log}"
         );
@@ -6284,6 +6281,74 @@ exit 0
             "the child ran its one entry: {entry_log}"
         );
         assert!(group_gone_within(agent.pgid, Duration::from_secs(2)));
+    }
+
+    /// The full name of [`a_publish_failure_probe_sees_a_zombie_agent_as_gone`].
+    #[cfg(target_os = "linux")]
+    const ZOMBIE_PROBE_TEST: &str =
+        "monitor::tests::a_publish_failure_probe_sees_a_zombie_agent_as_gone";
+
+    /// Why a publish-failure probe must ask `process_is_live`: a supervisor
+    /// killed before publishing orphans its agent, and the launcher's kill
+    /// through the sidecar leaves it a zombie until its new parent reaps it.
+    /// A job container's PID 1 never does. This process stands in for that
+    /// PID 1 as a child subreaper that does not reap during the check, where
+    /// `kill(agent, 0)` still reports the agent and `process_is_live` does
+    /// not. Linux-only, as `PR_SET_CHILD_SUBREAPER` is; the subreaper call
+    /// runs only in the child test process, never in the shared one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_publish_failure_probe_sees_a_zombie_agent_as_gone() {
+        if !crate::test_support::in_child_test(ZOMBIE_PROBE_TEST) {
+            // The child's agent runs `sleep`, so it keeps this PATH.
+            let path = std::env::var_os("PATH").expect("the test process has a PATH");
+            let output = crate::test_support::run_test_in_child(
+                ZOMBIE_PROBE_TEST,
+                &std::env::temp_dir(),
+                &[("PATH", &path)],
+            );
+            crate::test_support::assert_child_ran_exactly_one_passing_test(
+                &output,
+                ZOMBIE_PROBE_TEST,
+            );
+            return;
+        }
+        // SAFETY: this prctl option reads only its integer argument.
+        let subreaper = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1 as libc::c_ulong) };
+        assert_eq!(subreaper, 0, "become a child subreaper");
+
+        let fixture = StageFixture::new();
+        let run = kill_before_publishing(&fixture, |_, _| {});
+        let agent = run.agent.pgid;
+        assert!(
+            run.text.contains(&format!(
+                "ended the agent group {agent} its sidecar records"
+            )),
+            "the launcher killed the orphan: {}",
+            run.text
+        );
+        assert!(
+            stage_wait_until(Duration::from_secs(2), || {
+                !crate::test_support::process_is_live(agent)
+            }),
+            "the killed agent {agent} must not read as live"
+        );
+        let signed = libc::pid_t::try_from(agent).expect("pid fits pid_t");
+        // SAFETY: signal 0 only checks for existence.
+        let old_probe = unsafe { libc::kill(signed, 0) };
+        assert_eq!(old_probe, 0, "kill(agent, 0) reads the zombie as alive");
+
+        let mut status = 0;
+        // SAFETY: `status` is a live int; `signed` is this process's child.
+        let reaped = unsafe { libc::waitpid(signed, &mut status, 0) };
+        assert_eq!(reaped, signed, "the zombie is this subreaper's to reap");
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the launcher's SIGKILL ended the agent: status {status}"
+        );
+        // SAFETY: `status` is a live int; WNOHANG never blocks.
+        let leftover = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        assert_eq!(leftover, -1, "this process has no child left to reap");
     }
 
     /// What one killed-before-publishing run left: the wait's text, the
