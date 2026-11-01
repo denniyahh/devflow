@@ -430,6 +430,10 @@ enum GateCmd {
         /// Optional free-text note recorded with the approval.
         #[arg(long)]
         note: Option<String>,
+        /// The gate id `gate list` showed. Without it the command answers the
+        /// gate open now; with it, a gate opened since is refused.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
         /// Project root.
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -454,6 +458,10 @@ enum GateCmd {
         /// the phase instead of looping back to Code).
         #[arg(long)]
         note: String,
+        /// The gate id `gate list` showed. Without it the command answers the
+        /// gate open now; with it, a gate opened since is refused.
+        #[arg(long = "gate-id")]
+        gate_id: Option<String>,
         /// Project root.
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -653,11 +661,12 @@ fn run() -> Result<(), CliError> {
                 legacy_project,
                 stage_option,
                 note,
+                gate_id,
                 project,
             } => {
                 let (stage, project) =
                     resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, true, note, None)
+                gate_respond(&project_root(project)?, phase, stage, true, note, gate_id)
             }
             GateCmd::Reject {
                 phase,
@@ -665,6 +674,7 @@ fn run() -> Result<(), CliError> {
                 legacy_project,
                 stage_option,
                 note,
+                gate_id,
                 project,
             } => {
                 let (stage, project) =
@@ -675,7 +685,7 @@ fn run() -> Result<(), CliError> {
                     stage,
                     false,
                     Some(note),
-                    None,
+                    gate_id,
                 )
             }
             GateCmd::Show {
