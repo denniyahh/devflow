@@ -22,6 +22,13 @@
   **Why deferred:** 50.1-06 does not touch `agent.rs` or `agents/`, and `opencode.rs` does not use gates.
 
 - `devflow ship` cannot see a Ship answer written by `gate approve` until 50.1-14 (found during 50.1-13)
-  status: open
+  status: resolved
   **What:** `gate approve` now writes the keyed answer, while `ship_override` still checks and reads the unkeyed response. Probed: approve, then `ship_override`, refuses with "no Ship gate response written yet". It fails closed, and its wording is wrong for that one wave.
-  **Who:** 50.1-14 replaces that read with the keyed read and claim, and already lists `ship_override`.
+  **Who:** 50.1-14 replaced that read with the keyed read and claim. `pipeline_gate::tests::ship_override_ships_an_approval_written_by_gate_approve` failed on this refusal before the change and passes after it.
+
+- `stop_writes_no_state_while_the_lock_holder_survives_the_signal` can fail when `stop` signals its holder before the holder's trap is set (found during 50.1-14)
+  status: open
+  **What:** one run of the plan's suite gate at `df4c973` failed it at `tests/stop_e2e.rs:158`: `stop must refuse to mark state while the holder survives`, with `signalled pid ...` and then the lock reclaimed as stale. The holder is `sh -c "trap '' TERM; exec sleep 60"`, and the test runs `devflow stop` as soon as `spawn` returns, so a TERM that lands before `trap` kills the shell.
+  **Measured:** 1 failure in 3 runs of the integration binary under its suite (the `check.sh all` run and the rerun passed), 0 in 60 run alone. With a temporary `sleep 1;` before the `trap`, the test failed every time it ran (1 of 1), with the same message.
+  **Likely fix, not tested:** have the holder write a ready file after its `trap`, and wait for that file before running `stop`.
+  **Why deferred:** 50.1-14 did not change this test or `stop`'s holder path, and the test plants no gate.
