@@ -215,7 +215,12 @@ pub fn state_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     ))
 }
 
-/// Save workflow state to `.devflow/state-{NN}.json`, keyed by `state.phase`.
+/// Write `state` to `.devflow/state-{NN}.json`, keyed by `state.phase`, as a test
+/// fixture: a whole snapshot with no write lock and no re-read, overwriting whatever
+/// is on disk. Compiled only for tests and the `test-support` feature, never for
+/// production. Production writes go through [`update_state`], [`update_state_with`]
+/// or [`update_owned_state`].
+#[cfg(any(test, feature = "test-support"))]
 pub fn save_state(state: &State) -> Result<(), WorkflowError> {
     debug!("saving state: phase={} stage={}", state.phase, state.stage);
     let path = state_path(&state.project_root, state.phase);

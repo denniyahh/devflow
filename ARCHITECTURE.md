@@ -395,7 +395,7 @@ Key modules log via `tracing`'s `info!`/`warn!`/`debug!` macros:
 - **`main.rs`** — `advance`/`transition`/`run_gate` print human-readable
   progress to stdout and emit structured events to `events.jsonl` at every
   step (see [Events log](#events-log)).
-- **`workflow.rs`** — state I/O (`save_state`, `load_state`, legacy
+- **`workflow.rs`** — state I/O (`update_state`, `load_state`, legacy
   migration) logs at `DEBUG`; unreadable/corrupt state files warn at `WARN`
   rather than aborting a listing.
 - **`git.rs`** — branch operations (`feature_start`, `feature_finish`,
