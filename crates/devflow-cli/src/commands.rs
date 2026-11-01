@@ -12839,6 +12839,82 @@ mod tests {
         );
     }
 
+    /// The launcher keeps its copy of the lock until the publish save has returned, so
+    /// a supervisor that dies before it is recorded still reads live, and the launcher
+    /// decides what happens next. Once `start` has returned, the launcher's copy is gone
+    /// too, and the same file reads abandoned.
+    #[test]
+    fn the_launcher_keeps_its_lock_until_the_publish_save() {
+        const NAME: &str = "commands::tests::the_launcher_keeps_its_lock_until_the_publish_save";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("before_publish_save", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5024);
+        init_start_repo(root, phase);
+        let release = launch_hold_release();
+
+        let (at_hold, result) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            assert!(reached_hold(&release, &worker), "start reached the publish");
+            let pending = workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .expect("nothing has promoted the reservation yet");
+            let sidecar =
+                supervisor::read_sidecar(&pending.socket_path.with_extension("json")).unwrap();
+            // Only the launcher's copy is left once the supervisor is dead, and the
+            // agent never held one.
+            let supervisor_pid = libc::pid_t::try_from(sidecar.supervisor_pid).unwrap();
+            let agent_pgid = libc::pid_t::try_from(sidecar.agent_pgid).unwrap();
+            // SAFETY: both name processes this test's own start just launched, read
+            // from the sidecar they wrote while they are still running.
+            unsafe {
+                libc::kill(supervisor_pid, libc::SIGKILL);
+                libc::kill(-agent_pgid, libc::SIGKILL);
+            }
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while agent::agent_running(sidecar.supervisor_pid)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // A SIGKILLed process's leader reads gone before its other threads have
+            // closed its files, so watch for a while: the lock must stay held throughout.
+            let watch_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut at_hold = liveness::probe(&pending.liveness_path).unwrap();
+            while at_hold == liveness::Held::Live && std::time::Instant::now() < watch_until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                at_hold = liveness::probe(&pending.liveness_path).unwrap();
+            }
+            std::fs::write(&release, "").unwrap();
+            (at_hold, (worker.join().unwrap(), pending.liveness_path))
+        });
+        let (result, liveness_path) = result;
+        result.expect("the publish save itself succeeds");
+
+        assert_eq!(
+            at_hold,
+            liveness::Held::Live,
+            "the launcher still holds its copy before the publish save"
+        );
+        assert_eq!(
+            liveness::probe(&liveness_path).unwrap(),
+            liveness::Held::Abandoned,
+            "the launcher released its copy once the publish was done"
+        );
+    }
+
     /// A `start` that fails after reserving gives the reservation back: a state it
     /// created is gone, an earlier run's state is as it was, and no liveness file is
     /// left. The hold shows the reservation was really made, or a start that never
@@ -13129,6 +13205,129 @@ mod tests {
         }
         let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(PendingKind::No)], None);
         assert!(text.contains("devflow resume"), "control: {text}");
+    }
+
+    /// How long the second launcher gets to reach the guard if the write lock lets it.
+    const SECOND_LAUNCHER_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// V-05: the guard and the pending write are one step. Two launchers held between
+    /// them: under the write lock the second never reaches the hold and is refused once
+    /// the first has written. The control skips the lock and both reserve, which is
+    /// what shows the lock, not the hold's timing, is what excludes the second.
+    #[test]
+    fn two_launchers_cannot_both_reserve() {
+        const NAME: &str = "commands::tests::two_launchers_cannot_both_reserve";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["lock", "control"] {
+                let hold = tempfile::tempdir().unwrap();
+                let spec = launch_hold_spec("guarded", hold.path());
+                let mut env = vec![
+                    (LAUNCH_HOLD_ENV, spec.as_os_str()),
+                    (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                ];
+                if case == "control" {
+                    env.push(("DEVFLOW_TEST_SKIP_WRITE_LOCK", std::ffi::OsStr::new("1")));
+                }
+                let output =
+                    crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5023);
+        let control = std::env::var(RESERVE_CASE_ENV).unwrap() == "control";
+        let release = launch_hold_release();
+        let held = held_marker(&release);
+        let arrivals = || {
+            std::fs::read_to_string(&held)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        let reserve = || {
+            reserve_launch(
+                root,
+                phase,
+                LaunchVerb::Start,
+                Some(&fresh),
+                cache.as_deref(),
+            )
+            .map_err(|err| err.to_string())
+        };
+
+        let (first, second, arrived) = std::thread::scope(|scope| {
+            let first = scope.spawn(reserve);
+            assert!(
+                reached_hold(&release, &first),
+                "the first launcher reached its hold"
+            );
+            let second = scope.spawn(reserve);
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while control && arrivals() < 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if !control {
+                std::thread::sleep(SECOND_LAUNCHER_GRACE);
+            }
+            let arrived = arrivals();
+            std::fs::write(&release, "").unwrap();
+            // The first keeps its reservation, and so its lock, until the second has
+            // answered: joining hands back the value without dropping it first.
+            let second = second.join().unwrap();
+            (first.join().unwrap(), second, arrived)
+        });
+
+        println!(
+            "V-05 {}: {arrived} at the hold, first ok: {}, second ok: {}",
+            std::env::var(RESERVE_CASE_ENV).unwrap(),
+            first.is_ok(),
+            second.is_ok()
+        );
+        if control {
+            assert_eq!(arrived, 2, "with no lock, both launchers pass the guard");
+            assert!(
+                first.is_ok() && second.is_ok(),
+                "with no lock, both reserve: {:?} {:?}",
+                first.as_ref().map(|r| r.reservation.launch_id()),
+                second.as_ref().map(|r| r.reservation.launch_id()),
+            );
+        } else {
+            assert_eq!(arrived, 1, "the second launcher is held at the write lock");
+            let (won, refusal) = match (&first, &second) {
+                (Ok(won), Err(refusal)) | (Err(refusal), Ok(won)) => (won, refusal),
+                _ => panic!(
+                    "exactly one launcher reserves: {:?} {:?}",
+                    first.as_ref().map(|r| r.reservation.launch_id()),
+                    second.as_ref().map(|r| r.reservation.launch_id()),
+                ),
+            };
+            assert!(
+                refusal.contains(&format!("devflow stop --phase {phase}")),
+                "{refusal}"
+            );
+            assert_eq!(
+                workflow::load_state(root, phase)
+                    .unwrap()
+                    .pending_supervisor
+                    .map(|pending| pending.launch_id),
+                Some(won.reservation.launch_id().to_string()),
+                "the state names the launcher that reserved"
+            );
+            assert_eq!(
+                liveness_files(root).len(),
+                1,
+                "the refused one left no file"
+            );
+        }
+        for reserved in [first, second].into_iter().flatten() {
+            reserved.reservation.discard();
+        }
     }
 
     /// V-03: a reservation whose lock nothing holds, or whose file is gone, is

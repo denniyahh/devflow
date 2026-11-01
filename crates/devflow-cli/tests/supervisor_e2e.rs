@@ -649,6 +649,53 @@ fn census_never_sees_a_live_supervisor(supervisor_pid: u32) {
     drop(wrapper);
 }
 
+/// D-01 through the real binary: the `__monitor` re-exec adopts the reserved lock, so
+/// it reads live after the `devflow start` that took it has exited, and it reads
+/// not-live once that supervisor is gone (its last act removes the file).
+#[test]
+fn a_real_supervisor_holds_its_reserved_lock_after_its_launcher_exits() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let phase = PhaseId::new(64);
+    init_repo(&root, phase);
+    let fake_bin = common::fake_bin_dir(WAITING_CLAUDE);
+    let _reaper = common::LaunchedRunReaper::new(&root, phase, vec![]);
+
+    let output = spawn_start(&home, &root, phase, &fake_bin)
+        .wait_with_output()
+        .expect("wait for the start");
+    assert!(
+        output.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state = devflow_core::workflow::load_state(&root, phase).unwrap();
+    assert_eq!(state.pending_supervisor, None, "the publish promoted it");
+    let record = state.supervisor.expect("the start recorded its supervisor");
+    let liveness_path =
+        devflow_core::liveness::launch_liveness_path(&root, &record.launch_id).unwrap();
+    assert_eq!(
+        devflow_core::liveness::probe(&liveness_path).unwrap(),
+        devflow_core::liveness::Held::Live,
+        "the launcher has exited, so only the supervisor can hold this"
+    );
+
+    let outcome = supervisor::request_shutdown(&record.socket_path, RUN_WAIT);
+    assert!(
+        matches!(outcome, Ok(ShutdownOutcome::Stopped { .. })),
+        "the supervisor stops through its socket: {outcome:?}"
+    );
+    assert!(
+        holds_within(RUN_WAIT, || {
+            devflow_core::liveness::probe(&liveness_path).unwrap()
+                != devflow_core::liveness::Held::Live
+        }),
+        "control: the lock does not outlive its supervisor"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 50-15 (R-1, V-12): two `devflow start` launches racing for one phase yield
 // exactly one live supervisor and one agent group.
@@ -659,8 +706,8 @@ const RACE_GATE_TIMEOUT_SECS: &str = "15";
 
 /// A spawned `devflow start` for `phase` with the arguments the 48-19
 /// live-run refusal tests use (supervise mode, `--no-worktree`, the capture
-/// shape), so a loser fails only at the per-phase lock or at the live-run
-/// guard, never at an earlier refusal.
+/// shape), so a loser fails only at the reservation's live-run guard, never at
+/// an earlier refusal.
 fn spawn_start(
     home: &common::HermeticHome,
     root: &Path,
@@ -752,21 +799,15 @@ fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
         .find(|output| !output.status.success())
         .expect("one start lost");
     let stderr = String::from_utf8_lossy(&loser.stderr);
-    let lock_refusal = stderr.contains("holds the per-phase lock");
-    let live_refusal = stderr.contains(&format!("devflow stop --phase {phase}"))
-        && stderr.contains("a run is still live");
     assert!(
-        lock_refusal || live_refusal,
-        "the loser must be refused at the lock or at the live-run guard, nothing else\n{}",
+        stderr.contains(&format!("devflow stop --phase {phase}")),
+        "the loser's refusal must name `devflow stop`\n{}",
         report(loser)
     );
-    println!(
-        "V-12 loser refusal: {}",
-        if lock_refusal {
-            "per-phase lock"
-        } else {
-            "live-supervisor guard"
-        }
+    assert!(
+        stderr.contains("a run is still live"),
+        "the loser must be refused by the reservation's live-run guard\n{}",
+        report(loser)
     );
 
     let (alive, pgids) = live_supervisors(&home);
