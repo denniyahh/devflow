@@ -58,6 +58,7 @@ pub mod canary;
 pub mod config;
 #[cfg(test)]
 mod doc_check;
+pub(crate) mod durable;
 pub mod events;
 pub mod gates;
 pub mod git;
