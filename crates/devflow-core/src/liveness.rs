@@ -1090,6 +1090,7 @@ mod tests {
             dir.path().join(".h.live.4294967295.6.hold-tmp"),
             dir.path().join(".i.live.1.7.hold-tmp"),
             dir.path().join(format!("j.live.{gone}.8.hold-tmp")),
+            dir.path().join(format!("..{gone}.9.hold-tmp")),
         ];
         std::fs::write(&orphan, "").expect("plant the orphan");
         for path in &kept {
@@ -1107,5 +1108,138 @@ mod tests {
 
         let missing = remove_orphan_hold_temps(&dir.path().join("nope")).expect("a missing dir");
         assert_eq!(missing, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_take_skips_a_temp_name_already_taken() {
+        in_own_process(
+            "liveness::tests::a_take_skips_a_temp_name_already_taken",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("r.live");
+                let pid = std::process::id();
+                let next = HOLD_SEQ.load(Ordering::Relaxed);
+                let taken = dir
+                    .path()
+                    .join(format!(".r.live.{pid}.{next}{HOLD_TEMP_SUFFIX}"));
+                std::fs::write(&taken, "").expect("plant the next temp name");
+
+                let _hold = Hold::take(&path).expect("take a hold past the collision");
+                assert_eq!(probe(&path).expect("probe"), Held::Live);
+                assert!(taken.exists(), "another temp is left alone");
+            },
+        );
+    }
+
+    #[test]
+    fn a_take_in_a_missing_directory_is_an_error() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let refused = Hold::take(&dir.path().join("nope/r.live"));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "got {refused:?}"
+        );
+    }
+
+    /// A probe that read an unopenable path as absent would let a second
+    /// supervisor start beside a live one.
+    #[test]
+    fn a_probe_reports_an_error_other_than_absence() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").expect("create a file");
+        let error = probe(&file.join("x.live")).expect_err("a path under a file is no absence");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn live_holder_reports_a_record_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let lock = File::open(dir.path()).expect("open the directory");
+        lock.try_lock().expect("lock the directory");
+        assert_eq!(probe(dir.path()).expect("probe"), Held::Live);
+        assert!(
+            live_holder(dir.path()).is_err(),
+            "a held file with an unreadable record must not read as unheld"
+        );
+    }
+
+    #[test]
+    fn a_handoff_that_cannot_place_the_descriptor_fails_the_spawn() {
+        in_own_process(
+            "liveness::tests::a_handoff_that_cannot_place_the_descriptor_fails_the_spawn",
+            || {
+                free_fd_3();
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let other = File::create(dir.path().join("other")).expect("create a file");
+                let _other = place_at_fd_3(other);
+                let hold = Hold::take(&dir.path().join("x.live")).expect("take a hold");
+                assert_ne!(hold.as_raw_fd(), INHERITED_FD);
+
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: getrlimit writes only into the struct it is given.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                    0
+                );
+                limit.rlim_cur = 3;
+                let mut command = sleep_command();
+                // SAFETY: only `setrlimit`, in the child, on its stack-local
+                // copy. Closures run in order, so `dup2(raw, 3)` below then
+                // fails EBADF: fd 3 is outside the allowed range.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                pass_to_child(&mut command, &hold);
+
+                let spawned = command.spawn().map(ReapOnDrop);
+                assert_eq!(
+                    spawned
+                        .as_ref()
+                        .err()
+                        .and_then(std::io::Error::raw_os_error),
+                    Some(libc::EBADF),
+                    "a child that does not hold the lock must not start"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn adopting_a_close_on_exec_descriptor_keeps_it_close_on_exec() {
+        in_own_process(
+            "liveness::tests::adopting_a_close_on_exec_descriptor_keeps_it_close_on_exec",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("a.live");
+                let hold = Hold::take(&path).expect("take a hold");
+                let Hold { file, path } = hold;
+                let fd = std::os::fd::IntoRawFd::into_raw_fd(file);
+
+                let _adopted = adopt_inherited(fd, path).expect("adopt the descriptor");
+                // SAFETY: F_GETFD reads a flag of a descriptor `_adopted` owns.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            },
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directory_is_an_error_not_an_empty_sweep() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").expect("create a file");
+        let error = remove_orphan_hold_temps(&file).expect_err("a file is not a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
     }
 }
