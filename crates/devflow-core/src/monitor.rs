@@ -63,6 +63,15 @@ pub enum MonitorError {
     /// that never published its socket (it and what it started were ended).
     #[error("supervision shape not ready: {0}")]
     NotReady(String),
+    /// This launch's liveness lock could not be taken or adopted (D-01), so
+    /// the launch ended before any agent existed.
+    #[error("liveness lock of launch {launch_id}: {reason}")]
+    Liveness {
+        /// The launch's id, as it was given.
+        launch_id: String,
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 /// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
@@ -499,6 +508,7 @@ pub fn spawn_monitor(
         workdir,
         socket: socket_str,
         launch_id: &launch_id,
+        liveness_fd: None,
         keep_env: &keep_env,
         stream: stream
             .as_ref()
@@ -553,6 +563,9 @@ struct MonitorArgs<'a> {
     workdir: &'a str,
     socket: &'a str,
     launch_id: &'a str,
+    /// The descriptor number the `__monitor` process inherits its liveness
+    /// lock at.
+    liveness_fd: Option<std::os::fd::RawFd>,
     /// The adapter env NAMES the supervisor re-applies to the agent.
     keep_env: &'a [&'a str],
     /// The stream shape's prompt file and idle timeout in seconds; `None`
@@ -563,6 +576,7 @@ struct MonitorArgs<'a> {
 /// The `__monitor` argv up to and including `--`; the caller appends the
 /// agent's program and argv.
 fn monitor_args(args: &MonitorArgs<'_>) -> Vec<String> {
+    let _ = args.liveness_fd;
     let launch = if args.stream.is_some() {
         "stream"
     } else {
@@ -1402,6 +1416,8 @@ pub struct StageSpec {
     pub socket: SocketPath,
     /// The per-launch id the sidecar records.
     pub launch_id: String,
+    /// The inherited per-launch liveness descriptor to adopt, if any.
+    pub liveness_fd: Option<std::os::fd::RawFd>,
 }
 
 impl StageSpec {
@@ -1428,6 +1444,7 @@ impl StageSpec {
             io,
             socket,
             launch_id,
+            liveness_fd: None,
         }
     }
 }
@@ -2529,6 +2546,7 @@ mod tests {
                 workdir: "/workdir",
                 socket: "/cache/sock/x.sock",
                 launch_id: "0123456789abcdef",
+                liveness_fd: Some(crate::liveness::INHERITED_FD),
                 keep_env: &keep_env,
                 stream,
             })
@@ -2583,6 +2601,23 @@ mod tests {
         );
         assert_eq!(value_after(&capture, "--prompt-file"), None);
         assert_eq!(value_after(&capture, "--idle-timeout-secs"), None);
+
+        // The liveness descriptor's number crosses the exec in both shapes.
+        for argv in [&stream, &capture] {
+            assert_eq!(value_after(argv, "--liveness-fd").as_deref(), Some("3"));
+        }
+        // Control: a launch with no descriptor carries no flag.
+        let without = monitor_args(&MonitorArgs {
+            project_root: "/project",
+            state: &state,
+            workdir: "/workdir",
+            socket: "/cache/sock/x.sock",
+            launch_id: "0123456789abcdef",
+            liveness_fd: None,
+            keep_env: &keep_env,
+            stream: None,
+        });
+        assert_eq!(value_after(&without, "--liveness-fd"), None);
     }
 
     /// WR-07 (49-REVIEW.md): the chain's command never carries the variable.
@@ -6110,6 +6145,90 @@ exit 0
         );
         // SAFETY: getpgrp has no preconditions.
         assert_eq!(parsed.pgid, unsafe { libc::getpgrp() });
+    }
+
+    // ---- 50.1-07: adopting the liveness descriptor ----------------------
+
+    /// Supervise an agent that would record that it ran, with `liveness_fd`
+    /// and `launch_id` set as given, and return what the supervisor did and
+    /// whether the agent ever started. Run in a child process of its own
+    /// because `run_supervised_stage` installs the signal pipe.
+    fn supervise_with_liveness(
+        launch_id: &str,
+        liveness_fd: std::os::fd::RawFd,
+    ) -> (Result<StageRun, MonitorError>, bool) {
+        let fixture = StageFixture::new();
+        let ran = fixture.path("agent-ran");
+        let socket = SocketPath::for_launch(
+            fixture.cache.path(),
+            &fixture.root,
+            STAGE_PHASE,
+            &crate::supervisor::new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            fixture.root.clone(),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            launch_id.to_string(),
+        );
+        spec.args = vec!["-c".to_string(), format!("echo ran > {}", ran.display())];
+        spec.liveness_fd = Some(liveness_fd);
+        let result = run_supervised_stage(spec);
+        (result, ran.exists())
+    }
+
+    const CLOSED_FD_TEST: &str = "monitor::tests::a_liveness_descriptor_that_cannot_be_adopted_ends_the_stage_before_any_agent";
+
+    /// A supervisor that cannot take over the lock it was handed would run an
+    /// agent nothing can probe, so the stage ends before any agent exists.
+    #[test]
+    fn a_liveness_descriptor_that_cannot_be_adopted_ends_the_stage_before_any_agent() {
+        if crate::test_support::in_child_test(CLOSED_FD_TEST) {
+            let (result, agent_ran) =
+                supervise_with_liveness(&crate::supervisor::new_launch_id(), -1);
+            assert!(
+                matches!(&result, Err(MonitorError::Liveness { .. })),
+                "got {result:?}"
+            );
+            assert!(!agent_ran, "no agent may start without the lock");
+            return;
+        }
+        run_in_own_process(CLOSED_FD_TEST);
+    }
+
+    const INVALID_ID_TEST: &str =
+        "monitor::tests::an_invalid_launch_id_ends_the_stage_before_any_agent";
+
+    /// A launch id from argv never builds a path outside `.devflow/`.
+    #[test]
+    fn an_invalid_launch_id_ends_the_stage_before_any_agent() {
+        if crate::test_support::in_child_test(INVALID_ID_TEST) {
+            let (result, agent_ran) = supervise_with_liveness("../x", -1);
+            assert!(
+                matches!(&result, Err(MonitorError::Liveness { launch_id, .. }) if launch_id == "../x"),
+                "got {result:?}"
+            );
+            assert!(!agent_ran, "no agent may start without the lock");
+            return;
+        }
+        run_in_own_process(INVALID_ID_TEST);
+    }
+
+    /// Run the named test alone in a child process and require that it ran
+    /// and passed.
+    fn run_in_own_process(test_name: &str) {
+        let path_dir = tempfile::tempdir().expect("create the child's PATH directory");
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        let output = crate::test_support::run_test_in_child(
+            test_name,
+            path_dir.path(),
+            &[("PATH", path.as_os_str())],
+        );
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, test_name);
     }
 
     // ---- 50-24: run_supervised_stage before it publishes ----------------
