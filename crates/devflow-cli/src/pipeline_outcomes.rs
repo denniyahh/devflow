@@ -1131,6 +1131,7 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::prompt;
     use devflow_core::state::AgentKind;
+    use devflow_core::test_support::{gate_answer_files, preanswer_gate};
     use devflow_core::workflow;
 
     /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
@@ -1429,6 +1430,85 @@ mod tests {
         );
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// A Validate failure at the threshold, ready for `handle_validate_outcome` to
+    /// open the Validate gate.
+    fn state_one_failure_from_the_validate_gate(root: &Path, phase: PhaseId) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        state.last_validate_failure_commit_count = Some(0);
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// The pre-answer seam through the real waiter (`run_gate` and its poll, no
+    /// supervisor): the answer written before the gate opens decides that gate, and
+    /// no answer outlives it. Control in the same run: a pre-answer for another
+    /// stage decides nothing, so that gate times out with the pre-answer still
+    /// waiting. Runs in a child so the short gate timeout never touches this process.
+    #[test]
+    fn a_preanswered_gate_is_decided_by_its_preanswer_through_the_real_waiter() {
+        const NAME: &str = "pipeline_outcomes::tests::a_preanswered_gate_is_decided_by_its_preanswer_through_the_real_waiter";
+        const ABORT_NOTE: &str = "abort: decided by the pre-answer";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1"))],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+        let abort = devflow_core::gates::GateResponse {
+            approved: false,
+            note: Some(ABORT_NOTE.to_string()),
+            responded_by: Some("test".to_string()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let decided = PhaseId::new(4701);
+        let mut state = state_one_failure_from_the_validate_gate(root, decided);
+        preanswer_gate(root, decided, Stage::Validate, &abort);
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
+
+        let err = workflow::load_state(root, decided).unwrap_err();
+        assert!(
+            matches!(err, workflow::WorkflowError::MissingState(_)),
+            "the abort must clear the state, got {err:?}"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, decided).unwrap();
+        assert_eq!(last["event"], "workflow_aborted", "{last}");
+        assert_eq!(last["reason"], ABORT_NOTE, "{last}");
+        assert!(
+            gate_answer_files(root, decided, Stage::Validate).is_empty(),
+            "no answer may outlive the gate it decided"
+        );
+        assert!(
+            !Gates::preanswer_path(root, decided, Stage::Validate).exists(),
+            "the gate that opened must have taken the pre-answer"
+        );
+
+        let undecided = PhaseId::new(4702);
+        let mut state = state_one_failure_from_the_validate_gate(root, undecided);
+        preanswer_gate(root, undecided, Stage::Code, &abort);
+        let waited = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed)
+            .expect_err("a pre-answer for Code must not decide the Validate gate");
+        assert!(
+            waited.to_string().contains("timed out"),
+            "the Validate gate must wait until its timeout, got: {waited}"
+        );
+        assert!(
+            Gates::preanswer_path(root, undecided, Stage::Code).exists(),
+            "the Code pre-answer must still be waiting for a Code gate"
+        );
+        assert!(
+            workflow::load_state(root, undecided).is_ok(),
+            "the Code pre-answer must not have aborted the run"
+        );
     }
 
     /// Seed a Validate-stage DEVFLOW_RESULT marker (with the given verdict
