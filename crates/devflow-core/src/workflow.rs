@@ -60,6 +60,23 @@ pub enum WorkflowError {
         /// the recorded start time.
         holder: Option<u32>,
     },
+    /// A launch tried to write a state that does not record it as the supervisor.
+    #[error(
+        "phase {phase}: launch {ours} does not own the state, which records {}{}",
+        recorded.as_deref().unwrap_or("no supervisor"),
+        if *pending_only { "; this launch is only pending" } else { "" }
+    )]
+    NotOwner {
+        /// The phase whose state was to be written.
+        phase: PhaseId,
+        /// The launch that tried to write.
+        ours: String,
+        /// The launch the state records as its supervisor.
+        recorded: Option<String>,
+        /// Whether `ours` is the state's pending supervisor, and so may still
+        /// become the recorded one.
+        pending_only: bool,
+    },
 }
 
 /// A timed-out wait's description of who holds the lock.
@@ -581,6 +598,35 @@ pub fn write_lock_is_free(project_root: &Path, phase: PhaseId) -> bool {
         Err(TryLockError::WouldBlock) => false,
         Err(TryLockError::Error(error)) => panic!("try_lock {}: {error}", path.display()),
     }
+}
+
+/// How a state stands to one launch id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ownership {
+    /// The state records this launch as its supervisor.
+    Recorded,
+    /// This launch is the pending supervisor, not yet the recorded one.
+    PendingOnly,
+    /// The state names this launch nowhere.
+    Superseded {
+        /// The launch the state records instead, if any.
+        recorded: Option<String>,
+    },
+}
+
+/// How `state` stands to `launch_id`.
+pub fn ownership(_state: &State, _launch_id: &str) -> Ownership {
+    Ownership::Superseded { recorded: None }
+}
+
+/// [`update_state`] fenced to the launch the state records.
+pub fn update_owned_state<T, E: From<WorkflowError>>(
+    project_root: &Path,
+    phase: PhaseId,
+    _launch_id: &str,
+    apply: impl FnOnce(&mut State) -> Result<T, E>,
+) -> Result<(State, T), E> {
+    update_state(project_root, phase, apply)
 }
 
 /// Enumerate every active phase state, sorted by phase number.
@@ -1375,6 +1421,107 @@ mod tests {
             write_lock_status(root, phase).unwrap(),
             WriteLockStatus::Held { pid: None }
         );
+    }
+
+    fn supervisor_record(launch_id: &str) -> crate::state::SupervisorRecord {
+        crate::state::SupervisorRecord::new(
+            PathBuf::from(format!("/c/sock/{launch_id}.sock")),
+            launch_id.to_string(),
+            4242,
+            123_456,
+            "boot-id".to_string(),
+        )
+    }
+
+    fn pending_supervisor(launch_id: &str) -> crate::state::PendingSupervisor {
+        crate::state::PendingSupervisor::new(
+            launch_id.to_string(),
+            PathBuf::from(format!("/c/sock/{launch_id}.sock")),
+            PathBuf::from(format!("/c/supervisor-{launch_id}.live")),
+        )
+    }
+
+    #[test]
+    fn ownership_tells_recorded_pending_and_superseded_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_in(dir.path(), PhaseId::new(50), Stage::Code);
+        assert_eq!(
+            ownership(&state, "X"),
+            Ownership::Superseded { recorded: None }
+        );
+
+        state.supervisor = Some(supervisor_record("X"));
+        assert_eq!(ownership(&state, "X"), Ownership::Recorded);
+        assert_eq!(
+            ownership(&state, "Y"),
+            Ownership::Superseded {
+                recorded: Some("X".to_string())
+            }
+        );
+
+        state.pending_supervisor = Some(pending_supervisor("Y"));
+        assert_eq!(ownership(&state, "Y"), Ownership::PendingOnly);
+        assert_eq!(ownership(&state, "X"), Ownership::Recorded);
+        assert_eq!(
+            ownership(&state, "Z"),
+            Ownership::Superseded {
+                recorded: Some("X".to_string())
+            },
+            "a third launch is named nowhere"
+        );
+    }
+
+    #[test]
+    fn update_owned_state_refuses_a_launch_the_state_does_not_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(50));
+        let path = state_path(root, phase);
+        let mut state = state_in(root, phase, Stage::Code);
+        state.supervisor = Some(supervisor_record("X"));
+        save_state(&state).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let ran = std::cell::Cell::new(false);
+        let write_as = |launch_id: &str| {
+            update_owned_state(root, phase, launch_id, |state| {
+                ran.set(true);
+                state.stopped = true;
+                Ok::<(), WorkflowError>(())
+            })
+        };
+
+        let error = write_as("Y").unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                WorkflowError::NotOwner { phase: refused, ours, recorded, pending_only: false }
+                    if *refused == phase && ours == "Y" && recorded.as_deref() == Some("X")
+            ),
+            "got {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains('X') && message.contains('Y'), "{message}");
+        assert!(!ran.get(), "a superseded launch must not reach its closure");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        state.pending_supervisor = Some(pending_supervisor("Y"));
+        save_state(&state).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let error = write_as("Y").unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                WorkflowError::NotOwner { ours, recorded, pending_only: true, .. }
+                    if ours == "Y" && recorded.as_deref() == Some("X")
+            ),
+            "got {error}"
+        );
+        assert!(!ran.get(), "a pending launch must not reach its closure");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let (committed, ()) = write_as("X").expect("the recorded launch writes");
+        assert!(ran.get());
+        assert!(committed.stopped);
+        assert!(load_state(root, phase).unwrap().stopped);
     }
 
     #[test]
