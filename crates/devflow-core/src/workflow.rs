@@ -590,6 +590,25 @@ mod tests {
     }
 
     #[test]
+    fn save_state_is_written_through_the_durable_replace() {
+        use crate::durable::{Synced, take_synced};
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path(), PhaseId::new(1), Stage::Validate);
+        take_synced();
+
+        save_state(&state).expect("save");
+
+        let synced = take_synced();
+        assert!(
+            synced.contains(&Synced::Dir(dir.path().join(".devflow"))),
+            "a state save must fsync .devflow after the rename, recorded: {synced:?}"
+        );
+        let loaded = load_state(dir.path(), PhaseId::new(1)).expect("load");
+        assert_eq!(loaded.stage, Stage::Validate);
+        assert_eq!(loaded.phase, state.phase);
+    }
+
+    #[test]
     fn save_state_writes_atomically_and_leaves_no_temp() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path(), PhaseId::new(1), Stage::Validate);
