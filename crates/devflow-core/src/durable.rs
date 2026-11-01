@@ -1,8 +1,21 @@
 //! Durable file operations for state and gate records (Phase 50.1 D-09).
 //!
-//! `replace_durably` is D-09's replace: fsync a temp file, rename it over the
-//! target, fsync the directory, so a crash leaves the old bytes or the new bytes
-//! and a power loss cannot lose the rename.
+//! Every write, publish and removal in `workflow.rs` and `gates.rs` goes through
+//! one of D-09's three operations, which a source scan in this module's tests
+//! enforces:
+//! - replace ([`replace_durably`]): fsync a temp file, rename it over the target,
+//!   fsync the directory;
+//! - exclusive publish ([`publish_exclusive_durably`]): fsync a temp file, hard-link
+//!   it to the target, fsync the directory, never falling back to `rename`;
+//! - remove ([`remove_durably`]): unlink, then fsync the directory.
+//!
+//! The advisory coordination files of Phase 50.1 (`supervisor-<id>.live`,
+//! `NN-{stage}.{gate_id}.waiter`, `.devflow/.holder-NN`, `.devflow/.state-NN.lock`,
+//! `*.hold-tmp`, `.devflow/.gitignore`) are deliberately outside these operations.
+//! None of them holds a state or gate record, and a held `flock`, not their bytes
+//! or existence, decides liveness. Fsync guards only against power loss, after
+//! which no holder survives, so a lost or resurrected marker reads as not live,
+//! which is the truth after a reboot.
 //!
 //! Not established: these helpers make the calls, in order, and the `cfg(test)`
 //! recorder proves that. Durability across a real power loss is not tested.
@@ -69,8 +82,7 @@ pub(crate) fn replace_durably(path: &Path, contents: &[u8]) -> std::io::Result<(
     fsync_dir(parent_of(path))
 }
 
-/// RED scaffold: how a publish ended.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+/// How [`publish_exclusive_durably`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Publication {
     /// This call's bytes are at the target.
@@ -79,17 +91,22 @@ pub(crate) enum Publication {
     AlreadyExists,
 }
 
-/// RED scaffold: a hard-link publish with no directory fsync.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+/// Publish `contents` at `path` exactly once: temp, fsync, hard link, directory
+/// fsync. There is no fallback to `rename`, which would overwrite the first
+/// publisher; a filesystem that cannot hard-link fails loudly (Phase 48 D-04).
 pub(crate) fn publish_exclusive_durably(
     path: &Path,
     contents: &[u8],
 ) -> std::io::Result<Publication> {
     let tmp = write_synced_temp(path, contents)?;
     let publish = std::fs::hard_link(&tmp, path);
-    std::fs::remove_file(&tmp)?;
+    let cleanup = std::fs::remove_file(&tmp);
     match publish {
-        Ok(()) => Ok(Publication::Published),
+        Ok(()) => {
+            fsync_dir(parent_of(path))?;
+            cleanup?;
+            Ok(Publication::Published)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(Publication::AlreadyExists)
         }
@@ -97,27 +114,47 @@ pub(crate) fn publish_exclusive_durably(
     }
 }
 
-/// RED scaffold: an unlink with no directory fsync.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+/// Unlink `path`, then fsync its directory. Returns whether this call removed
+/// the file; a missing file is `Ok(false)` and syncs nothing.
+///
+/// An error from the directory fsync means the unlink happened but is not known
+/// durable, and a retry then reads `Ok(false)`.
 pub(crate) fn remove_durably(path: &Path) -> std::io::Result<bool> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            fsync_dir(parent_of(path))?;
+            Ok(true)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
 }
 
-/// RED scaffold: a rename with no directory fsync.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+/// Rename `from` to `to`, then fsync `to`'s directory. Callers keep both names in
+/// one directory, so that fsync covers both entries.
 pub(crate) fn rename_durably(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
+    std::fs::rename(from, to)?;
+    fsync_dir(parent_of(to))
 }
 
-/// RED scaffold: the walk R2-08 forbids, returning early on an existing target.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+/// Create `dir` and any missing parents, fsyncing the parent of each component it
+/// creates.
+///
+/// R2-08: every successful return has also fsynced `dir`'s own parent, whether
+/// this call created `dir`, lost the race to create it, or found it already there,
+/// because another process may have made the entry and not synced it yet.
+///
+/// Not established: an intermediate component another process made is not
+/// re-synced. DevFlow has none: [`crate::workflow::ensure_devflow_dir`] passes the
+/// `.devflow` component on its own first.
 pub(crate) fn create_dir_all_durably(dir: &Path) -> std::io::Result<()> {
-    if dir.is_dir() {
+    // The empty path (a bare file name's parent) and a filesystem root have no
+    // entry of their own to create or sync.
+    if dir.as_os_str().is_empty() || dir.parent().is_none() {
         return Ok(());
+    }
+    if dir.is_dir() {
+        return fsync_dir(parent_of(dir));
     }
     let missing: Vec<&Path> = dir
         .ancestors()
@@ -129,26 +166,48 @@ pub(crate) fn create_dir_all_durably(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// RED scaffold: a racing creator's `AlreadyExists` is an error here.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+/// Create one directory and fsync its parent. A racing creator's directory counts
+/// as created; a file in the way is an error.
 fn create_component_durably(component: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(component)?;
+    match std::fs::create_dir(component) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && component.is_dir() => {}
+        Err(error) => return Err(error),
+    }
     fsync_dir(parent_of(component))
 }
 
-/// RED scaffold: the replacing rename the helper exists to prevent.
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller: the gate quarantine in 50.1-06")
+)]
+static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Move `from` to a new name `{stem}.{pid}.{seq}{suffix}` in `dir`, by a no-replace
+/// hard link, then remove the source and fsync the directory (R-11). Returns the
+/// new name.
+///
+/// The destination is always a name nobody held: `pid` separates processes and the
+/// `AlreadyExists` retry covers a reused pid with a restarted counter. A crash
+/// between the link and the source removal leaves the file under both names, a
+/// duplicate and never a loss.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller: the gate quarantine in 50.1-06")
+)]
 pub(crate) fn rename_to_unique_durably(
     from: &Path,
     dir: &Path,
     stem: &str,
     suffix: &str,
 ) -> std::io::Result<PathBuf> {
-    static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
     rename_to_unique_durably_with(from, dir, stem, suffix, std::process::id(), &UNIQUE_SEQ)
 }
 
-#[allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller: the gate quarantine in 50.1-06")
+)]
 fn rename_to_unique_durably_with(
     from: &Path,
     dir: &Path,
@@ -157,10 +216,32 @@ fn rename_to_unique_durably_with(
     pid: u32,
     seq: &AtomicU64,
 ) -> std::io::Result<PathBuf> {
-    let n = seq.fetch_add(1, Ordering::Relaxed);
-    let candidate = dir.join(format!("{stem}.{pid}.{n}{suffix}"));
-    std::fs::rename(from, &candidate)?;
-    Ok(candidate)
+    loop {
+        let n = seq.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!("{stem}.{pid}.{n}{suffix}"));
+        match std::fs::hard_link(from, &candidate) {
+            Ok(()) => {
+                remove_linked_source(from)?;
+                fsync_dir(dir)?;
+                let from_dir = parent_of(from);
+                if from_dir != dir {
+                    fsync_dir(from_dir)?;
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Remove a source already linked under its new name. `NotFound` means a concurrent
+/// remover took it after the link; the bytes survive under the new name.
+fn remove_linked_source(from: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(from) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// One fsync the code under test made, in call order.
