@@ -1928,4 +1928,130 @@ mod tests {
         assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
         assert!(!state_path(root, phase).exists());
     }
+
+    /// Whether `line` names `save_state` as a whole identifier: an occurrence with no
+    /// ASCII letter, digit or `_` on either side, which also catches the function
+    /// passed as a value.
+    fn names_save_state(line: &str) -> bool {
+        const NAME: &str = "save_state";
+        let continues_identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        line.match_indices(NAME).any(|(at, _)| {
+            !line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(continues_identifier)
+                && !line[at + NAME.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(continues_identifier)
+        })
+    }
+
+    /// Every line of `source` that names `save_state`, before the first line that is
+    /// exactly `mod tests {`, leaving out whole-line `//` comments and the
+    /// definition line. Lines keep their
+    /// numbers in `source`, and a trailing comment stays as part of its code line.
+    fn save_state_violations(path: &str, source: &str) -> Vec<String> {
+        source
+            .lines()
+            .enumerate()
+            .take_while(|(_, line)| *line != "mod tests {")
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| !line.trim_start().starts_with("pub fn save_state("))
+            .filter(|(_, line)| names_save_state(line))
+            .map(|(index, _)| format!("{path}: line {}: save_state", index + 1))
+            .collect()
+    }
+
+    /// Every `.rs` file under `dir`, recursively, in sorted order.
+    fn rust_files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(rust_files_under(&path));
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// V-11 (criterion 3): no production code in this crate names `save_state`, whose
+    /// whole-snapshot write would bring back the lost update `update_state` removes.
+    /// Only test code is excluded: `mod tests` and the `test_support` module, whose
+    /// test-only declaration is asserted here, so no production file is allowlisted.
+    #[test]
+    fn no_production_code_saves_state_outside_update_state() {
+        const SOURCE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        assert!(
+            include_str!("lib.rs")
+                .contains("#[cfg(any(test, feature = \"test-support\"))]\npub mod test_support;"),
+            "test_support.rs is skipped only while it is declared test-only"
+        );
+        let root = std::path::Path::new(SOURCE_ROOT);
+        let files = rust_files_under(root);
+        let relative: Vec<String> = files
+            .iter()
+            .map(|file| file.strip_prefix(root).unwrap().display().to_string())
+            .collect();
+        for expected in ["workflow.rs", "supervisor/runtime.rs"] {
+            assert!(
+                relative.iter().any(|file| file == expected),
+                "the walk must reach {expected}: {relative:?}"
+            );
+        }
+        let real: Vec<String> = files
+            .iter()
+            .zip(&relative)
+            .filter(|(_, relative)| relative.as_str() != "test_support.rs")
+            .flat_map(|(file, relative)| {
+                save_state_violations(relative, &std::fs::read_to_string(file).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            real,
+            Vec::<String>::new(),
+            "production save_state references"
+        );
+
+        let call = "fn f() {\n    workflow::save_state(&state)?;\n}\n";
+        assert_eq!(
+            save_state_violations("planted.rs", call),
+            vec!["planted.rs: line 2: save_state"],
+            "a planted call"
+        );
+        let value = "    match publish_record(state, published, workflow::save_state)? {\n";
+        assert_eq!(
+            save_state_violations("planted.rs", value),
+            vec!["planted.rs: line 1: save_state"],
+            "the function passed as a value"
+        );
+        for (source, shape) in [
+            (
+                "let n = save_state_violations(p, s);",
+                "a longer identifier",
+            ),
+            (
+                "let n = my_save_state(p, s);",
+                "a longer identifier, on the left",
+            ),
+            ("// workflow::save_state(&state)?;", "a commented-out call"),
+            (
+                "fn f() {}\nmod tests {\n    workflow::save_state(&state)?;\n}\n",
+                "a call after `mod tests {`",
+            ),
+            (
+                "pub fn save_state(state: &State) -> Result<(), WorkflowError> {",
+                "the definition",
+            ),
+        ] {
+            assert_eq!(
+                save_state_violations("planted.rs", source),
+                Vec::<String>::new(),
+                "{shape}"
+            );
+        }
+    }
 }
