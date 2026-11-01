@@ -247,6 +247,33 @@ pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
     }
 }
 
+/// Scaffold for the failing tests: accepts any launch id.
+pub fn launch_liveness_path(project_root: &Path, launch_id: &str) -> Option<PathBuf> {
+    Some(
+        project_root
+            .join(".devflow")
+            .join(format!("supervisor-{launch_id}.live")),
+    )
+}
+
+/// Scaffold for the failing tests: wraps the descriptor and does nothing else.
+///
+/// # Errors
+/// None in the scaffold.
+pub fn adopt_inherited(fd: RawFd, path: PathBuf) -> std::io::Result<Hold> {
+    // SAFETY: the scaffold's caller hands over a descriptor it owns.
+    let file = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+    Ok(Hold { file, path })
+}
+
+/// Scaffold for the failing tests: names nobody.
+///
+/// # Errors
+/// None in the scaffold.
+pub fn live_holder(_path: &Path) -> std::io::Result<Option<(u32, Option<u64>)>> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +454,315 @@ mod tests {
                 );
                 drop(child);
                 assert_eq!(probe(&held).expect("probe"), Held::Abandoned);
+            },
+        );
+    }
+
+    /// This process's identity as a hold records it.
+    fn this_process() -> (u32, Option<u64>) {
+        let pid = std::process::id();
+        let start = crate::agent::process_start_time(pid);
+        assert!(start.is_some(), "this test needs /proc/<pid>/stat");
+        (pid, start)
+    }
+
+    #[test]
+    fn an_unheld_reservation_reads_abandoned() {
+        in_own_process(
+            "liveness::tests::an_unheld_reservation_reads_abandoned",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("r.live");
+                assert_eq!(probe(&path).expect("probe"), Held::Missing);
+
+                let hold = Hold::take(&path).expect("take a hold");
+                assert_eq!(probe(&path).expect("probe"), Held::Live);
+
+                drop(hold);
+                assert_eq!(probe(&path).expect("probe"), Held::Abandoned);
+            },
+        );
+    }
+
+    #[test]
+    fn unlock_on_a_duplicate_releases_the_inherited_lock() {
+        in_own_process(
+            "liveness::tests::unlock_on_a_duplicate_releases_the_inherited_lock",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("x.live");
+                let hold = Hold::take(&path).expect("take a hold");
+                let mut command = sleep_command();
+                pass_to_child(&mut command, &hold);
+                let mut child = ReapOnDrop(command.spawn().expect("spawn the child"));
+                assert_eq!(probe(&path).expect("probe"), Held::Live);
+
+                hold.file.unlock().expect("unlock the parent's copy");
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Abandoned,
+                    "unlock on a duplicate must release the lock the child inherited"
+                );
+                assert!(
+                    child.0.try_wait().expect("poll the child").is_none(),
+                    "the child still runs, and no longer holds anything"
+                );
+            },
+        );
+    }
+
+    /// The part of `source` before its test module.
+    fn production_part(source: &str) -> &str {
+        source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source)
+    }
+
+    /// The non-test, non-comment lines of `source` containing `needle`.
+    fn production_lines_containing(source: &str, needle: &str) -> Vec<String> {
+        production_part(source)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//") && line.contains(needle))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn no_code_unlocks_a_liveness_hold() {
+        let planted = production_lines_containing("    hold.file.unlock()?;\n", ".unlock(");
+        assert_eq!(planted, ["    hold.file.unlock()?;"]);
+        let comment = production_lines_containing("    // never call .unlock() here\n", ".unlock(");
+        assert_eq!(comment, Vec::<String>::new());
+        let in_tests = production_lines_containing(
+            "#[cfg(test)]\nmod tests {\n  a.unlock();\n}\n",
+            ".unlock(",
+        );
+        assert_eq!(in_tests, Vec::<String>::new());
+
+        for source in [include_str!("liveness.rs"), include_str!("monitor.rs")] {
+            assert!(
+                production_part(source).contains("pub fn "),
+                "the scan must have read production code"
+            );
+            assert_eq!(
+                production_lines_containing(source, ".unlock("),
+                Vec::<String>::new(),
+                "unlock on any duplicate releases the lock a child inherited"
+            );
+        }
+    }
+
+    #[test]
+    fn no_code_writes_a_hold_record_through_the_cursor() {
+        let planted = production_lines_containing("    file.write_all(record)?;\n", ".write_all(");
+        assert_eq!(planted, ["    file.write_all(record)?;"]);
+        let positional =
+            production_lines_containing("    file.write_all_at(record, 0)?;\n", ".write_all(");
+        assert_eq!(positional, Vec::<String>::new());
+
+        let source = include_str!("liveness.rs");
+        assert!(production_part(source).contains(".write_all_at("));
+        assert_eq!(
+            production_lines_containing(source, ".write_all("),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter() {
+        in_own_process(
+            "liveness::tests::adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("a.live");
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .expect("create the file");
+                file.try_lock().expect("lock the file");
+                // SAFETY: fcntl on a descriptor `file` owns; the result is owned
+                // by the adoption below.
+                let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 10) };
+                assert_ne!(fd, -1);
+                drop(file);
+                // SAFETY: F_GETFD reads a flag of the descriptor just made.
+                let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_eq!(
+                    before & libc::FD_CLOEXEC,
+                    0,
+                    "the fixture hands over an inheritable fd"
+                );
+
+                let hold = adopt_inherited(fd, path.clone()).expect("adopt the descriptor");
+                // SAFETY: F_GETFD reads a flag of a descriptor `hold` owns.
+                let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_ne!(after & libc::FD_CLOEXEC, 0, "an agent must not inherit it");
+                assert_eq!(
+                    live_holder(&path).expect("read the holder"),
+                    Some(this_process())
+                );
+
+                drop(hold);
+                assert_eq!(live_holder(&path).expect("read the holder"), None);
+                assert!(
+                    adopt_inherited(fd, path).is_err(),
+                    "a closed descriptor must be refused"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn launch_liveness_path_refuses_an_invalid_launch_id() {
+        let root = Path::new("/project/root");
+        assert_eq!(launch_liveness_path(root, "../x"), None);
+        let launch_id = crate::supervisor::new_launch_id();
+        assert_eq!(
+            launch_liveness_path(root, &launch_id),
+            Some(root.join(format!(".devflow/supervisor-{launch_id}.live")))
+        );
+    }
+
+    #[test]
+    fn a_probe_in_flight_neither_reads_live_nor_fails_a_take() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let path = dir.path().join("x.live");
+        std::fs::write(&path, b"").expect("create the file");
+
+        let in_flight = File::open(&path).expect("open");
+        in_flight.try_lock_shared().expect("take the shared lock");
+        assert_eq!(
+            probe(&path).expect("probe"),
+            Held::Abandoned,
+            "a probe must not read another probe as live"
+        );
+        drop(in_flight);
+
+        // The first try always meets the shared lock, so an implementation
+        // that does not wait fails every attempt. Only a stalled releaser
+        // thread on a loaded machine can fail one that does, hence the retries.
+        let waited_out = (0..5).any(|_| {
+            let in_flight = File::open(&path).expect("open");
+            in_flight.try_lock_shared().expect("take the shared lock");
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                drop(in_flight);
+            });
+            let taker = File::open(&path).expect("open");
+            let taken = try_lock_past_probes(&taker);
+            releaser.join().expect("join the releaser");
+            taken.is_ok()
+        });
+        assert!(waited_out, "a take must wait out a probe's momentary lock");
+
+        let holder = File::open(&path).expect("open");
+        holder.try_lock().expect("take the exclusive lock");
+        assert_eq!(probe(&path).expect("probe"), Held::Live);
+        let second_taker = File::open(&path).expect("open");
+        let started = Instant::now();
+        let second = try_lock_past_probes(&second_taker);
+        assert!(
+            matches!(second, Err(TryLockError::WouldBlock)),
+            "a real holder must refuse a second taker, got {second:?}"
+        );
+        assert!(started.elapsed() >= PROBE_RACE_WAIT);
+    }
+
+    #[test]
+    fn live_holder_refuses_an_empty_or_partial_record() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let path = dir.path().join("x.live");
+        let _hold = Hold::take(&path).expect("take a hold");
+        assert_eq!(
+            live_holder(&path).expect("the taken record reads"),
+            Some(this_process())
+        );
+
+        for record in ["", "12", "not-a-pid 5\n", "12 not-a-start\n", "12 34 56\n"] {
+            std::fs::write(&path, record).expect("rewrite the record");
+            let refused = live_holder(&path);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData),
+                "record {record:?} must be refused, got {refused:?}"
+            );
+        }
+    }
+
+    /// Take a hold on `path` and return a duplicate of its descriptor that is
+    /// not close-on-exec and shares its open file description, with the shared
+    /// offset past the record, where any cursor write leaves it. The hold's
+    /// drop closes only its own copy, so the duplicate keeps the lock.
+    fn duplicate_with_an_advanced_offset(path: &Path) -> (RawFd, usize) {
+        let hold = Hold::take(path).expect("take a hold");
+        // SAFETY: fcntl and lseek on a descriptor `hold` owns and on its new
+        // duplicate, which the caller owns.
+        unsafe {
+            let duplicate = libc::fcntl(hold.as_raw_fd(), libc::F_DUPFD, 10);
+            assert_ne!(duplicate, -1);
+            let offset = libc::lseek(duplicate, 0, libc::SEEK_END);
+            assert!(offset > 0, "the shared offset must have moved");
+            (duplicate, usize::try_from(offset).expect("a small offset"))
+        }
+    }
+
+    /// The rewrite `write_identity_record` replaced.
+    fn rewrite_through_the_cursor(file: &File) {
+        use std::io::Write;
+        let (pid, start) = this_process();
+        file.set_len(0).expect("truncate");
+        let start = start.expect("a start time");
+        let mut writer = file;
+        writer
+            .write_all(format!("{pid} {start}\n").as_bytes())
+            .expect("write through the cursor");
+    }
+
+    #[test]
+    fn adopting_a_descriptor_take_wrote_through_keeps_the_record_intact() {
+        in_own_process(
+            "liveness::tests::adopting_a_descriptor_take_wrote_through_keeps_the_record_intact",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let (pid, start) = this_process();
+
+                let adopted = dir.path().join("a.live");
+                let (duplicate, _) = duplicate_with_an_advanced_offset(&adopted);
+                let _hold = adopt_inherited(duplicate, adopted.clone()).expect("adopt");
+                let bytes = std::fs::read(&adopted).expect("read the record");
+                assert!(
+                    !bytes.contains(&0),
+                    "the record has a NUL hole: {bytes:?}; live_holder reads {:?}",
+                    live_holder(&adopted)
+                );
+                assert!(bytes.starts_with(format!("{pid} ").as_bytes()));
+                assert_eq!(
+                    live_holder(&adopted).expect("read the holder"),
+                    Some((pid, start))
+                );
+
+                let cursor = dir.path().join("b.live");
+                let (duplicate, offset) = duplicate_with_an_advanced_offset(&cursor);
+                // SAFETY: the caller owns the duplicate, and nothing else uses it.
+                let file = unsafe { File::from_raw_fd(duplicate) };
+                rewrite_through_the_cursor(&file);
+                let bytes = std::fs::read(&cursor).expect("read the record");
+                assert_eq!(
+                    bytes.iter().take_while(|&&byte| byte == 0).count(),
+                    offset,
+                    "a cursor write lands past a hole as long as the offset: {bytes:?}"
+                );
+                let unreadable = live_holder(&cursor);
+                assert!(
+                    unreadable
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData),
+                    "a live holder would go unnamed, got {unreadable:?}"
+                );
             },
         );
     }
