@@ -26,9 +26,13 @@ use devflow_core::agent_result;
 use devflow_core::agents;
 use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
-use devflow_core::gates::{GateAction, GateError, GateId, GateResponse, Gates, OpenGate};
+use devflow_core::gates::{
+    GateAction, GateError, GateFile, GateId, GateResponse, Gates, OpenGate, WaiterStatus,
+    is_gate_id,
+};
 use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
+use devflow_core::liveness;
 use devflow_core::lock;
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -1421,8 +1425,8 @@ pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliE
     }
     println!("{}", render_gate_list(&open));
     println!(
-        "\nanswer with: devflow gate approve <phase> [--note ...] | \
-         devflow gate reject <phase> --note ... (note with \"abort\" ends the phase)"
+        "\nanswer with: devflow gate approve <phase> [--gate-id <id>] [--note ...] | \
+         devflow gate reject <phase> [--gate-id <id>] --note ... (note with \"abort\" ends the phase)"
     );
     Ok(())
 }
@@ -1430,17 +1434,31 @@ pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliE
 /// Pure render of [`gate_list`]'s table, so what it shows is testable without
 /// capturing process stdout.
 fn render_gate_list(open: &[OpenGate]) -> String {
-    let mut table = format!("{:<6} {:<9} {:<9} CONTEXT", "PHASE", "STAGE", "AGE");
+    let mut table = format!(
+        "{:<6} {:<9} {:<9} {:<16} CONTEXT",
+        "PHASE", "STAGE", "AGE", "GATE ID"
+    );
     for gate in open {
         let context = render_gate_context(&gate.context, 100);
         table.push_str(&format!(
-            "\n{:<6} {:<9} {:<9} {context}",
+            "\n{:<6} {:<9} {:<9} {:<16} {context}",
             gate.phase,
             gate.stage.to_string(),
             recover::format_age(&gate.timestamp),
+            printable_gate_id(gate),
         ));
     }
     table
+}
+
+/// A gate's id for display. The gate file is untrusted text, so only a well-formed
+/// id reaches the terminal; `-` stands for a missing or malformed one.
+fn printable_gate_id(gate: &OpenGate) -> &str {
+    if is_gate_id(&gate.gate_id) {
+        &gate.gate_id
+    } else {
+        "-"
+    }
 }
 
 /// The `--all-roots` half of [`gate_list`]: fan out `Gates::list_open`
@@ -1462,7 +1480,10 @@ fn gate_list_all_roots() -> Result<(), CliError> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    println!("{:<6} {:<9} {:<9} ROOT / CONTEXT", "PHASE", "STAGE", "AGE");
+    println!(
+        "{:<6} {:<9} {:<9} {:<16} ROOT / CONTEXT",
+        "PHASE", "STAGE", "AGE", "GATE ID"
+    );
     for (root, gate) in &rows {
         println!("{}", render_all_roots_gate_row(root, gate, now));
     }
@@ -1476,10 +1497,11 @@ fn gate_list_all_roots() -> Result<(), CliError> {
 fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
     let context = render_gate_context(&gate.context, 100);
     format!(
-        "{:<6} {:<9} {:<9} {}\n           {context}",
+        "{:<6} {:<9} {:<9} {:<16} {}\n           {context}",
         gate.phase,
         gate.stage.to_string(),
         render_gate_age(&gate.timestamp, now),
+        printable_gate_id(gate),
         root.display(),
     )
 }
@@ -1537,6 +1559,10 @@ fn resolve_single_open_gate_stage(open: &[OpenGate], phase: PhaseId) -> Result<S
     }
 }
 
+/// Answer the gate the operator observed: the id they passed, or the id of the
+/// stage's open gate in this command's one [`Gates::list_open`] read. The id is
+/// fixed here and only re-checked afterwards, so a decision about one gate cannot
+/// land on the next (D-04).
 pub(crate) fn gate_respond(
     project_root: &Path,
     phase: PhaseId,
@@ -1545,22 +1571,20 @@ pub(crate) fn gate_respond(
     note: Option<String>,
     observed_gate_id: Option<String>,
 ) -> Result<(), CliError> {
-    let _ = observed_gate_id;
+    // A malformed id is refused before anything is read, so it can never name a
+    // path (T-50.1-42).
+    let given_gate_id = observed_gate_id.as_deref().map(GateId::parse).transpose()?;
+    let open = Gates::list_open(project_root);
     let stage = match stage {
         Some(stage) => stage,
-        None => resolve_single_open_gate_stage(&Gates::list_open(project_root), phase)?,
+        None => resolve_single_open_gate_stage(&open, phase)?,
     };
-    let holder_before_response = lock::holder_status(project_root, phase);
-    // Ship's stored-response exception is for `NoHolder` alone (T-48-16-03);
-    // a recycled pid is an unrelated process, not manual-recovery territory.
-    let ship_without_holder =
-        stage == Stage::Ship && matches!(holder_before_response, lock::HolderStatus::NoHolder);
-    if !holder_before_response.may_be_waiting() && !ship_without_holder {
-        return Err(CliError::Message(format!(
-            "no confirmed waiter holds phase {phase}'s lock for {stage}; no response was written. {}",
-            no_waiter_repair(phase, stage)
-        )));
-    }
+    let observed = match given_gate_id {
+        Some(gate_id) => gate_id,
+        None => open_gate_id_at_stage(&open, phase, stage)?,
+    };
+    require_gate_file_names(project_root, phase, stage, &observed)?;
+    refuse_a_gate_with_no_waiter(project_root, phase, stage, &observed)?;
     let responded_by = std::env::var("USER")
         .ok()
         .filter(|user| !user.is_empty())
@@ -1570,26 +1594,27 @@ pub(crate) fn gate_respond(
         note,
         responded_by: Some(responded_by),
     };
-    let path = Gates::respond(project_root, phase, stage, &response)?;
+    let path = Gates::answer(project_root, phase, stage, &observed, &response)
+        .map_err(gate_answer_error)?;
     events::emit(
         project_root,
         phase,
         "gate_response_written",
         serde_json::json!({
             "stage": stage.to_string(),
+            "gate_id": observed.as_str(),
             "approved": approved,
             "via": "cli",
         }),
     );
-    let holder_after_response = lock::holder_status(project_root, phase);
-    let pickup = match holder_after_response {
-        lock::HolderStatus::Live { .. } => {
-            response_pickup_message(stage, holder_after_response).to_owned()
-        }
-        _ => format!(
+    let pickup = if waiter_is_live(project_root, phase, stage, &observed) {
+        let waiter = waiter_holder_status(project_root, phase, stage, &observed);
+        response_pickup_message(stage, waiter).to_owned()
+    } else {
+        format!(
             "response was written, but no confirmed live holder will act. {}",
             no_waiter_repair(phase, stage)
-        ),
+        )
     };
     println!(
         "{} gate for phase {phase} {stage} — response was written; {pickup} (response at {})",
@@ -1599,13 +1624,174 @@ pub(crate) fn gate_respond(
     Ok(())
 }
 
-/// Whether `observed`'s gate has a live waiter.
-#[allow(dead_code)]
-fn waiter_is_live(project_root: &Path, phase: PhaseId, _stage: Stage, _observed: &GateId) -> bool {
-    matches!(
-        lock::holder_status(project_root, phase),
-        lock::HolderStatus::Live { .. }
+/// The id of the open gate at `phase` + `stage`, from an already-fetched listing.
+fn open_gate_id_at_stage(
+    open: &[OpenGate],
+    phase: PhaseId,
+    stage: Stage,
+) -> Result<GateId, CliError> {
+    let gate = open
+        .iter()
+        .find(|gate| gate.phase == phase && gate.stage == stage)
+        .ok_or(GateError::NoOpenGate { phase, stage })?;
+    GateId::parse(&gate.gate_id).map_err(|_| {
+        CliError::Message(format!(
+            "phase {phase} {stage}'s gate file has no valid gate id, so it cannot be answered; \
+             no response was written. {}",
+            no_waiter_repair(phase, stage)
+        ))
+    })
+}
+
+/// The id the stage's gate file names, or `None` with no gate file.
+fn gate_file_id(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+) -> Result<Option<String>, GateError> {
+    match std::fs::read_to_string(Gates::gate_path(project_root, phase, stage)) {
+        Ok(contents) => Ok(Some(serde_json::from_str::<GateFile>(&contents)?.gate_id)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Refuse unless the gate file still names `observed`. This runs before any
+/// liveness read: a stale id's registration is normally gone once its gate closed
+/// (its waiter finishes it, and `close` removes only abandoned ones), so reading
+/// liveness first would report a changed gate as a missing waiter, or, while the
+/// old waiter still lives, as a live one.
+fn require_gate_file_names(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    observed: &GateId,
+) -> Result<(), CliError> {
+    match gate_file_id(project_root, phase, stage)? {
+        None => Err(GateError::NoOpenGate { phase, stage }.into()),
+        Some(current) if current == observed.as_str() => Ok(()),
+        Some(current) => Err(CliError::Message(gate_changed_message(
+            phase,
+            stage,
+            observed.as_str(),
+            &current,
+        ))),
+    }
+}
+
+fn gate_changed_message(phase: PhaseId, stage: Stage, observed: &str, current: &str) -> String {
+    format!(
+        "phase {phase} {stage} is at gate {current}, not gate {observed}; nothing was written — \
+         run `devflow gate list` and answer again"
     )
+}
+
+/// The liveness half of [`gate_respond`]. Ship's stored-response exception is for
+/// no waiter of any kind (T-48-16-03): a recycled pid is an unrelated process, not
+/// manual-recovery territory.
+fn refuse_a_gate_with_no_waiter(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    observed: &GateId,
+) -> Result<(), CliError> {
+    let lock_holder = lock::holder_status(project_root, phase);
+    let may_be_waiting =
+        waiter_is_live(project_root, phase, stage, observed) || lock_holder.may_be_waiting();
+    let ship_without_holder =
+        stage == Stage::Ship && matches!(lock_holder, lock::HolderStatus::NoHolder);
+    if may_be_waiting || ship_without_holder {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "no confirmed waiter holds phase {phase}'s lock for {stage}; no response was written. {}",
+        no_waiter_repair(phase, stage)
+    )))
+}
+
+/// What the operator is told when [`Gates::answer`] refuses or sets aside.
+fn gate_answer_error(error: GateError) -> CliError {
+    match error {
+        GateError::GateIdMismatch {
+            phase,
+            stage,
+            observed,
+            current,
+        } => CliError::Message(gate_changed_message(phase, stage, &observed, &current)),
+        GateError::GateClosedAfterPublish {
+            phase,
+            stage,
+            observed,
+        } => CliError::Message(format!(
+            "the answer for gate {observed} at phase {phase} {stage} was published after that \
+             gate closed: it has been set aside; nothing will act on it, unless that gate's \
+             waiter consumed it before it closed — run `devflow gate list`"
+        )),
+        other => other.into(),
+    }
+}
+
+/// Whether `observed`'s gate has a live waiter: its registration reads live, or the
+/// per-phase lock holder does.
+///
+/// A writer may read the registration the instant it sees a gate file, because
+/// every waiter registers before it publishes ([`Gates::open_registered`], which
+/// every gate wait uses from 50.1-14).
+///
+/// The lock half is a transition, deleted in 50.1-20: waiters still hold the lock
+/// until 50.1-16 and 50.1-19 remove it, so without it a writer would refuse a live
+/// waiter in any wave between.
+fn waiter_is_live(project_root: &Path, phase: PhaseId, stage: Stage, observed: &GateId) -> bool {
+    let registered = match Gates::waiter_status(project_root, phase, stage, observed) {
+        Ok(status) => status == WaiterStatus::Live,
+        Err(error) => {
+            eprintln!(
+                "warning: could not probe the waiter registration of phase {phase} {stage} \
+                 gate {observed}: {error}"
+            );
+            false
+        }
+    };
+    registered
+        || matches!(
+            lock::holder_status(project_root, phase),
+            lock::HolderStatus::Live { .. }
+        )
+}
+
+/// The pid recorded by whoever holds `gate`'s registration, if anyone does and its
+/// record can be read.
+fn registered_waiter_pid(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    gate: &GateId,
+) -> Option<u32> {
+    let path = Gates::waiter_path(project_root, phase, stage, gate);
+    match liveness::live_holder(&path) {
+        Ok(holder) => holder.map(|(pid, _)| pid),
+        Err(error) => {
+            eprintln!(
+                "warning: could not read the waiter registration {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// [`waiter_is_live`]'s two halves as a [`lock::HolderStatus`], for the wording and
+/// the doctor facts that still take one until 50.1-20.
+fn waiter_holder_status(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    gate: &GateId,
+) -> lock::HolderStatus {
+    match registered_waiter_pid(project_root, phase, stage, gate) {
+        Some(pid) => lock::HolderStatus::Live { pid },
+        None => lock::holder_status(project_root, phase),
+    }
 }
 
 /// Operator recovery for a gate with no confirmed consumer. Ship is special:
@@ -3062,10 +3248,11 @@ pub(crate) fn gate_show(
 /// process stdout.
 fn render_gate_show(gate: &OpenGate) -> String {
     format!(
-        "phase {} {} ({})\n{}",
+        "phase {} {} ({})\ngate id: {}\n{}",
         gate.phase,
         gate.stage,
         recover::format_age(&gate.timestamp),
+        printable_gate_id(gate),
         render_gate_context(&gate.context, usize::MAX),
     )
 }
@@ -5005,7 +5192,7 @@ fn build_phase_facts(
 ) -> PhaseFacts {
     let phase = state.phase;
     let stopped = state.stopped;
-    let waiter = lock::holder_status(project_root, phase);
+    let waiter = phase_waiter_status(project_root, phase, open_gates);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let supervisor = probe_phase(&state);
@@ -5044,6 +5231,27 @@ fn build_phase_facts(
         feature_branch_exists,
         stopped,
     }
+}
+
+/// [`PhaseFacts::waiter`]: `Live` for the holder of a registration on one of the
+/// phase's open gates, else the lock half. The doctor reads this the way a writer
+/// reads [`waiter_is_live`]; the field stays a [`lock::HolderStatus`] until 50.1-20.
+fn phase_waiter_status(
+    project_root: &Path,
+    phase: PhaseId,
+    open_gates: &[OpenGate],
+) -> lock::HolderStatus {
+    open_gates
+        .iter()
+        .filter(|gate| gate.phase == phase)
+        .find_map(|gate| {
+            let gate_id = GateId::parse(&gate.gate_id).ok()?;
+            registered_waiter_pid(project_root, phase, gate.stage, &gate_id)
+        })
+        .map_or_else(
+            || lock::holder_status(project_root, phase),
+            |pid| lock::HolderStatus::Live { pid },
+        )
 }
 
 /// Derive the stage named by an event's `stage` field, but only when the
@@ -6401,6 +6609,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn doctor_facts_read_a_registered_waiter_as_the_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4906), Stage::Code);
+        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let open = Gates::list_open(root);
+
+        assert_eq!(
+            phase_waiter_status(root, phase, &open),
+            lock::HolderStatus::Live {
+                pid: std::process::id()
+            }
+        );
+        registration.finish();
+        assert_eq!(
+            phase_waiter_status(root, phase, &open),
+            lock::HolderStatus::NoHolder
+        );
+    }
+
     /// The lock half is why this test plants a `lock-NN`: that half is its subject,
     /// and 50.1-20 deletes both.
     #[test]
@@ -6748,6 +6977,38 @@ mod tests {
         };
         assert_eq!(phase, PhaseId::new(15));
         assert_eq!(stage, Some(Stage::Ship));
+    }
+
+    #[test]
+    fn gate_id_flag_is_taken_by_approve_and_reject() {
+        let approve =
+            Cli::try_parse_from(["devflow", "gate", "approve", "15", "--gate-id", "abc"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Approve { gate_id, .. },
+        } = approve.command
+        else {
+            panic!("expected gate approve");
+        };
+        assert_eq!(gate_id.as_deref(), Some("abc"));
+
+        let reject = Cli::try_parse_from([
+            "devflow",
+            "gate",
+            "reject",
+            "15",
+            "--note",
+            "n",
+            "--gate-id",
+            "abc",
+        ])
+        .unwrap();
+        let Command::Gate {
+            action: GateCmd::Reject { gate_id, .. },
+        } = reject.command
+        else {
+            panic!("expected gate reject");
+        };
+        assert_eq!(gate_id.as_deref(), Some("abc"));
     }
 
     #[test]
