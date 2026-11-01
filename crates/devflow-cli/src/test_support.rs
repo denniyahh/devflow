@@ -14,10 +14,57 @@
 //! rather than inside any one cluster.
 
 use devflow_core::agents;
+use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::phase_id::PhaseId;
+use devflow_core::stage::Stage;
 use devflow_core::state::{State, SupervisorRecord};
+use devflow_core::workflow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Run `handler` on another thread until it opens `stage`'s gate, read the state on
+/// disk at that moment, then answer the gate with an abort and wait for `handler`.
+///
+/// An abort clears the state file, so a handler that gates cannot show what it
+/// committed any other way: the state is read while the handler is held at its gate.
+pub(crate) fn state_on_disk_at_gate(
+    root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    handler: impl FnOnce() + Send,
+) -> State {
+    const GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(handler);
+        let started = std::time::Instant::now();
+        while !Gates::gate_path(root, phase, stage).exists() {
+            assert!(
+                !waiter.is_finished(),
+                "the handler returned without opening the {stage} gate"
+            );
+            assert!(
+                started.elapsed() < GATE_OPENS_WITHIN,
+                "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+        let on_disk = workflow::load_state(root, phase).unwrap();
+        Gates::respond(
+            root,
+            phase,
+            stage,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        waiter.join().unwrap();
+        on_disk
+    })
+}
 
 /// Serializes tests that mutate process-global env vars (`set_var`/
 /// `remove_var` are process-wide and `cargo test` runs in parallel by
