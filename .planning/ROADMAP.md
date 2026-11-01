@@ -522,7 +522,7 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 5/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+**Plans:** 7/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
 plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
 runs in wave 19
 
@@ -539,8 +539,8 @@ runs in wave 19
 
 **Wave 3**
 
-- [ ] 50.1-06-PLAN.md *(depends on 50.1-01, 50.1-04, 50.1-05)* — gate ids, keyed answers, observed-id writers, quarantine, claim, close (V-15 core, V-16, V-18)
-- [ ] 50.1-07-PLAN.md *(depends on 50.1-05, 50.1-02, 50.1-04)* — launch reservation through `spawn_monitor` and `__monitor --liveness-fd`
+- [x] 50.1-06-PLAN.md *(depends on 50.1-01, 50.1-04, 50.1-05)* — gate ids, keyed answers, observed-id writers, quarantine, claim, close (V-15 core, V-16, V-18)
+- [x] 50.1-07-PLAN.md *(depends on 50.1-05, 50.1-02, 50.1-04)* — launch reservation through `spawn_monitor` and `__monitor --liveness-fd`
 
 **Wave 4**
 
@@ -802,7 +802,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
-| 50.1 | 5/30 | In Progress | — |
+| 50.1 | 7/30 | In Progress | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -1030,6 +1030,17 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.171: `agent_running` Can Report a Just-Reaped Process as Running (BACKLOG)
+
+**Found:** 2026-11-01, Phase 50.1 plan 50.1-06, full core test run.
+
+**Defect:** `agents::opencode::tests::spawn_with_timeout_kills_a_descendant_after_its_parent_exits` failed in 1 of 3 full
+core runs at `06c39fe` and 0 of 60 run alone; the base commit was not measured. Likely cause: `running_per_status` treats
+`ESRCH`, from a status read after the reap, as still running. The two ingredients were measured; the sequence is
+inferred, not traced. Whether this also explains 999.151 was not checked.
+
+**Fix shape (not tested):** treat `ESRCH` as gone in `running_per_status`. Detail in Phase 50.1's `deferred-items.md`.
 
 ### Phase 999.151: `probe_rejects_a_setpgid_pipe_holder_before_parent_exit` Fails Intermittently in the Full Suite (BACKLOG)
 
