@@ -2335,7 +2335,19 @@ pub(crate) fn resume(
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
     crate::commands::refuse_resume_over_a_live_run(project_root, phase)?;
-    let mut state = workflow::load_state(project_root, phase)?;
+    let state = workflow::load_state(project_root, phase)?;
+    resume_loaded(project_root, phase, state, agent, legacy_claude_launch)
+}
+
+/// [`resume`] after its lock, its live-run refusal and its load: `state` is the copy
+/// it loaded, which may already be behind the file.
+fn resume_loaded(
+    project_root: &Path,
+    phase: PhaseId,
+    mut state: State,
+    agent: Option<AgentKind>,
+    legacy_claude_launch: bool,
+) -> Result<(), CliError> {
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
@@ -10306,5 +10318,117 @@ mod tests {
             Some(NEXT_STOPPED_BEFORE_SAVE_REASON),
             "publish_record's own stop is written"
         );
+    }
+
+    /// CR-03 and WR-10's successor: a hand-run `advance` whose environment names a
+    /// notify command persists it where it reads it, so it survives an advance that
+    /// fails before any later write. With the variable unset nothing is written at
+    /// all: the file is the same inode with the same bytes, since every write
+    /// replaces it by rename.
+    #[test]
+    fn advance_commits_a_changed_notify_command_where_it_sets_it() {
+        use std::os::unix::fs::MetadataExt;
+        const NAME: &str =
+            "pipeline_launch::tests::advance_commits_a_changed_notify_command_where_it_sets_it";
+        const PERSISTED: &str = ": persisted";
+        const EXPORTED: &str = ": exported";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            for env in [
+                vec![(
+                    devflow_core::gates::GATE_NOTIFY_CMD_ENV,
+                    std::ffi::OsStr::new(EXPORTED),
+                )],
+                vec![],
+            ] {
+                let output =
+                    crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2404);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_notify_cmd = Some(PERSISTED.to_string());
+        workflow::save_state(&state).unwrap();
+        let path = workflow::state_path(root, phase);
+        let bytes_before = std::fs::read(&path).unwrap();
+        let inode_before = std::fs::metadata(&path).unwrap().ino();
+
+        let err = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(1))
+            .expect_err("the stage mismatch fails the advance before any later write");
+        assert!(err.to_string().contains("stage mismatch"), "{err}");
+
+        if std::env::var_os(devflow_core::gates::GATE_NOTIFY_CMD_ENV).is_some() {
+            assert_eq!(
+                workflow::load_state(root, phase)
+                    .unwrap()
+                    .gate_notify_cmd
+                    .as_deref(),
+                Some(EXPORTED),
+                "the exported command is on disk despite the failed advance"
+            );
+        } else {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode_before,
+                "no write happens when the command did not change"
+            );
+        }
+    }
+
+    /// `resume` clears the stop and keeps a field another writer changed after it
+    /// loaded its copy.
+    #[test]
+    fn resume_commits_its_unstop_and_keeps_a_concurrent_field() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_commits_its_unstop_and_keeps_a_concurrent_field";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(2405);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        // The capture shape: no delivery canary.
+        state.legacy_claude_launch = true;
+        state.stopped = true;
+        state.stop_reason = Some("stopped after code completed (--until code)".to_string());
+        state.stop_until = Some(Stage::Code);
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.yes_ship = false;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        let result = resume_loaded(root, phase, state, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(!after.yes_ship, "the revoke survives the resume");
+        assert!(!after.stopped);
+        assert_eq!(after.stop_reason, None);
+        assert_eq!(after.stop_until, None);
+        assert!(after.supervisor.is_some(), "the resume launched the stage");
     }
 }
