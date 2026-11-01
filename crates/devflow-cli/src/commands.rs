@@ -27,8 +27,8 @@ use devflow_core::agents;
 use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{
-    GateAction, GateError, GateFile, GateId, GateResponse, Gates, OpenGate, WaiterStatus,
-    is_gate_id,
+    AnswerRead, GateAction, GateError, GateFile, GateId, GateResponse, Gates, OpenGate,
+    WaiterStatus, is_gate_id,
 };
 use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
@@ -1686,6 +1686,36 @@ fn gate_changed_message(phase: PhaseId, stage: Stage, observed: &str, current: &
     )
 }
 
+/// What a writer that listed a gate may do with that listing.
+enum ListedGate {
+    /// The gate file still names this id: it may answer it.
+    Current(GateId),
+    /// The listing has no valid id (a gate file from before gate ids): no answer
+    /// can bind to it.
+    NoValidId,
+    /// The gate file no longer names the listed id, or cannot be read.
+    Changed,
+}
+
+/// Compare a listed gate with the gate file, before any liveness read (see
+/// [`require_gate_file_names`] for why).
+fn classify_listed_gate(project_root: &Path, gate: &OpenGate) -> ListedGate {
+    let Ok(listed) = GateId::parse(&gate.gate_id) else {
+        return ListedGate::NoValidId;
+    };
+    match gate_file_id(project_root, gate.phase, gate.stage) {
+        Ok(Some(current)) if current == listed.as_str() => ListedGate::Current(listed),
+        Ok(_) => ListedGate::Changed,
+        Err(error) => {
+            eprintln!(
+                "warning: could not read phase {} {}'s gate file: {error}",
+                gate.phase, gate.stage
+            );
+            ListedGate::Changed
+        }
+    }
+}
+
 /// The liveness half of [`gate_respond`]. Ship's stored-response exception is for
 /// no waiter of any kind (T-48-16-03): a recycled pid is an unrelated process, not
 /// manual-recovery territory.
@@ -1829,7 +1859,7 @@ fn response_pickup_message(stage: Stage, status: lock::HolderStatus) -> &'static
 
 /// Answer or report every aged, unattended gate across every registered root
 /// (or a single `root`, when given) — the acting half of 23b's bound gate
-/// lifetime. Never signals any process; `Gates::reap` (structurally
+/// lifetime. Never signals any process; `Gates::reap_answer` (structurally
 /// incapable of approving, T-23-41) is the ONLY write path, so the sweep's
 /// sole effect on the world is written bytes a live poller was already
 /// watching for.
@@ -1837,8 +1867,8 @@ fn response_pickup_message(stage: Stage, status: lock::HolderStatus) -> &'static
 /// `GateError::NoOpenGate`/`AlreadyResponded` are treated as benign races —
 /// a human or `--yes-ship` may have answered the same gate between
 /// `list_open` and `reap` — and counted as skipped rather than returned as
-/// an error; `Gates::respond`'s own refusal to clobber an unconsumed
-/// response is the first-writer-wins resolution that makes this safe with
+/// an error; `Gates::reap_answer`'s own refusal to clobber an unconsumed
+/// answer is the first-writer-wins resolution that makes this safe with
 /// no new coordination code. Every successful reap emits `gate_reaped` in
 /// this process (the audit trail half — `run_gate_with_timeout`'s own
 /// `gate_resolved` fires independently in the target process when it picks
@@ -2029,7 +2059,8 @@ enum SweepStep {
     LeftAlone,
 }
 
-/// The sweep's per-gate step.
+/// The sweep's per-gate step, for the gate as it was listed: compare its id with
+/// the gate file, read its waiter, then answer that id and no other.
 fn sweep_one_gate(
     project_root: &Path,
     gate: &OpenGate,
@@ -2037,62 +2068,69 @@ fn sweep_one_gate(
     threshold: u64,
     dry_run: bool,
 ) -> SweepStep {
-    let holder = lock::holder_status(project_root, gate.phase);
-    if !gate_sweep_may_reap(
-        gate.stage,
-        matches!(holder, lock::HolderStatus::Live { .. }),
-    ) {
+    let at = project_root.display();
+    let (phase, stage) = (gate.phase, gate.stage);
+    let observed = match classify_listed_gate(project_root, gate) {
+        ListedGate::Current(observed) => observed,
+        ListedGate::NoValidId => {
+            println!(
+                "skipped phase {phase} {stage} at {at} — its gate file has no valid gate id; not reaped"
+            );
+            return SweepStep::Skipped;
+        }
+        ListedGate::Changed => {
+            println!(
+                "skipped phase {phase} {stage} at {at} — gate changed since it was listed; not reaped"
+            );
+            return SweepStep::Skipped;
+        }
+    };
+    let waiter_live = waiter_is_live(project_root, phase, stage, &observed);
+    if !gate_sweep_may_reap(stage, waiter_live) {
         println!(
-            "left phase {} {} alone at {} — no confirmed waiter; {}",
-            gate.phase,
-            gate.stage,
-            project_root.display(),
-            no_waiter_repair(gate.phase, gate.stage)
+            "left phase {phase} {stage} alone at {at} — no confirmed waiter; {}",
+            no_waiter_repair(phase, stage)
         );
         return SweepStep::LeftAlone;
     }
     if dry_run {
-        println!(
-            "would reap phase {} {} (age {age}s) at {}",
-            gate.phase,
-            gate.stage,
-            project_root.display()
-        );
+        println!("would reap phase {phase} {stage} (age {age}s) at {at}");
         return SweepStep::Reaped;
     }
-    match Gates::reap(
+    match Gates::reap_answer(
         project_root,
-        gate.phase,
-        gate.stage,
+        phase,
+        stage,
+        &observed,
         "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
         "devflow-reap",
     ) {
         Ok(_) => {
             events::emit(
                 project_root,
-                gate.phase,
+                phase,
                 "gate_reaped",
                 serde_json::json!({
-                    "stage": gate.stage.to_string(),
+                    "stage": stage.to_string(),
                     "age_secs": age,
                     "max_age_secs": threshold,
                 }),
             );
-            println!(
-                "reaped phase {} {} (age {age}s) at {}",
-                gate.phase,
-                gate.stage,
-                project_root.display()
-            );
+            println!("reaped phase {phase} {stage} (age {age}s) at {at}");
             SweepStep::Reaped
         }
-        Err(err) => {
+        Err(err @ GateError::GateIdMismatch { .. }) => {
             println!(
-                "skipped phase {} {} at {} — already answered ({err})",
-                gate.phase,
-                gate.stage,
-                project_root.display()
+                "skipped phase {phase} {stage} at {at} — gate changed since it was listed; not reaped ({err})"
             );
+            SweepStep::Skipped
+        }
+        Err(err @ (GateError::AlreadyResponded { .. } | GateError::NoOpenGate { .. })) => {
+            println!("skipped phase {phase} {stage} at {at} — already answered ({err})");
+            SweepStep::Skipped
+        }
+        Err(err) => {
+            println!("skipped phase {phase} {stage} at {at} — {err}");
             SweepStep::Skipped
         }
     }
@@ -2909,7 +2947,7 @@ fn run_backstop(
 /// Returns `Ok(true)` when a gate was found and handled — either reaped
 /// here, or discovered already answered by a race — telling the caller not
 /// to fall through to [`stop_via_lock`]. Returns `Ok(false)` when there is
-/// no open gate for `phase` at all, including the race where `Gates::reap`
+/// no open gate for `phase` at all, including the race where `Gates::reap_answer`
 /// reports `NoOpenGate` after this function's own `Gates::list_open` scan
 /// found one; that is the signal to fall through, not an error (cross-AI
 /// review 23-10).
@@ -2926,12 +2964,32 @@ fn stop_via_gate(
     stop_reap_observed_gate(project_root, phase, &gate)
 }
 
-/// [`stop_via_gate`]'s reap of the gate it listed.
+/// [`stop_via_gate`]'s reap of the gate as it was listed: compare its id with the
+/// gate file, read its waiter, then answer that id and no other. A gate it cannot
+/// answer falls through to the socket path.
 fn stop_reap_observed_gate(
     project_root: &Path,
     phase: PhaseId,
     gate: &OpenGate,
 ) -> Result<(bool, Option<AnsweredGate>), CliError> {
+    let observed = match classify_listed_gate(project_root, gate) {
+        ListedGate::Current(observed) => observed,
+        ListedGate::NoValidId => {
+            println!(
+                "stop: phase {phase} {} has a gate file with no valid gate id; no response was written. {}",
+                gate.stage,
+                no_waiter_repair(phase, gate.stage)
+            );
+            return Ok((false, None));
+        }
+        ListedGate::Changed => {
+            println!(
+                "stop: phase {phase} {} gate changed since it was listed; not reaped",
+                gate.stage
+            );
+            return Ok((false, None));
+        }
+    };
     let holder_before_reap = lock::holder_status(project_root, phase);
     let holder_identity_before_reap = lock::holder_identity(project_root, phase);
     let gate_is_current = workflow::load_state(project_root, phase)
@@ -2944,9 +3002,12 @@ fn stop_reap_observed_gate(
         );
         return Ok((false, None));
     }
+    let waiter_live = waiter_is_live(project_root, phase, gate.stage, &observed);
+    // Ship's stored-response exception is for no waiter of any kind: a recycled or
+    // unconfirmable lock record is not the no-holder case (T-48-16-03).
     let ship_without_holder =
         gate.stage == Stage::Ship && matches!(holder_before_reap, lock::HolderStatus::NoHolder);
-    if !matches!(holder_before_reap, lock::HolderStatus::Live { .. }) && !ship_without_holder {
+    if !waiter_live && !ship_without_holder {
         println!(
             "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
@@ -2957,19 +3018,21 @@ fn stop_reap_observed_gate(
             Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
         ));
     }
-    match Gates::reap(
+    match Gates::reap_answer(
         project_root,
         phase,
         gate.stage,
+        &observed,
         "abort: stopped by `devflow stop`",
         "devflow-stop",
     ) {
         Ok(path) => {
+            let waiter = waiter_holder_status(project_root, phase, gate.stage, &observed);
             println!(
                 "stop: wrote a rejection for phase {phase} {} at {} — {}",
                 gate.stage,
                 path.display(),
-                response_pickup_message(gate.stage, lock::holder_status(project_root, phase))
+                response_pickup_message(gate.stage, waiter)
             );
             Ok((
                 true,
@@ -2980,12 +3043,12 @@ fn stop_reap_observed_gate(
         // between our scan and this reap. Read its action: an approval or
         // loop-back is not `stop`'s outcome and must fall through to the
         // lock path; only an abort response can be treated as the requested
-        // stop action, and only with a still-live holder.
+        // stop action, and only with a still-live waiter.
         Err(GateError::AlreadyResponded { .. }) => stop_with_existing_response(
             project_root,
             phase,
             gate.stage,
-            &GateId::parse(&gate.gate_id)?,
+            &observed,
             holder_before_reap,
             holder_identity_before_reap,
         ),
@@ -2993,39 +3056,52 @@ fn stop_reap_observed_gate(
             false,
             Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
         )),
+        // The gate this stop observed is gone or replaced: the stop itself still has
+        // to happen, through the socket path.
+        Err(err @ GateError::GateIdMismatch { .. }) => {
+            println!("stop: gate changed since it was listed; not reaped ({err})");
+            Ok((false, None))
+        }
+        Err(err @ GateError::GateClosedAfterPublish { .. }) => {
+            println!("stop: {err}");
+            Ok((false, None))
+        }
         Err(err) => Err(err.into()),
     }
 }
 
-/// Classify a response which appeared after `stop_via_gate` saw an open gate.
+/// Classify an answer which appeared after `stop_via_gate` saw an open gate.
 /// An approval or loop-back is not attributable to `stop`, so that path must
 /// fall through to the lock holder. An abort can be the requested action only
-/// while the original holder is still confirmed live.
+/// while a waiter is confirmed live. `holder_before_reap` only rides along in the
+/// [`AnsweredGate`] until 50.1-20.
 fn stop_with_existing_response(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
-    _observed: &GateId,
+    observed: &GateId,
     holder_before_reap: lock::HolderStatus,
     holder_identity_before_reap: Option<(u32, Option<u64>)>,
 ) -> Result<(bool, Option<AnsweredGate>), CliError> {
-    let response_path = Gates::response_path(project_root, phase, stage);
-    let response_text = std::fs::read_to_string(&response_path).map_err(|err| {
-        CliError::Message(format!(
-            "stop: phase {phase} {stage} already has an unreadable response at {}: {err}",
-            response_path.display()
-        ))
-    })?;
-    let response: GateResponse = serde_json::from_str(&response_text).map_err(|err| {
-        CliError::Message(format!(
-            "stop: phase {phase} {stage} already has an unreadable response at {}: {err}",
-            response_path.display()
-        ))
-    })?;
-    match GateAction::from_response(&response) {
-        GateAction::Abort(_) if matches!(holder_before_reap, lock::HolderStatus::Live { .. }) => {
+    let answer = match Gates::read_answer(project_root, phase, stage, observed) {
+        AnswerRead::Bound(answer) => answer,
+        AnswerRead::Unbound(reason) => {
             println!(
-                "stop: phase {phase} {stage} already has an abort response awaiting a live lock holder; stop did not write it"
+                "stop: phase {phase} {stage} has an answer that will be set aside ({reason}); stop did not write it"
+            );
+            return Ok((false, None));
+        }
+        AnswerRead::None => {
+            println!(
+                "stop: phase {phase} {stage}'s answer is gone, so its gate was decided; stop did not write it"
+            );
+            return Ok((false, None));
+        }
+    };
+    match GateAction::from_response(&answer.response) {
+        GateAction::Abort(_) if waiter_is_live(project_root, phase, stage, observed) => {
+            println!(
+                "stop: phase {phase} {stage} already has an abort response awaiting a live waiter; stop did not write it"
             );
             Ok((
                 true,
@@ -6142,7 +6218,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
-    use devflow_core::gates::{AnswerRead, GateFile, WaiterRegistration};
+    use devflow_core::gates::WaiterRegistration;
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
 
     #[test]
