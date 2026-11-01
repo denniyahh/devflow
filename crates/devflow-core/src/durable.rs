@@ -526,4 +526,71 @@ mod tests {
             "the new name, then the removed one"
         );
     }
+
+    /// The file mutations D-09 reserves for this module.
+    const DURABLE_BYPASS_OPS: [&str; 4] = ["fs::write(", "rename(", "hard_link(", "remove_file("];
+
+    /// The numbered lines of `source` before its test module, whole-line comments
+    /// dropped. A trailing comment stays part of its code line.
+    fn non_test_code_lines(source: &str) -> Vec<(usize, &str)> {
+        source
+            .lines()
+            .enumerate()
+            .take_while(|(_, line)| *line != "mod tests {")
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .map(|(index, line)| (index + 1, line))
+            .collect()
+    }
+
+    fn durable_bypass_violations(file: &str, source: &str) -> Vec<String> {
+        let mut violations = Vec::new();
+        for (number, line) in non_test_code_lines(source) {
+            for op in DURABLE_BYPASS_OPS {
+                if line.contains(op) {
+                    violations.push(format!("{file}: line {number}: {op}"));
+                }
+            }
+        }
+        violations
+    }
+
+    /// D-09, criterion 3. The scope is exactly `workflow.rs` and `gates.rs`, D-09's
+    /// state and gate modules. `durable.rs` is excluded because it is where the
+    /// four operations live.
+    ///
+    /// Not established: this is a text scan, so a renamed import
+    /// (`use std::fs as f; f::write(`) or an `OpenOptions` write is not seen. The
+    /// `.gitignore` marker in `ensure_devflow_dir` is such a write, by design.
+    #[test]
+    fn state_and_gate_modules_mutate_files_only_through_the_durable_helpers() {
+        let workflow = durable_bypass_violations("workflow.rs", include_str!("workflow.rs"));
+        assert!(workflow.is_empty(), "direct mutations: {workflow:?}");
+        let gates = durable_bypass_violations("gates.rs", include_str!("gates.rs"));
+        assert!(gates.is_empty(), "direct mutations: {gates:?}");
+
+        let scan = |source: &str| durable_bypass_violations("planted.rs", source);
+        assert_eq!(
+            scan("fn sneaky() {\n    std::fs::rename(a, b).unwrap();\n}\n"),
+            ["planted.rs: line 2: rename("]
+        );
+        assert_eq!(
+            scan("let _ = std::fs::remove_file(p); // cleanup\n"),
+            ["planted.rs: line 1: remove_file("],
+            "a trailing comment is part of its code line"
+        );
+        assert_eq!(
+            scan("    // std::fs::write(p, b)\n"),
+            Vec::<String>::new(),
+            "a whole-line comment is not code"
+        );
+        assert_eq!(
+            scan("mod tests {\n    std::fs::hard_link(a, b).unwrap();\n}\n"),
+            Vec::<String>::new(),
+            "test code is out of scope"
+        );
+        assert_eq!(
+            scan("std::fs::write(p, b).unwrap();\n"),
+            ["planted.rs: line 1: fs::write("]
+        );
+    }
 }
