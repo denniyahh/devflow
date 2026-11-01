@@ -5039,6 +5039,66 @@ mod tests {
         );
     }
 
+    /// A Validate launch's dispatch stamp reaches disk with its first commit, and only
+    /// its fields do: a revoke another writer made since the caller loaded is kept.
+    #[test]
+    fn a_validate_launch_commits_its_dispatch_stamp() {
+        const NAME: &str = "pipeline_launch::tests::a_validate_launch_commits_its_dispatch_stamp";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(93);
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-stamp", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+            "verdict: pass\n",
+        )
+        .unwrap();
+        let observed = (
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            devflow_core::agent_result::phase_verification_mtime_nanos(&worktree, phase),
+        );
+        assert!(
+            observed.0.is_some(),
+            "premise: the artifact has a fingerprint"
+        );
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Validate;
+        state.worktree_path = Some(worktree);
+        // The capture shape: no delivery canary.
+        state.legacy_claude_launch = true;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.yes_ship = false;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        let result = launch_stage_inner(&mut state, None, None);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        result.unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.verification_run_nonce, Some(1));
+        assert_eq!(after.last_verification_fingerprint, observed.0);
+        assert_eq!(after.last_verification_mtime_nanos, observed.1);
+        assert!(after.verification_baseline_captured);
+        assert!(!after.yes_ship, "the concurrent revoke is kept");
+    }
+
     // ---- D-15 delivery-canary gate (31-03) ------------------------------
     //
     // Every case below except the last drives the gate with an INJECTED
