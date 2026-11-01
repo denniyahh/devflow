@@ -672,7 +672,6 @@ fn drain_signal_pipe(fd: libc::c_int) -> Vec<i32> {
 /// How long the control thread first waits after a persistent `accept` error.
 const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
 /// The longest the control thread waits between `accept` attempts.
-#[allow(dead_code)]
 const ACCEPT_BACKOFF_CAP: Duration = Duration::from_secs(1);
 
 /// How the control thread accepts a connection: `UnixListener::accept`, or a
@@ -740,14 +739,29 @@ impl Control {
     }
 
     /// Serve every pending connection.
+    ///
+    /// A persistent `accept` error (EMFILE) leaves the listener readable, so
+    /// [`run`](Self::run)'s `poll` would wake again at once and spin a core.
+    /// The error is logged and this thread sleeps the current backoff before
+    /// returning, doubling it from [`ACCEPT_BACKOFF_START`] up to
+    /// [`ACCEPT_BACKOFF_CAP`]; a successful accept resets it. Only this
+    /// thread sleeps, and it serves only pings, stop requests and the quit
+    /// flag, so during such an error each of those waits at most the cap.
     fn accept_all(&self, parked: &mut Vec<UnixStream>) {
         loop {
             match (self.accept)(&self.listener) {
-                Ok((stream, _)) => self.serve_connection(stream, parked),
+                Ok((stream, _)) => {
+                    self.accept_backoff.set(ACCEPT_BACKOFF_START);
+                    self.serve_connection(stream, parked);
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    log_accept_error(&error, self.accept_backoff.get());
+                    let backoff = self.accept_backoff.get();
+                    log_accept_error(&error, backoff);
+                    std::thread::sleep(backoff);
+                    self.accept_backoff
+                        .set((backoff * 2).min(ACCEPT_BACKOFF_CAP));
                     return;
                 }
             }
