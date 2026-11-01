@@ -6339,6 +6339,210 @@ exit 0
         crate::test_support::assert_child_ran_exactly_one_passing_test(&output, test_name);
     }
 
+    // ---- 50.1-07: a reservation through spawn_monitor --------------------
+
+    /// The re-exec entry [`spawn_reserved_sleeper`] names.
+    const RESERVED_ENTRY: &str = "monitor::tests::supervise_the_monitor_argv";
+
+    /// `spawn_monitor`'s re-exec target in this crate, which has no `__monitor`
+    /// subcommand: supervise the capture shape from the argv it was given.
+    /// Returns at once without that argv, so an `--include-ignored` run is
+    /// harmless.
+    #[test]
+    #[ignore = "re-exec entry of the reservation tests; returns at once without its argv"]
+    fn supervise_the_monitor_argv() {
+        let Some(encoded) = std::env::var_os(MONITOR_ARGV_ENV) else {
+            return;
+        };
+        let argv: Vec<String> =
+            serde_json::from_str(encoded.to_str().expect("a UTF-8 argv")).expect("a JSON argv");
+        let value_after = |flag: &str| {
+            let at = argv.iter().position(|arg| arg == flag);
+            argv[at.unwrap_or_else(|| panic!("no {flag}: {argv:?}")) + 1].clone()
+        };
+        let separator = argv.iter().position(|arg| arg == "--").expect("a `--`");
+        let (program, args) = argv[separator + 1..].split_first().expect("a program");
+        let socket = SocketPath::new(PathBuf::from(value_after("--socket"))).expect("the socket");
+        let mut spec = StageSpec::new(
+            PathBuf::from(value_after("--project")),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            program.clone(),
+            StageIo::Capture,
+            socket,
+            value_after("--launch-id"),
+        );
+        spec.args = args.to_vec();
+        spec.stage = Some(Stage::Code);
+        spec.liveness_fd = Some(value_after("--liveness-fd").parse().expect("a descriptor"));
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        run.supervisor.finish();
+    }
+
+    /// Reserve a launch and spawn its supervisor over `sh -c 'exec sleep 300'`.
+    fn spawn_reserved_sleeper(fixture: &StageFixture) -> (Reservation, Published) {
+        let state = State::new(
+            STAGE_PHASE,
+            AgentKind::Codex,
+            Mode::Supervise,
+            fixture.root.clone(),
+        );
+        let ctx = LaunchContext::new(
+            fixture.cache.path().to_path_buf(),
+            MonitorExec::HarnessEntry {
+                exe: std::env::current_exe().expect("current_exe for the re-exec entry"),
+                test_name: RESERVED_ENTRY.to_string(),
+            },
+        );
+        let reservation = Reservation::new(&ctx, &state).expect("reserve the launch");
+        let published = spawn_monitor(
+            &state,
+            "/bin/sh",
+            &["-c".to_string(), "exec sleep 300".to_string()],
+            &[],
+            MonitorLaunch::Legacy,
+            &ctx,
+            &reservation,
+        )
+        .expect("the supervisor publishes");
+        (reservation, published)
+    }
+
+    /// The supervisor `spawn_monitor` left as this process's unreaped child,
+    /// known only by the pid it recorded. Killed and reaped on every exit path.
+    struct RecordedSupervisor {
+        pid: libc::pid_t,
+        reaped: bool,
+    }
+
+    impl RecordedSupervisor {
+        fn of(pid: u32) -> Self {
+            let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+            assert!(pid > 1, "refusing to own pid {pid}");
+            Self { pid, reaped: false }
+        }
+
+        /// Whether it has exited and been reaped within `within`.
+        fn reaped_within(&mut self, within: Duration) -> bool {
+            self.reaped = self.reaped
+                || stage_wait_until(within, || {
+                    // SAFETY: `pid > 1` names this process's own unreaped child,
+                    // and a null status pointer is allowed.
+                    let reaped =
+                        unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+                    reaped == self.pid
+                });
+            self.reaped
+        }
+
+        fn kill_and_reap(&mut self) {
+            // SAFETY: `pid > 1` names this process's own child, unreaped, so
+            // the pid cannot have been recycled.
+            assert_eq!(unsafe { libc::kill(self.pid, libc::SIGKILL) }, 0);
+            assert!(
+                self.reaped_within(Duration::from_secs(5)),
+                "SIGKILL must end the supervisor"
+            );
+        }
+    }
+
+    impl Drop for RecordedSupervisor {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // SAFETY: as in `kill_and_reap`.
+                unsafe { libc::kill(self.pid, libc::SIGKILL) };
+                let _ = self.reaped_within(Duration::from_secs(5));
+            }
+        }
+    }
+
+    /// The reservation's liveness is the supervisor's, never the agent's. An
+    /// agent that inherited the descriptor would keep the lock after its
+    /// supervisor died, so the probe would stay `Live` here and block every later
+    /// launch: that is this test's failing direction.
+    /// `liveness::tests::adopting_the_inherited_descriptor_marks_it_close_on_exec_and_records_the_adopter`
+    /// pins the mechanism.
+    #[test]
+    fn a_killed_supervisor_leaves_its_reservation_abandoned_while_its_agent_runs() {
+        use crate::liveness::{Held, live_holder, probe};
+        let fixture = StageFixture::new();
+        let (reservation, published) = spawn_reserved_sleeper(&fixture);
+        let mut supervisor = RecordedSupervisor::of(published.supervisor_pid);
+        let agent_pgid = published.record.agent_pgid;
+        let agent = LeaderGroup::of(agent_pgid);
+        let path = reservation.liveness_path().to_path_buf();
+
+        drop(reservation);
+        assert_eq!(probe(&path).expect("probe"), Held::Live);
+        let holder = live_holder(&path).expect("read the holder");
+        assert_eq!(holder.map(|(pid, _)| pid), Some(published.supervisor_pid));
+
+        supervisor.kill_and_reap();
+        let abandoned = stage_wait_until(Duration::from_secs(2), || {
+            probe(&path).expect("probe") == Held::Abandoned
+        });
+        assert!(
+            abandoned,
+            "a dead supervisor's reservation must read abandoned, reads {:?}",
+            probe(&path)
+        );
+        assert!(
+            crate::test_support::process_is_live(agent_pgid),
+            "the agent must outlive its supervisor here, or this proved nothing about it"
+        );
+
+        drop(agent);
+        assert!(
+            group_gone_within(agent_pgid, Duration::from_secs(5)),
+            "the agent group must end: {:?}",
+            crate::test_support::live_group_members(agent_pgid)
+        );
+    }
+
+    /// The launch id has to exist before the spawn, so that the launch can be
+    /// recorded first (D-01): `spawn_monitor` uses the reservation's, never its own.
+    #[test]
+    fn spawn_monitor_uses_the_reservations_launch_id_and_socket() {
+        let fixture = StageFixture::new();
+        let (reservation, published) = spawn_reserved_sleeper(&fixture);
+        let mut supervisor = RecordedSupervisor::of(published.supervisor_pid);
+        let agent_pgid = published.record.agent_pgid;
+        let _agent = LeaderGroup::of(agent_pgid);
+
+        assert_eq!(published.record.launch_id, reservation.launch_id());
+        assert_eq!(published.record.socket_path, reservation.socket_path());
+        assert_eq!(
+            reservation.pending_record(),
+            crate::state::PendingSupervisor::new(
+                published.record.launch_id.clone(),
+                published.record.socket_path.clone(),
+                crate::liveness::launch_liveness_path(&fixture.root, &published.record.launch_id)
+                    .expect("a launch id"),
+            ),
+            "the pending record names the launch that was spawned"
+        );
+
+        let stopped = crate::supervisor::request_shutdown(
+            &published.record.socket_path,
+            Duration::from_secs(10),
+        )
+        .expect("request the stop");
+        assert!(
+            matches!(stopped, crate::supervisor::ShutdownOutcome::Stopped { .. }),
+            "the supervisor stops: {stopped:?}"
+        );
+        assert!(
+            supervisor.reaped_within(Duration::from_secs(5)),
+            "the supervisor exits after its stop"
+        );
+        assert!(
+            group_gone_within(agent_pgid, Duration::from_secs(5)),
+            "the agent group must end: {:?}",
+            crate::test_support::live_group_members(agent_pgid)
+        );
+    }
+
     // ---- 50-24: run_supervised_stage before it publishes ----------------
 
     /// The cache dir the publish-wait child entry builds its socket under.
