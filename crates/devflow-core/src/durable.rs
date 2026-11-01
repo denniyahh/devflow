@@ -346,6 +346,23 @@ mod tests {
     }
 
     #[test]
+    fn a_replace_whose_rename_fails_removes_its_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("target.json");
+        std::fs::create_dir(&occupied).unwrap();
+
+        replace_durably(&occupied, b"one").unwrap_err();
+
+        assert!(occupied.is_dir(), "the target is untouched");
+        assert_eq!(entry_names(dir.path()), ["target.json"], "no temp remains");
+        let synced = take_synced();
+        assert!(
+            !synced.iter().any(|entry| matches!(entry, Synced::Dir(_))),
+            "no directory fsync for a rename that never happened: {synced:?}"
+        );
+    }
+
+    #[test]
     fn exclusive_publish_never_replaces_and_fsyncs_the_directory() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("response.json");
