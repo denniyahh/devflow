@@ -1253,7 +1253,8 @@ pub(crate) fn test_hold(point: &str) {
 /// for this `point`, append a line to `<path>.held` and wait (bounded by
 /// [`TEST_HOLD_WAIT`]) until `<path>` exists. One line per arrival, so a test can
 /// count the launchers that reached it. Points: `guarded`, after the live-run guard
-/// inside the reservation's write-lock closure, and `reserved`, after that write.
+/// inside the reservation's write-lock closure; `reserved`, after that write; and
+/// `before_publish_save`, once the supervisor has answered its ping.
 /// Compiled out of non-test builds, together with every call.
 #[cfg(test)]
 pub(crate) fn launch_test_hold(point: &str) {
@@ -1902,6 +1903,8 @@ fn spawn_agent_and_record(
     // between the two always finds a live address.
     #[cfg(test)]
     test_hold("before_record_save");
+    #[cfg(test)]
+    launch_test_hold("before_publish_save");
     let record = published.record.clone();
     match publish_record(state, published, save_publish_fields)? {
         PublishOutcome::HandedOff => record_successor(record),

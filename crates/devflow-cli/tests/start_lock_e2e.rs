@@ -1,9 +1,9 @@
-//! End-to-end coverage for `start`'s per-phase writer lock.
+//! End-to-end coverage for `start`'s launch reservation.
 //!
-//! These tests deliberately hold the lock from the test process, then drive
-//! the compiled CLI as a separate process. That makes the refusal observable
-//! at the same boundary an operator uses, rather than coupling the test to
-//! `commands::start`'s implementation details.
+//! These tests deliberately hold a reservation's liveness lock from the test
+//! process, then drive the compiled CLI as a separate process. That makes the
+//! refusal observable at the same boundary an operator uses, rather than coupling
+//! the test to `commands::start`'s implementation details.
 //!
 //! Every `devflow` child runs through `common::hermetic_devflow`, so its
 //! registry entries land in a tempdir `HOME`, never the operator's real
@@ -15,7 +15,7 @@ use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::{AgentKind, PendingSupervisor, State};
 use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
 use devflow_core::test_support::gate_answer_files;
 use std::fs;
@@ -82,15 +82,30 @@ fn child(
 }
 
 #[test]
-fn start_refuses_while_another_process_holds_the_phase_lock() {
+fn start_refuses_while_another_launcher_holds_the_phases_reservation() {
+    const LAUNCH_ID: &str = "aaaa0000aaaa0090";
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let phase = PhaseId::new(90);
     init_repo(root, phase);
     let fake_bin = common::fake_bin_dir("exit 0");
-    let holder = devflow_core::lock::acquire(root, phase).expect("test holds phase lock");
-    let holder_pid = std::process::id();
+    let liveness_path = devflow_core::liveness::launch_liveness_path(root, LAUNCH_ID).unwrap();
+    fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+    let holder = devflow_core::liveness::Hold::take(&liveness_path).expect("test holds the lock");
+    let mut reserved = State::new(
+        phase,
+        AgentKind::Claude,
+        Mode::Supervise,
+        root.to_path_buf(),
+    );
+    reserved.pending_supervisor = Some(PendingSupervisor::new(
+        LAUNCH_ID.to_string(),
+        root.join(".devflow/never-published.sock"),
+        liveness_path,
+    ));
+    devflow_core::workflow::save_state(&reserved).unwrap();
+    let state_before = fs::read(devflow_core::workflow::state_path(root, phase)).unwrap();
     let worktrees_before = devflow_core::test_support::git_command(root)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -103,22 +118,28 @@ fn start_refuses_while_another_process_holds_the_phase_lock() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "start must refuse a held lock\nstdout: {}\nstderr: {stderr}",
+        "start must refuse a held reservation\nstdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&output.stdout)
     );
+    for expected in [
+        format!("devflow stop --phase {phase}"),
+        LAUNCH_ID.to_string(),
+    ] {
+        assert!(stderr.contains(&expected), "missing {expected:?}: {stderr}");
+    }
     assert!(
-        stderr.contains(&phase.to_string()),
-        "stderr must name phase: {stderr}"
+        !stderr.contains("devflow resume"),
+        "no resume hint while the reservation's lock is held: {stderr}"
     );
-    assert!(
-        stderr.contains(&holder_pid.to_string()),
-        "stderr must name holder pid {holder_pid}: {stderr}"
-    );
-    assert!(
-        !root
-            .join(format!(".devflow/state-{}.json", phase.padded()))
-            .exists(),
+    assert_eq!(
+        fs::read(devflow_core::workflow::state_path(root, phase)).unwrap(),
+        state_before,
         "a refused start must not write phase state"
+    );
+    assert_eq!(
+        liveness_files(root),
+        vec![format!("supervisor-{LAUNCH_ID}.live")],
+        "a refused start must leave no liveness file of its own"
     );
     let worktrees = devflow_core::test_support::git_command(root)
         .args(["worktree", "list", "--porcelain"])
@@ -142,7 +163,7 @@ fn start_refuses_while_another_process_holds_the_phase_lock() {
 }
 
 #[test]
-fn start_proceeds_when_no_process_holds_the_phase_lock() {
+fn start_proceeds_when_no_reservation_is_held() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
@@ -169,10 +190,15 @@ fn start_proceeds_when_no_process_holds_the_phase_lock() {
                 .contains("\"workflow_started\""),
         "an uncontended start must write state or its workflow_started event"
     );
+    assert_eq!(
+        pending_launch(root, phase),
+        None,
+        "a finished start leaves no reservation"
+    );
 }
 
 #[test]
-fn start_clears_leftover_gate_files_after_taking_the_lock() {
+fn start_clears_leftover_gate_files_after_reserving() {
     let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
@@ -460,6 +486,28 @@ fn phase_file_snapshot(root: &Path, phase: PhaseId) -> Vec<(PathBuf, Vec<u8>)> {
         .collect()
 }
 
+/// The launch id the phase's state names as pending, if its state loads.
+fn pending_launch(root: &Path, phase: PhaseId) -> Option<String> {
+    devflow_core::workflow::load_state(root, phase)
+        .ok()?
+        .pending_supervisor
+        .map(|pending| pending.launch_id)
+}
+
+/// The names of the liveness files under `root`'s `.devflow/`.
+fn liveness_files(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.join(".devflow"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("supervisor-") && name.ends_with(".live"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 fn snapshot_paths(snapshot: &[(PathBuf, Vec<u8>)]) -> Vec<&Path> {
     snapshot.iter().map(|(path, _)| path.as_path()).collect()
 }
@@ -557,6 +605,7 @@ fn assert_start_refuses_live_run(
     refusal: &str,
 ) {
     let fake_bin = common::fake_bin_dir("exit 0");
+    let liveness_before = liveness_files(root);
     let before = phase_file_snapshot(root, phase);
     // Negative control on the snapshot itself: it must cover the planted
     // state and both planted gate files, or byte-identity would prove nothing.
@@ -622,11 +671,15 @@ fn assert_start_refuses_live_run(
         snapshot_paths(&before),
         snapshot_paths(&after)
     );
-    let lock = root.join(format!(".devflow/lock-{}", phase.padded()));
-    assert!(
-        !lock.exists(),
-        "a refused start must not leave {}",
-        lock.display()
+    assert_eq!(
+        pending_launch(root, phase),
+        None,
+        "a refused start must leave no reservation"
+    );
+    assert_eq!(
+        liveness_files(root),
+        liveness_before,
+        "a refused start must leave no liveness file of its own"
     );
     assert_eq!(
         phase_branches(root, phase),
@@ -896,6 +949,7 @@ fn assert_resume_refuses_live_run(
     fake_bin: &common::FakeBin,
     case: &RefusalCase,
 ) {
+    let liveness_before = liveness_files(root);
     let before = phase_file_snapshot(root, phase);
     for required in &case.required {
         assert!(
@@ -918,7 +972,6 @@ fn assert_resume_refuses_live_run(
         case.refusal
     );
 
-    let padded = phase.padded();
     let common = [
         "refusing to resume; nothing was written".to_string(),
         format!(
@@ -952,9 +1005,15 @@ fn assert_resume_refuses_live_run(
         after, before,
         "a refused resume must leave phase files byte-identical"
     );
-    assert!(
-        !root.join(format!(".devflow/lock-{padded}")).exists(),
-        "a refused resume must not leave a phase lock"
+    assert_eq!(
+        pending_launch(root, phase),
+        None,
+        "a refused resume must leave no reservation"
+    );
+    assert_eq!(
+        liveness_files(root),
+        liveness_before,
+        "a refused resume must leave no liveness file of its own"
     );
     assert_eq!(
         stage_launched_count(root),

@@ -3,13 +3,14 @@
 //!
 //! The file pins both drivers:
 //! - the `start_*` arms cover criterion 4's shape: a foreground `devflow
-//!   start` parked at its Define preflight gate holds lock-NN itself;
+//!   start` parked at its Define preflight gate holds no lock-NN. It is that
+//!   gate's registered waiter, and it holds its launch reservation;
 //! - the `advance_*` arms cover a foreground `devflow advance` parked at a
 //!   Code gate.
 
 mod common;
 
-use devflow_core::gates::Gates;
+use devflow_core::gates::{GateFile, GateId, Gates, WaiterStatus};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -433,6 +434,41 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     );
 }
 
+/// The id of the phase's parked Define gate.
+fn define_gate_id(root: &Path, phase: PhaseId) -> GateId {
+    let gate =
+        fs::read(Gates::gate_path(root, phase, Stage::Define)).expect("read the Define gate");
+    let gate: GateFile = serde_json::from_slice(&gate).expect("parse the Define gate");
+    GateId::parse(&gate.gate_id).expect("the Define gate has a gate id")
+}
+
+/// The parked start is the Define gate's registered waiter, at once: every gate
+/// wait registers before it publishes, so `gate reject` will find it. The
+/// reservation is asserted beside that, never instead of it: it predates the gate.
+fn assert_parked_start_is_the_define_gates_waiter(root: &Path, phase: PhaseId, start_pid: u32) {
+    let gate_id = define_gate_id(root, phase);
+    assert_eq!(
+        Gates::waiter_status(root, phase, Stage::Define, &gate_id).unwrap(),
+        WaiterStatus::Live,
+        "the parked start must be registered on its Define gate"
+    );
+    assert!(
+        Gates::live_waiter_holders(root)
+            .iter()
+            .any(|(pid, _)| *pid == start_pid),
+        "the Define gate's waiter must be the parked start, pid {start_pid}"
+    );
+    let pending = devflow_core::workflow::load_state(root, phase)
+        .unwrap()
+        .pending_supervisor
+        .expect("the parked start holds its reservation");
+    assert_eq!(
+        devflow_core::liveness::probe(&pending.liveness_path).unwrap(),
+        devflow_core::liveness::Held::Live,
+        "the parked start holds its reservation's lock"
+    );
+}
+
 #[test]
 fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     let home = common::HermeticHome::new();
@@ -443,11 +479,8 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     let fake_bin = fake_bin_dir("sleep 60");
     let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "30");
 
-    assert_eq!(
-        devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
-        Some(start.0.id()),
-        "the parked start must hold its own phase lock"
-    );
+    assert_parked_start_is_the_define_gates_waiter(root, phase, start.0.id());
+    let gate_id = define_gate_id(root, phase);
 
     start.0.kill().expect("kill foreground start");
     start.0.wait().expect("reap foreground start");
@@ -506,13 +539,26 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     ));
     fs::write(&state_temp, b"orphaned state write").unwrap();
     fs::write(&gate_temp, b"orphaned gate write").unwrap();
-    for precondition in [&state_temp, &gate_temp, &state_path, &lock_path] {
+    let waiter_path = Gates::waiter_path(root, phase, Stage::Define, &gate_id);
+    for precondition in [&state_temp, &gate_temp, &state_path, &waiter_path] {
         assert!(
             precondition.exists(),
             "precondition: {} must exist before recovery, or its removal proves nothing",
             precondition.display()
         );
     }
+    assert_eq!(
+        Gates::waiter_status(root, phase, Stage::Define, &gate_id).unwrap(),
+        WaiterStatus::Absent,
+        "precondition: the killed start's registration must be unheld"
+    );
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .pending_supervisor
+            .is_some(),
+        "precondition: the killed start must leave its reservation in the state"
+    );
 
     let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
@@ -559,11 +605,7 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
     let fake_bin = fake_bin_dir("sleep 60");
     let mut start = spawn_parked_start(&home, root, phase, &fake_bin, "60");
 
-    assert_eq!(
-        devflow_core::lock::holder_identity(root, phase).map(|(pid, _)| pid),
-        Some(start.0.id()),
-        "the parked start must hold its own phase lock"
-    );
+    assert_parked_start_is_the_define_gates_waiter(root, phase, start.0.id());
 
     let before = Instant::now();
     let output = reject_define(&home, root, phase);
