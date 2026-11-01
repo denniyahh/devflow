@@ -38,6 +38,20 @@ pub enum WorkflowError {
     MissingState(PathBuf),
 }
 
+/// What [`update_state_with`] found on disk, read under the write lock.
+// Passed by value to one closure and consumed there, so its size costs one move;
+// a `Box<State>` would only make every caller unbox what it is about to edit.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum Existing {
+    /// No state file exists for the phase.
+    Missing,
+    /// The state file exists but does not read or parse.
+    Unloadable(WorkflowError),
+    /// The state as it is on disk now.
+    Loaded(State),
+}
+
 /// Filename prefix shared by every per-phase state file. Owned here so
 /// listing/migration never hardcode the naming scheme.
 const STATE_FILE_PREFIX: &str = "state-";
@@ -243,6 +257,46 @@ pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, Workflow
     }
     let contents = std::fs::read_to_string(&path)?;
     Ok(serde_json::from_str(&contents)?)
+}
+
+/// Read the state and hand it to `apply`.
+pub fn update_state_with<T, E: From<WorkflowError>>(
+    project_root: &Path,
+    phase: PhaseId,
+    apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
+) -> Result<T, E> {
+    let existing = match load_state(project_root, phase) {
+        Ok(state) => Existing::Loaded(state),
+        Err(WorkflowError::MissingState(_)) => Existing::Missing,
+        Err(error) => Existing::Unloadable(error),
+    };
+    let (_next, value) = apply(existing)?;
+    Ok(value)
+}
+
+/// Apply `apply` to the state on disk, returning the committed state.
+pub fn update_state<T, E: From<WorkflowError>>(
+    project_root: &Path,
+    phase: PhaseId,
+    apply: impl FnOnce(&mut State) -> Result<T, E>,
+) -> Result<(State, T), E> {
+    update_state_with(project_root, phase, |existing| {
+        let mut state = match existing {
+            Existing::Loaded(state) => state,
+            Existing::Missing => {
+                return Err(WorkflowError::MissingState(state_path(project_root, phase)).into());
+            }
+            Existing::Unloadable(error) => return Err(error.into()),
+        };
+        let value = apply(&mut state)?;
+        Ok((Some(state.clone()), (state, value)))
+    })
+}
+
+/// Whether the phase's state write lock is free.
+#[cfg(any(test, feature = "test-support"))]
+pub fn write_lock_is_free(_project_root: &Path, _phase: PhaseId) -> bool {
+    true
 }
 
 /// Enumerate every active phase state, sorted by phase number.
@@ -525,6 +579,118 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = stage;
         state
+    }
+
+    /// Wait out a fork in another test thread: between its fork and its exec a
+    /// child holds a duplicate of every descriptor, so `cargo test`'s threads can
+    /// keep a just-released `flock` busy for a moment. A real leak outlasts this.
+    fn wait_for_free_write_lock(root: &Path, phase: PhaseId) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !write_lock_is_free(root, phase) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// One of `update_state`'s callers, changing one field.
+    fn update_field(root: &Path, phase: PhaseId, set: impl FnOnce(&mut State)) {
+        update_state(root, phase, |state| {
+            set(state);
+            Ok::<(), WorkflowError>(())
+        })
+        .expect("update_state");
+    }
+
+    #[test]
+    fn update_state_rereads_so_a_write_made_between_loads_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(50);
+        save_state(&state_in(dir.path(), phase, Stage::Code)).unwrap();
+
+        update_field(dir.path(), phase, |state| state.stopped = true);
+        update_field(dir.path(), phase, |state| state.gate_pending = true);
+
+        let both = load_state(dir.path(), phase).unwrap();
+        assert!(both.stopped, "the other writer's change must survive");
+        assert!(both.gate_pending, "this writer's change must land");
+
+        // The lost update this API removes: a copy loaded before the other
+        // writer's change, saved whole after it.
+        save_state(&state_in(dir.path(), phase, Stage::Code)).unwrap();
+        let mut stale_copy = load_state(dir.path(), phase).unwrap();
+        update_field(dir.path(), phase, |state| state.stopped = true);
+        stale_copy.gate_pending = true;
+        save_state(&stale_copy).unwrap();
+        assert!(
+            !load_state(dir.path(), phase).unwrap().stopped,
+            "control: saving the older copy must lose the other writer's change"
+        );
+    }
+
+    #[test]
+    fn a_second_writer_waits_for_the_first_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(50);
+        save_state(&state_in(root, phase, Stage::Code)).unwrap();
+        let log = std::sync::Mutex::new(Vec::new());
+        let (entered, first_is_inside) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                update_field(root, phase, |_| {
+                    log.lock().unwrap().push("first start");
+                    entered.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    log.lock().unwrap().push("first end");
+                });
+            });
+            first_is_inside.recv().unwrap();
+            update_field(root, phase, |_| {
+                log.lock().unwrap().push("second start");
+            });
+        });
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["first start", "first end", "second start"]
+        );
+    }
+
+    #[test]
+    fn the_write_lock_is_held_only_inside_the_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(50);
+        save_state(&state_in(dir.path(), phase, Stage::Code)).unwrap();
+
+        update_field(dir.path(), phase, |_| {
+            assert!(
+                !write_lock_is_free(dir.path(), phase),
+                "the lock must be held inside the closure"
+            );
+        });
+
+        assert!(
+            wait_for_free_write_lock(dir.path(), phase),
+            "the lock must be released once update_state returns"
+        );
+    }
+
+    #[test]
+    fn update_state_on_a_missing_state_is_missing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(50);
+
+        let error = update_state(dir.path(), phase, |_| Ok::<(), WorkflowError>(())).unwrap_err();
+
+        assert!(
+            matches!(&error, WorkflowError::MissingState(path) if *path == state_path(dir.path(), phase)),
+            "got {error}"
+        );
+        assert!(!state_path(dir.path(), phase).exists());
     }
 
     #[test]
