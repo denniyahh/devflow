@@ -103,6 +103,15 @@ impl GateAction {
 }
 
 /// Errors produced by the gate protocol.
+///
+/// Whether a file was published matters to a caller deciding what to do next.
+/// Nothing was published on [`GateError::GateLockTimeout`],
+/// [`GateError::GateIdMismatch`], [`GateError::NoOpenGate`] and
+/// [`GateError::AlreadyResponded`]. A file was on
+/// [`GateError::GateClosedAfterPublish`] (it was then set aside) and on
+/// [`GateError::PublishedUnconfirmed`] (it was left in place). [`GateError::Io`]
+/// and [`GateError::Json`] say neither: from `answer` they can come from either
+/// side of the publish.
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
     /// Filesystem operation failed.
@@ -120,7 +129,52 @@ pub enum GateError {
     /// A gate id that does not have a gate id's format.
     #[error("`{0}` is not a gate id: expected 16 lowercase hex digits")]
     InvalidGateId(String),
+    /// The caller observed a gate that is no longer the one open at this stage.
+    #[error(
+        "phase {phase} stage {stage} is at gate {current}, not gate {observed} — see `devflow gate list`"
+    )]
+    GateIdMismatch {
+        phase: PhaseId,
+        stage: Stage,
+        observed: String,
+        current: String,
+    },
+    /// The answer was published for a gate that closed while it was being written.
+    /// It cannot answer the next gate. It was set aside, unless that gate's waiter
+    /// consumed it before the re-check ran.
+    #[error(
+        "the answer for gate {observed} at phase {phase} stage {stage} was published after that gate closed, and it was set aside unless its waiter had already consumed it"
+    )]
+    GateClosedAfterPublish {
+        phase: PhaseId,
+        stage: Stage,
+        observed: String,
+    },
+    /// The gate lock stayed held for the whole bounded wait. Returned only before
+    /// anything is published.
+    #[error(
+        "phase {phase}'s gate lock `.devflow/.gates-{padded}.lock` is still held after {waited:?}; nothing was changed", padded = phase.padded()
+    )]
+    GateLockTimeout { phase: PhaseId, waited: Duration },
+    /// The answer was published, but the re-check after it could not take the gate
+    /// lock, so whether its gate was still open is not known. The file stays where
+    /// it is: `GateLockTimeout`'s "nothing was changed" would be false here.
+    #[error(
+        "the answer for gate {observed} at phase {phase}'s {stage} gate was published and left in place, but the gate lock `.devflow/.gates-{padded}.lock` was still held after {waited:?}, so whether that gate was still open could not be confirmed; its waiter acts on it if the gate is still open — run `devflow gate list`", padded = phase.padded()
+    )]
+    PublishedUnconfirmed {
+        phase: PhaseId,
+        stage: Stage,
+        observed: String,
+        waited: Duration,
+    },
 }
+
+/// How long a gate operation waits for the phase's gate lock before giving up.
+/// It sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a fenced side
+/// effect stuck behind a stopped gate-lock holder releases the state write lock
+/// before a repair verb's bounded wait gives up.
+pub const GATE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// A gate's identity: 16 lowercase hex digits, fresh for every gate opened and
 /// never reused. Holding one means the id was checked, so it is safe in a path.
@@ -285,6 +339,29 @@ impl Gates {
         observed: &GateId,
         response: &GateResponse,
     ) -> Result<PathBuf, GateError> {
+        Self::answer_with_hook(project_root, phase, stage, observed, response, || {})
+    }
+
+    /// RED scaffold: moves nothing.
+    pub fn set_aside_unbound(
+        _project_root: &Path,
+        _phase: PhaseId,
+        _stage: Stage,
+        _gate: &GateId,
+    ) -> Result<Option<PathBuf>, GateError> {
+        Ok(None)
+    }
+
+    /// RED scaffold: no id check, no re-check.
+    fn answer_with_hook(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        response: &GateResponse,
+        before_publish: impl FnOnce(),
+    ) -> Result<PathBuf, GateError> {
+        before_publish();
         if !Self::gate_path(project_root, phase, stage).exists() {
             return Err(GateError::NoOpenGate { phase, stage });
         }
@@ -740,6 +817,42 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
         ),
         Err(err) => warn!("gate notify hook could not be spawned: {err}"),
     }
+}
+
+/// A file moved out of the way instead of being consumed or deleted.
+#[expect(dead_code, reason = "RED scaffold")]
+#[derive(Debug)]
+pub(crate) struct Quarantined {
+    from: PathBuf,
+    to: PathBuf,
+    label: String,
+    reason: &'static str,
+}
+
+/// RED scaffold: a replacing rename under a counter private to this process.
+#[cfg_attr(not(test), expect(dead_code, reason = "RED scaffold"))]
+fn set_aside(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    from: &Path,
+    label: &str,
+    reason: &'static str,
+    secs: u64,
+) -> std::io::Result<Quarantined> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let to = Gates::dir(project_root).join(format!(
+        "{padded}-{stage}.{label}.{secs}.{seq}.quarantined.json",
+        padded = phase.padded()
+    ));
+    crate::durable::rename_durably(from, &to)?;
+    Ok(Quarantined {
+        from: from.to_path_buf(),
+        to,
+        label: label.to_string(),
+        reason,
+    })
 }
 
 /// An answer body that is not JSON, or lacks what an answer needs.
@@ -1413,6 +1526,44 @@ mod tests {
         }
     }
 
+    /// The events named `name` in the project's event log, in order.
+    fn events_named(root: &Path, name: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(crate::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    /// Every quarantine file under `root`, sorted by name.
+    fn quarantine_files(root: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(Gates::dir(root))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().ends_with(".quarantined.json"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Hold the phase's gate lock through a descriptor of the test's own, as
+    /// another process would.
+    fn hold_gate_lock(root: &Path, phase: PhaseId) -> std::fs::File {
+        let path = root
+            .join(".devflow")
+            .join(format!(".gates-{}.lock", phase.padded()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        file.lock().unwrap();
+        file
+    }
+
     fn read_gate(root: &Path, phase: PhaseId, stage: Stage) -> GateFile {
         serde_json::from_str(
             &std::fs::read_to_string(Gates::gate_path(root, phase, stage)).unwrap(),
@@ -1499,6 +1650,473 @@ mod tests {
         assert_eq!(
             Gates::poll_response(dir.path(), phase, stage, 1),
             Some(approved())
+        );
+    }
+
+    /// V-15, both halves: an id-less answer is set aside under a name of its own,
+    /// byte for byte, and a valid answer to the live gate is then accepted.
+    #[test]
+    fn an_answer_without_a_gate_id_is_quarantined_and_a_valid_one_is_then_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        let body = "{\"approved\": true}";
+        std::fs::write(&slot, body).unwrap();
+        assert!(matches!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::Unbound(_)
+        ));
+
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate).unwrap();
+
+        let moved = moved.expect("an id-less answer must be set aside");
+        let name = moved.file_name().unwrap().to_string_lossy().into_owned();
+        let fields: Vec<&str> = name
+            .strip_prefix("07-code.noid.")
+            .and_then(|rest| rest.strip_suffix(".quarantined.json"))
+            .unwrap_or_else(|| panic!("not a noid quarantine name: {name}"))
+            .split('.')
+            .collect();
+        assert_eq!(fields.len(), 3, "secs, pid and seq: {name}");
+        assert_eq!(fields[1], std::process::id().to_string(), "{name}");
+        assert!(!slot.exists());
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), body);
+        let events = events_named(dir.path(), "gate_answer_quarantined");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["reason"], "missing_gate_id");
+
+        Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
+        assert!(matches!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::Bound(_)
+        ));
+    }
+
+    /// D-05, the writer's half: a refused answer never blocks a valid one, and a
+    /// bound answer is never moved: the first answer wins.
+    #[test]
+    fn answer_sets_aside_an_unbound_answer_in_its_own_slot_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        let id_less = "{\"approved\": false}";
+        std::fs::write(&slot, id_less).unwrap();
+
+        let answered = Gates::answer(dir.path(), phase, stage, &gate, &approved());
+
+        assert!(answered.is_ok(), "{answered:?}");
+        let quarantined = quarantine_files(dir.path());
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(std::fs::read_to_string(&quarantined[0]).unwrap(), id_less);
+        assert_eq!(
+            events_named(dir.path(), "gate_answer_quarantined")[0]["reason"],
+            "missing_gate_id"
+        );
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::Bound(GateAnswer {
+                gate_id: gate.to_string(),
+                response: approved(),
+            })
+        );
+
+        let bound = std::fs::read(&slot).unwrap();
+        let rejection = GateResponse {
+            approved: false,
+            note: Some("second answer".into()),
+            responded_by: None,
+        };
+        let second = Gates::answer(dir.path(), phase, stage, &gate, &rejection);
+        assert!(
+            matches!(second, Err(GateError::AlreadyResponded { .. })),
+            "{second:?}"
+        );
+        assert_eq!(std::fs::read(&slot).unwrap(), bound);
+        assert_eq!(quarantine_files(dir.path()).len(), 1);
+    }
+
+    /// R-09: setting an answer aside touches the given gate's slot and nothing else.
+    #[test]
+    fn an_answer_for_another_gate_id_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let old = GateId::new();
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        let wrong_body = serde_json::to_string(&GateAnswer {
+            gate_id: old.to_string(),
+            response: approved(),
+        })
+        .unwrap();
+        std::fs::write(&slot, &wrong_body).unwrap();
+        let old_slot = Gates::answer_path(dir.path(), phase, stage, &old);
+        std::fs::write(&old_slot, &wrong_body).unwrap();
+        let legacy = Gates::response_path(dir.path(), phase, stage);
+        std::fs::write(&legacy, "{\"approved\":true}").unwrap();
+
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate).unwrap();
+
+        let moved = moved.expect("an answer naming another gate must be set aside");
+        let name = moved.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(&format!("07-code.{old}.")), "{name}");
+        assert!(!slot.exists());
+        let events = events_named(dir.path(), "gate_answer_quarantined");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["reason"], "other_gate");
+        assert_eq!(events[0]["gate_id"], old.as_str());
+        assert_eq!(std::fs::read_to_string(&old_slot).unwrap(), wrong_body);
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "{\"approved\":true}"
+        );
+
+        let refused = Gates::set_aside_unbound(dir.path(), phase, stage, &old);
+        assert!(
+            matches!(&refused, Err(GateError::GateIdMismatch { observed, current, .. })
+                if observed == old.as_str() && current == gate.as_str()),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&old_slot).unwrap(), wrong_body);
+        assert_eq!(quarantine_files(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn answer_refuses_a_gate_id_the_gate_file_does_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let old = GateId::new();
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+
+        let refused = Gates::answer(dir.path(), phase, stage, &old, &approved());
+
+        assert!(
+            matches!(&refused, Err(GateError::GateIdMismatch { observed, current, .. })
+                if observed == old.as_str() && current == gate.as_str()),
+            "{refused:?}"
+        );
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &old).exists());
+
+        let no_gate = Gates::answer(dir.path(), phase, Stage::Validate, &old, &approved());
+        assert!(
+            matches!(no_gate, Err(GateError::NoOpenGate { .. })),
+            "{no_gate:?}"
+        );
+        let no_gates_dir = tempfile::tempdir().unwrap();
+        let no_dir = Gates::answer(no_gates_dir.path(), phase, stage, &old, &approved());
+        assert!(
+            matches!(no_dir, Err(GateError::NoOpenGate { .. })),
+            "{no_dir:?}"
+        );
+    }
+
+    /// V-18 (AR-48-04 path b): a writer past its pre-check while the gate closes and
+    /// the next opens cannot decide the next gate.
+    #[test]
+    fn a_late_respond_after_cleanup_cannot_decide_the_next_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+            .unwrap()
+            .gate_id;
+        let mut next = None;
+
+        let late = Gates::answer_with_hook(dir.path(), phase, stage, &first, &approved(), || {
+            next = Some(
+                Gates::open_gate(dir.path(), phase, stage, "next")
+                    .unwrap()
+                    .gate_id,
+            );
+        });
+
+        assert!(
+            matches!(&late, Err(GateError::GateClosedAfterPublish { observed, .. })
+                if observed == first.as_str()),
+            "{late:?}"
+        );
+        let quarantined = quarantine_files(dir.path());
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        let name = quarantined[0].file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(&format!("07-code.{first}.")), "{name}");
+        assert_eq!(
+            events_named(dir.path(), "gate_answer_quarantined")[0]["reason"],
+            "gate_closed"
+        );
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &first).exists());
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &next.unwrap()),
+            AnswerRead::None
+        );
+    }
+
+    /// T-50.1-20: an id in a body is untrusted, so no path is built from one that
+    /// fails `is_gate_id`.
+    #[test]
+    fn a_hostile_gate_id_in_an_answer_is_quarantined_as_noid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &gate),
+            "{\"gate_id\": \"../../x\", \"approved\": true}",
+        )
+        .unwrap();
+
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate).unwrap();
+
+        let moved = moved.expect("a hostile id must be set aside");
+        assert_eq!(moved.parent().unwrap(), Gates::dir(dir.path()));
+        let name = moved.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("07-code.noid."), "{name}");
+        let at_root: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(at_root, [".devflow"], "nothing outside .devflow");
+        assert!(!dir.path().join(".devflow").join("x").exists());
+    }
+
+    /// R-11: a counter private to each process would give two fresh processes the
+    /// same quarantine name in one second, and the second would overwrite the first.
+    #[test]
+    fn two_processes_quarantining_in_one_second_keep_both_answers() {
+        const NAME: &str =
+            "gates::tests::two_processes_quarantining_in_one_second_keep_both_answers";
+        const ONE_SECOND: u64 = 1_700_000_000;
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        if crate::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os("QUARANTINE_CHILD_ROOT").unwrap());
+            let legacy = Gates::response_path(&root, phase, stage);
+            set_aside(
+                &root,
+                phase,
+                stage,
+                &legacy,
+                "noid",
+                "legacy_unkeyed",
+                ONE_SECOND,
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = Gates::response_path(dir.path(), phase, stage);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let run_child = || {
+            let output = crate::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("QUARANTINE_CHILD_ROOT", dir.path().as_os_str())],
+            );
+            crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        };
+
+        std::fs::write(&legacy, "first").unwrap();
+        run_child();
+        std::fs::write(&legacy, "second").unwrap();
+        run_child();
+
+        let files = quarantine_files(dir.path());
+        let mut bodies: Vec<String> = files
+            .iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .collect();
+        bodies.sort();
+        assert_eq!(bodies, ["first", "second"], "{files:?}");
+        for file in &files {
+            let name = file.file_name().unwrap().to_string_lossy();
+            let fields = name
+                .strip_prefix(&format!("07-code.noid.{ONE_SECOND}."))
+                .and_then(|rest| rest.strip_suffix(".quarantined.json"))
+                .unwrap_or_else(|| panic!("not a quarantine name: {name}"));
+            assert_eq!(fields.split('.').count(), 2, "pid and seq: {name}");
+        }
+    }
+
+    /// T-50.1-118: a stopped gate-lock holder cannot hang a gate operation.
+    #[test]
+    fn a_gate_operation_gives_up_on_a_held_gate_lock_after_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        std::fs::write(&slot, "{\"approved\": true}").unwrap();
+        let holder = hold_gate_lock(dir.path(), phase);
+
+        let started = std::time::Instant::now();
+        let timed_out = Gates::set_aside_unbound(dir.path(), phase, stage, &gate);
+        let took = started.elapsed();
+
+        assert!(
+            matches!(timed_out, Err(GateError::GateLockTimeout { .. })),
+            "{timed_out:?}"
+        );
+        assert!(took >= GATE_LOCK_WAIT, "gave up after {took:?}");
+        assert!(
+            took < GATE_LOCK_WAIT + Duration::from_secs(2),
+            "waited {took:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&slot).unwrap(),
+            "{\"approved\": true}"
+        );
+
+        drop(holder);
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate).unwrap();
+        assert!(moved.is_some(), "the control: a free lock moves the body");
+        assert!(!slot.exists());
+    }
+
+    /// R2-04: after the publish, "nothing was changed" would be false.
+    #[test]
+    fn an_answer_whose_recheck_cannot_take_the_gate_lock_is_published_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let mut parked = None;
+
+        let started = std::time::Instant::now();
+        let unconfirmed =
+            Gates::answer_with_hook(dir.path(), phase, stage, &gate, &approved(), || {
+                parked = Some(hold_gate_lock(dir.path(), phase));
+            });
+        let took = started.elapsed();
+
+        let error = unconfirmed.unwrap_err();
+        assert!(
+            matches!(&error, GateError::PublishedUnconfirmed { observed, .. }
+                if observed == gate.as_str()),
+            "{error:?}"
+        );
+        assert!(took >= GATE_LOCK_WAIT, "gave up after {took:?}");
+        assert!(
+            took < GATE_LOCK_WAIT + Duration::from_secs(2),
+            "waited {took:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("published"), "{message}");
+        assert!(message.contains(gate.as_str()), "{message}");
+        assert!(!message.contains("nothing was changed"), "{message}");
+        assert!(Gates::answer_path(dir.path(), phase, stage, &gate).exists());
+        assert!(quarantine_files(dir.path()).is_empty());
+        drop(parked);
+        assert!(matches!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::Bound(answer) if answer.response == approved()
+        ));
+
+        // The control: held before the call, the writer publishes nothing and says so.
+        let other = Stage::Validate;
+        let second = Gates::open_gate(dir.path(), phase, other, "ctx")
+            .unwrap()
+            .gate_id;
+        let holder = hold_gate_lock(dir.path(), phase);
+        let error = Gates::answer(dir.path(), phase, other, &second, &approved()).unwrap_err();
+        assert!(
+            matches!(error, GateError::GateLockTimeout { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("nothing was changed"), "{error}");
+        assert!(!Gates::answer_path(dir.path(), phase, other, &second).exists());
+        drop(holder);
+    }
+
+    /// D-08 operator ruling (2026-10-26): the bound stays below the repair verbs'.
+    #[test]
+    fn the_gate_lock_wait_stays_below_the_write_lock_repair_wait() {
+        let repair = crate::workflow::WRITE_LOCK_REPAIR_WAIT;
+        assert!(
+            GATE_LOCK_WAIT < repair,
+            "GATE_LOCK_WAIT {GATE_LOCK_WAIT:?} must stay below WRITE_LOCK_REPAIR_WAIT {repair:?}"
+        );
+    }
+
+    /// The `workflow` items `gates.rs` may name, none of which takes the state write
+    /// lock.
+    const LOCK_FREE_WORKFLOW_ITEMS: &[&str] = &[
+        // Creates a directory and its marker file.
+        "ensure_devflow_dir",
+        // A constant: the gate lock's poll interval.
+        "WRITE_LOCK_POLL",
+    ];
+
+    /// Every `workflow` path in `source`'s non-test, non-comment lines that is not
+    /// on [`LOCK_FREE_WORKFLOW_ITEMS`]; a glob, a brace import or a rename counts,
+    /// since what it brings in cannot be read off the line.
+    fn state_lock_paths(source: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        for line in source.lines().take_while(|line| *line != "mod tests {") {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains("workflow as") {
+                paths.push(line.trim().to_string());
+            }
+            for (at, _) in line.match_indices("workflow::") {
+                let rest = &line[at + "workflow::".len()..];
+                let end = rest
+                    .find(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                    .unwrap_or(rest.len());
+                if !LOCK_FREE_WORKFLOW_ITEMS.contains(&&rest[..end]) {
+                    paths.push(line[at..].trim().to_string());
+                }
+            }
+        }
+        paths
+    }
+
+    /// D-08 operator ruling (2026-10-26): the order is always write lock, then gate
+    /// lock, so nothing holding the gate lock may take the write lock.
+    ///
+    /// Limit: this sees only `workflow::` paths written in `gates.rs`'s own text. A
+    /// call into a helper outside `workflow` (or a re-export under another name) that
+    /// itself takes the state write lock passes this scan; that case rests on review
+    /// of each gate-lock holder's body, which stays file operations only.
+    #[test]
+    fn gates_never_takes_the_state_write_lock() {
+        let source = include_str!("gates.rs");
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "the scan stops at this file's test module"
+        );
+        assert_eq!(state_lock_paths(source), Vec::<String>::new());
+
+        assert_eq!(
+            state_lock_paths("crate::workflow::update_state(root, phase, |s| Ok(s))\n").len(),
+            1
+        );
+        assert_eq!(
+            state_lock_paths("use crate::workflow::update_owned_state;\n").len(),
+            1
+        );
+        assert_eq!(state_lock_paths("use crate::workflow::{a, b};\n").len(), 1);
+        assert_eq!(state_lock_paths("use crate::workflow::*;\n").len(), 1);
+        assert_eq!(state_lock_paths("use crate::workflow as w;\n").len(), 1);
+        assert_eq!(
+            state_lock_paths("    // crate::workflow::update_state(root)\n").len(),
+            0,
+            "a whole-line comment is not code"
+        );
+        assert_eq!(
+            state_lock_paths("mod tests {\ncrate::workflow::update_state(root)\n").len(),
+            0,
+            "test code is out of scope"
         );
     }
 }
