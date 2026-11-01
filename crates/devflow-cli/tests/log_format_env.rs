@@ -5,11 +5,12 @@
 //! (`crates/devflow-cli/src/main.rs`) by building an `EnvFilter` from
 //! `RUST_LOG` on both branches.
 //!
-//! This test drives `devflow status` against a project whose only state is
-//! a legacy `.devflow/state.json`. `workflow::migrate_legacy_state` emits a
-//! `debug!("migrated legacy state.json to ...")` line as a side effect of
-//! that migration, giving a real DEBUG-level log line to assert on — not
-//! just "the binary didn't crash".
+//! This test drives `devflow recover --clean --phase 1` against a project
+//! holding `.devflow/state-01.json`. Before it deletes anything, the command
+//! loads the phase's state to refuse a live supervisor, and `workflow::load_state`
+//! emits `debug!("loading state from ...")`, giving a real DEBUG-level log line to
+//! assert on — not just "the binary didn't crash". (`devflow status` reads through
+//! `list_states`, which logs nothing at DEBUG, so it cannot serve here.)
 //!
 //! Regression guard for CR-02 (15-REVIEW.md, third round): `lib.rs` documents
 //! that "log output goes to stderr so stdout remains available for agent
@@ -28,13 +29,16 @@ use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::path::PathBuf;
 
-/// Set up a project dir with a legacy `.devflow/state.json` (phase 1, no
-/// matching per-phase file), so `devflow status` triggers the migration's
-/// `debug!` log line unconditionally.
-fn project_with_legacy_state() -> tempfile::TempDir {
+/// The DEBUG line `workflow::load_state` emits for the fixture's phase.
+const DEBUG_LINE: &str = "loading state from";
+
+/// What `recover --clean --phase 1` prints once it has cleared the fixture's state,
+/// so a test can tell "the line was filtered" from "the command never got there".
+const CLEANED_LINE: &str = "cleaned up workflow state for phase 1";
+
+/// Set up a project dir holding the per-phase state file for phase 1.
+fn project_with_phase_state() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let devflow_dir = dir.path().join(".devflow");
-    std::fs::create_dir_all(&devflow_dir).expect("create .devflow dir");
 
     // `State` is `#[non_exhaustive]`, so a downstream crate (this one) builds it
     // via `State::new` and overrides only what this fixture actually depends on.
@@ -48,20 +52,19 @@ fn project_with_legacy_state() -> tempfile::TempDir {
     );
     state.stage = Stage::Code; // `new` starts at Define; this fixture needs Code
     state.started_at = "0".to_string(); // fixed, not `timestamp_now()`, so the fixture is deterministic
-    let json = serde_json::to_string_pretty(&state).expect("serialize legacy state");
-    std::fs::write(devflow_dir.join("state.json"), json).expect("write legacy state.json");
+    devflow_core::workflow::save_state(&state).expect("save the phase's state");
 
     dir
 }
 
-fn run_status(
+fn run_recover_clean(
     home: &common::HermeticHome,
     dir: &PathBuf,
     log_format: Option<&str>,
     rust_log: Option<&str>,
 ) -> (String, String) {
     let mut cmd = common::hermetic_devflow(home);
-    cmd.arg("status").arg(dir);
+    cmd.args(["recover", "--clean", "--phase", "1"]).arg(dir);
 
     // Start from a clean env so ambient RUST_LOG/DEVFLOW_LOG_FORMAT from the
     // test runner's shell can't leak in and mask the behavior under test.
@@ -78,7 +81,7 @@ fn run_status(
     // `.with_writer(std::io::stderr)` — CR-02 fix), separate from the CLI's
     // own `println!` output on stdout. Return both streams so callers can
     // assert log lines land on stderr and never leak onto stdout.
-    let output = cmd.output().expect("run devflow status");
+    let output = cmd.output().expect("run devflow recover --clean");
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -88,22 +91,26 @@ fn run_status(
 #[test]
 fn rust_log_debug_is_honored_under_json_log_format() {
     let home = common::HermeticHome::new();
-    let dir = project_with_legacy_state();
-    let (stdout, stderr) = run_status(
+    let dir = project_with_phase_state();
+    let (stdout, stderr) = run_recover_clean(
         &home,
         &dir.path().to_path_buf(),
         Some("json"),
         Some("debug"),
     );
 
+    let line = stderr.lines().find(|line| line.contains(DEBUG_LINE));
     assert!(
-        stderr.contains("migrated legacy state.json"),
+        line.is_some(),
         "with DEVFLOW_LOG_FORMAT=json and RUST_LOG=debug, expected a DEBUG-level \
          tracing log to reach stderr (proving RUST_LOG is consulted on the json \
          branch, per WR-01 / commit 8672172), but it did not appear.\nstderr:\n{stderr}"
     );
+    let record: serde_json::Value =
+        serde_json::from_str(line.unwrap()).expect("the log line must come from the json branch");
+    assert_eq!(record["level"], "DEBUG");
     assert!(
-        !stdout.contains("migrated legacy state.json"),
+        !stdout.contains(DEBUG_LINE),
         "log lines must not leak onto stdout (CR-02) — stdout is reserved for \
          agent output and structured results per lib.rs's documented contract.\n\
          stdout:\n{stdout}"
@@ -113,21 +120,25 @@ fn rust_log_debug_is_honored_under_json_log_format() {
 #[test]
 fn rust_log_default_suppresses_debug_under_json_log_format() {
     let home = common::HermeticHome::new();
-    let dir = project_with_legacy_state();
-    // No RUST_LOG set — tracing-subscriber's EnvFilter::from_default_env()
-    // defaults to ERROR-level-only when the env var is absent, so this DEBUG
-    // line must NOT appear. If it does, RUST_LOG is being ignored (i.e. a
-    // fixed, too-verbose level is hardcoded again), the exact WR-01 bug class.
-    let (stdout, stderr) = run_status(&home, &dir.path().to_path_buf(), Some("json"), None);
+    let dir = project_with_phase_state();
+    // No RUST_LOG set — main.rs falls back to INFO, so this DEBUG line must NOT
+    // appear. If it does, RUST_LOG is being ignored (i.e. a fixed, too-verbose
+    // level is hardcoded again), the exact WR-01 bug class.
+    let (stdout, stderr) = run_recover_clean(&home, &dir.path().to_path_buf(), Some("json"), None);
 
     assert!(
-        !stderr.contains("migrated legacy state.json"),
+        stdout.contains(CLEANED_LINE),
+        "the command must have gone through the load that logs the line, or its \
+         absence below proves nothing.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(DEBUG_LINE),
         "with DEVFLOW_LOG_FORMAT=json and RUST_LOG unset, no DEBUG-level log \
          should reach stderr, but one did — RUST_LOG is not being consulted.\n\
          stderr:\n{stderr}"
     );
     assert!(
-        !stdout.contains("migrated legacy state.json"),
+        !stdout.contains(DEBUG_LINE),
         "log lines must never leak onto stdout (CR-02), regardless of level.\n\
          stdout:\n{stdout}"
     );
