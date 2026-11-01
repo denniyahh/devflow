@@ -12781,6 +12781,338 @@ mod tests {
         assert_eq!(liveness_files(root), Vec::<String>::new());
     }
 
+    const AGENT_SPAWN_HOLD_ENV: &str = "DEVFLOW_TEST_AGENT_SPAWN_HOLD";
+    /// Carries a fixture's project root to its children. Not a DevFlow setting.
+    const RESERVE_ROOT_ENV: &str = "P50_1_16_ROOT";
+
+    /// `verb` as the second launcher in these tests runs it.
+    fn launch_for_test(root: &Path, phase: PhaseId, verb: LaunchVerb) -> Result<(), String> {
+        match verb {
+            LaunchVerb::Start => start_for_test(root, phase),
+            LaunchVerb::Resume => crate::pipeline_launch::resume(root, phase, None, true)
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    /// A supervisor held before its agent spawn, ended through its socket by
+    /// [`HeldSupervisor::end`] or, if an assertion fails first, on drop.
+    struct HeldSupervisor {
+        release: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl HeldSupervisor {
+        /// Release the hold, wait for the supervisor to publish and stop it through
+        /// its socket. Whether a supervisor confirmed a stop.
+        fn end(&self) -> bool {
+            let _ = std::fs::write(&self.release, "");
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while std::time::Instant::now() < deadline {
+                let alive: Vec<PathBuf> = supervisor::sweep_in(&self.cache)
+                    .into_iter()
+                    .filter(|entry| matches!(entry.liveness, Ok(supervisor::Liveness::Alive(_))))
+                    .map(|entry| entry.socket_path)
+                    .collect();
+                if !alive.is_empty() {
+                    return alive.iter().fold(true, |stopped, socket| {
+                        let outcome = supervisor::request_shutdown(socket, REACH_HOLD_WITHIN);
+                        stopped
+                            && matches!(outcome, Ok(supervisor::ShutdownOutcome::Stopped { .. }))
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        }
+    }
+
+    impl Drop for HeldSupervisor {
+        fn drop(&mut self) {
+            if !self.release.exists() {
+                self.end();
+            }
+        }
+    }
+
+    /// V-01: a launcher SIGKILLed during its publish wait leaves a live supervisor
+    /// that the state names only as pending. It is held before its agent spawn, so
+    /// the agent pid file cannot be what refuses the second launch.
+    fn second_launch_refuses_over_a_dead_launchers_supervisor(
+        name: &str,
+        phase: PhaseId,
+        verb: LaunchVerb,
+    ) {
+        if devflow_core::test_support::in_child_test(name) {
+            let root = PathBuf::from(std::env::var_os(RESERVE_ROOT_ENV).unwrap());
+            match std::env::var(RESERVE_CASE_ENV).unwrap().as_str() {
+                "launcher" => {
+                    // Killed by the parent while it waits for the publish.
+                    let _ = launch_for_test(&root, phase, verb);
+                }
+                _ => assert_second_launch_is_refused(&root, phase, verb),
+            }
+            return;
+        }
+        let path_dir = crate::test_support::go_waiting_claude_dir();
+        let cache = crate::test_support::hermetic_cache_dir();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        init_start_repo(root, phase);
+        if verb == LaunchVerb::Resume {
+            let mut stopped = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Supervise,
+                root.to_path_buf(),
+            );
+            stopped.stopped = true;
+            stopped.legacy_claude_launch = true;
+            workflow::save_state(&stopped).unwrap();
+        }
+        let hold = tempfile::tempdir().unwrap();
+        let release = hold.path().join("release");
+        let spawn_hold: std::ffi::OsString = format!("define:{}", release.display()).into();
+        let mut launcher = devflow_core::test_support::spawn_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                (RESERVE_ROOT_ENV, root.as_os_str()),
+                (RESERVE_CASE_ENV, std::ffi::OsStr::new("launcher")),
+                (AGENT_SPAWN_HOLD_ENV, spawn_hold.as_os_str()),
+            ],
+        );
+        let supervisor = HeldSupervisor {
+            release: release.clone(),
+            cache: cache.path().to_path_buf(),
+        };
+        let held = held_marker(&release);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while !held.exists() {
+            let launcher_ended = launcher.try_wait().unwrap().is_some();
+            assert!(
+                !launcher_ended && std::time::Instant::now() < deadline,
+                "the launcher's supervisor never reached its hold (launcher ended: \
+                 {launcher_ended})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        launcher.kill().expect("SIGKILL the launcher");
+        launcher.wait().expect("reap the launcher");
+
+        assert!(
+            agent_pid_from_file(root, phase).is_none_or(|pid| !agent::agent_running(pid)),
+            "the agent pid file must not be able to cause the refusal"
+        );
+        let second = devflow_core::test_support::run_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                (RESERVE_ROOT_ENV, root.as_os_str()),
+                (RESERVE_CASE_ENV, std::ffi::OsStr::new("second")),
+            ],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&second, name);
+        assert!(
+            supervisor.end(),
+            "the held supervisor stops through its socket once it publishes"
+        );
+    }
+
+    /// The second launcher's half of the V-01 fixture.
+    fn assert_second_launch_is_refused(root: &Path, phase: PhaseId, verb: LaunchVerb) {
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+        let live_before = liveness_files(root);
+        let pending = workflow::load_state(root, phase)
+            .unwrap()
+            .pending_supervisor
+            .expect("the dead launcher's reservation names its supervisor");
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "the supervisor kept the lock after its launcher died"
+        );
+
+        let result = launch_for_test(root, phase, verb);
+        // A launch that wrongly proceeded is ended before the assertions below fail.
+        let after = workflow::load_state(root, phase).ok();
+        let _reap = after
+            .as_ref()
+            .map(crate::test_support::ReapMonitorOnDrop::after_launch);
+
+        let text = result.expect_err("a second launch must refuse a live pending supervisor");
+        for expected in [
+            format!("devflow stop --phase {phase}"),
+            pending.launch_id.clone(),
+        ] {
+            assert!(text.contains(&expected), "missing {expected:?}: {text}");
+        }
+        assert!(
+            !text.contains("devflow resume"),
+            "no resume hint while its lock is held: {text}"
+        );
+        assert!(
+            !text.contains("agent pid"),
+            "the refusal must not come from the agent pid file: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused launch writes no state"
+        );
+        assert_eq!(
+            liveness_files(root),
+            live_before,
+            "a refused launch leaves no liveness file of its own"
+        );
+    }
+
+    #[test]
+    fn start_refuses_over_a_pending_supervisor_whose_launcher_died() {
+        second_launch_refuses_over_a_dead_launchers_supervisor(
+            "commands::tests::start_refuses_over_a_pending_supervisor_whose_launcher_died",
+            PhaseId::new(5018),
+            LaunchVerb::Start,
+        );
+    }
+
+    #[test]
+    fn resume_refuses_over_a_pending_supervisor_whose_launcher_died() {
+        second_launch_refuses_over_a_dead_launchers_supervisor(
+            "commands::tests::resume_refuses_over_a_pending_supervisor_whose_launcher_died",
+            PhaseId::new(5019),
+            LaunchVerb::Resume,
+        );
+    }
+
+    /// V-03: a reservation whose lock nothing holds, or whose file is gone, is
+    /// abandoned. It blocks nothing, and the next launch replaces it and says so.
+    #[test]
+    fn an_abandoned_reservation_does_not_block_start() {
+        const NAME: &str = "commands::tests::an_abandoned_reservation_does_not_block_start";
+        const ABANDONED: &str = "aaaa0000aaaa5020";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["unheld", "missing"] {
+                let output = crate::test_support::run_hermetic_test_in_child(
+                    NAME,
+                    path_dir.path(),
+                    &[
+                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                        // libtest would otherwise swallow the line this test is about.
+                        ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
+                    ],
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{case}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let line = format!("cleared an abandoned launch reservation {ABANDONED}");
+                assert!(stdout.contains(&line), "{case}: {stdout}");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5020);
+        let liveness_path = liveness::launch_liveness_path(root, ABANDONED).unwrap();
+        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+        let unheld = std::env::var(RESERVE_CASE_ENV).unwrap() == "unheld";
+        if unheld {
+            drop(liveness::Hold::take(&liveness_path).unwrap());
+        }
+        let mut abandoned = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        abandoned.stage = Stage::Code;
+        abandoned.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            ABANDONED.to_string(),
+            root.join("never-published.sock"),
+            liveness_path.clone(),
+        ));
+        workflow::save_state(&abandoned).unwrap();
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        let reserved = reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            cache.as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("an abandoned reservation blocks nothing: {err}"));
+
+        let on_disk = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            on_disk
+                .pending_supervisor
+                .as_ref()
+                .map(|p| p.launch_id.as_str()),
+            Some(reserved.reservation.launch_id()),
+            "the new reservation replaces the abandoned one"
+        );
+        assert_eq!(
+            on_disk.stage,
+            Stage::Code,
+            "the earlier run's state is kept"
+        );
+        assert!(
+            !liveness_path.exists(),
+            "the abandoned liveness file is gone"
+        );
+        reserved.reservation.discard();
+    }
+
+    /// V-04: a live agent named by the pid file still refuses, with the agent
+    /// guidance. It is the control for V-01's fixture, which rules that cause out.
+    #[test]
+    fn a_live_agent_pid_still_refuses_start() {
+        const NAME: &str = "commands::tests::a_live_agent_pid_still_refuses_start";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5021);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let mut agent_process = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the live agent stand-in");
+        let pid = agent_process.id();
+        std::fs::write(
+            agent_result::agent_pid_path(root, phase),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+
+        let result = start_for_test(root, phase);
+        let _ = agent_process.kill();
+        let _ = agent_process.wait();
+
+        let text = result.expect_err("a live agent refuses the start");
+        for expected in [
+            format!("agent pid {pid} alive"),
+            "The agent pid file names a live process".to_string(),
+        ] {
+            assert!(text.contains(&expected), "missing {expected:?}: {text}");
+        }
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused start writes no state"
+        );
+    }
+
     /// `start` writes a fresh run's state only while holding the write lock: with
     /// another writer holding it, the create returns after that writer is done.
     #[test]
