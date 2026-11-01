@@ -657,7 +657,7 @@ fn run() -> Result<(), CliError> {
             } => {
                 let (stage, project) =
                     resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, true, note)
+                gate_respond(&project_root(project)?, phase, stage, true, note, None)
             }
             GateCmd::Reject {
                 phase,
@@ -669,7 +669,14 @@ fn run() -> Result<(), CliError> {
             } => {
                 let (stage, project) =
                     resolve_gate_target(stage, legacy_project, stage_option, project)?;
-                gate_respond(&project_root(project)?, phase, stage, false, Some(note))
+                gate_respond(
+                    &project_root(project)?,
+                    phase,
+                    stage,
+                    false,
+                    Some(note),
+                    None,
+                )
             }
             GateCmd::Show {
                 phase,
