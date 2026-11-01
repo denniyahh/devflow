@@ -20,6 +20,7 @@
 use crate::CliError;
 use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
+use crate::pipeline_launch::commit;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
@@ -31,7 +32,7 @@ use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, CheckpointApproval, State};
-use devflow_core::{agents, events, verify, version, workflow};
+use devflow_core::{agents, events, verify, version};
 use std::path::{Path, PathBuf};
 
 /// The sandbox writable roots a worktree-hosted agent needs to commit: the
@@ -1291,8 +1292,8 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
     }
 }
 
-/// Record the human-only checkpoint set for a Code evaluation, read from the
-/// EXECUTION root.
+/// The approval recording the human-only checkpoint set for a Code evaluation, read
+/// from the EXECUTION root, or `None` when nothing is to be recorded.
 ///
 /// The root is `state.worktree_path` when set, else `state.project_root` —
 /// NOT `project_root` — because `.planning/` is tracked content: an in-flight
@@ -1312,19 +1313,27 @@ pub(crate) fn generic_preflight_checks(project_root: &Path, state: &State) -> Re
 /// run whose first Code evaluation predates this field has an unobserved set,
 /// and recording it later would bless whatever the agent had already written.
 ///
-/// Callers own their own `save_state` so this can sit inside an arm that
-/// already saves once.
-fn record_checkpoint_set_for_code_evaluation(state: &mut State) -> Result<(), CliError> {
+/// This scans plan files, so it runs before the commit that records its answer,
+/// outside the write lock; [`fill_pending_approval`] applies that answer in the commit.
+fn approval_for_code_evaluation(state: &State) -> Option<CheckpointApproval> {
     if state.checkpoint_approval != CheckpointApproval::Pending {
-        return Ok(());
+        return None;
     }
     let execution_root = state
         .worktree_path
         .clone()
         .unwrap_or_else(|| state.project_root.clone());
     let current = verify::phase_checkpoint_declarations(&execution_root, state.phase);
-    state.checkpoint_approval = crate::pipeline_launch::recorded_approval(&current);
-    Ok(())
+    Some(crate::pipeline_launch::recorded_approval(&current))
+}
+
+/// Record `approval` on the state re-read under the write lock, where the
+/// only-from-`Pending` rule of [`approval_for_code_evaluation`] is applied again:
+/// a set recorded since the scan stands.
+fn fill_pending_approval(state: &mut State, approval: CheckpointApproval) {
+    if state.checkpoint_approval == CheckpointApproval::Pending {
+        state.checkpoint_approval = approval;
+    }
 }
 
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
@@ -1394,8 +1403,9 @@ pub(crate) fn run_preflight(
             abort(project_root, state, &ceiling_reason)?;
             return Ok(false);
         }
-        state.preflight_retries = state.preflight_retries.saturating_add(1);
-        workflow::save_state(state)?;
+        commit(state, |s| {
+            s.preflight_retries = s.preflight_retries.saturating_add(1)
+        })?;
 
         let context = format!(
             "[never-silent] preflight failed for stage {stage}: {} — human review needed \
@@ -1408,8 +1418,6 @@ pub(crate) fn run_preflight(
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
                 let _ = Gates::cleanup(project_root, state.phase, stage);
-                state.gate_pending = false;
-                state.preflight_retries = 0;
                 // 48-15 / R-8, T-48-15-01, T-48-07-02: in Auto mode a Code
                 // launch whose plans declare a human-only checkpoint is
                 // REFUSED, so the pass path below never runs for it. THIS is
@@ -1431,10 +1439,18 @@ pub(crate) fn run_preflight(
                 // The LoopBack arm below deliberately records nothing: "I will
                 // fix it and retry" is not approval, and treating it as
                 // approval is the repudiation path T-48-15-03 names.
-                if stage == Stage::Code {
-                    record_checkpoint_set_for_code_evaluation(state)?;
-                }
-                workflow::save_state(state)?;
+                let approval = if stage == Stage::Code {
+                    approval_for_code_evaluation(state)
+                } else {
+                    None
+                };
+                commit(state, |s| {
+                    s.gate_pending = false;
+                    s.preflight_retries = 0;
+                    if let Some(approval) = approval {
+                        fill_pending_approval(s, approval);
+                    }
+                })?;
                 launch_stage_inner(state, None, None)?;
             }
             GateAction::LoopBack(_) => {
@@ -1459,9 +1475,10 @@ pub(crate) fn run_preflight(
     // happened under the old binary has an unobserved set, and letting a
     // later loop-back or relaunched evaluation record it would bless
     // whatever the agent had already written by then.
-    if stage == Stage::Code && state.checkpoint_approval == CheckpointApproval::Pending {
-        record_checkpoint_set_for_code_evaluation(state)?;
-        workflow::save_state(state)?;
+    if stage == Stage::Code
+        && let Some(approval) = approval_for_code_evaluation(state)
+    {
+        commit(state, |s| fill_pending_approval(s, approval))?;
     }
 
     // Preflight passed: reset the retry counter, persisted (the wedge this
@@ -1470,8 +1487,7 @@ pub(crate) fn run_preflight(
     // passing preflight on an already-zero counter does not rewrite state
     // on every single launch.
     if state.preflight_retries != 0 {
-        state.preflight_retries = 0;
-        workflow::save_state(state)?;
+        commit(state, |s| s.preflight_retries = 0)?;
     }
     Ok(true)
 }
@@ -1480,6 +1496,7 @@ pub(crate) fn run_preflight(
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use devflow_core::workflow;
     // Named only by the recording assertions below; importing it at module
     // scope would be an unused import in a non-test build.
     use devflow_core::state::ApprovedCheckpoint;
