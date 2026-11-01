@@ -1514,6 +1514,27 @@ mod tests {
         );
     }
 
+    /// A caller must not report "nothing to clean" after moving an answer. The file
+    /// has no gate beside it, so setting it aside is the only thing the clean did.
+    #[test]
+    fn clean_phase_report_counts_a_lone_answer_it_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(52);
+        let answer = Gates::dir(root).join("52-code.response.json");
+        std::fs::create_dir_all(answer.parent().unwrap()).unwrap();
+        std::fs::write(&answer, "{}").unwrap();
+
+        let report = clean_phase_report(root, phase).expect("clean");
+
+        assert!(
+            report.removed_anything,
+            "an answer it set aside must count as removed from the live files"
+        );
+        assert!(!answer.exists());
+        assert_eq!(Gates::quarantined(root).len(), 1);
+    }
+
     /// D-05: an answer nobody consumed is set aside, never deleted, even when the
     /// phase it decided is being cleared. Its body stays readable under the
     /// quarantine name.
