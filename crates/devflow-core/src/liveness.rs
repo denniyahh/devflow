@@ -1,38 +1,82 @@
-//! Per-launch liveness: a `flock` a launcher takes and a spawned supervisor
-//! inherits and holds for life.
+//! Per-launch liveness: a `flock` a launcher takes before it saves a pending
+//! record, and a spawned supervisor inherits and holds for life, so a pending
+//! supervisor is probeable before its socket exists.
+//!
+//! D-01's two cases are told apart by the lock alone, with no pid read:
+//! a supervisor spawned but not yet published holds the lock, so the file
+//! reads [`Held::Live`]; a reservation whose launcher died before spawning
+//! anything holds nothing, so it reads [`Held::Abandoned`].
+//!
+//! Two traps, both pinned by this module's tests:
+//!
+//! - `dup2(3, 3)` is a no-op that leaves close-on-exec set, so a descriptor
+//!   that already is fd 3 would lose the lock at exec. `pass_to_child`
+//!   clears the flag in that case.
+//! - A `flock` belongs to the open file description, so `unlock()` on any
+//!   duplicate releases the lock a child inherited. Dropping a [`Hold`] is the
+//!   only release.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-/// The descriptor number a hold has in the child [`pass_to_child`] spawns.
+/// The descriptor number a hold has in the child `pass_to_child` spawns.
 pub const INHERITED_FD: RawFd = 3;
 
+/// The suffix of the temporary name a hold is locked under before it is
+/// published: `.{final_file_name}.{pid}.{seq}.hold-tmp`, beside the final name.
+///
+/// A temp is never a hold. No probe, holder lookup or sweep of final names
+/// reads one, and only `remove_orphan_hold_temps` removes one.
+pub const HOLD_TEMP_SUFFIX: &str = ".hold-tmp";
+
+/// How long taking an exclusive lock waits out a probe's momentary shared lock.
+/// A real holder holds for its lifetime, so it outlasts this.
+const PROBE_RACE_WAIT: Duration = Duration::from_millis(50);
+
+const PROBE_RACE_POLL: Duration = Duration::from_millis(1);
+
+static HOLD_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// An exclusive lock on a liveness file, released only by dropping it.
+///
+/// Never call `unlock()` on a hold or on any duplicate of its descriptor: the
+/// lock belongs to the open file description, so that releases the lock a
+/// child inherited while the child still runs.
 #[derive(Debug)]
 pub struct Hold {
     file: File,
     path: PathBuf,
 }
 
+/// The points of a take, in order, at which `take_inner` calls its hook. Each
+/// call passes the temp's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TakeStep {
+    /// The temp exists and is not locked yet.
+    TempCreated,
+    /// The temp is locked and has its record; the final name does not exist.
+    Locked,
+    /// The final name exists, and the temp has not been removed.
+    Published,
+}
+
 impl Hold {
-    /// Take a hold on `path`.
+    /// Take a hold on `path`, publishing that name only once the lock is held,
+    /// so no visible hold file is ever unheld while its creator lives. A sweep
+    /// may therefore remove a file that probes [`Held::Abandoned`] with no age
+    /// bound: nothing takes an exclusive lock through an existing hold name,
+    /// so such a file can never read [`Held::Live`] again.
     ///
     /// # Errors
-    /// Any error creating or locking the file.
+    /// [`std::io::ErrorKind::AlreadyExists`] if `path` exists, which is never
+    /// replaced; any other error creating, locking or linking the file. On any
+    /// error `path` was not created.
     pub fn take(path: &Path) -> std::io::Result<Hold> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.try_lock().map_err(std::io::Error::from)?;
-        Ok(Hold {
-            file,
-            path: path.to_path_buf(),
-        })
+        take_inner(path, &mut |_, _| {})
     }
 
     /// The path this hold was taken on.
@@ -47,6 +91,104 @@ impl AsRawFd for Hold {
     }
 }
 
+/// [`Hold::take`], calling `hook` at each [`TakeStep`].
+fn take_inner(path: &Path, hook: &mut dyn FnMut(TakeStep, &Path)) -> std::io::Result<Hold> {
+    let (temp, file) = create_hold_temp(path)?;
+    hook(TakeStep::TempCreated, &temp);
+    if let Err(error) = lock_and_publish(&file, &temp, path, hook) {
+        remove_temp_or_warn(&temp);
+        return Err(error);
+    }
+    hook(TakeStep::Published, &temp);
+    // The hold is already published and held. A temp left here names this live
+    // process, so it stays out of any sweep's reach until this process exits.
+    remove_temp_or_warn(&temp);
+    Ok(Hold {
+        file,
+        path: path.to_path_buf(),
+    })
+}
+
+/// Create `path`'s temp beside it, taking the next sequence on a collision.
+fn create_hold_temp(path: &Path) -> std::io::Result<(PathBuf, File)> {
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        ));
+    };
+    let name = name.to_string_lossy();
+    let pid = std::process::id();
+    loop {
+        let seq = HOLD_SEQ.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_file_name(format!(".{name}.{pid}.{seq}{HOLD_TEMP_SUFFIX}"));
+        let created = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp);
+        match created {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Lock `temp`, record this process in it, and link it to `path`. A hard link
+/// never replaces: an existing `path` fails `AlreadyExists`, and a temp removed
+/// under the take fails `NotFound` rather than publishing an unheld name.
+fn lock_and_publish(
+    file: &File,
+    temp: &Path,
+    path: &Path,
+    hook: &mut dyn FnMut(TakeStep, &Path),
+) -> std::io::Result<()> {
+    try_lock_past_probes(file)?;
+    write_identity_record(file)?;
+    hook(TakeStep::Locked, temp);
+    std::fs::hard_link(temp, path)
+}
+
+fn remove_temp_or_warn(temp: &Path) {
+    if let Err(error) = std::fs::remove_file(temp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("could not remove the hold temp {}: {error}", temp.display());
+    }
+}
+
+/// Take `file`'s exclusive lock, waiting out a probe's momentary shared lock
+/// for at most [`PROBE_RACE_WAIT`] before reporting `WouldBlock`.
+fn try_lock_past_probes(file: &File) -> Result<(), TryLockError> {
+    let deadline = Instant::now() + PROBE_RACE_WAIT;
+    loop {
+        match file.try_lock() {
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(PROBE_RACE_POLL);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Write this process's identity into a hold's file: `"{pid} {start}\n"`, or
+/// the pid alone when its start time cannot be read.
+///
+/// The write is positional, because it neither reads nor moves the descriptor's
+/// offset. A descriptor inherited across exec shares its offset with every
+/// duplicate, so a cursor write after a truncate would land past a NUL hole.
+pub(crate) fn write_identity_record(file: &File) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let record = match crate::agent::process_start_time(pid) {
+        Some(start) => format!("{pid} {start}\n"),
+        None => format!("{pid}\n"),
+    };
+    file.set_len(0)?;
+    file.write_all_at(record.as_bytes(), 0)
+}
+
 /// What a probe of a liveness file found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held {
@@ -58,7 +200,10 @@ pub enum Held {
     Missing,
 }
 
-/// Read a liveness file's state from its lock alone.
+/// Read a liveness file's state from its lock alone, with no pid read.
+///
+/// The probe tries a shared lock through its own open, so concurrent probes
+/// never read each other as live, while an exclusive holder still blocks it.
 ///
 /// # Errors
 /// Any error opening or locking the file other than its absence.
@@ -75,12 +220,32 @@ pub fn probe(path: &Path) -> std::io::Result<Held> {
     }
 }
 
-/// Scaffold for the failing tests: passes nothing to the child.
+/// Have `cmd`'s child inherit `hold` at [`INHERITED_FD`], so it holds the lock
+/// after this process drops its copy.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "first caller: the launch path in 50.1-07")
 )]
-pub(crate) fn pass_to_child(_cmd: &mut std::process::Command, _hold: &Hold) {}
+pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
+    let raw = hold.as_raw_fd();
+    // SAFETY: the callback only calls `fcntl` and `dup2`, both
+    // async-signal-safe, and reads errno. It allocates nothing and takes no
+    // locks. When the descriptor already is fd 3, `dup2` would be a no-op that
+    // leaves close-on-exec set, so that case clears the flag instead.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(cmd, move || {
+            let result = if raw == INHERITED_FD {
+                libc::fcntl(INHERITED_FD, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(raw, INHERITED_FD)
+            };
+            if result == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {
