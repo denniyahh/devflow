@@ -522,7 +522,7 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 3/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+**Plans:** 5/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
 plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
 runs in wave 19
 
@@ -534,8 +534,8 @@ runs in wave 19
 
 **Wave 2**
 
-- [ ] 50.1-04-PLAN.md *(depends on 50.1-01)* — `update_state` write flock with re-read, create path, owner fence, `pending_supervisor` field
-- [ ] 50.1-05-PLAN.md *(depends on 50.1-01)* — per-launch liveness lock: hold, probe, fd-3 inheritance, adoption; sidecar fsync (V-03 core, V-06)
+- [x] 50.1-04-PLAN.md *(depends on 50.1-01)* — `update_state` write flock with re-read, create path, owner fence, `pending_supervisor` field
+- [x] 50.1-05-PLAN.md *(depends on 50.1-01)* — per-launch liveness lock: hold, probe, fd-3 inheritance, adoption; sidecar fsync (V-03 core, V-06)
 
 **Wave 3**
 
@@ -802,7 +802,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
-| 50.1 | 3/30 | In Progress | — |
+| 50.1 | 5/30 | In Progress | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -1043,6 +1043,11 @@ failure rate only.
 
 **Fix shape (not decided):** reproduce under load (for example `cargo test` with `--test-threads` above the core
 count, repeated), then make the reap wait on a condition instead of on timing.
+
+*Recorded 2026-11-01 (Phase 50.1, plan 50.1-05):* this test failed in a full core run, and run alone under nextest it
+failed 1/5, then 1/40 at the plan's HEAD and 0/40 at its base; the test binary run directly failed 0/60 on both. Those
+counts cannot clear the base. It fails at about 0.1 s against a 2 s wait, so that wait is not running out (inferred from
+durations, not traced).
 
 *Related, recorded 2026-10-19 (operator request):* a sibling in the same module,
 `agents::opencode::tests::spawn_with_timeout_kills_a_hung_child`, failed once in the pinned CI container (2026-09-22):
