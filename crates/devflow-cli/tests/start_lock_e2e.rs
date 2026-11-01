@@ -17,6 +17,7 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::supervisor::{self, Liveness, ShutdownOutcome};
+use devflow_core::test_support::gate_answer_files;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
@@ -178,18 +179,16 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
     let phase = PhaseId::new(92);
     init_repo(root, phase);
     let fake_bin = common::fake_bin_dir("sleep 60");
+    // A legacy unkeyed answer: the one form no gate id can keep from a new gate.
     let response_path = Gates::response_path(root, phase, Stage::Define);
     fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-    fs::write(
-        &response_path,
-        serde_json::to_vec(&GateResponse {
-            approved: false,
-            note: Some("abort: planted stale response".into()),
-            responded_by: Some("start-lock-e2e-planted-response".into()),
-        })
-        .unwrap(),
-    )
+    let planted = serde_json::to_vec(&GateResponse {
+        approved: false,
+        note: Some("abort: planted stale response".into()),
+        responded_by: Some("start-lock-e2e-planted-response".into()),
+    })
     .unwrap();
+    fs::write(&response_path, &planted).unwrap();
     let _reaper = common::LaunchedRunReaper::new(root, phase, vec![]);
 
     let mut process = child(&home, root, phase, &fake_bin, "auto")
@@ -221,7 +220,17 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
     );
     assert!(
         !response_path.exists(),
-        "the planted response must be removed"
+        "the planted response must be gone from its old name"
+    );
+    let set_aside: Vec<_> = Gates::quarantined(root)
+        .into_iter()
+        .filter(|answer| fs::read(&answer.path).is_ok_and(|bytes| bytes == planted))
+        .collect();
+    assert_eq!(
+        set_aside.len(),
+        1,
+        "a quarantine file must hold the planted response's bytes: {:?}",
+        Gates::quarantined(root)
     );
     common::kill_and_reap(&mut process);
 }
@@ -394,24 +403,26 @@ fn plant_leftover_run(root: &Path, phase: PhaseId, agent_pid: Option<u32>) -> Pl
     plant_code_gate(root, phase)
 }
 
-/// A Code gate request and an aborting response, as a leftover run leaves
-/// them.
+/// A Code gate and an aborting answer bound to it, as a leftover run leaves them.
 fn plant_code_gate(root: &Path, phase: PhaseId) -> PlantedGate {
-    let request = Gates::write_gate(root, phase, Stage::Code, "planted leftover Code gate")
+    let opened = Gates::open_gate(root, phase, Stage::Code, "planted leftover Code gate")
         .expect("plant Code gate request");
-    let response = Gates::response_path(root, phase, Stage::Code);
-    fs::create_dir_all(response.parent().unwrap()).unwrap();
-    fs::write(
-        &response,
-        serde_json::to_vec(&GateResponse {
+    let response = Gates::answer(
+        root,
+        phase,
+        Stage::Code,
+        &opened.gate_id,
+        &GateResponse {
             approved: false,
             note: Some("abort: planted leftover response".into()),
             responded_by: Some("start-lock-e2e-planted-leftover".into()),
-        })
-        .unwrap(),
+        },
     )
     .expect("plant Code gate response");
-    PlantedGate { request, response }
+    PlantedGate {
+        request: opened.path,
+        response,
+    }
 }
 
 fn write_agent_pid(root: &Path, phase: PhaseId, pid: u32) {
@@ -549,10 +560,12 @@ fn assert_start_refuses_live_run(
     let before = phase_file_snapshot(root, phase);
     // Negative control on the snapshot itself: it must cover the planted
     // state and both planted gate files, or byte-identity would prove nothing.
+    let answers = gate_answer_files(root, phase, Stage::Code);
+    assert_eq!(answers.len(), 1, "the planted answer: {answers:?}");
     for required in [
         devflow_core::workflow::state_path(root, phase),
         Gates::gate_path(root, phase, Stage::Code),
-        Gates::response_path(root, phase, Stage::Code),
+        answers[0].clone(),
     ] {
         assert!(
             snapshot_paths(&before).contains(&required.as_path()),
@@ -740,8 +753,13 @@ fn start_replaces_a_leftover_state_whose_recorded_processes_are_dead() {
     );
     assert!(
         !planted.response.exists(),
-        "the leftover Code gate response must be cleared: {}",
+        "the leftover Code gate response must be out of its slot: {}",
         planted.response.display()
+    );
+    assert_eq!(
+        Gates::quarantined(root).len(),
+        1,
+        "the leftover response is set aside, not deleted"
     );
     assert!(
         events_contain_workflow_started(root),
