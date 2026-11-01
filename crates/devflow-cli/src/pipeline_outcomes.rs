@@ -30,7 +30,7 @@ use devflow_core::state::State;
 use devflow_core::{
     agent_result,
     agent_result::{AgentStatus, Verdict},
-    events, lock, workflow,
+    events, lock,
 };
 use std::path::{Path, PathBuf};
 
@@ -47,8 +47,9 @@ pub(crate) fn handle_infra_outcome(
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    state.infra_failures = state.infra_failures.saturating_add(1);
-    workflow::save_state(state)?;
+    commit(state, |s| {
+        s.infra_failures = s.infra_failures.saturating_add(1)
+    })?;
     gate_or_abort_infra(project_root, state, stage, reason)
 }
 
@@ -93,12 +94,12 @@ pub(crate) fn handle_rate_limited_outcome(
     reason: Option<String>,
 ) -> Result<(), CliError> {
     let retry_after = retry_after_from_reason(reason.as_deref());
-    let projected_infra_failures = state.infra_failures.saturating_add(1);
-    if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
-        return handle_infra_outcome(project_root, state, stage, reason);
+    commit(state, |s| {
+        s.infra_failures = s.infra_failures.saturating_add(1)
+    })?;
+    if state.infra_failures >= mode::MAX_INFRA_FAILURES {
+        return gate_or_abort_infra(project_root, state, stage, reason);
     }
-    state.infra_failures = projected_infra_failures;
-    workflow::save_state(state)?;
 
     let instructions =
         devflow_core::ship::build_single_agent_cron_instructions(project_root, phase, &retry_after);
@@ -594,62 +595,68 @@ pub(crate) fn handle_validate_outcome(
         // resets it — a commit count cannot clear it, which is the whole
         // point: the Code stage's fix command is a GSD command that commits
         // `.planning/` artifacts on cycles that changed no source.
-        state.phase_validate_failures = state.phase_validate_failures.saturating_add(1);
-        match agent_result::phase_commit_count(
+        //
+        // Measured before the commit: it runs git, which a write-lock closure
+        // must not do.
+        let measured_commit_count = agent_result::phase_commit_count(
             project_root,
             &devflow_core::config::git_flow_for_project(project_root),
             state.phase,
-        ) {
-            Some(current) => {
-                if mode::consecutive_failures_made_progress(
-                    state.last_validate_failure_commit_count,
-                    current,
-                ) {
-                    // New commits landed since the last recorded failure —
-                    // this failure is the first of a new streak, not a
-                    // continuation. Set to 1, not 0: the gate context rendered
-                    // below interpolates the counter into a message naming how
-                    // many times validation has failed, and zeroing it would
-                    // make that message read zero on a real failure.
-                    state.consecutive_failures = 1;
-                } else {
-                    // Now that the counter genuinely accumulates (18d), an
-                    // unbounded loop could otherwise overflow it and wrap to
-                    // 0, silently restoring the unreachable-ceiling bug in a
-                    // slower form.
-                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        );
+        commit(state, |s| {
+            s.phase_validate_failures = s.phase_validate_failures.saturating_add(1);
+            match measured_commit_count {
+                Some(current) => {
+                    if mode::consecutive_failures_made_progress(
+                        s.last_validate_failure_commit_count,
+                        current,
+                    ) {
+                        // New commits landed since the last recorded failure —
+                        // this failure is the first of a new streak, not a
+                        // continuation. Set to 1, not 0: the gate context rendered
+                        // below interpolates the counter into a message naming how
+                        // many times validation has failed, and zeroing it would
+                        // make that message read zero on a real failure.
+                        s.consecutive_failures = 1;
+                    } else {
+                        // Now that the counter genuinely accumulates (18d), an
+                        // unbounded loop could otherwise overflow it and wrap to
+                        // 0, silently restoring the unreachable-ceiling bug in a
+                        // slower form.
+                        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+                    }
+                    // The baseline advances on every recorded failure whose count
+                    // was actually MEASURED, regardless of which branch ran above
+                    // — updating it only on the progress branch would let a stale
+                    // low baseline report progress forever.
+                    s.last_validate_failure_commit_count = Some(current);
                 }
-                // The baseline advances on every recorded failure whose count
-                // was actually MEASURED, regardless of which branch ran above
-                // — updating it only on the progress branch would let a stale
-                // low baseline report progress forever.
-                state.last_validate_failure_commit_count = Some(current);
+                // 999.77 / A-04: the count could not be measured. Treat the cycle
+                // as not-progress — an absent measurement is not evidence that
+                // work landed — and, crucially, do NOT touch the baseline. Writing
+                // a forged zero here is the defect: the next successful
+                // measurement would then compare a real count against that zero,
+                // read it as forward progress, and hand back one free reset of the
+                // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
+                // means the next real measurement compares against the last real
+                // observation.
+                //
+                // `mode::consecutive_failures_made_progress` is deliberately not
+                // called on this arm and its signature is deliberately not widened
+                // — there is no count to compare.
+                None => {
+                    s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+                }
             }
-            // 999.77 / A-04: the count could not be measured. Treat the cycle
-            // as not-progress — an absent measurement is not evidence that
-            // work landed — and, crucially, do NOT touch the baseline. Writing
-            // a forged zero here is the defect: the next successful
-            // measurement would then compare a real count against that zero,
-            // read it as forward progress, and hand back one free reset of the
-            // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
-            // means the next real measurement compares against the last real
-            // observation.
-            //
-            // `mode::consecutive_failures_made_progress` is deliberately not
-            // called on this arm and its signature is deliberately not widened
-            // — there is no count to compare.
-            None => {
-                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            }
-        }
-        workflow::save_state(state)?;
+        })?;
         // 35.2: stamp the nonce on every Validate failure so the
         // loop-back cycle below sees it. launch_stage_inner stamps on
         // the launch path; this stamps on the already-running path
         // where launch_stage_inner already ran for THIS dispatch.
-        state.verification_run_nonce =
-            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
-        workflow::save_state(state)?;
+        commit(state, |s| {
+            s.verification_run_nonce =
+                Some(s.verification_run_nonce.unwrap_or(0).saturating_add(1));
+        })?;
     }
 
     // F-6: read ONCE, and used for both the message's ceiling clause and the
@@ -1125,6 +1132,7 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::prompt;
     use devflow_core::state::AgentKind;
+    use devflow_core::workflow;
 
     /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
     /// must be SKIPPED — never run unserialized against the shared checkout
@@ -2855,6 +2863,7 @@ mod tests {
         // ceiling exactly.
         state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
         std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let at = last_gate_context(root, phase).expect("the ceiling failure must also gate");
@@ -5642,10 +5651,11 @@ mod tests {
     }
 
     /// D-08: a Validate failure advances the counters on disk, not the caller's copy,
-    /// and leaves the field another writer changed. The temp directory is not a git
-    /// repository, so the commit count is unmeasured and the streak takes its `+ 1`
-    /// arm. `Supervise` gates every Validate, which holds the handler at its gate
-    /// while the file is read.
+    /// and leaves the field another writer changed. The temp directory has no feature
+    /// branch, which measures as zero commits, so the streak accumulates only against
+    /// the on-disk baseline of zero; the stale copy's absent baseline would reset it.
+    /// `Supervise` gates every Validate, which holds the handler at its gate while
+    /// the file is read.
     #[test]
     fn a_validate_failure_commits_its_counters_and_keeps_a_concurrent_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -5663,6 +5673,7 @@ mod tests {
                 state.yes_ship = false;
                 state.consecutive_failures = 2;
                 state.phase_validate_failures = 2;
+                state.last_validate_failure_commit_count = Some(0);
                 state.verification_run_nonce = Some(7);
             },
         );
