@@ -288,16 +288,18 @@ fn lock_for_sweep(
     }
 }
 
-/// Remove every stage's gate files for `phase`, retaining partial removal on error.
+/// Close every stage's gate for `phase`, retaining partial removal on error. An
+/// unconsumed answer is set aside rather than deleted (D-05), and counts as removed:
+/// it is gone from the live gate files.
 fn remove_gate_files(
     project_root: &Path,
     phase: PhaseId,
 ) -> (bool, Result<(), crate::gates::GateError>) {
     let mut removed = false;
     for stage in STAGES {
-        let (stage_removed, result) =
-            crate::gates::Gates::cleanup_with_partial_result(project_root, phase, stage);
-        removed |= stage_removed;
+        let (report, result) =
+            crate::gates::Gates::close_with_partial_result(project_root, phase, stage);
+        removed |= report.removed || !report.quarantined.is_empty();
         if let Err(error) = result {
             return (removed, Err(error));
         }
@@ -504,11 +506,14 @@ mod tests {
             crate::ship::cron_instructions_path(root, phase),
         ];
         for stage in [Stage::Validate, Stage::Ship] {
-            Gates::write_gate(root, phase, stage, "wedged gate").unwrap();
-            Gates::respond(
+            let gate_id = Gates::open_gate(root, phase, stage, "wedged gate")
+                .unwrap()
+                .gate_id;
+            let answer = Gates::answer(
                 root,
                 phase,
                 stage,
+                &gate_id,
                 &GateResponse {
                     approved: false,
                     note: Some("abort: test".into()),
@@ -516,7 +521,7 @@ mod tests {
                 },
             )
             .unwrap();
-            Gates::ack(root, phase, stage).unwrap();
+            Gates::claim(root, phase, stage, &gate_id).unwrap();
             let gate = Gates::gate_path(root, phase, stage);
             let temp = Gates::dir(root).join(format!(
                 ".{}.recovery.tmp",
@@ -525,8 +530,8 @@ mod tests {
             std::fs::write(&temp, "orphaned gate temp").unwrap();
             paths.extend([
                 gate,
-                Gates::response_path(root, phase, stage),
-                Gates::ack_path(root, phase, stage),
+                answer,
+                Gates::claim_path(root, phase, stage, &gate_id),
                 temp,
             ]);
         }
@@ -772,17 +777,26 @@ mod tests {
         // The gate files a waiting monitor is blocked on: the sweep must not
         // clean them either, so the lock has to be taken before gate cleanup
         // as well as before the state delete.
-        Gates::write_gate(root, phase, Stage::Code, "waiting").unwrap();
-        std::fs::write(
-            Gates::response_path(root, phase, Stage::Code),
-            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
+        let gate = Gates::open_gate(root, phase, Stage::Code, "waiting")
+            .unwrap()
+            .gate_id;
+        let answer = Gates::answer(
+            root,
+            phase,
+            Stage::Code,
+            &gate,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
         )
         .unwrap();
-        std::fs::write(Gates::ack_path(root, phase, Stage::Code), "{}").unwrap();
+        Gates::claim(root, phase, Stage::Code, &gate).unwrap();
         let gate_paths = [
             Gates::gate_path(root, phase, Stage::Code),
-            Gates::response_path(root, phase, Stage::Code),
-            Gates::ack_path(root, phase, Stage::Code),
+            answer,
+            Gates::claim_path(root, phase, Stage::Code, &gate),
         ];
         let gates_before: Vec<Vec<u8>> = gate_paths
             .iter()
@@ -1192,11 +1206,14 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(9);
         Gates::write_gate(root, phase, Stage::Code, "orphaned").unwrap();
-        Gates::write_gate(root, phase, Stage::Validate, "orphaned").unwrap();
-        Gates::respond(
+        let answered = Gates::open_gate(root, phase, Stage::Validate, "orphaned")
+            .unwrap()
+            .gate_id;
+        let answer = Gates::answer(
             root,
             phase,
             Stage::Validate,
+            &answered,
             &GateResponse {
                 approved: true,
                 note: None,
@@ -1204,7 +1221,7 @@ mod tests {
             },
         )
         .unwrap();
-        Gates::ack(root, phase, Stage::Validate).unwrap();
+        Gates::claim(root, phase, Stage::Validate, &answered).unwrap();
         assert!(!workflow::state_path(root, phase).exists());
         assert_eq!(Gates::list_open(root).len(), 1, "fixture: one open gate");
 
@@ -1213,8 +1230,8 @@ mod tests {
         for path in [
             Gates::gate_path(root, phase, Stage::Code),
             Gates::gate_path(root, phase, Stage::Validate),
-            Gates::response_path(root, phase, Stage::Validate),
-            Gates::ack_path(root, phase, Stage::Validate),
+            answer,
+            Gates::claim_path(root, phase, Stage::Validate, &answered),
         ] {
             assert!(
                 !path.exists(),
