@@ -20,3 +20,8 @@
   **Likely fix, not tested:** treat `ESRCH` as gone in `running_per_status`.
   **Not established:** the sequence is inferred from those two measurements and the failure's diagnostics, not traced. The test failed 0 of 60 run alone. Whether this also explains backlog 999.151 was not checked; that test fails on a different assertion, though 50.1-05 saw the same not-running-then-running shape there.
   **Why deferred:** 50.1-06 does not touch `agent.rs` or `agents/`, and `opencode.rs` does not use gates.
+
+- `devflow ship` cannot see a Ship answer written by `gate approve` until 50.1-14 (found during 50.1-13)
+  status: open
+  **What:** `gate approve` now writes the keyed answer, while `ship_override` still checks and reads the unkeyed response. Probed: approve, then `ship_override`, refuses with "no Ship gate response written yet". It fails closed, and its wording is wrong for that one wave.
+  **Who:** 50.1-14 replaces that read with the keyed read and claim, and already lists `ship_override`.
