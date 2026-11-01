@@ -180,7 +180,7 @@ fn start_clears_leftover_gate_files_after_taking_the_lock() {
     init_repo(root, phase);
     let fake_bin = common::fake_bin_dir("sleep 60");
     // A legacy unkeyed answer: the one form no gate id can keep from a new gate.
-    let response_path = Gates::response_path(root, phase, Stage::Define);
+    let response_path = Gates::dir(root).join(format!("{}-define.response.json", phase.padded()));
     fs::create_dir_all(response_path.parent().unwrap()).unwrap();
     let planted = serde_json::to_vec(&GateResponse {
         approved: false,
