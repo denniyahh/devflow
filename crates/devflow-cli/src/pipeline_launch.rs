@@ -25,9 +25,9 @@ use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_gate::transition;
 use crate::pipeline_gate::{abort, run_gate_with_timeout};
 use crate::pipeline_outcomes::{
-    ValidateOutcome, classify_validate_outcome, handle_infra_outcome, handle_rate_limited_outcome,
-    handle_ship_failure, handle_ship_outcome, handle_stage_failure, handle_validate_outcome,
-    truncate_reason,
+    ValidateOutcome, classify_validate_outcome, gate_or_abort_infra, handle_infra_outcome,
+    handle_rate_limited_outcome, handle_ship_failure, handle_ship_outcome, handle_stage_failure,
+    handle_validate_outcome, truncate_reason,
 };
 use crate::preflight::{
     agent_program, ensure_agent_binary, generic_preflight_checks, run_preflight,
@@ -2273,13 +2273,12 @@ pub(crate) fn handle_ambiguous_outcome(
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let projected_infra_failures = state.infra_failures.saturating_add(1);
-    if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
-        return handle_infra_outcome(project_root, state, stage, reason);
-    }
     commit(state, |s| {
         s.infra_failures = s.infra_failures.saturating_add(1)
     })?;
+    if state.infra_failures >= mode::MAX_INFRA_FAILURES {
+        return gate_or_abort_infra(project_root, state, stage, reason);
+    }
 
     events::emit(
         project_root,
