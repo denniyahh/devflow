@@ -21,7 +21,7 @@
 
 use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
-use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, launch_stage};
+use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, commit, launch_stage};
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
@@ -242,7 +242,6 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     // `ship_override`) no stop token is engaged and this proceeds.
     if crate::pipeline_launch::stop_requested_at_safe_point() {
         let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
-        state.gate_pending = false;
         crate::pipeline_launch::record_advance_stop(state, 6)?;
         return Err(CliError::Message(format!(
             "finalization did not run: {ADVANCE_STOP_REASON}"
@@ -434,8 +433,7 @@ pub(crate) fn run_gate_with_timeout(
     // flag from `state` inside this function instead of receiving it here.
     auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
-    state.gate_pending = true;
-    workflow::save_state(state)?;
+    commit(state, |s| s.gate_pending = true)?;
     Gates::write_gate(project_root, state.phase, stage, context)?;
     println!(
         "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
@@ -493,7 +491,6 @@ pub(crate) fn run_gate_with_timeout(
         // error unwinds every caller.
         if crate::pipeline_launch::stop_requested_at_safe_point() {
             let _ = Gates::cleanup(project_root, state.phase, stage);
-            state.gate_pending = false;
             crate::pipeline_launch::record_advance_stop(state, 5)?;
             return Err(CliError::Message(format!(
                 "the gate for stage {stage} was not auto-answered: {ADVANCE_STOP_REASON}"
@@ -509,14 +506,10 @@ pub(crate) fn run_gate_with_timeout(
     }
     match gate_wait_call(project_root, state.phase, stage, timeout_secs) {
         GateWaitEnd::Answered(response) => {
-            state.gate_pending = false;
-            // WR-10 (49-REVIEW.md): the operator may have edited the run's
-            // notify command on disk while this gate waited; keep that edit
-            // rather than overwriting it with the copy loaded before the wait.
-            if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
-                state.gate_notify_cmd = on_disk.gate_notify_cmd;
-            }
-            workflow::save_state(state)?;
+            // D-08: whatever changed on disk during the wait (a `stop`, a
+            // `yes_ship` revoke, an edited notify command) is kept, because this
+            // write re-reads the state and sets only this field.
+            commit(state, |s| s.gate_pending = false)?;
             Gates::ack(project_root, state.phase, stage)?;
             let action = GateAction::from_response(&response);
             events::emit(
@@ -545,10 +538,6 @@ pub(crate) fn run_gate_with_timeout(
             // `GateAction::Abort`: `abort()` deletes the state file, and a
             // stopped run keeps its state for `devflow resume`.
             let _ = Gates::cleanup(project_root, state.phase, stage);
-            state.gate_pending = false;
-            if let Ok(on_disk) = workflow::load_state(project_root, state.phase) {
-                state.gate_notify_cmd = on_disk.gate_notify_cmd;
-            }
             crate::pipeline_launch::record_advance_stop(state, 4)?;
             Err(CliError::Message(format!(
                 "the gate wait for stage {stage} ended: {ADVANCE_STOP_REASON}"
