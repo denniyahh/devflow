@@ -3504,4 +3504,68 @@ mod tests {
 
         assert!(!dir.path().join(".devflow").exists());
     }
+
+    #[test]
+    fn only_the_gate_id_format_parses_as_a_gate_id() {
+        let good = GateId::new();
+        assert_eq!(GateId::parse(good.as_str()).unwrap(), good);
+        assert_eq!(good.to_string(), good.as_str());
+        for bad in [
+            "",
+            "../../x",
+            "00000000000000A0",
+            "00000000000000a",
+            "00000000000000a00",
+            "noid",
+        ] {
+            let parsed = GateId::parse(bad);
+            assert!(
+                matches!(&parsed, Err(GateError::InvalidGateId(id)) if id == bad),
+                "{bad:?}: {parsed:?}"
+            );
+        }
+    }
+
+    /// What an operator reads must say what happened and where to look next.
+    #[test]
+    fn a_gate_id_error_names_the_ids_and_where_to_look() {
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let mismatch = GateError::GateIdMismatch {
+            phase,
+            stage,
+            observed: "old-id".into(),
+            current: "new-id".into(),
+        }
+        .to_string();
+        for needle in ["old-id", "new-id", "devflow gate list"] {
+            assert!(mismatch.contains(needle), "{needle}: {mismatch}");
+        }
+        let closed = GateError::GateClosedAfterPublish {
+            phase,
+            stage,
+            observed: "old-id".into(),
+        }
+        .to_string();
+        for needle in ["old-id", "published", "set aside"] {
+            assert!(closed.contains(needle), "{needle}: {closed}");
+        }
+        let unconfirmed = GateError::PublishedUnconfirmed {
+            phase,
+            stage,
+            observed: "old-id".into(),
+            waited: GATE_LOCK_WAIT,
+        }
+        .to_string();
+        for needle in ["left in place", ".gates-07.lock", "devflow gate list"] {
+            assert!(unconfirmed.contains(needle), "{needle}: {unconfirmed}");
+        }
+        let timeout = GateError::GateLockTimeout {
+            phase,
+            waited: GATE_LOCK_WAIT,
+        }
+        .to_string();
+        for needle in [".gates-07.lock", "nothing was changed"] {
+            assert!(timeout.contains(needle), "{needle}: {timeout}");
+        }
+    }
 }
