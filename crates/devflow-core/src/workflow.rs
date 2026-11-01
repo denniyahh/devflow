@@ -8,10 +8,9 @@
 
 use crate::phase_id::PhaseId;
 use crate::state::State;
-#[cfg(any(test, feature = "test-support"))]
-use std::fs::TryLockError;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -292,11 +291,24 @@ pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, Workflow
     Ok(serde_json::from_str(&contents)?)
 }
 
+/// How often a bounded acquisition tries the write lock.
+pub const WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// The wait a repair verb gives the write lock by default: longer than the longest
+/// legitimate closure, 50.1-16's reservation with up to two
+/// [`crate::supervisor::protocol::IO_TIMEOUT`] socket probes, and short enough that
+/// a repair verb always answers.
+pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
+
 /// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.
 ///
 /// DevFlow never replaces or removes it, because a `flock` belongs to an inode
 /// and `state-NN.json` is replaced on every write (D-08). Its name does not start
 /// with `lock-`, so `lock.rs`'s stale-lock sweep leaves it alone.
+///
+/// A holder records `"{pid} {start}\n"` in it for as long as it holds the lock.
+/// The record only names a process in a message: nothing signals or waits on it,
+/// and it does not decide whether the lock is held (R-03).
 fn state_lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!(
         ".{STATE_FILE_PREFIX}{padded}.lock",
@@ -307,11 +319,16 @@ fn state_lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
 /// A held state write lock. Dropping it closes the file, which is the only way
 /// the lock ends: an explicit release would drop it for every duplicate of the
 /// descriptor, including one a forked child has not closed yet.
+///
+/// `file` is `None` only under the `DEVFLOW_TEST_SKIP_WRITE_LOCK` test seam.
 struct WriteLock {
     file: Option<File>,
 }
 
 impl Drop for WriteLock {
+    /// Clear the holder record while the lock is still held, so a non-empty record
+    /// names the current holder. A holder that dies leaves its record behind, and
+    /// a reader then finds the process gone or the lock free.
     fn drop(&mut self) {
         if let Some(file) = &self.file {
             let _ = file.set_len(0);
@@ -319,30 +336,101 @@ impl Drop for WriteLock {
     }
 }
 
-/// Take the phase's state write lock, waiting for as long as it is held.
+/// Take the phase's state write lock: for as long as it is held when `wait` is
+/// `None`, else until `wait` has passed, then [`WorkflowError::WriteLockTimeout`].
 ///
 /// The descriptor is close-on-exec, as std opens every file, so a process spawned
 /// while this is held does not keep the lock.
 fn lock_for_write(
     project_root: &Path,
     phase: PhaseId,
-    _wait: Option<Duration>,
+    wait: Option<Duration>,
 ) -> Result<WriteLock, WorkflowError> {
+    // Only for 50.1-16's negative control, that two launchers both reserve once
+    // the lock is skipped (VALIDATION V-05). A release build has no such read.
+    #[cfg(any(test, feature = "test-support"))]
+    if std::env::var_os("DEVFLOW_TEST_SKIP_WRITE_LOCK").is_some() {
+        return Ok(WriteLock { file: None });
+    }
     ensure_devflow_dir(&devflow_dir(project_root))?;
+    let path = state_lock_path(project_root, phase);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(state_lock_path(project_root, phase))?;
+        .open(&path)?;
+    match wait {
+        None => block_on_write_lock(&file)?,
+        Some(wait) => poll_for_write_lock(&file, &path, phase, wait)?,
+    }
+    record_write_lock_holder(&file);
+    Ok(WriteLock { file: Some(file) })
+}
+
+fn block_on_write_lock(file: &File) -> Result<(), WorkflowError> {
     // `flock` returns EINTR when a signal handler without SA_RESTART runs.
     loop {
         match file.lock() {
-            Ok(()) => return Ok(WriteLock { file: Some(file) }),
+            Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// Try the lock every [`WRITE_LOCK_POLL`] until `wait` has passed; a zero `wait`
+/// makes one attempt.
+fn poll_for_write_lock(
+    file: &File,
+    path: &Path,
+    phase: PhaseId,
+    wait: Duration,
+) -> Result<(), WorkflowError> {
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let remaining = wait.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(WorkflowError::WriteLockTimeout {
+                phase,
+                waited: wait,
+                holder: recorded_write_lock_holder(path),
+            });
+        }
+        std::thread::sleep(WRITE_LOCK_POLL.min(remaining));
+    }
+}
+
+/// Record this process as the lock's holder. Written at an explicit offset, so the
+/// descriptor's own offset never matters (R-01). The record is a diagnostic, so a
+/// failure to write it is a warning and the lock is still held.
+fn record_write_lock_holder(file: &File) {
+    let pid = std::process::id();
+    let record = match crate::agent::process_start_time(pid) {
+        Some(start) => format!("{pid} {start}\n"),
+        None => format!("{pid}\n"),
+    };
+    if let Err(error) = file
+        .set_len(0)
+        .and_then(|()| file.write_all_at(record.as_bytes(), 0))
+    {
+        warn!("could not record the state write lock's holder: {error}");
+    }
+}
+
+/// The pid in the lock file's record, when that process is live with the recorded
+/// start time. An empty, torn, start-less or dead record is `None`, as is a holder
+/// that has acquired the lock and not yet recorded itself.
+fn recorded_write_lock_holder(lock_path: &Path) -> Option<u32> {
+    let record = std::fs::read_to_string(lock_path).ok()?;
+    let (pid, start) = record.strip_suffix('\n')?.split_once(' ')?;
+    let (pid, start) = (pid.parse().ok()?, start.parse().ok()?);
+    crate::agent::is_same_process(pid, start).then_some(pid)
 }
 
 /// [`update_state`] for a caller that must see what is on disk before deciding,
@@ -351,12 +439,37 @@ fn lock_for_write(
 /// and a value for the caller.
 ///
 /// `apply` runs with the lock held, under the same contract as [`update_state`].
+/// This blocks while the lock is held, for the same callers as [`update_state`].
 pub fn update_state_with<T, E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
     apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
 ) -> Result<T, E> {
-    let _lock = lock_for_write(project_root, phase, None)?;
+    update_state_with_wait(project_root, phase, None, apply)
+}
+
+/// [`update_state_with`] for the verbs whose job is to diagnose a wedge: `stop`,
+/// `recover`, `status` and `doctor`. A SIGSTOPped or D-state holder must not hang
+/// them, so this tries the lock until `wait` has passed
+/// ([`WRITE_LOCK_REPAIR_WAIT`] is their default) and then returns
+/// [`WorkflowError::WriteLockTimeout`] naming the holder, with `apply` not run and
+/// nothing written.
+pub fn update_state_with_within<T, E: From<WorkflowError>>(
+    project_root: &Path,
+    phase: PhaseId,
+    wait: Duration,
+    apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
+) -> Result<T, E> {
+    update_state_with_wait(project_root, phase, Some(wait), apply)
+}
+
+fn update_state_with_wait<T, E: From<WorkflowError>>(
+    project_root: &Path,
+    phase: PhaseId,
+    wait: Option<Duration>,
+    apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
+) -> Result<T, E> {
+    let _lock = lock_for_write(project_root, phase, wait)?;
     let existing = match load_state(project_root, phase) {
         Ok(state) => Existing::Loaded(state),
         Err(WorkflowError::MissingState(_)) => Existing::Missing,
@@ -377,45 +490,41 @@ pub fn update_state_with<T, E: From<WorkflowError>>(
     Ok(value)
 }
 
-/// The bounded form of [`update_state_with`].
-pub fn update_state_with_within<T, E: From<WorkflowError>>(
-    _project_root: &Path,
-    phase: PhaseId,
-    wait: Duration,
-    _apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
-) -> Result<T, E> {
-    Err(WorkflowError::WriteLockTimeout {
-        phase,
-        waited: wait,
-        holder: None,
-    }
-    .into())
-}
-
-/// How often a bounded acquisition tries the write lock.
-pub const WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
-
-/// The default wait for a repair verb.
-pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
-
-/// The state of a phase's write lock.
+/// What [`write_lock_status`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteLockStatus {
-    /// Nothing holds the lock.
+    /// Nothing holds the lock, or its file does not exist yet.
     Free,
     /// Something holds the lock.
     Held {
-        /// The holder, when its record names a live process.
+        /// The holder's pid, when its record names a process that is live with the
+        /// recorded start time.
         pid: Option<u32>,
     },
 }
 
-/// Read the state of a phase's write lock without waiting.
+/// Read the state of the phase's write lock without waiting, for `status` and
+/// `doctor`. It creates no file. It asks for a shared lock, so two concurrent reads
+/// never report each other as the holder.
 pub fn write_lock_status(
-    _project_root: &Path,
-    _phase: PhaseId,
+    project_root: &Path,
+    phase: PhaseId,
 ) -> Result<WriteLockStatus, WorkflowError> {
-    Ok(WriteLockStatus::Free)
+    let path = state_lock_path(project_root, phase);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WriteLockStatus::Free);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(WriteLockStatus::Free),
+        Err(TryLockError::WouldBlock) => Ok(WriteLockStatus::Held {
+            pid: recorded_write_lock_holder(&path),
+        }),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
 }
 
 /// Change the state on disk: take the phase's write lock, re-read the state, run
@@ -431,6 +540,13 @@ pub fn write_lock_status(
 /// process, wait on a gate or an agent, or take another lock. That includes this
 /// lock: calling this or [`clear_state`] for the same phase from inside `apply`
 /// deadlocks.
+///
+/// This blocks while the lock is held, and is for workflow writers: supervisors,
+/// launchers, gate writers and outcome handlers. A closure is short by contract, a
+/// holder that dies releases the lock, and a SIGSTOPped holder delays them only
+/// until it is continued or killed, where a timeout would turn a stalled peer into
+/// a failed stage transition. A verb that diagnoses a wedge uses
+/// [`update_state_with_within`], [`clear_state_within`] or [`write_lock_status`].
 pub fn update_state<T, E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
@@ -546,23 +662,24 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
 /// file naming the same phase and orphaned write temps. Returns whether this
 /// call removed any file, so a caller can report only what it cleaned.
 ///
-/// Takes the write lock, so a removal never interleaves with an update.
+/// Takes the write lock, so a removal never interleaves with an update. This blocks
+/// while the lock is held, for the same callers as [`update_state`].
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
-    let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, false);
+    let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, None, false);
     result.map(|()| removed)
 }
 
-/// The bounded form of [`clear_state`].
+/// [`clear_state`] for the verbs whose job is to diagnose a wedge, as
+/// [`update_state_with_within`]: on [`WorkflowError::WriteLockTimeout`] nothing was
+/// removed.
 pub fn clear_state_within(
-    _project_root: &Path,
+    project_root: &Path,
     phase: PhaseId,
     wait: Duration,
 ) -> Result<bool, WorkflowError> {
-    Err(WorkflowError::WriteLockTimeout {
-        phase,
-        waited: wait,
-        holder: None,
-    })
+    let (removed, result) =
+        clear_state_with_partial_result_impl(project_root, phase, Some(wait), false);
+    result.map(|()| removed)
 }
 
 /// Clear state for recovery while retaining removals that happened before an
@@ -571,12 +688,13 @@ pub(crate) fn clear_state_with_partial_result(
     project_root: &Path,
     phase: PhaseId,
 ) -> (bool, Result<(), WorkflowError>) {
-    clear_state_with_partial_result_impl(project_root, phase, true)
+    clear_state_with_partial_result_impl(project_root, phase, None, true)
 }
 
 fn clear_state_with_partial_result_impl(
     project_root: &Path,
     phase: PhaseId,
+    wait: Option<Duration>,
     report_temp_removal_failure: bool,
 ) -> (bool, Result<(), WorkflowError>) {
     // Nothing to remove, so no lock file to leave behind in a project DevFlow has
@@ -584,7 +702,7 @@ fn clear_state_with_partial_result_impl(
     if !devflow_dir(project_root).exists() {
         return (false, Ok(()));
     }
-    let _lock = match lock_for_write(project_root, phase, None) {
+    let _lock = match lock_for_write(project_root, phase, wait) {
         Ok(lock) => lock,
         Err(error) => return (false, Err(error)),
     };

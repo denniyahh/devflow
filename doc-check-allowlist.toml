@@ -67,6 +67,11 @@ reason = "Test-only: #[cfg(test)] hold points in the devflow-core monitor (50-24
 
 [[exceptions]]
 kind = "source_to_docs"
+token = "DEVFLOW_TEST_SKIP_WRITE_LOCK"
+reason = "Test-only: under the devflow-core test-support feature, workflow::lock_for_write takes no lock while it is set, used only for the negative control that two launchers both reserve once the state write lock is skipped; compiled out of release builds, so it is not an operator setting (Phase 50.1, plan 50.1-04)."
+
+[[exceptions]]
+kind = "source_to_docs"
 token = "DEVFLOW_TEST_STOPPED_OUTCOME_HOLD"
 reason = "Test-only: under the devflow-core test-support feature, Supervisor::wait_agent waits while it names a path that does not exist, after a stopped agent exits and before the stopped outcome is decided, so a CLI test can order that decision against the next stage's publish; compiled out of release builds, so it is not an operator setting (Phase 50, plan 50-23)."
 
