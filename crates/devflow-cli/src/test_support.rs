@@ -269,7 +269,7 @@ pub(crate) fn commit_on_feature_branch(root: &Path, phase: PhaseId, label: &str)
 /// (`mode::MAX_PREFLIGHT_RETRIES`) bounds the recursion regardless, so
 /// an unconditionally-failing preflight now terminates in a logged
 /// `abort` instead of blocking forever on a second gate's
-/// `poll_response`.
+/// `Gates::await_answer`.
 pub(crate) struct AlwaysFailAdapter;
 
 impl agents::AgentDriver for AlwaysFailAdapter {
@@ -298,7 +298,7 @@ impl agents::AgentDriver for AlwaysFailAdapter {
 /// pass. An adapter that fails unconditionally would make a recursive
 /// `launch_stage` retry fail its OWN preflight check too, recursing into
 /// a second gate this test never seeds a response for — blocking on
-/// `poll_response` instead of asserting.
+/// `Gates::await_answer` instead of asserting.
 pub(crate) struct FailOnceAdapter {
     failed_once: std::cell::Cell<bool>,
 }

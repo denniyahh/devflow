@@ -11,7 +11,7 @@
 
 mod common;
 
-use devflow_core::gates::{GateAction, GateFile, GateId, Gates};
+use devflow_core::gates::{AwaitOutcome, GateAction, GateFile, GateId, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -72,7 +72,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, timeout_secs: u64, what: &str) 
 /// `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` (test-only, read here — never by
 /// production code): how long this test's patience with the spawned child
 /// extends before the bounded wait below panics instead of hanging CI
-/// indefinitely. Defaults comfortably above `Gates::poll_response`'s 60s
+/// indefinitely. Defaults comfortably above `Gates::await_answer`'s 60s
 /// backoff cap; tighten via the env var in CI if 90s is too generous.
 fn e2e_child_timeout() -> Duration {
     let secs: u64 = std::env::var("DEVFLOW_E2E_CHILD_TIMEOUT_SECS")
@@ -150,7 +150,7 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
 const AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// The plan's core claim: a gate older than the default threshold is answered
-/// with a rejection, and a real `Gates::poll_response` thread — the exact
+/// with a rejection, and a real `Gates::await_answer` thread — the exact
 /// live-poller seam `run_gate_with_timeout` blocks on in production — picks
 /// it up and resolves to `GateAction::Abort`.
 #[test]
@@ -172,11 +172,14 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
     std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
 
-    Gates::write_gate(root, phase, stage, "approve merge?").unwrap();
+    let gate = Gates::open_gate(root, phase, stage, "approve merge?")
+        .unwrap()
+        .gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
     std::thread::scope(|scope| {
-        let poller = scope.spawn(move || Gates::poll_response(root, phase, stage, 30));
+        let waiter =
+            scope.spawn(move || Gates::await_answer(root, phase, stage, &gate, 30, || false));
 
         let output = common::hermetic_devflow(&home)
             .args(["gate", "sweep", "--root"])
@@ -190,10 +193,13 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let response = poller
-            .join()
-            .expect("poller thread")
-            .expect("a live Gates::poll_response must observe the sweep's response within 30s");
+        let outcome = waiter.join().expect("waiter thread");
+        let AwaitOutcome::Answered(answer) = outcome else {
+            panic!(
+                "a live Gates::await_answer must observe the sweep's answer within 30s: {outcome:?}"
+            );
+        };
+        let response = answer.response;
         assert!(
             !response.approved,
             "a reap must never write an approval (T-23-41)"
