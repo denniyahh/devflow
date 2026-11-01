@@ -8995,6 +8995,89 @@ mod tests {
         )
     }
 
+    /// D-01 through the real launch path: the launcher reserves, the `__monitor`
+    /// re-exec adopts the descriptor at fd 3, and after `launch_stage` has
+    /// returned (the launcher's copy dropped) the supervisor alone holds the
+    /// lock, under its own intact identity record (R-01), with no take temp left
+    /// behind (R-06). The supervisor removes the file as its last act.
+    #[test]
+    fn a_launched_supervisor_holds_its_liveness_lock_after_the_launcher_drops_it() {
+        use devflow_core::liveness::{self, Held};
+        const NAME: &str = "pipeline_launch::tests::a_launched_supervisor_holds_its_liveness_lock_after_the_launcher_drops_it";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let mut state = State::new(
+            PhaseId::new(5007),
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+
+        let result = launch_stage(&mut state, None, None);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        result.expect("the launch succeeds");
+        let record = state.supervisor.clone().expect("the launch records it");
+        let path = liveness::launch_liveness_path(root, &record.launch_id)
+            .expect("a recorded launch id has the launch id format");
+
+        assert_eq!(
+            liveness::probe(&path).expect("probe"),
+            Held::Live,
+            "the supervisor must hold the lock after the launcher dropped its copy"
+        );
+        let socket = devflow_core::supervisor::SocketPath::new(record.socket_path.clone())
+            .expect("the recorded socket path");
+        let supervisor_pid = devflow_core::supervisor::read_sidecar(&socket.sidecar_path())
+            .expect("read the sidecar")
+            .supervisor_pid;
+        assert_ne!(
+            supervisor_pid,
+            std::process::id(),
+            "the supervisor is its own process"
+        );
+        let holder = liveness::live_holder(&path).expect("the holder's record reads");
+        assert!(
+            matches!(holder, Some((pid, Some(_))) if pid == supervisor_pid),
+            "the adopter's record must name supervisor {supervisor_pid}, got {holder:?}"
+        );
+        let temps: Vec<String> = std::fs::read_dir(root.join(".devflow"))
+            .expect("read .devflow")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(liveness::HOLD_TEMP_SUFFIX))
+            .collect();
+        assert_eq!(temps, Vec::<String>::new(), "no take temp is left behind");
+
+        let stopped =
+            devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                stopped,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "the supervisor stops through its socket: {stopped:?}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while liveness::probe(&path).expect("probe") != Held::Missing {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exited supervisor must have removed its liveness file, probe reads {:?}",
+                liveness::probe(&path)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Names which run of `a_failed_monitor_spawn_clears_the_supervisor_record`
     /// a child is (`fail` or `ok`). Not a DevFlow setting, so it carries no
     /// `DEVFLOW_` prefix the doc check would require documented.
