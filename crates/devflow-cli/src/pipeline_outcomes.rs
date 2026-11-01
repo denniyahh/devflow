@@ -925,9 +925,8 @@ pub(crate) fn handle_stage_failure(
     );
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
-            // CR-01: clean up the stale gate/response/ack before retrying so
-            // the retry cannot silently consume the prior response.
-            let _ = Gates::cleanup(project_root, state.phase, stage);
+            // CR-01: close the gate before retrying; its answer is spent.
+            let _ = Gates::close(project_root, state.phase, stage);
             state.gate_pending = false;
             launch_stage(state, None, Some(stage))
         }
@@ -936,7 +935,7 @@ pub(crate) fn handle_stage_failure(
             // target before planning exists for a Define/Plan failure
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
-            let _ = Gates::cleanup(project_root, state.phase, stage);
+            let _ = Gates::close(project_root, state.phase, stage);
             launch_stage(state, None, Some(stage))
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -2331,12 +2330,12 @@ mod tests {
     ///
     /// A gate response is re-seeded at the top of every loop iteration (not
     /// just once before the loop) so it survives `prepare_loop_back_to_code`'s
-    /// `Gates::cleanup(.., Stage::Validate)` — which fires on every ordinary
+    /// `Gates::close(.., Stage::Validate)` — which fires on every ordinary
     /// loop-back cycle once `state.stage` is `Validate` and would otherwise
-    /// delete a response written only once up front before the final,
+    /// remove a response written only once up front before the final,
     /// gate-triggering cycle ever gets to read it. With it re-seeded every
     /// iteration, the forced gate on the final cycle resolves immediately via
-    /// `Gates::poll_response` finding an already-written file, instead of
+    /// the gate wait finding an already-written file, instead of
     /// waiting out the (default 7-day) gate timeout. PATH is neutralized
     /// under `ENV_MUTEX` so neither `handle_validate_outcome`'s loop-back nor
     /// `transition()`'s own `launch_stage` call risk spawning a real agent
@@ -5449,8 +5448,8 @@ mod tests {
     /// hook — with `DEVFLOW_NON_SILENT_GATE=1` since Auto mode would not
     /// normally gate a Code failure (unexpected/never-silent gate). The
     /// notify sentinel is a side effect distinct from the gate file itself,
-    /// so it survives even though `Gates::cleanup` removes the gate/
-    /// response/ack once the gate resolves. This test sets
+    /// so it survives even though `Gates::close` removes the gate/
+    /// answer/claim once the gate resolves. This test sets
     /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
     #[test]
     // D-09 (48-09): mutates `DEVFLOW_GATE_NOTIFY_CMD` process-wide.

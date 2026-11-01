@@ -2124,7 +2124,7 @@ fn park_auto_rescan_repair(
             _ => reason,
         });
     })?;
-    Gates::cleanup(project_root, state.phase, stage)?;
+    Gates::close(project_root, state.phase, stage)?;
     events::emit(
         project_root,
         state.phase,
@@ -2846,11 +2846,9 @@ pub(crate) fn advance_with(
                                 // — and persist it before relaunching, because
                                 // the next resume runs in a separate process.
                                 GateAction::Advance => {
-                                    // CR-01: drop the gate/response/ack now, so
-                                    // a later Code gate in this run cannot
-                                    // silently consume this approval as its own
-                                    // answer.
-                                    let _ = Gates::cleanup(project_root, phase, stage);
+                                    // CR-01: close the gate now. The approval
+                                    // was bound to this gate's id and is spent.
+                                    let _ = Gates::close(project_root, phase, stage);
                                     let approval = recorded_approval(&current);
                                     commit(&mut state, |s| {
                                         s.gate_pending = false;
@@ -2886,8 +2884,13 @@ pub(crate) fn advance_with(
                                     }
                                     // Supervise may use the ordinary repair
                                     // loop: its next Code run is not
-                                    // unattended, and the unchanged response
-                                    // is the human's request to repair.
+                                    // unattended. D-07: this rejection answered
+                                    // "approve the changed checkpoint set?". The
+                                    // stage-failure gate that follows asks a
+                                    // different question, where any non-abort
+                                    // answer relaunches the stage, so it opens
+                                    // under its own id and waits for its own
+                                    // answer.
                                     reason = Some(augment_unresolved_checkpoint_reason(
                                         reason,
                                         &format!(

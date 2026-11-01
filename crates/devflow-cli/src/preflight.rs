@@ -1417,7 +1417,7 @@ pub(crate) fn run_preflight(
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
-                let _ = Gates::cleanup(project_root, state.phase, stage);
+                let _ = Gates::close(project_root, state.phase, stage);
                 // 48-15 / R-8, T-48-15-01, T-48-07-02: in Auto mode a Code
                 // launch whose plans declare a human-only checkpoint is
                 // REFUSED, so the pass path below never runs for it. THIS is
@@ -1456,7 +1456,7 @@ pub(crate) fn run_preflight(
             GateAction::LoopBack(_) => {
                 // D-18f: "I will fix it, then retry" — re-check deliberately,
                 // bounded by the ceiling above.
-                let _ = Gates::cleanup(project_root, state.phase, stage);
+                let _ = Gates::close(project_root, state.phase, stage);
                 launch_stage(state, None, None)?;
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason)?,
@@ -2481,7 +2481,7 @@ mod tests {
     /// separately. `state.preflight_retries` starts one below the ceiling —
     /// exercising the bound via a REAL recursive `run_preflight` call
     /// (through `launch_stage`) rather than simulating multiple cycles: with
-    /// only ONE gate response ever seeded, and `Gates::poll_response`
+    /// only ONE gate response ever seeded, and the gate wait
     /// blocking synchronously in this same thread, nothing could seed a
     /// SECOND response file mid-recursion inside one call stack — deferring
     /// to the ceiling on the very next cycle instead genuinely exercises
@@ -2877,7 +2877,7 @@ mod tests {
         }
 
         // The terminus is deliberately NOT asserted as Ok. LoopBack re-enters
-        // `run_preflight`, which refuses again; its own `Gates::cleanup` has
+        // `run_preflight`, which refuses again; its own `Gates::close` has
         // removed the one seeded response, so the next cycle's gate reaches
         // the bounded 2s timeout and that Err propagates. Which terminus the
         // recursion reaches is `run_preflight_loopback_bounds_recursion`'s
