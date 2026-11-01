@@ -1,6 +1,13 @@
 //! Durable file operations for state and gate records (Phase 50.1 D-09).
-#![allow(dead_code, reason = "RED scaffold: no caller until the GREEN commit")]
+//!
+//! `replace_durably` is D-09's replace: fsync a temp file, rename it over the
+//! target, fsync the directory, so a crash leaves the old bytes or the new bytes
+//! and a power loss cannot lose the rename.
+//!
+//! Not established: these helpers make the calls, in order, and the `cfg(test)`
+//! recorder proves that. Durability across a real power loss is not tested.
 
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 #[cfg(test)]
@@ -9,12 +16,59 @@ use std::sync::atomic::AtomicU64;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// RED scaffold: the temp-and-rename the old writers did, with no fsync.
-pub(crate) fn replace_durably(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// Fsync a directory, making a create, rename or unlink inside it durable.
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()?;
+    #[cfg(test)]
+    record(Synced::Dir(dir.to_path_buf()));
+    Ok(())
+}
+
+fn sync_file(file: &File, path: &Path) -> std::io::Result<()> {
+    file.sync_all()?;
+    #[cfg(test)]
+    record(Synced::File(path.to_path_buf()));
+    #[cfg(not(test))]
+    let _ = path;
+    Ok(())
+}
+
+/// The directory holding `path`; a bare file name lives in the current directory.
+fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Create a sibling temp in DevFlow's shared `.{name}.{pid}.{n}.tmp` shape, which
+/// every cleanup sweep matches on, write `contents` to it and fsync it. The temp
+/// is removed on any error.
+fn write_synced_temp(path: &Path, contents: &[u8]) -> std::io::Result<std::path::PathBuf> {
     let (tmp, mut file) = crate::workflow::create_unique_temp(path, std::process::id(), &TEMP_SEQ)?;
-    file.write_all(contents)?;
-    drop(file);
-    std::fs::rename(&tmp, path)
+    if let Err(error) = file
+        .write_all(contents)
+        .and_then(|()| sync_file(&file, &tmp))
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(tmp)
+}
+
+/// Replace `path` with `contents`: temp, fsync, rename, directory fsync.
+///
+/// An error after the rename (the directory fsync failed) leaves the new bytes in
+/// place: the caller is told the write is not known durable, not that it failed
+/// to happen.
+pub(crate) fn replace_durably(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = write_synced_temp(path, contents)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fsync_dir(parent_of(path))
 }
 
 /// One fsync the code under test made, in call order.
@@ -30,6 +84,11 @@ pub(crate) enum Synced {
 #[cfg(test)]
 thread_local! {
     static SYNCED: std::cell::RefCell<Vec<Synced>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record(entry: Synced) {
+    SYNCED.with(|synced| synced.borrow_mut().push(entry));
 }
 
 /// Drain and return this thread's recorded fsyncs.
