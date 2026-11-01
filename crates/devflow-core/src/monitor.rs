@@ -414,10 +414,22 @@ impl Reservation {
     /// # Errors
     /// The socket path does not fit, or the lock could not be taken.
     pub fn new(ctx: &LaunchContext, state: &State) -> Result<Self, MonitorError> {
+        Self::for_phase(ctx, &state.project_root, state.phase)
+    }
+
+    /// [`Reservation::new`] for a launcher that has no state yet: it reserves
+    /// before it reads one (D-01).
+    ///
+    /// # Errors
+    /// The socket path does not fit, or the lock could not be taken.
+    pub fn for_phase(
+        ctx: &LaunchContext,
+        project_root: &Path,
+        phase: PhaseId,
+    ) -> Result<Self, MonitorError> {
         let launch_id = crate::supervisor::new_launch_id();
-        let socket =
-            SocketPath::for_launch(&ctx.cache_dir, &state.project_root, state.phase, &launch_id)?;
-        let path = liveness_path_of(&state.project_root, &launch_id)?;
+        let socket = SocketPath::for_launch(&ctx.cache_dir, project_root, phase, &launch_id)?;
+        let path = liveness_path_of(project_root, &launch_id)?;
         let failed = |err: std::io::Error| liveness_error(&launch_id, err);
         if let Some(dir) = path.parent() {
             crate::workflow::ensure_devflow_dir(dir).map_err(failed)?;
@@ -452,6 +464,19 @@ impl Reservation {
             self.socket_path().to_path_buf(),
             self.liveness_path().to_path_buf(),
         )
+    }
+
+    /// Give back a reservation nothing was spawned from: remove its liveness file,
+    /// then drop the hold. Never `unlock()`: only dropping releases the lock.
+    pub fn discard(self) {
+        if let Err(err) = std::fs::remove_file(self.liveness_path())
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "could not remove the liveness file {}: {err}",
+                self.liveness_path().display()
+            );
+        }
     }
 }
 

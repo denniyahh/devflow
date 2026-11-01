@@ -1248,6 +1248,39 @@ pub(crate) fn test_hold(point: &str) {
     }
 }
 
+/// Test-only hold point (50.1-16) for a launcher, which [`test_hold`] never holds
+/// outside an engaged advance: when `DEVFLOW_TEST_LAUNCH_HOLD` is `<point>:<path>`
+/// for this `point`, append a line to `<path>.held` and wait (bounded by
+/// [`TEST_HOLD_WAIT`]) until `<path>` exists. One line per arrival, so a test can
+/// count the launchers that reached it. Points: `guarded`, after the live-run guard
+/// inside the reservation's write-lock closure, and `reserved`, after that write.
+/// Compiled out of non-test builds, together with every call.
+#[cfg(test)]
+pub(crate) fn launch_test_hold(point: &str) {
+    use std::io::Write as _;
+    let Ok(hold) = std::env::var("DEVFLOW_TEST_LAUNCH_HOLD") else {
+        return;
+    };
+    let Some((at, path)) = hold.split_once(':') else {
+        return;
+    };
+    if at != point {
+        return;
+    }
+    if let Ok(mut held) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{path}.held"))
+    {
+        let _ = writeln!(held, "{point}");
+    }
+    let release = Path::new(path);
+    let deadline = std::time::Instant::now() + TEST_HOLD_WAIT;
+    while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The `__monitor` process body (50-11): supervise the stage's agent under
 /// an addressed supervisor (`monitor::run_supervised_stage`), then, only
 /// when the agent completed on its own, advance the stage machine
@@ -1326,6 +1359,12 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
 
     let result = match run.outcome {
         AgentOutcome::Completed(_) if advance => {
+            wait_while_launch_is_pending(
+                project_root,
+                phase,
+                &invocation.launch_id,
+                LAUNCH_RECORD_WAIT,
+            );
             let stop_guard = StopTokenGuard::engage(run.supervisor.token());
             let advanced = advance_for_stage(project_root, Some(phase), stage);
             // The advance has returned and released the per-phase lock. Only
@@ -1575,11 +1614,41 @@ fn record_supervisor_stop(project_root: &Path, phase: PhaseId, launch_id: &str) 
 /// How long the supervise-only entry waits for its launcher's record.
 const LAUNCH_RECORD_WAIT: Duration = Duration::from_secs(15);
 
+/// A fast agent's advance must not run before its launcher promotes it: the
+/// launcher's publish save would then overwrite whatever record the advance wrote.
+/// `start` and `resume` no longer hold the long lock that ordered the two (D-08), so
+/// wait (bounded by `wait`) while the state names `launch_id` only as pending. A
+/// launcher that died never promotes, and the advance goes on when the wait expires.
+/// A launch with no reservation (a stage handoff) does not wait: its launcher holds
+/// the advance lock across the publish. 50.1-19 replaces this with the promotion watch.
+fn wait_while_launch_is_pending(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    wait: Duration,
+) {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let pending = workflow::load_state(project_root, phase)
+            .ok()
+            .and_then(|state| state.pending_supervisor)
+            .is_some_and(|pending| pending.launch_id == launch_id);
+        if !pending {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!("launch {launch_id} was not promoted within {wait:?}; advancing anyway");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The supervise-only path (test build): keep serving until the launcher has
 /// recorded THIS launch in the state file (bounded), so a launcher still
 /// waiting for the publish cannot miss a socket that finished first. A
-/// production supervisor gets the same ordering from `advance`, which takes
-/// the per-phase lock its launcher holds until after the publish.
+/// production supervisor gets the same ordering from
+/// [`wait_while_launch_is_pending`].
 fn wait_for_launch_record(project_root: &Path, phase: PhaseId, launch_id: &str) {
     let deadline = std::time::Instant::now() + LAUNCH_RECORD_WAIT;
     while std::time::Instant::now() < deadline {
@@ -1675,10 +1744,87 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
 /// `devflow resume`, the wrong remedy. With no record the run reads not
 /// launched, and the launch's own error message is the remedy.
 ///
+/// A reservation the failed launch made ends with it: a `pending_supervisor` naming
+/// this launch is cleared too (D-01).
+///
 /// Called only on a failure path, never before the save that records a new
 /// record (50-13's rule).
 fn record_failed_launch(state: &mut State) -> Result<(), CliError> {
-    commit(state, |s| s.supervisor = None)
+    let failed = state.pending_supervisor.clone();
+    commit(state, |s| {
+        s.supervisor = None;
+        if failed.is_some() && s.pending_supervisor == failed {
+            s.pending_supervisor = None;
+        }
+    })
+}
+
+thread_local! {
+    /// The reservation `start` or `resume` made at its top, until the launch that
+    /// spawns from it takes it ([`take_held_reservation`]). Per thread because a
+    /// launcher runs on one thread and a test may run two launchers in one process.
+    static HELD_RESERVATION: std::cell::RefCell<Option<monitor::Reservation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hand `reservation` to the launch this thread runs next.
+pub(crate) fn hold_reservation(reservation: monitor::Reservation) {
+    HELD_RESERVATION.with_borrow_mut(|held| *held = Some(reservation));
+}
+
+/// The reservation [`hold_reservation`] was given, if nothing has taken it yet.
+fn take_held_reservation() -> Option<monitor::Reservation> {
+    HELD_RESERVATION.with_borrow_mut(Option::take)
+}
+
+/// Give back the reservation this thread still holds: a launch that failed, or that
+/// returned without spawning from it. A no-op once a launch has taken it.
+///
+/// The state stops naming it, and a state the reservation itself `created` (no run
+/// was ever written into it) is removed. The liveness lock is released last, so no
+/// other launcher can reserve this phase in between. A failure here is only warned
+/// about: what is left reads abandoned, and the next launch clears it.
+pub(crate) fn abandon_reservation(project_root: &Path, phase: PhaseId, created: bool) {
+    let Some(reservation) = take_held_reservation() else {
+        return;
+    };
+    if let Err(err) = clear_reservation(project_root, phase, reservation.launch_id(), created) {
+        eprintln!(
+            "warning: could not clear launch reservation {} from phase {phase}'s state: {err}",
+            reservation.launch_id()
+        );
+    }
+    reservation.discard();
+}
+
+/// The state half of [`abandon_reservation`].
+fn clear_reservation(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    created: bool,
+) -> Result<(), CliError> {
+    let remove_state = workflow::update_state_with(project_root, phase, |existing| {
+        let workflow::Existing::Loaded(mut state) = existing else {
+            return Ok::<_, CliError>((None, false));
+        };
+        let names_it = state
+            .pending_supervisor
+            .as_ref()
+            .is_some_and(|pending| pending.launch_id == launch_id);
+        if !names_it {
+            return Ok((None, false));
+        }
+        if created {
+            return Ok((None, true));
+        }
+        state.pending_supervisor = None;
+        Ok((Some(state), false))
+    })?;
+    if remove_state {
+        workflow::clear_state(project_root, phase)?;
+    }
+    Ok(())
 }
 
 /// The tail of [`launch_stage_inner`]: validate the agent binary, archive
@@ -1862,6 +2008,7 @@ fn publish_record<E: Into<CliError>>(
     if let Err(err) = save(state) {
         return Err(shut_down_unrecorded(state, &record, err.into()));
     }
+    promote_pending(state);
     if successor_runs_on(&record.socket_path) {
         return Ok(PublishOutcome::HandedOff);
     }
@@ -1875,12 +2022,27 @@ fn publish_record<E: Into<CliError>>(
     Ok(PublishOutcome::SuccessorAlreadyEnded)
 }
 
-/// [`publish_record`]'s production save: the record and, once `publish_record` has
-/// set one, its stop. It only ever sets `stopped`: a `stop` another writer landed
-/// while this launch ran is on disk and is not this launcher's to clear.
+/// The publish's promotion (D-01): the reservation ends once the state records the
+/// launch it reserved. A reservation naming another launch stays.
+fn promote_pending(state: &mut State) {
+    let recorded = state.supervisor.as_ref().map(|r| r.launch_id.as_str());
+    let promoted = state
+        .pending_supervisor
+        .as_ref()
+        .is_some_and(|pending| Some(pending.launch_id.as_str()) == recorded);
+    if promoted {
+        state.pending_supervisor = None;
+    }
+}
+
+/// [`publish_record`]'s production save: the record, its promotion and, once
+/// `publish_record` has set one, its stop. It only ever sets `stopped`: a `stop`
+/// another writer landed while this launch ran is on disk and is not this launcher's
+/// to clear.
 fn save_publish_fields(published: &State) -> Result<(), workflow::WorkflowError> {
     workflow::update_state(&published.project_root, published.phase, |s| {
         s.supervisor = published.supervisor.clone();
+        promote_pending(s);
         if published.stopped {
             s.stopped = true;
             s.stop_reason = published.stop_reason.clone();
@@ -2046,10 +2208,23 @@ fn spawn_next_supervisor(
         return Ok(None);
     }
     let spawn_failed = |err| CliError::Message(format!("could not spawn monitor: {err}"));
-    let reservation = monitor::Reservation::new(&ctx, state).map_err(spawn_failed)?;
+    let reservation = match take_held_reservation() {
+        Some(held) if reservation_is_pending(state, &held) => held,
+        held => {
+            if let Some(held) = held {
+                held.discard();
+            }
+            monitor::Reservation::new(&ctx, state).map_err(spawn_failed)?
+        }
+    };
     let published =
-        monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx, &reservation)
-            .map_err(spawn_failed)?;
+        match monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx, &reservation) {
+            Ok(published) => published,
+            Err(err) => {
+                reservation.discard();
+                return Err(spawn_failed(err));
+            }
+        };
     #[cfg(test)]
     test_hold("before_publish");
     // Safe point 3 (50-13): the next supervisor answered its ping but is not
@@ -2066,6 +2241,14 @@ fn spawn_next_supervisor(
         ctx,
         launch_label,
     }))
+}
+
+/// Whether `state` still names `reservation` as its pending supervisor.
+fn reservation_is_pending(state: &State, reservation: &monitor::Reservation) -> bool {
+    state
+        .pending_supervisor
+        .as_ref()
+        .is_some_and(|pending| pending.launch_id == reservation.launch_id())
 }
 
 /// Render the re-scan gate's context: which plan files carry a human-only
@@ -2366,31 +2549,37 @@ pub(crate) fn handle_ambiguous_outcome(
 /// a plain `devflow resume` must not clear an opt-out the operator already
 /// chose.
 ///
-/// Criterion 2's 48-20 guard refuses to resume while the recorded monitor or
-/// agent remains live. It runs under the phase lock before state is loaded or
-/// written; see [`crate::commands::refuse_resume_over_a_live_run`].
+/// The reservation at the top (D-01, D-08) refuses to resume while the phase's
+/// supervisor or agent remains live, and writes the pending record in one step with
+/// that check; see [`crate::commands::reserve_launch`]. A resume that fails, or
+/// returns without spawning from it, gives the reservation back.
 pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
-    let _lock = match lock::acquire(project_root, phase) {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, path: _ }) => {
-            return Err(CliError::Message(format!(
-                "another devflow process (pid {pid}) is already running"
-            )));
-        }
-        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
-    };
-    crate::commands::refuse_resume_over_a_live_run(project_root, phase)?;
-    let state = workflow::load_state(project_root, phase)?;
-    resume_loaded(project_root, phase, state, agent, legacy_claude_launch)
+    let reserved = crate::commands::reserve_launch(
+        project_root,
+        phase,
+        crate::commands::LaunchVerb::Resume,
+        None,
+        devflow_core::registry::cache_dir().as_deref(),
+    )?;
+    hold_reservation(reserved.reservation);
+    let result = resume_loaded(
+        project_root,
+        phase,
+        reserved.state,
+        agent,
+        legacy_claude_launch,
+    );
+    abandon_reservation(project_root, phase, reserved.created);
+    result
 }
 
-/// [`resume`] after its lock, its live-run refusal and its load: `state` is the copy
-/// it loaded, which may already be behind the file.
+/// [`resume`] after its reservation: `state` is the copy that wrote, which may already
+/// be behind the file.
 fn resume_loaded(
     project_root: &Path,
     phase: PhaseId,
@@ -4253,6 +4442,9 @@ mod tests {
 
     #[test]
     fn resume_with_agent_refuses_before_touching_state_when_target_cannot_run_the_stage() {
+        const NAME: &str = "pipeline_launch::tests::\
+             resume_with_agent_refuses_before_touching_state_when_target_cannot_run_the_stage";
+        enter_agent_free_child!(NAME, "codex");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -4288,6 +4480,9 @@ mod tests {
     #[test]
     fn resume_with_agent_refuses_auto_mode_handoff_that_would_fail_the_later_unattended_launch_check()
      {
+        const NAME: &str = "pipeline_launch::tests::\
+             resume_with_agent_refuses_auto_mode_handoff_that_would_fail_the_later_unattended_launch_check";
+        enter_agent_free_child!(NAME, "codex");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -9411,6 +9606,81 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn state_with_pending(root: &Path, phase: PhaseId, launch_id: &str) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            launch_id.to_string(),
+            root.join("pending.sock"),
+            root.join("pending.live"),
+        ));
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// With no long lock between them, a fast agent's advance waits for its launcher's
+    /// promotion, so the launcher's publish cannot overwrite what the advance writes.
+    #[test]
+    fn an_advance_waits_while_its_launch_is_only_pending() {
+        const LAUNCH: &str = "aaaa0000aaaa1610";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1610);
+        state_with_pending(root, phase, LAUNCH);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                workflow::update_state(root, phase, |state| {
+                    state.pending_supervisor = None;
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            });
+            wait_while_launch_is_pending(root, phase, LAUNCH, Duration::from_secs(30));
+            assert_eq!(
+                workflow::load_state(root, phase)
+                    .unwrap()
+                    .pending_supervisor,
+                None,
+                "the wait ends only once the promotion is on disk"
+            );
+        });
+    }
+
+    /// The wait is bounded: a launcher that died never promotes, and the advance goes on.
+    #[test]
+    fn an_advance_stops_waiting_for_a_promotion_when_its_bound_expires() {
+        const LAUNCH: &str = "aaaa0000aaaa1611";
+        const BOUND: Duration = Duration::from_millis(100);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1611);
+        state_with_pending(root, phase, LAUNCH);
+        let started = std::time::Instant::now();
+        wait_while_launch_is_pending(root, phase, LAUNCH, BOUND);
+        assert!(started.elapsed() >= BOUND, "it waited out its bound");
+        assert!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .is_some(),
+            "precondition: the promotion never happened"
+        );
+    }
+
+    /// Another launch's reservation is no reason to wait, so a handoff's supervisor
+    /// does not sit out the bound behind a reservation that is not its own.
+    #[test]
+    fn an_advance_does_not_wait_on_another_launchs_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1612);
+        state_with_pending(root, phase, "bbbb0000bbbb1612");
+        let bound = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        wait_while_launch_is_pending(root, phase, "aaaa0000aaaa1612", bound);
+        assert!(started.elapsed() < bound, "it returned without waiting");
     }
 
     /// Names which run of `a_failed_monitor_spawn_clears_the_supervisor_record`

@@ -35,6 +35,7 @@ use devflow_core::history;
 use devflow_core::liveness;
 use devflow_core::lock;
 use devflow_core::mode::Mode;
+use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::recover;
 use devflow_core::registry;
@@ -404,17 +405,43 @@ pub(crate) fn start(
         return Ok(());
     }
 
-    let _phase_lock = match lock::acquire(project_root, phase) {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, .. }) => {
-            return Err(CliError::Message(format!(
-                "phase {phase}: another devflow process (pid {pid}) holds the per-phase lock \
-                 — refusing to start; nothing was written"
-            )));
-        }
-        Err(err) => return Err(CliError::Message(err.to_string())),
-    };
-    refuse_start_over_a_live_run(project_root, phase)?;
+    // D-01, D-08: the reservation excludes a second launcher. Its guard runs before
+    // any gate cleanup, git mutation or run state, so a refusal changes nothing.
+    let reserved = reserve_launch(
+        project_root,
+        phase,
+        LaunchVerb::Start,
+        Some(&state),
+        registry::cache_dir().as_deref(),
+    )?;
+    let launch_id = reserved.reservation.launch_id().to_string();
+    let mut created = reserved.created;
+    crate::pipeline_launch::hold_reservation(reserved.reservation);
+    let result = start_reserved(
+        project_root,
+        state,
+        force,
+        worktree,
+        &launch_id,
+        &mut created,
+    );
+    crate::pipeline_launch::abandon_reservation(project_root, phase, created);
+    result
+}
+
+/// [`start`] after its reservation: everything that can fail or return without
+/// launching, so `start` gives the reservation back whichever way this ends.
+/// `created` goes `false` once the state file holds this run, not only the
+/// reservation.
+fn start_reserved(
+    project_root: &Path,
+    mut state: State,
+    force: bool,
+    worktree: bool,
+    launch_id: &str,
+    created: &mut bool,
+) -> Result<(), CliError> {
+    let (phase, agent, mode) = (state.phase, state.agent, state.mode);
     set_aside_leftover_gates(project_root, phase, &mut std::io::stderr());
 
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
@@ -727,7 +754,8 @@ pub(crate) fn start(
     // an in-progress state nothing would ever advance. Save first; if the
     // launch fails, clear the just-saved state so `devflow status`/`recover`
     // don't report a phantom run (the failure WR-11 originally targeted).
-    create_run_state(project_root, phase, &state)?;
+    create_run_state(project_root, phase, &mut state, launch_id)?;
+    *created = false;
     events::emit(
         project_root,
         phase,
@@ -748,12 +776,107 @@ pub(crate) fn start(
     Ok(())
 }
 
-/// Write a fresh run's state for `start`, under the write lock. This is the one
-/// documented write of a whole state: it creates the run, replacing any state on
-/// disk (50.1-16 turns this into a check-and-reserve).
-fn create_run_state(project_root: &Path, phase: PhaseId, state: &State) -> Result<(), CliError> {
-    workflow::update_state_with(project_root, phase, |_existing| {
+/// Write a fresh run's state for `start`, under the write lock, over the state its
+/// reservation left. This is the one documented write of a whole state: it replaces
+/// what is on disk, keeping the reservation, and only while the state still names
+/// `launch_id`. If it no longer does, the reservation was cleared, and nothing launches.
+fn create_run_state(
+    project_root: &Path,
+    phase: PhaseId,
+    state: &mut State,
+    launch_id: &str,
+) -> Result<(), CliError> {
+    workflow::update_state_with(project_root, phase, |existing| {
+        let pending = match existing {
+            workflow::Existing::Loaded(reserved) => reserved.pending_supervisor,
+            _ => None,
+        }
+        .filter(|pending| pending.launch_id == launch_id);
+        if pending.is_none() {
+            return Err(CliError::Message(format!(
+                "phase {phase}: launch reservation {launch_id} was cleared while `start` \
+                 prepared the run — nothing was launched"
+            )));
+        }
+        state.pending_supervisor = pending;
         Ok::<_, CliError>((Some(state.clone()), ()))
+    })
+}
+
+/// A launch's reservation, made at the top of `start` and `resume`.
+pub(crate) struct Reserved {
+    /// The launch id and held liveness lock the supervisor will take over.
+    pub(crate) reservation: monitor::Reservation,
+    /// Whether the reservation's write created the state file, so that giving the
+    /// reservation back removes it.
+    pub(crate) created: bool,
+    /// The state as the reservation wrote it.
+    pub(crate) state: State,
+}
+
+/// Record the launch before its supervisor exists (D-01): take a reservation, then
+/// in one write-lock closure run the live-run guard and write
+/// `state.pending_supervisor`, so two launchers cannot both pass the guard (V-05).
+/// `fresh` is `start`'s new state, written when none loads; `resume` passes `None`
+/// and gets its missing-state or load error once the guard has passed.
+///
+/// A refused launch gives the reservation back, so it leaves no liveness file and
+/// changes no state. The closure's only I/O is the guard's bounded probes: no spawn,
+/// hook or gate wait happens under the write lock (D-08).
+pub(crate) fn reserve_launch(
+    project_root: &Path,
+    phase: PhaseId,
+    verb: LaunchVerb,
+    fresh: Option<&State>,
+    cache_dir: Option<&Path>,
+) -> Result<Reserved, CliError> {
+    let ctx = crate::pipeline_launch::launch_context()?;
+    let reservation =
+        monitor::Reservation::for_phase(&ctx, project_root, phase).map_err(|err| {
+            CliError::Message(format!(
+                "could not reserve a launch of phase {phase}: {err}"
+            ))
+        })?;
+    let pending = reservation.pending_record();
+    let written = workflow::update_state_with(project_root, phase, |existing| {
+        refuse_launch_over_a_live_run(project_root, phase, verb, &existing, cache_dir)?;
+        #[cfg(test)]
+        crate::pipeline_launch::launch_test_hold("guarded");
+        let state_file = workflow::state_path(project_root, phase);
+        let (mut next, created, replaced) = match (existing, fresh) {
+            (workflow::Existing::Loaded(state), _) => (state, false, false),
+            (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true, false),
+            (workflow::Existing::Unloadable(_), Some(fresh)) => (fresh.clone(), true, true),
+            (workflow::Existing::Missing, None) => {
+                return Err(workflow::WorkflowError::MissingState(state_file).into());
+            }
+            (workflow::Existing::Unloadable(error), None) => return Err(error.into()),
+        };
+        next.pending_supervisor = Some(pending);
+        Ok::<_, CliError>((
+            Some(next.clone()),
+            (next, created, replaced.then_some(state_file)),
+        ))
+    });
+    let (state, created, replaced) = match written {
+        Ok(written) => written,
+        Err(err) => {
+            reservation.discard();
+            return Err(err);
+        }
+    };
+    if let Some(path) = replaced {
+        println!(
+            "note: replaced the state file {}, which did not load, with this launch's reservation",
+            path.display()
+        );
+    }
+    #[cfg(test)]
+    crate::pipeline_launch::launch_test_hold("reserved");
+    Ok(Reserved {
+        reservation,
+        created,
+        state,
     })
 }
 
@@ -3538,55 +3661,8 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     })
 }
 
-/// Refuse `start` while the phase's run is live (criterion 2, D-01: one
-/// writer per phase). `start` calls this under the per-phase lock and before
-/// any gate cleanup, git mutation or state write, so a refusal writes
-/// nothing. `--force` does not bypass it. See
-/// [`refuse_launch_over_a_live_run`] for what counts as live.
-///
-/// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12):
-/// without a state file the agent pid file is not read, so a live process it
-/// names does not refuse, because `recover --clean` leaves that file behind
-/// and a recycled pid would otherwise block `start` with no DevFlow repair.
-/// The supervisor sockets of this root and phase are still swept.
-///
-/// Out of scope: the lock-free window between agent exit and `advance` taking
-/// the lock stays backlog 999.136. This check says nothing about a gate waiter.
-fn refuse_start_over_a_live_run(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(
-        project_root,
-        phase,
-        LaunchVerb::Start,
-        registry::cache_dir().as_deref(),
-    )
-}
-
-/// Criterion 2, D-01 and D-02's `resume` half, promoted by the operator on
-/// 2026-09-23 as backlog 999.140: `pipeline_launch::resume` calls this just
-/// after it has acquired its phase lock and before it loads or writes state.
-/// The `devflow resume` CLI arm is resume's only production caller; no monitor
-/// or advance path calls resume. An agent that runs `devflow resume` for its
-/// own phase is refused correctly.
-///
-/// Liveness is shared with `start` ([`refuse_launch_over_a_live_run`]).
-/// Without a state file, resume still reports its own missing-state error.
-/// For a state that will not load, the guard finds the run through its
-/// sidecar (R-12, 999.139), and resume then cannot launch anyway because its
-/// own `load_state` fails immediately afterwards.
-pub(crate) fn refuse_resume_over_a_live_run(
-    project_root: &Path,
-    phase: PhaseId,
-) -> Result<(), CliError> {
-    refuse_launch_over_a_live_run(
-        project_root,
-        phase,
-        LaunchVerb::Resume,
-        registry::cache_dir().as_deref(),
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LaunchVerb {
+pub(crate) enum LaunchVerb {
     Start,
     Resume,
 }
@@ -3626,24 +3702,44 @@ impl LaunchVerb {
 /// - **Agent pid file** (unchanged, D-12): a live pid there is live. Pid
 ///   liveness, not identity: a recycled pid gives a fail-closed false
 ///   refusal (Option A, 2026-09-22). Not read without a state file (the
-///   no-state carve-out on [`refuse_start_over_a_live_run`]).
+///   no-state carve-out below).
 ///
 /// A loaded state with no record over a live supervisor (a launcher that
 /// died before saving it, T-50-90/T-50-91) is accepted until Phase 50.1.
+///
+/// Runs on the state [`reserve_launch`]'s closure read (criterion 2, D-01: one
+/// writer per phase), before any gate cleanup, git mutation or state write, so a
+/// refusal writes nothing. `--force` does not bypass it. `resume`'s missing-state
+/// error comes after it; so does its load error, for a state the guard could only
+/// find through its sidecar (R-12, 999.139). Only the `devflow resume` CLI arm
+/// reaches this for `resume`, and an agent that runs it for its own phase is refused
+/// correctly.
+///
+/// No-state carve-out (operator-approved 2026-09-22, unchanged by D-12): without a
+/// state file the agent pid file is not read, so a live process it names does not
+/// refuse, because `recover --clean` leaves that file behind and a recycled pid would
+/// otherwise block `start` with no DevFlow repair. The supervisor sockets of this
+/// root and phase are still swept.
+///
+/// Out of scope: the lock-free window between agent exit and `advance` taking the
+/// lock stays backlog 999.136. This check says nothing about a gate waiter.
 fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
     verb: LaunchVerb,
+    existing: &workflow::Existing,
     cache_dir: Option<&Path>,
 ) -> Result<(), CliError> {
     let state_file = workflow::state_path(project_root, phase);
-    let state = workflow::load_state(project_root, phase).ok();
-    let no_state = state.is_none() && !state_file.exists();
-    let sockets = possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir).map_err(
-        |(dir, why)| {
+    let state = match existing {
+        workflow::Existing::Loaded(state) => Some(state),
+        _ => None,
+    };
+    let no_state = matches!(existing, workflow::Existing::Missing);
+    let sockets =
+        possibly_live_sockets(project_root, phase, state, cache_dir).map_err(|(dir, why)| {
             unlistable_socket_dir_refusal(phase, verb, (&state_file, no_state, &dir), &why)
-        },
-    )?;
+        })?;
     let agent = (!no_state)
         .then(|| agent_pid_from_file(project_root, phase))
         .flatten()
@@ -3835,8 +3931,7 @@ fn unlistable_socket_dir_refusal(
     ))
 }
 
-/// The refusal text for [`refuse_launch_over_a_live_run`]. It fires while the
-/// launcher holds the lock: each live socket is named with the `stop` line
+/// The refusal text for [`refuse_launch_over_a_live_run`]: each live socket is named with the `stop` line
 /// that ends it (50-14), and a live agent pid with the identity checks the
 /// operator must make before signalling it.
 fn live_run_refusal(
@@ -12064,6 +12159,21 @@ mod tests {
         use super::*;
         use supervisor::backstop::BackstopDecision;
 
+        /// The guard over what is on disk now, as `reserve_launch`'s closure sees it.
+        fn refuse_launch_on_disk(
+            root: &Path,
+            phase: PhaseId,
+            verb: LaunchVerb,
+            cache: &Path,
+        ) -> Result<(), CliError> {
+            let existing = match workflow::load_state(root, phase) {
+                Ok(state) => workflow::Existing::Loaded(state),
+                Err(workflow::WorkflowError::MissingState(_)) => workflow::Existing::Missing,
+                Err(error) => workflow::Existing::Unloadable(error),
+            };
+            refuse_launch_over_a_live_run(root, phase, verb, &existing, Some(cache))
+        }
+
         /// A project root whose phase state file exists and will not load.
         fn root_with_an_unloadable_state(phase: PhaseId) -> tempfile::TempDir {
             let root = tempfile::tempdir().unwrap();
@@ -12091,12 +12201,7 @@ mod tests {
             let (listable, result) = without_dac_override(|| {
                 (
                     std::fs::read_dir(&sock).is_ok(),
-                    refuse_launch_over_a_live_run(
-                        root.path(),
-                        phase,
-                        LaunchVerb::Start,
-                        Some(cache.path()),
-                    ),
+                    refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, cache.path()),
                 )
             });
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -12127,12 +12232,8 @@ mod tests {
             let root = root_with_an_unloadable_state(phase);
             let cache = tempfile::tempdir().unwrap();
             assert!(!registry::socket_dir_in(cache.path()).exists());
-            let result = refuse_launch_over_a_live_run(
-                root.path(),
-                phase,
-                LaunchVerb::Resume,
-                Some(cache.path()),
-            );
+            let result =
+                refuse_launch_on_disk(root.path(), phase, LaunchVerb::Resume, cache.path());
             assert!(
                 result.is_ok(),
                 "a missing socket dir is not a refusal: {result:?}"
@@ -12189,12 +12290,7 @@ mod tests {
             assert!(!workflow::state_path(root.path(), phase).exists());
             let (base, _sock) = stop_socket_dir();
             let _alive = serve_unrecorded(base.path(), root.path(), phase);
-            let result = refuse_launch_over_a_live_run(
-                root.path(),
-                phase,
-                LaunchVerb::Start,
-                Some(base.path()),
-            );
+            let result = refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, base.path());
             let Err(CliError::Message(text)) = result else {
                 panic!("a live socket with no state file must refuse: {result:?}");
             };
@@ -12220,12 +12316,7 @@ mod tests {
             let (listable, result) = without_dac_override(|| {
                 (
                     std::fs::read_dir(&sock).is_ok(),
-                    refuse_launch_over_a_live_run(
-                        root.path(),
-                        phase,
-                        LaunchVerb::Start,
-                        Some(cache.path()),
-                    ),
+                    refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, cache.path()),
                 )
             });
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -12253,14 +12344,8 @@ mod tests {
             let phase = PhaseId::new(1505);
             let root = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
-            let guard = || {
-                refuse_launch_over_a_live_run(
-                    root.path(),
-                    phase,
-                    LaunchVerb::Start,
-                    Some(cache.path()),
-                )
-            };
+            let guard =
+                || refuse_launch_on_disk(root.path(), phase, LaunchVerb::Start, cache.path());
             assert!(guard().is_ok(), "no socket directory: {:?}", guard());
             std::fs::create_dir_all(registry::socket_dir_in(cache.path())).unwrap();
             assert!(guard().is_ok(), "an empty socket directory: {:?}", guard());
@@ -12705,14 +12790,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4902);
-        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let launch_id = "aaaa0000aaaa4902";
+        let mut reserved = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        reserved.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            launch_id.to_string(),
+            root.join("reserved.sock"),
+            root.join("reserved.live"),
+        ));
+        workflow::save_state(&reserved).unwrap();
+        let mut fresh = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         let log = std::sync::Mutex::new(Vec::new());
 
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|scope| {
             let log = &log;
-            let fresh = &fresh;
+            let fresh = &mut fresh;
             let holder = scope.spawn(move || {
                 workflow::update_state_with(root, phase, |_existing| {
                     entered_tx.send(()).unwrap();
@@ -12724,7 +12822,7 @@ mod tests {
             });
             entered_rx.recv_timeout(HOLDER_ENTERS_WITHIN).unwrap();
             let creator = scope.spawn(move || {
-                create_run_state(root, phase, fresh).unwrap();
+                create_run_state(root, phase, fresh, launch_id).unwrap();
                 log.lock().unwrap().push(CREATE_RETURNS);
             });
             std::thread::sleep(BLOCKED_WRITER_GRACE);
@@ -12741,6 +12839,40 @@ mod tests {
             serde_json::to_value(workflow::load_state(root, phase).unwrap()).unwrap(),
             serde_json::to_value(&fresh).unwrap(),
             "the file holds the fresh state"
+        );
+        assert_eq!(fresh.mode, Mode::Supervise, "the fresh state replaced it");
+        assert_eq!(
+            fresh.pending_supervisor, reserved.pending_supervisor,
+            "the fresh state keeps the reservation"
+        );
+    }
+
+    /// The reservation was cleared while `start` prepared the run: the create refuses
+    /// and writes nothing, for a state naming another launch and for no state at all.
+    #[test]
+    fn a_fresh_run_is_refused_once_its_reservation_was_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(4903);
+        let mut fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let err = create_run_state(root, phase, &mut fresh, "aaaa0000aaaa4903").unwrap_err();
+        assert!(err.to_string().contains("was cleared"), "{err}");
+        assert!(!workflow::state_path(root, phase).exists());
+
+        let mut other = fresh.clone();
+        other.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            "bbbb0000bbbb4903".to_string(),
+            root.join("other.sock"),
+            root.join("other.live"),
+        ));
+        workflow::save_state(&other).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let err = create_run_state(root, phase, &mut fresh, "aaaa0000aaaa4903").unwrap_err();
+        assert!(err.to_string().contains("was cleared"), "{err}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before
         );
     }
 }
