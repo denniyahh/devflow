@@ -41,7 +41,7 @@ use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::ship_evidence;
 use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State, SupervisorRecord};
+use devflow_core::state::{AgentKind, PendingSupervisor, State, SupervisorRecord};
 use devflow_core::supervisor;
 use devflow_core::version;
 use devflow_core::workflow;
@@ -852,32 +852,71 @@ pub(crate) fn reserve_launch(
             }
             (workflow::Existing::Unloadable(error), None) => return Err(error.into()),
         };
-        next.pending_supervisor = Some(pending);
-        Ok::<_, CliError>((
-            Some(next.clone()),
-            (next, created, replaced.then_some(state_file)),
-        ))
+        // The guard has passed, so a reservation still here is abandoned.
+        let abandoned = next.pending_supervisor.replace(pending);
+        if let Some(abandoned) = &abandoned {
+            remove_abandoned_liveness_file(project_root, abandoned);
+        }
+        let outcome = ReserveOutcome {
+            state: next.clone(),
+            created,
+            replaced: replaced.then_some(state_file),
+            abandoned: abandoned.map(|abandoned| abandoned.launch_id),
+        };
+        Ok::<_, CliError>((Some(next), outcome))
     });
-    let (state, created, replaced) = match written {
-        Ok(written) => written,
+    let outcome = match written {
+        Ok(outcome) => outcome,
         Err(err) => {
             reservation.discard();
             return Err(err);
         }
     };
-    if let Some(path) = replaced {
+    if let Some(path) = outcome.replaced {
         println!(
             "note: replaced the state file {}, which did not load, with this launch's reservation",
             path.display()
         );
     }
+    if let Some(launch_id) = outcome.abandoned {
+        println!("cleared an abandoned launch reservation {launch_id}");
+    }
     #[cfg(test)]
     crate::pipeline_launch::launch_test_hold("reserved");
     Ok(Reserved {
         reservation,
-        created,
-        state,
+        created: outcome.created,
+        state: outcome.state,
     })
+}
+
+/// What [`reserve_launch`]'s write-lock closure hands back to print and return.
+struct ReserveOutcome {
+    state: State,
+    created: bool,
+    /// The state file a reservation replaced because it did not load.
+    replaced: Option<PathBuf>,
+    /// The launch id of the abandoned reservation this one replaced.
+    abandoned: Option<String>,
+}
+
+/// Remove an abandoned reservation's liveness file, best effort: `recover --clean`
+/// sweeps one left behind. Only the path this project's launch id derives to, and only
+/// while nothing holds it, because the path was read from a state file. An unheld hold
+/// file can never read live again, so removing it races no holder.
+fn remove_abandoned_liveness_file(project_root: &Path, abandoned: &PendingSupervisor) {
+    let path = &abandoned.liveness_path;
+    if liveness::launch_liveness_path(project_root, &abandoned.launch_id).as_ref() != Some(path)
+        || !matches!(liveness::probe(path), Ok(liveness::Held::Abandoned))
+    {
+        return;
+    }
+    if let Err(err) = std::fs::remove_file(path) {
+        eprintln!(
+            "warning: could not remove the abandoned liveness file {}: {err}",
+            path.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3704,8 +3743,10 @@ impl LaunchVerb {
 ///   refusal (Option A, 2026-09-22). Not read without a state file (the
 ///   no-state carve-out below).
 ///
-/// A loaded state with no record over a live supervisor (a launcher that
-/// died before saving it, T-50-90/T-50-91) is accepted until Phase 50.1.
+/// A loaded state's `pending_supervisor` (D-01, T-50-90) counts too, from the moment
+/// it is reserved: a held liveness lock is live, with or without a socket, and its
+/// refusal names only `devflow stop`. An unheld or missing lock is an abandoned
+/// reservation, which does not refuse and which [`reserve_launch`] replaces.
 ///
 /// Runs on the state [`reserve_launch`]'s closure read (criterion 2, D-01: one
 /// writer per phase), before any gate cleanup, git mutation or state write, so a
@@ -3770,6 +3811,12 @@ fn possibly_live_sockets(
             .as_ref()
             .and_then(recorded_live_socket)
             .into_iter()
+            .chain(
+                state
+                    .pending_supervisor
+                    .as_ref()
+                    .and_then(pending_live_socket),
+            )
             .collect());
     }
     let Some(cache_dir) = cache_dir else {
@@ -3790,17 +3837,38 @@ struct LiveSocket {
     /// The record's or sidecar's launch id; for a socket with no usable
     /// sidecar, its file name's, else its ping reply's, else `unknown`.
     launch_id: String,
-    /// `ALIVE`, `STALE`, or why the socket could not be probed.
+    /// `ALIVE`, `STALE`, [`PENDING_NO_SOCKET`], or why it could not be probed.
     liveness: String,
     /// Why the sidecar cannot be used, for a socket with none that parses:
     /// `stop --launch` cannot validate it, so the refusal names bare `stop`.
     sidecar_problem: Option<String>,
+    /// How the state names this supervisor, if it does.
+    pending: PendingKind,
 }
+
+/// Whether a [`LiveSocket`] is a state's pending supervisor. While one is live, no
+/// refusal suggests `devflow resume` (ROADMAP 50.1 criterion 2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    /// Not pending: a recorded or swept supervisor.
+    No,
+    /// Pending, with a socket that was probed.
+    Published,
+    /// Pending, with no socket yet: only its held liveness lock says it is live.
+    Reserved,
+}
+
+/// The liveness a refusal names for a pending supervisor with no socket yet.
+const PENDING_NO_SOCKET: &str = "PENDING (reserved, no socket yet)";
 
 impl LiveSocket {
     /// The refusal line that names this socket's repair.
     fn repair_line(&self, phase: PhaseId) -> String {
         let (id, liveness, socket) = (&self.launch_id, &self.liveness, self.socket.display());
+        // No `--launch`: `stop --launch` validates a sidecar, and this has none yet.
+        if self.pending == PendingKind::Reserved {
+            return format!("launch {id} ({liveness}): run `devflow stop --phase {phase}` first");
+        }
         match &self.sidecar_problem {
             None => format!(
                 "launch {id} ({liveness}, socket {socket}): run \
@@ -3820,20 +3888,59 @@ impl LiveSocket {
 /// The loaded state's record as a [`LiveSocket`], or `None` when its socket
 /// is GONE or STALE over a group the backstop proves gone.
 fn recorded_live_socket(record: &SupervisorRecord) -> Option<LiveSocket> {
+    socket_live_socket(&record.socket_path, &record.launch_id, Some(record))
+}
+
+/// A state's pending supervisor as a [`LiveSocket`], or `None` when its reservation
+/// is abandoned. A published socket is probed as a recorded one is, and with or
+/// without one, a held liveness lock is live: only the lock and the socket decide,
+/// never a pid (D-01). A probe that fails is live (fail closed, T-50-40).
+fn pending_live_socket(pending: &PendingSupervisor) -> Option<LiveSocket> {
+    if pending.socket_path.exists()
+        && let Some(live) = socket_live_socket(&pending.socket_path, &pending.launch_id, None)
+    {
+        return Some(LiveSocket {
+            pending: PendingKind::Published,
+            ..live
+        });
+    }
+    let liveness = match liveness::probe(&pending.liveness_path) {
+        Ok(liveness::Held::Live) => PENDING_NO_SOCKET.to_string(),
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => return None,
+        Err(error) => format!("liveness probe failed ({error})"),
+    };
+    Some(LiveSocket {
+        socket: pending.socket_path.clone(),
+        launch_id: pending.launch_id.clone(),
+        liveness,
+        sidecar_problem: None,
+        pending: PendingKind::Reserved,
+    })
+}
+
+/// The supervisor at `socket` as a [`LiveSocket`], or `None` when it is GONE or
+/// STALE over a group the backstop proves gone. `record` is the state's record of
+/// it, when the state has published one.
+fn socket_live_socket(
+    socket: &Path,
+    launch_id: &str,
+    record: Option<&SupervisorRecord>,
+) -> Option<LiveSocket> {
     let live = |liveness: &str, sidecar_problem: Option<String>| LiveSocket {
-        socket: record.socket_path.clone(),
-        launch_id: record.launch_id.clone(),
+        socket: socket.to_path_buf(),
+        launch_id: launch_id.to_string(),
         liveness: liveness.to_string(),
         sidecar_problem,
+        pending: PendingKind::No,
     };
-    match supervisor::probe(&record.socket_path) {
+    match supervisor::probe(socket) {
         Ok(supervisor::Liveness::Gone) => None,
         Ok(supervisor::Liveness::Alive(_)) => Some(live("ALIVE", None)),
         Err(error) => Some(live(&probe_failure(&error), None)),
         Ok(supervisor::Liveness::Stale) => {
-            match supervisor::read_sidecar(&record.socket_path.with_extension("json")) {
+            match supervisor::read_sidecar(&socket.with_extension("json")) {
                 Ok(sidecar) => {
-                    let decision = supervisor::backstop::assess(&sidecar, Some(record));
+                    let decision = supervisor::backstop::assess(&sidecar, record);
                     stale_group_may_live(&decision).then(|| live("STALE", None))
                 }
                 Err(supervisor::SidecarError::Io(error))
@@ -3883,6 +3990,7 @@ fn swept_live_socket(entry: &supervisor::SweepEntry) -> Option<LiveSocket> {
         launch_id,
         liveness,
         sidecar_problem,
+        pending: PendingKind::No,
     })
 }
 
@@ -3961,14 +4069,26 @@ fn live_run_refusal(
             text.push_str(&live.repair_line(phase));
         }
     }
-    if let Some(pid) = agent {
+    // Criterion 2: `resume`'s own lines name `devflow resume`, and while a pending
+    // supervisor is live none of them may be printed. Once it is gone, `status` says
+    // what is next. A live agent is named above, and `stop` ends a supervisor's agent.
+    let pending_blocks_resume =
+        verb == LaunchVerb::Resume && sockets.iter().any(|live| live.pending != PendingKind::No);
+    if let Some(pid) = agent.filter(|_| !pending_blocks_resume) {
         text.push('\n');
         text.push_str(&agent_refusal_guidance(phase, verb, pid));
     }
-    text.push_str(&format!(
-        "\nOnce every supervisor and process named above is gone, run `{}` again.",
-        verb.rerun(phase)
-    ));
+    if pending_blocks_resume {
+        text.push_str(&format!(
+            "\nOnce every supervisor and process named above is gone, `devflow status --phase \
+             {phase}` names what to do next."
+        ));
+    } else {
+        text.push_str(&format!(
+            "\nOnce every supervisor and process named above is gone, run `{}` again.",
+            verb.rerun(phase)
+        ));
+    }
     text
 }
 
@@ -12946,6 +13066,7 @@ mod tests {
         for expected in [
             format!("devflow stop --phase {phase}"),
             pending.launch_id.clone(),
+            PENDING_NO_SOCKET.to_string(),
         ] {
             assert!(text.contains(&expected), "missing {expected:?}: {text}");
         }
@@ -12985,6 +13106,29 @@ mod tests {
             PhaseId::new(5019),
             LaunchVerb::Resume,
         );
+    }
+
+    /// Criterion 2: while a pending supervisor is live, a refused `resume` never
+    /// suggests `devflow resume`, even when an agent is live beside it. The control is
+    /// the same refusal over a recorded supervisor, which does name it.
+    #[test]
+    fn a_resume_refused_over_a_pending_supervisor_never_names_resume() {
+        let phase = PhaseId::new(5022);
+        let live = |pending| LiveSocket {
+            socket: PathBuf::from("/s.sock"),
+            launch_id: "aaaa0000aaaa5022".to_string(),
+            liveness: PENDING_NO_SOCKET.to_string(),
+            sidecar_problem: None,
+            pending,
+        };
+        for pending in [PendingKind::Published, PendingKind::Reserved] {
+            let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(pending)], Some(77));
+            assert!(!text.contains("devflow resume"), "{text}");
+            assert!(text.contains("agent pid 77 alive"), "{text}");
+            assert!(text.contains("devflow status --phase"), "{text}");
+        }
+        let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(PendingKind::No)], None);
+        assert!(text.contains("devflow resume"), "control: {text}");
     }
 
     /// V-03: a reservation whose lock nothing holds, or whose file is gone, is
