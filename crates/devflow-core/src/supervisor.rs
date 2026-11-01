@@ -1618,6 +1618,35 @@ mod tests {
     }
 
     #[test]
+    fn the_sidecar_publish_fsyncs_its_directory() {
+        use crate::durable::{Synced, take_synced};
+
+        let cache = short_cache();
+        let root = Path::new(ROOT);
+        let phase = PhaseId::new(7);
+        let launch_id = new_launch_id();
+        let socket = SocketPath::for_launch(cache.path(), root, phase, &launch_id)
+            .expect("socket path fits sun_path");
+        let sidecar = sample_sidecar(&launch_id, root, phase);
+        let target = socket.sidecar_path();
+        let socket_dir = target.parent().expect("a socket directory").to_path_buf();
+        take_synced();
+
+        write_sidecar(&socket, &sidecar).expect("write a sidecar");
+        assert!(target.exists(), "the link is what the fsync makes durable");
+        assert_eq!(take_synced(), [Synced::Dir(socket_dir)]);
+
+        let refused = write_sidecar(&socket, &sidecar);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+            "a second write is refused, got {refused:?}"
+        );
+        assert_eq!(take_synced(), [], "a refused write published nothing");
+    }
+
+    #[test]
     fn sidecar_round_trips_and_is_owner_only() {
         let cache = short_cache();
         let root = Path::new(ROOT);

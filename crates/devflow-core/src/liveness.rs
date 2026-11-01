@@ -320,6 +320,24 @@ fn parse_identity_record(record: &str) -> Option<(u32, Option<u64>)> {
     fields.next().is_none().then_some((pid, start))
 }
 
+/// [`Hold::take`], pausing at each [`TakeStep`], so a test drives the exact code
+/// a take ships.
+#[cfg(test)]
+pub(crate) fn take_with_hook(
+    path: &Path,
+    hook: &mut dyn FnMut(TakeStep, &Path),
+) -> std::io::Result<Hold> {
+    take_inner(path, hook)
+}
+
+/// Scaffold for the failing tests: removes nothing.
+///
+/// # Errors
+/// None in the scaffold.
+pub fn remove_orphan_hold_temps(_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,5 +828,195 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// The sweep a remover runs: orphaned temps, then every `*.live` that
+    /// probes abandoned (the 50.1-21 and `close` rule).
+    fn sweep(dir: &Path) {
+        remove_orphan_hold_temps(dir).expect("sweep the temps");
+        for entry in std::fs::read_dir(dir).expect("read the directory") {
+            let path = entry.expect("read an entry").path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "live")
+                && probe(&path).expect("probe") == Held::Abandoned
+            {
+                std::fs::remove_file(&path).expect("remove an abandoned hold");
+            }
+        }
+    }
+
+    fn hold_temps_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("read an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(HOLD_TEMP_SUFFIX))
+            .collect()
+    }
+
+    /// The order `take_inner` replaced: the final name exists before its lock.
+    fn take_create_then_lock(path: &Path, hook: &mut dyn FnMut(&Path)) -> Hold {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create the final name");
+        hook(path);
+        file.try_lock().expect("lock it");
+        write_identity_record(&file).expect("write the record");
+        Hold {
+            file,
+            path: path.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn a_hold_is_published_only_once_it_is_held() {
+        in_own_process(
+            "liveness::tests::a_hold_is_published_only_once_it_is_held",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("r.live");
+                let holder = this_process();
+                let mut steps = Vec::new();
+                let hold = take_with_hook(&path, &mut |step, temp| {
+                    sweep(dir.path());
+                    let published = step == TakeStep::Published;
+                    assert_eq!(
+                        probe(&path).expect("probe"),
+                        if published { Held::Live } else { Held::Missing },
+                        "the final name at {step:?}"
+                    );
+                    assert_eq!(
+                        live_holder(&path).expect("read the holder"),
+                        published.then_some(holder),
+                        "the holder at {step:?}"
+                    );
+                    assert!(temp.exists(), "the sweep must keep the temp at {step:?}");
+                    steps.push(step);
+                })
+                .expect("take a hold");
+                assert_eq!(
+                    steps,
+                    [TakeStep::TempCreated, TakeStep::Locked, TakeStep::Published]
+                );
+                assert_eq!(probe(&path).expect("probe"), Held::Live);
+                assert_eq!(hold_temps_in(dir.path()), Vec::<String>::new());
+
+                drop(hold);
+                assert_eq!(probe(&path).expect("probe"), Held::Abandoned);
+                sweep(dir.path());
+                assert!(!path.exists(), "an abandoned hold stays removable");
+
+                let control = dir.path().join("c.live");
+                let held = take_create_then_lock(&control, &mut |_| sweep(dir.path()));
+                assert_eq!(
+                    probe(&control).expect("probe"),
+                    Held::Missing,
+                    "create-then-lock: the sweep unlinked the name, so a held hold reads not live"
+                );
+                drop(held);
+            },
+        );
+    }
+
+    #[test]
+    fn a_take_never_replaces_an_existing_name() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let path = dir.path().join("r.live");
+        std::fs::write(&path, "someone else's\n").expect("plant the name");
+
+        let refused = Hold::take(&path);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists),
+            "got {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the name"),
+            "someone else's\n"
+        );
+        assert_eq!(hold_temps_in(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_take_whose_temp_vanished_publishes_nothing() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let path = dir.path().join("r.live");
+        let refused = take_with_hook(&path, &mut |step, temp| {
+            if step == TakeStep::Locked {
+                std::fs::remove_file(temp).expect("remove the temp under the take");
+            }
+        });
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "got {refused:?}"
+        );
+        assert!(!path.exists(), "an unheld name must never be published");
+    }
+
+    #[test]
+    fn a_hold_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let path = dir.path().join("r.live");
+        let _hold = Hold::take(&path).expect("take a hold");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// The pid of a process that has exited and been reaped.
+    fn gone_pid() -> u32 {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        pid
+    }
+
+    #[test]
+    fn orphaned_hold_temps_are_removed_only_when_unheld_and_their_creator_is_gone() {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let gone = gone_pid();
+        let this = std::process::id();
+        let orphan = dir.path().join(format!(".a.live.{gone}.0.hold-tmp"));
+        let held = dir.path().join(format!(".b.live.{gone}.1.hold-tmp"));
+        let kept = [
+            held.clone(),
+            dir.path().join(format!(".c.live.{this}.2.hold-tmp")),
+            dir.path().join("d.live"),
+            dir.path().join(".e.live.notapid.3.hold-tmp"),
+            dir.path().join(format!(".f.live.{gone}.4.tmp")),
+            dir.path().join(".g.live.0.5.hold-tmp"),
+            dir.path().join(".h.live.4294967295.6.hold-tmp"),
+            dir.path().join(".i.live.1.7.hold-tmp"),
+            dir.path().join(format!("j.live.{gone}.8.hold-tmp")),
+        ];
+        std::fs::write(&orphan, "").expect("plant the orphan");
+        for path in &kept {
+            std::fs::write(path, "").expect("plant a file");
+        }
+        let lock = File::open(&held).expect("open the held temp");
+        lock.try_lock().expect("hold the temp");
+
+        let removed = remove_orphan_hold_temps(dir.path()).expect("sweep");
+        assert_eq!(removed, std::slice::from_ref(&orphan));
+        assert!(!orphan.exists());
+        for path in &kept {
+            assert!(path.exists(), "{} must be kept", path.display());
+        }
+
+        let missing = remove_orphan_hold_temps(&dir.path().join("nope")).expect("a missing dir");
+        assert_eq!(missing, Vec::<PathBuf>::new());
     }
 }
