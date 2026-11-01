@@ -1887,63 +1887,10 @@ pub(crate) fn gate_sweep(
                 left_alone += 1;
                 continue;
             }
-            let holder_before_reap = lock::holder_status(project_root, gate.phase);
-            if !gate_sweep_may_reap(gate.stage, holder_before_reap) {
-                left_alone += 1;
-                println!(
-                    "left phase {} {} alone at {} — no confirmed waiter; {}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display(),
-                    no_waiter_repair(gate.phase, gate.stage)
-                );
-                continue;
-            }
-            if dry_run {
-                reaped += 1;
-                println!(
-                    "would reap phase {} {} (age {age}s) at {}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display()
-                );
-                continue;
-            }
-            match Gates::reap(
-                project_root,
-                gate.phase,
-                gate.stage,
-                "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
-                "devflow-reap",
-            ) {
-                Ok(_) => {
-                    reaped += 1;
-                    events::emit(
-                        project_root,
-                        gate.phase,
-                        "gate_reaped",
-                        serde_json::json!({
-                            "stage": gate.stage.to_string(),
-                            "age_secs": age,
-                            "max_age_secs": threshold,
-                        }),
-                    );
-                    println!(
-                        "reaped phase {} {} (age {age}s) at {}",
-                        gate.phase,
-                        gate.stage,
-                        project_root.display()
-                    );
-                }
-                Err(err) => {
-                    skipped += 1;
-                    println!(
-                        "skipped phase {} {} at {} — already answered ({err})",
-                        gate.phase,
-                        gate.stage,
-                        project_root.display()
-                    );
-                }
+            match sweep_one_gate(project_root, &gate, age, threshold, dry_run) {
+                SweepStep::Reaped => reaped += 1,
+                SweepStep::Skipped => skipped += 1,
+                SweepStep::LeftAlone => left_alone += 1,
             }
         }
     }
@@ -2067,8 +2014,88 @@ pub(crate) fn gate_sweep(
     Ok(())
 }
 
-fn gate_sweep_may_reap(_stage: Stage, holder: lock::HolderStatus) -> bool {
-    matches!(holder, lock::HolderStatus::Live { .. })
+fn gate_sweep_may_reap(_stage: Stage, waiter_live: bool) -> bool {
+    waiter_live
+}
+
+/// What the sweep did with one aged gate it listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepStep {
+    /// Answered with an abort, or, under `--dry-run`, would have been.
+    Reaped,
+    /// Not answered: answered already, changed since it was listed, or unanswerable.
+    Skipped,
+    /// Not answered: nothing is waiting on it.
+    LeftAlone,
+}
+
+/// The sweep's per-gate step.
+fn sweep_one_gate(
+    project_root: &Path,
+    gate: &OpenGate,
+    age: u64,
+    threshold: u64,
+    dry_run: bool,
+) -> SweepStep {
+    let holder = lock::holder_status(project_root, gate.phase);
+    if !gate_sweep_may_reap(
+        gate.stage,
+        matches!(holder, lock::HolderStatus::Live { .. }),
+    ) {
+        println!(
+            "left phase {} {} alone at {} — no confirmed waiter; {}",
+            gate.phase,
+            gate.stage,
+            project_root.display(),
+            no_waiter_repair(gate.phase, gate.stage)
+        );
+        return SweepStep::LeftAlone;
+    }
+    if dry_run {
+        println!(
+            "would reap phase {} {} (age {age}s) at {}",
+            gate.phase,
+            gate.stage,
+            project_root.display()
+        );
+        return SweepStep::Reaped;
+    }
+    match Gates::reap(
+        project_root,
+        gate.phase,
+        gate.stage,
+        "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
+        "devflow-reap",
+    ) {
+        Ok(_) => {
+            events::emit(
+                project_root,
+                gate.phase,
+                "gate_reaped",
+                serde_json::json!({
+                    "stage": gate.stage.to_string(),
+                    "age_secs": age,
+                    "max_age_secs": threshold,
+                }),
+            );
+            println!(
+                "reaped phase {} {} (age {age}s) at {}",
+                gate.phase,
+                gate.stage,
+                project_root.display()
+            );
+            SweepStep::Reaped
+        }
+        Err(err) => {
+            println!(
+                "skipped phase {} {} at {} — already answered ({err})",
+                gate.phase,
+                gate.stage,
+                project_root.display()
+            );
+            SweepStep::Skipped
+        }
+    }
 }
 
 /// What became of one [`agent::StrayProcess`] candidate the opt-in
@@ -2896,6 +2923,15 @@ fn stop_via_gate(
     else {
         return Ok((false, None));
     };
+    stop_reap_observed_gate(project_root, phase, &gate)
+}
+
+/// [`stop_via_gate`]'s reap of the gate it listed.
+fn stop_reap_observed_gate(
+    project_root: &Path,
+    phase: PhaseId,
+    gate: &OpenGate,
+) -> Result<(bool, Option<AnsweredGate>), CliError> {
     let holder_before_reap = lock::holder_status(project_root, phase);
     let holder_identity_before_reap = lock::holder_identity(project_root, phase);
     let gate_is_current = workflow::load_state(project_root, phase)
@@ -2949,6 +2985,7 @@ fn stop_via_gate(
             project_root,
             phase,
             gate.stage,
+            &GateId::parse(&gate.gate_id)?,
             holder_before_reap,
             holder_identity_before_reap,
         ),
@@ -2968,6 +3005,7 @@ fn stop_with_existing_response(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
+    _observed: &GateId,
     holder_before_reap: lock::HolderStatus,
     holder_identity_before_reap: Option<(u32, Option<u64>)>,
 ) -> Result<(bool, Option<AnsweredGate>), CliError> {
@@ -6104,7 +6142,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
-    use devflow_core::gates::{AnswerRead, WaiterRegistration};
+    use devflow_core::gates::{AnswerRead, GateFile, WaiterRegistration};
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
 
     #[test]
@@ -6172,26 +6210,10 @@ mod tests {
 
     #[test]
     fn gate_sweep_preview_uses_the_no_waiter_matrix() {
-        assert!(!gate_sweep_may_reap(
-            Stage::Code,
-            lock::HolderStatus::NoHolder
-        ));
-        assert!(!gate_sweep_may_reap(
-            Stage::Code,
-            lock::HolderStatus::Recycled { pid: 42 }
-        ));
-        assert!(!gate_sweep_may_reap(
-            Stage::Ship,
-            lock::HolderStatus::NoHolder
-        ));
-        assert!(!gate_sweep_may_reap(
-            Stage::Ship,
-            lock::HolderStatus::Unconfirmable { pid: 42 }
-        ));
-        assert!(gate_sweep_may_reap(
-            Stage::Code,
-            lock::HolderStatus::Live { pid: 42 }
-        ));
+        for stage in [Stage::Code, Stage::Ship] {
+            assert!(!gate_sweep_may_reap(stage, false), "{stage} with no waiter");
+            assert!(gate_sweep_may_reap(stage, true), "{stage} with a waiter");
+        }
     }
 
     #[test]
@@ -6465,47 +6487,40 @@ mod tests {
         let root = dir.path();
         let phase = PhaseId::new(4809);
         let stage = Stage::Code;
-        let path = Gates::response_path(root, phase, stage);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let carried = lock::HolderStatus::Live { pid: 7 };
 
-        let write_response = |approved, note: Option<&str>| {
-            std::fs::write(
-                &path,
-                serde_json::to_string(&GateResponse {
-                    approved,
-                    note: note.map(str::to_owned),
-                    responded_by: Some("test".into()),
-                })
-                .unwrap(),
-            )
-            .unwrap();
+        // A new gate per case: a gate keeps its first answer.
+        let answered_gate = |approved, note: Option<&str>| {
+            let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
+            let response = GateResponse {
+                approved,
+                note: note.map(str::to_owned),
+                responded_by: Some("test".into()),
+            };
+            Gates::answer(root, phase, stage, &gate, &response).unwrap();
+            gate
         };
 
-        write_response(true, None);
-        let non_abort = stop_with_existing_response(
-            root,
-            phase,
-            stage,
-            lock::HolderStatus::Live { pid: 7 },
-            None,
-        )
-        .unwrap();
+        let approved = answered_gate(true, None);
+        let registration = Gates::register_waiter(root, phase, stage, &approved).unwrap();
+        let non_abort =
+            stop_with_existing_response(root, phase, stage, &approved, carried, None).unwrap();
         assert_eq!(non_abort, (false, None));
+        registration.finish();
 
-        write_response(false, Some("abort"));
-        let no_holder =
-            stop_with_existing_response(root, phase, stage, lock::HolderStatus::NoHolder, None)
-                .unwrap();
-        assert_eq!(no_holder, (false, None));
+        let no_waiter = answered_gate(false, Some("abort"));
+        let unregistered =
+            stop_with_existing_response(root, phase, stage, &no_waiter, carried, None).unwrap();
+        assert_eq!(
+            unregistered,
+            (false, None),
+            "the parameter is only a carrier: nothing on disk is no waiter"
+        );
 
-        let live_abort = stop_with_existing_response(
-            root,
-            phase,
-            stage,
-            lock::HolderStatus::Live { pid: 7 },
-            None,
-        )
-        .unwrap();
+        let live = answered_gate(false, Some("abort"));
+        let registration = Gates::register_waiter(root, phase, stage, &live).unwrap();
+        let live_abort =
+            stop_with_existing_response(root, phase, stage, &live, carried, None).unwrap();
         assert!(matches!(
             live_abort,
             (
@@ -6513,6 +6528,172 @@ mod tests {
                 Some((Stage::Code, lock::HolderStatus::Live { pid: 7 }, None))
             )
         ));
+        registration.finish();
+    }
+
+    /// State at `stage` with its gate pending, the shape `stop` treats as current.
+    fn state_pending_at(root: &Path, phase: PhaseId, stage: Stage) {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = stage;
+        state.gate_pending = true;
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The open gate of `phase` as `Gates::list_open` shows it, as a writer holds
+    /// it after listing.
+    fn listed_gate(root: &Path, phase: PhaseId) -> OpenGate {
+        Gates::list_open(root)
+            .into_iter()
+            .find(|gate| gate.phase == phase)
+            .expect("the gate is listed")
+    }
+
+    #[test]
+    fn gate_sweep_reaps_only_the_observed_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4911), Stage::Code);
+        Gates::open_gate(root, phase, stage, "g1").unwrap();
+        let g1_entry = listed_gate(root, phase);
+        Gates::close(root, phase, stage).unwrap();
+        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let g2 = g2.gate_id;
+
+        assert_eq!(
+            sweep_one_gate(root, &g1_entry, 1, 0, false),
+            SweepStep::Skipped,
+            "a gate changed since it was listed is reported, not left as waiterless"
+        );
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &g2),
+            AnswerRead::None
+        );
+        assert_eq!(listed_gate(root, phase).gate_id, g2.as_str());
+
+        let g2_entry = listed_gate(root, phase);
+        assert_eq!(
+            sweep_one_gate(root, &g2_entry, 1, 0, false),
+            SweepStep::Reaped
+        );
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
+            panic!("the sweep answers the gate it observed");
+        };
+        assert!(!answer.response.approved, "a reap never approves (T-23-41)");
+        registration.finish();
+    }
+
+    /// A gate file from before gate ids can be reported, and nothing else: no
+    /// answer can bind to it. Both writers skip it before reading liveness.
+    #[test]
+    fn a_gate_with_no_gate_id_is_reported_and_never_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4912), Stage::Code);
+        state_pending_at(root, phase, stage);
+        Gates::open_gate(root, phase, stage, "g").unwrap();
+        let mut entry = listed_gate(root, phase);
+        entry.gate_id = String::new();
+        let file = GateFile {
+            phase,
+            stage,
+            context: entry.context.clone(),
+            timestamp: entry.timestamp.clone(),
+            gate_id: String::new(),
+        };
+        std::fs::write(
+            Gates::gate_path(root, phase, stage),
+            serde_json::to_string_pretty(&file).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sweep_one_gate(root, &entry, 1, 0, false),
+            SweepStep::Skipped
+        );
+        assert_eq!(
+            stop_reap_observed_gate(root, phase, &entry).unwrap(),
+            (false, None)
+        );
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+    }
+
+    #[test]
+    fn stop_answers_only_the_observed_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4913), Stage::Code);
+        state_pending_at(root, phase, stage);
+        Gates::open_gate(root, phase, stage, "g1").unwrap();
+        let g1_entry = listed_gate(root, phase);
+        Gates::close(root, phase, stage).unwrap();
+        let (g2, registration) = Gates::open_registered(root, phase, stage, "g2").unwrap();
+        let g2 = g2.gate_id;
+
+        assert_eq!(
+            stop_reap_observed_gate(root, phase, &g1_entry).unwrap(),
+            (false, None),
+            "a stale entry falls through to the socket path"
+        );
+        assert_eq!(
+            Gates::read_answer(root, phase, stage, &g2),
+            AnswerRead::None
+        );
+
+        // Control: with G2's own entry the same waiter is answered, so the refusal
+        // above was the id comparison, not a missing waiter.
+        let g2_entry = listed_gate(root, phase);
+        let (answered, _) = stop_reap_observed_gate(root, phase, &g2_entry).unwrap();
+        assert!(answered);
+        let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
+            panic!("stop answers the gate it observed");
+        };
+        assert!(matches!(
+            GateAction::from_response(&answer.response),
+            GateAction::Abort(_)
+        ));
+        registration.finish();
+    }
+
+    #[test]
+    fn stop_reads_an_existing_answer_for_the_observed_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4914), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let answer_with = |approved, note: &str| {
+            let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+            let entry = listed_gate(root, phase);
+            let response = GateResponse {
+                approved,
+                note: Some(note.to_owned()),
+                responded_by: Some("human".into()),
+            };
+            Gates::answer(root, phase, stage, &opened.gate_id, &response).unwrap();
+            (opened.gate_id, entry, registration)
+        };
+
+        let (gate, entry, registration) = answer_with(false, "abort: by a human");
+        let (stopped, answered) = stop_reap_observed_gate(root, phase, &entry).unwrap();
+        assert!(stopped, "a live abort is the requested stop");
+        assert_eq!(answered.map(|(stage, _, _)| stage), Some(stage));
+        let AnswerRead::Bound(kept) = Gates::read_answer(root, phase, stage, &gate) else {
+            panic!("the first answer stays");
+        };
+        assert_eq!(kept.response.responded_by.as_deref(), Some("human"));
+        registration.finish();
+        Gates::close(root, phase, stage).unwrap();
+
+        let (gate, entry, registration) = answer_with(true, "approved by a human");
+        assert_eq!(
+            stop_reap_observed_gate(root, phase, &entry).unwrap(),
+            (false, None),
+            "an approval is not stop's outcome"
+        );
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &gate),
+            AnswerRead::Bound(kept) if kept.response.approved
+        ));
+        registration.finish();
     }
 
     /// Open G1, close it, and open G2 at the same stage with a held registration:
@@ -7517,18 +7698,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let gate = devflow_core::gates::GateFile {
-            phase,
-            stage,
-            context: "ctx".to_string(),
-            timestamp: now.saturating_sub(age_secs).to_string(),
-            gate_id: String::new(),
-        };
-        std::fs::write(
-            Gates::gate_path(root, phase, stage),
-            serde_json::to_string_pretty(&gate).unwrap(),
-        )
-        .unwrap();
+        let path = Gates::gate_path(root, phase, stage);
+        let mut gate: GateFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        gate.timestamp = now.saturating_sub(age_secs).to_string();
+        std::fs::write(path, serde_json::to_string_pretty(&gate).unwrap()).unwrap();
     }
 
     /// Task 2 behavior: `--dry-run` computes and prints every decision but
@@ -7558,28 +7732,29 @@ mod tests {
     fn gate_sweep_skips_already_responded_gate_without_clobbering() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(31), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(31), Stage::Ship, aged_past_threshold());
+        let (phase, stage) = (PhaseId::new(31), Stage::Ship);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
+        backdate_gate(root, phase, stage, aged_past_threshold());
+        let listed_before_the_answer = listed_gate(root, phase);
         let response = GateResponse {
             approved: true,
             note: None,
             responded_by: Some("human".into()),
         };
-        Gates::respond(root, PhaseId::new(31), Stage::Ship, &response).unwrap();
-        let before =
-            std::fs::read_to_string(Gates::response_path(root, PhaseId::new(31), Stage::Ship))
-                .unwrap();
+        let path = Gates::answer(root, phase, stage, &opened.gate_id, &response).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
 
         let result = gate_sweep(None, false, Some(root.to_path_buf()), false);
+        let raced = sweep_one_gate(root, &listed_before_the_answer, 1, 0, false);
 
         assert!(result.is_ok(), "an already-answered gate must not error");
-        let after =
-            std::fs::read_to_string(Gates::response_path(root, PhaseId::new(31), Stage::Ship))
-                .unwrap();
+        assert_eq!(raced, SweepStep::Skipped, "the race is a skip");
+        let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             before, after,
             "the pre-existing response must be byte-identical afterwards"
         );
+        registration.finish();
     }
 
     /// Task 2 behavior (T-23-43 audit trail): a successful reap emits
