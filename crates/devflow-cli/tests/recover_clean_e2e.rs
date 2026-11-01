@@ -211,10 +211,10 @@ fn sweep_that_clears_nothing_does_not_claim_a_cleanup() {
     assert!(devflow_core::workflow::state_path(root, phase).exists());
 }
 
-/// R-6: removing a corrupt legacy state file is a cleanup that the sweep
-/// must report, not a warning followed by an empty-sweep claim.
+/// Phase 50 D-20: the sweep leaves a `state.json` from an old binary alone, so it
+/// has cleaned nothing and says so.
 #[test]
-fn sweep_removes_and_names_corrupt_legacy_state() {
+fn sweep_leaves_a_legacy_state_file_alone_and_says_it_cleaned_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_repo(root);
@@ -226,21 +226,14 @@ fn sweep_removes_and_names_corrupt_legacy_state() {
 
     let text = combined(&output);
     assert!(output.status.success(), "sweep failed: {text}");
+    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "{\"stage\":");
     assert!(
-        !legacy.exists(),
-        "the corrupt legacy state file must be removed"
+        text.contains("no stale workflow state was cleaned"),
+        "a sweep that removed nothing must say so: {text}"
     );
     assert!(
-        text.lines().any(|line| {
-            line.contains("legacy state.json")
-                && line.contains("removed")
-                && !line.starts_with("warning:")
-        }),
-        "the removal must have a non-warning report line: {text}"
-    );
-    assert!(
-        !text.contains("no stale workflow state was cleaned"),
-        "a sweep that removed legacy state must not say it cleaned nothing: {text}"
+        !text.contains("legacy"),
+        "the sweep has no legacy state to report: {text}"
     );
 }
 
@@ -356,10 +349,10 @@ fn sweep_keeps_a_cron_record_for_a_phase_that_still_has_state() {
     );
 }
 
-/// 48-REVIEW WR-03: removing a phase held only in a legacy `state.json` is a
-/// cleanup, not "nothing to clean".
+/// Phase 50 D-20: a `state.json` naming the phase is not that phase's state, so an
+/// explicit clean finds nothing to clean and leaves the file alone.
 #[test]
-fn explicit_clean_of_legacy_state_says_it_cleaned() {
+fn explicit_clean_leaves_a_legacy_state_file_alone_and_finds_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_repo(root);
@@ -367,17 +360,18 @@ fn explicit_clean_of_legacy_state_says_it_cleaned() {
     let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     let legacy = root.join(".devflow/state.json");
     std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
+    let bytes = serde_json::to_string(&state).unwrap();
+    std::fs::write(&legacy, &bytes).unwrap();
 
     let output = recover_clean(root, Some(phase));
 
     let text = combined(&output);
-    assert!(output.status.success(), "legacy clean failed: {text}");
+    assert!(output.status.success(), "explicit clean failed: {text}");
     assert!(
-        text.contains("cleaned up workflow state for phase 68"),
-        "removing legacy state must be reported as a cleanup: {text}"
+        text.contains("nothing to clean for phase 68"),
+        "a legacy file is not the phase's state: {text}"
     );
-    assert!(!legacy.exists());
+    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), bytes);
     assert!(!devflow_core::workflow::state_path(root, phase).exists());
 }
 
