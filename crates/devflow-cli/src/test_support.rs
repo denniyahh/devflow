@@ -591,6 +591,26 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
     dir
 }
 
+/// A `claude` stand-in that answers `--version`, then waits for `go` in
+/// its working directory (the project root) and exits 0, with `sleep`
+/// linked beside it so the wait works under the replaced PATH.
+pub(crate) fn go_waiting_claude_dir() -> tempfile::TempDir {
+    let path_dir = agent_free_dir_with_agent_stub("claude");
+    std::fs::write(
+        path_dir.path().join("claude"),
+        "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+         while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
+    )
+    .unwrap();
+    let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .expect("sleep must exist to run this test");
+    std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+    path_dir
+}
+
 /// Count `stage_launched` events recorded for `phase` across the WHOLE
 /// event log — `last_event_for_phase` only sees the most recent line and
 /// cannot distinguish one launch from two.

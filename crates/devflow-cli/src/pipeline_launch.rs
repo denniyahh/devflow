@@ -3264,26 +3264,6 @@ mod tests {
     /// Names the file a V-07 child writes its recorded socket path to.
     const V07_OUT_ENV: &str = "DEVFLOW_TEST_V07_OUT";
 
-    /// A `claude` stand-in that answers `--version`, then waits for `go` in
-    /// its working directory (the project root) and exits 0, with `sleep`
-    /// linked beside it so the wait works under the replaced PATH.
-    fn go_waiting_claude_dir() -> tempfile::TempDir {
-        let path_dir = agent_free_dir_with_agent_stub("claude");
-        std::fs::write(
-            path_dir.path().join("claude"),
-            "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
-             while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
-        )
-        .unwrap();
-        let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
-            .into_iter()
-            .map(Path::new)
-            .find(|path| path.is_file())
-            .expect("sleep must exist to run this test");
-        std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
-        path_dir
-    }
-
     /// V-07 (criterion 3): a launch persists `state.supervisor.socket_path`
     /// under its context's cache dir (`DEVFLOW_CACHE_DIR/sock/`), never under
     /// the project root, and the reloaded state holds exactly the published

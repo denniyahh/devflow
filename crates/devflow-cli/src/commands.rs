@@ -12482,6 +12482,220 @@ mod tests {
         );
     }
 
+    // The launch reservation (50.1-16, D-01). Every test here runs its launch in a
+    // child: `launch_context` needs a hermetic DEVFLOW_CACHE_DIR, and the test holds
+    // read their variables from that child's environment.
+
+    const LAUNCH_HOLD_ENV: &str = "DEVFLOW_TEST_LAUNCH_HOLD";
+    /// Names which arm of a case-split reservation test a child runs. Not a DevFlow
+    /// setting, so it carries no `DEVFLOW_` prefix the doc check would require
+    /// documented.
+    const RESERVE_CASE_ENV: &str = "P50_1_16_CASE";
+    /// How long a test waits for a launcher to reach a hold point.
+    const REACH_HOLD_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// `<point>:<release path>`, with the release path in `dir`.
+    fn launch_hold_spec(point: &str, dir: &Path) -> std::ffi::OsString {
+        format!("{point}:{}", dir.join("release").display()).into()
+    }
+
+    /// The release path this child's [`LAUNCH_HOLD_ENV`] names.
+    fn launch_hold_release() -> PathBuf {
+        let spec = std::env::var(LAUNCH_HOLD_ENV).expect("the parent sets the hold");
+        let (_point, release) = spec.split_once(':').expect("<point>:<path>");
+        PathBuf::from(release)
+    }
+
+    /// `release`'s marker file, which a hold writes when it is reached.
+    fn held_marker(release: &Path) -> PathBuf {
+        let mut held = release.as_os_str().to_os_string();
+        held.push(".held");
+        PathBuf::from(held)
+    }
+
+    /// Wait until the hold on `release` is reached: `true`, or `false` once `worker`
+    /// has finished without reaching it or [`REACH_HOLD_WITHIN`] has passed.
+    fn reached_hold<T>(release: &Path, worker: &std::thread::ScopedJoinHandle<'_, T>) -> bool {
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        let held = held_marker(release);
+        while !held.exists() {
+            if worker.is_finished() || std::time::Instant::now() > deadline {
+                return held.exists();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// A repo `start` can launch from: `develop` carries a ROADMAP naming `phase`.
+    fn init_start_repo(root: &Path, phase: PhaseId) {
+        crate::test_support::init_repo(root);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(
+            root.join(".planning/ROADMAP.md"),
+            format!("# Roadmap\n\n### Phase {phase}: reservation fixture\n"),
+        )
+        .unwrap();
+        for args in [
+            &["add", ".planning/ROADMAP.md"][..],
+            &["commit", "-q", "-m", "roadmap"][..],
+        ] {
+            let status = devflow_core::test_support::git_command(root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+    }
+
+    /// `start` as these tests run it: Supervise, no worktree, the capture shape.
+    fn start_for_test(root: &Path, phase: PhaseId) -> Result<(), String> {
+        start(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// The names of `root`'s liveness files.
+    fn liveness_files(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root.join(".devflow")) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("supervisor-") && name.ends_with(".live"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// D-01's tracer: `start` names its supervisor before that supervisor exists,
+    /// the supervisor publishes under that id, and the publish save promotes it.
+    #[test]
+    fn start_reserves_then_its_supervisor_is_promoted_and_the_reservation_cleared() {
+        const NAME: &str = "commands::tests::\
+                            start_reserves_then_its_supervisor_is_promoted_and_the_reservation_cleared";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("reserved", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5016);
+        init_start_repo(root, phase);
+        let release = launch_hold_release();
+
+        let (observed, result) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            let observed =
+                reached_hold(&release, &worker).then(|| workflow::load_state(root, phase).unwrap());
+            std::fs::write(&release, "").unwrap();
+            (observed, worker.join().unwrap())
+        });
+        let finished = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&finished);
+        result.expect("the start launches");
+
+        let observed = observed.expect("start returned without reaching its reservation hold");
+        let pending = observed
+            .pending_supervisor
+            .expect("the state names the reservation before anything is spawned");
+        assert_eq!(observed.supervisor, None, "nothing is published yet");
+        assert_eq!(
+            finished.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(pending.launch_id.as_str()),
+            "the supervisor publishes under the reserved id"
+        );
+        assert_eq!(
+            finished.pending_supervisor, None,
+            "the publish save promotes the reservation"
+        );
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "the supervisor holds the reserved lock after the launcher has returned"
+        );
+    }
+
+    /// A `start` that fails after reserving gives the reservation back: a state it
+    /// created is gone, an earlier run's state is as it was, and no liveness file is
+    /// left. The hold shows the reservation was really made, or a start that never
+    /// reserved would pass every check after it.
+    #[test]
+    fn a_start_that_fails_after_reserving_gives_the_reservation_back() {
+        const NAME: &str =
+            "commands::tests::a_start_that_fails_after_reserving_gives_the_reservation_back";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // No `claude` on this PATH, so `ensure_agent_binary` refuses the start.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["no_state", "dead_run"] {
+                let hold = tempfile::tempdir().unwrap();
+                let spec = launch_hold_spec("reserved", hold.path());
+                let output = crate::test_support::run_hermetic_test_in_child(
+                    NAME,
+                    path_dir.path(),
+                    &[
+                        (LAUNCH_HOLD_ENV, spec.as_os_str()),
+                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                    ],
+                );
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5017);
+        let dead_run = std::env::var(RESERVE_CASE_ENV).unwrap() == "dead_run";
+        let state_file = workflow::state_path(root, phase);
+        if dead_run {
+            let mut old = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            old.stage = Stage::Code;
+            old.stopped = true;
+            workflow::save_state(&old).unwrap();
+        }
+        let before = std::fs::read(&state_file).ok();
+        let release = launch_hold_release();
+
+        let (observed, result) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            let observed =
+                reached_hold(&release, &worker).then(|| workflow::load_state(root, phase).unwrap());
+            std::fs::write(&release, "").unwrap();
+            (observed, worker.join().unwrap())
+        });
+
+        let observed = observed.expect("start returned without reaching its reservation hold");
+        assert!(observed.pending_supervisor.is_some(), "the start reserved");
+        let err = result.expect_err("no agent binary resolves");
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(
+            std::fs::read(&state_file).ok(),
+            before,
+            "the state file is back as it was before the start"
+        );
+        assert_eq!(liveness_files(root), Vec::<String>::new());
+    }
+
     /// `start` writes a fresh run's state only while holding the write lock: with
     /// another writer holding it, the create returns after that writer is done.
     #[test]
