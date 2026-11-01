@@ -163,6 +163,9 @@ enum Command {
         /// Per-launch id the launcher waits to see in this supervisor's ping reply.
         #[arg(long)]
         launch_id: String,
+        /// The inherited descriptor holding this launch's liveness lock.
+        #[arg(long)]
+        liveness_fd: Option<i32>,
         /// Adapter env var NAME to re-apply to the agent (repeatable; the value stays off argv).
         #[arg(long = "keep-env")]
         keep_env: Vec<String>,
@@ -613,6 +616,7 @@ fn run() -> Result<(), CliError> {
             launch,
             socket,
             launch_id,
+            liveness_fd,
             keep_env,
             prompt_file,
             idle_timeout_secs,
@@ -627,6 +631,7 @@ fn run() -> Result<(), CliError> {
                 launch,
                 socket,
                 launch_id,
+                liveness_fd,
                 keep_env,
                 prompt_file,
                 idle_timeout_secs,

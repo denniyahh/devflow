@@ -227,10 +227,6 @@ pub fn probe(path: &Path) -> std::io::Result<Held> {
 
 /// Have `cmd`'s child inherit `hold` at [`INHERITED_FD`], so it holds the lock
 /// after this process drops its copy.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: the launch path in 50.1-07")
-)]
 pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
     let raw = hold.as_raw_fd();
     // SAFETY: the callback only calls `fcntl` and `dup2`, both
