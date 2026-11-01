@@ -305,10 +305,10 @@ pub fn preanswer_gate(
     stage: crate::stage::Stage,
     response: &crate::gates::GateResponse,
 ) {
-    let dir = crate::gates::Gates::dir(root);
-    crate::workflow::ensure_devflow_dir(&dir).expect("create the gates directory");
+    crate::workflow::ensure_devflow_dir(&crate::gates::Gates::dir(root))
+        .expect("create the gates directory");
     let body = serde_json::to_string_pretty(response).expect("serialize the response");
-    let path = dir.join(format!("{}-{stage}.preanswer.json", phase.padded()));
+    let path = crate::gates::Gates::preanswer_path(root, phase, stage);
     crate::durable::replace_durably(&path, body.as_bytes()).expect("write the pre-answer");
 }
 
@@ -318,12 +318,16 @@ pub fn preanswer_gate(
 /// [`crate::gates::GateError::NoOpenGate`] with no gate file, or whatever
 /// [`crate::gates::Gates::answer`] returns.
 pub fn answer_open_gate(
-    _root: &std::path::Path,
+    root: &std::path::Path,
     phase: crate::phase_id::PhaseId,
     stage: crate::stage::Stage,
-    _response: &crate::gates::GateResponse,
+    response: &crate::gates::GateResponse,
 ) -> Result<std::path::PathBuf, crate::gates::GateError> {
-    Err(crate::gates::GateError::NoOpenGate { phase, stage })
+    let Some(live) = crate::gates::Gates::current_gate_id(root, phase, stage)? else {
+        return Err(crate::gates::GateError::NoOpenGate { phase, stage });
+    };
+    let gate = crate::gates::GateId::parse(&live)?;
+    crate::gates::Gates::answer(root, phase, stage, &gate, response)
 }
 
 /// Run `body` with `hook` installed for this thread, to run once inside the first
@@ -332,10 +336,17 @@ pub fn answer_open_gate(
 /// a writer reports `GateClosedAfterPublish` installs it here; a hook run before
 /// `Gates::answer` yields `GateIdMismatch` instead. No gate lock is held when it runs,
 /// so it may close and open gates. A hook `body` never reached is dropped unrun.
-pub fn with_answer_before_publish<R>(
-    _hook: impl FnOnce() + 'static,
-    body: impl FnOnce() -> R,
-) -> R {
+pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl FnOnce() -> R) -> R {
+    /// Clears the slot however `body` ends, so a later answer on this thread runs
+    /// no hook.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            crate::gates::set_answer_publish_hook(None);
+        }
+    }
+    crate::gates::set_answer_publish_hook(Some(Box::new(hook)));
+    let _clear = ClearOnDrop;
     body()
 }
 
