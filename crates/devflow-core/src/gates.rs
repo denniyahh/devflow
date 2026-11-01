@@ -4769,6 +4769,59 @@ mod tests {
         );
     }
 
+    /// The caller reports only what was cleaned, so a lone keyed file or abandoned
+    /// registration counts as removed. Own process: the registration's lock must read
+    /// released.
+    #[test]
+    fn the_unkeyed_cleanup_reports_removing_each_kind_of_keyed_file() {
+        in_own_process(
+            "gates::tests::the_unkeyed_cleanup_reports_removing_each_kind_of_keyed_file",
+            || {
+                let (phase, stage) = (PhaseId::new(7), Stage::Code);
+                let gate = GateId::new();
+                let lone_answer = tempfile::tempdir().unwrap();
+                let lone_claim = tempfile::tempdir().unwrap();
+                for (dir, path) in [
+                    (
+                        &lone_answer,
+                        Gates::answer_path(lone_answer.path(), phase, stage, &gate),
+                    ),
+                    (
+                        &lone_claim,
+                        Gates::claim_path(lone_claim.path(), phase, stage, &gate),
+                    ),
+                ] {
+                    std::fs::create_dir_all(Gates::dir(dir.path())).unwrap();
+                    std::fs::write(&path, "{}").unwrap();
+                    assert!(Gates::cleanup(dir.path(), phase, stage).unwrap());
+                    assert!(!path.exists());
+                    assert!(
+                        !Gates::cleanup(dir.path(), phase, stage).unwrap(),
+                        "nothing is left to remove"
+                    );
+                }
+
+                let lone_waiter = tempfile::tempdir().unwrap();
+                drop(Gates::register_waiter(lone_waiter.path(), phase, stage, &gate).unwrap());
+                assert!(Gates::cleanup(lone_waiter.path(), phase, stage).unwrap());
+                assert!(!Gates::cleanup(lone_waiter.path(), phase, stage).unwrap());
+            },
+        );
+    }
+
+    /// Only absence reads as "no pre-answer": a test that planted one must not go on
+    /// with an unanswered gate because it could not be read.
+    #[test]
+    fn a_preanswer_that_cannot_be_read_fails_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        std::fs::create_dir_all(Gates::preanswer_path(dir.path(), phase, stage)).unwrap();
+
+        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx");
+
+        assert!(matches!(opened, Err(GateError::Io(_))), "{opened:?}");
+    }
+
     const PREANSWER_SEAM_NOT_FOUND: &str =
         "no gated fn consume_preanswer( or no gated item naming preanswer.json";
     const TEST_BUILD_ONLY: &str = "#[cfg(any(test, feature = \"test-support\"))]";
