@@ -1053,11 +1053,16 @@ mod tests {
     #[test]
     fn a_hold_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("create a temp dir");
-        let path = dir.path().join("r.live");
-        let _hold = Hold::take(&path).expect("take a hold");
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        in_own_process("liveness::tests::a_hold_file_is_owner_only", || {
+            // SAFETY: umask sets one process flag, and this process runs one
+            // test. With no umask to narrow it, the mode is the code's own.
+            unsafe { libc::umask(0) };
+            let dir = tempfile::tempdir().expect("create a temp dir");
+            let path = dir.path().join("r.live");
+            let _hold = Hold::take(&path).expect("take a hold");
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        });
     }
 
     /// The pid of a process that has exited and been reaped.
