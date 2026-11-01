@@ -5619,4 +5619,119 @@ mod tests {
             "the observation is on disk"
         );
     }
+
+    /// A state saved as `seed` left it, and the stale copy a handler's caller loaded
+    /// before `other_writer` changed the file.
+    fn stale_copy_after(
+        root: &Path,
+        seed: impl FnOnce(&mut State),
+        other_writer: impl FnOnce(&mut State),
+    ) -> (PhaseId, State) {
+        let phase = PhaseId::new(90);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.gate_notify_cmd = Some("true".to_string());
+        seed(&mut state);
+        workflow::save_state(&state).unwrap();
+        let stale = workflow::load_state(root, phase).unwrap();
+        workflow::update_state(root, phase, |state| {
+            other_writer(state);
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        (phase, stale)
+    }
+
+    /// D-08: a Validate failure advances the counters on disk, not the caller's copy,
+    /// and leaves the field another writer changed. The temp directory is not a git
+    /// repository, so the commit count is unmeasured and the streak takes its `+ 1`
+    /// arm. `Supervise` gates every Validate, which holds the handler at its gate
+    /// while the file is read.
+    #[test]
+    fn a_validate_failure_commits_its_counters_and_keeps_a_concurrent_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, mut stale) = stale_copy_after(
+            root,
+            |state| {
+                state.mode = Mode::Supervise;
+                state.stage = Stage::Validate;
+                state.yes_ship = true;
+                state.consecutive_failures = 1;
+                state.phase_validate_failures = 1;
+            },
+            |state| {
+                state.yes_ship = false;
+                state.consecutive_failures = 2;
+                state.phase_validate_failures = 2;
+                state.verification_run_nonce = Some(7);
+            },
+        );
+
+        let on_disk = state_on_disk_at_gate(root, phase, Stage::Validate, || {
+            handle_validate_outcome(root, &mut stale, ValidateOutcome::Failed).unwrap();
+        });
+
+        assert!(!on_disk.yes_ship, "the concurrent revoke survives");
+        assert_eq!(on_disk.consecutive_failures, 3);
+        assert_eq!(on_disk.phase_validate_failures, 3);
+        assert_eq!(on_disk.verification_run_nonce, Some(8));
+    }
+
+    /// D-08: an infra outcome increments the counter on disk, not the caller's copy.
+    #[test]
+    fn an_infra_outcome_increments_the_on_disk_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, mut stale) = stale_copy_after(
+            root,
+            |state| {
+                state.stage = Stage::Code;
+                state.infra_failures = 1;
+            },
+            |state| state.infra_failures = 2,
+        );
+
+        let on_disk = state_on_disk_at_gate(root, phase, Stage::Code, || {
+            handle_infra_outcome(root, &mut stale, Stage::Code, Some("killed".into())).unwrap();
+        });
+
+        assert_eq!(on_disk.infra_failures, 3);
+    }
+
+    /// The infra ceiling is read from the committed counter: a stale copy below it
+    /// does not schedule another auto-resume once the counter on disk has reached it.
+    #[test]
+    fn a_rate_limit_reads_the_infra_ceiling_from_the_committed_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, mut stale) = stale_copy_after(
+            root,
+            |state| {
+                state.stage = Stage::Code;
+                state.infra_failures = 1;
+            },
+            |state| state.infra_failures = mode::MAX_INFRA_FAILURES - 1,
+        );
+
+        handle_rate_limited_outcome(
+            root,
+            &mut stale,
+            phase,
+            Stage::Code,
+            Some("rate limited until 2026-06-18T15:45:30Z".into()),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                workflow::load_state(root, phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "the ceiling on disk must abort, clearing state"
+        );
+        assert!(
+            devflow_core::ship::load_cron_instructions(root, phase).is_err(),
+            "no auto-resume is scheduled at the ceiling"
+        );
+    }
 }

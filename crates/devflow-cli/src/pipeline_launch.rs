@@ -2952,6 +2952,49 @@ mod tests {
         };
     }
 
+    /// The infra ceiling is read from the committed counter: a stale copy below it
+    /// does not re-drive the stage once the counter on disk has reached it. The agent-free
+    /// `PATH` makes a re-drive fail at its binary check rather than start an agent.
+    #[test]
+    fn an_ambiguous_outcome_reads_the_infra_ceiling_from_the_committed_counter() {
+        const NAME: &str = "pipeline_launch::tests::an_ambiguous_outcome_reads_the_infra_ceiling_from_the_committed_counter";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(91);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = 1;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        let outcome = handle_ambiguous_outcome(
+            root,
+            &mut state,
+            Stage::Code,
+            Some("context canceled".into()),
+        );
+
+        assert!(
+            matches!(
+                workflow::load_state(root, phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "the ceiling on disk must abort, not re-drive the stage (handler returned {outcome:?})"
+        );
+        outcome.unwrap();
+    }
+
     /// D-04/D-05/F-1: the chain flag is engaged for `Stage::Code` under
     /// `Mode::Auto` and for nothing else.
     ///
