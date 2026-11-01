@@ -3809,14 +3809,15 @@ mod tests {
         );
     }
 
-    /// A phase parked at an open, already-answered Code gate: the state says
-    /// `gate_pending`, the request file is on disk, and an unconsumed response
-    /// sits beside it. Returns the (request, response) bytes as planted.
+    /// A phase parked at an open, answered Code gate whose waiter was killed before it
+    /// consumed the answer: the state says `gate_pending`, the gate file is on disk,
+    /// and an unconsumed answer for that gate sits beside it. Returns the gate's id
+    /// and the answer's bytes as planted.
     fn seed_code_gate_with_pending_answer(
         root: &Path,
         phase: PhaseId,
         mode: Mode,
-    ) -> (Vec<u8>, Vec<u8>) {
+    ) -> (devflow_core::gates::GateId, Vec<u8>) {
         let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
         state.stage = Stage::Code;
         state.gate_pending = true;
@@ -3825,39 +3826,37 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        Gates::write_gate(
+        let opened = Gates::open_gate(
             root,
             phase,
             Stage::Code,
             "[never-silent] stage code failed — human review needed",
         )
         .unwrap();
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: stale answer nobody polled","responded_by":"test"}"#,
+        let answer_path = Gates::answer(
+            root,
+            phase,
+            Stage::Code,
+            &opened.gate_id,
+            &gate_response(false, Some("abort: stale answer nobody polled")),
         )
         .unwrap();
-        (
-            std::fs::read(Gates::gate_path(root, phase, Stage::Code)).unwrap(),
-            std::fs::read(&response_path).unwrap(),
-        )
+        let bytes = std::fs::read(&answer_path).unwrap();
+        (opened.gate_id, bytes)
     }
 
-    /// SURV-02 / Phase 48 criterion 3 (48-CONTEXT D-05 "verified correction"):
-    /// `resume` relaunches the saved stage and never reads a pending answer.
-    /// The gate here is a stage-failure gate, not a preflight refusal: the
-    /// relaunch's preflight PASSES (Supervise mode), so nothing re-fires the
-    /// gate, and the planted answer must survive byte-identical — not read,
-    /// not acked, not deleted.
+    /// SURV-02 / Phase 48 criterion 3: a `resume` whose relaunch opens no gate
+    /// relaunches the saved stage and leaves a pending answer exactly as it found it.
+    /// The gate here is a stage-failure gate, not a preflight refusal: the relaunch's
+    /// preflight PASSES (Supervise mode), so nothing opens a new gate, and the planted
+    /// answer stays byte-identical: not read, not claimed, not set aside.
     ///
-    /// Scope: asserts on the state immediately after `resume()` returns. The
-    /// detached monitor it spawns is reaped at drop; what that monitor would
-    /// do with the answer later is outside this test.
+    /// Scope: asserts on the state immediately after `resume()` returns. What happens
+    /// to the answer once a later gate opens is
+    /// `resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id`.
     #[test]
-    fn resume_relaunches_without_consuming_a_pending_gate_answer() {
-        const NAME: &str =
-            "pipeline_launch::tests::resume_relaunches_without_consuming_a_pending_gate_answer";
+    fn a_resume_that_opens_no_gate_leaves_a_pending_answer_where_it_is() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_that_opens_no_gate_leaves_a_pending_answer_where_it_is";
         enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
@@ -3865,8 +3864,9 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(91);
-        let (request_before, response_before) =
+        let (gate, answer_before) =
             seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
+        let request_before = std::fs::read(Gates::gate_path(root, phase, Stage::Code)).unwrap();
 
         let result = resume(root, phase, None, false);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
@@ -3892,11 +3892,10 @@ mod tests {
             "resume must launch the saved stage exactly once"
         );
 
-        // (b) the pending answer was neither read-and-consumed nor deleted.
-        let response_path = Gates::response_path(root, phase, Stage::Code);
+        // (b) the pending answer was neither consumed nor moved.
         assert_eq!(
-            std::fs::read(&response_path).ok(),
-            Some(response_before),
+            std::fs::read(Gates::answer_path(root, phase, Stage::Code, &gate)).ok(),
+            Some(answer_before),
             "resume must leave the pending gate answer on disk byte-identical"
         );
         assert_eq!(
@@ -3905,59 +3904,90 @@ mod tests {
             "resume must leave the gate request untouched"
         );
         assert!(
-            !Gates::ack_path(root, phase, Stage::Code).exists(),
-            "an ack file means a poller consumed the answer"
+            gate_claim_files(root, phase, Stage::Code).is_empty(),
+            "a claim file means a consumer took the answer"
         );
-        let events =
-            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
         assert!(
-            !events.contains("\"gate_resolved\""),
-            "resume must not resolve the gate: {events}"
+            events_of_kind(root, "gate_resolved").is_empty(),
+            "resume must not resolve the gate"
         );
     }
 
-    /// THE CONTROL for the test above: the one path 48-CONTEXT says DOES
-    /// consume a stale answer on resume — a preflight refusal. Mode::Auto at
-    /// Code with the legacy launch forced is refused by
-    /// `preflight_unattended_launch_check`, the refusal gate re-fires at the
-    /// same phase+stage, reads the planted abort answer, and `abort()` cleans
-    /// it up. Same fixture, opposite result: proves the assertions above can
-    /// observe consumption when it happens.
+    /// D-06 (V-17): an answer whose waiter was killed before it consumed the answer
+    /// never decides the gate a `resume` reaches next. Mode::Auto at Code with the legacy
+    /// launch forced is refused by `preflight_unattended_launch_check`, so the
+    /// rerun opens the same stage's gate in this process. It opens under a new id, the
+    /// old answer is set aside, and the new gate waits: its short timeout is what ends
+    /// this test.
     #[test]
-    fn resume_preflight_refusal_consumes_a_pending_gate_answer() {
-        const NAME: &str =
-            "pipeline_launch::tests::resume_preflight_refusal_consumes_a_pending_gate_answer";
-        enter_agent_free_child!(NAME, "claude");
+    fn resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id() {
+        const NAME: &str = "pipeline_launch::tests::resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1"))],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
         let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let phase = PhaseId::new(92);
-        seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
+        let (old_gate, old_answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Auto);
 
         let result = resume(root, phase, None, false);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded_for_reap
             .as_ref()
             .map(ReapMonitorOnDrop::after_launch);
-        result.unwrap();
 
         assert!(
-            !Gates::response_path(root, phase, Stage::Code).exists(),
-            "the preflight-refusal gate must have consumed the stale answer"
+            events_of_kind(root, "gate_resolved").is_empty(),
+            "the killed waiter's answer must not decide the rerun's gate: {:?}",
+            events_of_kind(root, "gate_resolved")
         );
-        let events =
-            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        let err = result.expect_err("the rerun's gate has no answer, so its wait times out");
         assert!(
-            events.contains("\"gate_resolved\""),
-            "the stale answer must have resolved the re-fired gate: {events}"
+            err.to_string().contains("timed out awaiting a response"),
+            "{err}"
         );
+        assert_eq!(events_of_kind(root, "gate_timeout").len(), 1);
         assert_eq!(
             stage_launched_count(root, phase),
             0,
-            "an aborted preflight must not launch the stage"
+            "a refused preflight with an unanswered gate launches nothing"
         );
+
+        let new_gate = live_gate_id(root, phase, Stage::Code);
+        assert_ne!(new_gate, old_gate, "the rerun's gate has its own id");
+        assert_eq!(
+            Gates::read_answer(root, phase, Stage::Code, &new_gate),
+            devflow_core::gates::AnswerRead::None,
+            "nothing answers the rerun's gate"
+        );
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Code),
+            Vec::<PathBuf>::new(),
+            "the old answer is out of the answer slots"
+        );
+
+        let quarantined = Gates::quarantined(root);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].label, old_gate.as_str());
+        assert_eq!(
+            std::fs::read(&quarantined[0].path).unwrap(),
+            old_answer,
+            "the set-aside file holds the answer's bytes"
+        );
+        let events = events_of_kind(root, "gate_answer_quarantined");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["reason"], "gate_closed");
+        assert_eq!(events[0]["gate_id"], old_gate.as_str());
     }
 
     /// D-15 (999.60): `resume` is also the recovery verb for a rate-limited
@@ -6054,8 +6084,11 @@ mod tests {
         }
     }
 
-    /// Pre-answer the next gate at `stage` so its poll returns immediately. The
-    /// shapes are `write_gate_response`'s.
+    /// Pre-answer the next gate at `stage` so its wait returns immediately.
+    ///
+    /// `GateAction::from_response` maps these three shapes: approved ->
+    /// `Advance`; not approved with a note containing "abort" -> `Abort`;
+    /// anything else not approved -> `LoopBack`.
     fn preanswer_gate_response(
         root: &Path,
         phase: PhaseId,
@@ -6088,33 +6121,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-    }
-
-    /// Write an arbitrary gate response so a gate's poll returns immediately.
-    ///
-    /// `GateAction::from_response` maps these three shapes: approved ->
-    /// `Advance`; not approved with a note containing "abort" -> `Abort`;
-    /// anything else not approved -> `LoopBack`.
-    fn write_gate_response(
-        root: &Path,
-        phase: PhaseId,
-        stage: Stage,
-        approved: bool,
-        note: Option<&str>,
-    ) {
-        assert!(
-            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
-            "write_gate_response must run inside a child test with an agent-free PATH (999.80)"
-        );
-        let response_path = Gates::response_path(root, phase, stage);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        let body = match note {
-            Some(note) => serde_json::json!({
-                "approved": approved, "note": note, "responded_by": "test"
-            }),
-            None => serde_json::json!({ "approved": approved, "responded_by": "test" }),
-        };
-        std::fs::write(&response_path, serde_json::to_vec(&body).unwrap()).unwrap();
     }
 
     /// 48-15 Task 1 / R-8: approving the re-scan gate must make the approval
@@ -6457,34 +6463,24 @@ mod tests {
         );
     }
 
-    /// 48-15 Task 1 / T-48-15-03: a non-abort rejection must record NOTHING.
-    /// Widening the approved set on a rejection is the repudiation path — the
-    /// human said no and the next resume would proceed as though they had
-    /// said yes. It also must not relaunch, and the plan file it objected to
-    /// has to appear in what the fall-through gate shows the operator.
+    /// D-07 (V-22) and 48-15 Task 1 / T-48-15-03. A non-abort rejection must record
+    /// NOTHING: widening the approved set on a rejection is the repudiation path. It
+    /// also no longer answers the stage-failure gate that follows. That gate asks a
+    /// different question ("stage failed: retry, loop to Code, or abort?") where any
+    /// non-abort answer relaunches the stage, so it opens with its own id and waits;
+    /// its short timeout is what ends this test. The plan file the operator objected
+    /// to has to appear in what that gate shows them.
     #[test]
-    fn rejecting_the_rescan_gate_records_nothing_and_falls_through() {
-        const NAME: &str =
-            "pipeline_launch::tests::rejecting_the_rescan_gate_records_nothing_and_falls_through";
+    fn rejecting_the_rescan_gate_leaves_the_follow_on_gate_waiting_for_its_own_answer() {
+        const NAME: &str = "pipeline_launch::tests::rejecting_the_rescan_gate_leaves_the_follow_on_gate_waiting_for_its_own_answer";
         const ROOT_ENV: &str = "DEVFLOW_PIPELINE_LAUNCH_RESCAN_REJECT_ROOT";
         let phase = PhaseId::new(102);
 
         if !devflow_core::test_support::in_child_test(NAME) {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            // SUPERVISE, and the reason is load-bearing. The rejection path
-            // ends in `handle_stage_failure`'s LoopBack arm, which calls
-            // `launch_stage` -> `run_preflight`. In AUTO,
-            // `preflight_unattended_launch_check` refuses that launch
-            // precisely BECAUSE the plan declares a human-only checkpoint, so
-            // a third gate opens with no response left and the test blocks on
-            // the three-day poll instead of failing. Measured, not assumed:
-            // the Auto run printed `[DOES NOT HOLD] no plan declares a
-            // human-only checkpoint` and spawned zero monitors.
-            //
-            // The route under test has no mode check (D-07), and nothing in
-            // the rejection path reads `mode`, so Supervise exercises the
-            // same code with the downstream refusal out of the way.
+            // Supervise: D-07's route. Auto parks for repair instead
+            // (`park_auto_rescan_repair`), with no follow-on gate.
             build_rescan_fixture(
                 root,
                 phase,
@@ -6496,7 +6492,10 @@ mod tests {
             let output = crate::test_support::run_hermetic_test_in_child(
                 NAME,
                 path_dir.path(),
-                &[(ROOT_ENV, root.as_os_str())],
+                &[
+                    (ROOT_ENV, root.as_os_str()),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1")),
+                ],
             );
             devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
             return;
@@ -6512,11 +6511,10 @@ mod tests {
             .unwrap()
             .checkpoint_approval;
 
-        // Not approved, and the note deliberately does NOT say "abort" —
-        // `GateAction::from_response` maps that to LoopBack, the "I will fix
-        // the plan" answer. The fall-through gate below consumes this same
-        // response, which is correct: it is the same question.
-        write_gate_response(
+        // Not approved, and the note deliberately does NOT say "abort":
+        // `GateAction::from_response` maps that to LoopBack, the "I will fix the plan"
+        // answer.
+        preanswer_gate_response(
             root,
             phase,
             Stage::Code,
@@ -6527,7 +6525,39 @@ mod tests {
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded = workflow::load_state(root, phase).ok();
         let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
-        result.unwrap();
+
+        // One answer decided one gate.
+        let resolved = events_of_kind(root, "gate_resolved");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "the rejection decides the re-scan gate and nothing else: {resolved:?}"
+        );
+        assert_eq!(resolved[0]["action"], "loop_back");
+        let err = result.expect_err("the follow-on gate has no answer, so its wait times out");
+        assert!(
+            err.to_string().contains("timed out awaiting a response"),
+            "{err}"
+        );
+        assert_eq!(events_of_kind(root, "gate_timeout").len(), 1);
+
+        // The follow-on gate is its own gate, waiting.
+        let follow_on = live_gate_id(root, phase, Stage::Code);
+        assert_ne!(
+            resolved[0]["gate_id"],
+            follow_on.as_str(),
+            "the follow-on gate opens with its own id"
+        );
+        assert_eq!(
+            Gates::read_answer(root, phase, Stage::Code, &follow_on),
+            devflow_core::gates::AnswerRead::None,
+            "no answer is bound to the follow-on gate"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "nothing relaunches on the plan the operator just rejected"
+        );
 
         let after = workflow::load_state(root, phase)
             .unwrap()
@@ -6541,16 +6571,15 @@ mod tests {
             "a rejection must never reach the relaunch path"
         );
 
-        // A rejection must REACH the existing non-auto-decide dispatch, not
-        // stop at the re-scan gate. `handle_stage_failure` is the only thing
-        // that emits a `[never-silent]` context, and the augmented reason it
-        // renders must name the plan file the human objected to — that gate
-        // is where they will actually read it.
+        // A rejection must REACH the existing non-auto-decide dispatch, not stop at the
+        // re-scan gate. `handle_stage_failure` is the only thing that emits a
+        // `[never-silent]` context, and the augmented reason it renders must name the
+        // plan file the human objected to: that gate is where they will actually read
+        // it.
         //
-        // Asserting on the never-silent context specifically, NOT merely on
-        // "some gate mentions the plan file": the re-scan gate's own context
-        // already names it, so the weaker assertion passes without any of
-        // this plan's changes and would measure nothing.
+        // Asserting on the never-silent context specifically, NOT merely on "some gate
+        // mentions the plan file": the re-scan gate's own context already names it, so
+        // the weaker assertion would measure nothing.
         let plan_file = rescan_plan_file_name(phase);
         let gate_contexts: Vec<String> = events_of_kind(root, "gate_fired")
             .iter()
@@ -6562,24 +6591,13 @@ mod tests {
                     && context.contains("could not auto-resolve")
                     && context.contains(&plan_file)
             }),
-            "the fall-through gate must name `{plan_file}` in an augmented \
+            "the follow-on gate must name `{plan_file}` in an augmented \
              unresolved-checkpoint reason; contexts were {gate_contexts:?}"
         );
-        // At least two: the re-scan gate AND the never-silent fall-through.
-        // Deliberately not an EXACT count — the LoopBack arm relaunches the
-        // stage, and that monitor's own background `devflow advance` can fire
-        // further gates on its own schedule. Pinning the count would make this
-        // test fail on a race rather than on the behaviour it asserts; the
-        // never-silent context check above is what discriminates.
-        let code_gates = events_of_kind(root, "gate_fired")
-            .into_iter()
-            .filter(|event| event["stage"] == "code")
-            .count();
-        assert!(
-            code_gates >= 2,
-            "a rejection fires the re-scan gate AND then the never-silent \
-             fall-through gate; {code_gates} gate(s) means the dispatch was \
-             not reached"
+        assert_eq!(
+            gate_contexts.len(),
+            2,
+            "the re-scan gate and the follow-on gate: {gate_contexts:?}"
         );
     }
 
@@ -10667,6 +10685,136 @@ mod tests {
         }
         files.sort();
         files
+    }
+
+    /// Every line of `source` that opens a gate without registering its waiter, before
+    /// the first line that is exactly `mod tests {`, leaving out whole-line `//`
+    /// comments. Lines keep their numbers in `source`.
+    fn unregistered_gate_open_violations(label: &str, source: &str) -> Vec<String> {
+        source
+            .lines()
+            .enumerate()
+            .take_while(|(_, line)| *line != "mod tests {")
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| {
+                [
+                    "Gates::open_gate(",
+                    "Gates::write_gate(",
+                    "Gates::register_waiter(",
+                ]
+                .iter()
+                .any(|opener| line.contains(opener))
+            })
+            .map(|(index, line)| format!("{label}: line {}: {}", index + 1, line.trim()))
+            .collect()
+    }
+
+    /// D-04 order, every caller (V-37): a gate a process waits on opens through
+    /// `Gates::open_registered`, so a writer that sees the gate file always finds its
+    /// waiter registered. No production code in either crate calls the separate steps.
+    /// There is no allowlist: a production opener that is not a waiter has no case
+    /// today, and adding one is a reviewed change to this scan.
+    ///
+    /// Limit: integration tests under `crates/*/tests/` are test code and not scanned,
+    /// and a call that does not spell the `Gates::` path is not seen.
+    #[test]
+    fn no_production_code_opens_a_gate_except_through_open_registered() {
+        assert!(
+            include_str!("main.rs").contains("#[cfg(test)]\nmod test_support;"),
+            "the CLI's test_support.rs is skipped only while it is declared test-only"
+        );
+        assert!(
+            include_str!("../../devflow-core/src/lib.rs")
+                .contains("#[cfg(any(test, feature = \"test-support\"))]\npub mod test_support;"),
+            "core's test_support.rs is skipped only while it is declared test-only"
+        );
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let files: Vec<std::path::PathBuf> = ["devflow-cli/src", "devflow-core/src"]
+            .iter()
+            .flat_map(|source_root| rust_files_under(&crates.join(source_root)))
+            .collect();
+        let labelled: Vec<(String, &std::path::PathBuf)> = files
+            .iter()
+            .map(|file| {
+                let label = file.strip_prefix(crates).unwrap().display().to_string();
+                (label, file)
+            })
+            .collect();
+        for expected in [
+            "devflow-cli/src/pipeline_gate.rs",
+            "devflow-core/src/recover.rs",
+        ] {
+            assert!(
+                labelled.iter().any(|(label, _)| label == expected),
+                "the walk must reach {expected}"
+            );
+        }
+        let skipped = [
+            "devflow-core/src/gates.rs",
+            "devflow-cli/src/test_support.rs",
+            "devflow-core/src/test_support.rs",
+        ];
+        let real: Vec<String> = labelled
+            .iter()
+            .filter(|(label, _)| !skipped.contains(&label.as_str()))
+            .flat_map(|(label, file)| {
+                unregistered_gate_open_violations(label, &std::fs::read_to_string(file).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            real,
+            Vec::<String>::new(),
+            "production gate openers outside open_registered"
+        );
+
+        assert_eq!(
+            unregistered_gate_open_violations(
+                "planted",
+                "fn wait() {\n    Gates::write_gate(root, phase, stage, ctx)?;\n}\n"
+            ),
+            vec!["planted: line 2: Gates::write_gate(root, phase, stage, ctx)?;"],
+            "a planted write_gate"
+        );
+        assert_eq!(
+            unregistered_gate_open_violations(
+                "planted",
+                "    let opened = Gates::open_gate(root, phase, stage, ctx)?;\n"
+            ),
+            vec!["planted: line 1: let opened = Gates::open_gate(root, phase, stage, ctx)?;"],
+            "a planted open_gate"
+        );
+        assert_eq!(
+            unregistered_gate_open_violations(
+                "planted",
+                "    let registration = Gates::register_waiter(root, phase, stage, &id)?;\n"
+            ),
+            vec![
+                "planted: line 1: let registration = Gates::register_waiter(root, phase, stage, &id)?;"
+            ],
+            "a planted register_waiter"
+        );
+        for (source, shape) in [
+            (
+                "    let (opened, registration) = Gates::open_registered(root, phase, stage, ctx)?;\n",
+                "the one permitted opener",
+            ),
+            (
+                "// Gates::write_gate(root, phase, stage, ctx)?;\n",
+                "a commented-out call",
+            ),
+            (
+                "mod tests {\n    Gates::open_gate(root, phase, stage, ctx);\n",
+                "a call after `mod tests {`",
+            ),
+        ] {
+            assert_eq!(
+                unregistered_gate_open_violations("planted", source),
+                Vec::<String>::new(),
+                "{shape}"
+            );
+        }
     }
 
     /// V-11 (criterion 3): no production code in this crate names `save_state`, whose

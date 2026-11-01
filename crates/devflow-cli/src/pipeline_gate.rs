@@ -2120,6 +2120,171 @@ mod tests {
         );
     }
 
+    /// A gate wait on another thread, on a saved Code-stage state.
+    fn spawn_code_gate_waiter(
+        root: &Path,
+        phase: PhaseId,
+    ) -> std::thread::JoinHandle<Result<GateAction, CliError>> {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+        let root_owned = root.to_path_buf();
+        std::thread::spawn(move || {
+            let mut state = workflow::load_state(&root_owned, phase).unwrap();
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None)
+        })
+    }
+
+    /// Wait for the stage's gate file, then return the id it names.
+    fn wait_for_open_gate(root: &Path, phase: PhaseId, stage: Stage) -> gates::GateId {
+        const GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        while !Gates::gate_path(root, phase, stage).exists() {
+            assert!(
+                started.elapsed() < GATE_OPENS_WITHIN,
+                "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        live_gate_id(root, phase, stage)
+    }
+
+    fn events_named(root: &Path, name: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    fn approval() -> GateResponse {
+        GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("test".into()),
+        }
+    }
+
+    /// D-05, waiter half (V-15 CLI): an answer with no gate id, written to the live
+    /// gate's own slot, is set aside with an event and the wait goes on. A valid answer
+    /// then decides the gate through the claim, and the registration is gone.
+    #[test]
+    fn a_gate_wait_quarantines_an_answer_without_a_gate_id_and_accepts_a_valid_one() {
+        const SET_ASIDE_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(88);
+        let waiter = spawn_code_gate_waiter(root, phase);
+        let gate = wait_for_open_gate(root, phase, Stage::Code);
+
+        // Renamed into place, so the waiter never reads a partly written file and the
+        // reason below is the missing id alone.
+        let slot = Gates::answer_path(root, phase, Stage::Code, &gate);
+        let partial = root.join("idless-answer");
+        std::fs::write(&partial, br#"{"approved": true}"#).unwrap();
+        std::fs::rename(&partial, &slot).unwrap();
+
+        let started = std::time::Instant::now();
+        while slot.exists() {
+            assert!(
+                started.elapsed() < SET_ASIDE_WITHIN,
+                "the wait must move an answer with no gate id out of its slot"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let quarantined = events_named(root, "gate_answer_quarantined");
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0]["reason"], "missing_gate_id");
+        assert!(
+            !waiter.is_finished(),
+            "an answer with no gate id does not end the wait"
+        );
+        assert!(events_named(root, "gate_resolved").is_empty());
+
+        answer_open_gate(root, phase, Stage::Code, &approval()).unwrap();
+        let action = waiter.join().unwrap().unwrap();
+        assert_eq!(action, GateAction::Advance);
+        assert!(
+            Gates::claim_path(root, phase, Stage::Code, &gate).exists(),
+            "the answer was consumed through the claim"
+        );
+        assert_eq!(
+            Gates::waiter_status(root, phase, Stage::Code, &gate).unwrap(),
+            gates::WaiterStatus::Absent
+        );
+    }
+
+    /// D-04: a gate's waiter is registered from the first moment the gate file can be
+    /// seen until the wait ends. This positive check cannot catch a reordering
+    /// deterministically; 50.1-08's
+    /// `a_writer_answering_the_instant_the_gate_file_appears_finds_its_waiter_registered`
+    /// and its control do.
+    #[test]
+    fn a_gate_wait_registers_its_waiter_for_the_whole_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(89);
+        let waiter = spawn_code_gate_waiter(root, phase);
+        let gate = wait_for_open_gate(root, phase, Stage::Code);
+        assert_eq!(
+            Gates::waiter_status(root, phase, Stage::Code, &gate).unwrap(),
+            gates::WaiterStatus::Live,
+            "registered as soon as the gate file is visible"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished());
+        assert_eq!(
+            Gates::waiter_status(root, phase, Stage::Code, &gate).unwrap(),
+            gates::WaiterStatus::Live,
+            "registered while it waits"
+        );
+
+        answer_open_gate(root, phase, Stage::Code, &approval()).unwrap();
+        waiter.join().unwrap().unwrap();
+        assert_eq!(
+            Gates::waiter_status(root, phase, Stage::Code, &gate).unwrap(),
+            gates::WaiterStatus::Absent,
+            "not registered once the wait is over"
+        );
+    }
+
+    /// D-04: when the claim for the live gate already exists as the answer arrives,
+    /// another consumer acted on it, and this waiter does nothing but say so.
+    #[test]
+    fn a_waiter_whose_answer_was_consumed_elsewhere_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(85);
+        let waiter = spawn_code_gate_waiter(root, phase);
+        let gate = wait_for_open_gate(root, phase, Stage::Code);
+
+        assert_eq!(
+            Gates::claim(root, phase, Stage::Code, &gate).unwrap(),
+            gates::Claim::Claimed
+        );
+        answer_open_gate(root, phase, Stage::Code, &approval()).unwrap();
+
+        let err = waiter
+            .join()
+            .unwrap()
+            .expect_err("a consumed answer must not decide this waiter's gate");
+        let message = err.to_string();
+        assert!(message.contains("another consumer"), "{message}");
+        assert!(message.contains(gate.as_str()), "{message}");
+        assert!(events_named(root, "gate_resolved").is_empty());
+        assert!(
+            workflow::load_state(root, phase).unwrap().gate_pending,
+            "the waiter recorded nothing about a decision it did not take"
+        );
+        assert_eq!(
+            Gates::waiter_status(root, phase, Stage::Code, &gate).unwrap(),
+            gates::WaiterStatus::Absent
+        );
+    }
+
     /// A `yes_ship` revoke made after a caller loaded its copy survives that caller's
     /// transition, which writes only the transition's own fields (D-08, T-50.1-34).
     #[test]

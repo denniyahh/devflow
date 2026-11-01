@@ -14,7 +14,7 @@
 //! rather than inside any one cluster.
 
 use devflow_core::agents;
-use devflow_core::gates::{GateResponse, Gates};
+use devflow_core::gates::{GateFile, GateId, GateResponse, Gates};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{State, SupervisorRecord};
@@ -64,6 +64,14 @@ pub(crate) fn state_on_disk_at_gate(
         waiter.join().unwrap();
         on_disk
     })
+}
+
+/// The id the stage's gate file names right now, as a test reads the gate it sees.
+pub(crate) fn live_gate_id(root: &Path, phase: PhaseId, stage: Stage) -> GateId {
+    let gate: GateFile =
+        serde_json::from_slice(&std::fs::read(Gates::gate_path(root, phase, stage)).unwrap())
+            .unwrap();
+    GateId::parse(&gate.gate_id).unwrap()
 }
 
 /// The ack and claim files of a stage, in either layout: the unkeyed
