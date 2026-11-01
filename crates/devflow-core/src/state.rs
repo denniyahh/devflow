@@ -284,9 +284,9 @@ pub struct State {
     /// current stage (D-04): its socket path, launch id, and the agent
     /// identity the stale-socket backstop validates. Written by the launcher,
     /// under the write lock ([`crate::workflow::update_state`]), in one save that
-    /// replaces the previous record; it is never cleared ahead of that save. `None` means no
-    /// supervisor has been published for this state, OR the state was written
-    /// by a binary predating this field. The socket path is the only handle a
+    /// replaces the previous record; it is never cleared ahead of that save.
+    /// `None` means no supervisor has been published for this state, OR the state
+    /// was written by a binary predating this field. The socket path is the only handle a
     /// liveness question starts from: it is passed to
     /// [`crate::supervisor::probe`] as recorded, never re-derived.
     #[serde(default)]
