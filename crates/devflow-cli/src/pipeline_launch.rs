@@ -1690,7 +1690,7 @@ fn spawn_agent_and_record(
     #[cfg(test)]
     test_hold("before_record_save");
     let record = published.record.clone();
-    match publish_record(state, published, workflow::save_state)? {
+    match publish_record(state, published, save_publish_fields)? {
         PublishOutcome::HandedOff => record_successor(record),
         PublishOutcome::SuccessorAlreadyEnded => {}
     }
@@ -1806,6 +1806,11 @@ fn publish_record<E: Into<CliError>>(
         state.phase, record.launch_id
     );
     Ok(PublishOutcome::SuccessorAlreadyEnded)
+}
+
+/// [`publish_record`]'s production save.
+fn save_publish_fields(published: &State) -> Result<(), workflow::WorkflowError> {
+    workflow::save_state(published)
 }
 
 /// After a failed publish save (`save_err`): ask the unrecorded supervisor
@@ -10161,6 +10166,117 @@ mod tests {
             handoff_order_violation(&format!("fn other() {{\n{take}{hold}{mark}{check}}}\n")),
             missing(ORDER_RUN_NOT_FOUND),
             "no run_monitor"
+        );
+    }
+
+    /// A supervisor's stop lands on the state another writer just changed: a write
+    /// in progress when the stop path started is waited for and kept, because the
+    /// stop re-reads under the write lock and writes only `stopped` and its reason.
+    /// Today's load-and-save on the same interleaving is overwritten by that writer.
+    #[test]
+    fn record_supervisor_stop_commits_only_stopped_and_its_reason() {
+        const LAUNCH_ID: &str = "thislaunch0000000000";
+        const WRITER_HOLD: Duration = Duration::from_millis(200);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2401);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = Some(SupervisorRecord::new(
+            root.join("this-launch.sock"),
+            LAUNCH_ID.to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        ));
+        workflow::save_state(&state).unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer_root = root.to_path_buf();
+        let writer = std::thread::spawn(move || {
+            workflow::update_state(&writer_root, phase, |on_disk| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                on_disk.gate_notify_cmd = Some(": edited".to_string());
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+        });
+        held_rx.recv().unwrap();
+        let stop_root = root.to_path_buf();
+        let stop = std::thread::spawn(move || record_supervisor_stop(&stop_root, phase, LAUNCH_ID));
+        std::thread::sleep(WRITER_HOLD);
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        stop.join().unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(after.stopped, "the stop is recorded");
+        assert_eq!(after.stop_reason.as_deref(), Some(SUPERVISOR_STOP_REASON));
+        assert_eq!(
+            after.gate_notify_cmd.as_deref(),
+            Some(": edited"),
+            "the other writer's field is kept"
+        );
+    }
+
+    /// The other half of `record_supervisor_stop`'s delta: a state naming another
+    /// launch is this supervisor's to leave alone, down to the byte.
+    #[test]
+    fn record_supervisor_stop_leaves_a_state_naming_another_launch_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2402);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = Some(fabricated_prior_record(root));
+        workflow::save_state(&state).unwrap();
+        let path = workflow::state_path(root, phase);
+        let before = std::fs::read(&path).unwrap();
+
+        record_supervisor_stop(root, phase, "anotherlaunch0000000");
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The publish save writes the record and, when `publish_record` has set one, a
+    /// stop. It never clears a `stop` another writer landed while the launch ran, and
+    /// it keeps every other field.
+    #[test]
+    fn the_publish_save_commits_only_the_record_and_a_stop() {
+        const CONCURRENT_STOP: &str = "stopped via `devflow stop`";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2403);
+        let mut launcher = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&launcher).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.stopped = true;
+            on_disk.stop_reason = Some(CONCURRENT_STOP.to_string());
+            on_disk.gate_notify_cmd = Some(": edited".to_string());
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        let record = fabricated_prior_record(root);
+        launcher.supervisor = Some(record.clone());
+
+        save_publish_fields(&launcher).unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.supervisor.as_ref(), Some(&record));
+        assert!(after.stopped, "the concurrent stop is not cleared");
+        assert_eq!(after.stop_reason.as_deref(), Some(CONCURRENT_STOP));
+        assert_eq!(after.gate_notify_cmd.as_deref(), Some(": edited"));
+
+        launcher.stopped = true;
+        launcher.stop_reason = Some(NEXT_STOPPED_BEFORE_SAVE_REASON.to_string());
+
+        save_publish_fields(&launcher).unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            after.stop_reason.as_deref(),
+            Some(NEXT_STOPPED_BEFORE_SAVE_REASON),
+            "publish_record's own stop is written"
         );
     }
 }

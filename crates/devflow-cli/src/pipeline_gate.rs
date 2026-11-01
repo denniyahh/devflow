@@ -2107,4 +2107,73 @@ mod tests {
             "control: the check fails on a waiter that holds the lock"
         );
     }
+
+    /// A `yes_ship` revoke made after a caller loaded its copy survives that caller's
+    /// transition, which writes only the transition's own fields (D-08, T-50.1-34).
+    #[test]
+    fn transition_commits_only_its_fields() {
+        const NAME: &str = "pipeline_gate::tests::transition_commits_only_its_fields";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(88);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.yes_ship = false;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        // The launch this ends in fails on the agent-free PATH, which is not this
+        // test's subject.
+        let _ = transition(root, &mut state, Stage::Validate);
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(!after.yes_ship, "the revoke survives the transition");
+        assert_eq!(after.stage, Stage::Validate, "the transition's own write");
+    }
+
+    /// A loop-back writes its stage move and the verification observation
+    /// `select_loop_back_fix` recorded (F-11: this is the write that persists it), and
+    /// keeps a field another writer changed since the caller loaded its copy.
+    #[test]
+    fn a_loop_back_commits_its_fields_and_the_verification_observation() {
+        const FINGERPRINT: u64 = 0xF1;
+        const MTIME_NANOS: u64 = 0xF2;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(89);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.gate_pending = true;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.yes_ship = false;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        state.last_verification_fingerprint = Some(FINGERPRINT);
+        state.last_verification_mtime_nanos = Some(MTIME_NANOS);
+
+        prepare_loop_back_to_code(
+            root,
+            &mut state,
+            FixType::GapsOnly,
+            LoopBackReason::GateResponse,
+        )
+        .unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(!after.yes_ship, "the concurrent revoke is kept");
+        assert_eq!(after.stage, Stage::Code);
+        assert!(!after.gate_pending);
+        assert_eq!(after.last_verification_fingerprint, Some(FINGERPRINT));
+        assert_eq!(after.last_verification_mtime_nanos, Some(MTIME_NANOS));
+    }
 }
