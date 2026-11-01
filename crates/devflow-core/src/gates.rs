@@ -131,7 +131,7 @@ impl GateId {
     /// A fresh gate id.
     #[must_use]
     pub fn new() -> Self {
-        Self("0000000000000000".to_string())
+        Self(crate::supervisor::new_launch_id())
     }
 
     /// Check an id read from elsewhere; anything [`is_gate_id`] refuses is
@@ -265,49 +265,78 @@ impl Gates {
         ))
     }
 
-    /// RED scaffold: writes no id.
+    /// Open a gate under a fresh gate id, replacing any earlier gate file for the
+    /// stage.
     pub fn open_gate(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
-        let path = Self::write_gate(project_root, phase, stage, context)?;
-        Ok(OpenedGate {
-            gate_id: GateId::new(),
-            path,
-        })
+        Self::write_gate_file(project_root, phase, stage, context)
     }
 
-    /// RED scaffold: publishes nothing.
+    /// Answer the gate the caller observed: publish a [`GateAnswer`] for that id,
+    /// exactly once.
     pub fn answer(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         observed: &GateId,
-        _response: &GateResponse,
+        response: &GateResponse,
     ) -> Result<PathBuf, GateError> {
-        Ok(Self::answer_path(project_root, phase, stage, observed))
+        if !Self::gate_path(project_root, phase, stage).exists() {
+            return Err(GateError::NoOpenGate { phase, stage });
+        }
+        let path = Self::answer_path(project_root, phase, stage, observed);
+        let answer = GateAnswer {
+            gate_id: observed.to_string(),
+            response: response.clone(),
+        };
+        publish_response_exclusive(&path, &serde_json::to_string_pretty(&answer)?, phase, stage)?;
+        Ok(path)
     }
 
-    /// RED scaffold: reads nothing.
+    /// What is in one gate's answer slot. Only reads: a file that does not bind is
+    /// reported and left where it is.
     pub fn read_answer(
-        _project_root: &Path,
-        _phase: PhaseId,
-        _stage: Stage,
-        _gate: &GateId,
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
     ) -> AnswerRead {
-        AnswerRead::None
+        let path = Self::answer_path(project_root, phase, stage, gate);
+        match std::fs::read(&path) {
+            Ok(bytes) => match classify_answer(&bytes, gate.as_str()) {
+                Ok(answer) => AnswerRead::Bound(answer),
+                Err(reason) => AnswerRead::Unbound(reason.to_string()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AnswerRead::None,
+            Err(error) => {
+                warn!("could not read gate answer {}: {error}", path.display());
+                AnswerRead::Unbound(REASON_UNPARSABLE.to_string())
+            }
+        }
     }
 
-    /// RED scaffold: publishes nothing.
+    /// Claim a gate's answer for consumption: the first caller gets
+    /// [`Claim::Claimed`] and acts on the answer, any later one
+    /// [`Claim::AlreadyConsumed`].
     pub fn claim(
-        _project_root: &Path,
-        _phase: PhaseId,
-        _stage: Stage,
-        _gate: &GateId,
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
     ) -> Result<Claim, GateError> {
-        Ok(Claim::Claimed)
+        let path = Self::claim_path(project_root, phase, stage, gate);
+        if let Some(parent) = path.parent() {
+            crate::workflow::ensure_devflow_dir(parent)?;
+        }
+        let ack = serde_json::to_string_pretty(&GateAck { received: true })?;
+        match crate::durable::publish_exclusive_durably(&path, ack.as_bytes())? {
+            crate::durable::Publication::Published => Ok(Claim::Claimed),
+            crate::durable::Publication::AlreadyExists => Ok(Claim::AlreadyConsumed),
+        }
     }
 
     /// Every open gate (request written, no response yet), sorted by phase
@@ -434,17 +463,28 @@ impl Gates {
         stage: Stage,
         context: &str,
     ) -> Result<PathBuf, GateError> {
+        Self::write_gate_file(project_root, phase, stage, context).map(|opened| opened.path)
+    }
+
+    /// Write a gate file under a fresh gate id. Disposes of nothing.
+    fn write_gate_file(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        context: &str,
+    ) -> Result<OpenedGate, GateError> {
+        let gate_id = GateId::new();
         let gate = GateFile {
             phase,
             stage,
             context: context.to_string(),
             timestamp: unix_now(),
-            gate_id: String::new(),
+            gate_id: gate_id.to_string(),
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
         write_atomic(&path, &serde_json::to_string_pretty(&gate)?)?;
-        Ok(path)
+        Ok(OpenedGate { gate_id, path })
     }
 
     /// Poll for a response with exponential backoff (1s → 2s → 4s … capped at
@@ -699,6 +739,27 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
             String::from_utf8_lossy(&out.stderr)
         ),
         Err(err) => warn!("gate notify hook could not be spawned: {err}"),
+    }
+}
+
+/// An answer body that is not JSON, or lacks what an answer needs.
+const REASON_UNPARSABLE: &str = "unparsable";
+/// An answer body with no gate id.
+const REASON_MISSING_GATE_ID: &str = "missing_gate_id";
+/// An answer body naming a gate other than the one whose slot holds it.
+const REASON_OTHER_GATE: &str = "other_gate";
+
+/// Whether a file in the answer slot of gate `slot_id` binds to that gate: its body
+/// parses as a [`GateAnswer`] naming `slot_id`. Otherwise, why not.
+fn classify_answer(bytes: &[u8], slot_id: &str) -> Result<GateAnswer, &'static str> {
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Err(REASON_UNPARSABLE);
+    };
+    match body.get("gate_id").and_then(serde_json::Value::as_str) {
+        None | Some("") if body.is_object() => Err(REASON_MISSING_GATE_ID),
+        None | Some("") => Err(REASON_UNPARSABLE),
+        Some(id) if id != slot_id => Err(REASON_OTHER_GATE),
+        Some(_) => serde_json::from_value(body).map_err(|_| REASON_UNPARSABLE),
     }
 }
 
