@@ -272,6 +272,30 @@ pub fn assert_child_ran_exactly_one_passing_test(output: &std::process::Output, 
     );
 }
 
+/// The answer files of a stage: keyed `.response.json` files and the legacy
+/// unkeyed response, sorted. Not quarantine, gate, claim or waiter files.
+pub fn gate_answer_files(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(crate::gates::Gates::dir(root)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-{stage}.", phase.padded());
+    let mut files: Vec<std::path::PathBuf> = entries
+        .map(|entry| entry.expect("read a gates directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest == "response.json" || rest.ends_with(".response.json"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 // ## Why there is no in-process absent-`git` harness in THIS crate
 //
 // 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests

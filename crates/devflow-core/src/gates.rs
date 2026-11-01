@@ -19,6 +19,7 @@
 //! Writes are atomic and fsynced (`crate::durable`) so a reader never sees a
 //! partial file and a power loss cannot lose a published one. Polling uses exponential backoff so a long human wait costs little.
 
+use crate::liveness;
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
@@ -302,6 +303,61 @@ pub struct OpenGate {
     pub gate_id: String,
 }
 
+/// A waiter's registration: a held lock on `NN-{stage}.{gate_id}.waiter` (D-04).
+///
+/// The lock is the registration. It dies with the process, so a crashed waiter's
+/// file reads [`WaiterStatus::Absent`] although it is still there. Dropping this
+/// without [`finish`](Self::finish) leaves that unheld file for the stage's next
+/// [`Gates::close`] to remove.
+#[derive(Debug)]
+pub struct WaiterRegistration {
+    hold: liveness::Hold,
+}
+
+impl WaiterRegistration {
+    /// End the registration: remove the waiter file, then release the lock. Only
+    /// the owner removes a live registration (R-06). A failed removal is logged and
+    /// leaves an unheld file, which the stage's next close removes.
+    pub fn finish(self) {
+        let Self { hold } = self;
+        if let Err(error) = crate::durable::remove_durably(hold.path()) {
+            warn!(
+                "could not remove the waiter registration {}: {error}",
+                hold.path().display()
+            );
+        }
+        drop(hold);
+    }
+}
+
+/// Whether a gate has a waiter. Only the held registration lock counts, never a
+/// pid, a socket or a file's existence (D-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaiterStatus {
+    /// A process holds the gate's registration.
+    Live,
+    /// Nothing holds it: no registration, or its waiter finished or died.
+    Absent,
+}
+
+/// How [`Gates::await_answer`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwaitOutcome {
+    /// The gate's own answer, bound to its id.
+    Answered(GateAnswer),
+    /// A file in the gate's slot that does not bind to it, left where it is. The
+    /// caller moves it with [`Gates::set_aside_unbound`] and waits again with the
+    /// time left.
+    Unbound {
+        /// Why it does not bind.
+        reason: String,
+    },
+    /// The wait ran out with nothing in the slot.
+    TimedOut,
+    /// The caller's `cancel` answered `true`.
+    Cancelled,
+}
+
 /// The gate-file protocol, scoped to a project's `.devflow/gates/` directory.
 pub struct Gates;
 
@@ -353,21 +409,166 @@ impl Gates {
         ))
     }
 
+    /// Path to the waiter registration for one gate.
+    pub fn waiter_path(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> PathBuf {
+        Self::dir(project_root).join(format!(
+            "{padded}-{stage}.{gate}{WAITER_SUFFIX}",
+            padded = phase.padded()
+        ))
+    }
+
     /// Open a gate under a fresh gate id, replacing any earlier gate file for the
     /// stage. Whatever the earlier gate left is disposed of first, in one gate-lock
     /// critical section with the write: an unclaimed answer is set aside, and a
     /// claimed pair is removed and recorded as an event.
+    ///
+    /// For fixtures and any opener that is not a waiter. A waiter opens through
+    /// [`open_registered`](Self::open_registered), so its gate file is never visible
+    /// before its registration.
     pub fn open_gate(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
+        Self::open_gate_as(project_root, phase, stage, &GateId::new(), context)
+    }
+
+    /// Open a gate and register its waiter, in that order on disk: the registration
+    /// exists before the gate file does, so a writer that sees the gate file finds
+    /// the waiter registered, or registered and since dead (D-04).
+    ///
+    /// A crash between the two leaves no gate file, so no writer can learn the id,
+    /// and an unheld registration the stage's next close removes.
+    pub fn open_registered(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        context: &str,
+    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
+        Self::open_registered_with_hooks(project_root, phase, stage, context, || {}, || {})
+    }
+
+    /// [`open_registered`](Self::open_registered)'s whole sequence, so the tests run
+    /// the order a release build ships. The hooks run outside the gate lock. A failed
+    /// publish finishes the registration, leaving neither file.
+    fn open_registered_with_hooks(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        context: &str,
+        before_publish: impl FnOnce(),
+        after_publish: impl FnOnce(),
+    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
+        let gate_id = GateId::new();
+        before_publish();
+        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, context)?;
+        after_publish();
+        let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
+        Ok((opened, registration))
+    }
+
+    /// The order [`open_registered`](Self::open_registered) must not have, as the
+    /// control of the tests that pin its order.
+    #[cfg(test)]
+    fn publish_then_register(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        context: &str,
+        before_publish: impl FnOnce(),
+        after_publish: impl FnOnce(),
+    ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
+        let gate_id = GateId::new();
+        before_publish();
+        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, context)?;
+        after_publish();
+        let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
+        Ok((opened, registration))
+    }
+
+    /// [`open_gate`](Self::open_gate) under the id the caller chose. The disposal
+    /// never touches a `.waiter` file: the registration for the gate being opened may
+    /// already exist.
+    fn open_gate_as(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate_id: &GateId,
+        context: &str,
+    ) -> Result<OpenedGate, GateError> {
         let _lock = gate_lock(project_root, phase)?;
         let (_, _, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
         disposal?;
-        Self::write_gate_file(project_root, phase, stage, context)
+        Self::write_gate_file(project_root, phase, stage, gate_id, context)
+    }
+
+    /// Register as `gate`'s waiter by taking a lock on its `.waiter` file, held until
+    /// [`WaiterRegistration::finish`] or this process's death (D-04). A waiter with no
+    /// supervisor socket registers the same way. It records this process's identity
+    /// for an operator; only the lock decides liveness.
+    ///
+    /// # Errors
+    /// [`GateError::Io`], including when `gate` already has a registration file, which
+    /// is never replaced.
+    pub fn register_waiter(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<WaiterRegistration, GateError> {
+        crate::workflow::ensure_devflow_dir(&Self::dir(project_root))?;
+        let hold = liveness::Hold::take(&Self::waiter_path(project_root, phase, stage, gate))?;
+        Ok(WaiterRegistration { hold })
+    }
+
+    /// Whether `gate` has a waiter, read from its registration lock alone.
+    ///
+    /// # Errors
+    /// [`GateError::Io`] when the registration exists but cannot be probed.
+    pub fn waiter_status(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<WaiterStatus, GateError> {
+        let exists = Self::waiter_path(project_root, phase, stage, gate).exists();
+        Ok(if exists {
+            WaiterStatus::Live
+        } else {
+            WaiterStatus::Absent
+        })
+    }
+
+    /// The pid and start time of every process holding a waiter registration, for
+    /// the stray reaper's safety set. A holder whose record cannot be read is logged
+    /// and left out.
+    pub fn live_waiter_holders(_project_root: &Path) -> Vec<(u32, Option<u64>)> {
+        Vec::new()
+    }
+
+    /// Wait for `gate`'s answer, reading only that gate's slot. Never writes, renames
+    /// or removes a file (R-09), so a waiter that outlives its gate cannot touch the
+    /// current gate's files.
+    ///
+    /// A caller receiving [`AwaitOutcome::Unbound`] moves the body with
+    /// [`set_aside_unbound`](Self::set_aside_unbound) and waits again with the time
+    /// left. `cancel` is checked before every read.
+    pub fn await_answer(
+        _project_root: &Path,
+        _phase: PhaseId,
+        _stage: Stage,
+        _gate: &GateId,
+        _timeout_secs: u64,
+        _cancel: impl Fn() -> bool,
+    ) -> AwaitOutcome {
+        AwaitOutcome::TimedOut
     }
 
     /// Answer the gate the caller observed: publish a [`GateAnswer`] for that id,
@@ -943,17 +1144,18 @@ impl Gates {
         stage: Stage,
         context: &str,
     ) -> Result<PathBuf, GateError> {
-        Self::write_gate_file(project_root, phase, stage, context).map(|opened| opened.path)
+        Self::write_gate_file(project_root, phase, stage, &GateId::new(), context)
+            .map(|opened| opened.path)
     }
 
-    /// Write a gate file under a fresh gate id. Disposes of nothing.
+    /// Write a gate file under `gate_id`. Disposes of nothing.
     fn write_gate_file(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
+        gate_id: &GateId,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
-        let gate_id = GateId::new();
         let gate = GateFile {
             phase,
             stage,
@@ -964,7 +1166,10 @@ impl Gates {
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
         write_atomic(&path, &serde_json::to_string_pretty(&gate)?)?;
-        Ok(OpenedGate { gate_id, path })
+        Ok(OpenedGate {
+            gate_id: gate_id.clone(),
+            path,
+        })
     }
 
     /// Poll for a response with exponential backoff (1s → 2s → 4s … capped at
@@ -1474,6 +1679,8 @@ fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError>
     }
 }
 
+/// The suffix of a waiter registration's file name.
+const WAITER_SUFFIX: &str = ".waiter";
 /// An answer body that is not JSON, or lacks what an answer needs.
 const REASON_UNPARSABLE: &str = "unparsable";
 /// An answer body with no gate id.
@@ -3524,6 +3731,432 @@ mod tests {
                 "{bad:?}: {parsed:?}"
             );
         }
+    }
+
+    // ---- D-04: a waiter is live exactly while it holds its registration ----
+
+    /// Run `body` in a child test process of its own. Another test's fork holds a
+    /// duplicate of every descriptor here until its exec, so under `cargo test` a lock
+    /// read right after its release could still read held.
+    fn in_own_process(test_name: &str, body: impl FnOnce()) {
+        if crate::test_support::in_child_test(test_name) {
+            body();
+            return;
+        }
+        let path_dir = tempfile::tempdir().unwrap();
+        let output = crate::test_support::run_test_in_child(test_name, path_dir.path(), &[]);
+        crate::test_support::assert_child_ran_exactly_one_passing_test(&output, test_name);
+    }
+
+    /// Every `*.waiter` file under `root`'s gates directory, sorted by name.
+    fn waiter_files(root: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(Gates::dir(root)) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().ends_with(WAITER_SUFFIX))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// The gate id in the name of a waiter file at `phase`'s `stage`.
+    fn waiter_file_gate(path: &Path, phase: PhaseId, stage: Stage) -> GateId {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let id = name
+            .strip_prefix(&format!("{}-{stage}.", phase.padded()))
+            .and_then(|rest| rest.strip_suffix(WAITER_SUFFIX))
+            .unwrap();
+        GateId::parse(id).unwrap()
+    }
+
+    #[test]
+    fn a_registered_waiter_reads_live_and_its_answer_is_awaited_and_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let registration = Gates::register_waiter(dir.path(), phase, stage, &gate).unwrap();
+        assert_eq!(
+            Gates::waiter_status(dir.path(), phase, stage, &gate).unwrap(),
+            WaiterStatus::Live
+        );
+
+        let root = dir.path().to_path_buf();
+        let answered = gate.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            Gates::answer(&root, phase, stage, &answered, &approved()).unwrap();
+        });
+        let outcome = Gates::await_answer(dir.path(), phase, stage, &gate, 30, || false);
+        writer.join().unwrap();
+
+        assert_eq!(
+            outcome,
+            AwaitOutcome::Answered(GateAnswer {
+                gate_id: gate.to_string(),
+                response: approved(),
+            })
+        );
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::Claimed
+        );
+        registration.finish();
+        assert_eq!(
+            Gates::waiter_status(dir.path(), phase, stage, &gate).unwrap(),
+            WaiterStatus::Absent
+        );
+        assert!(!Gates::waiter_path(dir.path(), phase, stage, &gate).exists());
+    }
+
+    #[test]
+    fn a_crashed_waiters_registration_reads_absent() {
+        const NAME: &str = "gates::tests::a_crashed_waiters_registration_reads_absent";
+        const DIED_REGISTERED: i32 = 75;
+        const MARKER: &str = "registered-marker";
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        if crate::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os("WAITER_CRASH_ROOT").unwrap());
+            let gate = GateId::parse(&std::env::var("WAITER_CRASH_GATE").unwrap()).unwrap();
+            let _registration = Gates::register_waiter(&root, phase, stage, &gate).unwrap();
+            std::fs::write(root.join(MARKER), "registered").unwrap();
+            std::process::exit(DIED_REGISTERED);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[
+                ("WAITER_CRASH_ROOT", dir.path().as_os_str()),
+                ("WAITER_CRASH_GATE", std::ffi::OsStr::new(gate.as_str())),
+            ],
+        );
+
+        assert_eq!(output.status.code(), Some(DIED_REGISTERED), "{output:?}");
+        assert!(dir.path().join(MARKER).exists(), "the child died elsewhere");
+        assert!(
+            Gates::waiter_path(dir.path(), phase, stage, &gate).exists(),
+            "a crash leaves the file behind"
+        );
+        assert_eq!(
+            Gates::waiter_status(dir.path(), phase, stage, &gate).unwrap(),
+            WaiterStatus::Absent,
+            "a marker file outliving its process must not read live"
+        );
+
+        let held = GateId::new();
+        let registration = Gates::register_waiter(dir.path(), phase, stage, &held).unwrap();
+        assert_eq!(
+            Gates::waiter_status(dir.path(), phase, stage, &held).unwrap(),
+            WaiterStatus::Live,
+            "the control: a registration still held reads live"
+        );
+        registration.finish();
+    }
+
+    /// R-09: the wait hands an unbound body back untouched, and the caller moves it.
+    #[test]
+    fn await_answer_returns_an_unbound_answer_without_moving_it() {
+        const ID_LESS_BODY: &str = "{\"approved\":true}";
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        std::fs::write(&slot, ID_LESS_BODY).unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = Gates::await_answer(dir.path(), phase, stage, &gate, 5, || false);
+
+        assert_eq!(
+            outcome,
+            AwaitOutcome::Unbound {
+                reason: REASON_MISSING_GATE_ID.to_string(),
+            }
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "returned at its first read"
+        );
+        assert_eq!(std::fs::read_to_string(&slot).unwrap(), ID_LESS_BODY);
+        assert_eq!(
+            events_named(dir.path(), "gate_answer_quarantined").len(),
+            0,
+            "the wait records nothing because it moved nothing"
+        );
+
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate).unwrap();
+        assert!(moved.is_some());
+        assert!(!slot.exists());
+        assert_eq!(events_named(dir.path(), "gate_answer_quarantined").len(), 1);
+
+        let root = dir.path().to_path_buf();
+        let answered = gate.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Gates::answer(&root, phase, stage, &answered, &approved()).unwrap();
+        });
+        let outcome = Gates::await_answer(dir.path(), phase, stage, &gate, 10, || false);
+        writer.join().unwrap();
+        assert_eq!(
+            outcome,
+            AwaitOutcome::Answered(GateAnswer {
+                gate_id: gate.to_string(),
+                response: approved(),
+            })
+        );
+    }
+
+    /// R-06. Own process: the abandoned registration's lock must read released.
+    #[test]
+    fn close_removes_only_an_abandoned_waiter_registration() {
+        in_own_process(
+            "gates::tests::close_removes_only_an_abandoned_waiter_registration",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let (phase, stage) = (PhaseId::new(7), Stage::Code);
+                let live = GateId::new();
+                let abandoned = GateId::new();
+                let registration = Gates::register_waiter(dir.path(), phase, stage, &live).unwrap();
+                drop(Gates::register_waiter(dir.path(), phase, stage, &abandoned).unwrap());
+                // Another stage's abandoned registration is not this close's to remove.
+                let elsewhere = GateId::new();
+                drop(
+                    Gates::register_waiter(dir.path(), phase, Stage::Validate, &elsewhere).unwrap(),
+                );
+                let live_path = Gates::waiter_path(dir.path(), phase, stage, &live);
+                let abandoned_path = Gates::waiter_path(dir.path(), phase, stage, &abandoned);
+
+                let report = Gates::close(dir.path(), phase, stage).unwrap();
+
+                assert!(report.removed, "the abandoned registration was removed");
+                assert!(!abandoned_path.exists(), "an abandoned registration goes");
+                assert!(live_path.exists(), "a live registration stays");
+                assert_eq!(
+                    Gates::waiter_status(dir.path(), phase, stage, &live).unwrap(),
+                    WaiterStatus::Live
+                );
+                assert!(
+                    Gates::waiter_path(dir.path(), phase, Stage::Validate, &elsewhere).exists()
+                );
+
+                registration.finish();
+                assert!(!live_path.exists(), "the owner removes its own");
+            },
+        );
+    }
+
+    /// R-06: a take in flight is not a gate file of any kind.
+    #[test]
+    fn a_waiter_hold_temp_does_not_make_its_phase_appear_on_disk() {
+        use crate::liveness::{HOLD_TEMP_SUFFIX, TakeStep};
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        std::fs::create_dir_all(Gates::dir(dir.path())).unwrap();
+        let gate = GateId::new();
+        let mut paused = false;
+
+        let hold = liveness::take_with_hook(
+            &Gates::waiter_path(dir.path(), phase, stage, &gate),
+            &mut |step, temp| {
+                if step != TakeStep::Locked {
+                    return;
+                }
+                paused = true;
+                assert!(temp.to_string_lossy().ends_with(HOLD_TEMP_SUFFIX));
+                assert_eq!(
+                    std::fs::read_dir(Gates::dir(dir.path())).unwrap().count(),
+                    1,
+                    "the temp is the phase's only entry"
+                );
+                assert!(!Gates::phases_on_disk(dir.path()).contains(&phase));
+                assert_eq!(Gates::list_open(dir.path()), Vec::new());
+                assert_eq!(Gates::live_waiter_holders(dir.path()), Vec::new());
+                assert_eq!(
+                    crate::test_support::gate_answer_files(dir.path(), phase, stage),
+                    Vec::<PathBuf>::new()
+                );
+                Gates::close(dir.path(), phase, stage).unwrap();
+                assert!(temp.exists(), "a close leaves a take in flight alone");
+            },
+        )
+        .unwrap();
+        assert!(paused, "the take never reached the point under test");
+        drop(hold);
+
+        let control = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(Gates::dir(control.path())).unwrap();
+        std::fs::write(Gates::dir(control.path()).join(".07-code.json.1.0.tmp"), "").unwrap();
+        assert!(
+            Gates::phases_on_disk(control.path()).contains(&phase),
+            "the control: a durable temp marks a gate write that outlived its phase"
+        );
+    }
+
+    #[test]
+    fn live_waiter_holders_names_the_registered_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = GateId::new();
+        let pid = std::process::id();
+        let holds = |root: &Path| {
+            Gates::live_waiter_holders(root)
+                .iter()
+                .any(|(holder, _)| *holder == pid)
+        };
+        let registration = Gates::register_waiter(dir.path(), phase, stage, &gate).unwrap();
+        assert!(
+            holds(dir.path()),
+            "{:?}",
+            Gates::live_waiter_holders(dir.path())
+        );
+        registration.finish();
+        assert!(!holds(dir.path()));
+    }
+
+    /// The writer a CLI runs: learn the id from the gate file, and answer only a gate
+    /// with a registered waiter. Returns what it read.
+    fn answer_if_registered(root: &Path, phase: PhaseId, stage: Stage) -> WaiterStatus {
+        let gate = GateId::parse(&read_gate(root, phase, stage).gate_id).unwrap();
+        let status = Gates::waiter_status(root, phase, stage, &gate).unwrap();
+        if status == WaiterStatus::Live {
+            Gates::answer(root, phase, stage, &gate, &approved()).unwrap();
+        }
+        status
+    }
+
+    /// D-04's order, through the private fn that is `open_registered`'s whole body,
+    /// with the publish-first order as its control.
+    #[test]
+    fn a_writer_answering_the_instant_the_gate_file_appears_finds_its_waiter_registered() {
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+
+        let shipped = tempfile::tempdir().unwrap();
+        let mut shipped_read = None;
+        let (opened, registration) = Gates::open_registered_with_hooks(
+            shipped.path(),
+            phase,
+            stage,
+            "ctx",
+            || {},
+            || shipped_read = Some(answer_if_registered(shipped.path(), phase, stage)),
+        )
+        .unwrap();
+        assert_eq!(shipped_read, Some(WaiterStatus::Live));
+        assert_eq!(
+            Gates::await_answer(shipped.path(), phase, stage, &opened.gate_id, 5, || false),
+            AwaitOutcome::Answered(GateAnswer {
+                gate_id: opened.gate_id.to_string(),
+                response: approved(),
+            })
+        );
+        registration.finish();
+
+        let control = tempfile::tempdir().unwrap();
+        let mut control_read = None;
+        let (opened, registration) = Gates::publish_then_register(
+            control.path(),
+            phase,
+            stage,
+            "ctx",
+            || {},
+            || control_read = Some(answer_if_registered(control.path(), phase, stage)),
+        )
+        .unwrap();
+        assert_eq!(control_read, Some(WaiterStatus::Absent));
+        assert_eq!(
+            Gates::read_answer(control.path(), phase, stage, &opened.gate_id),
+            AnswerRead::None,
+            "the writer refused"
+        );
+        registration.finish();
+        assert_ne!(
+            shipped_read, control_read,
+            "the two orders must be told apart, or the test proves nothing"
+        );
+    }
+
+    /// A kill-point fixture for each side of the publish, in the shipped sequence.
+    #[test]
+    fn a_waiter_killed_between_registering_and_publishing_leaves_no_answerable_gate() {
+        const NAME: &str = "gates::tests::a_waiter_killed_between_registering_and_publishing_leaves_no_answerable_gate";
+        const KILLED: i32 = 76;
+        const MARKER: &str = "kill-point-marker";
+        const BEFORE_PUBLISH: &str = "before_publish";
+        const AFTER_PUBLISH: &str = "after_publish";
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        if crate::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os("GATE_KILL_ROOT").unwrap());
+            let point = std::env::var("GATE_KILL_POINT").unwrap();
+            let kill_at = |here: &str| {
+                if point == here {
+                    std::fs::write(root.join(MARKER), here).unwrap();
+                    std::process::exit(KILLED);
+                }
+            };
+            let opened = Gates::open_registered_with_hooks(
+                &root,
+                phase,
+                stage,
+                "ctx",
+                || kill_at(BEFORE_PUBLISH),
+                || kill_at(AFTER_PUBLISH),
+            );
+            panic!("the kill point {point} never fired: {opened:?}");
+        }
+        let killed_at = |point: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path_dir = tempfile::tempdir().unwrap();
+            let output = crate::test_support::run_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[
+                    ("GATE_KILL_ROOT", dir.path().as_os_str()),
+                    ("GATE_KILL_POINT", std::ffi::OsStr::new(point)),
+                ],
+            );
+            assert_eq!(output.status.code(), Some(KILLED), "{output:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(MARKER)).unwrap(),
+                point,
+                "the child died elsewhere"
+            );
+            dir
+        };
+
+        let before = killed_at(BEFORE_PUBLISH);
+        assert!(!Gates::gate_path(before.path(), phase, stage).exists());
+        assert_eq!(Gates::list_open(before.path()), Vec::new());
+        let registrations = waiter_files(before.path());
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        let gate = waiter_file_gate(&registrations[0], phase, stage);
+        assert_eq!(
+            Gates::waiter_status(before.path(), phase, stage, &gate).unwrap(),
+            WaiterStatus::Absent
+        );
+        Gates::close(before.path(), phase, stage).unwrap();
+        assert_eq!(waiter_files(before.path()), Vec::<PathBuf>::new());
+
+        let after = killed_at(AFTER_PUBLISH);
+        assert!(Gates::gate_path(after.path(), phase, stage).exists());
+        let open = Gates::list_open(after.path());
+        assert_eq!(open.len(), 1, "{open:?}");
+        let gate = GateId::parse(&open[0].gate_id).unwrap();
+        assert!(Gates::waiter_path(after.path(), phase, stage, &gate).exists());
+        assert_eq!(
+            Gates::waiter_status(after.path(), phase, stage, &gate).unwrap(),
+            WaiterStatus::Absent,
+            "a waiter that died at its gate"
+        );
     }
 
     /// What an operator reads must say what happened and where to look next.
