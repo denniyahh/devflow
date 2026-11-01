@@ -15,9 +15,14 @@
 //! - A `flock` belongs to the open file description, so `unlock()` on any
 //!   duplicate releases the lock a child inherited. Dropping a [`Hold`] is the
 //!   only release.
+//!
+//! The identity record a hold writes (pid and start time) is advisory, not state,
+//! and stays outside D-09's durable helpers and their scan: the lock, not its
+//! bytes, decides liveness, and a crash that loses the record loses nothing. It
+//! only names the holder for an operator.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -247,31 +252,72 @@ pub(crate) fn pass_to_child(cmd: &mut std::process::Command, hold: &Hold) {
     }
 }
 
-/// Scaffold for the failing tests: accepts any launch id.
+/// The liveness file of launch `launch_id`: `.devflow/supervisor-{launch_id}.live`.
+/// `None` unless the id has [`crate::supervisor::new_launch_id`]'s format, so a
+/// launch id read from disk never builds a path outside `.devflow/`.
 pub fn launch_liveness_path(project_root: &Path, launch_id: &str) -> Option<PathBuf> {
-    Some(
+    crate::supervisor::is_launch_id(launch_id).then(|| {
         project_root
             .join(".devflow")
-            .join(format!("supervisor-{launch_id}.live")),
-    )
+            .join(format!("supervisor-{launch_id}.live"))
+    })
 }
 
-/// Scaffold for the failing tests: wraps the descriptor and does nothing else.
+/// The supervisor's side of `pass_to_child`: take ownership of the inherited
+/// descriptor `fd` on `path`, mark it close-on-exec so an agent this process
+/// spawns never inherits it, and record this process as the holder.
 ///
 /// # Errors
-/// None in the scaffold.
+/// `fd` is not an open descriptor, or the record could not be written.
 pub fn adopt_inherited(fd: RawFd, path: PathBuf) -> std::io::Result<Hold> {
-    // SAFETY: the scaffold's caller hands over a descriptor it owns.
-    let file = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+    // SAFETY: fcntl on a descriptor number reads and sets its flags and touches
+    // no memory; a closed number fails with EBADF.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: the descriptor is open (checked above) and was handed to this
+    // process for exclusive ownership; nothing else here uses it.
+    let file = unsafe { File::from_raw_fd(fd) };
+    write_identity_record(&file)?;
     Ok(Hold { file, path })
 }
 
-/// Scaffold for the failing tests: names nobody.
+/// Whose lock this is: the pid and start time the holder recorded, while the
+/// lock is held; `None` when nothing holds it. For telling an operator or the
+/// stray-reaper safety set who holds it, never for deciding liveness: [`probe`]
+/// alone decides that.
 ///
 /// # Errors
-/// None in the scaffold.
-pub fn live_holder(_path: &Path) -> std::io::Result<Option<(u32, Option<u64>)>> {
-    Ok(None)
+/// [`std::io::ErrorKind::InvalidData`] for an empty or unparsable record, which
+/// a reader racing a rewrite can get, so its caller refuses rather than acts;
+/// any other error probing or reading the file.
+pub fn live_holder(path: &Path) -> std::io::Result<Option<(u32, Option<u64>)>> {
+    if probe(path)? != Held::Live {
+        return Ok(None);
+    }
+    let record = match std::fs::read_to_string(path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    parse_identity_record(&record).map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} has an unreadable record: {record:?}", path.display()),
+        )
+    })
+}
+
+/// Parse [`write_identity_record`]'s format. A record without its final newline
+/// is a partial one.
+fn parse_identity_record(record: &str) -> Option<(u32, Option<u64>)> {
+    let mut fields = record.strip_suffix('\n')?.split(' ');
+    let pid = fields.next()?.parse().ok()?;
+    let start = fields.next().map(str::parse).transpose().ok()?;
+    fields.next().is_none().then_some((pid, start))
 }
 
 #[cfg(test)]
@@ -280,7 +326,6 @@ mod tests {
     use crate::test_support::{
         assert_child_ran_exactly_one_passing_test, in_child_test, run_test_in_child,
     };
-    use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 

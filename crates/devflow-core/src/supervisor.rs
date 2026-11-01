@@ -138,7 +138,7 @@ pub fn new_launch_id() -> String {
 /// launch id read from disk (a sidecar, a socket name) is printed into
 /// copy-paste `devflow stop --launch <id>` lines, so this is the one rule
 /// every reader applies before trusting one.
-fn is_launch_id(id: &str) -> bool {
+pub(crate) fn is_launch_id(id: &str) -> bool {
     const LAUNCH_ID_LEN: usize = 16;
     id.len() == LAUNCH_ID_LEN
         && id
