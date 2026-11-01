@@ -522,15 +522,15 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 30 plans (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+**Plans:** 3/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
 plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
 runs in wave 19
 
 **Wave 1**
 
-- [ ] 50.1-01-PLAN.md *(no plan dependencies)* — durable replace / exclusive publish / remove with directory fsync; state and gate writers routed; D-09 source scan (V-10, V-14)
-- [ ] 50.1-02-PLAN.md *(no plan dependencies)* — 999.166 items 5 (accept backoff) and 9 (zombie-safe probe)
-- [ ] 50.1-03-PLAN.md *(no plan dependencies)* — requirement IDs SURV-03, SURV-04, SUPV-03, SUPV-04, SUPV-05 and traceability
+- [x] 50.1-01-PLAN.md *(no plan dependencies)* — durable replace / exclusive publish / remove with directory fsync; state and gate writers routed; D-09 source scan (V-10, V-14)
+- [x] 50.1-02-PLAN.md *(no plan dependencies)* — 999.166 items 5 (accept backoff) and 9 (zombie-safe probe)
+- [x] 50.1-03-PLAN.md *(no plan dependencies)* — requirement IDs SURV-03, SURV-04, SUPV-03, SUPV-04, SUPV-05 and traceability
 
 **Wave 2**
 
@@ -802,7 +802,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
-| 50.1 | — | Not started | — |
+| 50.1 | 3/30 | In Progress | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
