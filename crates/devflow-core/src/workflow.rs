@@ -42,7 +42,6 @@ pub enum WorkflowError {
 /// listing/migration never hardcode the naming scheme.
 const STATE_FILE_PREFIX: &str = "state-";
 const CORRUPT_LEGACY_STATE_HINT: &str = "devflow recover --clean";
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Return the `.devflow` directory for a project.
 pub fn devflow_dir(project_root: &Path) -> PathBuf {
@@ -193,32 +192,12 @@ pub fn save_state(state: &State) -> Result<(), WorkflowError> {
     Ok(())
 }
 
-/// Return a unique sibling temporary path using the shared DevFlow temp shape.
-pub(crate) fn unique_temp_path(target: &Path) -> PathBuf {
-    unique_temp_path_with(
-        target,
-        std::process::id(),
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
-    )
-}
-
 fn unique_temp_path_with(target: &Path, pid: u32, sequence: u64) -> PathBuf {
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     target.with_file_name(format!(".{name}.{pid}.{sequence}.tmp"))
 }
 
 /// Create a unique sibling temporary file, retrying only a colliding orphan.
-fn create_unique_temp_for_current_process(target: &Path) -> std::io::Result<(PathBuf, File)> {
-    loop {
-        let tmp = unique_temp_path(target);
-        match File::create_new(&tmp) {
-            Ok(file) => return Ok((tmp, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 pub(crate) fn create_unique_temp(
     target: &Path,
     pid: u32,
@@ -234,23 +213,13 @@ pub(crate) fn create_unique_temp(
     }
 }
 
-/// Write state through a sibling temporary file so readers never observe a
-/// truncated or partially written state file.
+/// Write state through [`crate::durable::replace_durably`], so readers never
+/// observe a truncated file and a power loss cannot lose the rename (D-09).
 fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> {
     if let Some(parent) = path.parent() {
         ensure_devflow_dir(parent)?;
     }
-    let (tmp, mut file) = create_unique_temp_for_current_process(path)?;
-    if let Err(error) = file.write_all(contents.as_bytes()) {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    drop(file);
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error.into());
-    }
+    crate::durable::replace_durably(path, contents.as_bytes())?;
     Ok(())
 }
 
