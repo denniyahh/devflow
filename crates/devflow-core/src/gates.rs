@@ -12,12 +12,15 @@
 //! - `NN-{stage}.{gate_id}.ack.json` — the consumption claim (a [`GateAck`]); the
 //!   first process to publish it consumes the answer.
 //!
+//! - `NN-{stage}.{gate_id}.waiter` — the waiter's registration: a file whose held
+//!   lock says something still waits on that gate ([`Gates::register_waiter`]).
+//!
 //! The unkeyed `NN-{stage}.response.json` and `NN-{stage}.ack.json` of
 //! [`Gates::respond`], [`Gates::poll_response`] and [`Gates::ack`] stay until the
 //! CLI has moved off them.
 //!
 //! Writes are atomic and fsynced (`crate::durable`) so a reader never sees a
-//! partial file and a power loss cannot lose a published one. Polling uses exponential backoff so a long human wait costs little.
+//! partial file and a power loss cannot lose a published one. Polling uses exponential backoff so a long human wait costs little, and never moves a file.
 
 use crate::liveness;
 use crate::phase_id::PhaseId;
@@ -422,6 +425,16 @@ impl Gates {
         ))
     }
 
+    /// Path to a stage's pre-answer, which exists only in test builds. See
+    /// [`crate::test_support::preanswer_gate`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn preanswer_path(project_root: &Path, phase: PhaseId, stage: Stage) -> PathBuf {
+        Self::dir(project_root).join(format!(
+            "{padded}-{stage}.preanswer.json",
+            padded = phase.padded()
+        ))
+    }
+
     /// Open a gate under a fresh gate id, replacing any earlier gate file for the
     /// stage. Whatever the earlier gate left is disposed of first, in one gate-lock
     /// critical section with the write: an unclaimed answer is set aside, and a
@@ -512,7 +525,9 @@ impl Gates {
         let (_, _, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
         disposal?;
-        Self::write_gate_file(project_root, phase, stage, gate_id, context)
+        let opened = Self::write_gate_file(project_root, phase, stage, gate_id, context)?;
+        consume_preanswer(project_root, phase, stage, gate_id)?;
+        Ok(opened)
     }
 
     /// Register as `gate`'s waiter by taking a lock on its `.waiter` file, held until
@@ -929,6 +944,7 @@ impl Gates {
             Self::set_aside_slot_if_unbound(project_root, phase, stage, observed)?;
         }
         before_publish();
+        run_answer_publish_hook();
         let path = Self::answer_path(project_root, phase, stage, observed);
         let answer = GateAnswer {
             gate_id: observed.to_string(),
@@ -972,7 +988,7 @@ impl Gates {
     }
 
     /// The id the stage's gate file names, or `None` with no gate file.
-    fn current_gate_id(
+    pub(crate) fn current_gate_id(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
@@ -1215,8 +1231,9 @@ impl Gates {
         stage: Stage,
         context: &str,
     ) -> Result<PathBuf, GateError> {
-        Self::write_gate_file(project_root, phase, stage, &GateId::new(), context)
-            .map(|opened| opened.path)
+        let opened = Self::write_gate_file(project_root, phase, stage, &GateId::new(), context)?;
+        consume_preanswer(project_root, phase, stage, &opened.gate_id)?;
+        Ok(opened.path)
     }
 
     /// Write a gate file under `gate_id`. Disposes of nothing.
@@ -1246,6 +1263,9 @@ impl Gates {
     /// Poll for a response, reading at backoff boundaries (1 s doubling to 60 s) and
     /// at the timeout, giving up after `timeout_secs`. Returns the parsed response
     /// when it appears, or `None` on timeout. Only reads (R-09).
+    ///
+    /// Transition bridge, deleted in 50.1-15: it also reads the live gate's keyed
+    /// answer.
     pub fn poll_response(
         project_root: &Path,
         phase: PhaseId,
@@ -1257,7 +1277,7 @@ impl Gates {
         backoff_wait(
             Duration::from_secs(timeout_secs),
             || false,
-            || read_unkeyed_response(&path),
+            || Self::read_live_or_unkeyed(project_root, phase, stage),
         )
         .found()
     }
@@ -1270,6 +1290,9 @@ impl Gates {
     /// caller tells the two apart by asking its own `cancel` again: a `None` returned
     /// before the timeout means `cancel` answered `true`. `cancel` is checked before
     /// every read, so a cancel wins over a response already on disk.
+    ///
+    /// Transition bridge, deleted in 50.1-15: it also reads the live gate's keyed
+    /// answer.
     pub fn poll_response_cancellable(
         project_root: &Path,
         phase: PhaseId,
@@ -1283,9 +1306,28 @@ impl Gates {
             path.display()
         );
         backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
-            read_unkeyed_response(&path)
+            Self::read_live_or_unkeyed(project_root, phase, stage)
         })
         .found()
+    }
+
+    /// One read of an unkeyed poll: the live gate's bound answer, else the unkeyed
+    /// response. Moves nothing (R-09). Transition bridge, deleted in 50.1-15.
+    fn read_live_or_unkeyed(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Option<GateResponse> {
+        let live = Self::current_gate_id(project_root, phase, stage)
+            .ok()
+            .flatten()
+            .and_then(|id| GateId::parse(&id).ok());
+        if let Some(gate) = live
+            && let AnswerRead::Bound(answer) = Self::read_answer(project_root, phase, stage, &gate)
+        {
+            return Some(answer.response);
+        }
+        read_unkeyed_response(&Self::response_path(project_root, phase, stage))
     }
 
     /// Write an ack file signalling the response was read.
@@ -1301,6 +1343,9 @@ impl Gates {
     /// Remove the gate, response, and ack files for a stage, and their
     /// orphaned write temps. Idempotent. Returns whether this call removed
     /// any file, so a caller can report only what it actually cleaned.
+    ///
+    /// Transition bridge, deleted in 50.1-15: it also removes the stage's keyed
+    /// answer and claim files, and its waiter files that read abandoned (R-06).
     pub fn cleanup(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<bool, GateError> {
         let (removed, result) = Self::cleanup_with_partial_result(project_root, phase, stage);
         result.map(|()| removed)
@@ -1353,9 +1398,114 @@ impl Gates {
                 }
             }
         }
+        match Self::remove_keyed_stage_files(project_root, phase, stage) {
+            Ok(was_removed) => removed |= was_removed,
+            Err(error) => return (removed, Err(error)),
+        }
+        match Self::remove_abandoned_waiters(project_root, phase, stage) {
+            Ok(was_removed) => removed |= was_removed,
+            Err(error) => return (removed, Err(error)),
+        }
         (removed, Ok(()))
     }
+
+    /// Remove the stage's keyed answer and claim files. Transition bridge, deleted in
+    /// 50.1-15.
+    fn remove_keyed_stage_files(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<bool, GateError> {
+        let prefix = format!("{}-{stage}.", phase.padded());
+        let mut removed = false;
+        for entry in std::fs::read_dir(Self::dir(project_root))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix)
+                && (name.ends_with(".response.json") || name.ends_with(".ack.json"))
+            {
+                removed |= crate::durable::remove_durably(&entry.path())?;
+            }
+        }
+        Ok(removed)
+    }
 }
+
+/// Publish the stage's pre-answer, if there is one, as `gate`'s answer, and remove it.
+///
+/// Not re-entrant, by design: this runs inside [`Gates::open_gate`]'s gate-lock critical
+/// section, so it calls only the unlocked publish step and never [`Gates::answer`] or
+/// anything else that takes the gate lock. A second open file description in this
+/// process cannot take the `flock` the first holds, so `gate_lock` would poll until
+/// [`GATE_LOCK_WAIT`] and fail with [`GateError::GateLockTimeout`]. It never takes the
+/// state write lock either.
+#[cfg(any(test, feature = "test-support"))]
+fn consume_preanswer(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    gate: &GateId,
+) -> Result<(), GateError> {
+    let path = Gates::preanswer_path(project_root, phase, stage);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let answer = GateAnswer {
+        gate_id: gate.to_string(),
+        response: serde_json::from_slice(&bytes)?,
+    };
+    publish_response_exclusive(
+        &Gates::answer_path(project_root, phase, stage, gate),
+        &serde_json::to_string_pretty(&answer)?,
+        phase,
+        stage,
+    )?;
+    crate::durable::remove_durably(&path)?;
+    Ok(())
+}
+
+/// A release build has no pre-answer: nothing can turn a stray file into an answer
+/// (T-50.1-30).
+#[cfg(not(any(test, feature = "test-support")))]
+fn consume_preanswer(
+    _project_root: &Path,
+    _phase: PhaseId,
+    _stage: Stage,
+    _gate: &GateId,
+) -> Result<(), GateError> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// What the next answer this thread publishes runs, after its id check and before
+    /// its publish. See [`crate::test_support::with_answer_before_publish`].
+    static ANSWER_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install `hook`, replacing any earlier one, or clear the slot with `None`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn set_answer_publish_hook(hook: Option<Box<dyn FnOnce()>>) {
+    ANSWER_PUBLISH_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Take the installed hook out of its slot and run it, so it runs once, and with the
+/// slot free in case it answers a gate itself.
+#[cfg(any(test, feature = "test-support"))]
+fn run_answer_publish_hook() {
+    let hook = ANSWER_PUBLISH_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// A release build runs no closure inside an answer (T-50.1-104).
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_answer_publish_hook() {}
 
 #[cfg(test)]
 thread_local! {
