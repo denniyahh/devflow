@@ -461,7 +461,8 @@ pub(crate) fn rfc3339_now() -> String {
 /// sidecar there (another launch's) fails the link with
 /// [`io::ErrorKind::AlreadyExists`] and is left as it was. The socket
 /// directory is created `0700` if absent and refused if it is unsafe, as
-/// [`publish`] does.
+/// [`publish`] does. The directory is fsynced after the link, so a crash
+/// cannot lose the entry (D-09); a failed link fsyncs nothing.
 pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -505,7 +506,8 @@ pub(crate) fn write_sidecar(socket: &SocketPath, sidecar: &Sidecar) -> io::Resul
             temp.display()
         );
     }
-    written
+    written?;
+    crate::durable::fsync_dir(dir)
 }
 
 /// Read and parse the sidecar at `path`. Read-only.
