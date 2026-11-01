@@ -80,7 +80,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, timeout_secs: u64, what: &str) 
 /// instead of hanging CI indefinitely. Shared with `gate_sweep_e2e.rs`'s
 /// identically-named helper so the two real-child fixtures cannot drift
 /// into different reliability characteristics. Defaults comfortably above
-/// `Gates::poll_response`'s 60s backoff cap.
+/// `Gates::await_answer`'s 60s backoff cap.
 fn e2e_child_timeout() -> Duration {
     let secs: u64 = std::env::var("DEVFLOW_E2E_CHILD_TIMEOUT_SECS")
         .ok()

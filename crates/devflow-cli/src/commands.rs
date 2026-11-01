@@ -1716,8 +1716,8 @@ fn gate_changed_message(phase: PhaseId, stage: Stage, observed: &str, current: &
 enum ListedGate {
     /// The gate file still names this id: it may answer it.
     Current(GateId),
-    /// The listing has no valid id (a gate file from before gate ids): no answer
-    /// can bind to it.
+    /// The listing's id is empty or malformed (a gate file with no id at all does
+    /// not parse, so it is never listed): no answer can bind to it.
     NoValidId,
     /// The gate file no longer names the listed id, or cannot be read.
     Changed,
@@ -5426,7 +5426,7 @@ fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
 
 /// Build `doctor`'s per-phase reconciliation section (after the existing
 /// tool/env checks), read-only: it never writes state or calls
-/// `events::emit`, `Gates::cleanup`/`Gates::write`, or any `recover::clean*`
+/// `events::emit`, `Gates::close`/`Gates::open_gate`, or any `recover::clean*`
 /// function (T-18-02). A pure string builder (not a direct `println!`) so
 /// it's directly assertable in tests without capturing process stdout.
 fn render_reconciliation_text(facts: &[PhaseFacts]) -> String {
@@ -6684,8 +6684,8 @@ mod tests {
         registration.finish();
     }
 
-    /// A gate file from before gate ids can be reported, and nothing else: no
-    /// answer can bind to it. Both writers skip it before reading liveness.
+    /// A gate file naming an empty id can be reported, and nothing else: no answer
+    /// can bind to it. Both writers skip it before reading liveness.
     #[test]
     fn a_gate_with_no_gate_id_is_reported_and_never_answered() {
         let dir = tempfile::tempdir().unwrap();

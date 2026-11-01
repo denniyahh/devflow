@@ -110,7 +110,7 @@ fn parse_gate_max_unattended_age(raw: Option<String>) -> u64 {
 /// against that function's seven days. The old split treated "how long to
 /// wait for a human" and "how long before a sweep gives up on one" as
 /// independent questions. They are not, because the sweep does not merely
-/// report: `Gates::reap` writes an `abort:` response, and any monitor still
+/// report: `Gates::reap_answer` writes an `abort:` response, and any monitor still
 /// polling that gate consumes it on its next read and tears the phase down
 /// via `abort()` — which clears state and deregisters, unlike the clean
 /// resumable stop a poll timeout produces. A threshold SHORTER than the poll
@@ -121,7 +121,7 @@ fn parse_gate_max_unattended_age(raw: Option<String>) -> u64 {
 ///
 /// Known edge at equality: a gate reaches this age at roughly the moment its
 /// own poll gives up, so a sweep invoked inside that window can still catch a
-/// live poller mid-backoff (`poll_response` caps its sleep at 60s) and turn
+/// live waiter mid-backoff (`Gates::await_answer` reads at most 60s apart) and turn
 /// what would have been a timeout into an abort. Set this above
 /// `DEVFLOW_GATE_TIMEOUT_SECS` if that distinction matters for a given run.
 pub(crate) fn gate_max_unattended_age_secs() -> u64 {

@@ -13,9 +13,10 @@
 //! spelling second. A regression that made `padded()` drop the minor number
 //! would keep every path well-formed and break every one of these.
 
+use devflow_core::gates::{GateId, Gates};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
-use devflow_core::{agent_result, gates::Gates, workflow, worktree};
+use devflow_core::{agent_result, workflow, worktree};
 use std::path::{Path, PathBuf};
 
 const ROOT: &str = "/tmp/devflow-decimal-phase-paths";
@@ -23,10 +24,11 @@ const ROOT: &str = "/tmp/devflow-decimal-phase-paths";
 /// Every identifier-derived path for one phase, in one place.
 fn paths_for(phase: PhaseId) -> Vec<PathBuf> {
     let root = Path::new(ROOT);
+    let gate = GateId::parse("0123456789abcdef").unwrap();
     vec![
         workflow::state_path(root, phase),
         Gates::gate_path(root, phase, Stage::Validate),
-        Gates::response_path(root, phase, Stage::Validate),
+        Gates::answer_path(root, phase, Stage::Validate, &gate),
         worktree::phase_path(root, phase),
         worktree::phase_agent_path(root, phase, "claude"),
         agent_result::stdout_path(root, phase),
