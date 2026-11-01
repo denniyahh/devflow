@@ -4695,4 +4695,31 @@ mod tests {
             assert!(!reason.contains("never starts"), "{reason}");
         }
     }
+
+    /// D-08: a failing preflight increments the retry counter on disk, not the
+    /// caller's copy. The state is read while the handler is held at its gate, because
+    /// the abort that ends the test clears the file.
+    #[test]
+    fn a_preflight_retry_counter_commits_on_the_re_read_state() {
+        const NAME: &str =
+            "preflight::tests::a_preflight_retry_counter_commits_on_the_re_read_state";
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(63);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.preflight_retries = 1;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        let on_disk = state_on_disk_at_gate(root, phase, Stage::Plan, || {
+            run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
+        });
+
+        assert_eq!(on_disk.preflight_retries, 2);
+    }
 }
