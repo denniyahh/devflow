@@ -718,11 +718,13 @@ pub(crate) fn start(
     Ok(())
 }
 
-/// Write a fresh run's state for `start`.
+/// Write a fresh run's state for `start`, under the write lock. This is the one
+/// documented write of a whole state: it creates the run, replacing any state on
+/// disk (50.1-16 turns this into a check-and-reserve).
 fn create_run_state(project_root: &Path, phase: PhaseId, state: &State) -> Result<(), CliError> {
-    let _ = (project_root, phase);
-    workflow::save_state(state)?;
-    Ok(())
+    workflow::update_state_with(project_root, phase, |_existing| {
+        Ok::<_, CliError>((Some(state.clone()), ()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2932,21 +2934,23 @@ fn persist_stopped_state(
         }
         (Err(err), _) => return Err(CliError::Message(err.to_string())),
     };
-    let mut state = match workflow::load_state(project_root, phase) {
-        Ok(state) => state,
-        Err(workflow::WorkflowError::MissingState(_)) => {
-            println!("stop: no persisted state for phase {phase} — already stopped");
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
-    state.stopped = true;
-    let reason = "stopped via `devflow stop`".to_string();
-    state.stop_reason = Some(match state.stop_reason.take() {
-        Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
-        _ => reason,
-    });
-    workflow::save_state(&state)?;
+    let found_state = workflow::update_state_with(project_root, phase, |existing| {
+        let mut state = match existing {
+            workflow::Existing::Loaded(state) => state,
+            workflow::Existing::Missing => return Ok((None, false)),
+            workflow::Existing::Unloadable(err) => return Err(CliError::from(err)),
+        };
+        state.stopped = true;
+        let reason = "stopped via `devflow stop`".to_string();
+        state.stop_reason = Some(match state.stop_reason.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+            _ => reason,
+        });
+        Ok((Some(state), true))
+    })?;
+    if !found_state {
+        println!("stop: no persisted state for phase {phase} — already stopped");
+    }
     Ok(())
 }
 
