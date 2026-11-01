@@ -19,7 +19,7 @@ use crate::pipeline_gate::{
     LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
     transition,
 };
-use crate::pipeline_launch::launch_stage;
+use crate::pipeline_launch::{commit, launch_stage};
 use devflow_core::gates::{GateAction, GateResponse, Gates};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
@@ -370,7 +370,7 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
         //
         // F-11: this update does NOT reach disk through the `save_state`
         // earlier in `handle_validate_outcome` — that one runs before this
-        // point. It is persisted a few statements later, by the `save_state`
+        // point. It is persisted a few statements later, by the `commit`
         // inside `prepare_loop_back_to_code`, reached via the
         // `loop_back_to_code` call on the next line at every call site. A
         // process killed in that interval loses the update, and the
@@ -733,13 +733,16 @@ pub(crate) fn handle_validate_outcome(
             // aborting is destructive and irreversible relative to gating and
             // would kill a phase that may be one cycle from converging.
             GateAction::Advance => {
-                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
                 transition(project_root, state, Stage::Ship)
             }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
+                // Reset first: its `commit` replaces `state`, so it must not run
+                // between this selection and the loop-back write that carries the
+                // observation the selection recorded in `state`.
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
                 let fix = select_loop_back_fix(&evidence_root, state.phase, state);
-                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
                 loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
             // No reset on abort: the phase is ending and `abort` clears its
@@ -771,8 +774,8 @@ pub(crate) fn handle_validate_outcome(
 /// The caller must never pass "a gate fired" here. Supervise gates on every
 /// Validate, so that would clear the total at every failure and the bound
 /// would never accumulate at all — an unbounded loop wearing a gate on every
-/// cycle. The persisting write is the caller's: both arms that call this go on
-/// to `transition` or `loop_back_to_code`, each of which saves state.
+/// cycle. The reset commits itself (D-08): `transition` and `loop_back_to_code`,
+/// which both arms go on to, write only their own fields.
 ///
 /// # Why the reset announces itself (WR-03, WR-04, 35-REVIEW)
 ///
@@ -789,14 +792,17 @@ pub(crate) fn handle_validate_outcome(
 /// is specific: `loop_back_to_code` reaches `run_preflight`, which can `abort()`
 /// (clearing the phase's state file) and return `Ok(false)`, so a following
 /// `save_state` would resurrect the state file of an aborted phase as a phantom
-/// active run. Reporting rather than reordering keeps the existing single
-/// persisting write.
-fn reset_phase_failures_at_ceiling(project_root: &Path, state: &mut State, ceiling_gate: bool) {
+/// active run. The reset stays ahead of that call.
+fn reset_phase_failures_at_ceiling(
+    project_root: &Path,
+    state: &mut State,
+    ceiling_gate: bool,
+) -> Result<(), CliError> {
     if !ceiling_gate {
-        return;
+        return Ok(());
     }
     let spent = state.phase_validate_failures;
-    state.phase_validate_failures = 0;
+    commit(state, |s| s.phase_validate_failures = 0)?;
     events::emit(
         project_root,
         state.phase,
@@ -811,6 +817,7 @@ fn reset_phase_failures_at_ceiling(project_root: &Path, state: &mut State, ceili
          ceiling {} reached and answered by a human — the count restarts at zero",
         mode::MAX_PHASE_VALIDATE_FAILURES
     );
+    Ok(())
 }
 
 /// IN-02: map "was there a commit baseline when this Validate failure was
