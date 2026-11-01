@@ -330,12 +330,96 @@ pub(crate) fn take_with_hook(
     take_inner(path, hook)
 }
 
-/// Scaffold for the failing tests: removes nothing.
+/// Remove the hold temps in `dir` that a creator died leaving: a name of
+/// [`HOLD_TEMP_SUFFIX`]'s shape, unheld, whose creator pid is not a live process.
+/// Returns the paths removed. `recover --clean` (50.1-21) calls this for
+/// `.devflow/` and the gates directory.
+///
+/// A temp is never a hold. Removing an unheld temp of a dead creator is safe
+/// because the hold, if it was ever published, lives on under its final name,
+/// which this function never touches. The pid only keeps the sweep off a creator
+/// mid-take, so it can only keep a file: a reused pid keeps a leftover until that
+/// process exits, and is never a wrong removal.
+///
+/// Anything else is kept, including a name that does not parse. An entry this
+/// cannot judge is kept and warned about, never skipped silently.
 ///
 /// # Errors
-/// None in the scaffold.
-pub fn remove_orphan_hold_temps(_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    Ok(Vec::new())
+/// `dir` could not be read for a reason other than being absent.
+pub fn remove_orphan_hold_temps(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!("could not read an entry of {}: {error}", dir.display());
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(creator) = file_name.to_str().and_then(hold_temp_creator) else {
+            continue;
+        };
+        let path = entry.path();
+        if !creator_may_be_alive(creator) && remove_if_unheld(&path) {
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
+/// The creator pid in a hold temp's name, `.{final_name}.{pid}.{seq}.hold-tmp`.
+/// `None` for any other name, and for a pid outside `1..=i32::MAX`, which `kill`
+/// would read as a process group.
+fn hold_temp_creator(name: &str) -> Option<i32> {
+    let mut fields = name.strip_suffix(HOLD_TEMP_SUFFIX)?.rsplitn(3, '.');
+    fields.next()?.parse::<u64>().ok()?;
+    let pid: i32 = fields.next()?.parse().ok()?;
+    let final_name = fields.next()?.strip_prefix('.')?;
+    (pid >= 1 && !final_name.is_empty()).then_some(pid)
+}
+
+/// Whether `pid` might still be running: anything but `ESRCH` counts.
+fn creator_may_be_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 sends nothing, and `pid >= 1` addresses one process.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove the temp at `path` if a separate open can take its lock. The removal
+/// is advisory and outside D-09: nothing depends on the temp being gone.
+fn remove_if_unheld(path: &Path) -> bool {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            tracing::warn!("keeping hold temp {}: {error}", path.display());
+            return false;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return false,
+        Err(TryLockError::Error(error)) => {
+            tracing::warn!("keeping hold temp {}: {error}", path.display());
+            return false;
+        }
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!("keeping hold temp {}: {error}", path.display());
+            false
+        }
+    }
 }
 
 #[cfg(test)]
