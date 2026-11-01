@@ -99,14 +99,22 @@ pub(crate) fn publish_exclusive_durably(
     contents: &[u8],
 ) -> std::io::Result<Publication> {
     let tmp = write_synced_temp(path, contents)?;
-    let publish = std::fs::hard_link(&tmp, path);
+    let publication = publication_of(std::fs::hard_link(&tmp, path));
     let cleanup = std::fs::remove_file(&tmp);
-    match publish {
-        Ok(()) => {
-            fsync_dir(parent_of(path))?;
-            cleanup?;
-            Ok(Publication::Published)
-        }
+    let publication = publication?;
+    if publication == Publication::Published {
+        fsync_dir(parent_of(path))?;
+        cleanup?;
+    }
+    Ok(publication)
+}
+
+/// What a hard-link attempt means for a publish. Only `AlreadyExists` says another
+/// publisher won; any other error, a filesystem without hard links for one, stays
+/// an error rather than reading as an answer that is not there.
+fn publication_of(link: std::io::Result<()>) -> std::io::Result<Publication> {
+    match link {
+        Ok(()) => Ok(Publication::Published),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(Publication::AlreadyExists)
         }
@@ -149,8 +157,8 @@ pub(crate) fn rename_durably(from: &Path, to: &Path) -> std::io::Result<()> {
 /// `.devflow` component on its own first.
 pub(crate) fn create_dir_all_durably(dir: &Path) -> std::io::Result<()> {
     // The empty path (a bare file name's parent) and a filesystem root have no
-    // entry of their own to create or sync.
-    if dir.as_os_str().is_empty() || dir.parent().is_none() {
+    // parent, and no entry of their own to create or sync.
+    if dir.parent().is_none() {
         return Ok(());
     }
     if dir.is_dir() {
@@ -525,6 +533,61 @@ mod tests {
             [Synced::Dir(to_dir), Synced::Dir(from_dir)],
             "the new name, then the removed one"
         );
+    }
+
+    #[test]
+    fn a_bare_file_name_lives_in_the_current_directory() {
+        assert_eq!(parent_of(Path::new("bare")), Path::new("."));
+        assert_eq!(parent_of(Path::new("a/b")), Path::new("a"));
+    }
+
+    #[test]
+    fn the_empty_path_and_the_root_have_no_entry_to_sync() {
+        create_dir_all_durably(Path::new("")).unwrap();
+        create_dir_all_durably(Path::new("/")).unwrap();
+        assert_eq!(take_synced(), []);
+    }
+
+    #[test]
+    fn only_already_exists_means_another_publisher_won() {
+        let error = |kind: std::io::ErrorKind| Err(std::io::Error::from(kind));
+
+        assert_eq!(publication_of(Ok(())).unwrap(), Publication::Published);
+        assert_eq!(
+            publication_of(error(std::io::ErrorKind::AlreadyExists)).unwrap(),
+            Publication::AlreadyExists
+        );
+        assert_eq!(
+            publication_of(error(std::io::ErrorKind::PermissionDenied))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "a filesystem that cannot link must not read as a lost race"
+        );
+    }
+
+    #[test]
+    fn a_unique_rename_of_a_missing_source_is_an_error_not_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        let error =
+            rename_to_unique_durably_with(&missing, dir.path(), "a", ".b", 1, &AtomicU64::new(0))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(entry_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_source_a_concurrent_remover_took_is_not_an_error_but_a_failed_removal_is() {
+        let dir = tempfile::tempdir().unwrap();
+
+        remove_linked_source(&dir.path().join("gone")).unwrap();
+        // `remove_file` on a directory fails with something other than NotFound.
+        let error = remove_linked_source(dir.path()).unwrap_err();
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// The file mutations D-09 reserves for this module.
