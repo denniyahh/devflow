@@ -3233,4 +3233,275 @@ mod tests {
         .unwrap();
         assert!(Gates::list_open(dir.path()).is_empty());
     }
+
+    #[test]
+    fn close_reports_removed_for_a_lone_gate_file_and_for_a_lone_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        assert!(Gates::close(dir.path(), phase, stage).unwrap().removed);
+
+        std::fs::write(Gates::dir(dir.path()).join(".07-code.json.1.0.tmp"), "temp").unwrap();
+        assert!(Gates::close(dir.path(), phase, stage).unwrap().removed);
+
+        assert!(!Gates::close(dir.path(), phase, stage).unwrap().removed);
+    }
+
+    #[test]
+    fn close_removes_a_lone_legacy_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let ack = Gates::ack(dir.path(), phase, stage).unwrap();
+
+        Gates::close(dir.path(), phase, stage).unwrap();
+
+        assert!(!ack.exists());
+    }
+
+    #[test]
+    fn a_claim_with_its_answer_already_gone_is_reported_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::Claimed
+        );
+
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+
+        assert_eq!(
+            report.claimed,
+            [ClaimedAnswer {
+                gate_id: gate.to_string(),
+                answer: None,
+            }]
+        );
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &gate).exists());
+    }
+
+    /// A read that fails for any reason but absence stops the disposal, with the
+    /// claim and the gate file kept for the next close.
+    #[test]
+    fn a_claimed_answer_that_cannot_be_read_stops_the_close_and_keeps_the_gate_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        std::fs::create_dir(&slot).unwrap();
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::Claimed
+        );
+
+        let closed = Gates::close(dir.path(), phase, stage);
+
+        assert!(matches!(closed, Err(GateError::Io(_))), "{closed:?}");
+        assert!(Gates::gate_path(dir.path(), phase, stage).exists());
+        assert!(Gates::claim_path(dir.path(), phase, stage, &gate).exists());
+        assert!(events_named(dir.path(), "gate_claimed_answer_removed").is_empty());
+    }
+
+    /// Only absence reads as "no gate": any other failure must not.
+    #[test]
+    fn a_gate_file_that_cannot_be_read_is_an_error_not_a_closed_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = GateId::new();
+        std::fs::create_dir_all(Gates::gate_path(dir.path(), phase, stage)).unwrap();
+
+        let current = Gates::claim(dir.path(), phase, stage, &gate);
+
+        assert!(matches!(current, Err(GateError::Io(_))), "{current:?}");
+    }
+
+    /// Only absence reads as an empty slot: a slot that cannot be read is neither
+    /// empty nor moved.
+    #[test]
+    fn an_answer_slot_that_cannot_be_read_is_not_an_empty_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        std::fs::create_dir(&slot).unwrap();
+
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::Unbound("unparsable".to_string())
+        );
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate);
+        assert!(matches!(moved, Err(GateError::Io(_))), "{moved:?}");
+        assert!(slot.is_dir());
+    }
+
+    /// Another process setting a file aside first is not an error; any other failure
+    /// to move it is.
+    #[test]
+    fn setting_aside_a_file_already_gone_is_a_no_op_and_any_other_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gates_dir = Gates::dir(dir.path());
+        std::fs::create_dir_all(&gates_dir).unwrap();
+        let missing = gates_dir.join("missing.json");
+        let directory = gates_dir.join("a-directory");
+        std::fs::create_dir(&directory).unwrap();
+
+        let gone = set_aside_if_present(dir.path(), phase, stage, &missing, "noid", "unparsable");
+        assert!(matches!(gone, Ok(None)), "{gone:?}");
+        let failed =
+            set_aside_if_present(dir.path(), phase, stage, &directory, "noid", "unparsable");
+        assert!(failed.is_err(), "{failed:?}");
+
+        let unclaimed = |path: &Path| UnclaimedAnswer {
+            path: path.to_path_buf(),
+            slot_id: None,
+        };
+        let gone = set_aside_unclaimed(dir.path(), phase, stage, &unclaimed(&missing));
+        assert!(matches!(gone, Ok(None)), "{gone:?}");
+        let failed = set_aside_unclaimed(dir.path(), phase, stage, &unclaimed(&directory));
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(quarantine_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_gates_path_that_is_not_a_directory_fails_the_stage_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let gates_dir = Gates::dir(dir.path());
+        std::fs::create_dir_all(gates_dir.parent().unwrap()).unwrap();
+        std::fs::write(&gates_dir, "not a directory").unwrap();
+
+        let scanned = StageFiles::scan(dir.path(), PhaseId::new(7), Stage::Code);
+
+        assert!(matches!(scanned, Err(GateError::Io(_))));
+    }
+
+    /// A name that passes as an answer file but holds no gate id is never reported as
+    /// that gate's answer, however its body reads.
+    #[test]
+    fn an_answer_file_named_with_no_gate_id_is_set_aside_as_another_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gates_dir = Gates::dir(dir.path());
+        std::fs::create_dir_all(&gates_dir).unwrap();
+        std::fs::write(
+            gates_dir.join("07-code.garbage.response.json"),
+            "{\"gate_id\": \"garbage\", \"approved\": true}",
+        )
+        .unwrap();
+
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+
+        assert_eq!(report.quarantined.len(), 1, "{report:?}");
+        let name = report.quarantined[0].file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("07-code.noid."), "{name}");
+        assert_eq!(
+            events_named(dir.path(), "gate_answer_quarantined")[0]["reason"],
+            "other_gate"
+        );
+    }
+
+    #[test]
+    fn classifying_an_answer_names_the_reason_it_does_not_bind() {
+        let id = "00000000000000a0";
+        let classify = |body: &str| classify_answer(body.as_bytes(), id).map(|_| ());
+
+        assert_eq!(classify("not json"), Err("unparsable"));
+        assert_eq!(classify("[1]"), Err("unparsable"), "not an object");
+        assert_eq!(classify("{\"approved\": true}"), Err("missing_gate_id"));
+        assert_eq!(
+            classify("{\"gate_id\": \"\", \"approved\": true}"),
+            Err("missing_gate_id")
+        );
+        assert_eq!(
+            classify("{\"gate_id\": 7, \"approved\": true}"),
+            Err("missing_gate_id")
+        );
+        assert_eq!(
+            classify("{\"gate_id\": \"00000000000000a1\", \"approved\": true}"),
+            Err("other_gate")
+        );
+        assert_eq!(
+            classify("{\"gate_id\": \"00000000000000a0\"}"),
+            Err("unparsable"),
+            "its own id, but no decision"
+        );
+        assert_eq!(
+            classify("{\"gate_id\": \"00000000000000a0\", \"approved\": true}"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_gate_and_a_quarantine_carry_the_current_time() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(dir.path(), phase, stage, &gate);
+        std::fs::write(&slot, "not json").unwrap();
+
+        let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate)
+            .unwrap()
+            .unwrap();
+
+        let opened_at: u64 = read_gate(dir.path(), phase, stage)
+            .timestamp
+            .parse()
+            .unwrap();
+        assert!(opened_at >= before, "{opened_at} is before {before}");
+        let name = moved.file_name().unwrap().to_string_lossy().into_owned();
+        let secs: u64 = name
+            .strip_prefix("07-code.noid.")
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(secs >= before, "{secs} is before {before}");
+    }
+
+    /// A read path and a refusal must leave a project without a gates directory as
+    /// they found it.
+    #[test]
+    fn reading_or_refusing_without_a_gates_dir_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = GateId::new();
+
+        assert!(Gates::list_open(dir.path()).is_empty());
+        assert!(Gates::quarantined(dir.path()).is_empty());
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::None
+        );
+        assert_eq!(
+            Gates::close(dir.path(), phase, stage).unwrap(),
+            CloseReport::default()
+        );
+        let refusals = [
+            Gates::answer(dir.path(), phase, stage, &gate, &approved()).map(|_| ()),
+            Gates::claim(dir.path(), phase, stage, &gate).map(|_| ()),
+            Gates::set_aside_unbound(dir.path(), phase, stage, &gate).map(|_| ()),
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(refusal, Err(GateError::NoOpenGate { .. })),
+                "{refusal:?}"
+            );
+        }
+
+        assert!(!dir.path().join(".devflow").exists());
+    }
 }
