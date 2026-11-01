@@ -6849,6 +6849,26 @@ mod tests {
         registration.finish();
     }
 
+    /// The window this mapping covers, the gate changing between `gate_respond`'s
+    /// comparison and `Gates::answer`'s re-check, has no seam, so the mapping is
+    /// tested on its own.
+    #[test]
+    fn a_gate_changed_at_publish_is_reported_like_one_changed_before_it() {
+        let message = gate_answer_error(GateError::GateIdMismatch {
+            phase: PhaseId::new(4907),
+            stage: Stage::Code,
+            observed: "g1".into(),
+            current: "g2".into(),
+        })
+        .to_string();
+
+        assert_eq!(
+            message,
+            gate_changed_message(PhaseId::new(4907), Stage::Code, "g1", "g2")
+        );
+        assert!(message.contains("nothing was written"), "{message}");
+    }
+
     #[test]
     fn gate_list_and_show_print_the_gate_id() {
         let dir = tempfile::tempdir().unwrap();

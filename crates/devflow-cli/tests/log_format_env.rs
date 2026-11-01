@@ -152,8 +152,8 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
 /// `devflow` now logs at INFO level by default with no env var set at all.
 ///
 /// This drives `devflow gate approve` against a project with a single open
-/// gate — `Gates::respond` emits `info!("gate response written for phase
-/// {phase} {stage}: approved=...")` as an unconditional side effect of a
+/// gate — `Gates::answer` emits `info!("gate answer written for phase {phase}
+/// {stage} gate {gate}: approved=...")` as an unconditional side effect of a
 /// successful approval, giving a real INFO-level log line to assert on. If
 /// commit 50db857 were reverted (back to the bare `from_default_env()`),
 /// this line would default to being suppressed and this test would fail.
@@ -167,6 +167,8 @@ fn project_with_open_gate(phase: PhaseId, stage: Stage) -> tempfile::TempDir {
 fn rust_log_unset_still_shows_info_level_logs_by_default() {
     let home = common::HermeticHome::new();
     let dir = project_with_open_gate(PhaseId::new(15), Stage::Ship);
+    let gate_id = Gates::list_open(dir.path())[0].gate_id.clone();
+    let logged = format!("gate answer written for phase 15 ship gate {gate_id}: approved=true");
 
     let mut cmd = common::hermetic_devflow(&home);
     cmd.arg("gate")
@@ -187,13 +189,13 @@ fn rust_log_unset_still_shows_info_level_logs_by_default() {
         "devflow gate approve should succeed against a single open gate\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("gate response written for phase 15 ship: approved=true"),
+        stderr.contains(&logged),
         "with RUST_LOG unset, an INFO-level tracing log should still reach stderr \
          by default (CR-01 / commit 50db857 — default level is INFO, not \
          ERROR-only), but it did not appear.\nstderr:\n{stderr}"
     );
     assert!(
-        !stdout.contains("gate response written for phase 15 ship: approved=true"),
+        !stdout.contains(&logged),
         "the tracing log line must not leak onto stdout (CR-02) — only the CLI's \
          own printed confirmation message belongs there.\nstdout:\n{stdout}"
     );

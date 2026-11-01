@@ -18,6 +18,7 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State, SupervisorRecord};
 use devflow_core::supervisor::{self, Liveness};
+use devflow_core::test_support::{answer_open_gate, gate_answer_files};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -309,7 +310,7 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response
         "stderr: {stderr}"
     );
     assert!(
-        !Gates::response_path(root, phase, Stage::Ship).exists(),
+        gate_answer_files(root, phase, Stage::Ship).is_empty(),
         "a recycled Ship holder must not receive an unconsumable abort response"
     );
     assert!(holder.try_wait().expect("poll holder").is_none());
@@ -363,7 +364,7 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
         "stderr: {stderr}"
     );
     assert!(
-        !Gates::response_path(root, phase, Stage::Code).exists(),
+        gate_answer_files(root, phase, Stage::Code).is_empty(),
         "an unconfirmable non-Ship holder must not receive a stale abort response"
     );
     assert!(holder.try_wait().expect("poll holder").is_none());
@@ -410,7 +411,7 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
     };
     assert!(!status.success(), "SIGTERM must end the live holder");
     assert!(
-        !Gates::response_path(root, phase, Stage::Code).exists(),
+        gate_answer_files(root, phase, Stage::Code).is_empty(),
         "a stale gate must not receive a response"
     );
     assert!(
@@ -445,7 +446,7 @@ fn gate_approve_without_a_live_holder_does_not_claim_advance() {
         output.status.success(),
         "stdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+    assert!(!gate_answer_files(root, phase, Stage::Ship).is_empty());
     assert!(
         !stdout.contains("workflow will advance"),
         "no-holder response must not claim an outcome: {stdout}"
@@ -480,7 +481,7 @@ fn wait_for_child_exit(
             let pid = child.id();
             let lock_present = devflow_core::lock::holder(root, phase).is_some();
             let gate_present = Gates::gate_path(root, phase, Stage::Code).exists();
-            let response_present = Gates::response_path(root, phase, Stage::Code).exists();
+            let response_present = !gate_answer_files(root, phase, Stage::Code).is_empty();
             // Reap before panicking — see doc comment above for why this
             // stays bounded without ever signalling the child.
             let _ = child.wait();
@@ -744,9 +745,11 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
         "first stop failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let response_path = Gates::response_path(root, phase, Stage::Ship);
+    let answers = gate_answer_files(root, phase, Stage::Ship);
+    assert_eq!(answers.len(), 1, "the first stop writes one answer");
+    let response_path = &answers[0];
     let first_bytes =
-        std::fs::read(&response_path).expect("response file must exist after first stop");
+        std::fs::read(response_path).expect("response file must exist after first stop");
 
     let second = run_stop();
     assert!(
@@ -754,11 +757,63 @@ fn stop_is_idempotent_against_an_already_answered_gate() {
         "second stop failed: {}",
         String::from_utf8_lossy(&second.stderr)
     );
-    let second_bytes = std::fs::read(&response_path).expect("response file must still exist");
+    let second_bytes = std::fs::read(response_path).expect("response file must still exist");
     assert_eq!(
         first_bytes, second_bytes,
         "the second stop must not modify the response file the first one wrote"
     );
+}
+
+/// The id `gate list` prints is the id `gate approve --gate-id` takes, and an id
+/// for a gate that has since been replaced answers nothing. The approval that
+/// follows with the listed id is the control: the refusal was the id comparison,
+/// not a missing waiter.
+#[test]
+fn gate_approve_takes_the_id_gate_list_shows_and_refuses_a_replaced_one() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(111);
+    let g1 = Gates::open_gate(root, phase, Stage::Ship, "first")
+        .unwrap()
+        .gate_id;
+    Gates::close(root, phase, Stage::Ship).unwrap();
+    let g2 = Gates::open_gate(root, phase, Stage::Ship, "second")
+        .unwrap()
+        .gate_id;
+    let approve_with = |gate_id: &str| {
+        common::hermetic_devflow(&home)
+            .args(["gate", "approve", &phase.to_string(), "--gate-id", gate_id])
+            .arg("--project")
+            .arg(root)
+            .output()
+            .expect("run devflow gate approve")
+    };
+
+    let list = common::hermetic_devflow(&home)
+        .args(["gate", "list"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate list");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(listed.contains(g2.as_str()), "{listed}");
+
+    let refused = approve_with(g1.as_str());
+    let refusal = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "a replaced id must be refused");
+    assert!(
+        refusal.contains(g1.as_str()) && refusal.contains(g2.as_str()),
+        "the refusal names both gates: {refusal}"
+    );
+    assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+
+    let answered = approve_with(g2.as_str());
+    assert!(
+        answered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    assert_eq!(gate_answer_files(root, phase, Stage::Ship).len(), 1);
 }
 
 /// Task 3 behavior: a response written by hand before `stop` ever runs (a
@@ -772,7 +827,7 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
     let phase = PhaseId::new(100);
 
     Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
-    Gates::respond(
+    let response_path = answer_open_gate(
         root,
         phase,
         Stage::Ship,
@@ -783,7 +838,6 @@ fn stop_against_a_hand_written_response_is_a_success_no_op() {
         },
     )
     .unwrap();
-    let response_path = Gates::response_path(root, phase, Stage::Ship);
     let before = std::fs::read(&response_path).unwrap();
 
     let output = common::hermetic_devflow(&home)
@@ -1702,7 +1756,7 @@ fn stop_after_a_supervisor_killed_at_a_gate_reaps_and_reports_gone() {
         "a teardown that signalled nothing says the phase is resumable (R-8): {text}"
     );
     assert!(
-        !Gates::response_path(&run.root, run.phase, Stage::Define).exists(),
+        gate_answer_files(&run.root, run.phase, Stage::Define).is_empty(),
         "no gate response is written without a live waiter"
     );
     assert_eq!(run.probe(), Liveness::Gone, "the socket is torn down");
@@ -1912,7 +1966,7 @@ fn stop_with_a_launch_id_tears_down_only_that_socket() {
     let state = devflow_core::workflow::load_state(&run.root, run.phase).unwrap();
     assert!(!state.stopped, "a targeted stop records nothing");
     assert!(
-        !Gates::response_path(&run.root, run.phase, Stage::Define).exists(),
+        gate_answer_files(&run.root, run.phase, Stage::Define).is_empty(),
         "a targeted stop answers no gate"
     );
 }

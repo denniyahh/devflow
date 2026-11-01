@@ -11,11 +11,12 @@
 
 mod common;
 
-use devflow_core::gates::{GateAction, GateFile, Gates};
+use devflow_core::gates::{GateAction, GateFile, GateId, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::gate_answer_files;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -106,7 +107,7 @@ fn wait_for_child_exit(
             let pid = child.id();
             let lock_present = devflow_core::lock::holder(root, phase).is_some();
             let gate_present = Gates::gate_path(root, phase, Stage::Code).exists();
-            let response_present = Gates::response_path(root, phase, Stage::Code).exists();
+            let response_present = !gate_answer_files(root, phase, Stage::Code).is_empty();
             // Reap before panicking — see doc comment above for why this
             // stays bounded without ever signalling the child.
             let _ = child.wait();
@@ -129,18 +130,12 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let gate = GateFile {
-        phase,
-        stage,
-        context: "abandoned run".to_string(),
-        timestamp: now.saturating_sub(age_secs).to_string(),
-        gate_id: String::new(),
-    };
-    std::fs::write(
-        Gates::gate_path(root, phase, stage),
-        serde_json::to_string_pretty(&gate).unwrap(),
-    )
-    .unwrap();
+    let path = Gates::gate_path(root, phase, stage);
+    let mut gate: GateFile =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    gate.context = "abandoned run".to_string();
+    gate.timestamp = now.saturating_sub(age_secs).to_string();
+    std::fs::write(path, serde_json::to_string_pretty(&gate).unwrap()).unwrap();
 }
 
 /// An age past any plausible `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` default.
@@ -245,7 +240,7 @@ fn sweep_leaves_a_fresh_gate_untouched() {
     assert_eq!(open[0].phase, phase);
     assert_eq!(open[0].stage, stage);
     assert!(
-        !Gates::response_path(root, phase, stage).exists(),
+        gate_answer_files(root, phase, stage).is_empty(),
         "a fresh gate must get no response file at all"
     );
 }
@@ -331,14 +326,19 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
          proof that a live poller is genuinely blocking on it"
     );
 
-    // The reap itself: the same `Gates::reap` primitive Task 1/2's tests
+    // The reap itself: the same `Gates::reap_answer` primitive Task 1/2's tests
     // exercise against a thread-based live poller. This test's job is to
     // prove the OTHER end of that same write — a real, separate process
     // consuming it.
-    Gates::reap(
+    let listed = Gates::list_open(root)
+        .into_iter()
+        .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+        .expect("the child's Code gate is listed");
+    Gates::reap_answer(
         root,
         phase,
         Stage::Code,
+        &GateId::parse(&listed.gate_id).expect("the child's gate has a gate id"),
         "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
         "devflow-reap",
     )
@@ -367,7 +367,7 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     );
 
     // The negative that separates this plan from a reaper that terminates
-    // processes: neither the sweep's write path (`Gates::reap`, exercised
+    // processes: neither the sweep's write path (`Gates::reap_answer`, exercised
     // above) nor this test itself ever sent the child a signal. Checked
     // mechanically by this file's own acceptance grep for signalling call
     // forms (must be zero), not asserted at runtime — there is no API
