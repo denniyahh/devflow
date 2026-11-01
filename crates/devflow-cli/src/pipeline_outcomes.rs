@@ -1131,7 +1131,7 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::prompt;
     use devflow_core::state::AgentKind;
-    use devflow_core::test_support::{gate_answer_files, preanswer_gate};
+    use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
     use devflow_core::workflow;
 
     /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
@@ -1409,13 +1409,15 @@ mod tests {
         // Pre-write a rejected response whose note says "abort" so
         // `GateAction::from_response` resolves to `Abort` rather than a
         // loop-back-to-Code.
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
@@ -1557,7 +1559,6 @@ mod tests {
         std::fs::write(agent_result::stdout_path(root, phase), marker).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Validate);
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
         let mut context = String::new();
 
         std::thread::scope(|scope| {
@@ -1580,10 +1581,14 @@ mod tests {
 
             context = std::fs::read_to_string(&gate_path).unwrap();
 
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -1791,13 +1796,15 @@ mod tests {
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, outcome).unwrap();
 
@@ -1844,13 +1851,15 @@ mod tests {
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, outcome).unwrap();
 
@@ -2161,13 +2170,15 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, post_fix).unwrap();
 
@@ -2210,13 +2221,15 @@ mod tests {
         state.consecutive_failures = 1;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         advance(root, Some(phase)).unwrap();
 
@@ -2254,13 +2267,15 @@ mod tests {
         state.consecutive_failures = 2;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_infra_outcome(
             root,
@@ -2345,15 +2360,16 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
         for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -2414,19 +2430,20 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
         for i in 0..(mode::MAX_CONSECUTIVE_FAILURES + 1) {
             // A real new commit BEFORE the failure is recorded, on every
             // cycle — the count observed at each failure strictly exceeds
             // the previously recorded baseline.
             commit_on_feature_branch(root, phase, &format!("wave-{i}"));
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -2486,15 +2503,16 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
         for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -2618,14 +2636,16 @@ mod tests {
         state.consecutive_failures = 1;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         let seed_gate_response = || {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
         };
         seed_gate_response();
 
@@ -2746,16 +2766,18 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
         for cycle in 1..=mode::MAX_PHASE_VALIDATE_FAILURES {
             // One trivial commit per cycle — the whole premise of 999.78.
             commit_on_feature_branch(root, phase, &format!("trivial-{cycle}"));
             // Re-seeded every iteration: `prepare_loop_back_to_code` cleans up
             // the Validate gate on every ordinary loop-back, which deletes a
             // response written only once up front.
-            std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+            );
             state.stage = Stage::Validate;
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
@@ -2835,13 +2857,15 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
         let mut first_gate_context = String::new();
         for cycle in 1..=5 {
             commit_on_feature_branch(root, phase, &format!("trivial-{cycle}"));
-            std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+            );
             state.stage = Stage::Validate;
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             if cycle == 1 {
@@ -2925,8 +2949,6 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         let ceiling_clause = format!(
             "The per-phase ceiling of {} is reached",
             mode::MAX_PHASE_VALIDATE_FAILURES
@@ -2934,7 +2956,12 @@ mod tests {
 
         // BELOW the ceiling. This gates — Supervise always does — so the
         // message exists to be inspected.
-        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let below = last_gate_context(root, phase).expect("Supervise gates on every Validate");
 
@@ -2943,7 +2970,12 @@ mod tests {
         state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
-        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let at = last_gate_context(root, phase).expect("the ceiling failure must also gate");
 
@@ -3062,9 +3094,12 @@ mod tests {
         at_ceiling.stage = Stage::Validate;
         at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         workflow::save_state(&at_ceiling).unwrap();
-        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
-        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
-        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            at_ceiling_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
 
         // HALF TWO — below the ceiling, everything else identical. Supervise
@@ -3079,9 +3114,12 @@ mod tests {
         below.stage = Stage::Validate;
         below.phase_validate_failures = 2;
         workflow::save_state(&below).unwrap();
-        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
-        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
-        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            below_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
 
         assert!(
@@ -3152,9 +3190,12 @@ mod tests {
         auto.stage = Stage::Validate;
         auto.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES;
         workflow::save_state(&auto).unwrap();
-        let auto_response = Gates::response_path(root, auto_phase, Stage::Validate);
-        std::fs::create_dir_all(auto_response.parent().unwrap()).unwrap();
-        std::fs::write(&auto_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            auto_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut auto, ValidateOutcome::Passed);
 
         // CONTROL — SUPERVISE, below the ceiling, also a pass. Gates (Supervise
@@ -3170,9 +3211,12 @@ mod tests {
         supervise.stage = Stage::Validate;
         supervise.phase_validate_failures = 2;
         workflow::save_state(&supervise).unwrap();
-        let supervise_response = Gates::response_path(root, supervise_phase, Stage::Validate);
-        std::fs::create_dir_all(supervise_response.parent().unwrap()).unwrap();
-        std::fs::write(&supervise_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            supervise_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut supervise, ValidateOutcome::Passed);
 
         let auto_context = last_gate_context(root, auto_phase)
@@ -3237,9 +3281,12 @@ mod tests {
         at_ceiling.stage = Stage::Validate;
         at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         workflow::save_state(&at_ceiling).unwrap();
-        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
-        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
-        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            at_ceiling_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
 
         // NEGATIVE CONTROL — below the ceiling, everything else identical.
@@ -3253,9 +3300,12 @@ mod tests {
         below.stage = Stage::Validate;
         below.phase_validate_failures = 2;
         workflow::save_state(&below).unwrap();
-        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
-        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
-        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            below_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
 
         assert!(
@@ -3319,9 +3369,12 @@ mod tests {
         state.phase_validate_failures = u32::MAX;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
 
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
@@ -4582,13 +4635,15 @@ mod tests {
 
         // No {phase:02}-VERIFICATION.md — mid-arc precondition.
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let _ = handle_validate_outcome(
             root,
@@ -4645,13 +4700,15 @@ mod tests {
 
         // No {phase:02}-VERIFICATION.md — mid-arc precondition.
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
@@ -4701,13 +4758,15 @@ mod tests {
         // No {phase:02}-VERIFICATION.md — same mid-arc precondition that
         // flips the two Validate arms above.
 
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let _ = handle_ship_outcome(root, &mut state);
 
@@ -4778,13 +4837,15 @@ mod tests {
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, outcome).unwrap();
 
@@ -4814,15 +4875,16 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
         for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
@@ -4867,13 +4929,15 @@ mod tests {
         state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
@@ -4981,13 +5045,15 @@ mod tests {
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         // Pre-seed an Abort response so `run_gate`'s poll resolves immediately.
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_rate_limited_outcome(
             root,
@@ -5116,7 +5182,6 @@ mod tests {
         workflow::save_state(&state).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -5138,10 +5203,14 @@ mod tests {
 
             // Unblock the poll with an Abort response so the spawned thread
             // finishes (abort() cleans up on its own; no monitor spawned).
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Ship,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -5282,8 +5351,8 @@ mod tests {
             "the pre-authorized gate must let the run reach a completed Ship without a human"
         );
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
 
         // Exactly one gate_fired for this phase+stage — the retry-gate reopen
         // path (a second gate_fired) must never have run.
@@ -5339,7 +5408,6 @@ mod tests {
         workflow::save_state(&state).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -5359,15 +5427,19 @@ mod tests {
             // happened if it were ever going to — it must not.
             std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(
-                !response_path.exists(),
+                gate_answer_files(root, phase, Stage::Ship).is_empty(),
                 "with yes_ship unset, no response may ever be auto-written — the run must wait for a human"
             );
 
             // Unblock the poll so the spawned thread finishes.
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Ship,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -5481,13 +5553,15 @@ mod tests {
         // Pre-write an Abort response so the call resolves without spawning
         // a monitor (the notify hook already fired by the time `run_gate`
         // starts polling, so this doesn't affect what we're asserting).
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let result =
             handle_stage_failure(root, &mut state, Stage::Code, Some("build failed".into()));
@@ -5691,9 +5765,12 @@ mod tests {
         state.verification_baseline_captured = true;
         state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
-        let response = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response.parent().unwrap()).unwrap();
-        std::fs::write(&response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
 
         // The launch this ends in fails on the agent-free PATH, which is not this
         // test's subject.
