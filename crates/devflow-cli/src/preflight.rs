@@ -1496,6 +1496,7 @@ pub(crate) fn run_preflight(
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use devflow_core::test_support::preanswer_gate;
     use devflow_core::workflow;
     // Named only by the recording assertions below; importing it at module
     // scope would be an unused import in a non-test build.
@@ -1960,13 +1961,15 @@ mod tests {
         state.yes_ship = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let adapter = agents::driver_for(AgentKind::Claude);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
@@ -2120,13 +2123,15 @@ mod tests {
         state.stage = Stage::Define;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Define);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let adapter = agents::driver_for(AgentKind::Codex);
         let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
@@ -2165,13 +2170,15 @@ mod tests {
         state.stage = Stage::Plan;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Plan);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Plan,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let should_continue = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
 
@@ -2226,9 +2233,12 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Plan);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Plan,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let preflight = run_preflight(root, &mut state, &adapter);
@@ -2299,13 +2309,13 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Plan);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Plan,
+            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
+                .unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let preflight = run_preflight(root, &mut state, &adapter);
@@ -2413,9 +2423,12 @@ mod tests {
         state.stage = Stage::Define;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Define);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
@@ -2500,13 +2513,13 @@ mod tests {
         state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Define);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Define,
+            &serde_json::from_str(r#"{"approved":false,"note":"retry","responded_by":"test"}"#)
+                .unwrap(),
+        );
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
@@ -2763,9 +2776,12 @@ mod tests {
         approve_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&approve_state).unwrap();
 
-        let response_path = Gates::response_path(approve_root, approve_phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            approve_root,
+            approve_phase,
+            Stage::Code,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let approve_result = run_preflight(
             approve_root,
@@ -2831,14 +2847,16 @@ mod tests {
         loopback_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&loopback_state).unwrap();
 
-        let loopback_response = Gates::response_path(loopback_root, loopback_phase, Stage::Code);
-        std::fs::create_dir_all(loopback_response.parent().unwrap()).unwrap();
         // Not approved, and the note does NOT say "abort" — LoopBack.
-        std::fs::write(
-            &loopback_response,
-            r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            loopback_root,
+            loopback_phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"I will fix the plan first","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         // SAFETY: serialized under ENV_MUTEX (the guard is still held).
         unsafe {
@@ -2959,9 +2977,12 @@ mod tests {
         assert_eq!(state.checkpoint_approval, CheckpointApproval::Pending);
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let approved = run_preflight(root, &mut state, &adapter);
@@ -3047,9 +3068,12 @@ mod tests {
         state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, stage);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            stage,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         let adapter = FailOnceAdapter::new();
         let result = run_preflight(root, &mut state, &adapter);
@@ -3153,16 +3177,15 @@ mod tests {
         refusal_state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
         workflow::save_state(&refusal_state).unwrap();
 
-        let refusal_response = Gates::response_path(refusal_root, refusal_phase, Stage::Code);
-        std::fs::create_dir_all(refusal_response.parent().unwrap()).unwrap();
         // APPROVED — the strongest answer a human can give. Even this must not
         // upgrade an Unrecorded set: nobody ever observed what this run's Code
         // stage started from, so there is no set to approve.
-        std::fs::write(
-            &refusal_response,
-            r#"{"approved":true,"responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            refusal_root,
+            refusal_phase,
+            Stage::Code,
+            &serde_json::from_str(r#"{"approved":true,"responded_by":"test"}"#).unwrap(),
+        );
 
         // No second `env_lock()` here: this test already holds it from its
         // first line, and the mutex is not reentrant — re-acquiring it

@@ -819,6 +819,7 @@ mod tests {
     use devflow_core::gates::GateResponse;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
+    use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
 
     macro_rules! enter_path_isolated_child {
         ($name:expr, $path_dir:expr) => {
@@ -867,21 +868,21 @@ mod tests {
 
         // Pre-write an approved Ship gate response so `run_gate` returns
         // `GateAction::Advance` immediately instead of polling.
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
+                .unwrap(),
+        );
 
         advance(root, Some(phase)).unwrap();
 
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
     }
 
@@ -915,13 +916,13 @@ mod tests {
         )
         .unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
+                .unwrap(),
+        );
 
         advance(root, Some(phase)).unwrap();
 
@@ -1068,7 +1069,7 @@ mod tests {
                 .unwrap()
                 .gate_pending
         );
-        Gates::respond(
+        answer_open_gate(
             root,
             PhaseId::new(22),
             Stage::Ship,
@@ -1218,9 +1219,8 @@ mod tests {
         // Give any (incorrect) auto-write a moment to have happened if it
         // were ever going to.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
         assert!(
-            !response_path.exists(),
+            gate_answer_files(root, phase, Stage::Ship).is_empty(),
             "yes_ship must NEVER auto-approve the reopened finalization-retry gate \
              (T-23-91) — a failing finalization must wait for a human"
         );
@@ -1236,7 +1236,7 @@ mod tests {
 
         // Unblock the poll (reject, not approve — this test's subject is
         // that nothing auto-approves it) so the spawned thread can finish.
-        Gates::respond(
+        answer_open_gate(
             root,
             phase,
             Stage::Ship,
@@ -1322,13 +1322,13 @@ mod tests {
                 "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
             )
             .unwrap();
-            let response_path = Gates::response_path(root, phase, Stage::Ship);
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":true,"note":null,"responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Ship,
+                &serde_json::from_str(r#"{"approved":true,"note":null,"responded_by":"test"}"#)
+                    .unwrap(),
+            );
         }
 
         let results: Vec<(PhaseId, Result<(), CliError>)> = std::thread::scope(|scope| {
@@ -1528,13 +1528,15 @@ mod tests {
         // A fresh infra fault after the clean transition starts counting
         // from 1, not resuming the pre-transition MAX_INFRA_FAILURES - 1
         // count toward a false premature abort.
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_infra_outcome(root, &mut state, Stage::Validate, Some("killed".into())).unwrap();
 
@@ -1608,8 +1610,8 @@ mod tests {
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("events recorded for phase");
         assert_eq!(last["event"], "workflow_finished");
@@ -1748,8 +1750,8 @@ mod tests {
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("events recorded for phase");
         assert_eq!(last["event"], "workflow_aborted");
@@ -1964,7 +1966,7 @@ mod tests {
         let mut on_disk = workflow::load_state(root, phase).unwrap();
         on_disk.gate_notify_cmd = Some(": edited".to_string());
         workflow::save_state(&on_disk).unwrap();
-        Gates::respond(
+        answer_open_gate(
             root,
             phase,
             Stage::Code,
@@ -2023,7 +2025,7 @@ mod tests {
             "what ran during the wait ran with the waiter still inside it"
         );
 
-        Gates::respond(
+        answer_open_gate(
             root,
             phase,
             Stage::Code,
