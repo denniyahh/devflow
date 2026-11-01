@@ -14,6 +14,7 @@ use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::gate_answer_files;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -264,8 +265,9 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "wedge reject unexpectedly succeeded: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(
-        !Gates::response_path(root, phase, Stage::Code).exists(),
+    assert_eq!(
+        gate_answer_files(root, phase, Stage::Code),
+        Vec::<PathBuf>::new(),
         "a wedged gate must receive no stale response"
     );
     let output_text = format!(
@@ -424,8 +426,9 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
         stdout.contains("1 would be reaped"),
         "summary must count only the confirmed-live would-reap decision: {stdout}"
     );
-    assert!(
-        !Gates::response_path(root, phase, Stage::Code).exists(),
+    assert_eq!(
+        gate_answer_files(root, phase, Stage::Code),
+        Vec::<PathBuf>::new(),
         "dry-run sweep must not write a response"
     );
 }
@@ -472,8 +475,9 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         output_text.contains(&recovery_hint),
         "reject must name `{recovery_hint}`: {output_text}"
     );
-    assert!(
-        !Gates::response_path(root, phase, Stage::Define).exists(),
+    assert_eq!(
+        gate_answer_files(root, phase, Stage::Define),
+        Vec::<PathBuf>::new(),
         "an unanswerable Define gate must receive no response"
     );
 
