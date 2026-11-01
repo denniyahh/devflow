@@ -5878,6 +5878,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
+    use devflow_core::test_support::gate_answer_files;
 
     #[test]
     fn gate_response_message_does_not_claim_pickup_after_live_becomes_no_holder() {
@@ -5908,7 +5909,7 @@ mod tests {
         let phase = PhaseId::new(4801);
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         assert!(!stop_via_gate(root, phase).unwrap().0);
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
     #[test]
@@ -5929,7 +5930,7 @@ mod tests {
         std::fs::write(path, format!("{pid}\n{start}")).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         assert!(stop_via_gate(root, phase).unwrap().0);
-        assert!(Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(!gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
     #[test]
@@ -5939,7 +5940,7 @@ mod tests {
         let phase = PhaseId::new(4802);
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
     #[test]
@@ -5973,7 +5974,7 @@ mod tests {
         let phase = PhaseId::new(4803);
         Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
         gate_respond(root, phase, Some(Stage::Ship), true, None).unwrap();
-        assert!(Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(!gate_answer_files(root, phase, Stage::Ship).is_empty());
         assert!(no_waiter_repair(phase, Stage::Ship).contains("devflow ship --phase 4803"));
     }
 
@@ -5996,7 +5997,7 @@ mod tests {
             err.to_string().contains("devflow resume --phase 4804"),
             "repair must name the concrete phase: {err}"
         );
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
     }
 
     /// T-48-16-03 at the `gate` verbs, not only at `stop`: Ship's
@@ -6028,7 +6029,7 @@ mod tests {
             err.to_string().contains("no response was written"),
             "the refusal must say nothing was written: {err}"
         );
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
     }
 
     #[test]
@@ -6057,7 +6058,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            !Gates::response_path(root, phase, Stage::Ship).exists(),
+            gate_answer_files(root, phase, Stage::Ship).is_empty(),
             "a recycled holder must not receive an unconsumable Ship abort response"
         );
         assert!(
@@ -6086,7 +6087,7 @@ mod tests {
         stop(root, phase).expect("Ship with no holder may retain its abort response");
 
         assert!(
-            Gates::response_path(root, phase, Stage::Ship).exists(),
+            !gate_answer_files(root, phase, Stage::Ship).is_empty(),
             "the manual-recovery Ship exception must remain available"
         );
         assert!(
@@ -6112,7 +6113,7 @@ mod tests {
         std::fs::write(path, pid.to_string()).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         let error = stop(root, phase).unwrap_err().to_string();
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
         assert!(error.contains("refusing to signal"), "{error}");
         let message =
             response_pickup_message(Stage::Code, lock::HolderStatus::Unconfirmable { pid: 42 });
@@ -7037,10 +7038,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            Gates::response_path(root, PhaseId::new(15), Stage::Ship).exists(),
+            !gate_answer_files(root, PhaseId::new(15), Stage::Ship).is_empty(),
             "explicit-stage rejection must land"
         );
-        assert!(!Gates::response_path(root, PhaseId::new(15), Stage::Validate).exists());
+        assert!(gate_answer_files(root, PhaseId::new(15), Stage::Validate).is_empty());
     }
 
     /// Backdate an already-written gate's `timestamp` so it reads as
@@ -7092,7 +7093,7 @@ mod tests {
         gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
 
         assert!(
-            !Gates::response_path(root, PhaseId::new(30), Stage::Ship).exists(),
+            gate_answer_files(root, PhaseId::new(30), Stage::Ship).is_empty(),
             "dry-run must never write a response file"
         );
         let open = Gates::list_open(root);
