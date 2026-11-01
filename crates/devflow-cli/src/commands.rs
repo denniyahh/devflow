@@ -7759,7 +7759,7 @@ mod tests {
             },
         )
         .unwrap();
-        let unkeyed = Gates::response_path(root, phase, Stage::Define);
+        let unkeyed = Gates::dir(root).join(format!("{}-define.response.json", phase.padded()));
         std::fs::write(
             &unkeyed,
             br#"{"approved":true,"note":"legacy","responded_by":"test"}"#,
