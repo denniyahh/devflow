@@ -5556,4 +5556,67 @@ mod tests {
             "Direction B: nonce absent → FullExecute"
         );
     }
+
+    /// A loop-back answered at the ceiling gate persists both the budget reset and the
+    /// verification observation. Each is a write of its own or part of one: an
+    /// ordering that replaced the caller's copy between recording the observation and
+    /// writing it would lose it, and the next cycle would read an unchanged artifact
+    /// as fresh (F-11).
+    #[test]
+    fn a_ceiling_loop_back_persists_the_reset_and_the_verification_observation() {
+        const NAME: &str = "pipeline_outcomes::tests::a_ceiling_loop_back_persists_the_reset_and_the_verification_observation";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(97);
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+            "verdict: gaps — written by this run\n",
+        )
+        .unwrap();
+        let observed = agent_result::phase_verification_fingerprint(&worktree, phase);
+        assert!(
+            observed.is_some(),
+            "premise: the artifact has a fingerprint"
+        );
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Validate;
+        state.worktree_path = Some(worktree);
+        state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
+        workflow::save_state(&state).unwrap();
+        let response = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response.parent().unwrap()).unwrap();
+        std::fs::write(&response, LOOP_BACK_RESPONSE).unwrap();
+
+        // The launch this ends in fails on the agent-free PATH, which is not this
+        // test's subject.
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.stage, Stage::Code, "premise: the run looped back");
+        assert_eq!(after.phase_validate_failures, 0, "the reset is on disk");
+        assert_eq!(
+            after.last_verification_fingerprint, observed,
+            "the observation is on disk"
+        );
+    }
 }
