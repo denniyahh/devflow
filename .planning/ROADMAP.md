@@ -522,7 +522,7 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 13/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+**Plans:** 14/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
 plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
 runs in wave 19
 
@@ -565,7 +565,7 @@ runs in wave 19
 
 **Wave 9**
 
-- [ ] 50.1-14-PLAN.md *(depends on 50.1-13)* — gate waits open, register, await and claim; `close` everywhere; D-06/D-07 tests (V-15 CLI, V-17, V-20, V-21, V-22)
+- [x] 50.1-14-PLAN.md *(depends on 50.1-13)* — gate waits open, register, await and claim; `close` everywhere; D-06/D-07 tests (V-15 CLI, V-17, V-20, V-21, V-22)
 
 **Wave 10**
 
@@ -802,7 +802,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
-| 50.1 | 13/30 | In Progress | — |
+| 50.1 | 14/30 | In Progress | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
