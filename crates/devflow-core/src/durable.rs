@@ -11,7 +11,8 @@
 //!
 //! The advisory coordination files of Phase 50.1 (`supervisor-<id>.live`,
 //! `NN-{stage}.{gate_id}.waiter`, `.devflow/.holder-NN`, `.devflow/.state-NN.lock`,
-//! `*.hold-tmp`, `.devflow/.gitignore`) are deliberately outside these operations.
+//! `.devflow/.gates-NN.lock`, `*.hold-tmp`, `.devflow/.gitignore`) are deliberately
+//! outside these operations.
 //! None of them holds a state or gate record, and a held `flock`, not their bytes
 //! or existence, decides liveness. Fsync guards only against power loss, after
 //! which no holder survives, so a lost or resurrected marker reads as not live,
@@ -185,10 +186,6 @@ fn create_component_durably(component: &Path) -> std::io::Result<()> {
     fsync_dir(parent_of(component))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: the gate quarantine in 50.1-06")
-)]
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Move `from` to a new name `{stem}.{pid}.{seq}{suffix}` in `dir`, by a no-replace
@@ -199,10 +196,6 @@ static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `AlreadyExists` retry covers a reused pid with a restarted counter. A crash
 /// between the link and the source removal leaves the file under both names, a
 /// duplicate and never a loss.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: the gate quarantine in 50.1-06")
-)]
 pub(crate) fn rename_to_unique_durably(
     from: &Path,
     dir: &Path,
@@ -212,10 +205,6 @@ pub(crate) fn rename_to_unique_durably(
     rename_to_unique_durably_with(from, dir, stem, suffix, std::process::id(), &UNIQUE_SEQ)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "first caller: the gate quarantine in 50.1-06")
-)]
 fn rename_to_unique_durably_with(
     from: &Path,
     dir: &Path,

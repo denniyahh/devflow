@@ -342,17 +342,34 @@ impl Gates {
         Self::answer_with_hook(project_root, phase, stage, observed, response, || {})
     }
 
-    /// RED scaffold: moves nothing.
+    /// Move an answer that does not bind to `gate` out of that gate's slot, and
+    /// return its new name. This is how a waiter disposes of one (reading never
+    /// moves anything). It touches `gate`'s slot and nothing else, and only while
+    /// the gate file names `gate` (R-09).
     pub fn set_aside_unbound(
-        _project_root: &Path,
-        _phase: PhaseId,
-        _stage: Stage,
-        _gate: &GateId,
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
     ) -> Result<Option<PathBuf>, GateError> {
-        Ok(None)
+        if !Self::dir(project_root).is_dir() {
+            return Err(GateError::NoOpenGate { phase, stage });
+        }
+        let _lock = gate_lock(project_root, phase)?;
+        Self::require_open(project_root, phase, stage, gate)?;
+        let moved = Self::set_aside_slot_if_unbound(project_root, phase, stage, gate)?;
+        Ok(moved.map(|quarantined| quarantined.to))
     }
 
-    /// RED scaffold: no id check, no re-check.
+    /// [`answer`](Self::answer) with a seam between the pre-check and the publish,
+    /// where no lock is held.
+    ///
+    /// Under the gate lock: the gate file must name `observed`, and a body in its
+    /// slot that does not bind is moved, so a refused answer never blocks a valid
+    /// one (D-05). Then the exclusive publish, outside the lock. Then under the gate
+    /// lock again: if the gate closed meanwhile, this writer sets its own publish
+    /// aside, so a decision about one gate can never be read as a decision about the
+    /// next.
     fn answer_with_hook(
         project_root: &Path,
         phase: PhaseId,
@@ -361,17 +378,110 @@ impl Gates {
         response: &GateResponse,
         before_publish: impl FnOnce(),
     ) -> Result<PathBuf, GateError> {
-        before_publish();
-        if !Self::gate_path(project_root, phase, stage).exists() {
+        if !Self::dir(project_root).is_dir() {
             return Err(GateError::NoOpenGate { phase, stage });
         }
+        {
+            let _lock = gate_lock(project_root, phase)?;
+            Self::require_open(project_root, phase, stage, observed)?;
+            Self::set_aside_slot_if_unbound(project_root, phase, stage, observed)?;
+        }
+        before_publish();
         let path = Self::answer_path(project_root, phase, stage, observed);
         let answer = GateAnswer {
             gate_id: observed.to_string(),
             response: response.clone(),
         };
         publish_response_exclusive(&path, &serde_json::to_string_pretty(&answer)?, phase, stage)?;
-        Ok(path)
+        info!(
+            "gate answer written for phase {phase} {stage} gate {observed}: approved={}",
+            response.approved
+        );
+
+        // The answer is published: "nothing was changed" is no longer true, and
+        // without the lock this writer cannot tell an open gate from a closed one,
+        // so a timeout here leaves the file where it is (R2-04).
+        let _lock = gate_lock(project_root, phase).map_err(|error| match error {
+            GateError::GateLockTimeout { waited, .. } => GateError::PublishedUnconfirmed {
+                phase,
+                stage,
+                observed: observed.to_string(),
+                waited,
+            },
+            other => other,
+        })?;
+        if Self::current_gate_id(project_root, phase, stage)?.as_deref() == Some(observed.as_str())
+        {
+            return Ok(path);
+        }
+        set_aside_if_present(
+            project_root,
+            phase,
+            stage,
+            &path,
+            observed.as_str(),
+            REASON_GATE_CLOSED,
+        )?;
+        Err(GateError::GateClosedAfterPublish {
+            phase,
+            stage,
+            observed: observed.to_string(),
+        })
+    }
+
+    /// The id the stage's gate file names, or `None` with no gate file.
+    fn current_gate_id(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<Option<String>, GateError> {
+        match std::fs::read_to_string(Self::gate_path(project_root, phase, stage)) {
+            Ok(contents) => Ok(Some(serde_json::from_str::<GateFile>(&contents)?.gate_id)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Refuse unless the stage's gate file names `gate`.
+    fn require_open(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> Result<(), GateError> {
+        match Self::current_gate_id(project_root, phase, stage)? {
+            None => Err(GateError::NoOpenGate { phase, stage }),
+            Some(current) if current == gate.as_str() => Ok(()),
+            Some(current) => Err(GateError::GateIdMismatch {
+                phase,
+                stage,
+                observed: gate.to_string(),
+                current,
+            }),
+        }
+    }
+
+    /// Set aside what is in `gate`'s slot when it does not bind to `gate`. A bound
+    /// answer stays: the first answer wins.
+    fn set_aside_slot_if_unbound(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> std::io::Result<Option<Quarantined>> {
+        let path = Self::answer_path(project_root, phase, stage, gate);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match classify_answer(&bytes, gate.as_str()) {
+            Ok(_) => Ok(None),
+            Err(reason) => {
+                let label = body_label(&bytes);
+                set_aside_if_present(project_root, phase, stage, &path, &label, reason)
+            }
+        }
     }
 
     /// What is in one gate's answer slot. Only reads: a file that does not bind is
@@ -820,7 +930,6 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
 }
 
 /// A file moved out of the way instead of being consumed or deleted.
-#[expect(dead_code, reason = "RED scaffold")]
 #[derive(Debug)]
 pub(crate) struct Quarantined {
     from: PathBuf,
@@ -829,8 +938,10 @@ pub(crate) struct Quarantined {
     reason: &'static str,
 }
 
-/// RED scaffold: a replacing rename under a counter private to this process.
-#[cfg_attr(not(test), expect(dead_code, reason = "RED scaffold"))]
+/// Move `from` to a quarantine name beside it, log it and record it: the one way
+/// an answer is set aside. The name is unique across processes and the move never
+/// replaces anything (R-11), so two same-second quarantines both survive. `label`
+/// names the gate in the file name, so it must be a checked gate id or `noid`.
 fn set_aside(
     project_root: &Path,
     phase: PhaseId,
@@ -840,19 +951,109 @@ fn set_aside(
     reason: &'static str,
     secs: u64,
 ) -> std::io::Result<Quarantined> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let to = Gates::dir(project_root).join(format!(
-        "{padded}-{stage}.{label}.{secs}.{seq}.quarantined.json",
-        padded = phase.padded()
-    ));
-    crate::durable::rename_durably(from, &to)?;
-    Ok(Quarantined {
+    let to = crate::durable::rename_to_unique_durably(
+        from,
+        &Gates::dir(project_root),
+        &format!("{padded}-{stage}.{label}.{secs}", padded = phase.padded()),
+        ".quarantined.json",
+    )?;
+    let quarantined = Quarantined {
         from: from.to_path_buf(),
         to,
         label: label.to_string(),
         reason,
-    })
+    };
+    warn!(
+        "gate answer set aside ({}): {} -> {}",
+        quarantined.reason,
+        quarantined.from.display(),
+        quarantined.to.display()
+    );
+    crate::events::emit(
+        project_root,
+        phase,
+        "gate_answer_quarantined",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "from": quarantined.from.display().to_string(),
+            "to": quarantined.to.display().to_string(),
+            "reason": quarantined.reason,
+            "gate_id": quarantined.label,
+        }),
+    );
+    Ok(quarantined)
+}
+
+/// [`set_aside`] at the current time, where a source already gone is not an error:
+/// another process set it aside, and it owns the record.
+fn set_aside_if_present(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    from: &Path,
+    label: &str,
+    reason: &'static str,
+) -> std::io::Result<Option<Quarantined>> {
+    match set_aside(project_root, phase, stage, from, label, reason, unix_secs()) {
+        Ok(quarantined) => Ok(Some(quarantined)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The label for a quarantined body: the id it names when that is a gate id, so
+/// that a hostile id never reaches a path, else [`NO_GATE_ID_LABEL`].
+fn body_label(bytes: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .as_ref()
+        .and_then(|body| body.get("gate_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| is_gate_id(id))
+        .unwrap_or(NO_GATE_ID_LABEL)
+        .to_string()
+}
+
+/// The phase's gate lock, released on drop. The file is never removed or replaced,
+/// so two lockers can never hold different inodes.
+struct GateLock {
+    _file: std::fs::File,
+}
+
+/// Take the phase's gate lock, `.devflow/.gates-NN.lock`, waiting at most
+/// [`GATE_LOCK_WAIT`].
+///
+/// It is held only across a few file operations, and `gates.rs` never takes the
+/// state write lock, so a caller holding the state write lock may take the gate
+/// lock inside it (50.1-19's owner fence) and nothing takes them in the other
+/// order. `gates_never_takes_the_state_write_lock` holds that order for direct
+/// `workflow::` paths only: a path through a helper outside `workflow` is not
+/// scanned and rests on review.
+fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError> {
+    let devflow = project_root.join(".devflow");
+    crate::workflow::ensure_devflow_dir(&devflow)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(devflow.join(format!(".gates-{}.lock", phase.padded())))?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(GateLock { _file: file }),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+        let waited = started.elapsed();
+        let Some(remaining) = GATE_LOCK_WAIT
+            .checked_sub(waited)
+            .filter(|left| !left.is_zero())
+        else {
+            return Err(GateError::GateLockTimeout { phase, waited });
+        };
+        std::thread::sleep(crate::workflow::WRITE_LOCK_POLL.min(remaining));
+    }
 }
 
 /// An answer body that is not JSON, or lacks what an answer needs.
@@ -861,6 +1062,10 @@ const REASON_UNPARSABLE: &str = "unparsable";
 const REASON_MISSING_GATE_ID: &str = "missing_gate_id";
 /// An answer body naming a gate other than the one whose slot holds it.
 const REASON_OTHER_GATE: &str = "other_gate";
+/// An answer that bound to its gate, but the gate is no longer live.
+const REASON_GATE_CLOSED: &str = "gate_closed";
+/// The label of a quarantined body that names no usable gate id.
+const NO_GATE_ID_LABEL: &str = "noid";
 
 /// Whether a file in the answer slot of gate `slot_id` binds to that gate: its body
 /// parses as a [`GateAnswer`] naming `slot_id`. Otherwise, why not.
@@ -907,10 +1112,13 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), GateError> {
 }
 
 fn unix_now() -> String {
+    unix_secs().to_string()
+}
+
+fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[cfg(test)]
