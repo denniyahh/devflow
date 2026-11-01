@@ -34,7 +34,7 @@ use crate::preflight::{
     worktree_writable_roots,
 };
 use devflow_core::config::capture_retention;
-use devflow_core::gates::{GateAction, Gates};
+use devflow_core::gates::{AwaitOutcome, GateAction, GateAnswer, GateId, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
@@ -1140,7 +1140,7 @@ fn shut_down_unpublished(record: &SupervisorRecord) {
     }
 }
 
-/// How an advance's gate wait ended (safe point 4).
+/// How a gate wait ended (safe point 4).
 #[derive(Debug)]
 pub(crate) enum GateWaitEnd {
     /// The gate was answered.
@@ -1151,31 +1151,68 @@ pub(crate) enum GateWaitEnd {
     Stopped,
 }
 
-/// An advance's gate wait (50-13, R-2, safe point 4). Inside a supervisor's
-/// advance the run is `GateWait` for the wait and `Advancing` again after
-/// it, and the poll is cancelled by the supervisor's stop token, so a
-/// SIGTERM/SIGINT or socket stop ends the wait within about a second as
-/// [`GateWaitEnd::Stopped`]. Anywhere else (the hidden `devflow advance`, a
-/// foreground gate) it is `Gates::poll_response`, unchanged.
+/// A gate wait (50-13, R-2, safe point 4), for one gate id's answer and no other
+/// (D-04, D-05). It holds no write lock. Inside a supervisor's advance the run is
+/// `GateWait` for the wait and `Advancing` again after it, and the wait is cancelled
+/// by the supervisor's stop token, so a SIGTERM/SIGINT or socket stop ends it within
+/// about a second as [`GateWaitEnd::Stopped`]. Anywhere else (the hidden `devflow
+/// advance`, a foreground gate) nothing cancels it.
+///
+/// # Errors
+/// A file in this gate's slot that does not bind to it could not be set aside, because
+/// the gate closed or was replaced, or its lock or the file could not be taken. The
+/// wait ends and the file stays where it is (R-09).
 pub(crate) fn wait_for_gate_response(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
+    gate_id: &GateId,
     timeout_secs: u64,
-) -> GateWaitEnd {
-    let Some(token) = with_stop_token(StopToken::clone) else {
-        return Gates::poll_response(project_root, phase, stage, timeout_secs)
-            .map_or(GateWaitEnd::TimedOut, GateWaitEnd::Answered);
-    };
-    token.enter(OwnerPhase::GateWait);
-    let polled = Gates::poll_response_cancellable(project_root, phase, stage, timeout_secs, || {
-        token.stop_requested()
+) -> Result<GateWaitEnd, CliError> {
+    let token = with_stop_token(StopToken::clone);
+    if let Some(token) = &token {
+        token.enter(OwnerPhase::GateWait);
+    }
+    let outcome = await_bound_answer(project_root, phase, stage, gate_id, timeout_secs, || {
+        token.as_ref().is_some_and(StopToken::stop_requested)
     });
-    token.enter(OwnerPhase::Advancing);
-    match polled {
-        Some(response) => GateWaitEnd::Answered(response),
-        None if token.safe_point() == SafePoint::StopHere => GateWaitEnd::Stopped,
+    if let Some(token) = &token {
+        token.enter(OwnerPhase::Advancing);
+    }
+    Ok(match outcome? {
+        Some(answer) => GateWaitEnd::Answered(answer.response),
+        None if stop_requested_at_safe_point() => GateWaitEnd::Stopped,
         None => GateWaitEnd::TimedOut,
+    })
+}
+
+/// `Gates::await_answer`, setting aside each file in the slot that does not bind to
+/// `gate_id` and waiting again with the time left (R-09: the read itself moves nothing).
+/// Returns the gate's answer, or `None` on a timeout or a cancel.
+fn await_bound_answer(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    gate_id: &GateId,
+    timeout_secs: u64,
+    cancel: impl Fn() -> bool,
+) -> Result<Option<GateAnswer>, CliError> {
+    let started = std::time::Instant::now();
+    loop {
+        let left = timeout_secs.saturating_sub(started.elapsed().as_secs());
+        match Gates::await_answer(project_root, phase, stage, gate_id, left, &cancel) {
+            AwaitOutcome::Unbound { reason } => {
+                Gates::set_aside_unbound(project_root, phase, stage, gate_id).map_err(|err| {
+                    CliError::Message(format!(
+                        "phase {phase}: the wait for {stage} gate {gate_id} ended: the file in \
+                         its answer slot does not bind to it ({reason}) and was not set aside: \
+                         {err}"
+                    ))
+                })?;
+            }
+            AwaitOutcome::Answered(answer) => return Ok(Some(answer)),
+            AwaitOutcome::TimedOut | AwaitOutcome::Cancelled => return Ok(None),
+        }
     }
 }
 

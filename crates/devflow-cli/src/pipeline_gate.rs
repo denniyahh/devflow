@@ -23,7 +23,7 @@ use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, commit, launch_stage};
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
+use devflow_core::gates::{self, Claim, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
@@ -385,15 +385,22 @@ fn gate_wait_call(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
+    gate_id: &gates::GateId,
     timeout_secs: u64,
-) -> GateWaitEnd {
+) -> Result<GateWaitEnd, CliError> {
     let wait = || {
         WAIT_ENTERED.with_borrow_mut(|entered| {
             if let Some(entered) = entered.take() {
                 let _ = entered.send(());
             }
         });
-        crate::pipeline_launch::wait_for_gate_response(project_root, phase, stage, timeout_secs)
+        crate::pipeline_launch::wait_for_gate_response(
+            project_root,
+            phase,
+            stage,
+            gate_id,
+            timeout_secs,
+        )
     };
     if WAIT_HOLDS_WRITE_LOCK.get() {
         return workflow::update_state_with(project_root, phase, |_| {
@@ -404,8 +411,8 @@ fn gate_wait_call(
     wait()
 }
 
-/// Write a gate file and block (in the detached monitor) until a response or
-/// the long poll timeout. Acks the response so the Hermes poller can clean up.
+/// Open a gate and block (in the detached monitor) until its answer or the long
+/// timeout, consuming the answer through its claim. See [`run_gate_with_timeout`].
 pub(crate) fn run_gate(
     project_root: &Path,
     state: &mut State,
@@ -422,10 +429,15 @@ pub(crate) fn run_gate(
     )
 }
 
-/// `run_gate`'s body, parameterized on the poll timeout (WR-02, phase 20
+/// `run_gate`'s body, parameterized on the wait's timeout (WR-02, phase 20
 /// review) so [`finish_workflow_with_gate_timeout`]'s foreground retry-gate
 /// wait can pass a bounded timeout instead of [`gate_timeout_secs`]'s
 /// multi-day production default.
+///
+/// The bound protocol (D-04, D-05): a fresh gate id with this waiter registered before
+/// the gate file is published, that registration held for the whole wait, a wait for
+/// that id's answer with no write lock held, and one first-wins claim before anything
+/// acts on the answer.
 pub(crate) fn run_gate_with_timeout(
     project_root: &Path,
     state: &mut State,
@@ -444,7 +456,10 @@ pub(crate) fn run_gate_with_timeout(
     auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
     commit(state, |s| s.gate_pending = true)?;
-    Gates::write_gate(project_root, state.phase, stage, context)?;
+    // A crash inside this call before the publish leaves `gate_pending` with no gate
+    // file, which `doctor`'s `check_gate_pending_without_gate` reports.
+    let (opened, registration) = Gates::open_registered(project_root, state.phase, stage, context)?;
+    let gate_id = &opened.gate_id;
     println!(
         "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
         state.phase.padded()
@@ -486,41 +501,69 @@ pub(crate) fn run_gate_with_timeout(
         "notify_fired",
         serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
     );
-    // The auto-response, if any, is written here — after the gate request
-    // and both `gate_fired`/`notify_fired` events, so the event stream still
-    // reads as a real gate that was really answered, and before
-    // `Gates::poll_response` below so the poll's very first read finds it
-    // (`Gates::respond` refuses with `NoOpenGate` if written before
-    // `Gates::write_gate` above, and `poll_response` would never observe a
-    // response written after it returns).
+    // The auto-response, if any, is written here: after the gate opened and both
+    // `gate_fired`/`notify_fired` events, so the event stream still reads as a real gate
+    // that was really answered, and before the wait below, whose first read finds it.
     if let Some(response) = auto_response {
-        // Safe point 5 (CR-01, 50-REVIEW.md): a response already on disk
+        // Safe point 5 (CR-01, 50-REVIEW.md): an answer already on disk
         // wins over a stop in the wait below, so a stop taken during the
         // advance is honoured before the pre-authorized one is written. As
-        // at safe point 4, the gate is cleared, the stop recorded and an
+        // at safe point 4, the gate is closed, the stop recorded and an
         // error unwinds every caller.
         if crate::pipeline_launch::stop_requested_at_safe_point() {
-            let _ = Gates::cleanup(project_root, state.phase, stage);
+            let _ = Gates::close(project_root, state.phase, stage);
+            registration.finish();
             crate::pipeline_launch::record_advance_stop(state, 5)?;
             return Err(CliError::Message(format!(
                 "the gate for stage {stage} was not auto-answered: {ADVANCE_STOP_REASON}"
             )));
         }
-        match Gates::respond(project_root, state.phase, stage, response) {
+        match Gates::answer(project_root, state.phase, stage, gate_id, response) {
             Ok(_) => {}
             // A human or 23b's stale-gate sweep may have answered first;
             // first-writer-wins is the correct resolution, not an error.
             Err(GateError::AlreadyResponded { .. }) => {}
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                registration.finish();
+                return Err(err.into());
+            }
         }
     }
-    match gate_wait_call(project_root, state.phase, stage, timeout_secs) {
+    let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs) {
+        Ok(end) => end,
+        Err(err) => {
+            registration.finish();
+            return Err(err);
+        }
+    };
+    match wait_end {
         GateWaitEnd::Answered(response) => {
+            match Gates::claim(project_root, state.phase, stage, gate_id) {
+                Ok(Claim::Claimed) => {}
+                Ok(Claim::AlreadyConsumed) => {
+                    registration.finish();
+                    return Err(CliError::Message(format!(
+                        "phase {}: the answer to {stage} gate {gate_id} was already consumed: \
+                         another consumer (`devflow ship`) acted on it, so this wait did nothing",
+                        state.phase
+                    )));
+                }
+                // R-08: the gate closed or was replaced after the answer was read, or
+                // its lock was held too long. Nothing here records a decision.
+                Err(err) => {
+                    registration.finish();
+                    return Err(CliError::Message(format!(
+                        "phase {}: the answer to {stage} gate {gate_id} could not be claimed, \
+                         so nothing was consumed: {err}",
+                        state.phase
+                    )));
+                }
+            }
+            registration.finish();
             // D-08: whatever changed on disk during the wait (a `stop`, a
             // `yes_ship` revoke, an edited notify command) is kept, because this
             // write re-reads the state and sets only this field.
             commit(state, |s| s.gate_pending = false)?;
-            Gates::ack(project_root, state.phase, stage)?;
             let action = GateAction::from_response(&response);
             events::emit(
                 project_root,
@@ -528,6 +571,7 @@ pub(crate) fn run_gate_with_timeout(
                 "gate_resolved",
                 serde_json::json!({
                     "stage": stage.to_string(),
+                    "gate_id": gate_id.as_str(),
                     "approved": response.approved,
                     "action": match &action {
                         GateAction::Advance => "advance",
@@ -542,18 +586,20 @@ pub(crate) fn run_gate_with_timeout(
         GateWaitEnd::Stopped => {
             // Safe point 4 (50-13, R-2): the supervisor running this advance
             // was stopped during the wait. The gate has no waiter any more, so
-            // it is cleared (no stale request or response outlives the run),
-            // the stop is recorded, and an error unwinds every caller through
-            // `?`, which releases the per-phase lock. Deliberately not
-            // `GateAction::Abort`: `abort()` deletes the state file, and a
-            // stopped run keeps its state for `devflow resume`.
-            let _ = Gates::cleanup(project_root, state.phase, stage);
+            // it is closed (an unconsumed answer is set aside, nothing outlives
+            // the run in its slot), the stop is recorded, and an error unwinds
+            // every caller through `?`, which releases the per-phase lock.
+            // Deliberately not `GateAction::Abort`: `abort()` deletes the state
+            // file, and a stopped run keeps its state for `devflow resume`.
+            let _ = Gates::close(project_root, state.phase, stage);
+            registration.finish();
             crate::pipeline_launch::record_advance_stop(state, 4)?;
             Err(CliError::Message(format!(
                 "the gate wait for stage {stage} ended: {ADVANCE_STOP_REASON}"
             )))
         }
         GateWaitEnd::TimedOut => {
+            registration.finish();
             events::emit(
                 project_root,
                 state.phase,
@@ -1438,15 +1484,18 @@ mod tests {
         state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
-        // Pre-write a rejected response whose note says "abort" so
+        // Pre-answer a rejection whose note says "abort" so
         // `GateAction::from_response` resolves to `Abort`.
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: requirements changed".into()),
+                responded_by: Some("test".into()),
+            },
+        );
 
         handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
@@ -1461,26 +1510,36 @@ mod tests {
             "gate must have fired and aborted — Stage::Code means it silently looped back and tried to launch an agent"
         );
 
-        // The gate, response, and ack files for the stage the gate fired on
-        // (Validate) must all be gone after the Abort path runs.
+        // The gate, answer and claim files for the stage the gate fired on
+        // (Validate) must all be gone after the Abort path runs, and the answer it
+        // consumed is not left set aside either.
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
-        assert!(
-            !Gates::response_path(root, phase, Stage::Validate).exists(),
-            "stale response file must not survive an aborted gate"
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Validate),
+            Vec::<std::path::PathBuf>::new(),
+            "no answer may outlive an aborted gate"
         );
-        assert!(!Gates::ack_path(root, phase, Stage::Validate).exists());
+        assert_eq!(
+            gate_claim_files(root, phase, Stage::Validate),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert_eq!(Gates::quarantined(root), Vec::new());
 
-        // Simulate the phase reaching the same gate again later (e.g. after
-        // a restart) — write a fresh request but no new response. If cleanup
-        // had not happened, `poll_response` would instantly return the old,
-        // already-consumed response instead of blocking for a fresh human
-        // decision.
-        Gates::write_gate(root, phase, Stage::Validate, "re-fired gate").unwrap();
+        // The phase reaching the same gate again later (e.g. after a restart) waits
+        // for a fresh human decision.
+        let refired = Gates::open_gate(root, phase, Stage::Validate, "re-fired gate").unwrap();
         let started = std::time::Instant::now();
-        let got = Gates::poll_response(root, phase, Stage::Validate, 1);
+        let end = crate::pipeline_launch::wait_for_gate_response(
+            root,
+            phase,
+            Stage::Validate,
+            &refired.gate_id,
+            1,
+        )
+        .unwrap();
         assert!(
-            got.is_none(),
-            "poll_response must not instantly resolve from a stale response after cleanup"
+            matches!(end, GateWaitEnd::TimedOut),
+            "the re-fired gate must wait for its own answer: {end:?}"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
@@ -2283,6 +2342,42 @@ mod tests {
             Gates::waiter_status(root, phase, Stage::Code, &gate).unwrap(),
             gates::WaiterStatus::Absent
         );
+    }
+
+    /// R-09, wait arm: a set-aside acts only while the gate file names this gate. When
+    /// the gate was replaced or closed, the wait ends with that error and the file
+    /// stays where it is.
+    #[test]
+    fn a_wait_whose_gate_changed_ends_with_the_error_and_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(84);
+        let old = Gates::open_gate(root, phase, Stage::Code, "g1").unwrap();
+        Gates::open_gate(root, phase, Stage::Code, "g2").unwrap();
+        let slot = Gates::answer_path(root, phase, Stage::Code, &old.gate_id);
+        let idless = br#"{"approved": true}"#;
+        std::fs::write(&slot, idless).unwrap();
+
+        let assert_refused = |refusal: &str| {
+            let err = crate::pipeline_launch::wait_for_gate_response(
+                root,
+                phase,
+                Stage::Code,
+                &old.gate_id,
+                5,
+            )
+            .expect_err("a set-aside the gate refuses ends the wait");
+            let message = err.to_string();
+            assert!(message.contains(old.gate_id.as_str()), "{message}");
+            assert!(message.contains("was not set aside"), "{message}");
+            assert!(message.contains(refusal), "{message}");
+            assert_eq!(std::fs::read(&slot).unwrap(), idless);
+            assert_eq!(Gates::quarantined(root), Vec::new());
+        };
+
+        assert_refused(old.gate_id.as_str());
+        std::fs::remove_file(Gates::gate_path(root, phase, Stage::Code)).unwrap();
+        assert_refused("no open gate");
     }
 
     /// A `yes_ship` revoke made after a caller loaded its copy survives that caller's

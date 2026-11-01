@@ -5578,11 +5578,10 @@ mod tests {
         );
     }
 
-    /// CR-01 regression: after a stage failure's gate resolves via Advance
-    /// and the retry (also a stage failure) fires a fresh gate, the SECOND
-    /// gate's poll must not instantly resolve from the FIRST gate's
-    /// already-consumed response/ack — `handle_stage_failure` must clean
-    /// those up before the retry launches.
+    /// CR-01 regression: after a stage failure's gate resolves and the phase reaches
+    /// the same gate again, the SECOND gate's wait must not resolve from the FIRST
+    /// gate's consumed answer: the first gate's answer and claim are gone, and the
+    /// second gate has its own id.
     #[test]
     fn stage_failure_retry_cleans_stale_response() {
         const NAME: &str = "pipeline_outcomes::tests::stage_failure_retry_cleans_stale_response";
@@ -5601,33 +5600,47 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        // Pre-write an Abort response so the first failure resolves
-        // immediately without spawning a monitor.
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        // Pre-answer an abort so the first failure resolves immediately without
+        // spawning a monitor.
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        );
 
         handle_stage_failure(root, &mut state, Stage::Code, Some("first failure".into())).unwrap();
 
-        // abort() must have cleaned up the gate/response/ack for Code.
+        // abort() must have removed the gate and the answer it consumed.
         assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Code).exists());
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Code),
+            Vec::<std::path::PathBuf>::new(),
+            "no answer may outlive the gate it decided"
+        );
+        assert_eq!(
+            crate::test_support::gate_claim_files(root, phase, Stage::Code),
+            Vec::<std::path::PathBuf>::new()
+        );
 
-        // Simulate the phase reaching the same gate again later (e.g. a
-        // fresh retry after abort would normally clear state, but re-fire
-        // here directly to prove the CR-01 stale-response reuse regression
-        // is closed): write a fresh gate but no new response.
-        Gates::write_gate(root, phase, Stage::Code, "re-fired gate").unwrap();
+        // The phase reaching the same gate again waits for a fresh decision.
+        let refired = Gates::open_gate(root, phase, Stage::Code, "re-fired gate").unwrap();
         let started = std::time::Instant::now();
-        let got = Gates::poll_response(root, phase, Stage::Code, 1);
+        let end = crate::pipeline_launch::wait_for_gate_response(
+            root,
+            phase,
+            Stage::Code,
+            &refired.gate_id,
+            1,
+        )
+        .unwrap();
         assert!(
-            got.is_none(),
-            "poll_response must not instantly resolve from a stale response after cleanup"
+            matches!(end, crate::pipeline_launch::GateWaitEnd::TimedOut),
+            "the re-fired gate must wait for its own answer: {end:?}"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
