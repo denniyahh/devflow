@@ -141,6 +141,7 @@ pub(crate) fn remove_durably(path: &Path) -> std::io::Result<bool> {
 
 /// Rename `from` to `to`, then fsync `to`'s directory. Callers keep both names in
 /// one directory, so that fsync covers both entries.
+#[cfg(test)]
 pub(crate) fn rename_durably(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)?;
     fsync_dir(parent_of(to))

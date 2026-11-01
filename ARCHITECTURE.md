@@ -162,9 +162,9 @@ four layers, tried in order:
 
 State is per-phase (`crates/devflow-core/src/workflow.rs`): each active
 phase persists to `.devflow/state-{phase:02}.json`, so `devflow parallel`
-sibling phases never clobber one another. A legacy single-slot
-`.devflow/state.json` from a pre-14a binary is migrated to its per-phase
-name on first read.
+sibling phases never clobber one another. A single-slot
+`.devflow/state.json` left by a pre-14a binary is not read, renamed or
+removed.
 
 Two independent lock levels (`crates/devflow-core/src/lock.rs`), both
 file-based (`O_EXCL` create, PID written into the file, stale-holder
