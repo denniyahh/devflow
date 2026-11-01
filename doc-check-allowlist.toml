@@ -84,3 +84,8 @@ reason = "Test-only: under the devflow-core test-support feature, run_supervised
 kind = "source_to_docs"
 token = "DEVFLOW_TEST_LAUNCH_HOLD"
 reason = "Test-only: #[cfg(test)] hold points in a launcher's reservation (reserve_launch) wait while it names <point>:<path> and that path does not exist, so a CLI test can observe the reservation and hold two launchers between their guard and their write; compiled out of non-test builds, so it is not an operator setting (Phase 50.1, plan 50.1-16)."
+
+[[exceptions]]
+kind = "source_to_docs"
+token = "DEVFLOW_TEST_AGENT_SPAWN_HOLD"
+reason = "Test-only: under the devflow-core test-support feature, run_supervised_stage waits while it names <stage>:<path> for its stage and that path does not exist, after it adopts its liveness lock and before it spawns its agent, so 50.1-16 and 50.1-17 fixtures can hold a pending supervisor with no agent and no socket; compiled out of release builds, so it is not an operator setting (Phase 50.1, plan 50.1-16)."

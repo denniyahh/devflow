@@ -1620,6 +1620,8 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     crate::supervisor::runtime::install_signal_pipe()?;
     let liveness = adopt_liveness(&spec)?;
+    #[cfg(any(test, feature = "test-support"))]
+    agent_spawn_test_hold(&spec);
 
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
     let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
@@ -1811,6 +1813,37 @@ fn stream_wait_test_hold(token: &crate::supervisor::runtime::StopToken) {
     let _ = std::fs::write(&held, "");
     let deadline = std::time::Instant::now() + STREAM_WAIT_HOLD_WAIT;
     while !release.exists() && !token.stop_requested() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How long [`agent_spawn_test_hold`] waits for its release file.
+#[cfg(any(test, feature = "test-support"))]
+const AGENT_SPAWN_HOLD_WAIT: Duration = Duration::from_secs(60);
+
+/// Test-only hold (50.1-16). When `DEVFLOW_TEST_AGENT_SPAWN_HOLD` is
+/// `<stage>:<path>` for `spec`'s stage: create `<path>.held`, then wait, polling
+/// every 20 ms and bounded by [`AGENT_SPAWN_HOLD_WAIT`], until `<path>` exists. So a
+/// test can hold a supervisor that has adopted its liveness lock and has no agent and
+/// no socket, the window a pending record exists for; scoped to a stage so a handoff
+/// fixture holds only the next stage's supervisor. Returns at once when the variable
+/// is absent or names another stage. Compiled only under `cfg(test)` or the
+/// `test-support` feature, together with its one call.
+#[cfg(any(test, feature = "test-support"))]
+fn agent_spawn_test_hold(spec: &StageSpec) {
+    let Ok(hold) = std::env::var("DEVFLOW_TEST_AGENT_SPAWN_HOLD") else {
+        return;
+    };
+    let Some((stage, path)) = hold.split_once(':') else {
+        return;
+    };
+    if spec.stage.map(|stage| stage.to_string()).as_deref() != Some(stage) {
+        return;
+    }
+    let _ = std::fs::write(format!("{path}.held"), "");
+    let release = Path::new(path);
+    let deadline = std::time::Instant::now() + AGENT_SPAWN_HOLD_WAIT;
+    while !release.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
