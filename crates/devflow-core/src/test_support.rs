@@ -526,7 +526,7 @@ mod tests {
             .unwrap()
             .gate_id;
         let keyed = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
-        let legacy = Gates::response_path(dir.path(), PHASE, STAGE);
+        let legacy = Gates::dir(dir.path()).join("07-code.response.json");
         std::fs::write(&legacy, "{}").unwrap();
         Gates::claim(dir.path(), PHASE, STAGE, &gate).unwrap();
         let _registration = Gates::register_waiter(dir.path(), PHASE, STAGE, &gate).unwrap();
