@@ -2,12 +2,19 @@
 //!
 //! A *gate* is a pause point where DevFlow writes a request to
 //! `.devflow/gates/` and waits for a human (or the Hermes cron poller) to drop
-//! a response file. The protocol is three files per gated stage:
+//! a response file. Phase and stage are a gate's location; its gate id, fresh for
+//! every gate opened, is its identity. The protocol is:
 //!
-//! - `NN-{stage}.json` — the gate request DevFlow writes (a [`GateFile`]).
-//! - `NN-{stage}.response.json` — the human's answer (a [`GateResponse`]).
-//! - `NN-{stage}.ack.json` — DevFlow's receipt (a [`GateAck`]) so the poller can
-//!   clean up.
+//! - `NN-{stage}.json` — the gate request DevFlow writes (a [`GateFile`], which
+//!   names the gate id).
+//! - `NN-{stage}.{gate_id}.response.json` — the answer to that one gate (a
+//!   [`GateAnswer`], whose body names the same id).
+//! - `NN-{stage}.{gate_id}.ack.json` — the consumption claim (a [`GateAck`]); the
+//!   first process to publish it consumes the answer.
+//!
+//! The unkeyed `NN-{stage}.response.json` and `NN-{stage}.ack.json` of
+//! [`Gates::respond`], [`Gates::poll_response`] and [`Gates::ack`] stay until the
+//! CLI has moved off them.
 //!
 //! Writes are atomic and fsynced (`crate::durable`) so a reader never sees a
 //! partial file and a power loss cannot lose a published one. Polling uses exponential backoff so a long human wait costs little.
@@ -31,6 +38,10 @@ pub struct GateFile {
     pub context: String,
     /// Unix timestamp (seconds) when the gate was written.
     pub timestamp: String,
+    /// The gate's identity. Empty only in a gate file written before gate ids
+    /// existed, which no writer can answer through [`Gates::answer`].
+    #[serde(default)]
+    pub gate_id: String,
 }
 
 /// The human's response to a gate.
@@ -44,6 +55,17 @@ pub struct GateResponse {
     /// Who responded (human name, or "hermes").
     #[serde(default)]
     pub responded_by: Option<String>,
+}
+
+/// An answer as stored on disk: a [`GateResponse`] bound to the gate it decides.
+/// `gate_id` has no default, so a body without one does not parse as an answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateAnswer {
+    /// The gate this answer decides.
+    pub gate_id: String,
+    /// The decision.
+    #[serde(flatten)]
+    pub response: GateResponse,
 }
 
 /// DevFlow's receipt that it has read a [`GateResponse`].
@@ -95,6 +117,86 @@ pub enum GateError {
     /// Responding to a gate that already has a response on disk.
     #[error("gate for phase {phase} stage {stage} already has a response awaiting pickup")]
     AlreadyResponded { phase: PhaseId, stage: Stage },
+    /// A gate id that does not have a gate id's format.
+    #[error("`{0}` is not a gate id: expected 16 lowercase hex digits")]
+    InvalidGateId(String),
+}
+
+/// A gate's identity: 16 lowercase hex digits, fresh for every gate opened and
+/// never reused. Holding one means the id was checked, so it is safe in a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateId(String);
+
+impl GateId {
+    /// A fresh gate id.
+    #[must_use]
+    pub fn new() -> Self {
+        Self("0000000000000000".to_string())
+    }
+
+    /// Check an id read from elsewhere; anything [`is_gate_id`] refuses is
+    /// [`GateError::InvalidGateId`].
+    pub fn parse(id: &str) -> Result<GateId, GateError> {
+        if is_gate_id(id) {
+            Ok(GateId(id.to_string()))
+        } else {
+            Err(GateError::InvalidGateId(id.to_string()))
+        }
+    }
+
+    /// The id as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for GateId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for GateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Whether `id` has a gate id's format. No path is built from an id that fails
+/// this: the id in an answer body is untrusted input.
+#[must_use]
+pub fn is_gate_id(id: &str) -> bool {
+    crate::supervisor::is_launch_id(id)
+}
+
+/// A gate [`Gates::open_gate`] opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedGate {
+    /// The new gate's identity.
+    pub gate_id: GateId,
+    /// The gate file.
+    pub path: PathBuf,
+}
+
+/// What [`Gates::read_answer`] found in one gate's answer slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerRead {
+    /// Nothing is there.
+    None,
+    /// An answer that binds to this gate.
+    Bound(GateAnswer),
+    /// A file that does not bind to this gate, with the reason.
+    Unbound(String),
+}
+
+/// How [`Gates::claim`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// This call consumed the answer.
+    Claimed,
+    /// Another claim got there first; this caller must not act on the answer.
+    AlreadyConsumed,
 }
 
 /// An open gate: a request the workflow wrote that has no response yet.
@@ -108,6 +210,8 @@ pub struct OpenGate {
     pub context: String,
     /// Unix timestamp (seconds) when the gate was written.
     pub timestamp: String,
+    /// The gate's identity, empty for a gate file from before gate ids.
+    pub gate_id: String,
 }
 
 /// The gate-file protocol, scoped to a project's `.devflow/gates/` directory.
@@ -138,6 +242,72 @@ impl Gates {
             "{padded}-{stage}.ack.json",
             padded = phase.padded()
         ))
+    }
+
+    /// Path to the answer file for one gate.
+    pub fn answer_path(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+    ) -> PathBuf {
+        Self::dir(project_root).join(format!(
+            "{padded}-{stage}.{gate}.response.json",
+            padded = phase.padded()
+        ))
+    }
+
+    /// Path to the consumption claim for one gate.
+    pub fn claim_path(project_root: &Path, phase: PhaseId, stage: Stage, gate: &GateId) -> PathBuf {
+        Self::dir(project_root).join(format!(
+            "{padded}-{stage}.{gate}.ack.json",
+            padded = phase.padded()
+        ))
+    }
+
+    /// RED scaffold: writes no id.
+    pub fn open_gate(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        context: &str,
+    ) -> Result<OpenedGate, GateError> {
+        let path = Self::write_gate(project_root, phase, stage, context)?;
+        Ok(OpenedGate {
+            gate_id: GateId::new(),
+            path,
+        })
+    }
+
+    /// RED scaffold: publishes nothing.
+    pub fn answer(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        _response: &GateResponse,
+    ) -> Result<PathBuf, GateError> {
+        Ok(Self::answer_path(project_root, phase, stage, observed))
+    }
+
+    /// RED scaffold: reads nothing.
+    pub fn read_answer(
+        _project_root: &Path,
+        _phase: PhaseId,
+        _stage: Stage,
+        _gate: &GateId,
+    ) -> AnswerRead {
+        AnswerRead::None
+    }
+
+    /// RED scaffold: publishes nothing.
+    pub fn claim(
+        _project_root: &Path,
+        _phase: PhaseId,
+        _stage: Stage,
+        _gate: &GateId,
+    ) -> Result<Claim, GateError> {
+        Ok(Claim::Claimed)
     }
 
     /// Every open gate (request written, no response yet), sorted by phase
@@ -172,6 +342,7 @@ impl Gates {
                 stage: gate.stage,
                 context: gate.context,
                 timestamp: gate.timestamp,
+                gate_id: gate.gate_id,
             });
         }
         open.sort_by_key(|g| (g.phase, g.stage.to_string()));
@@ -268,6 +439,7 @@ impl Gates {
             stage,
             context: context.to_string(),
             timestamp: unix_now(),
+            gate_id: String::new(),
         };
         let path = Self::gate_path(project_root, phase, stage);
         info!("writing gate {} for phase {phase}", stage);
@@ -584,6 +756,7 @@ mod tests {
             stage: Stage::Validate,
             context: "review the validation".into(),
             timestamp: "1750000000".into(),
+            gate_id: GateId::new().to_string(),
         };
         let json = serde_json::to_string(&gate).unwrap();
         let back: GateFile = serde_json::from_str(&json).unwrap();
@@ -1168,6 +1341,103 @@ mod tests {
         assert!(
             started.elapsed() >= std::time::Duration::from_secs(1),
             "an uncancelled wait runs to its timeout"
+        );
+    }
+
+    fn approved() -> GateResponse {
+        GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        }
+    }
+
+    fn read_gate(root: &Path, phase: PhaseId, stage: Stage) -> GateFile {
+        serde_json::from_str(
+            &std::fs::read_to_string(Gates::gate_path(root, phase, stage)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// D-04, D-05: a gate has an id, an answer names it, and consuming the answer
+    /// is one first-wins claim.
+    #[test]
+    fn a_gate_answered_for_its_own_id_is_read_bound_and_claimed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+
+        let opened = Gates::open_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let gate = opened.gate_id.clone();
+        assert!(is_gate_id(gate.as_str()), "{gate} is not a gate id");
+        assert_eq!(opened.path, Gates::gate_path(dir.path(), phase, stage));
+        assert_eq!(
+            read_gate(dir.path(), phase, stage).gate_id,
+            gate.as_str(),
+            "the gate file must name the id open_gate returned"
+        );
+
+        let path = Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("07-code.{gate}.response.json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["gate_id"], gate.as_str());
+        assert_eq!(body["approved"], true);
+
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &gate),
+            AnswerRead::Bound(GateAnswer {
+                gate_id: gate.to_string(),
+                response: approved(),
+            })
+        );
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::Claimed
+        );
+        assert!(Gates::claim_path(dir.path(), phase, stage, &gate).exists());
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::AlreadyConsumed,
+            "a second claim of one answer must not consume it again"
+        );
+    }
+
+    #[test]
+    fn two_gates_opened_at_one_stage_get_different_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+
+        let first = Gates::open_gate(dir.path(), phase, stage, "first").unwrap();
+        let second = Gates::open_gate(dir.path(), phase, stage, "second").unwrap();
+
+        assert_ne!(first.gate_id, second.gate_id);
+        assert_eq!(
+            read_gate(dir.path(), phase, stage).gate_id,
+            second.gate_id.as_str()
+        );
+    }
+
+    #[test]
+    fn write_gate_still_returns_its_path_and_now_writes_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+
+        let path = Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+
+        assert_eq!(path, Gates::gate_path(dir.path(), phase, stage));
+        let gate = read_gate(dir.path(), phase, stage);
+        assert!(
+            is_gate_id(&gate.gate_id),
+            "write_gate must write a valid id, wrote {:?}",
+            gate.gate_id
+        );
+        Gates::respond(dir.path(), phase, stage, &approved()).unwrap();
+        assert_eq!(
+            Gates::poll_response(dir.path(), phase, stage, 1),
+            Some(approved())
         );
     }
 }

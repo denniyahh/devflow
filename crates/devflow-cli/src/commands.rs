@@ -7064,6 +7064,7 @@ mod tests {
             stage,
             context: "ctx".to_string(),
             timestamp: now.saturating_sub(age_secs).to_string(),
+            gate_id: String::new(),
         };
         std::fs::write(
             Gates::gate_path(root, phase, stage),
@@ -8228,6 +8229,7 @@ mod tests {
             stage: Stage::Ship,
             context: "ctx".to_string(),
             timestamp: "not-a-number".to_string(),
+            gate_id: String::new(),
         };
 
         let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &gate, 10_000);

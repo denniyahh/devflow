@@ -134,6 +134,7 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
         stage,
         context: "abandoned run".to_string(),
         timestamp: now.saturating_sub(age_secs).to_string(),
+        gate_id: String::new(),
     };
     std::fs::write(
         Gates::gate_path(root, phase, stage),
