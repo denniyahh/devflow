@@ -319,10 +319,6 @@ fn gitignore_covers_all_devflow_paths() {
             "workflow::state_path",
             workflow::state_path(root, PhaseId::new(16)),
         ),
-        (
-            "workflow::legacy_state_path",
-            workflow::legacy_state_path(root),
-        ),
         ("Gates::dir", Gates::dir(root)),
         ("lock::lock_path", lock::lock_path(root, PhaseId::new(16))),
         ("lock::project_lock_path", lock::project_lock_path(root)),

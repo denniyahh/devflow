@@ -29,8 +29,8 @@ fn advance_state_loading_fails_cleanly_for_missing_and_corrupt_state() {
         Err(WorkflowError::Json(_))
     ));
 
-    // A corrupt LEGACY state.json must not wedge loading either — it is left
-    // in place (unmigratable) and per-phase reads proceed independently.
+    // A corrupt state.json from an old binary must not wedge loading either: it
+    // is not read, and per-phase reads proceed independently.
     std::fs::write(root.join(".devflow/state.json"), "{\"stage\":").unwrap();
     assert!(matches!(
         load_state(root, PhaseId::new(8)),

@@ -83,9 +83,8 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// 14-CR-01: only STALE phases are swept — a phase whose agent is still
 /// running, or whose state is simply fresh, is kept (with a warning naming
 /// the explicit `--phase` escape hatch), so cleaning one dead phase under
-/// `devflow parallel` can never orphan a healthy sibling. Also removes an
-/// unparsable legacy `state.json` (14-CR-04 — this reset is the one
-/// sanctioned place), lock files whose holder is dead (the sweep lives in
+/// `devflow parallel` can never orphan a healthy sibling. Also removes lock
+/// files whose holder is dead (the sweep lives in
 /// [`crate::lock::remove_stale_locks`], which refuses to delete a live
 /// holder's lock), gate files whose phase has no state file, and
 /// cron-instruction records for phases that no longer have state —
@@ -98,8 +97,7 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
 
 /// What [`clean_report`] did: the phases whose state it cleared, the
 /// stateless phases whose orphaned gate files or cron records it removed,
-/// whether it removed an unparsable legacy state file, and warnings for
-/// anything it kept or could not remove.
+/// and warnings for anything it kept or could not remove.
 #[derive(Debug, Default)]
 pub struct CleanReport {
     /// Phases whose persisted state was cleared.
@@ -108,8 +106,6 @@ pub struct CleanReport {
     pub orphan_gates_cleared: Vec<PhaseId>,
     /// Phases with no state file whose leftover cron records were removed.
     pub orphan_cron_records_removed: Vec<PhaseId>,
-    /// Whether the unparsable legacy `.devflow/state.json` was removed.
-    pub corrupt_legacy_state_removed: bool,
     /// Whether a removal the sweep attempted failed. Each failure is also
     /// described in `warnings`.
     pub removal_failed: bool,
@@ -142,11 +138,6 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
         }
     }
     sweep_orphan_gates(project_root, &mut report);
-    match workflow::remove_corrupt_legacy_state(project_root) {
-        Ok(true) => report.corrupt_legacy_state_removed = true,
-        Ok(false) => {}
-        Err(err) => report.fail(format!("could not remove corrupt legacy state.json: {err}")),
-    }
     for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
         match outcome {
             crate::lock::StaleLockRemovalOutcome::Notice(warning) => {
@@ -337,9 +328,8 @@ const STAGES: [crate::stage::Stage; 5] = [
 /// What [`clean_phase_report`] did for one phase.
 #[derive(Debug, Default)]
 pub struct PhaseCleanReport {
-    /// Whether this call removed any of the phase's state (including a
-    /// legacy single-slot file naming it), gate files, cron record, or their
-    /// orphaned write temps.
+    /// Whether this call removed any of the phase's state, gate files, cron
+    /// record, or their orphaned write temps.
     pub removed_anything: bool,
     /// Whether a removal failed. Each failure is also in `warnings`.
     pub removal_failed: bool,
@@ -829,35 +819,6 @@ mod tests {
             "the sweep must leave the holder's lock file untouched"
         );
         drop(guard);
-    }
-
-    /// 14-CR-04: a corrupt legacy `state.json` (old binary killed mid-write)
-    /// can never be migrated or matched by a per-phase clear — the operator
-    /// reset is the one sanctioned place to remove it.
-    #[test]
-    fn clean_removes_corrupt_legacy_state_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join(".devflow/state.json");
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, "{\"stage\":").unwrap();
-
-        let report = clean_report(dir.path()).expect("clean");
-
-        assert!(
-            !legacy.exists(),
-            "recover --clean must remove an unparsable legacy state.json"
-        );
-        assert!(
-            report.corrupt_legacy_state_removed,
-            "the report must retain the corrupt legacy-state removal"
-        );
-
-        let no_legacy = tempfile::tempdir().unwrap();
-        let report = clean_report(no_legacy.path()).expect("clean without legacy state");
-        assert!(
-            !report.corrupt_legacy_state_removed,
-            "the report must not claim a legacy-state removal when no legacy file exists"
-        );
     }
 
     /// Phase 50 D-20: neither clean touches a `state.json` left by an old binary,
@@ -1492,29 +1453,6 @@ mod tests {
             "the valid orphan cron record must be removed"
         );
         assert_eq!(report.orphan_cron_records_removed, vec![phase]);
-    }
-
-    /// WR-03 (48-REVIEW.md): `found_anything` was computed before the legacy
-    /// `state.json` migration, so clearing a phase held only in the legacy
-    /// file reported "nothing to clean" after deleting its state.
-    #[test]
-    fn clean_phase_report_counts_legacy_state_it_removes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(7);
-        let legacy = workflow::legacy_state_path(root);
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        let state = state_aged_phase(root, phase, 0, None);
-        std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
-
-        let report = clean_phase_report(root, phase).expect("clean");
-
-        assert!(!legacy.exists());
-        assert!(!workflow::state_path(root, phase).exists());
-        assert!(
-            report.removed_anything,
-            "removing a phase's legacy state is a cleanup, not \"nothing to clean\""
-        );
     }
 
     /// Control for the test below: a cron record the clean does remove is a

@@ -3,8 +3,8 @@
 //! State is per-phase: each active phase persists to
 //! `.devflow/state-{phase:02}.json` (mirroring the per-phase lock naming), so
 //! `devflow parallel` sibling phases never clobber one another
-//! (13-DEFERRED-CR-03). A legacy single-slot `.devflow/state.json` from an
-//! older binary is migrated to its per-phase name on first read.
+//! (13-DEFERRED-CR-03). A single-slot `.devflow/state.json` left by an older
+//! binary is not read, renamed or removed (Phase 50 D-20).
 
 use crate::phase_id::PhaseId;
 use crate::state::State;
@@ -102,9 +102,8 @@ pub enum Existing {
 }
 
 /// Filename prefix shared by every per-phase state file. Owned here so
-/// listing/migration never hardcode the naming scheme.
+/// listing never hardcodes the naming scheme.
 const STATE_FILE_PREFIX: &str = "state-";
-const CORRUPT_LEGACY_STATE_HINT: &str = "devflow recover --clean";
 
 /// Return the `.devflow` directory for a project.
 pub fn devflow_dir(project_root: &Path) -> PathBuf {
@@ -216,46 +215,6 @@ pub fn state_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     ))
 }
 
-/// Path of the legacy single-slot state file written by pre-14a binaries.
-pub(crate) fn legacy_state_path(project_root: &Path) -> PathBuf {
-    devflow_dir(project_root).join("state.json")
-}
-
-/// One-shot migration: move a legacy `.devflow/state.json` to its per-phase
-/// name. Called before any read so an upgrade mid-run keeps its state. A
-/// per-phase file that already exists wins — the legacy file is then stale
-/// and removed without overwriting.
-fn migrate_legacy_state(project_root: &Path) {
-    let legacy = legacy_state_path(project_root);
-    let Ok(contents) = std::fs::read_to_string(&legacy) else {
-        return;
-    };
-    let Ok(state) = serde_json::from_str::<State>(&contents) else {
-        warn!(
-            "legacy state at {} is unparsable — leaving it in place; remove it with `{CORRUPT_LEGACY_STATE_HINT}`",
-            legacy.display()
-        );
-        return;
-    };
-    let target = state_path(project_root, state.phase);
-    if target.exists() {
-        debug!(
-            "per-phase state already exists for phase {} — dropping stale legacy file",
-            state.phase
-        );
-    } else if let Err(err) = crate::durable::rename_durably(&legacy, &target) {
-        warn!(
-            "could not migrate legacy state to {}: {err}",
-            target.display()
-        );
-        return;
-    } else {
-        debug!("migrated legacy state.json to {}", target.display());
-        return;
-    }
-    let _ = crate::durable::remove_durably(&legacy);
-}
-
 /// Save workflow state to `.devflow/state-{NN}.json`, keyed by `state.phase`.
 pub fn save_state(state: &State) -> Result<(), WorkflowError> {
     debug!("saving state: phase={} stage={}", state.phase, state.stage);
@@ -298,7 +257,6 @@ fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> 
 
 /// Load workflow state for a phase from `.devflow/state-{NN}.json`.
 pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, WorkflowError> {
-    migrate_legacy_state(project_root);
     let path = state_path(project_root, phase);
     debug!("loading state from {}", path.display());
     if !path.exists() {
@@ -665,7 +623,6 @@ pub fn update_owned_state<T, E: From<WorkflowError>>(
 /// whole listing — `status`/`recover` must degrade, not die, on one corrupt
 /// file.
 pub fn list_states(project_root: &Path) -> Vec<State> {
-    migrate_legacy_state(project_root);
     let mut states = Vec::new();
     let Ok(entries) = std::fs::read_dir(devflow_dir(project_root)) else {
         return states;
@@ -712,31 +669,9 @@ pub fn state_file_phases(project_root: &Path) -> Vec<PhaseId> {
     phases
 }
 
-/// Delete a legacy `state.json` that cannot be parsed — and therefore can
-/// never be migrated by [`migrate_legacy_state`] or matched by
-/// [`clear_state`]'s phase check (14-CR-04). Ordinary reads deliberately
-/// leave such a file in place; only the operator-driven reset
-/// (`recover --clean`) is sanctioned to call this. Returns whether a file
-/// was removed.
-pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, WorkflowError> {
-    let legacy = legacy_state_path(project_root);
-    let Ok(contents) = std::fs::read_to_string(&legacy) else {
-        return Ok(false);
-    };
-    if serde_json::from_str::<State>(&contents).is_ok() {
-        // Parsable: the normal migration path owns it.
-        return Ok(false);
-    }
-    let removed = crate::durable::remove_durably(&legacy)?;
-    if removed {
-        warn!("removed unparsable legacy state at {}", legacy.display());
-    }
-    Ok(removed)
-}
-
-/// Remove a phase's persisted state if present, with a legacy single-slot
-/// file naming the same phase and orphaned write temps. Returns whether this
-/// call removed any file, so a caller can report only what it cleaned.
+/// Remove a phase's persisted state if present, with its orphaned write temps.
+/// Returns whether this call removed any file, so a caller can report only what
+/// it cleaned.
 ///
 /// Takes the write lock, so a removal never interleaves with an update. This blocks
 /// while the lock is held, for the same callers as [`update_state`].
@@ -791,18 +726,6 @@ fn clear_state_with_partial_result_impl(
             Err(error) => return (removed, Err(error.into())),
         }
     }
-    // A legacy single-slot file for this phase is the same state under its
-    // old name — clearing must not leave it behind to be re-migrated.
-    let legacy = legacy_state_path(project_root);
-    if let Ok(contents) = std::fs::read_to_string(&legacy)
-        && let Ok(state) = serde_json::from_str::<State>(&contents)
-        && state.phase == phase
-    {
-        match crate::durable::remove_durably(&legacy) {
-            Ok(was_removed) => removed |= was_removed,
-            Err(error) => return (removed, Err(error.into())),
-        }
-    }
     let temp_prefix = format!(
         ".{}.",
         path.file_name().unwrap_or_default().to_string_lossy()
@@ -839,11 +762,6 @@ fn clear_state_with_partial_result_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn migrate_legacy_state_warning_names_recovery_command() {
-        assert!(CORRUPT_LEGACY_STATE_HINT.contains("recover --clean"));
-    }
 
     #[test]
     fn ensure_devflow_dir_writes_star_gitignore() {
@@ -1845,20 +1763,6 @@ mod tests {
         assert!(!clear_state(dir.path(), PhaseId::new(1)).expect("clear again"));
     }
 
-    /// `clear_state` reports a legacy single-slot file it removes for the
-    /// phase, not only a per-phase file (48-REVIEW WR-03).
-    #[test]
-    fn clear_state_counts_a_legacy_file_it_removes() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), PhaseId::new(14), Stage::Code);
-        let legacy = legacy_state_path(dir.path());
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
-
-        assert!(clear_state(dir.path(), PhaseId::new(14)).expect("clear"));
-        assert!(!legacy.exists());
-    }
-
     #[test]
     fn clear_only_touches_its_own_phase() {
         let dir = tempfile::tempdir().unwrap();
@@ -2023,56 +1927,5 @@ mod tests {
 
         assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
         assert!(!state_path(root, phase).exists());
-    }
-
-    /// Upgrade path: a legacy single-slot `state.json` written by an older
-    /// binary must be readable after upgrading — migrated to its per-phase
-    /// name on first load/list, with the legacy file removed.
-    #[test]
-    fn legacy_state_json_migrates_on_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), PhaseId::new(9), Stage::Validate);
-        let legacy = legacy_state_path(dir.path());
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-        let loaded = load_state(dir.path(), PhaseId::new(9)).expect("legacy state must migrate");
-        assert_eq!(loaded.phase, PhaseId::new(9));
-        assert_eq!(loaded.stage, Stage::Validate);
-        assert!(!legacy.exists(), "legacy file must be gone after migration");
-        assert!(state_path(dir.path(), PhaseId::new(9)).exists());
-    }
-
-    #[test]
-    fn legacy_state_json_migrates_on_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), PhaseId::new(4), Stage::Code);
-        let legacy = legacy_state_path(dir.path());
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-        let states = list_states(dir.path());
-        assert_eq!(states.len(), 1);
-        assert_eq!(states[0].phase, PhaseId::new(4));
-        assert!(!legacy.exists());
-    }
-
-    #[test]
-    fn legacy_migration_never_overwrites_existing_per_phase_state() {
-        let dir = tempfile::tempdir().unwrap();
-        // Newer per-phase state at Ship...
-        save_state(&state_in(dir.path(), PhaseId::new(9), Stage::Ship)).unwrap();
-        // ...and a stale legacy file for the same phase still at Code.
-        let legacy = legacy_state_path(dir.path());
-        std::fs::write(
-            &legacy,
-            serde_json::to_string_pretty(&state_in(dir.path(), PhaseId::new(9), Stage::Code))
-                .unwrap(),
-        )
-        .unwrap();
-
-        let loaded = load_state(dir.path(), PhaseId::new(9)).unwrap();
-        assert_eq!(loaded.stage, Stage::Ship, "per-phase state must win");
-        assert!(!legacy.exists(), "stale legacy file must be dropped");
     }
 }
