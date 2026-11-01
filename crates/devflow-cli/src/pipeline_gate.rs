@@ -345,6 +345,56 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     Ok(())
 }
 
+// A gate wait is a plain call in a normal build. The test build routes it through
+// the wrapper below, the only path that can hold the write lock across a wait.
+#[cfg(not(test))]
+use crate::pipeline_launch::wait_for_gate_response as gate_wait_call;
+
+#[cfg(test)]
+thread_local! {
+    /// Set on a waiter thread to make its gate wait hold the state write lock
+    /// (V-12's control). See [`gate_wait_call`].
+    static WAIT_HOLDS_WRITE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Told once this thread is at its gate wait, after [`gate_wait_call`] has taken
+    /// whatever it holds, so a probe never reads the moment before.
+    static WAIT_ENTERED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The test build's route to a gate wait, and V-12's control (50.1-10): with
+/// [`WAIT_HOLDS_WRITE_LOCK`] set, the wait call runs inside a
+/// `workflow::update_state_with` closure, the waiter that holds the lock across
+/// its wait. `a_gate_wait_never_holds_the_write_lock` runs the same path both ways,
+/// which is what shows its probe can see a held lock. A release build has no such
+/// path. Every later rewrite of the wait (50.1-14) keeps this wrapper around its
+/// wait call.
+///
+/// The wait writes no state, so the variant cannot deadlock on its own lock; the
+/// commits before and after the wait stay outside it.
+#[cfg(test)]
+fn gate_wait_call(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    timeout_secs: u64,
+) -> GateWaitEnd {
+    let wait = || {
+        WAIT_ENTERED.with_borrow_mut(|entered| {
+            if let Some(entered) = entered.take() {
+                let _ = entered.send(());
+            }
+        });
+        crate::pipeline_launch::wait_for_gate_response(project_root, phase, stage, timeout_secs)
+    };
+    if WAIT_HOLDS_WRITE_LOCK.get() {
+        return workflow::update_state_with(project_root, phase, |_| {
+            Ok::<_, workflow::WorkflowError>((None, wait()))
+        })
+        .expect("the control's waiter takes the write lock");
+    }
+    wait()
+}
+
 /// Write a gate file and block (in the detached monitor) until a response or
 /// the long poll timeout. Acks the response so the Hermes poller can clean up.
 pub(crate) fn run_gate(
@@ -457,12 +507,7 @@ pub(crate) fn run_gate_with_timeout(
             Err(err) => return Err(err.into()),
         }
     }
-    match crate::pipeline_launch::wait_for_gate_response(
-        project_root,
-        state.phase,
-        stage,
-        timeout_secs,
-    ) {
+    match gate_wait_call(project_root, state.phase, stage, timeout_secs) {
         GateWaitEnd::Answered(response) => {
             state.gate_pending = false;
             // WR-10 (49-REVIEW.md): the operator may have edited the run's
@@ -1941,6 +1986,136 @@ mod tests {
                 .as_deref(),
             Some(": edited"),
             "the resolution save must not overwrite the on-disk edit"
+        );
+    }
+
+    /// Runs one waiter on a saved state and answers its gate after `during_wait`.
+    /// Returns what `during_wait` returned, once the waiter has finished.
+    fn with_a_waiter_at_its_gate<T>(
+        root: &Path,
+        phase: PhaseId,
+        hold_across_wait: bool,
+        during_wait: impl FnOnce() -> T,
+    ) -> T {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let root_owned = root.to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            WAIT_HOLDS_WRITE_LOCK.set(hold_across_wait);
+            WAIT_ENTERED.set(Some(entered_tx));
+            let mut state = workflow::load_state(&root_owned, phase).unwrap();
+            run_gate_with_timeout(&root_owned, &mut state, Stage::Code, "ctx", 30, None).map(|_| ())
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the waiter reaches its gate wait");
+        assert!(
+            Gates::gate_path(root, phase, Stage::Code).exists(),
+            "the gate is open while the waiter waits"
+        );
+
+        let seen = during_wait();
+        assert!(
+            !waiter.is_finished(),
+            "what ran during the wait ran with the waiter still inside it"
+        );
+
+        Gates::respond(
+            root,
+            phase,
+            Stage::Code,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        waiter.join().unwrap().unwrap();
+        seen
+    }
+
+    /// D-08's lost update (V-13): a `stop` written while a gate waits survives the
+    /// write the waiter makes after its wait, because that write re-reads the state
+    /// and sets only `gate_pending`.
+    #[test]
+    fn a_stop_written_during_a_gate_wait_survives_the_waiters_write() {
+        const STOP_REASON: &str = "stopped via `devflow stop`";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(86);
+
+        with_a_waiter_at_its_gate(root, phase, false, || {
+            workflow::update_state(root, phase, |state| {
+                state.stopped = true;
+                state.stop_reason = Some(STOP_REASON.to_string());
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+        });
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert!(after.stopped, "the stop survives the waiter's write");
+        assert_eq!(after.stop_reason.as_deref(), Some(STOP_REASON));
+        assert!(!after.gate_pending, "the waiter's own write landed");
+    }
+
+    /// Three write-lock probes, 100 ms apart, taken while a waiter is inside its gate
+    /// wait. `true` means free. `hold_across_wait` selects V-12's control.
+    fn in_wait_write_lock_probes(hold_across_wait: bool) -> Vec<bool> {
+        const PROBES: usize = 3;
+        const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(87);
+        with_a_waiter_at_its_gate(root, phase, hold_across_wait, || {
+            (0..PROBES)
+                .map(|probe| {
+                    if probe > 0 {
+                        std::thread::sleep(PROBE_INTERVAL);
+                    }
+                    workflow::write_lock_is_free(root, phase)
+                })
+                .collect()
+        })
+    }
+
+    /// The assertion V-12 makes, kept apart so its control can show it fails.
+    fn no_probe_saw_the_lock_held(probes: &[bool]) -> Result<(), String> {
+        if probes.iter().all(|free| *free) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the write lock read held during a gate wait: {probes:?}"
+            ))
+        }
+    }
+
+    /// Criterion 3 (V-12): no gate wait holds the write lock, so a `stop` or a
+    /// `gate respond` is never blocked for the length of a wait. The control runs the
+    /// same waiter with the wait call inside an `update_state_with` closure, and the
+    /// same probes then read held, so the check the production path passes fails on
+    /// a waiter that holds the lock.
+    #[test]
+    fn a_gate_wait_never_holds_the_write_lock() {
+        let production = in_wait_write_lock_probes(false);
+        println!("production in-wait probes (true = free): {production:?}");
+        assert_eq!(no_probe_saw_the_lock_held(&production), Ok(()));
+
+        let control = in_wait_write_lock_probes(true);
+        println!("control in-wait probes (true = free): {control:?}");
+        assert_eq!(
+            control,
+            vec![false, false, false],
+            "control: every probe sees the lock the waiter holds"
+        );
+        assert!(
+            no_probe_saw_the_lock_held(&control).is_err(),
+            "control: the check fails on a waiter that holds the lock"
         );
     }
 }
