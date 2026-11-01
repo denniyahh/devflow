@@ -2002,6 +2002,29 @@ mod tests {
         assert_eq!(states[0].phase, PhaseId::new(5));
     }
 
+    /// Phase 50 D-20: a `state.json` left by an old binary is not state. Every read
+    /// and the phase's clear ignore it, and the file stays exactly as it was.
+    #[test]
+    fn a_legacy_state_json_is_neither_read_nor_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(7);
+        let legacy = devflow_dir(root).join("state.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&state_in(root, phase, Stage::Code)).unwrap();
+        std::fs::write(&legacy, &bytes).unwrap();
+
+        assert!(matches!(
+            load_state(root, phase),
+            Err(WorkflowError::MissingState(_))
+        ));
+        assert!(list_states(root).is_empty());
+        assert!(!clear_state(root, phase).expect("clear"));
+
+        assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+        assert!(!state_path(root, phase).exists());
+    }
+
     /// Upgrade path: a legacy single-slot `state.json` written by an older
     /// binary must be readable after upgrading — migrated to its per-phase
     /// name on first load/list, with the legacy file removed.

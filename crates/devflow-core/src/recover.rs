@@ -860,6 +860,38 @@ mod tests {
         );
     }
 
+    /// Phase 50 D-20: neither clean touches a `state.json` left by an old binary,
+    /// parsable or not, and neither counts it as something cleaned. The parsable one
+    /// is stale, so a clean that read it as this phase's state would clear it.
+    #[test]
+    fn clean_leaves_a_legacy_state_json_alone() {
+        let phase = PhaseId::new(7);
+        let parsable = serde_json::to_vec(&state_aged_phase(
+            Path::new("/representative-project"),
+            phase,
+            STALE_THRESHOLD.as_secs() + 60,
+            None,
+        ))
+        .unwrap();
+        for bytes in [b"{\"stage\":".to_vec(), parsable] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let legacy = root.join(".devflow/state.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, &bytes).unwrap();
+
+            let swept = clean_report(root).expect("sweep");
+            assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+            assert!(swept.cleared.is_empty());
+            assert!(!swept.removal_failed, "{:?}", swept.warnings);
+
+            let explicit = clean_phase_report(root, phase).expect("explicit clean");
+            assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+            assert!(!explicit.removed_anything);
+            assert!(!workflow::state_path(root, phase).exists());
+        }
+    }
+
     /// 14-CR-01: explicit `--phase` cleanup clears exactly that phase, even
     /// when it is fresh, and leaves siblings alone.
     #[test]
