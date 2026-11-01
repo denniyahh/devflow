@@ -65,6 +65,7 @@ pub mod git;
 pub mod gsd_config;
 pub mod history;
 pub mod hooks;
+pub mod liveness;
 pub mod lock;
 pub mod mode;
 pub mod monitor;
