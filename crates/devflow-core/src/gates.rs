@@ -832,6 +832,31 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_write_publish_and_cleanup_fsync_the_gates_directory() {
+        use crate::durable::{Synced, take_synced};
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(48);
+        let stage = Stage::Code;
+        let gates_dir = Synced::Dir(Gates::dir(dir.path()));
+        let response = Gates::response_path(dir.path(), phase, stage);
+
+        Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+        let synced = take_synced();
+        assert!(synced.contains(&gates_dir), "write_gate: {synced:?}");
+
+        publish_response_exclusive(&response, "{}", phase, stage).unwrap();
+        let synced = take_synced();
+        assert!(synced.contains(&gates_dir), "publish: {synced:?}");
+
+        assert!(Gates::cleanup(dir.path(), phase, stage).unwrap());
+        assert_eq!(
+            take_synced(),
+            [gates_dir.clone(), gates_dir],
+            "one directory fsync per removed file: the gate and the response"
+        );
+    }
+
+    #[test]
     fn second_publisher_past_the_existence_check_gets_already_responded() {
         let dir = tempfile::tempdir().unwrap();
         let phase = PhaseId::new(48);

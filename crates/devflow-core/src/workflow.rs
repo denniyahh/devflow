@@ -559,6 +559,110 @@ mod tests {
     }
 
     #[test]
+    fn clear_state_removes_durably() {
+        use crate::durable::{Synced, take_synced};
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path(), PhaseId::new(1), Stage::Validate);
+        save_state(&state).expect("save");
+        take_synced();
+
+        assert!(clear_state(dir.path(), PhaseId::new(1)).expect("clear"));
+
+        assert!(!state_path(dir.path(), PhaseId::new(1)).exists());
+        let synced = take_synced();
+        assert!(
+            synced.contains(&Synced::Dir(dir.path().join(".devflow"))),
+            "clearing must fsync .devflow after the unlink, recorded: {synced:?}"
+        );
+    }
+
+    fn sorted_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn ensure_devflow_dir_steady_state_creates_no_temp_and_fsyncs_only_the_parent() {
+        use crate::durable::{Publication, Synced, publish_exclusive_durably, take_synced};
+        let root = tempfile::tempdir().unwrap();
+        let devflow = root.path().join(".devflow");
+        let gitignore = devflow.join(".gitignore");
+
+        ensure_devflow_dir(&devflow).expect("first call");
+        assert!(take_synced().contains(&Synced::Dir(root.path().to_path_buf())));
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "*\n");
+
+        let before = sorted_entries(&devflow);
+        ensure_devflow_dir(&devflow).expect("second call");
+        assert_eq!(take_synced(), [Synced::Dir(root.path().to_path_buf())]);
+        assert_eq!(sorted_entries(&devflow), before, "no temp and no new entry");
+
+        // Control: the exclusive publish on the existing marker syncs a temp on
+        // every call, so the recorder would see one if the routing ever used it.
+        assert_eq!(
+            publish_exclusive_durably(&gitignore, b"*\n").unwrap(),
+            Publication::AlreadyExists
+        );
+        let synced = take_synced();
+        assert!(
+            synced.iter().any(|entry| matches!(
+                entry,
+                Synced::File(temp) if {
+                    let name = temp.file_name().unwrap().to_string_lossy();
+                    name.starts_with(".gitignore.") && name.ends_with(".tmp")
+                }
+            )),
+            "the publish syncs a temp: {synced:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_devflow_dir_syncs_the_devflow_entry_for_a_nested_dir() {
+        use crate::durable::{Synced, take_synced};
+        let root = tempfile::tempdir().unwrap();
+        let devflow = root.path().join(".devflow");
+        std::fs::create_dir(&devflow).unwrap();
+
+        ensure_devflow_dir(&devflow.join("gates")).expect("nested call");
+
+        let synced = take_synced();
+        let count = |wanted: &Synced| synced.iter().filter(|entry| *entry == wanted).count();
+        assert_eq!(
+            count(&Synced::Dir(root.path().to_path_buf())),
+            1,
+            "the .devflow entry: {synced:?}"
+        );
+        assert_eq!(
+            count(&Synced::Dir(devflow.clone())),
+            1,
+            "the gates entry: {synced:?}"
+        );
+        assert!(
+            !synced.iter().any(|entry| matches!(entry, Synced::File(_))),
+            "no file fsync: {synced:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_devflow_dir_recreates_a_deleted_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let devflow = root.path().join(".devflow");
+        ensure_devflow_dir(&devflow).expect("first call");
+        std::fs::remove_file(devflow.join(".gitignore")).unwrap();
+
+        ensure_devflow_dir(&devflow).expect("second call");
+
+        assert_eq!(
+            std::fs::read_to_string(devflow.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
+    #[test]
     fn save_state_is_written_through_the_durable_replace() {
         use crate::durable::{Synced, take_synced};
         let dir = tempfile::tempdir().unwrap();
