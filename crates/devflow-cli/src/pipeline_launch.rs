@@ -533,8 +533,8 @@ where
             // — the `session_id_from_capture` idiom. A refusal that did not
             // record what it found would re-run the guard on the next launch
             // and lose the evidence of what was verified when.
-            state.canary = Some(outcome.clone());
-            workflow::save_state(state)?;
+            let recorded = outcome.clone();
+            commit(state, |s| s.canary = Some(recorded))?;
             emit_canary_outcome(state, &outcome);
             outcome
         }
@@ -583,8 +583,7 @@ where
 /// wrong problem entirely. With no record, the run reads not launched, and the
 /// right remedy is the message below.
 fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
-    state.supervisor = None;
-    workflow::save_state(state)?;
+    commit(state, |s| s.supervisor = None)?;
     Err(CliError::Message(message))
 }
 
@@ -1498,20 +1497,30 @@ fn record_supervisor_stop(project_root: &Path, phase: PhaseId, launch_id: &str) 
         Ok(guard) => guard,
         Err(err) => return not_recorded(&format!("the per-phase lock was not acquired ({err})")),
     };
-    let mut state = match workflow::load_state(project_root, phase) {
-        Ok(state) if names_this_launch(&state) => state,
-        Ok(_) => {
+    // Bounded like the lock wait above (T-50-68): a wedged write-lock holder must
+    // not keep this supervisor from reaching `finish`.
+    let written =
+        workflow::update_state_with_within(project_root, phase, SUPERVISOR_STOP_WAIT, |existing| {
+            match existing {
+                workflow::Existing::Loaded(mut state) if names_this_launch(&state) => {
+                    state.stopped = true;
+                    state.stop_reason = Some(SUPERVISOR_STOP_REASON.to_string());
+                    Ok((Some(state), true))
+                }
+                workflow::Existing::Loaded(_) => Ok((None, false)),
+                workflow::Existing::Missing => {
+                    Err(workflow::WorkflowError::MissingState(path.clone()))
+                }
+                workflow::Existing::Unloadable(err) => Err(err),
+            }
+        });
+    match written {
+        Ok(true) => info!("phase {phase}: {SUPERVISOR_STOP_REASON}"),
+        Ok(false) => {
             info!("phase {phase}: launch {launch_id} was superseded before its stop was recorded");
-            return;
         }
-        Err(err) => return not_recorded(&format!("the state does not load ({err})")),
-    };
-    state.stopped = true;
-    state.stop_reason = Some(SUPERVISOR_STOP_REASON.to_string());
-    if let Err(err) = workflow::save_state(&state) {
-        return not_recorded(&format!("the save failed ({err})"));
+        Err(err) => not_recorded(&format!("the state was not updated ({err})")),
     }
-    info!("phase {phase}: {SUPERVISOR_STOP_REASON}");
 }
 
 /// How long the supervise-only entry waits for its launcher's record.
@@ -1620,9 +1629,7 @@ pub(crate) fn launch_context() -> Result<monitor::LaunchContext, CliError> {
 /// Called only on a failure path, never before the save that records a new
 /// record (50-13's rule).
 fn record_failed_launch(state: &mut State) -> Result<(), CliError> {
-    state.supervisor = None;
-    workflow::save_state(state)?;
-    Ok(())
+    commit(state, |s| s.supervisor = None)
 }
 
 /// The tail of [`launch_stage_inner`]: validate the agent binary, archive
@@ -1649,7 +1656,18 @@ fn spawn_agent_and_record(
     // anything is spawned, as this save always has. It once also cleared
     // the previous stage's monitor pid (WR-04, 18-fix); that field is gone
     // from the CLI (50-22), and the record keeps its own rule below.
-    workflow::save_state(state)?;
+    let checkpoint_resumes = state.checkpoint_resumes;
+    let verification_run_nonce = state.verification_run_nonce;
+    let last_verification_fingerprint = state.last_verification_fingerprint;
+    let last_verification_mtime_nanos = state.last_verification_mtime_nanos;
+    let verification_baseline_captured = state.verification_baseline_captured;
+    commit(state, |s| {
+        s.checkpoint_resumes = checkpoint_resumes;
+        s.verification_run_nonce = verification_run_nonce;
+        s.last_verification_fingerprint = last_verification_fingerprint;
+        s.last_verification_mtime_nanos = last_verification_mtime_nanos;
+        s.verification_baseline_captured = verification_baseline_captured;
+    })?;
 
     // WR-04 (18-fix, 50-23 T-50-62): every error before the publish save
     // ends the launch with no supervisor record (see `record_failed_launch`),
@@ -1677,10 +1695,10 @@ fn spawn_agent_and_record(
     let pid = published.supervisor_pid;
     let socket_path = published.record.socket_path.display().to_string();
     let launch_id = published.record.launch_id.clone();
-    // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
-    // record held only in memory here is lost unless it is written again
-    // (18b). The ping-confirmed supervisor record replaces any previous one
-    // in this same save; it is never cleared first.
+    // `transition()` commits BEFORE `launch_stage`, so a record held only in
+    // memory here is lost unless it is written again (18b). The ping-confirmed
+    // supervisor record replaces any previous one in this same save; it is never
+    // cleared first.
     //
     // The handoff (50-13, R-1): this save is the publish. The previous
     // supervisor, when this launch is its advance, stays alive and
@@ -1808,9 +1826,19 @@ fn publish_record<E: Into<CliError>>(
     Ok(PublishOutcome::SuccessorAlreadyEnded)
 }
 
-/// [`publish_record`]'s production save.
+/// [`publish_record`]'s production save: the record and, once `publish_record` has
+/// set one, its stop. It only ever sets `stopped`: a `stop` another writer landed
+/// while this launch ran is on disk and is not this launcher's to clear.
 fn save_publish_fields(published: &State) -> Result<(), workflow::WorkflowError> {
-    workflow::save_state(published)
+    workflow::update_state(&published.project_root, published.phase, |s| {
+        s.supervisor = published.supervisor.clone();
+        if published.stopped {
+            s.stopped = true;
+            s.stop_reason = published.stop_reason.clone();
+        }
+        Ok::<(), workflow::WorkflowError>(())
+    })
+    .map(|_| ())
 }
 
 /// After a failed publish save (`save_err`): ask the unrecorded supervisor

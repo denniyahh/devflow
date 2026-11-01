@@ -66,17 +66,18 @@ pub(crate) fn transition(
     // `launch_stage` — no new monitor is spawned, and `loop_back_to_code`
     // (a retry, not an advance) is untouched by this check.
     if state.stop_until == Some(from) {
-        state.stopped = true;
-        state.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
-        // T-20-03b / doctor gap (D-09): clear the supervisor record and
-        // gate_pending so neither check_dead_agent nor check_dead_monitor
-        // misreports this intentional stop as a crashed agent or dead
-        // monitor (50-13): the supervisor running this advance finishes once
-        // it returns, so the record would otherwise name a socket that is
-        // gone.
-        state.supervisor = None;
-        state.gate_pending = false;
-        workflow::save_state(state)?;
+        commit(state, |s| {
+            s.stopped = true;
+            s.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
+            // T-20-03b / doctor gap (D-09): clear the supervisor record and
+            // gate_pending so neither check_dead_agent nor check_dead_monitor
+            // misreports this intentional stop as a crashed agent or dead
+            // monitor (50-13): the supervisor running this advance finishes
+            // once it returns, so the record would otherwise name a socket
+            // that is gone.
+            s.supervisor = None;
+            s.gate_pending = false;
+        })?;
         events::emit(
             project_root,
             state.phase,
@@ -95,13 +96,14 @@ pub(crate) fn transition(
         &hooks::hooks_for_transition(from, to),
         to,
     );
-    state.stage = to;
-    if mode::transition_resets_consecutive_failures(from, to) {
-        state.consecutive_failures = 0;
-    }
-    state.infra_failures = 0;
-    state.gate_pending = false;
-    workflow::save_state(state)?;
+    commit(state, |s| {
+        s.stage = to;
+        if mode::transition_resets_consecutive_failures(from, to) {
+            s.consecutive_failures = 0;
+        }
+        s.infra_failures = 0;
+        s.gate_pending = false;
+    })?;
     events::emit(
         project_root,
         state.phase,
@@ -179,9 +181,17 @@ pub(crate) fn prepare_loop_back_to_code(
     // later gate for the same phase+stage).
     let gate_stage = state.stage;
     let _ = Gates::cleanup(project_root, state.phase, gate_stage);
-    state.stage = Stage::Code;
-    state.gate_pending = false;
-    workflow::save_state(state)?;
+    // F-11 (`select_loop_back_fix`): this is the write that persists the
+    // verification observation that function records in the caller's copy, one
+    // write per loop-back. Nothing else writes those two fields during an advance.
+    let observed_fingerprint = state.last_verification_fingerprint;
+    let observed_mtime_nanos = state.last_verification_mtime_nanos;
+    commit(state, |s| {
+        s.stage = Stage::Code;
+        s.gate_pending = false;
+        s.last_verification_fingerprint = observed_fingerprint;
+        s.last_verification_mtime_nanos = observed_mtime_nanos;
+    })?;
     events::emit(
         project_root,
         state.phase,
