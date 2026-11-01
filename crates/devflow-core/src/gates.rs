@@ -591,15 +591,15 @@ impl Gates {
         timeout_secs: u64,
         cancel: impl Fn() -> bool,
     ) -> AwaitOutcome {
-        let end = backoff_wait(
-            Duration::from_secs(timeout_secs),
-            cancel,
-            || match Self::read_answer(project_root, phase, stage, gate) {
+        let end = backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
+            #[cfg(test)]
+            SLOT_READS.with(|reads| reads.set(reads.get() + 1));
+            match Self::read_answer(project_root, phase, stage, gate) {
                 AnswerRead::None => None,
                 AnswerRead::Bound(answer) => Some(AwaitOutcome::Answered(answer)),
                 AnswerRead::Unbound(reason) => Some(AwaitOutcome::Unbound { reason }),
-            },
-        );
+            }
+        });
         match end {
             WaitEnd::Found(outcome) => outcome,
             WaitEnd::TimedOut => AwaitOutcome::TimedOut,
@@ -1383,6 +1383,12 @@ impl Gates {
         }
         (removed, Ok(()))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread's [`Gates::await_answer`] read its slot.
+    static SLOT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// How [`backoff_wait`] ended.
@@ -4261,6 +4267,176 @@ mod tests {
             WaiterStatus::Absent,
             "a waiter that died at its gate"
         );
+    }
+
+    // ---- D-13 items 4 and 7, R-09: the wait backs off, cancels first, moves nothing ----
+
+    /// Reads at 0 s, 1 s and 3 s, the next one due at 7 s, with `cancel` honoured at
+    /// the next whole slice after 4.5 s.
+    #[test]
+    fn await_answer_backs_off_between_reads_and_still_cancels_within_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = GateId::new();
+        SLOT_READS.with(|reads| reads.set(0));
+        let started = std::time::Instant::now();
+
+        let outcome = Gates::await_answer(dir.path(), phase, stage, &gate, 60, || {
+            started.elapsed() >= std::time::Duration::from_millis(4500)
+        });
+
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, AwaitOutcome::Cancelled);
+        assert_eq!(SLOT_READS.with(std::cell::Cell::get), 3);
+        assert!(
+            elapsed <= std::time::Duration::from_millis(5600),
+            "cancelled {elapsed:?} in, more than a second after the cancel"
+        );
+    }
+
+    /// A stop accepted in the same second as an answer wins (D-13 item 7).
+    #[test]
+    fn await_answer_checks_cancellation_before_reading_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
+        let body = std::fs::read(&slot).unwrap();
+
+        let outcome = Gates::await_answer(dir.path(), phase, stage, &gate, 30, || true);
+
+        assert_eq!(outcome, AwaitOutcome::Cancelled);
+        assert_eq!(
+            std::fs::read(&slot).unwrap(),
+            body,
+            "the answer is untouched"
+        );
+    }
+
+    /// The deadline is a read boundary too: an answer that lands in the last backoff
+    /// interval is an answer, not a timeout.
+    #[test]
+    fn await_answer_reads_once_more_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let root = dir.path().to_path_buf();
+        let answered = gate.clone();
+        // Past the read at 1 s and before the deadline at 2 s; the next backoff
+        // boundary would be 3 s.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1400));
+            Gates::answer(&root, phase, stage, &answered, &approved()).unwrap();
+        });
+
+        let outcome = Gates::await_answer(dir.path(), phase, stage, &gate, 2, || false);
+
+        writer.join().unwrap();
+        assert_eq!(
+            outcome,
+            AwaitOutcome::Answered(GateAnswer {
+                gate_id: gate.to_string(),
+                response: approved(),
+            })
+        );
+
+        let silent = GateId::new();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            Gates::await_answer(dir.path(), phase, stage, &silent, 0, || false),
+            AwaitOutcome::TimedOut,
+            "a zero timeout still ends"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// Every file under `root`'s gates directory, name and bytes.
+    fn gates_dir_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(Gates::dir(root))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// R-09: a waiter that outlives its gate, a superseded supervisor among them, can
+    /// never move the current gate's files.
+    #[test]
+    fn a_waiter_whose_gate_was_replaced_never_touches_another_gates_files() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        const MORE_READS_SEEN: u32 = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+            .unwrap()
+            .gate_id;
+        let registration = Gates::register_waiter(dir.path(), phase, stage, &first).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reads_seen = std::sync::Arc::new(AtomicU32::new(0));
+        let waiter = {
+            let (root, first) = (dir.path().to_path_buf(), first.clone());
+            let (stop, reads_seen) = (stop.clone(), reads_seen.clone());
+            std::thread::spawn(move || {
+                Gates::await_answer(&root, phase, stage, &first, 30, || {
+                    reads_seen.store(SLOT_READS.with(std::cell::Cell::get), Ordering::SeqCst);
+                    stop.load(Ordering::SeqCst)
+                })
+            })
+        };
+
+        let current = Gates::open_gate(dir.path(), phase, stage, "second")
+            .unwrap()
+            .gate_id;
+        Gates::answer(dir.path(), phase, stage, &current, &approved()).unwrap();
+        std::fs::write(
+            Gates::response_path(dir.path(), phase, stage),
+            serde_json::to_string(&approved()).unwrap(),
+        )
+        .unwrap();
+        let third = GateId::new();
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &third),
+            serde_json::to_string(&GateAnswer {
+                gate_id: third.to_string(),
+                response: approved(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot = gates_dir_snapshot(dir.path());
+        let quarantined_before = events_named(dir.path(), "gate_answer_quarantined").len();
+        let taken_at = std::time::Instant::now();
+        let reads_then = reads_seen.load(Ordering::SeqCst);
+
+        // `cancel` publishes the count before each read, so it lags by one read: three
+        // more seen means at least two more made after the snapshot.
+        while reads_seen.load(Ordering::SeqCst) < reads_then + MORE_READS_SEEN
+            || taken_at.elapsed() < std::time::Duration::from_millis(3500)
+        {
+            assert!(
+                taken_at.elapsed() < std::time::Duration::from_secs(20),
+                "the waiter stopped reading"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert_eq!(gates_dir_snapshot(dir.path()), snapshot);
+        assert_eq!(
+            events_named(dir.path(), "gate_answer_quarantined").len(),
+            quarantined_before
+        );
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(waiter.join().unwrap(), AwaitOutcome::Cancelled);
+        registration.finish();
     }
 
     /// What an operator reads must say what happened and where to look next.
