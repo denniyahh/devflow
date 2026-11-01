@@ -4445,6 +4445,303 @@ mod tests {
         registration.finish();
     }
 
+    // ---- The test-only pre-answer, and the unkeyed bridge ----
+
+    #[test]
+    fn a_preanswer_is_published_for_the_gate_that_opens_next() {
+        const PREANSWER_NAME: &str = "07-code.preanswer.json";
+        use crate::test_support::preanswer_gate;
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let bound = |gate: &GateId| GateAnswer {
+            gate_id: gate.to_string(),
+            response: rejection(),
+        };
+
+        let opened = tempfile::tempdir().unwrap();
+        preanswer_gate(opened.path(), phase, stage, &rejection());
+        let gate = Gates::open_gate(opened.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        assert_eq!(
+            Gates::read_answer(opened.path(), phase, stage, &gate),
+            AnswerRead::Bound(bound(&gate))
+        );
+        assert!(!Gates::dir(opened.path()).join(PREANSWER_NAME).exists());
+
+        let registered = tempfile::tempdir().unwrap();
+        preanswer_gate(registered.path(), phase, stage, &rejection());
+        let (opened_gate, registration) =
+            Gates::open_registered(registered.path(), phase, stage, "ctx").unwrap();
+        assert_eq!(
+            Gates::await_answer(
+                registered.path(),
+                phase,
+                stage,
+                &opened_gate.gate_id,
+                5,
+                || false
+            ),
+            AwaitOutcome::Answered(bound(&opened_gate.gate_id))
+        );
+        registration.finish();
+
+        let unkeyed = tempfile::tempdir().unwrap();
+        preanswer_gate(unkeyed.path(), phase, stage, &rejection());
+        Gates::write_gate(unkeyed.path(), phase, stage, "ctx").unwrap();
+        assert_eq!(
+            Gates::poll_response(unkeyed.path(), phase, stage, 5),
+            Some(rejection())
+        );
+
+        // The control: a pre-answer for another stage decides nothing here.
+        let elsewhere = tempfile::tempdir().unwrap();
+        preanswer_gate(elsewhere.path(), phase, Stage::Validate, &rejection());
+        let gate = Gates::open_gate(elsewhere.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        assert_eq!(
+            Gates::read_answer(elsewhere.path(), phase, stage, &gate),
+            AnswerRead::None
+        );
+        assert!(
+            Gates::dir(elsewhere.path())
+                .join("07-validate.preanswer.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn the_unkeyed_poll_also_reads_the_live_gates_keyed_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+
+        // The control: another gate's answer in its own slot is not this gate's.
+        let other = GateId::new();
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &other),
+            serde_json::to_string(&GateAnswer {
+                gate_id: other.to_string(),
+                response: rejection(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(Gates::poll_response(dir.path(), phase, stage, 0), None);
+
+        let live = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
+        Gates::answer(dir.path(), phase, stage, &live, &approved()).unwrap();
+        assert_eq!(
+            Gates::poll_response(dir.path(), phase, stage, 1),
+            Some(approved())
+        );
+        assert_eq!(
+            Gates::poll_response_cancellable(dir.path(), phase, stage, 1, || false),
+            Some(approved())
+        );
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &live),
+            AnswerRead::Bound(GateAnswer {
+                gate_id: live.to_string(),
+                response: approved(),
+            }),
+            "the polls only read"
+        );
+    }
+
+    /// Own process: the dropped registration's lock must read released.
+    #[test]
+    fn the_unkeyed_cleanup_also_removes_the_stages_keyed_files() {
+        in_own_process(
+            "gates::tests::the_unkeyed_cleanup_also_removes_the_stages_keyed_files",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let (phase, stage) = (PhaseId::new(7), Stage::Code);
+                Gates::write_gate(dir.path(), phase, stage, "ctx").unwrap();
+                let live = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
+                Gates::answer(dir.path(), phase, stage, &live, &approved()).unwrap();
+                assert_eq!(
+                    Gates::claim(dir.path(), phase, stage, &live).unwrap(),
+                    Claim::Claimed
+                );
+                drop(Gates::register_waiter(dir.path(), phase, stage, &live).unwrap());
+                let held = GateId::new();
+                let registration = Gates::register_waiter(dir.path(), phase, stage, &held).unwrap();
+                let set_aside = Gates::dir(dir.path()).join(format!(
+                    "07-code.noid.1.{}.0.quarantined.json",
+                    std::process::id()
+                ));
+                std::fs::write(&set_aside, "{}").unwrap();
+
+                assert!(Gates::cleanup(dir.path(), phase, stage).unwrap());
+
+                assert_eq!(
+                    crate::test_support::gate_answer_files(dir.path(), phase, stage),
+                    Vec::<PathBuf>::new()
+                );
+                assert!(!Gates::claim_path(dir.path(), phase, stage, &live).exists());
+                assert!(!Gates::waiter_path(dir.path(), phase, stage, &live).exists());
+                assert_eq!(
+                    Gates::waiter_status(dir.path(), phase, stage, &held).unwrap(),
+                    WaiterStatus::Live,
+                    "R-06: a live registration is its owner's to remove"
+                );
+                assert!(
+                    Gates::waiter_path(dir.path(), phase, stage, &held).exists(),
+                    "R-06: a live registration stays"
+                );
+                assert!(set_aside.exists(), "a set-aside answer is never removed");
+                registration.finish();
+            },
+        );
+    }
+
+    const PREANSWER_SEAM_NOT_FOUND: &str =
+        "no gated fn consume_preanswer( or no gated item naming preanswer.json";
+    const TEST_BUILD_ONLY: &str = "#[cfg(any(test, feature = \"test-support\"))]";
+    const RELEASE_BUILD_ONLY: &str = "#[cfg(not(any(test, feature = \"test-support\")))]";
+
+    /// Each line of `source` before the first line that is exactly `mod tests {`,
+    /// numbered from 1, without its whole-line `//` comments.
+    fn numbered_non_test_lines(source: &str) -> Vec<(usize, &str)> {
+        source
+            .lines()
+            .enumerate()
+            .take_while(|(_, line)| *line != "mod tests {")
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .map(|(index, line)| (index + 1, line))
+            .collect()
+    }
+
+    /// Where a gated item ends: the first later line that is the header's indent
+    /// followed by `}`, or the header itself when it is a whole item.
+    fn gated_item_end(lines: &[(usize, &str)], header: usize) -> usize {
+        let text = lines[header].1;
+        if text.ends_with('}') || text.ends_with(';') {
+            return header;
+        }
+        let indent = &text[..text.len() - text.trim_start().len()];
+        let closing = format!("{indent}}}");
+        lines[header + 1..]
+            .iter()
+            .position(|(_, line)| *line == closing)
+            .map_or(lines.len() - 1, |offset| header + 1 + offset)
+    }
+
+    /// T-50.1-30 as a pure scan: every line naming the pre-answer sits inside an item
+    /// gated to test builds, and a gated `consume_preanswer` exists. Each violation is
+    /// `line {n}: {trimmed line}`, then [`PREANSWER_SEAM_NOT_FOUND`].
+    fn preanswer_seam_violations(source: &str) -> Vec<String> {
+        let lines = numbered_non_test_lines(source);
+        let under =
+            |attribute: &str, index: usize| index > 0 && lines[index - 1].1.trim() == attribute;
+        let mut gated = vec![false; lines.len()];
+        for index in 0..lines.len() {
+            if under(TEST_BUILD_ONLY, index) {
+                gated[index..=gated_item_end(&lines, index)].fill(true);
+            }
+        }
+        let mut violations = Vec::new();
+        for (index, (number, line)) in lines.iter().enumerate() {
+            let names_seam = line.contains("preanswer.json") || line.contains("preanswer_path(");
+            let bad_path_header =
+                line.contains("fn preanswer_path(") && !under(TEST_BUILD_ONLY, index);
+            let bad_consume_header = line.contains("fn consume_preanswer(")
+                && !under(TEST_BUILD_ONLY, index)
+                && !under(RELEASE_BUILD_ONLY, index);
+            if (names_seam && !gated[index]) || bad_path_header || bad_consume_header {
+                violations.push(format!("line {number}: {}", line.trim()));
+            }
+        }
+        let gated_consume = (0..lines.len()).any(|index| {
+            under(TEST_BUILD_ONLY, index) && lines[index].1.contains("fn consume_preanswer(")
+        });
+        let gated_name =
+            (0..lines.len()).any(|index| gated[index] && lines[index].1.contains("preanswer.json"));
+        if !gated_consume || !gated_name {
+            violations.push(PREANSWER_SEAM_NOT_FOUND.to_string());
+        }
+        violations
+    }
+
+    /// T-50.1-30. Limit: this reads `gates.rs` only, where the seam lives. A reader in
+    /// another file, or one that builds the name without the `preanswer.json` literal,
+    /// is not seen, and the answer-publish hook slot is not scanned.
+    #[test]
+    fn the_preanswer_seam_is_compiled_only_in_test_builds() {
+        let source = include_str!("gates.rs");
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "the scan would read its own plants"
+        );
+        assert_eq!(preanswer_seam_violations(source), Vec::<String>::new());
+
+        let good = [
+            "impl Gates {",
+            "    #[cfg(any(test, feature = \"test-support\"))]",
+            "    pub fn preanswer_path(root: &Path) -> PathBuf {",
+            "        root.join(\"07-code.preanswer.json\")",
+            "    }",
+            "}",
+            "#[cfg(any(test, feature = \"test-support\"))]",
+            "fn consume_preanswer(root: &Path) {",
+            "    let _path = Gates::preanswer_path(root);",
+            "}",
+            "#[cfg(not(any(test, feature = \"test-support\")))]",
+            "fn consume_preanswer(_root: &Path) {}",
+            "fn open_gate_as(root: &Path) {",
+            "    consume_preanswer(root);",
+            "}",
+        ];
+        assert_eq!(good.len(), 15);
+        assert_eq!(
+            preanswer_seam_violations(&good.join("\n")),
+            Vec::<String>::new()
+        );
+
+        let mut ungated_copy = good.to_vec();
+        ungated_copy.remove(6);
+        assert_eq!(
+            preanswer_seam_violations(&ungated_copy.join("\n")),
+            [
+                "line 7: fn consume_preanswer(root: &Path) {",
+                "line 8: let _path = Gates::preanswer_path(root);",
+                PREANSWER_SEAM_NOT_FOUND,
+            ]
+        );
+
+        let mut ungated_reader = good.to_vec();
+        ungated_reader.extend([
+            "fn read_preanswer(root: &Path) -> Option<String> {",
+            "    std::fs::read_to_string(root.join(\"07-code.preanswer.json\")).ok()",
+            "}",
+        ]);
+        assert_eq!(
+            preanswer_seam_violations(&ungated_reader.join("\n")),
+            ["line 17: std::fs::read_to_string(root.join(\"07-code.preanswer.json\")).ok()"]
+        );
+
+        let carrying =
+            "fn consume_preanswer(root: &Path) { let _path = Gates::preanswer_path(root); }";
+        let mut no_op_carrying_the_seam = good.to_vec();
+        no_op_carrying_the_seam[11] = carrying;
+        assert_eq!(
+            preanswer_seam_violations(&no_op_carrying_the_seam.join("\n")),
+            [format!("line 12: {carrying}")]
+        );
+
+        let mut comment_and_tests = good.to_vec();
+        comment_and_tests.extend([
+            "// reads NN-{stage}.preanswer.json through preanswer_path(",
+            "mod tests {",
+            "    fn plant(root: &Path) { let _ = Gates::preanswer_path(root); }",
+        ]);
+        assert_eq!(
+            preanswer_seam_violations(&comment_and_tests.join("\n")),
+            Vec::<String>::new()
+        );
+    }
+
     /// What an operator reads must say what happened and where to look next.
     #[test]
     fn a_gate_id_error_names_the_ids_and_where_to_look() {
