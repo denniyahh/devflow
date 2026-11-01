@@ -466,10 +466,16 @@ impl Gates {
         after_publish: impl FnOnce(),
     ) -> Result<(OpenedGate, WaiterRegistration), GateError> {
         let gate_id = GateId::new();
-        before_publish();
-        let opened = Self::open_gate_as(project_root, phase, stage, &gate_id, context)?;
-        after_publish();
         let registration = Self::register_waiter(project_root, phase, stage, &gate_id)?;
+        before_publish();
+        let opened = match Self::open_gate_as(project_root, phase, stage, &gate_id, context) {
+            Ok(opened) => opened,
+            Err(error) => {
+                registration.finish();
+                return Err(error);
+            }
+        };
+        after_publish();
         Ok((opened, registration))
     }
 
@@ -538,19 +544,36 @@ impl Gates {
         stage: Stage,
         gate: &GateId,
     ) -> Result<WaiterStatus, GateError> {
-        let exists = Self::waiter_path(project_root, phase, stage, gate).exists();
-        Ok(if exists {
-            WaiterStatus::Live
-        } else {
-            WaiterStatus::Absent
+        let path = Self::waiter_path(project_root, phase, stage, gate);
+        Ok(match liveness::probe(&path)? {
+            liveness::Held::Live => WaiterStatus::Live,
+            liveness::Held::Abandoned | liveness::Held::Missing => WaiterStatus::Absent,
         })
     }
 
     /// The pid and start time of every process holding a waiter registration, for
     /// the stray reaper's safety set. A holder whose record cannot be read is logged
     /// and left out.
-    pub fn live_waiter_holders(_project_root: &Path) -> Vec<(u32, Option<u64>)> {
-        Vec::new()
+    pub fn live_waiter_holders(project_root: &Path) -> Vec<(u32, Option<u64>)> {
+        let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
+            return Vec::new();
+        };
+        let mut holders = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.to_string_lossy().ends_with(WAITER_SUFFIX) {
+                continue;
+            }
+            match liveness::live_holder(&path) {
+                Ok(Some(holder)) => holders.push(holder),
+                Ok(None) => {}
+                Err(error) => warn!(
+                    "could not read the waiter registration {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        holders
     }
 
     /// Wait for `gate`'s answer, reading only that gate's slot. Never writes, renames
@@ -561,14 +584,27 @@ impl Gates {
     /// [`set_aside_unbound`](Self::set_aside_unbound) and waits again with the time
     /// left. `cancel` is checked before every read.
     pub fn await_answer(
-        _project_root: &Path,
-        _phase: PhaseId,
-        _stage: Stage,
-        _gate: &GateId,
-        _timeout_secs: u64,
-        _cancel: impl Fn() -> bool,
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+        timeout_secs: u64,
+        cancel: impl Fn() -> bool,
     ) -> AwaitOutcome {
-        AwaitOutcome::TimedOut
+        let end = backoff_wait(
+            Duration::from_secs(timeout_secs),
+            cancel,
+            || match Self::read_answer(project_root, phase, stage, gate) {
+                AnswerRead::None => None,
+                AnswerRead::Bound(answer) => Some(AwaitOutcome::Answered(answer)),
+                AnswerRead::Unbound(reason) => Some(AwaitOutcome::Unbound { reason }),
+            },
+        );
+        match end {
+            WaitEnd::Found(outcome) => outcome,
+            WaitEnd::TimedOut => AwaitOutcome::TimedOut,
+            WaitEnd::Cancelled => AwaitOutcome::Cancelled,
+        }
     }
 
     /// Answer the gate the caller observed: publish a [`GateAnswer`] for that id,
@@ -677,6 +713,10 @@ impl Gates {
         }
         let temps = Self::remove_stage_temps(project_root, phase, stage);
         match temps {
+            Ok(removed) => report.removed |= removed,
+            Err(error) => return (report, Err(error)),
+        }
+        match Self::remove_abandoned_waiters(project_root, phase, stage) {
             Ok(removed) => report.removed |= removed,
             Err(error) => return (report, Err(error)),
         }
@@ -812,6 +852,32 @@ impl Gates {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                removed |= crate::durable::remove_durably(&entry.path())?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Remove the stage's waiter registrations that read abandoned. An abandoned
+    /// registration never reads live again, because nothing takes a lock through an
+    /// existing hold name, so the probe and the removal cannot race a waiter. A live
+    /// one is never removed here: only its owner does that, through
+    /// [`WaiterRegistration::finish`] (R-06).
+    fn remove_abandoned_waiters(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<bool, GateError> {
+        let prefix = format!("{}-{stage}.", phase.padded());
+        let mut removed = false;
+        for entry in std::fs::read_dir(Self::dir(project_root))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix)
+                && name.ends_with(WAITER_SUFFIX)
+                && liveness::probe(&entry.path())? == liveness::Held::Abandoned
+            {
                 removed |= crate::durable::remove_durably(&entry.path())?;
             }
         }
@@ -1061,7 +1127,9 @@ impl Gates {
 
     /// Every phase that has a gate request, response, ack, or orphaned write
     /// temp on disk, whether or not the gate is still open — so a reset can
-    /// reach gate files that outlived their phase's state.
+    /// reach gate files that outlived their phase's state. A waiter's in-flight take
+    /// temp is not one: it is never a gate write, and the sweep of orphaned hold temps
+    /// removes one a dead creator left.
     pub fn phases_on_disk(project_root: &Path) -> std::collections::BTreeSet<PhaseId> {
         let mut phases = std::collections::BTreeSet::new();
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
@@ -1070,6 +1138,9 @@ impl Gates {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
+            if name.ends_with(liveness::HOLD_TEMP_SUFFIX) {
+                continue;
+            }
             let name = name.strip_prefix('.').unwrap_or(name);
             if let Some((phase, _)) = name.split_once('-')
                 && let Ok(phase) = phase.parse::<PhaseId>()
@@ -1311,6 +1382,39 @@ impl Gates {
             }
         }
         (removed, Ok(()))
+    }
+}
+
+/// How [`backoff_wait`] ended.
+enum WaitEnd<T> {
+    /// `read` found something.
+    Found(T),
+    /// The timeout ran out.
+    TimedOut,
+    /// `cancel` answered `true`.
+    Cancelled,
+}
+
+/// The wait loop every gate wait shares: `read` until it finds something, `cancel`
+/// answers `true`, or `timeout` runs out.
+fn backoff_wait<T>(
+    timeout: Duration,
+    cancel: impl Fn() -> bool,
+    mut read: impl FnMut() -> Option<T>,
+) -> WaitEnd<T> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(found) = read() {
+            return WaitEnd::Found(found);
+        }
+        if cancel() {
+            return WaitEnd::Cancelled;
+        }
+        let waited = started.elapsed();
+        if waited >= timeout {
+            return WaitEnd::TimedOut;
+        }
+        std::thread::sleep((timeout - waited).min(Duration::from_secs(1)));
     }
 }
 
