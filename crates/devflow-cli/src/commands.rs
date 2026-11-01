@@ -325,7 +325,7 @@ pub(crate) fn start(
     // non-default value. Provenance (D-12, `28-CONTEXT.md`): the typed
     // `--yes-ship` CLI flag OR a standing `yes_ship = true` in
     // `devflow.toml`, combined here with logical OR since the flag has no
-    // negative form. Combined before the first `save_state` below, so the
+    // negative form. Combined before `create_run_state` below, so the
     // persisted authorization exists before the detached monitor that will
     // later consult it is ever spawned. `run_gate_with_timeout` must never
     // re-derive this from `state` itself — see its own comment.
@@ -340,15 +340,15 @@ pub(crate) fn start(
     }
     state.yes_ship = yes_ship || config_yes_ship;
     // Persist the operator's gate notify hook for the processes that outlive
-    // this one (monitor chain, rate-limit resume), on the same "before the
-    // first `save_state`" idiom. Captured here rather than in `State::new`
+    // this one (monitor chain, rate-limit resume), on the same "before
+    // `create_run_state`" idiom. Captured here rather than in `State::new`
     // so constructing a state never reads the environment (49-REVIEW.md
     // WR-01); `resume` and `advance` apply the same rule (CR-03).
     state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
 
     // D-11's opt-out (31-04), combined on the same shape and for the same
     // reasons as `yes_ship` directly above: OR-ed with an environment override
-    // rather than replacing it, before the first `save_state` below so the
+    // rather than replacing it, before `create_run_state` below so the
     // persisted value exists before any detached monitor consults it, and with
     // a notice when the environment ALONE supplied it — a standing default is
     // never a silent one.
@@ -412,7 +412,7 @@ pub(crate) fn start(
         ensure_base_is_a_local_branch(project_root, base)?;
     }
     // CR-02 (45-REVIEW.md): persist the resolved trunk on the same "before
-    // the first `save_state`" idiom `yes_ship` uses directly above, and for
+    // `create_run_state`" idiom `yes_ship` uses directly above, and for
     // the same reason — `advance`, `resume` and the checkout hooks that
     // merge this phase branch all run in SEPARATE processes whose
     // environment need not carry `DEVFLOW_BASE_BRANCH`. Without this the
@@ -570,9 +570,9 @@ pub(crate) fn start(
     // `if worktree { ... }` fork above, because that fork is what creates the
     // worktree and sets `state.worktree_path` — the repair targets the copy of
     // `.planning/config.json` the agent will actually read, and before the fork
-    // that copy does not exist (F-10). It sits BEFORE the first
-    // `workflow::save_state` below, matching this function's own
-    // "combine before the first save_state" idiom for `yes_ship` and D-11's
+    // that copy does not exist (F-10). It sits BEFORE
+    // `create_run_state` below, matching this function's own
+    // "combine before `create_run_state`" idiom for `yes_ship` and D-11's
     // opt-out.
     //
     // Why `start` needs this at all, and not just `resume`: a freshly forked
@@ -623,8 +623,8 @@ pub(crate) fn start(
     // Validate agent runs in the worktree, so the artifact lands on
     // `feature/phase-{N}` inside the worktree and is invisible from the main
     // checkout; reading the project root here is exactly the defect plan 33-05
-    // closed (CR-01) and must not be reintroduced. Persisted by the
-    // `workflow::save_state` below rather than by a second write.
+    // closed (CR-01) and must not be reintroduced. Persisted by
+    // `create_run_state` below rather than by a second write.
     let evidence_root: PathBuf = state
         .worktree_path
         .clone()
@@ -658,7 +658,7 @@ pub(crate) fn start(
     // checkout"; placing the call above the worktree fork would silently
     // break that promise.
     //
-    // Placement is also deliberately BEFORE `workflow::save_state` below: a
+    // Placement is also deliberately BEFORE `create_run_state` below: a
     // refusal here must never leave persisted state behind for a run that
     // is not going to start (mirroring the same "don't persist a run that
     // will never launch" reasoning `ensure_agent_binary` and
@@ -3195,7 +3195,7 @@ fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
 
 /// Refuse `start` while the phase's run is live (criterion 2, D-01: one
 /// writer per phase). `start` calls this under the per-phase lock and before
-/// any gate cleanup, git mutation or `save_state`, so a refusal writes
+/// any gate cleanup, git mutation or state write, so a refusal writes
 /// nothing. `--force` does not bypass it. See
 /// [`refuse_launch_over_a_live_run`] for what counts as live.
 ///
@@ -5059,7 +5059,7 @@ fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
 }
 
 /// Build `doctor`'s per-phase reconciliation section (after the existing
-/// tool/env checks), read-only: it never calls `workflow::save_state`,
+/// tool/env checks), read-only: it never writes state or calls
 /// `events::emit`, `Gates::cleanup`/`Gates::write`, or any `recover::clean*`
 /// function (T-18-02). A pure string builder (not a direct `println!`) so
 /// it's directly assertable in tests without capturing process stdout.

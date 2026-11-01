@@ -369,8 +369,8 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
         // treated as stale. Without this, one rewrite would mark the artifact
         // fresh for the rest of the run.
         //
-        // F-11: this update does NOT reach disk through the `save_state`
-        // earlier in `handle_validate_outcome` — that one runs before this
+        // F-11: this update does NOT reach disk through the `commit`s
+        // earlier in `handle_validate_outcome` — those run before this
         // point. It is persisted a few statements later, by the `commit`
         // inside `prepare_loop_back_to_code`, reached via the
         // `loop_back_to_code` call on the next line at every call site. A
@@ -382,7 +382,7 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
         //
         // The window is ACCEPTED, not closed. It spans a handful of statements
         // with no blocking wait in it (the gate wait precedes this mutation),
-        // and the only alternative is a second `save_state` on every single
+        // and the only alternative is a second write on every single
         // loop-back — doubling the persistence cost of the common path to
         // defend an interval a kill can barely land in. Do not add one.
         // WR-06: both halves of the observation advance together, or the next
@@ -795,11 +795,10 @@ pub(crate) fn handle_validate_outcome(
 ///
 /// So the pre-reset total is reported here, at the moment it is spent, on both
 /// channels. The alternative the review proposed — moving the reset after
-/// `loop_back_to_code` and adding a `save_state` — is NOT taken, and the reason
+/// `loop_back_to_code` and adding a write — is NOT taken, and the reason
 /// is specific: `loop_back_to_code` reaches `run_preflight`, which can `abort()`
 /// (clearing the phase's state file) and return `Ok(false)`, so a following
-/// `save_state` would resurrect the state file of an aborted phase as a phantom
-/// active run. The reset stays ahead of that call.
+/// write would land on an aborted phase. The reset stays ahead of that call.
 fn reset_phase_failures_at_ceiling(
     project_root: &Path,
     state: &mut State,
