@@ -50,7 +50,7 @@ pub(crate) fn state_on_disk_at_gate(
             std::thread::sleep(POLL);
         }
         let on_disk = workflow::load_state(root, phase).unwrap();
-        Gates::respond(
+        devflow_core::test_support::answer_open_gate(
             root,
             phase,
             stage,
@@ -64,6 +64,26 @@ pub(crate) fn state_on_disk_at_gate(
         waiter.join().unwrap();
         on_disk
     })
+}
+
+/// The ack and claim files of a stage, in either layout: the unkeyed
+/// `NN-{stage}.ack.json` and each keyed `NN-{stage}.{id}.ack.json`, sorted.
+pub(crate) fn gate_claim_files(root: &Path, phase: PhaseId, stage: Stage) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(Gates::dir(root)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-{stage}.", phase.padded());
+    let mut files: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("read a gates directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest == "ack.json" || rest.ends_with(".ack.json"))
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// Serializes tests that mutate process-global env vars (`set_var`/
