@@ -935,6 +935,8 @@ pub(crate) struct MonitorInvocation {
     pub(crate) socket: PathBuf,
     /// The per-launch id the launcher waits to see in a ping reply.
     pub(crate) launch_id: String,
+    /// The inherited descriptor holding this launch's liveness lock.
+    pub(crate) liveness_fd: Option<i32>,
     /// Adapter environment variable NAMES to re-apply to the agent from this
     /// process's environment (values never travel on argv, T-50-41).
     pub(crate) keep_env: Vec<String>,
@@ -1285,7 +1287,22 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
     // line from the recorded outcome, so a shutdown that arrived while
     // advancing is answered `handed_off`.
     run.supervisor.finish();
+    if let Some(hold) = run.liveness {
+        remove_liveness_file(&hold);
+    }
     result
+}
+
+/// A supervisor's last act (D-01): remove its liveness file while it still holds
+/// the lock. A file left behind reads abandoned once this process exits, and
+/// `recover --clean` sweeps it, so a failure is only warned about.
+fn remove_liveness_file(hold: &devflow_core::liveness::Hold) {
+    if let Err(err) = std::fs::remove_file(hold.path()) {
+        warn!(
+            "could not remove the liveness file {}: {err}",
+            hold.path().display()
+        );
+    }
 }
 
 /// Forward a stop that reached this supervisor after safe point 3 to the
@@ -1388,6 +1405,7 @@ fn stage_spec(invocation: &MonitorInvocation) -> Result<monitor::StageSpec, CliE
     spec.workdir = invocation.workdir.clone();
     spec.args = args.to_vec();
     spec.envs = kept_env(&invocation.keep_env);
+    spec.liveness_fd = invocation.liveness_fd;
     Ok(spec)
 }
 
@@ -1614,6 +1632,7 @@ fn spawn_agent_and_record(
     // never clears the record before the save that replaces it.
     let SpawnedLaunch {
         published,
+        reservation,
         ctx,
         launch_label,
     } = match spawn_next_supervisor(state, program, args, extra_env, archived_stage, launch) {
@@ -1649,6 +1668,9 @@ fn spawn_agent_and_record(
         PublishOutcome::HandedOff => record_successor(record),
         PublishOutcome::SuccessorAlreadyEnded => {}
     }
+    // The publish is done, so the launcher's copy of the liveness lock goes.
+    // Only dropping releases it: `unlock` would also release the supervisor's.
+    drop(reservation);
     #[cfg(test)]
     test_hold("after_publish");
     match devflow_core::ship::consume_cron_instructions(&state.project_root, state.phase) {
@@ -1843,10 +1865,12 @@ fn successor_runs_on(socket: &Path) -> bool {
 }
 
 /// What [`spawn_next_supervisor`] hands back to [`spawn_agent_and_record`]
-/// for the publish: the ping-confirmed supervisor, the launch context it
-/// was spawned under, and the launch shape's label.
+/// for the publish: the ping-confirmed supervisor, the reservation it was
+/// spawned from, the launch context it was spawned under, and the launch
+/// shape's label.
 struct SpawnedLaunch {
     published: monitor::Published,
+    reservation: monitor::Reservation,
     ctx: monitor::LaunchContext,
     launch_label: &'static str,
 }
@@ -1913,8 +1937,11 @@ fn spawn_next_supervisor(
     if stopped_at_safe_point(state, 2)? {
         return Ok(None);
     }
-    let published = monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx)
-        .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    let spawn_failed = |err| CliError::Message(format!("could not spawn monitor: {err}"));
+    let reservation = monitor::Reservation::new(&ctx, state).map_err(spawn_failed)?;
+    let published =
+        monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx, &reservation)
+            .map_err(spawn_failed)?;
     #[cfg(test)]
     test_hold("before_publish");
     // Safe point 3 (50-13): the next supervisor answered its ping but is not
@@ -1927,6 +1954,7 @@ fn spawn_next_supervisor(
     }
     Ok(Some(SpawnedLaunch {
         published,
+        reservation,
         ctx,
         launch_label,
     }))
@@ -3332,8 +3360,16 @@ mod tests {
         // Since 50-11 `spawn_monitor` waits for the publish, so the control
         // monitor (libtest given `__monitor`'s arguments) exiting by itself
         // comes back as `NotReady` rather than as a pid to poll.
-        let control_result =
-            monitor::spawn_monitor(&control, "claude", &[], &[], prompt(), &subcommand);
+        let control_reservation = monitor::Reservation::new(&subcommand, &control).unwrap();
+        let control_result = monitor::spawn_monitor(
+            &control,
+            "claude",
+            &[],
+            &[],
+            prompt(),
+            &subcommand,
+            &control_reservation,
+        );
         assert!(
             matches!(control_result, Err(monitor::MonitorError::NotReady(_))),
             "the control monitor (libtest given __monitor's arguments) must exit by itself \
@@ -9344,6 +9380,7 @@ mod tests {
             state.supervisor = Some(prior.clone());
             workflow::save_state(&state).unwrap();
             let ctx = launch_context().expect("the parent passes DEVFLOW_CACHE_DIR");
+            let reservation = monitor::Reservation::new(&ctx, &state).expect("reserve the launch");
             let published = monitor::spawn_monitor(
                 &state,
                 "claude",
@@ -9351,6 +9388,7 @@ mod tests {
                 &[],
                 monitor::MonitorLaunch::Legacy,
                 &ctx,
+                &reservation,
             )
             .expect("the next supervisor publishes");
             let mut holder = state.clone();

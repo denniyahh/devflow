@@ -115,6 +115,14 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
             root.to_path_buf(),
         );
         let ctx = launch_context();
+        // The reservation creates `.devflow/` too, so its `.gitignore` goes
+        // before the spawn: this case stays about `spawn_monitor`'s own write.
+        let reservation =
+            monitor::Reservation::new(&ctx.context, &state).expect("take the reservation");
+        if !gitignore_is_star(root) {
+            failures.push("monitor::Reservation::new (monitor.rs)");
+        }
+        std::fs::remove_file(root.join(".devflow").join(".gitignore")).unwrap();
         let result = monitor::spawn_monitor(
             &state,
             "sh",
@@ -122,6 +130,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
             &[],
             monitor::MonitorLaunch::Legacy,
             &ctx.context,
+            &reservation,
         );
         assert!(
             matches!(result, Err(monitor::MonitorError::NotReady(_))),

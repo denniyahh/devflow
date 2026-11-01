@@ -392,6 +392,87 @@ pub(crate) fn strip_notify_env(child_cmd: &mut std::process::Command) {
     child_cmd.env_remove(crate::gates::GATE_NOTIFY_CMD_ENV);
 }
 
+/// A launch's reservation (D-01): the launch id, socket path and held liveness
+/// file a launcher creates before it spawns anything, so the launch can be
+/// recorded before its supervisor exists.
+///
+/// [`spawn_monitor`] uses this id and socket and passes the lock to the
+/// `__monitor` process at [`crate::liveness::INHERITED_FD`]. Drop the reservation
+/// only after the publish: dropping it is the only release of the launcher's
+/// copy, and the spawned supervisor keeps its own.
+#[derive(Debug)]
+pub struct Reservation {
+    launch_id: String,
+    socket: SocketPath,
+    liveness: crate::liveness::Hold,
+}
+
+impl Reservation {
+    /// Create a launch id for `state`'s phase and take its liveness lock under
+    /// the project's `.devflow/`.
+    ///
+    /// # Errors
+    /// The socket path does not fit, or the lock could not be taken.
+    pub fn new(ctx: &LaunchContext, state: &State) -> Result<Self, MonitorError> {
+        let launch_id = crate::supervisor::new_launch_id();
+        let socket =
+            SocketPath::for_launch(&ctx.cache_dir, &state.project_root, state.phase, &launch_id)?;
+        let path = liveness_path_of(&state.project_root, &launch_id)?;
+        let failed = |err: std::io::Error| liveness_error(&launch_id, err);
+        if let Some(dir) = path.parent() {
+            crate::workflow::ensure_devflow_dir(dir).map_err(failed)?;
+        }
+        let liveness = crate::liveness::Hold::take(&path).map_err(failed)?;
+        Ok(Self {
+            launch_id,
+            socket,
+            liveness,
+        })
+    }
+
+    /// The launch id the spawned supervisor will publish.
+    pub fn launch_id(&self) -> &str {
+        &self.launch_id
+    }
+
+    /// The socket the spawned supervisor will publish.
+    pub fn socket_path(&self) -> &Path {
+        self.socket.as_path()
+    }
+
+    /// The liveness file this reservation holds.
+    pub fn liveness_path(&self) -> &Path {
+        self.liveness.path()
+    }
+
+    /// This reservation as the record a launcher saves before it spawns.
+    pub fn pending_record(&self) -> crate::state::PendingSupervisor {
+        crate::state::PendingSupervisor::new(
+            self.launch_id.clone(),
+            self.socket_path().to_path_buf(),
+            self.liveness_path().to_path_buf(),
+        )
+    }
+}
+
+/// `launch_id`'s liveness file under `project_root`; an id that is not a launch
+/// id never builds a path.
+fn liveness_path_of(project_root: &Path, launch_id: &str) -> Result<PathBuf, MonitorError> {
+    crate::liveness::launch_liveness_path(project_root, launch_id).ok_or_else(|| {
+        MonitorError::Liveness {
+            launch_id: launch_id.to_string(),
+            reason: "not a launch id".to_string(),
+        }
+    })
+}
+
+fn liveness_error(launch_id: &str, err: std::io::Error) -> MonitorError {
+    MonitorError::Liveness {
+        launch_id: launch_id.to_string(),
+        reason: err.to_string(),
+    }
+}
+
 /// A supervisor [`spawn_monitor`] started and saw publish: the record the
 /// caller persists in [`State::supervisor`] and the supervisor's pid.
 #[non_exhaustive]
@@ -417,6 +498,10 @@ pub struct Published {
 /// `__monitor` process's environment and only their names on its argv
 /// (`--keep-env NAME`), so a value is never visible in the process table.
 ///
+/// The launch id and socket are `reservation`'s, and its liveness lock crosses
+/// the exec at [`crate::liveness::INHERITED_FD`], so the new process holds the
+/// lock from before it runs. The caller keeps `reservation` until the publish.
+///
 /// Returns only after the new supervisor answers a ping with this launch's
 /// id, through [`wait_for_publish`]. A supervisor that exits first, or does
 /// not publish within [`PUBLISH_WAIT`], is ended with what it started and
@@ -431,6 +516,7 @@ pub fn spawn_monitor(
     envs: &[(String, String)],
     launch: MonitorLaunch,
     ctx: &LaunchContext,
+    reservation: &Reservation,
 ) -> Result<Published, MonitorError> {
     let project_root = state
         .project_root
@@ -464,9 +550,8 @@ pub fn spawn_monitor(
         .unwrap_or(&state.project_root);
     let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
-    let launch_id = crate::supervisor::new_launch_id();
-    let socket =
-        SocketPath::for_launch(&ctx.cache_dir, &state.project_root, state.phase, &launch_id)?;
+    let launch_id = reservation.launch_id.clone();
+    let socket = &reservation.socket;
     let socket_str = socket.as_path().to_str().ok_or(MonitorError::NonUtf8Path)?;
 
     let stream = match launch {
@@ -508,7 +593,7 @@ pub fn spawn_monitor(
         workdir,
         socket: socket_str,
         launch_id: &launch_id,
-        liveness_fd: None,
+        liveness_fd: Some(crate::liveness::INHERITED_FD),
         keep_env: &keep_env,
         stream: stream
             .as_ref()
@@ -525,6 +610,7 @@ pub fn spawn_monitor(
     let mut child_cmd = monitor_command(&ctx.exec, &binary, workdir_path, &monitor_argv)?;
     child_cmd.envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     strip_notify_env(&mut child_cmd);
+    crate::liveness::pass_to_child(&mut child_cmd, &reservation.liveness);
 
     // RESEARCH Finding 6: the supervisor leads its own process group, so it
     // never sits in the operator's shell job and a terminal Ctrl-C to a
@@ -538,7 +624,7 @@ pub fn spawn_monitor(
     let supervisor_pid = child.id();
     info!("monitor spawned with pid {supervisor_pid}; waiting for its socket");
 
-    let reply = wait_for_publish(&mut child, &socket, &launch_id, PUBLISH_WAIT)?;
+    let reply = wait_for_publish(&mut child, socket, &launch_id, PUBLISH_WAIT)?;
     info!(
         "supervisor {supervisor_pid} published {} ({})",
         socket.as_path().display(),
@@ -576,7 +662,6 @@ struct MonitorArgs<'a> {
 /// The `__monitor` argv up to and including `--`; the caller appends the
 /// agent's program and argv.
 fn monitor_args(args: &MonitorArgs<'_>) -> Vec<String> {
-    let _ = args.liveness_fd;
     let launch = if args.stream.is_some() {
         "stream"
     } else {
@@ -604,6 +689,10 @@ fn monitor_args(args: &MonitorArgs<'_>) -> Vec<String> {
     .iter()
     .map(ToString::to_string)
     .collect();
+    if let Some(fd) = args.liveness_fd {
+        argv.push("--liveness-fd".to_string());
+        argv.push(fd.to_string());
+    }
     for name in args.keep_env {
         argv.push("--keep-env".to_string());
         argv.push((*name).to_string());
@@ -1458,6 +1547,9 @@ pub struct StageRun {
     /// The still-published supervisor. The caller owns
     /// [`Supervisor::hand_off`] and [`Supervisor::finish`].
     pub supervisor: Supervisor,
+    /// The launch's liveness lock, when this process adopted one. The caller
+    /// keeps it until its last act.
+    pub liveness: Option<crate::liveness::Hold>,
 }
 
 /// How long [`confirm_own_group`] waits for a just-spawned agent's
@@ -1470,7 +1562,10 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 /// The order is the contract:
 /// 1. [`install_signal_pipe`](crate::supervisor::runtime::install_signal_pipe),
 ///    so SIGTERM and SIGINT to this process become stop events, never a
-///    death that orphans the agent (D-05, 999.134).
+///    death that orphans the agent (D-05, 999.134). Then adopt the inherited
+///    liveness descriptor ([`StageSpec::liveness_fd`]), which marks it
+///    close-on-exec, so the agent never inherits it (D-01). A failed adoption
+///    is [`MonitorError::Liveness`], before any agent exists.
 /// 2. Spawn the agent through `hermetic_command` (the adapter env re-applied
 ///    after its scrub, the gate notify command stripped) with
 ///    `process_group(0)`, then require that it leads its own process group
@@ -1499,6 +1594,7 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 /// advances only on [`AgentOutcome::Completed`].
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     crate::supervisor::runtime::install_signal_pipe()?;
+    let liveness = adopt_liveness(&spec)?;
 
     let stdout_file = crate::agent_result::stdout_path(&spec.project_root, spec.phase);
     let exit_file = crate::agent_result::exit_code_path(&spec.project_root, spec.phase);
@@ -1574,7 +1670,19 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     Ok(StageRun {
         outcome,
         supervisor,
+        liveness,
     })
+}
+
+/// Take over the liveness descriptor `spec` names, if it names one.
+fn adopt_liveness(spec: &StageSpec) -> Result<Option<crate::liveness::Hold>, MonitorError> {
+    let Some(fd) = spec.liveness_fd else {
+        return Ok(None);
+    };
+    let path = liveness_path_of(&spec.project_root, &spec.launch_id)?;
+    crate::liveness::adopt_inherited(fd, path)
+        .map(Some)
+        .map_err(|err| liveness_error(&spec.launch_id, err))
 }
 
 /// Owns a just-spawned agent's unreaped `Child` from the moment its pgid
