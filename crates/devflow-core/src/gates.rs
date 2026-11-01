@@ -1243,9 +1243,9 @@ impl Gates {
         })
     }
 
-    /// Poll for a response with exponential backoff (1s → 2s → 4s … capped at
-    /// 60s), giving up after `timeout_secs`. Returns the parsed response when it
-    /// appears, or `None` on timeout.
+    /// Poll for a response, reading at backoff boundaries (1 s doubling to 60 s) and
+    /// at the timeout, giving up after `timeout_secs`. Returns the parsed response
+    /// when it appears, or `None` on timeout. Only reads (R-09).
     pub fn poll_response(
         project_root: &Path,
         phase: PhaseId,
@@ -1253,36 +1253,23 @@ impl Gates {
         timeout_secs: u64,
     ) -> Option<GateResponse> {
         let path = Self::response_path(project_root, phase, stage);
-        let deadline = Duration::from_secs(timeout_secs);
-        let mut waited = Duration::ZERO;
-        let mut backoff = Duration::from_secs(1);
-        let cap = Duration::from_secs(60);
         debug!("polling for gate response at {}", path.display());
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(&path)
-                && let Ok(response) = serde_json::from_str::<GateResponse>(&contents)
-            {
-                return Some(response);
-            }
-            if waited >= deadline {
-                return None;
-            }
-            let sleep = backoff.min(deadline - waited);
-            std::thread::sleep(sleep);
-            waited += sleep;
-            backoff = (backoff * 2).min(cap);
-        }
+        backoff_wait(
+            Duration::from_secs(timeout_secs),
+            || false,
+            || read_unkeyed_response(&path),
+        )
+        .found()
     }
 
-    /// [`poll_response`](Self::poll_response) that a caller can cancel
-    /// (50-13, R-2): the same loop, except that every sleep is at most one
-    /// second and `cancel` is checked on every iteration, so a cancel ends
+    /// [`poll_response`](Self::poll_response) that a caller can cancel (50-13, R-2):
+    /// the same reads, with `cancel` checked at least once a second, so a cancel ends
     /// the wait within about a second of being set.
     ///
-    /// Returns the response when it appears, or `None` on a timeout or a
-    /// cancel. A caller tells the two apart by asking its own `cancel`
-    /// again: a `None` returned before the timeout means `cancel` answered
-    /// `true`. A response already on disk wins over a cancel.
+    /// Returns the response when it appears, or `None` on a timeout or a cancel. A
+    /// caller tells the two apart by asking its own `cancel` again: a `None` returned
+    /// before the timeout means `cancel` answered `true`. `cancel` is checked before
+    /// every read, so a cancel wins over a response already on disk.
     pub fn poll_response_cancellable(
         project_root: &Path,
         phase: PhaseId,
@@ -1291,29 +1278,14 @@ impl Gates {
         cancel: impl Fn() -> bool,
     ) -> Option<GateResponse> {
         let path = Self::response_path(project_root, phase, stage);
-        let deadline = Duration::from_secs(timeout_secs);
-        let mut waited = Duration::ZERO;
-        let mut backoff = Duration::from_secs(1);
-        let cap = Duration::from_secs(60);
-        let slice = Duration::from_secs(1);
         debug!(
             "polling (cancellable) for gate response at {}",
             path.display()
         );
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(&path)
-                && let Ok(response) = serde_json::from_str::<GateResponse>(&contents)
-            {
-                return Some(response);
-            }
-            if waited >= deadline || cancel() {
-                return None;
-            }
-            let sleep = backoff.min(deadline - waited).min(slice);
-            std::thread::sleep(sleep);
-            waited += sleep;
-            backoff = (backoff * 2).min(cap);
-        }
+        backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
+            read_unkeyed_response(&path)
+        })
+        .found()
     }
 
     /// Write an ack file signalling the response was read.
@@ -1401,27 +1373,61 @@ enum WaitEnd<T> {
     Cancelled,
 }
 
+impl<T> WaitEnd<T> {
+    /// What `read` found, if it did.
+    fn found(self) -> Option<T> {
+        match self {
+            WaitEnd::Found(found) => Some(found),
+            WaitEnd::TimedOut | WaitEnd::Cancelled => None,
+        }
+    }
+}
+
+/// The gap between a wait's first two reads, doubling up to [`READ_BACKOFF_CAP`].
+const READ_BACKOFF_START: Duration = Duration::from_secs(1);
+/// The longest gap between two reads of a wait.
+const READ_BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// The longest a wait sleeps before it checks `cancel` again.
+const CANCEL_CHECK_SLICE: Duration = Duration::from_secs(1);
+
 /// The wait loop every gate wait shares: `read` until it finds something, `cancel`
 /// answers `true`, or `timeout` runs out.
+///
+/// `cancel` is checked first and at least once a second, so a stop accepted in the
+/// same second as an answer wins and a wait of days stays cancellable. `read` runs
+/// only at backoff boundaries, so such a wait costs few reads (D-13 items 4 and 7).
+/// The timeout is a boundary too, so an answer that lands in the last gap is an
+/// answer rather than a timeout.
 fn backoff_wait<T>(
     timeout: Duration,
     cancel: impl Fn() -> bool,
     mut read: impl FnMut() -> Option<T>,
 ) -> WaitEnd<T> {
     let started = std::time::Instant::now();
+    let mut next_read = Duration::ZERO;
+    let mut backoff = READ_BACKOFF_START;
     loop {
-        if let Some(found) = read() {
-            return WaitEnd::Found(found);
-        }
         if cancel() {
             return WaitEnd::Cancelled;
+        }
+        if started.elapsed() >= next_read {
+            if let Some(found) = read() {
+                return WaitEnd::Found(found);
+            }
+            next_read = next_read.saturating_add(backoff).min(timeout);
+            backoff = (backoff * 2).min(READ_BACKOFF_CAP);
         }
         let waited = started.elapsed();
         if waited >= timeout {
             return WaitEnd::TimedOut;
         }
-        std::thread::sleep((timeout - waited).min(Duration::from_secs(1)));
+        std::thread::sleep(CANCEL_CHECK_SLICE.min(next_read.saturating_sub(waited)));
     }
+}
+
+/// The body at the unkeyed response path, when it parses as a response.
+fn read_unkeyed_response(path: &Path) -> Option<GateResponse> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 /// Fire the operator-configured gate notify hook, if any.
