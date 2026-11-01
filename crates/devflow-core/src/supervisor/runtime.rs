@@ -28,12 +28,14 @@
 
 use super::protocol::{self, PingReply, Reply, Request, ShutdownAccepted, ShutdownStopped};
 use super::{PublishError, Sidecar, SocketPath};
+use std::cell::Cell;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// The exit code a stopped run reports: the shell convention for a death by
 /// SIGTERM, `128 + 15`. The monitor writes it to the exit file on
@@ -534,6 +536,8 @@ impl Supervisor {
                 sidecar: sidecar.clone(),
                 token: token.clone(),
                 quit: Arc::clone(&quit),
+                accept: UnixListener::accept,
+                accept_backoff: Cell::new(ACCEPT_BACKOFF_START),
             };
             let handle = std::thread::Builder::new()
                 .name("supervisor-control".to_string())
@@ -665,12 +669,38 @@ fn drain_signal_pipe(fd: libc::c_int) -> Vec<i32> {
     }
 }
 
+/// How long the control thread first waits after a persistent `accept` error.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
+/// The longest the control thread waits between `accept` attempts.
+#[allow(dead_code)]
+const ACCEPT_BACKOFF_CAP: Duration = Duration::from_secs(1);
+
+/// How the control thread accepts a connection: `UnixListener::accept`, or a
+/// test's injected failure.
+type AcceptFn = fn(&UnixListener) -> io::Result<(UnixStream, SocketAddr)>;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`log_accept_error`] ran on this thread.
+    static ACCEPT_ERROR_LOGS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Report a persistent `accept` error and the wait before the next attempt.
+fn log_accept_error(error: &io::Error, backoff: Duration) {
+    #[cfg(test)]
+    ACCEPT_ERROR_LOGS.with(|logs| logs.set(logs.get() + 1));
+    tracing::warn!("supervisor accept failed: {error}; retrying in {backoff:?}");
+}
+
 /// The control thread's state.
 struct Control {
     listener: UnixListener,
     sidecar: Sidecar,
     token: StopToken,
     quit: Arc<AtomicBool>,
+    accept: AcceptFn,
+    /// The wait before the next attempt after a persistent `accept` error.
+    accept_backoff: Cell<Duration>,
 }
 
 impl Control {
@@ -712,12 +742,12 @@ impl Control {
     /// Serve every pending connection.
     fn accept_all(&self, parked: &mut Vec<UnixStream>) {
         loop {
-            match self.listener.accept() {
+            match (self.accept)(&self.listener) {
                 Ok((stream, _)) => self.serve_connection(stream, parked),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    tracing::warn!("supervisor accept failed: {error}");
+                    log_accept_error(&error, self.accept_backoff.get());
                     return;
                 }
             }
@@ -1301,7 +1331,7 @@ mod tests {
                     action
                 })
             };
-            let reached = std::cell::Cell::new(false);
+            let reached = Cell::new(false);
             let verdict = run_stage(&token, Some(window), &|| {
                 reached.set(true);
                 ready.wait();
@@ -1928,5 +1958,181 @@ mod tests {
             ],
             "the read, the hold and a decoy wait_agent only after the test-module cut"
         );
+    }
+
+    thread_local! {
+        /// How many times this test thread's accept seam ran.
+        static ACCEPT_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_accept_attempt() {
+        ACCEPT_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+    }
+
+    /// An accept seam that always fails as a process out of descriptors does.
+    fn accept_out_of_descriptors(_: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+        count_accept_attempt();
+        Err(io::Error::from_raw_os_error(libc::EMFILE))
+    }
+
+    /// An accept seam with nothing pending.
+    fn accept_would_block(_: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+        count_accept_attempt();
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    /// An accept seam interrupted once, then with nothing pending.
+    fn accept_interrupted_once(_: &UnixListener) -> io::Result<(UnixStream, SocketAddr)> {
+        count_accept_attempt();
+        if ACCEPT_ATTEMPTS.with(Cell::get) == 1 {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    /// A `Control` on a real, non-blocking listener with `accept` as its
+    /// seam, and one client connected, so `poll` keeps reporting the listener
+    /// readable until something accepts. The sidecar's agent pid numbers no
+    /// process: these tests never stop anything.
+    struct AcceptFixture {
+        control: Control,
+        _client: UnixStream,
+        _cache: tempfile::TempDir,
+    }
+
+    fn accept_fixture(accept: AcceptFn) -> AcceptFixture {
+        let cache = short_cache();
+        let path = cache.path().join("control.sock");
+        let listener = UnixListener::bind(&path).expect("bind the control socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make the listener non-blocking");
+        let client = UnixStream::connect(&path).expect("connect the one client");
+        let socket = SocketPath::new(path).expect("socket path fits");
+        let control = Control {
+            listener,
+            sidecar: test_sidecar(&socket, u32::MAX),
+            token: StopToken::new(OwnerPhase::AgentRunning),
+            quit: Arc::new(AtomicBool::new(false)),
+            accept,
+            accept_backoff: Cell::new(ACCEPT_BACKOFF_START),
+        };
+        AcceptFixture {
+            control,
+            _client: client,
+            _cache: cache,
+        }
+    }
+
+    /// A correct loop makes about 7 attempts in a second (10 ms doubling to
+    /// a 1 s cap); the bound leaves room, and the old loop spun in the
+    /// thousands. The attempts are counted on this thread, so `run` runs here
+    /// and a helper thread tells it to quit.
+    #[test]
+    fn a_persistent_accept_error_backs_off_and_is_logged() {
+        const MAX_ATTEMPTS_IN_A_SECOND: usize = 25;
+        let AcceptFixture {
+            control,
+            _client,
+            _cache,
+        } = accept_fixture(accept_out_of_descriptors);
+        let quit = Arc::clone(&control.quit);
+        let quitter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            quit.store(true, Ordering::Release);
+        });
+
+        let parked = control.run();
+        quitter.join().expect("the quitter thread");
+
+        let attempts = ACCEPT_ATTEMPTS.with(Cell::get);
+        let logged = ACCEPT_ERROR_LOGS.with(Cell::get);
+        assert!(parked.is_empty(), "no connection was served");
+        assert!(
+            attempts <= MAX_ATTEMPTS_IN_A_SECOND,
+            "an EMFILE must back off, not spin: {attempts} accept attempts in one second"
+        );
+        assert!(logged >= 1, "the persistent error is logged");
+        assert!(
+            logged <= attempts,
+            "logged {logged} times for {attempts} attempts"
+        );
+    }
+
+    /// A deliberately long backoff makes a sleep in the `WouldBlock` arm
+    /// visible against a margin no scheduling delay reaches.
+    #[test]
+    fn a_would_block_accept_returns_without_backing_off() {
+        const LONG_BACKOFF: Duration = Duration::from_secs(5);
+        let fixture = accept_fixture(accept_would_block);
+        let mut parked = Vec::new();
+
+        fixture.control.accept_all(&mut parked);
+        assert_eq!(ACCEPT_ATTEMPTS.with(Cell::get), 1);
+        assert_eq!(fixture.control.accept_backoff.get(), ACCEPT_BACKOFF_START);
+
+        fixture.control.accept_backoff.set(LONG_BACKOFF);
+        let started = Instant::now();
+        fixture.control.accept_all(&mut parked);
+        assert!(
+            started.elapsed() < LONG_BACKOFF / 2,
+            "a WouldBlock accept slept for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fixture.control.accept_backoff.get(), LONG_BACKOFF);
+        assert_eq!(ACCEPT_ERROR_LOGS.with(Cell::get), 0, "nothing to log");
+    }
+
+    #[test]
+    fn an_interrupted_accept_retries_without_backing_off() {
+        let fixture = accept_fixture(accept_interrupted_once);
+        fixture.control.accept_all(&mut Vec::new());
+        assert_eq!(
+            ACCEPT_ATTEMPTS.with(Cell::get),
+            2,
+            "an interrupted accept is retried at once"
+        );
+        assert_eq!(fixture.control.accept_backoff.get(), ACCEPT_BACKOFF_START);
+        assert_eq!(ACCEPT_ERROR_LOGS.with(Cell::get), 0, "nothing to log");
+    }
+
+    #[test]
+    fn the_accept_backoff_doubles_up_to_its_cap() {
+        let fixture = accept_fixture(accept_out_of_descriptors);
+        fixture.control.accept_all(&mut Vec::new());
+        assert_eq!(
+            fixture.control.accept_backoff.get(),
+            ACCEPT_BACKOFF_START * 2,
+            "one error doubles the wait"
+        );
+
+        // Doubling this would pass the cap, so it must clamp.
+        let near_cap = ACCEPT_BACKOFF_CAP.mul_f64(0.75);
+        fixture.control.accept_backoff.set(near_cap);
+        let started = Instant::now();
+        fixture.control.accept_all(&mut Vec::new());
+        assert!(
+            started.elapsed() >= near_cap,
+            "the error slept the current wait, {near_cap:?}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fixture.control.accept_backoff.get(), ACCEPT_BACKOFF_CAP);
+    }
+
+    /// The client's connection is accepted for real, then read to its close,
+    /// so the next accept finds nothing pending.
+    #[test]
+    fn a_successful_accept_resets_the_backoff() {
+        let AcceptFixture {
+            control,
+            _client: client,
+            _cache,
+        } = accept_fixture(UnixListener::accept);
+        drop(client);
+        control.accept_backoff.set(ACCEPT_BACKOFF_CAP);
+
+        control.accept_all(&mut Vec::new());
+
+        assert_eq!(control.accept_backoff.get(), ACCEPT_BACKOFF_START);
     }
 }
