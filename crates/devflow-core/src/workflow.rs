@@ -1555,6 +1555,83 @@ mod tests {
     }
 
     #[test]
+    fn write_lock_status_reports_a_lock_file_it_cannot_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(devflow_dir(dir.path()), "a file, not a directory").unwrap();
+
+        let result = write_lock_status(dir.path(), PhaseId::new(50));
+
+        assert!(
+            matches!(result, Err(WorkflowError::Io(_))),
+            "a lock nobody can ask about must not read as free, got {result:?}"
+        );
+    }
+
+    /// A signal handler installed without `SA_RESTART` makes a blocked `flock` return
+    /// EINTR. DevFlow's own stop handler sets `SA_RESTART`, but this crate is a library
+    /// and its host's handlers are not ours. The handler is process-global, so this
+    /// runs in a child.
+    #[test]
+    fn a_signal_does_not_fail_a_blocked_write() {
+        use std::os::unix::thread::JoinHandleExt;
+        const NAME: &str = "workflow::tests::a_signal_does_not_fail_a_blocked_write";
+        extern "C" fn do_nothing(_signal: libc::c_int) {}
+
+        if !crate::test_support::in_child_test(NAME) {
+            let empty_path = tempfile::tempdir().unwrap();
+            let output = crate::test_support::run_test_in_child(NAME, empty_path.path(), &[]);
+            crate::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        // SAFETY: an all-zero `sigaction` is a valid value of the struct: no flags,
+        // an empty mask. The handler does nothing, so it is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = do_nothing as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(50);
+        save_state(&state_in(&root, phase, Stage::Code)).unwrap();
+        update_field(&root, phase, |_| {});
+        let holder = File::options()
+            .read(true)
+            .write(true)
+            .open(state_lock_path(&root, phase))
+            .unwrap();
+        holder.lock().unwrap();
+
+        let writer_root = root.clone();
+        let writer = std::thread::spawn(move || {
+            update_state(&writer_root, phase, |state| {
+                state.stopped = true;
+                Ok::<(), WorkflowError>(())
+            })
+            .map(|_| ())
+        });
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: the writer has not been joined, so its pthread_t is valid.
+            assert_eq!(
+                unsafe { libc::pthread_kill(writer.as_pthread_t(), libc::SIGUSR1) },
+                0
+            );
+        }
+        drop(holder);
+
+        writer
+            .join()
+            .unwrap()
+            .expect("a signal must not fail a write blocked on the lock");
+        assert!(load_state(&root, phase).unwrap().stopped);
+    }
+
+    #[test]
     fn paths_are_per_phase_under_devflow_dir() {
         let root = Path::new("/repo");
         assert_eq!(devflow_dir(root), Path::new("/repo/.devflow"));
