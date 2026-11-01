@@ -307,7 +307,10 @@ fn carried_phase_failures(
     }
 }
 
-/// Clear every stage's gate files before a new run starts (scaffolding).
+/// Close every stage's leftover gate before a new run starts. An unused answer is set
+/// aside, never deleted, and each one is named on `warnings`. A close that fails only
+/// warns: a leftover answer cannot decide the new run's gate anyway, because that gate
+/// opens under a new id and sets aside whatever is in the stage's slots (D-05, D-06).
 fn set_aside_leftover_gates(
     project_root: &Path,
     phase: PhaseId,
@@ -320,11 +323,22 @@ fn set_aside_leftover_gates(
         Stage::Validate,
         Stage::Ship,
     ] {
-        if let Err(err) = Gates::cleanup(project_root, phase, stage) {
-            let _ = writeln!(
-                warnings,
-                "warning: could not clear stale gate files for phase {phase} {stage}: {err}"
-            );
+        match Gates::close(project_root, phase, stage) {
+            Ok(report) => {
+                for path in report.quarantined {
+                    let _ = writeln!(
+                        warnings,
+                        "warning: set aside an unused answer for phase {phase} {stage}: {}",
+                        path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    warnings,
+                    "warning: could not clear stale gate files for phase {phase} {stage}: {err}"
+                );
+            }
         }
     }
 }
@@ -1656,7 +1670,7 @@ fn open_gate_id_at_stage(
 }
 
 /// The id the stage's gate file names, or `None` with no gate file.
-fn gate_file_id(
+pub(crate) fn gate_file_id(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,

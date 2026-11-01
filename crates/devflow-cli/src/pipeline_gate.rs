@@ -23,7 +23,9 @@ use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, commit, launch_stage};
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{self, Claim, GateAction, GateError, GateResponse, Gates};
+use devflow_core::gates::{
+    self, AnswerRead, Claim, GateAction, GateError, GateId, GateResponse, Gates,
+};
 use devflow_core::hooks;
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
@@ -176,11 +178,9 @@ pub(crate) fn prepare_loop_back_to_code(
     reason: LoopBackReason,
 ) -> Result<String, CliError> {
     // Capture the stage the gate actually fired on before it's mutated below,
-    // so cleanup targets the right stage's gate files (see CR-01: a stale
-    // response/ack left on disk after a loop-back is silently reused by a
-    // later gate for the same phase+stage).
+    // so the close targets the right stage's gate files (see CR-01).
     let gate_stage = state.stage;
-    let _ = Gates::cleanup(project_root, state.phase, gate_stage);
+    let _ = Gates::close(project_root, state.phase, gate_stage);
     // F-11 (`select_loop_back_fix`): this is the write that persists the
     // verification observation that function records in the caller's copy, one
     // write per loop-back. Nothing else writes those two fields during an advance.
@@ -251,7 +251,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     // resumed run asks again. Outside a supervisor's advance (the foreground
     // `ship_override`) no stop token is engaged and this proceeds.
     if crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+        let _ = Gates::close(project_root, state.phase, Stage::Ship);
         crate::pipeline_launch::record_advance_stop(state, 6)?;
         return Err(CliError::Message(format!(
             "finalization did not run: {ADVANCE_STOP_REASON}"
@@ -264,7 +264,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
         // The original Ship approval has already been consumed. Reopen an
         // actionable gate and keep this monitor waiting so a terminal-hook
         // failure cannot turn into an invisible stalled Ship state.
-        let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+        let _ = Gates::close(project_root, state.phase, Stage::Ship);
         let context = format!(
             "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
@@ -284,7 +284,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             None,
         )? {
             GateAction::Advance => {
-                let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+                let _ = Gates::close(project_root, state.phase, Stage::Ship);
             }
             GateAction::LoopBack(_) => {
                 return loop_back_to_code(
@@ -297,8 +297,8 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             GateAction::Abort(reason) => return abort(project_root, state, &reason),
         }
     }
-    let _ = Gates::cleanup(project_root, state.phase, Stage::Validate);
-    let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+    let _ = Gates::close(project_root, state.phase, Stage::Validate);
+    let _ = Gates::close(project_root, state.phase, Stage::Ship);
     workflow::clear_state(project_root, state.phase)?;
     // 23b: the workflow is genuinely over — deregister this (project_root,
     // phase) from the machine-global registry so `devflow gate list
@@ -385,7 +385,7 @@ fn gate_wait_call(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
-    gate_id: &gates::GateId,
+    gate_id: &GateId,
     timeout_secs: u64,
 ) -> Result<GateWaitEnd, CliError> {
     let wait = || {
@@ -658,9 +658,9 @@ pub(crate) fn run_gate_with_timeout(
 /// Abort the workflow with a reason, clearing state.
 pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<(), CliError> {
     println!("workflow aborted for phase {}: {reason}", state.phase);
-    // See CR-01: without this, a stale response/ack for this phase+stage
-    // survives on disk and is silently reused if the gate fires again later.
-    let _ = Gates::cleanup(project_root, state.phase, state.stage);
+    // See CR-01: an answer for this phase+stage must not outlive the run. An unused
+    // one is set aside, never deleted.
+    let _ = Gates::close(project_root, state.phase, state.stage);
     let _ = workflow::clear_state(project_root, state.phase);
     // 23b: an abort also ends the workflow — deregister the same as the
     // success path so an aborted phase does not linger in the registry.
@@ -674,36 +674,32 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
     Ok(())
 }
 
-/// Manual ship override (20e, D-01): a second, out-of-process consumer of
-/// the SAME on-disk Ship gate response `run_gate`'s live blocking poll
-/// consumes. `devflow gate approve` only WRITES a response file
-/// (`Gates::respond`) — a live monitor polling `Gates::poll_response` is
-/// what actually advances the workflow. If that monitor died before
-/// consuming the response, the approval sits unconsumed forever; this
-/// function reads the already-written response directly and, on
-/// `GateAction::Advance`, drives the SAME `finish_workflow` the live poll
-/// loop would have called (D-01) — not a reimplementation of the after-ship
-/// hook batch.
+/// Manual ship override (20e, D-01): a second, out-of-process consumer of the same
+/// Ship answer `run_gate`'s live wait consumes. `devflow gate approve` only WRITES an
+/// answer (`Gates::answer`); a live monitor waiting on the gate is what normally
+/// advances the workflow. If that monitor died before consuming the answer, the
+/// approval sits unconsumed forever; this function reads the answer directly, claims
+/// it, and on `GateAction::Advance` drives the SAME `finish_workflow` the live wait
+/// would have called (D-01) — not a reimplementation of the after-ship hook batch.
 ///
-/// Guard order (D-02, review: Codex HIGH + MEDIUM, Hermes ack-race):
-/// 1. Acquire the per-phase lock ([`lock::acquire`]) BEFORE touching state,
-///    so this can never race a still-live monitor's `poll_response` — the
-///    exact idiom [`crate::pipeline_launch::resume`] uses.
-/// 2. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is
-///    refused, naming the stage to resolve first.
-/// 3. Both the Ship gate REQUEST (`Gates::gate_path`) and RESPONSE
-///    (`Gates::response_path`) must exist on disk.
-/// 4. The ACK (`Gates::ack_path`) must be ABSENT — its presence means a
-///    (now-dead) monitor already consumed this response and may have died
-///    mid-`finish_workflow`; re-running the terminal hooks in that state
-///    would risk a double-run, so this refuses and directs the operator to
-///    `devflow doctor` instead.
+/// Guard order (D-02, D-04):
+/// 1. Acquire the per-phase lock ([`lock::acquire`]) BEFORE touching state, the idiom
+///    [`crate::pipeline_launch::resume`] uses.
+/// 2. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
+///    the stage to resolve first.
+/// 3. The live Ship gate must hold an answer bound to its id. A file that does not bind
+///    is refused and left where it is: this command reads and moves nothing (R-09).
+/// 4. The answer must be claimed before anything acts on it. A claim already there means
+///    another consumer took it and may have died mid-`finish_workflow`, and any claim
+///    error (the gate closed or was replaced since this command read it, R-08, or its
+///    lock was held too long) means nothing was consumed. All of them refuse here, so
+///    no claim error reaches `finish_workflow`, `loop_back_to_code` or `abort`.
 ///
 /// `force` is accepted and echoed in the CLI output for explicit operator
 /// auditability (Hermes LOW: make `--force` semantics explicit), but is
 /// deliberately NOT consulted by any guard above — D-02 scopes `--force` to
 /// "skip Ship-gate re-verification," never to bypassing the stage, lock,
-/// gate-existence, or ack checks themselves. This design has no separate
+/// gate-existence, or claim checks themselves. This design has no separate
 /// Ship-gate re-verification step beyond those four guards, so `--force`
 /// currently changes no observable behavior; it exists so the flag is never
 /// silently ignored and cannot later be wired to widen scope without an
@@ -734,30 +730,7 @@ pub(crate) fn ship_override(
         )));
     }
 
-    if !Gates::gate_path(project_root, phase, Stage::Ship).exists()
-        || !Gates::response_path(project_root, phase, Stage::Ship).exists()
-    {
-        return Err(CliError::Message(format!(
-            "phase {phase}: no Ship gate response written yet — nothing to ship (a dead monitor \
-             never wrote or received one; wait for `devflow gate approve` or resolve the pipeline first)"
-        )));
-    }
-
-    if Gates::ack_path(project_root, phase, Stage::Ship).exists() {
-        return Err(CliError::Message(format!(
-            "phase {phase}: the Ship gate response was already consumed (an ack file is present) \
-             — the phase may be mid-finalization from a monitor that died partway through; run \
-             `devflow doctor` to inspect it rather than re-running terminal hooks"
-        )));
-    }
-
-    let response_path = Gates::response_path(project_root, phase, Stage::Ship);
-    let contents = std::fs::read_to_string(&response_path).map_err(|err| {
-        CliError::Message(format!("could not read the Ship gate response: {err}"))
-    })?;
-    let response: GateResponse = serde_json::from_str(&contents).map_err(|err| {
-        CliError::Message(format!("could not parse the Ship gate response: {err}"))
-    })?;
+    let response = claim_ship_answer(project_root, phase)?;
 
     println!(
         "phase {phase}: manual ship override (--force={force}) — driving the already-written \
@@ -799,6 +772,64 @@ pub(crate) fn ship_override(
             )
         }
         GateAction::Abort(reason) => abort(project_root, &state, &reason),
+    }
+}
+
+/// Read the live Ship gate's answer and claim it: guards 3 and 4 of [`ship_override`].
+/// Every refusal here consumes nothing.
+fn claim_ship_answer(project_root: &Path, phase: PhaseId) -> Result<GateResponse, CliError> {
+    let stage = Stage::Ship;
+    let no_answer = || {
+        CliError::Message(format!(
+            "phase {phase}: no Ship gate response written yet — nothing to ship (a dead monitor \
+             never wrote or received one; wait for `devflow gate approve` or resolve the pipeline first)"
+        ))
+    };
+    let gate_id = crate::commands::gate_file_id(project_root, phase, stage)?
+        .ok_or_else(no_answer)
+        .and_then(|id| {
+            GateId::parse(&id).map_err(|_| {
+                CliError::Message(format!(
+                    "phase {phase}: the Ship gate file has no valid gate id, so no answer can \
+                     bind to it; nothing was consumed. Run `devflow doctor`"
+                ))
+            })
+        })?;
+    let answer = match Gates::read_answer(project_root, phase, stage, &gate_id) {
+        AnswerRead::None => return Err(no_answer()),
+        AnswerRead::Unbound(reason) => {
+            return Err(CliError::Message(format!(
+                "phase {phase}: the file in Ship gate {gate_id}'s answer slot does not bind to it \
+                 ({reason}); nothing was consumed. `devflow gate approve` or `devflow gate reject` \
+                 sets that file aside before publishing a valid answer"
+            )));
+        }
+        AnswerRead::Bound(answer) => answer,
+    };
+    let claim = Gates::claim(project_root, phase, stage, &gate_id);
+    #[cfg(test)]
+    note_claim(&claim);
+    match claim {
+        Ok(Claim::Claimed) => Ok(answer.response),
+        Ok(Claim::AlreadyConsumed) => Err(CliError::Message(format!(
+            "phase {phase}: the Ship gate response was already consumed (gate {gate_id} has a \
+             claim) — the phase may be mid-finalization from a monitor that died partway through; \
+             run `devflow doctor` to inspect it rather than re-running terminal hooks"
+        ))),
+        Err(GateError::NoOpenGate { .. } | GateError::GateIdMismatch { .. }) => {
+            Err(CliError::Message(format!(
+                "phase {phase}: the Ship gate {gate_id} this command read was closed or replaced \
+                 before it could be claimed; nothing was consumed. Run `devflow status`"
+            )))
+        }
+        Err(GateError::GateLockTimeout { waited, .. }) => Err(CliError::Message(format!(
+            "phase {phase}: could not take the gate lock to claim Ship gate {gate_id} within \
+             {waited:?}; nothing was consumed. Run `devflow ship` again"
+        ))),
+        Err(err) => Err(CliError::Message(format!(
+            "phase {phase}: could not claim Ship gate {gate_id}'s answer; nothing was consumed: \
+             {err}"
+        ))),
     }
 }
 
@@ -1355,7 +1386,7 @@ mod tests {
     /// reopens the loser's Ship gate for human review (`finish_workflow`'s
     /// retry loop) — but only ONE gate response was ever pre-written per
     /// phase (consumed by its first gate open), so the reopened gate has
-    /// nothing to consume. Unbounded, `Gates::poll_response` then polls the
+    /// nothing to consume. Unbounded, the gate wait then waits on the
     /// 7-day production default (`DEVFLOW_GATE_TIMEOUT_SECS`) with no
     /// response ever arriving — that is the wedge this plan closes.
     ///
@@ -1382,7 +1413,7 @@ mod tests {
         // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
         // poll to a few seconds instead of the 7-day production default.
         // Every OTHER test that reaches `run_gate` pre-writes its response
-        // before calling in, so `poll_response` finds it on the very first
+        // before calling in, so the wait finds it on the very first
         // read regardless of this value — only a *reopened*, unanswered
         // gate (this test's race-loser path) ever actually waits it out.
         unsafe {
@@ -1490,7 +1521,7 @@ mod tests {
     /// Regression test for CR-01: `abort()` must clean up the gate's
     /// response/ack files for the stage the gate actually fired on. Without
     /// that cleanup, a later gate for the same phase+stage would find the
-    /// old, already-consumed response still on disk and `poll_response`
+    /// old, already-consumed response still on disk and the gate wait
     /// would resolve from it instantly instead of waiting for a fresh human
     /// decision.
     ///
@@ -1500,7 +1531,7 @@ mod tests {
     /// reset-vs-accumulate change reset the directly-seeded streak to 1, so no
     /// gate fired and the test fell through to a real agent launch while every
     /// gate-file assertion it owned still passed (`prepare_loop_back_to_code`
-    /// calls the same `Gates::cleanup` that `abort()` does).
+    /// calls the same `Gates::close` that `abort()` does).
     #[test]
     fn abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response() {
         const NAME: &str = "pipeline_gate::tests::abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response";
@@ -1670,10 +1701,10 @@ mod tests {
     }
 
     /// 20e Task 1: the tracer end-to-end case — a phase parked at
-    /// `Stage::Ship` with a REQUEST + RESPONSE (approved) written via
-    /// `Gates::respond`, no ack, and no live process polling. `ship_override`
-    /// must reach the SAME terminal state `finish_workflow` produces: state
-    /// cleared, gate/response/ack files gone, `workflow_finished` emitted.
+    /// `Stage::Ship` with a gate and its approved answer, no claim, and no live
+    /// process waiting. `ship_override` must reach the SAME terminal state
+    /// `finish_workflow` produces: state cleared, gate, answer and claim files gone,
+    /// `workflow_finished` emitted.
     #[test]
     fn ship_override_advances_via_written_response() {
         let dir = tempfile::tempdir().unwrap();
