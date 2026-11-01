@@ -5010,4 +5010,169 @@ mod tests {
             assert!(timeout.contains(needle), "{needle}: {timeout}");
         }
     }
+
+    // ---- The keyed protocol is the only one ----
+
+    /// The declarations D-05 deleted: each could read or write the single per-stage
+    /// answer slot, or delete an unconsumed answer.
+    const UNKEYED_API: [&str; 9] = [
+        "fn response_path(",
+        "fn ack_path(",
+        "fn respond(",
+        "fn reap(",
+        "fn poll_response(",
+        "fn poll_response_cancellable(",
+        "fn ack(",
+        "fn cleanup(",
+        "fn cleanup_with_partial_result(",
+    ];
+
+    fn non_test_code_lines(source: &str) -> Vec<(usize, &str)> {
+        source
+            .lines()
+            .enumerate()
+            .take_while(|(_, line)| *line != "mod tests {")
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .map(|(index, line)| (index + 1, line))
+            .collect()
+    }
+
+    fn unkeyed_api_violations(source: &str) -> Vec<String> {
+        let mut violations = Vec::new();
+        for (number, line) in non_test_code_lines(source) {
+            for declaration in UNKEYED_API {
+                if line.contains(declaration) {
+                    violations.push(format!("line {number}: {declaration}"));
+                }
+            }
+        }
+        violations
+    }
+
+    /// D-05: with these gone, a caller reaching for the unkeyed slot is a compile
+    /// error, and this scan fails if one is declared again.
+    #[test]
+    fn the_unkeyed_gate_api_and_its_bridge_are_gone() {
+        let source = include_str!("gates.rs");
+        assert!(
+            source.lines().any(|line| line == "mod tests {"),
+            "the scan stops at this line, so it must exist"
+        );
+        assert!(
+            non_test_code_lines(source)
+                .iter()
+                .any(|(_, line)| line.contains("pub fn open_gate(")),
+            "the scan must read the keyed API's declarations"
+        );
+        assert_eq!(unkeyed_api_violations(source), Vec::<String>::new());
+
+        assert_eq!(
+            unkeyed_api_violations("impl Gates {\n    pub fn cleanup(root: &Path) {}\n}\n"),
+            ["line 2: fn cleanup("]
+        );
+        assert_eq!(
+            unkeyed_api_violations("impl Gates {\n    // pub fn cleanup(root: &Path) {}\n}\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unkeyed_api_violations("mod tests {\n    pub fn respond(root: &Path) {}\n}\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The unkeyed name, written by a run from before gate ids.
+    fn plant_legacy_answer(root: &Path, phase: PhaseId, stage: Stage) -> (PathBuf, Vec<u8>) {
+        let path = Gates::dir(root).join(format!("{}-{stage}.response.json", phase.padded()));
+        let body = serde_json::to_vec(&approved()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &body).unwrap();
+        (path, body)
+    }
+
+    fn quarantine_reasons(root: &Path) -> Vec<String> {
+        events_named(root, "gate_answer_quarantined")
+            .iter()
+            .map(|event| event["reason"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// D-05, R-09: a legacy answer decides nothing, whichever side of the open it
+    /// landed on. The wait reads only its own gate's slot and moves nothing, the
+    /// listing is not hidden by it, and only an open or a close sets it aside.
+    #[test]
+    fn a_legacy_unkeyed_answer_is_set_aside_and_never_read() {
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+
+        let before_open = tempfile::tempdir().unwrap();
+        let (path, body) = plant_legacy_answer(before_open.path(), phase, stage);
+        let gate = Gates::open_gate(before_open.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        assert!(!path.exists(), "the open sets the legacy answer aside");
+        assert_eq!(quarantine_reasons(before_open.path()), ["legacy_unkeyed"]);
+        let set_aside = quarantine_files(before_open.path());
+        assert_eq!(set_aside.len(), 1);
+        assert_eq!(std::fs::read(&set_aside[0]).unwrap(), body);
+        assert_eq!(
+            Gates::read_answer(before_open.path(), phase, stage, &gate),
+            AnswerRead::None
+        );
+
+        let after_open = tempfile::tempdir().unwrap();
+        let live = Gates::open_gate(after_open.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let (path, body) = plant_legacy_answer(after_open.path(), phase, stage);
+        let open = Gates::list_open(after_open.path());
+        assert_eq!(open.len(), 1, "a legacy answer does not hide the gate");
+        assert_eq!(open[0].gate_id, live.as_str());
+        assert_eq!(
+            Gates::await_answer(after_open.path(), phase, stage, &live, 2, || false),
+            AwaitOutcome::TimedOut,
+            "a legacy approval is never this gate's answer"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body,
+            "R-09: a wait moves nothing"
+        );
+        assert!(quarantine_files(after_open.path()).is_empty());
+
+        let report = Gates::close(after_open.path(), phase, stage).unwrap();
+        assert!(!path.exists(), "the close sets the legacy answer aside");
+        assert_eq!(report.quarantined.len(), 1);
+        assert_eq!(std::fs::read(&report.quarantined[0]).unwrap(), body);
+        assert_eq!(quarantine_reasons(after_open.path()), ["legacy_unkeyed"]);
+    }
+
+    /// Phase 50 D-20: an id-less gate file has no reader. The gate at the other stage
+    /// is the control: it would be missing too if the listing were simply broken.
+    #[test]
+    fn a_gate_file_without_an_id_is_not_listed_as_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(7);
+        let listed = Gates::open_gate(dir.path(), phase, Stage::Validate, "listed")
+            .unwrap()
+            .gate_id;
+        let mut idless = serde_json::to_value(GateFile {
+            phase,
+            stage: Stage::Code,
+            context: "no id".into(),
+            timestamp: "1750000000".into(),
+            gate_id: GateId::new().to_string(),
+        })
+        .unwrap();
+        assert!(idless.as_object_mut().unwrap().remove("gate_id").is_some());
+        std::fs::write(
+            Gates::gate_path(dir.path(), phase, Stage::Code),
+            idless.to_string(),
+        )
+        .unwrap();
+
+        let open = Gates::list_open(dir.path());
+
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].stage, Stage::Validate);
+        assert_eq!(open[0].gate_id, listed.as_str());
+    }
 }
