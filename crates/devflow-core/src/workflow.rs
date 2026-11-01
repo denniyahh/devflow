@@ -8,7 +8,9 @@
 
 use crate::phase_id::PhaseId;
 use crate::state::State;
-use std::fs::File;
+#[cfg(any(test, feature = "test-support"))]
+use std::fs::TryLockError;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +38,14 @@ pub enum WorkflowError {
     /// No active state file exists.
     #[error("no active DevFlow state at {0}")]
     MissingState(PathBuf),
+    /// A closure returned a state for another phase than the one it was given.
+    #[error("the state to write is for phase {found}, not phase {expected}")]
+    PhaseMismatch {
+        /// The phase whose state file is being written.
+        expected: PhaseId,
+        /// The phase the returned state names.
+        found: PhaseId,
+    },
 }
 
 /// What [`update_state_with`] found on disk, read under the write lock.
@@ -259,22 +269,92 @@ pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, Workflow
     Ok(serde_json::from_str(&contents)?)
 }
 
-/// Read the state and hand it to `apply`.
+/// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.
+///
+/// DevFlow never replaces or removes it, because a `flock` belongs to an inode
+/// and `state-NN.json` is replaced on every write (D-08). Its name does not start
+/// with `lock-`, so `lock.rs`'s stale-lock sweep leaves it alone.
+fn state_lock_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!(
+        ".{STATE_FILE_PREFIX}{padded}.lock",
+        padded = phase.padded()
+    ))
+}
+
+/// A held state write lock. Dropping it closes the file, which is the only way
+/// the lock ends: an explicit release would drop it for every duplicate of the
+/// descriptor, including one a forked child has not closed yet.
+struct WriteLock {
+    _file: File,
+}
+
+/// Take the phase's state write lock, waiting for as long as it is held.
+///
+/// The descriptor is close-on-exec, as std opens every file, so a process spawned
+/// while this is held does not keep the lock.
+fn lock_for_write(project_root: &Path, phase: PhaseId) -> Result<WriteLock, WorkflowError> {
+    ensure_devflow_dir(&devflow_dir(project_root))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_lock_path(project_root, phase))?;
+    // `flock` returns EINTR when a signal handler without SA_RESTART runs.
+    loop {
+        match file.lock() {
+            Ok(()) => return Ok(WriteLock { _file: file }),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// [`update_state`] for a caller that must see what is on disk before deciding,
+/// such as one that creates a missing state: check and write are one step under
+/// the write lock. `apply` returns the state to write, or `None` to write nothing,
+/// and a value for the caller.
+///
+/// `apply` runs with the lock held, under the same contract as [`update_state`].
 pub fn update_state_with<T, E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
     apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
 ) -> Result<T, E> {
+    let _lock = lock_for_write(project_root, phase)?;
     let existing = match load_state(project_root, phase) {
         Ok(state) => Existing::Loaded(state),
         Err(WorkflowError::MissingState(_)) => Existing::Missing,
         Err(error) => Existing::Unloadable(error),
     };
-    let (_next, value) = apply(existing)?;
+    let (next, value) = apply(existing)?;
+    if let Some(state) = next {
+        if state.phase != phase {
+            return Err(WorkflowError::PhaseMismatch {
+                expected: phase,
+                found: state.phase,
+            }
+            .into());
+        }
+        let contents = serde_json::to_string_pretty(&state).map_err(WorkflowError::from)?;
+        write_state_atomic(&state_path(project_root, phase), &contents)?;
+    }
     Ok(value)
 }
 
-/// Apply `apply` to the state on disk, returning the committed state.
+/// Change the state on disk: take the phase's write lock, re-read the state, run
+/// `apply` on it, write the result durably, and release the lock (D-08). Returns
+/// the committed state and `apply`'s value. A missing state is
+/// [`WorkflowError::MissingState`], and an unreadable one is its load error;
+/// neither runs `apply`. An error from `apply` writes nothing.
+///
+/// `apply` sets only the fields its caller changes. Assigning a whole copy loaded
+/// earlier brings back the lost update this function exists to remove.
+///
+/// `apply` runs with the lock held, so it must be short: it must not spawn a
+/// process, wait on a gate or an agent, or take another lock. That includes this
+/// lock: calling this or [`clear_state`] for the same phase from inside `apply`
+/// deadlocks.
 pub fn update_state<T, E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
@@ -293,10 +373,22 @@ pub fn update_state<T, E: From<WorkflowError>>(
     })
 }
 
-/// Whether the phase's state write lock is free.
+/// Whether the phase's state write lock is free, asked through a separate open.
+/// A lock file that does not exist yet is free. For tests only: a fork in another
+/// thread can keep a just-released lock busy until its exec.
 #[cfg(any(test, feature = "test-support"))]
-pub fn write_lock_is_free(_project_root: &Path, _phase: PhaseId) -> bool {
-    true
+pub fn write_lock_is_free(project_root: &Path, phase: PhaseId) -> bool {
+    let path = state_lock_path(project_root, phase);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(error) => panic!("open {}: {error}", path.display()),
+    };
+    match file.try_lock() {
+        Ok(()) => true,
+        Err(TryLockError::WouldBlock) => false,
+        Err(TryLockError::Error(error)) => panic!("try_lock {}: {error}", path.display()),
+    }
 }
 
 /// Enumerate every active phase state, sorted by phase number.
@@ -377,6 +469,8 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
 /// Remove a phase's persisted state if present, with a legacy single-slot
 /// file naming the same phase and orphaned write temps. Returns whether this
 /// call removed any file, so a caller can report only what it cleaned.
+///
+/// Takes the write lock, so a removal never interleaves with an update.
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
     let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, false);
     result.map(|()| removed)
@@ -396,6 +490,15 @@ fn clear_state_with_partial_result_impl(
     phase: PhaseId,
     report_temp_removal_failure: bool,
 ) -> (bool, Result<(), WorkflowError>) {
+    // Nothing to remove, so no lock file to leave behind in a project DevFlow has
+    // not touched.
+    if !devflow_dir(project_root).exists() {
+        return (false, Ok(()));
+    }
+    let _lock = match lock_for_write(project_root, phase) {
+        Ok(lock) => lock,
+        Err(error) => return (false, Err(error)),
+    };
     let path = state_path(project_root, phase);
     let mut removed = false;
     if path.exists() {
@@ -691,6 +794,44 @@ mod tests {
             "got {error}"
         );
         assert!(!state_path(dir.path(), phase).exists());
+    }
+
+    #[test]
+    fn clear_state_in_a_project_without_a_devflow_dir_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!clear_state(dir.path(), PhaseId::new(50)).expect("clear"));
+
+        assert!(!devflow_dir(dir.path()).exists());
+    }
+
+    #[test]
+    fn clear_state_waits_for_a_write_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(50);
+        save_state(&state_in(root, phase, Stage::Code)).unwrap();
+        let log = std::sync::Mutex::new(Vec::new());
+        let (entered, writer_is_inside) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                update_field(root, phase, |_| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    log.lock().unwrap().push("write end");
+                });
+            });
+            writer_is_inside.recv().unwrap();
+            assert!(clear_state(root, phase).expect("clear"));
+            log.lock().unwrap().push("clear end");
+        });
+
+        assert_eq!(*log.lock().unwrap(), ["write end", "clear end"]);
+        assert!(
+            !state_path(root, phase).exists(),
+            "the writer finished first, so the clear has the last word"
+        );
     }
 
     #[test]
