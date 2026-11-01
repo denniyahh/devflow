@@ -91,6 +91,17 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       can still be lost: an accepted gap that 50.1 shrinks from a multi-day wait to one write and
       does not close (D-08).
 
+- [ ] **SURV-04**: A gate answer decides only the gate it names. Each gate carries a fresh gate id;
+      an answer with a missing or different id is refused loudly and set aside under a quarantine
+      name, never consumed and never silently deleted, and a valid answer to the live gate is then
+      accepted. A `resume` rerun opens a new gate id and reports any unused answer. A late Ship
+      answer still works through `devflow ship`, through one exclusive consumption claim. A
+      Supervise re-scan rejection waits for its own follow-on answer.
+      *Traces to 999.130 (part 4), AR-48-04, the T-48-12-05 caveat and Phase 50 crash-table row D2.*
+      Acceptance: ROADMAP 50.1 criterion 4.
+      Decisions: D-04 (Claude, remit); D-05, D-06 and D-07 (Operator). Within D-05, setting a
+      refused answer aside rather than leaving it in the slot is Claude (remit).
+
 ### Checkpoint Consistency (CHKPT)
 
 - [x] **CHKPT-01**: Preflight and the resume route use one parsed checkpoint predicate; a marker
@@ -154,6 +165,41 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       agents; otherwise → `write_rate_limit_cron`.
       **Re-test the SUPV-01 dependency rather than assuming it.**
 
+- [ ] **SUPV-03**: A supervisor that is live but whose record was never saved is never joined by a
+      second one. The launcher records a pending supervisor, separate from the recorded one, under
+      the write lock before it spawns, probeable through a per-launch liveness lock before its
+      socket exists. `start` and `resume` check and reserve in one step and refuse over it, naming
+      `devflow stop`. `status` and `stop` never suggest `devflow resume` while it is live. An
+      abandoned reservation does not block a launch and is cleared by the next launch or `stop`. An
+      orphaned pending supervisor ends itself when its promotion wait expires. A foreground `start`
+      or `resume` before its spawn, `devflow ship` and a hand-run `advance` hold a per-phase holder
+      file that `stop` signals after an identity check.
+      *Traces to T-50-90 and T-50-91 (Phase 50 crash-table rows A7 and C4).*
+      Acceptance: ROADMAP 50.1 criteria 1 and 2.
+      Decisions: D-01, D-02, D-15 and D-17 (Operator). Within D-01, the per-launch liveness lock and
+      the one-step check-and-reserve are Claude (remit, from the review).
+      Also carried here, decided after this ID mapping was drawn: D-18 (Operator: a stop never lands
+      inside a `devflow ship` finalization hook) and D-19 (Operator: `stop` and `status` name an
+      orphaned agent honestly).
+
+- [ ] **SUPV-04**: A supervisor whose launch id is not the recorded one writes no state, ack or gate
+      cleanup, consumes no gate answer and spawns no next stage. It ends its agent group and logs
+      why. The recorded supervisor writes normally.
+      *Traces to 999.130 (part 3).*
+      Acceptance: ROADMAP 50.1 criterion 5.
+      Decisions: D-03 (Operator). Extending the fence past state writes to answers, acks, gate
+      cleanup and the next-stage spawn is Claude (remit, from the review).
+
+- [ ] **SUPV-05**: The eight open Phase 50 code-review residuals (999.166 items 1, 2 and 4-9) are
+      each fixed with a test that fails before the fix, or accepted with a reason the operator has
+      approved (D-13; item 6 is fixed, not accepted, D-16). One full Phase 49-rig run reaches Ship
+      on the 50.1 binary, with the Phase 50 fault arm re-run.
+      *Traces to 999.166.*
+      Acceptance: ROADMAP 50.1 criterion 6.
+      Decisions: D-12, D-13 and D-16 (Operator).
+      **Not established:** one run is a smoke check of the seams, not a reliability bound, and
+      proves nothing about durability, ownership races or stale answers (D-12).
+
 ### Test Infrastructure (INFRA)
 
 - [x] **INFRA-01**: CI runs a job that reproduces the sequential `fmt → clippy → test` load shape
@@ -215,13 +261,17 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Complete |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Complete |
+| SUPV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
+| SUPV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
+| SUPV-05 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
 | SURV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
+| SURV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**
 
-- v3.0.0 requirements: 13 total
-- Mapped to phases: 13
+- v3.0.0 requirements: 18 total
+- Mapped to phases: 18
 - Unmapped: 0 ✓
 - Duplicates (a requirement owned by more than one phase): 0 ✓
 
@@ -239,5 +289,5 @@ records an observation, it does not take ownership:
 
 ---
 *Requirements defined: 2026-09-03*
-*Last updated: 2026-09-03 after the v3.0.0 roadmap was created — 10/10 requirements mapped
-across 6 phases (46-51), 5 waves.*
+*Last updated: 2026-11-01 after Phase 50.1's IDs were assigned (SUPV-03, SUPV-04, SUPV-05,
+SURV-03, SURV-04) — 18/18 requirements mapped across 7 phases (46-51 plus inserted 50.1), 5 waves.*
