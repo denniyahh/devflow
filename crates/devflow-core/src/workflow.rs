@@ -89,16 +89,23 @@ fn find_devflow_marker(dir: &Path) -> Option<PathBuf> {
 /// `.devflow` ancestor at all. Do not confuse the two.
 ///
 /// Contract:
-/// 1. `create_dir_all(dir)` — create `dir` and all missing parents.
-/// 2. Find the shallowest `.devflow` path component (see
+/// 1. Find the shallowest `.devflow` path component (see
 ///    [`find_devflow_marker`]).
+/// 2. Create that component, then `dir`, with all missing parents, through
+///    [`crate::durable::create_dir_all_durably`]. Each returns having fsynced the
+///    parent of the directory it was given, even when it already existed, so no
+///    writer returns success on an entry another process has not synced (R2-08).
+///    That costs one directory fsync per call, two when `dir` is below `.devflow`.
 /// 3. If found, write `<marker>/.gitignore` with the bytes `*\n`, using
 ///    `create_new(true)` so an existing file — whatever its content — is left
 ///    untouched; a lost race against a concurrent creator surfaces as
 ///    `AlreadyExists`, which this function maps to `Ok(())`. Any other I/O
 ///    error propagates via `?`.
-/// 4. If no `.devflow` component exists, this function is exactly equivalent
-///    to `create_dir_all`.
+/// 4. If no `.devflow` component exists, this function only creates `dir`
+///    durably.
+///
+/// The marker takes no temp file and no file fsync (R-15): this runs on every
+/// state write, and `.gitignore` is not a state or gate record.
 ///
 /// Returns `std::io::Result<()>`, not a crate-specific error enum: this
 /// plan's seven conversion sites each live in a different module with their
@@ -107,16 +114,19 @@ fn find_devflow_marker(dir: &Path) -> Option<PathBuf> {
 /// `Io(#[from] std::io::Error)` variant, so `?` converts at every call site
 /// with zero signature churn.
 ///
-/// **Deleted-marker note:** if `.devflow/.gitignore` is deleted after
-/// creation, subsequent calls will not recreate it — the protection is
-/// established once per directory lifetime. Recreating a deleted marker
-/// would violate the rule that this function must never overwrite an
-/// existing `.gitignore` a user or another tool may own, and it cannot
-/// distinguish "user deleted it" from "never created."
+/// **Deleted-marker note:** if `.devflow/.gitignore` is deleted, or lost to a
+/// crash, the next call recreates it, because `create_new(true)` succeeds on a
+/// missing file. An existing file is never overwritten, whatever its content.
 pub fn ensure_devflow_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    let marker = find_devflow_marker(dir);
+    if let Some(marker_dir) = marker.as_deref()
+        && marker_dir != dir
+    {
+        crate::durable::create_dir_all_durably(marker_dir)?;
+    }
+    crate::durable::create_dir_all_durably(dir)?;
 
-    let Some(marker_dir) = find_devflow_marker(dir) else {
+    let Some(marker_dir) = marker else {
         return Ok(());
     };
 
@@ -170,7 +180,7 @@ fn migrate_legacy_state(project_root: &Path) {
             "per-phase state already exists for phase {} — dropping stale legacy file",
             state.phase
         );
-    } else if let Err(err) = std::fs::rename(&legacy, &target) {
+    } else if let Err(err) = crate::durable::rename_durably(&legacy, &target) {
         warn!(
             "could not migrate legacy state to {}: {err}",
             target.display()
@@ -180,7 +190,7 @@ fn migrate_legacy_state(project_root: &Path) {
         debug!("migrated legacy state.json to {}", target.display());
         return;
     }
-    let _ = std::fs::remove_file(&legacy);
+    let _ = crate::durable::remove_durably(&legacy);
 }
 
 /// Save workflow state to `.devflow/state-{NN}.json`, keyed by `state.phase`.
@@ -303,9 +313,11 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
         // Parsable: the normal migration path owns it.
         return Ok(false);
     }
-    std::fs::remove_file(&legacy)?;
-    warn!("removed unparsable legacy state at {}", legacy.display());
-    Ok(true)
+    let removed = crate::durable::remove_durably(&legacy)?;
+    if removed {
+        warn!("removed unparsable legacy state at {}", legacy.display());
+    }
+    Ok(removed)
 }
 
 /// Remove a phase's persisted state if present, with a legacy single-slot
@@ -334,10 +346,10 @@ fn clear_state_with_partial_result_impl(
     let mut removed = false;
     if path.exists() {
         debug!("clearing state at {}", path.display());
-        if let Err(error) = std::fs::remove_file(&path) {
-            return (removed, Err(error.into()));
+        match crate::durable::remove_durably(&path) {
+            Ok(was_removed) => removed |= was_removed,
+            Err(error) => return (removed, Err(error.into())),
         }
-        removed = true;
     }
     // A legacy single-slot file for this phase is the same state under its
     // old name — clearing must not leave it behind to be re-migrated.
@@ -346,10 +358,10 @@ fn clear_state_with_partial_result_impl(
         && let Ok(state) = serde_json::from_str::<State>(&contents)
         && state.phase == phase
     {
-        if let Err(error) = std::fs::remove_file(&legacy) {
-            return (removed, Err(error.into()));
+        match crate::durable::remove_durably(&legacy) {
+            Ok(was_removed) => removed |= was_removed,
+            Err(error) => return (removed, Err(error.into())),
         }
-        removed = true;
     }
     let temp_prefix = format!(
         ".{}.",
@@ -363,8 +375,8 @@ fn clear_state_with_partial_result_impl(
                 continue;
             }
             let temp = entry.path();
-            match std::fs::remove_file(&temp) {
-                Ok(()) => removed = true,
+            match crate::durable::remove_durably(&temp) {
+                Ok(was_removed) => removed |= was_removed,
                 Err(error) if report_temp_removal_failure => {
                     return (
                         removed,
@@ -613,7 +625,9 @@ mod tests {
                 entry,
                 Synced::File(temp) if {
                     let name = temp.file_name().unwrap().to_string_lossy();
-                    name.starts_with(".gitignore.") && name.ends_with(".tmp")
+                    // The shared temp shape `.{name}.{pid}.{n}.tmp`, for a name
+                    // that itself starts with a dot.
+                    name.starts_with("..gitignore.") && name.ends_with(".tmp")
                 }
             )),
             "the publish syncs a temp: {synced:?}"

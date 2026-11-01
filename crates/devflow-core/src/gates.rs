@@ -9,19 +9,16 @@
 //! - `NN-{stage}.ack.json` — DevFlow's receipt (a [`GateAck`]) so the poller can
 //!   clean up.
 //!
-//! Writes are atomic (write-to-temp + rename) so a reader never sees a partial
-//! file. Polling uses exponential backoff so a long human wait costs little.
+//! Writes are atomic and fsynced (`crate::durable`) so a reader never sees a
+//! partial file and a power loss cannot lose a published one. Polling uses exponential backoff so a long human wait costs little.
 
 use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
-
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The gate request DevFlow writes when it pauses for a human decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,10 +380,10 @@ impl Gates {
         let mut removed = false;
         for path in &paths {
             if path.exists() {
-                if let Err(error) = std::fs::remove_file(path) {
-                    return (removed, Err(error.into()));
+                match crate::durable::remove_durably(path) {
+                    Ok(was_removed) => removed |= was_removed,
+                    Err(error) => return (removed, Err(error.into())),
                 }
-                removed = true;
             }
         }
         let dir = Self::dir(project_root);
@@ -410,10 +407,10 @@ impl Gates {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.ends_with(".tmp") && prefixes.iter().any(|prefix| name.starts_with(prefix)) {
-                if let Err(error) = std::fs::remove_file(entry.path()) {
-                    return (removed, Err(error.into()));
+                match crate::durable::remove_durably(&entry.path()) {
+                    Ok(was_removed) => removed |= was_removed,
+                    Err(error) => return (removed, Err(error.into())),
                 }
-                removed = true;
             }
         }
         (removed, Ok(()))
@@ -545,46 +542,21 @@ fn publish_response_exclusive(
     if let Some(parent) = path.parent() {
         crate::workflow::ensure_devflow_dir(parent)?;
     }
-    let (tmp, mut file) = crate::workflow::create_unique_temp(path, std::process::id(), &TEMP_SEQ)?;
-    if let Err(error) = std::io::Write::write_all(&mut file, contents.as_bytes()) {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    drop(file);
-
-    let publish = std::fs::hard_link(&tmp, path);
-    let cleanup = std::fs::remove_file(&tmp);
-    match publish {
-        Ok(()) => cleanup.map_err(GateError::Io),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = cleanup;
+    match crate::durable::publish_exclusive_durably(path, contents.as_bytes())? {
+        crate::durable::Publication::Published => Ok(()),
+        crate::durable::Publication::AlreadyExists => {
             Err(GateError::AlreadyResponded { phase, stage })
-        }
-        Err(error) => {
-            let _ = cleanup;
-            Err(error.into())
         }
     }
 }
 
-/// Write `contents` to `path` atomically: write a temp file in the same
-/// directory, then rename over the target so readers never see a partial write.
+/// Write `contents` to `path` through [`crate::durable::replace_durably`], so
+/// readers never see a partial write and a power loss cannot lose the rename.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), GateError> {
     if let Some(parent) = path.parent() {
         crate::workflow::ensure_devflow_dir(parent)?;
     }
-    let (tmp, mut file) = crate::workflow::create_unique_temp(path, std::process::id(), &TEMP_SEQ)?;
-    if let Err(error) = std::io::Write::write_all(&mut file, contents.as_bytes()) {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    drop(file);
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error.into());
-    }
+    crate::durable::replace_durably(path, contents.as_bytes())?;
     Ok(())
 }
 
