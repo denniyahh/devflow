@@ -180,8 +180,8 @@ pub(crate) fn launch_stage_inner(
     // it — that pairing is what makes `mode::MAX_CHECKPOINT_RESUMES` bound
     // one stage's resume attempts, not a phase's entire lifetime (the same
     // distinction `MAX_INFRA_FAILURES`'s doc comment draws for
-    // `infra_failures`). Persisted below by `spawn_agent_and_record`'s own
-    // `save_state` calls — no extra save needed here.
+    // `infra_failures`). Persisted below by `spawn_agent_and_record`'s first
+    // commit — no extra save needed here.
     state.checkpoint_resumes = 0;
 
     stamp_validate_dispatch_window(state);
@@ -1058,6 +1058,18 @@ pub(crate) fn commit(state: &mut State, apply: impl FnOnce(&mut State)) -> Resul
     })?;
     *state = committed;
     Ok(())
+}
+
+/// CR-03 (49-REVIEW.md): commit the notify command this process's environment
+/// resolves to, where `resume` and a hand-run `advance` read it, so it reaches the
+/// chain they launch whatever they do next. With no change, nothing is written: the
+/// detached chain carries no variable and keeps the persisted command.
+fn commit_notify_env(state: &mut State) -> Result<(), CliError> {
+    let resolved = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.clone());
+    if resolved == state.gate_notify_cmd {
+        return Ok(());
+    }
+    commit(state, |s| s.gate_notify_cmd = resolved)
 }
 
 /// An advance safe point (50-13, R-2): when the engaged supervisor's stop
@@ -2061,19 +2073,20 @@ fn park_auto_rescan_repair(
     unapproved_files: &[String],
 ) -> Result<(), CliError> {
     debug_assert_eq!(state.mode, Mode::Auto);
-    state.mode = Mode::Supervise;
-    state.stopped = true;
-    state.gate_pending = false;
     let reason = format!(
         "checkpoint re-scan rejected in Auto mode; phase switched to Supervise for its remaining \
          stages and parked for repair of {}",
         unapproved_files.join(", ")
     );
-    state.stop_reason = Some(match state.stop_reason.take() {
-        Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
-        _ => reason,
-    });
-    workflow::save_state(state)?;
+    commit(state, |s| {
+        s.mode = Mode::Supervise;
+        s.stopped = true;
+        s.gate_pending = false;
+        s.stop_reason = Some(match s.stop_reason.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+            _ => reason,
+        });
+    })?;
     Gates::cleanup(project_root, state.phase, stage)?;
     events::emit(
         project_root,
@@ -2264,8 +2277,9 @@ pub(crate) fn handle_ambiguous_outcome(
     if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
         return handle_infra_outcome(project_root, state, stage, reason);
     }
-    state.infra_failures = projected_infra_failures;
-    workflow::save_state(state)?;
+    commit(state, |s| {
+        s.infra_failures = s.infra_failures.saturating_add(1)
+    })?;
 
     events::emit(
         project_root,
@@ -2350,7 +2364,7 @@ fn resume_loaded(
 ) -> Result<(), CliError> {
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
-    state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
+    commit_notify_env(&mut state)?;
     if let Some(requested) = agent
         && requested != state.agent
     {
@@ -2383,8 +2397,7 @@ fn resume_loaded(
             .health(&candidate)
             .map_err(|err| CliError::Message(format!("handoff to {requested} refused: {err}")))?;
 
-        state.agent = requested;
-        workflow::save_state(&state)?;
+        commit(&mut state, |s| s.agent = requested)?;
         events::emit(
             project_root,
             phase,
@@ -2398,12 +2411,7 @@ fn resume_loaded(
         );
         println!("handoff: {from_agent} → {requested}");
     }
-    if state.stopped {
-        state.stopped = false;
-        state.stop_reason = None;
-        state.stop_until = None;
-    }
-    // Combined BEFORE the save below, so the persisted value exists before the
+    // Combined BEFORE the commit below, so the persisted value exists before the
     // detached monitor this relaunch spawns ever consults it.
     if apply_legacy_launch_opt_out(&mut state, legacy_claude_launch) {
         println!(
@@ -2415,7 +2423,7 @@ fn resume_loaded(
     // SIGKILLed run left behind in its own worktree — the case the in-process
     // guard structurally cannot cover, because `Drop` never runs on a kill.
     // Placed after `load_state` (the state is what names the launch root) and
-    // before the `save_state` below, so the repair is complete before anything
+    // before the commit below, so the repair is complete before anything
     // is spawned. Root resolved with the same
     // `worktree_path.unwrap_or(project_root)` idiom `spawn_monitor` uses for
     // `--workdir` (F-11) — a second spelling here would repair a different copy
@@ -2430,7 +2438,18 @@ fn resume_loaded(
         phase,
         AUTO_CHAIN_REPAIR_FROM_RESUME,
     );
-    workflow::save_state(&state)?;
+    // The stopped test reads the file as it is now: the operator's `resume` is the
+    // later word on a stop that landed after this copy loaded, and a run launched
+    // while still marked stopped could never advance.
+    let legacy_claude_launch = state.legacy_claude_launch;
+    commit(&mut state, |s| {
+        if s.stopped {
+            s.stopped = false;
+            s.stop_reason = None;
+            s.stop_until = None;
+        }
+        s.legacy_claude_launch = legacy_claude_launch;
+    })?;
     match launch_stage(&mut state, None, None) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -2448,9 +2467,10 @@ fn resume_loaded(
             // and actionable again rather than silently stalled. Best-effort
             // save — the original launch error is what the caller needs to
             // see either way.
-            state.stopped = true;
-            state.stop_reason = Some(format!("resume launch failed: {err}"));
-            let _ = workflow::save_state(&state);
+            let _ = commit(&mut state, |s| {
+                s.stopped = true;
+                s.stop_reason = Some(format!("resume launch failed: {err}"));
+            });
             Err(err)
         }
     }
@@ -2602,7 +2622,7 @@ pub(crate) fn advance_with(
     // CR-03 (49-REVIEW.md): a hand-run `advance` updates the run's notify
     // command; the detached chain carries no variable, so its `advance`
     // keeps the persisted one.
-    state.gate_notify_cmd = devflow_core::gates::apply_notify_env(state.gate_notify_cmd.take());
+    commit_notify_env(&mut state)?;
 
     match stage {
         Some(expected) if expected != state.stage => {
@@ -2668,8 +2688,7 @@ pub(crate) fn advance_with(
     // top level) or a missing capture, so this is a safe no-op for every
     // non-Claude run.
     if let Some(session_id) = agent_result::session_id_from_capture(project_root, phase) {
-        state.session_id = Some(session_id);
-        workflow::save_state(&state)?;
+        commit(&mut state, |s| s.session_id = Some(session_id))?;
     }
 
     // D-01/D-06: dispatch on the exhaustive outcome_policy::decide_action
@@ -2796,9 +2815,11 @@ pub(crate) fn advance_with(
                                     // silently consume this approval as its own
                                     // answer.
                                     let _ = Gates::cleanup(project_root, phase, stage);
-                                    state.gate_pending = false;
-                                    state.checkpoint_approval = recorded_approval(&current);
-                                    workflow::save_state(&state)?;
+                                    let approval = recorded_approval(&current);
+                                    commit(&mut state, |s| {
+                                        s.gate_pending = false;
+                                        s.checkpoint_approval = approval;
+                                    })?;
                                     if state.mode == Mode::Auto {
                                         return relaunch_checkpoint_session(
                                             &mut state,
