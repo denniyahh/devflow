@@ -354,13 +354,19 @@ impl Gates {
     }
 
     /// Open a gate under a fresh gate id, replacing any earlier gate file for the
-    /// stage.
+    /// stage. Whatever the earlier gate left is disposed of first, in one gate-lock
+    /// critical section with the write: an unclaimed answer is set aside, and a
+    /// claimed pair is removed and recorded as an event.
     pub fn open_gate(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         context: &str,
     ) -> Result<OpenedGate, GateError> {
+        let _lock = gate_lock(project_root, phase)?;
+        let (_, _, disposal) =
+            Self::set_aside_stage_answers(project_root, phase, stage, &mut |_| {});
+        disposal?;
         Self::write_gate_file(project_root, phase, stage, context)
     }
 
@@ -376,24 +382,49 @@ impl Gates {
         Self::answer_with_hook(project_root, phase, stage, observed, response, || {})
     }
 
-    /// RED scaffold: writes nothing.
+    /// Answer an abandoned gate with a rejection, for the gate the caller observed.
+    /// Mitigation for T-23-41 (Elevation of Privilege): this function takes **no**
+    /// boolean parameter and hard-codes `approved: false` at the literal below, so no
+    /// caller can ever make it write an approval.
+    ///
+    /// The caller-supplied `note`'s lowercase form MUST contain the abort keyword
+    /// [`GateAction::from_response`] matches on (`"abort"`), so the reap resolves to
+    /// `GateAction::Abort` and never relaunches an agent on an abandoned run. It
+    /// publishes the way [`answer`](Self::answer) does, with the same checks.
     pub fn reap_answer(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         observed: &GateId,
-        _note: &str,
-        _responded_by: &str,
+        note: &str,
+        responded_by: &str,
     ) -> Result<PathBuf, GateError> {
-        Ok(Self::answer_path(project_root, phase, stage, observed))
+        let response = GateResponse {
+            approved: false,
+            note: Some(note.to_string()),
+            responded_by: Some(responded_by.to_string()),
+        };
+        Self::answer_with_hook(project_root, phase, stage, observed, &response, || {})
     }
 
-    /// RED scaffold: lists nothing.
-    pub fn quarantined(_project_root: &Path) -> Vec<QuarantinedAnswer> {
-        Vec::new()
+    /// Every answer that was set aside, for `status` and `doctor`. A file whose name
+    /// does not parse is skipped.
+    pub fn quarantined(project_root: &Path) -> Vec<QuarantinedAnswer> {
+        let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
+            return Vec::new();
+        };
+        let mut listed: Vec<QuarantinedAnswer> = entries
+            .flatten()
+            .filter_map(|entry| parse_quarantine_name(&entry.path()))
+            .collect();
+        listed.sort_by(|a, b| a.path.cmp(&b.path));
+        listed
     }
 
-    /// RED scaffold: removes the gate file and nothing else.
+    /// Close a stage's gate. Every unconsumed answer is set aside, never deleted;
+    /// every consumed answer/claim pair is removed and reported in
+    /// [`CloseReport::claimed`] (R-02); then the gate file and orphaned durable temps
+    /// go. Idempotent.
     pub fn close(
         project_root: &Path,
         phase: PhaseId,
@@ -403,7 +434,7 @@ impl Gates {
         result.map(|()| report)
     }
 
-    /// RED scaffold.
+    /// [`close`](Self::close), retaining what happened before an error.
     pub(crate) fn close_with_partial_result(
         project_root: &Path,
         phase: PhaseId,
@@ -412,24 +443,178 @@ impl Gates {
         Self::close_with_partial_result_with(project_root, phase, stage, &mut |_| {})
     }
 
-    /// RED scaffold.
+    /// The gate file goes last (R2-05), so a crash inside a close leaves it and every
+    /// pair not yet removed for the next close to report: a pair is reported twice at
+    /// worst, never zero times.
     fn close_with_partial_result_with(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
-        _hook: &mut dyn FnMut(DisposalStep),
+        hook: &mut dyn FnMut(DisposalStep),
     ) -> (CloseReport, Result<(), GateError>) {
-        let path = Self::gate_path(project_root, phase, stage);
-        match crate::durable::remove_durably(&path) {
-            Ok(removed) => (
-                CloseReport {
-                    removed,
-                    ..CloseReport::default()
-                },
-                Ok(()),
-            ),
-            Err(error) => (CloseReport::default(), Err(error.into())),
+        let mut report = CloseReport::default();
+        if !Self::dir(project_root).is_dir() {
+            return (report, Ok(()));
         }
+        let _lock = match gate_lock(project_root, phase) {
+            Ok(lock) => lock,
+            Err(error) => return (report, Err(error)),
+        };
+        let (quarantined, claimed, disposal) =
+            Self::set_aside_stage_answers(project_root, phase, stage, hook);
+        report.quarantined = quarantined.into_iter().map(|moved| moved.to).collect();
+        report.removed = !claimed.is_empty();
+        report.claimed = claimed;
+        if let Err(error) = disposal {
+            return (report, Err(error));
+        }
+        let gate_file =
+            crate::durable::remove_durably(&Self::gate_path(project_root, phase, stage));
+        match gate_file {
+            Ok(removed) => report.removed |= removed,
+            Err(error) => return (report, Err(error.into())),
+        }
+        let temps = Self::remove_stage_temps(project_root, phase, stage);
+        match temps {
+            Ok(removed) => report.removed |= removed,
+            Err(error) => return (report, Err(error)),
+        }
+        (report, Ok(()))
+    }
+
+    /// The only stage-wide disposal, called only by [`open_gate`](Self::open_gate) and
+    /// a close (R-09), both under the gate lock.
+    ///
+    /// Unclaimed answers are set aside first. Each claimed pair's event then goes out
+    /// before that pair's files are removed, so a crash reports a pair again rather
+    /// than losing it. What was done before an error is returned with it.
+    fn set_aside_stage_answers(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        hook: &mut dyn FnMut(DisposalStep),
+    ) -> (Vec<Quarantined>, Vec<ClaimedAnswer>, Result<(), GateError>) {
+        let mut quarantined = Vec::new();
+        let mut claimed = Vec::new();
+        let result = Self::dispose_stage_answers(
+            project_root,
+            phase,
+            stage,
+            hook,
+            &mut quarantined,
+            &mut claimed,
+        );
+        (quarantined, claimed, result)
+    }
+
+    fn dispose_stage_answers(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        hook: &mut dyn FnMut(DisposalStep),
+        quarantined: &mut Vec<Quarantined>,
+        claimed: &mut Vec<ClaimedAnswer>,
+    ) -> Result<(), GateError> {
+        let files = StageFiles::scan(project_root, phase, stage)?;
+        for slot in &files.unclaimed_answers {
+            let moved = set_aside_unclaimed(project_root, phase, stage, slot)?;
+            quarantined.extend(moved);
+        }
+        for gate in &files.claimed_gates {
+            Self::remove_claimed_pair(
+                project_root,
+                phase,
+                stage,
+                gate,
+                hook,
+                quarantined,
+                claimed,
+            )?;
+        }
+        if let Some(legacy_ack) = &files.legacy_ack {
+            crate::durable::remove_durably(legacy_ack)?;
+        }
+        Ok(())
+    }
+
+    /// Record one claimed pair, then remove it. A body that never bound to its gate is
+    /// set aside instead of removed: a claim does not license deleting it (D-05).
+    fn remove_claimed_pair(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        gate: &GateId,
+        hook: &mut dyn FnMut(DisposalStep),
+        quarantined: &mut Vec<Quarantined>,
+        claimed: &mut Vec<ClaimedAnswer>,
+    ) -> Result<(), GateError> {
+        let path = Self::answer_path(project_root, phase, stage, gate);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let bound = bytes
+            .as_deref()
+            .map(|bytes| classify_answer(bytes, gate.as_str()));
+        let answer = bound.clone().and_then(Result::ok);
+        let response = answer.as_ref().map(|answer| &answer.response);
+        warn!("removing claimed answer for phase {phase} {stage} gate {gate}");
+        crate::events::emit(
+            project_root,
+            phase,
+            "gate_claimed_answer_removed",
+            serde_json::json!({
+                "stage": stage.to_string(),
+                "gate_id": gate.as_str(),
+                "approved": response.map(|response| response.approved),
+                "note": response.and_then(|response| response.note.as_deref()),
+                "responded_by": response.and_then(|response| response.responded_by.as_deref()),
+            }),
+        );
+        hook(DisposalStep::ClaimedEventEmitted(gate.to_string()));
+        claimed.push(ClaimedAnswer {
+            gate_id: gate.to_string(),
+            answer,
+        });
+        match (bound, bytes) {
+            (Some(Err(reason)), Some(bytes)) => {
+                let moved = set_aside_if_present(
+                    project_root,
+                    phase,
+                    stage,
+                    &path,
+                    &body_label(&bytes),
+                    reason,
+                )?;
+                quarantined.extend(moved);
+            }
+            _ => {
+                crate::durable::remove_durably(&path)?;
+            }
+        }
+        crate::durable::remove_durably(&Self::claim_path(project_root, phase, stage, gate))?;
+        Ok(())
+    }
+
+    /// Remove the stage's orphaned durable temps. A `*.hold-tmp` never matches, so a
+    /// waiter mid-registration is untouched.
+    fn remove_stage_temps(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<bool, GateError> {
+        let prefix = format!(".{}-{stage}.", phase.padded());
+        let mut removed = false;
+        for entry in std::fs::read_dir(Self::dir(project_root))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                removed |= crate::durable::remove_durably(&entry.path())?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Move an answer that does not bind to `gate` out of that gate's slot, and
@@ -599,16 +784,24 @@ impl Gates {
     /// Claim a gate's answer for consumption: the first caller gets
     /// [`Claim::Claimed`] and acts on the answer, any later one
     /// [`Claim::AlreadyConsumed`].
+    ///
+    /// The claim succeeds only while the gate file still names `gate`, checked in one
+    /// gate-lock critical section with the publish (R-08). A gate id is never reused
+    /// (fresh per open), so once a gate's file is removed or replaced no claim of it
+    /// can succeed. On [`GateError::NoOpenGate`] or [`GateError::GateIdMismatch`]
+    /// nothing was published, and the caller must not act on the answer.
     pub fn claim(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         gate: &GateId,
     ) -> Result<Claim, GateError> {
-        let path = Self::claim_path(project_root, phase, stage, gate);
-        if let Some(parent) = path.parent() {
-            crate::workflow::ensure_devflow_dir(parent)?;
+        if !Self::dir(project_root).is_dir() {
+            return Err(GateError::NoOpenGate { phase, stage });
         }
+        let _lock = gate_lock(project_root, phase)?;
+        Self::require_open(project_root, phase, stage, gate)?;
+        let path = Self::claim_path(project_root, phase, stage, gate);
         let ack = serde_json::to_string_pretty(&GateAck { received: true })?;
         match crate::durable::publish_exclusive_durably(&path, ack.as_bytes())? {
             crate::durable::Publication::Published => Ok(Claim::Claimed),
@@ -617,9 +810,11 @@ impl Gates {
     }
 
     /// Every open gate (request written, no response yet), sorted by phase
-    /// then stage. Request files are `NN-{stage}.json`; `.response.json` and
-    /// `.ack.json` siblings are protocol artifacts, not requests, and any
-    /// unparsable file is skipped — listing must degrade, not die.
+    /// then stage. Request files are `NN-{stage}.json`; a name with more after the
+    /// stage (a keyed answer, a claim, a quarantined answer) is a protocol artifact,
+    /// not a request, and any unparsable file is skipped — listing must degrade, not
+    /// die. A gate is hidden once its own live answer, or a legacy unkeyed one, is
+    /// there. Only reads.
     pub fn list_open(project_root: &Path) -> Vec<OpenGate> {
         let mut open = Vec::new();
         let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
@@ -628,10 +823,12 @@ impl Gates {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.ends_with(".json")
-                || name.ends_with(".response.json")
-                || name.ends_with(".ack.json")
-            {
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            // The phase may hold a dot (`50.1-code.json`), so look past it first.
+            let after_phase = stem.split_once('-').map_or(stem, |(_, rest)| rest);
+            if after_phase.contains('.') {
                 continue;
             }
             let Ok(contents) = std::fs::read_to_string(entry.path()) else {
@@ -640,7 +837,13 @@ impl Gates {
             let Ok(gate) = serde_json::from_str::<GateFile>(&contents) else {
                 continue;
             };
-            if Self::response_path(project_root, gate.phase, gate.stage).exists() {
+            let answered = GateId::parse(&gate.gate_id).is_ok_and(|id| {
+                matches!(
+                    Self::read_answer(project_root, gate.phase, gate.stage, &id),
+                    AnswerRead::Bound(_)
+                )
+            });
+            if answered || Self::response_path(project_root, gate.phase, gate.stage).exists() {
                 continue;
             }
             open.push(OpenGate {
@@ -1020,10 +1223,11 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
 }
 
 /// The point inside a close's disposal that a kill-point fixture stops at.
-#[expect(dead_code, reason = "RED scaffold")]
 enum DisposalStep {
     /// A claimed pair's event is out and its files are not yet removed.
-    ClaimedEventEmitted(String),
+    ClaimedEventEmitted(
+        #[cfg_attr(not(test), expect(dead_code, reason = "only the fixture reads the id"))] String,
+    ),
 }
 
 /// A file moved out of the way instead of being consumed or deleted.
@@ -1098,6 +1302,123 @@ fn set_aside_if_present(
     }
 }
 
+/// What a stage-wide disposal has to deal with, in name order so a report and a
+/// kill-point fixture are deterministic.
+struct StageFiles {
+    unclaimed_answers: Vec<UnclaimedAnswer>,
+    claimed_gates: Vec<GateId>,
+    legacy_ack: Option<PathBuf>,
+}
+
+/// An answer file with no claim beside it.
+struct UnclaimedAnswer {
+    path: PathBuf,
+    /// The id in its file name, `None` for the legacy unkeyed name.
+    slot_id: Option<String>,
+}
+
+impl StageFiles {
+    fn scan(project_root: &Path, phase: PhaseId, stage: Stage) -> Result<StageFiles, GateError> {
+        let dir = Gates::dir(project_root);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StageFiles {
+                    unclaimed_answers: Vec::new(),
+                    claimed_gates: Vec::new(),
+                    legacy_ack: None,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let prefix = format!("{}-{stage}.", phase.padded());
+        let mut names = Vec::new();
+        for entry in entries {
+            if let Some(name) = entry?.file_name().to_str()
+                && let Some(rest) = name.strip_prefix(&prefix)
+            {
+                names.push(rest.to_string());
+            }
+        }
+        names.sort();
+        let claimed_gates: Vec<GateId> = names
+            .iter()
+            .filter_map(|rest| rest.strip_suffix(".ack.json"))
+            .filter_map(|id| GateId::parse(id).ok())
+            .collect();
+        let unclaimed_answers = names
+            .iter()
+            .filter_map(|rest| {
+                let slot_id = match rest.as_str() {
+                    "response.json" => None,
+                    keyed => Some(keyed.strip_suffix(".response.json")?.to_string()),
+                };
+                let claimed = slot_id
+                    .as_deref()
+                    .is_some_and(|id| claimed_gates.iter().any(|gate| gate.as_str() == id));
+                (!claimed).then(|| UnclaimedAnswer {
+                    path: dir.join(format!("{prefix}{rest}")),
+                    slot_id,
+                })
+            })
+            .collect();
+        let legacy_ack = names
+            .iter()
+            .any(|rest| rest == "ack.json")
+            .then(|| Gates::ack_path(project_root, phase, stage));
+        Ok(StageFiles {
+            unclaimed_answers,
+            claimed_gates,
+            legacy_ack,
+        })
+    }
+}
+
+/// Set aside one unclaimed answer. The reason says what the file is, the same at
+/// open, close and read: a legacy name is always `legacy_unkeyed`, a body that binds
+/// to its slot `gate_closed`, and any other the reason it does not bind.
+fn set_aside_unclaimed(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    answer: &UnclaimedAnswer,
+) -> std::io::Result<Option<Quarantined>> {
+    let bytes = match std::fs::read(&answer.path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let reason = match answer.slot_id.as_deref() {
+        None => REASON_LEGACY_UNKEYED,
+        Some(id) => match classify_answer(&bytes, id) {
+            Ok(_) if is_gate_id(id) => REASON_GATE_CLOSED,
+            Ok(_) => REASON_OTHER_GATE,
+            Err(reason) => reason,
+        },
+    };
+    let label = body_label(&bytes);
+    set_aside_if_present(project_root, phase, stage, &answer.path, &label, reason)
+}
+
+/// Parse `NN-{stage}.{label}.{secs}.{pid}.{seq}.quarantined.json`.
+fn parse_quarantine_name(path: &Path) -> Option<QuarantinedAnswer> {
+    let name = path.file_name()?.to_str()?;
+    let (phase, rest) = name.strip_suffix(".quarantined.json")?.split_once('-')?;
+    let fields: Vec<&str> = rest.split('.').collect();
+    let [stage, label, secs, pid, seq] = fields[..] else {
+        return None;
+    };
+    secs.parse::<u64>().ok()?;
+    pid.parse::<u32>().ok()?;
+    seq.parse::<u64>().ok()?;
+    Some(QuarantinedAnswer {
+        phase: phase.parse().ok()?,
+        stage: stage.parse().ok()?,
+        label: label.to_string(),
+        path: path.to_path_buf(),
+    })
+}
+
 /// The label for a quarantined body: the id it names when that is a gate id, so
 /// that a hostile id never reaches a path, else [`NO_GATE_ID_LABEL`].
 fn body_label(bytes: &[u8]) -> String {
@@ -1161,6 +1482,8 @@ const REASON_MISSING_GATE_ID: &str = "missing_gate_id";
 const REASON_OTHER_GATE: &str = "other_gate";
 /// An answer that bound to its gate, but the gate is no longer live.
 const REASON_GATE_CLOSED: &str = "gate_closed";
+/// An answer under the unkeyed per-stage name.
+const REASON_LEGACY_UNKEYED: &str = "legacy_unkeyed";
 /// The label of a quarantined body that names no usable gate id.
 const NO_GATE_ID_LABEL: &str = "noid";
 
