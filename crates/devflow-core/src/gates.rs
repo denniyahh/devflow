@@ -253,6 +253,40 @@ pub enum Claim {
     AlreadyConsumed,
 }
 
+/// A claimed answer whose files a close removed: the consumer claimed it, and the
+/// caller knows from the run's state whether the decision was ever recorded (R-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedAnswer {
+    /// The gate the claim was for.
+    pub gate_id: String,
+    /// The answer as read, or `None` when it was already gone or did not bind.
+    pub answer: Option<GateAnswer>,
+}
+
+/// What [`Gates::close`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloseReport {
+    /// Whether this call removed any file (not counting what it set aside).
+    pub removed: bool,
+    /// Where each answer it set aside now lives.
+    pub quarantined: Vec<PathBuf>,
+    /// Every claimed answer whose files it removed.
+    pub claimed: Vec<ClaimedAnswer>,
+}
+
+/// An answer that was set aside, as [`Gates::quarantined`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedAnswer {
+    /// The phase of the gate it was answering.
+    pub phase: PhaseId,
+    /// The stage of that gate.
+    pub stage: Stage,
+    /// The gate id it named, or `noid`.
+    pub label: String,
+    /// Where it now lives.
+    pub path: PathBuf,
+}
+
 /// An open gate: a request the workflow wrote that has no response yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenGate {
@@ -340,6 +374,62 @@ impl Gates {
         response: &GateResponse,
     ) -> Result<PathBuf, GateError> {
         Self::answer_with_hook(project_root, phase, stage, observed, response, || {})
+    }
+
+    /// RED scaffold: writes nothing.
+    pub fn reap_answer(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        observed: &GateId,
+        _note: &str,
+        _responded_by: &str,
+    ) -> Result<PathBuf, GateError> {
+        Ok(Self::answer_path(project_root, phase, stage, observed))
+    }
+
+    /// RED scaffold: lists nothing.
+    pub fn quarantined(_project_root: &Path) -> Vec<QuarantinedAnswer> {
+        Vec::new()
+    }
+
+    /// RED scaffold: removes the gate file and nothing else.
+    pub fn close(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> Result<CloseReport, GateError> {
+        let (report, result) = Self::close_with_partial_result(project_root, phase, stage);
+        result.map(|()| report)
+    }
+
+    /// RED scaffold.
+    pub(crate) fn close_with_partial_result(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> (CloseReport, Result<(), GateError>) {
+        Self::close_with_partial_result_with(project_root, phase, stage, &mut |_| {})
+    }
+
+    /// RED scaffold.
+    fn close_with_partial_result_with(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        _hook: &mut dyn FnMut(DisposalStep),
+    ) -> (CloseReport, Result<(), GateError>) {
+        let path = Self::gate_path(project_root, phase, stage);
+        match crate::durable::remove_durably(&path) {
+            Ok(removed) => (
+                CloseReport {
+                    removed,
+                    ..CloseReport::default()
+                },
+                Ok(()),
+            ),
+            Err(error) => (CloseReport::default(), Err(error.into())),
+        }
     }
 
     /// Move an answer that does not bind to `gate` out of that gate's slot, and
@@ -927,6 +1017,13 @@ fn run_notify_command(cmd: &str, phase: PhaseId, stage: Stage, context: &str, un
         ),
         Err(err) => warn!("gate notify hook could not be spawned: {err}"),
     }
+}
+
+/// The point inside a close's disposal that a kill-point fixture stops at.
+#[expect(dead_code, reason = "RED scaffold")]
+enum DisposalStep {
+    /// A claimed pair's event is out and its files are not yet removed.
+    ClaimedEventEmitted(String),
 }
 
 /// A file moved out of the way instead of being consumed or deleted.
@@ -2326,5 +2423,491 @@ mod tests {
             0,
             "test code is out of scope"
         );
+    }
+
+    fn rejection() -> GateResponse {
+        GateResponse {
+            approved: false,
+            note: Some("rejected".into()),
+            responded_by: None,
+        }
+    }
+
+    /// Plant an answered and claimed pair for `gate`, as a consumer leaves it.
+    fn plant_claimed_pair(root: &Path, phase: PhaseId, stage: Stage, gate: &GateId) -> GateAnswer {
+        let answer = GateAnswer {
+            gate_id: gate.to_string(),
+            response: rejection(),
+        };
+        std::fs::write(
+            Gates::answer_path(root, phase, stage, gate),
+            serde_json::to_string(&answer).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            Gates::claim_path(root, phase, stage, gate),
+            serde_json::to_string(&GateAck { received: true }).unwrap(),
+        )
+        .unwrap();
+        answer
+    }
+
+    #[test]
+    fn closing_a_gate_sets_aside_unconsumed_answers_and_removes_consumed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
+        let old = GateId::new();
+        let old_answer = plant_claimed_pair(dir.path(), phase, stage, &old);
+        let gates_dir = Gates::dir(dir.path());
+        let temps = [
+            gates_dir.join(format!(".07-code.{gate}.response.json.1.0.tmp")),
+            gates_dir.join(".07-code.json.1.0.tmp"),
+        ];
+        let hold_temp = gates_dir.join(format!(".07-code.{gate}.waiter.1.0.hold-tmp"));
+        let other_stage_temp = gates_dir.join(".07-validate.json.1.0.tmp");
+        for path in temps.iter().chain([&hold_temp, &other_stage_temp]) {
+            std::fs::write(path, "temp").unwrap();
+        }
+
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+
+        assert!(report.removed);
+        assert_eq!(report.quarantined.len(), 1, "{report:?}");
+        let name = report.quarantined[0].file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(&format!("07-code.{gate}.")), "{name}");
+        assert_eq!(
+            events_named(dir.path(), "gate_answer_quarantined")[0]["reason"],
+            "gate_closed"
+        );
+        assert_eq!(
+            report.claimed,
+            [ClaimedAnswer {
+                gate_id: old.to_string(),
+                answer: Some(old_answer),
+            }]
+        );
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &old).exists());
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &old).exists());
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &gate).exists());
+        assert!(!Gates::gate_path(dir.path(), phase, stage).exists());
+        assert!(temps.iter().all(|path| !path.exists()), "{temps:?}");
+        assert!(hold_temp.exists(), "a hold temp is never a durable temp");
+        assert!(other_stage_temp.exists(), "another stage's temp stays");
+
+        let again = Gates::close(dir.path(), phase, stage).unwrap();
+        assert_eq!(
+            again,
+            CloseReport::default(),
+            "a second close finds nothing"
+        );
+    }
+
+    /// D-05 over R-02: a claim does not license deleting a body that never bound.
+    #[test]
+    fn a_claimed_body_that_does_not_bind_is_reported_and_set_aside_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &gate),
+            "{\"approved\": true}",
+        )
+        .unwrap();
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::Claimed
+        );
+
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+
+        assert_eq!(
+            report.claimed,
+            [ClaimedAnswer {
+                gate_id: gate.to_string(),
+                answer: None,
+            }]
+        );
+        let quarantined = quarantine_files(dir.path());
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(
+            std::fs::read_to_string(&quarantined[0]).unwrap(),
+            "{\"approved\": true}"
+        );
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &gate).exists());
+    }
+
+    /// R-08: a gate id is never reused, so once its gate file is gone or replaced no
+    /// claim of it can succeed: a paused `devflow ship` cannot finalize a second time.
+    #[test]
+    fn a_paused_consumer_cannot_claim_a_gate_that_closed_or_was_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+            .unwrap()
+            .gate_id;
+        Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
+        assert!(
+            matches!(
+                Gates::read_answer(dir.path(), phase, stage, &first),
+                AnswerRead::Bound(_)
+            ),
+            "the reader pauses here, holding a bound answer"
+        );
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &first).unwrap(),
+            Claim::Claimed
+        );
+        Gates::close(dir.path(), phase, stage).unwrap();
+        let next = Gates::open_gate(dir.path(), phase, stage, "next")
+            .unwrap()
+            .gate_id;
+        let next_gate_file = std::fs::read(Gates::gate_path(dir.path(), phase, stage)).unwrap();
+
+        let paused = Gates::claim(dir.path(), phase, stage, &first);
+
+        assert!(
+            matches!(&paused, Err(GateError::GateIdMismatch { observed, current, .. })
+                if observed == first.as_str() && current == next.as_str()),
+            "{paused:?}"
+        );
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &first).exists());
+        assert_eq!(
+            std::fs::read(Gates::gate_path(dir.path(), phase, stage)).unwrap(),
+            next_gate_file
+        );
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &next).exists());
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &next),
+            AnswerRead::None
+        );
+
+        // A gate closed with none opened after it.
+        let other = Stage::Validate;
+        let closed = Gates::open_gate(dir.path(), phase, other, "ctx")
+            .unwrap()
+            .gate_id;
+        Gates::close(dir.path(), phase, other).unwrap();
+        let gone = Gates::claim(dir.path(), phase, other, &closed);
+        assert!(
+            matches!(gone, Err(GateError::NoOpenGate { .. })),
+            "{gone:?}"
+        );
+        assert!(!Gates::claim_path(dir.path(), phase, other, &closed).exists());
+    }
+
+    /// R-02, a kill-point fixture: a consumer killed after its claim and before it
+    /// recorded its decision leaves a record the next close reports.
+    #[test]
+    fn a_claim_whose_consumer_died_is_reported_when_its_gate_closes() {
+        const NAME: &str =
+            "gates::tests::a_claim_whose_consumer_died_is_reported_when_its_gate_closes";
+        const KILLED_AFTER_CLAIM: i32 = 73;
+        const MARKER: &str = "claimed-marker";
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let kept = GateResponse {
+            approved: true,
+            note: Some("kept".into()),
+            responded_by: None,
+        };
+        if crate::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os("CLAIM_KILL_ROOT").unwrap());
+            let gate = Gates::open_gate(&root, phase, stage, "ctx")
+                .unwrap()
+                .gate_id;
+            Gates::answer(&root, phase, stage, &gate, &kept).unwrap();
+            assert_eq!(
+                Gates::claim(&root, phase, stage, &gate).unwrap(),
+                Claim::Claimed
+            );
+            std::fs::write(root.join(MARKER), "claimed").unwrap();
+            std::process::exit(KILLED_AFTER_CLAIM);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[("CLAIM_KILL_ROOT", dir.path().as_os_str())],
+        );
+
+        assert_eq!(output.status.code(), Some(KILLED_AFTER_CLAIM), "{output:?}");
+        assert!(dir.path().join(MARKER).exists(), "the child died elsewhere");
+        let gate = GateId::parse(&read_gate(dir.path(), phase, stage).gate_id).unwrap();
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+        assert_eq!(
+            report.claimed,
+            [ClaimedAnswer {
+                gate_id: gate.to_string(),
+                answer: Some(GateAnswer {
+                    gate_id: gate.to_string(),
+                    response: kept,
+                }),
+            }]
+        );
+        assert!(report.quarantined.is_empty(), "{report:?}");
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &gate).exists());
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &gate).exists());
+        let events = events_named(dir.path(), "gate_claimed_answer_removed");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["gate_id"], gate.as_str());
+        assert_eq!(events[0]["approved"], true);
+        assert_eq!(events[0]["note"], "kept");
+
+        // The control: an answer nobody claimed is never reported as claimed.
+        let unclaimed = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        Gates::answer(dir.path(), phase, stage, &unclaimed, &approved()).unwrap();
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+        assert_eq!(report.quarantined.len(), 1, "{report:?}");
+        assert!(report.claimed.is_empty(), "{report:?}");
+    }
+
+    /// R2-05, a kill-point fixture: the gate file goes last and each pair's event
+    /// precedes its removal, so a crash inside a close reports a pair twice at worst,
+    /// never zero times.
+    #[test]
+    fn a_close_killed_mid_disposal_leaves_the_gate_file_and_the_unremoved_pair() {
+        const NAME: &str =
+            "gates::tests::a_close_killed_mid_disposal_leaves_the_gate_file_and_the_unremoved_pair";
+        const KILLED_MID_DISPOSAL: i32 = 74;
+        // Fixed and ordered, so the child removes the first pair before the second.
+        const FIRST: &str = "00000000000000a0";
+        const SECOND: &str = "00000000000000a1";
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let first = GateId::parse(FIRST).unwrap();
+        let second = GateId::parse(SECOND).unwrap();
+        if crate::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os("CLOSE_KILL_ROOT").unwrap());
+            Gates::open_gate(&root, phase, stage, "ctx").unwrap();
+            plant_claimed_pair(&root, phase, stage, &first);
+            plant_claimed_pair(&root, phase, stage, &second);
+            let mut hook = |step: DisposalStep| {
+                let DisposalStep::ClaimedEventEmitted(id) = step;
+                if id == SECOND {
+                    std::process::exit(KILLED_MID_DISPOSAL);
+                }
+            };
+            let _ = Gates::close_with_partial_result_with(&root, phase, stage, &mut hook);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+
+        let output = crate::test_support::run_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[("CLOSE_KILL_ROOT", dir.path().as_os_str())],
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(KILLED_MID_DISPOSAL),
+            "{output:?}"
+        );
+        assert!(
+            Gates::gate_path(dir.path(), phase, stage).exists(),
+            "the gate file must outlive the pairs"
+        );
+        assert!(Gates::answer_path(dir.path(), phase, stage, &second).exists());
+        assert!(Gates::claim_path(dir.path(), phase, stage, &second).exists());
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &first).exists());
+        let reported = |root: &Path| {
+            events_named(root, "gate_claimed_answer_removed")
+                .iter()
+                .filter(|event| event["gate_id"] == SECOND)
+                .count()
+        };
+        assert_eq!(
+            reported(dir.path()),
+            1,
+            "the event comes before the removal"
+        );
+
+        let report = Gates::close(dir.path(), phase, stage).unwrap();
+
+        assert_eq!(report.claimed.len(), 1, "{report:?}");
+        assert_eq!(report.claimed[0].gate_id, SECOND);
+        assert!(report.claimed[0].answer.is_some(), "{report:?}");
+        assert_eq!(
+            reported(dir.path()),
+            2,
+            "a duplicate report, never a lost one"
+        );
+        assert!(!Gates::gate_path(dir.path(), phase, stage).exists());
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &second).exists());
+        assert!(!Gates::claim_path(dir.path(), phase, stage, &second).exists());
+    }
+
+    #[test]
+    fn opening_a_gate_sets_aside_the_previous_gates_unconsumed_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let first = Gates::open_gate(dir.path(), phase, stage, "first")
+            .unwrap()
+            .gate_id;
+        Gates::answer(dir.path(), phase, stage, &first, &approved()).unwrap();
+        let legacy = Gates::response_path(dir.path(), phase, stage);
+        std::fs::write(&legacy, "{\"approved\":true}").unwrap();
+
+        let next = Gates::open_gate(dir.path(), phase, stage, "next")
+            .unwrap()
+            .gate_id;
+
+        assert_eq!(
+            Gates::read_answer(dir.path(), phase, stage, &next),
+            AnswerRead::None
+        );
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &first).exists());
+        assert!(!legacy.exists());
+        let mut reasons: Vec<String> = events_named(dir.path(), "gate_answer_quarantined")
+            .iter()
+            .map(|event| event["reason"].as_str().unwrap().to_string())
+            .collect();
+        reasons.sort();
+        assert_eq!(reasons, ["gate_closed", "legacy_unkeyed"]);
+        assert_eq!(quarantine_files(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn quarantined_lists_every_set_aside_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let decimal: PhaseId = "50.1".parse().unwrap();
+        let first = Gates::open_gate(dir.path(), PhaseId::new(7), Stage::Code, "ctx")
+            .unwrap()
+            .gate_id;
+        Gates::answer(
+            dir.path(),
+            PhaseId::new(7),
+            Stage::Code,
+            &first,
+            &approved(),
+        )
+        .unwrap();
+        Gates::close(dir.path(), PhaseId::new(7), Stage::Code).unwrap();
+        let second = Gates::open_gate(dir.path(), decimal, Stage::Validate, "ctx")
+            .unwrap()
+            .gate_id;
+        std::fs::write(
+            Gates::answer_path(dir.path(), decimal, Stage::Validate, &second),
+            "not json",
+        )
+        .unwrap();
+        Gates::set_aside_unbound(dir.path(), decimal, Stage::Validate, &second).unwrap();
+        std::fs::write(
+            Gates::dir(dir.path()).join("07-code.noid.x.quarantined.json"),
+            "a name that does not parse",
+        )
+        .unwrap();
+
+        let listed = Gates::quarantined(dir.path());
+
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let code = listed.iter().find(|q| q.stage == Stage::Code).unwrap();
+        assert_eq!(code.phase, PhaseId::new(7));
+        assert_eq!(code.label, first.as_str());
+        assert_eq!(
+            std::fs::read_to_string(&code.path).unwrap(),
+            serde_json::to_string_pretty(&GateAnswer {
+                gate_id: first.to_string(),
+                response: approved(),
+            })
+            .unwrap()
+        );
+        let validate = listed.iter().find(|q| q.stage == Stage::Validate).unwrap();
+        assert_eq!(validate.phase, decimal);
+        assert_eq!(validate.label, "noid");
+        assert_eq!(std::fs::read_to_string(&validate.path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn reap_answer_writes_a_rejection_for_the_observed_gate_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let other = GateId::new();
+
+        let refused = Gates::reap_answer(dir.path(), phase, stage, &other, "abort: x", "sweep");
+        assert!(
+            matches!(refused, Err(GateError::GateIdMismatch { .. })),
+            "{refused:?}"
+        );
+        assert!(!Gates::answer_path(dir.path(), phase, stage, &other).exists());
+
+        Gates::reap_answer(dir.path(), phase, stage, &gate, "abort: x", "sweep").unwrap();
+
+        let AnswerRead::Bound(answer) = Gates::read_answer(dir.path(), phase, stage, &gate) else {
+            panic!("the reap must be read back as an answer to its gate");
+        };
+        assert!(!answer.response.approved);
+        assert_eq!(answer.response.responded_by.as_deref(), Some("sweep"));
+        assert!(matches!(
+            GateAction::from_response(&answer.response),
+            GateAction::Abort(_)
+        ));
+    }
+
+    #[test]
+    fn list_open_reports_the_gate_id_and_hides_a_gate_its_live_answer_decided() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let open = Gates::list_open(dir.path());
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].gate_id, gate.as_str());
+
+        // What sits beside a gate file must not read as another request, even with a
+        // gate-shaped body, in a decimal phase whose own name holds a dot.
+        let decimal: PhaseId = "50.1".parse().unwrap();
+        let decimal_gate = Gates::open_gate(dir.path(), decimal, stage, "decimal").unwrap();
+        let gate_shaped = std::fs::read_to_string(&decimal_gate.path).unwrap();
+        for name in [
+            "50.1-code.noid.1.1.0.quarantined.json",
+            "50.1-code.0000000000000000.ack.json",
+            "50.1-code.0000000000000000.extra.json",
+        ] {
+            std::fs::write(Gates::dir(dir.path()).join(name), &gate_shaped).unwrap();
+        }
+        assert_eq!(Gates::list_open(dir.path()).len(), 2, "{gate_shaped}");
+
+        let other = GateId::new();
+        std::fs::write(
+            Gates::answer_path(dir.path(), phase, stage, &other),
+            serde_json::to_string(&GateAnswer {
+                gate_id: other.to_string(),
+                response: approved(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            Gates::list_open(dir.path()).len(),
+            2,
+            "an answer for another id must not hide the gate"
+        );
+
+        Gates::answer(dir.path(), phase, stage, &gate, &approved()).unwrap();
+        let open = Gates::list_open(dir.path());
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].phase, decimal);
+
+        // A legacy unkeyed response still hides its gate until the CLI moves off it.
+        std::fs::write(
+            Gates::response_path(dir.path(), decimal, stage),
+            "{\"approved\":true}",
+        )
+        .unwrap();
+        assert!(Gates::list_open(dir.path()).is_empty());
     }
 }
