@@ -4425,6 +4425,29 @@ mod tests {
         );
     }
 
+    /// A publish that fails leaves no registration behind for a gate that never opened.
+    #[test]
+    fn an_open_registered_whose_publish_fails_leaves_no_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let gate_path = Gates::gate_path(dir.path(), phase, stage);
+        std::fs::create_dir_all(&gate_path).unwrap();
+        let mut registered_at_publish = None;
+
+        let opened = Gates::open_registered_with_hooks(
+            dir.path(),
+            phase,
+            stage,
+            "ctx",
+            || registered_at_publish = Some(waiter_files(dir.path()).len()),
+            || panic!("the publish must fail"),
+        );
+
+        assert!(matches!(opened, Err(GateError::Io(_))), "{opened:?}");
+        assert_eq!(registered_at_publish, Some(1), "it did register first");
+        assert_eq!(waiter_files(dir.path()), Vec::<PathBuf>::new());
+    }
+
     // ---- D-13 items 4 and 7, R-09: the wait backs off, cancels first, moves nothing ----
 
     /// Reads at 0 s, 1 s and 3 s, the next one due at 7 s, with `cancel` honoured at
