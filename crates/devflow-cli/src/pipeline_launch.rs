@@ -2936,6 +2936,7 @@ mod tests {
     use devflow_core::gates::Gates;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
+    use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
 
     macro_rules! enter_agent_free_child {
         ($name:expr, $program:literal) => {
@@ -4567,7 +4568,6 @@ mod tests {
 
         let code_gate = Gates::gate_path(root, phase, Stage::Code);
         let validate_gate = Gates::gate_path(root, phase, Stage::Validate);
-        let response_path = Gates::response_path(root, phase, Stage::Code);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -4591,10 +4591,14 @@ mod tests {
                 "an Unknown Code outcome must never transition to Validate"
             );
 
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Code,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -4737,13 +4741,15 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         advance_for_stage(root, Some(phase), Some(Stage::Code)).unwrap();
 
@@ -5718,13 +5724,15 @@ mod tests {
             std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
             "write_abort_gate_response must run inside a child test with an agent-free PATH (999.80)"
         );
-        let response_path = Gates::response_path(root, phase, stage);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            stage,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
     }
 
     /// The `CheckpointApproval` a passing Code preflight would have left for
@@ -6037,6 +6045,51 @@ mod tests {
         );
     }
 
+    /// A response in one of the three shapes `write_gate_response` documents.
+    fn gate_response(approved: bool, note: Option<&str>) -> devflow_core::gates::GateResponse {
+        devflow_core::gates::GateResponse {
+            approved,
+            note: note.map(str::to_string),
+            responded_by: Some("test".to_string()),
+        }
+    }
+
+    /// Pre-answer the next gate at `stage` so its poll returns immediately. The
+    /// shapes are `write_gate_response`'s.
+    fn preanswer_gate_response(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        approved: bool,
+        note: Option<&str>,
+    ) {
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "preanswer_gate_response must run inside a child test with an agent-free PATH (999.80)"
+        );
+        preanswer_gate(root, phase, stage, &gate_response(approved, note));
+    }
+
+    /// Answer the gate that opens next at `stage`, as a human would once they see
+    /// it. A gate still holding an earlier answer refuses this one, and no gate may
+    /// be open yet, so this retries until a gate takes it.
+    fn answer_the_next_open_gate(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        response: &devflow_core::gates::GateResponse,
+    ) {
+        const NEXT_GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        while answer_open_gate(root, phase, stage, response).is_err() {
+            assert!(
+                started.elapsed() < NEXT_GATE_OPENS_WITHIN,
+                "no {stage} gate took the answer within {NEXT_GATE_OPENS_WITHIN:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Write an arbitrary gate response so a gate's poll returns immediately.
     ///
     /// `GateAction::from_response` maps these three shapes: approved ->
@@ -6104,7 +6157,7 @@ mod tests {
         );
         let root = root.as_path();
 
-        write_gate_response(root, phase, Stage::Code, true, None);
+        preanswer_gate_response(root, phase, Stage::Code, true, None);
 
         let first = advance_for_stage(root, Some(phase), Some(Stage::Code));
         let reloaded_first = workflow::load_state(root, phase).ok();
@@ -6205,7 +6258,7 @@ mod tests {
         );
         let root = root.as_path();
         let expected_approval = recorded_from_body(phase, &rescan_plan_body_rewritten());
-        write_gate_response(root, phase, Stage::Code, true, None);
+        preanswer_gate_response(root, phase, Stage::Code, true, None);
 
         let writer_root = root.to_path_buf();
         let writer = std::thread::spawn(move || {
@@ -6222,7 +6275,12 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
+            answer_the_next_open_gate(
+                &writer_root,
+                phase,
+                Stage::Code,
+                &gate_response(false, Some("abort")),
+            );
         });
 
         let result = advance_for_stage(root, Some(phase), Some(Stage::Code));
@@ -6283,8 +6341,7 @@ mod tests {
         let before = workflow::load_state(root, phase)
             .unwrap()
             .checkpoint_approval;
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        write_gate_response(
+        preanswer_gate_response(
             root,
             phase,
             Stage::Code,
@@ -6293,7 +6350,6 @@ mod tests {
         );
 
         let writer_root = root.to_path_buf();
-        let writer_response_path = response_path.clone();
         let third_gate_response_written =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_third_gate_response_written =
@@ -6305,13 +6361,24 @@ mod tests {
                 // `stopped` before it removes the response, so a response the
                 // park removed is always seen with `stopped` set. Reading the
                 // state first let a whole park land between the two reads.
-                let response_gone = !writer_response_path.exists();
+                // The pre-answer is read before the answer files because the
+                // gate publishes the answer before it removes the pre-answer.
+                let response_gone = !Gates::preanswer_path(&writer_root, phase, Stage::Code)
+                    .exists()
+                    && gate_answer_files(&writer_root, phase, Stage::Code).is_empty();
                 let state = workflow::load_state(&writer_root, phase);
                 if state.as_ref().is_ok_and(|state| state.stopped) {
                     return;
                 }
-                if response_gone {
-                    write_gate_response(&writer_root, phase, Stage::Code, false, Some("abort"));
+                if response_gone
+                    && answer_open_gate(
+                        &writer_root,
+                        phase,
+                        Stage::Code,
+                        &gate_response(false, Some("abort")),
+                    )
+                    .is_ok()
+                {
                     writer_third_gate_response_written
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     return;
@@ -6363,8 +6430,8 @@ mod tests {
         assert_eq!(events_of_kind(root, "checkpoint_repair_parked").len(), 1);
         assert!(
             !Gates::gate_path(root, phase, Stage::Code).exists()
-                && !response_path.exists()
-                && !Gates::ack_path(root, phase, Stage::Code).exists(),
+                && gate_answer_files(root, phase, Stage::Code).is_empty()
+                && gate_claim_files(root, phase, Stage::Code).is_empty(),
             "parking must leave no stale gate protocol files"
         );
 
@@ -6551,7 +6618,7 @@ mod tests {
         );
         let root = root.as_path();
 
-        write_gate_response(
+        preanswer_gate_response(
             root,
             phase,
             Stage::Code,
@@ -9003,7 +9070,7 @@ mod tests {
             "control: N still answers gate_wait"
         );
         assert!(!run.state().stopped, "control: not stopped while waiting");
-        Gates::respond(
+        answer_open_gate(
             &run.root,
             run.phase,
             Stage::Define,
@@ -9087,7 +9154,7 @@ mod tests {
             );
             assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
             assert!(!state.gate_pending, "no gate is left pending");
-            assert!(!Gates::response_path(&run.root, run.phase, Stage::Ship).exists());
+            assert!(gate_answer_files(&run.root, run.phase, Stage::Ship).is_empty());
             let stopped = events_named(&run.root, "advance_stopped");
             assert_eq!(stopped.len(), 1, "{}", run.events());
             assert_eq!(stopped[0]["safe_point"], safe_point, "{}", stopped[0]);
