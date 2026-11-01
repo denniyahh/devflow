@@ -1496,4 +1496,47 @@ mod tests {
             report.warnings
         );
     }
+
+    /// D-05: an answer nobody consumed is set aside, never deleted, even when the
+    /// phase it decided is being cleared. Its body stays readable under the
+    /// quarantine name.
+    #[test]
+    fn recover_sets_an_unconsumed_answer_aside_when_it_clears_a_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(53);
+        workflow::save_state(&state_aged_phase(
+            root,
+            phase,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(DEAD_PID),
+        ))
+        .unwrap();
+        let gate = Gates::open_gate(root, phase, Stage::Code, "left open")
+            .unwrap()
+            .gate_id;
+        let answer = Gates::answer(
+            root,
+            phase,
+            Stage::Code,
+            &gate,
+            &GateResponse {
+                approved: true,
+                note: Some("unclaimed".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        let body = std::fs::read(&answer).unwrap();
+
+        clean(root).expect("clean");
+
+        assert!(!workflow::state_path(root, phase).exists());
+        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
+        assert!(!answer.exists(), "no live answer is left behind");
+        let set_aside = Gates::quarantined(root);
+        assert_eq!(set_aside.len(), 1, "{set_aside:?}");
+        assert_eq!(set_aside[0].label, gate.as_str());
+        assert_eq!(std::fs::read(&set_aside[0].path).unwrap(), body);
+    }
 }
