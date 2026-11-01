@@ -79,6 +79,18 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       What survives: `gate reject` and `stop` both print that a waiting process will pick up the
       response without ever checking whether one exists, and neither names the repair.
 
+- [ ] **SURV-03**: Every state change for a phase goes through one short OS lock and a re-read of
+      the state file, so an update made while another writer waited (including across a gate wait)
+      is not lost. State and gate files are replaced, published first-wins or removed only through
+      helpers that fsync the file and its directory. No gate wait holds the write lock.
+      *Traces to 999.130 (parts 1, 2, 5) and Phase 50 crash-table row D1.*
+      Acceptance: ROADMAP 50.1 criterion 3 (a source scan with a planted bypass that must fail it;
+      a gate-wait test with a holding control).
+      Decisions: D-08 (Operator); D-09 and D-11 (Claude, remit).
+      **Not established:** power loss itself is not tested (D-09). A hand edit that races a write
+      can still be lost: an accepted gap that 50.1 shrinks from a multi-day wait to one write and
+      does not close (D-08).
+
 ### Checkpoint Consistency (CHKPT)
 
 - [x] **CHKPT-01**: Preflight and the resume route use one parsed checkpoint predicate; a marker
@@ -203,6 +215,7 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Complete |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Complete |
+| SURV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**

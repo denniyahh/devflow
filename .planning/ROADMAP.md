@@ -34,7 +34,7 @@ note, the success criteria below deliberately claim no more than the evidence su
 | 48 | Survivable State Writes and Honest Gate Recovery | SURV-01, SURV-02, CHKPT-01, CHKPT-02, TEST-01 | 2 | Complete    |
 | 49 | Live Unattended Run — The Milestone's Instrument | VERIFY-01 | 3 | Complete    |
 | 50 | Addressable Monitor Liveness | SUPV-01 | 4 | Complete    |
-| 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | TBD | 4 (after 50) | Not started |
+| 50.1 | Split-Lock State-Handling Overhaul (INSERTED) | SUPV-03, SUPV-04, SUPV-05, SURV-03, SURV-04 | 4 (after 50) | Not started |
 | 51 | Rate-Limit Agent Failover | SUPV-02 | 5 | Not started |
 
 ### Phase 46: CI Load Shape and Operator Input Validation
@@ -493,7 +493,7 @@ a short OS lock (`flock`) around every state write; an `update_state(root, phase
 `State` consumed by value across blocking calls; a launcher-to-monitor ownership token handoff;
 gate-waiter registration (which closes the stale-gate-answer hazard, AR-48-04 and the T-48-12-05
 caveat); fsync of the file and its directory. See the 999.130 entry for evidence and constraints.
-**Requirements**: TBD (none assigned yet; set at discuss/plan)
+**Requirements**: SUPV-03, SUPV-04, SUPV-05, SURV-03, SURV-04
 **Success Criteria** (what must be TRUE):
 
   1. A supervisor that is live but whose record was never saved is never joined by a second one:
