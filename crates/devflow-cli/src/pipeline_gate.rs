@@ -411,6 +411,45 @@ fn gate_wait_call(
     wait()
 }
 
+/// V-21's view of one approval's two consumers, shared by the threads that install it.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ClaimProbe {
+    claimed: std::sync::atomic::AtomicUsize,
+    already_consumed: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set on a consumer's thread to count its claim, see [`note_claim`].
+    static CLAIM_PROBE: std::cell::RefCell<Option<std::sync::Arc<ClaimProbe>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Count a consumer's claim outcome and hold it until the other consumer has claimed
+/// too, with a bound. Without the hold the winner acts at once and closes the gate, and
+/// the loser meets a closed gate rather than the other's claim. Does nothing on a
+/// thread with no probe installed.
+#[cfg(test)]
+fn note_claim(claim: &Result<Claim, GateError>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    const OTHER_CONSUMER_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+    let Some(probe) = CLAIM_PROBE.with_borrow(Clone::clone) else {
+        return;
+    };
+    match claim {
+        Ok(Claim::Claimed) => probe.claimed.fetch_add(1, SeqCst),
+        Ok(Claim::AlreadyConsumed) => probe.already_consumed.fetch_add(1, SeqCst),
+        Err(_) => 0,
+    };
+    let started = std::time::Instant::now();
+    while probe.claimed.load(SeqCst) + probe.already_consumed.load(SeqCst) < 2
+        && started.elapsed() < OTHER_CONSUMER_WITHIN
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Open a gate and block (in the detached monitor) until its answer or the long
 /// timeout, consuming the answer through its claim. See [`run_gate_with_timeout`].
 pub(crate) fn run_gate(
@@ -538,7 +577,10 @@ pub(crate) fn run_gate_with_timeout(
     };
     match wait_end {
         GateWaitEnd::Answered(response) => {
-            match Gates::claim(project_root, state.phase, stage, gate_id) {
+            let claim = Gates::claim(project_root, state.phase, stage, gate_id);
+            #[cfg(test)]
+            note_claim(&claim);
+            match claim {
                 Ok(Claim::Claimed) => {}
                 Ok(Claim::AlreadyConsumed) => {
                     registration.finish();
@@ -1651,8 +1693,8 @@ mod tests {
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
 
-        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        Gates::respond(
+        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        answer_open_gate(
             root,
             phase,
             Stage::Ship,
@@ -1728,8 +1770,8 @@ mod tests {
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
 
-        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        Gates::respond(
+        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        answer_open_gate(
             root,
             phase,
             Stage::Ship,
@@ -1791,8 +1833,8 @@ mod tests {
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
 
-        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
-        Gates::respond(
+        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        answer_open_gate(
             root,
             phase,
             Stage::Ship,
@@ -1870,20 +1912,20 @@ mod tests {
             );
 
             // A request written but no response yet is the same fail-closed case.
-            Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
+            Gates::open_gate(root, phase, Stage::Ship, "ctx").unwrap();
             let err = ship_override(root, phase, force).unwrap_err();
             assert!(
                 err.to_string().contains("no Ship gate response"),
                 "force={force}: {err}"
             );
-            let _ = Gates::cleanup(root, phase, Stage::Ship);
+            let _ = Gates::close(root, phase, Stage::Ship);
         }
     }
 
     /// 20e Task 2 (review: Codex HIGH — lock race): a contended per-phase
     /// lock refuses fail-closed, naming the holder pid, with `--force` both
     /// true and false — `ship_override` must never race a live holder's
-    /// `poll_response`.
+    /// gate wait.
     #[test]
     fn ship_override_refuses_when_lock_contended() {
         let dir = tempfile::tempdir().unwrap();
@@ -1904,13 +1946,13 @@ mod tests {
         }
     }
 
-    /// 20e Task 2 (review: Hermes ack-race): a Ship response that already
-    /// has an ack file alongside it was already consumed by a (now-dead)
-    /// monitor — `ship_override` refuses and directs to `devflow doctor`
-    /// rather than re-running terminal hooks, with `--force` both true and
-    /// false. `finish_workflow` must never be reached: state stays intact.
+    /// 20e Task 2 (review: Hermes ack-race): a Ship answer that already has a claim
+    /// was already consumed, by a monitor that may have died mid-finalization.
+    /// `ship_override` refuses and directs to `devflow doctor` rather than re-running
+    /// terminal hooks, with `--force` both true and false. `finish_workflow` must never
+    /// be reached: state stays intact.
     #[test]
-    fn ship_override_refuses_when_response_already_acked() {
+    fn ship_override_refuses_when_the_answer_was_already_claimed() {
         for force in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
@@ -1920,19 +1962,14 @@ mod tests {
             state.stage = Stage::Ship;
             workflow::save_state(&state).unwrap();
 
-            Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
-            Gates::respond(
-                root,
-                phase,
-                Stage::Ship,
-                &GateResponse {
-                    approved: true,
-                    note: None,
-                    responded_by: Some("test".into()),
-                },
-            )
-            .unwrap();
-            Gates::ack(root, phase, Stage::Ship).unwrap();
+            let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
+                .unwrap()
+                .gate_id;
+            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+            assert_eq!(
+                Gates::claim(root, phase, Stage::Ship, &gate).unwrap(),
+                gates::Claim::Claimed
+            );
 
             let err = ship_override(root, phase, force).unwrap_err();
             assert!(
@@ -1941,9 +1978,139 @@ mod tests {
             );
 
             let reloaded = workflow::load_state(root, phase)
-                .expect("an already-acked refusal must never clear state");
+                .expect("an already-claimed refusal must never clear state");
             assert_eq!(reloaded.stage, Stage::Ship);
         }
+    }
+
+    /// R-09: `ship_override` reads and moves nothing. A file in the live gate's slot
+    /// that does not bind is refused, named, and left for `devflow gate approve` or
+    /// `reject`, which set it aside before publishing a valid answer.
+    #[test]
+    fn ship_override_refuses_an_answer_that_does_not_bind_and_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(98);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+        let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
+            .unwrap()
+            .gate_id;
+        let slot = Gates::answer_path(root, phase, Stage::Ship, &gate);
+        std::fs::write(&slot, br#"{"approved": true}"#).unwrap();
+
+        let message = ship_override(root, phase, false).unwrap_err().to_string();
+        assert!(message.contains("missing_gate_id"), "{message}");
+        assert!(message.contains("devflow gate approve"), "{message}");
+        assert_eq!(std::fs::read(&slot).unwrap(), br#"{"approved": true}"#);
+        assert_eq!(
+            gate_claim_files(root, phase, Stage::Ship),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().stage,
+            Stage::Ship
+        );
+    }
+
+    /// A phase parked at Stage::Ship in a repo whose terminal hooks can finish it.
+    fn ship_ready_fixture(root: &Path, phase: PhaseId) {
+        init_repo(root);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
+        let branch_created = devflow_core::test_support::git_command(root)
+            .args(["branch", &branch, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.gate_notify_cmd = Some("true".to_string());
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// The writer and the reader of a Ship approval agree: what `devflow gate approve`
+    /// publishes is what `devflow ship` finds, claims and finishes on.
+    #[test]
+    fn ship_override_ships_an_approval_written_by_gate_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(99);
+        ship_ready_fixture(root, phase);
+        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+
+        crate::commands::gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
+        ship_override(root, phase, false).unwrap();
+
+        assert!(matches!(
+            workflow::load_state(root, phase),
+            Err(workflow::WorkflowError::MissingState(_))
+        ));
+        assert_eq!(events_named(root, "workflow_shipped").len(), 1);
+    }
+
+    /// D-04's consumption claim (V-21), as a defence-in-depth backstop (R2-11). This
+    /// waiter is an in-process gate wait with no supervisor record, a state 50.1-29's
+    /// R-17 guard and D-17's holder leave no production path to; the test pins that the
+    /// claim alone still lets only one of the two consumers act on one approval, if a
+    /// waiter exists that neither guard sees.
+    #[test]
+    fn ship_override_and_a_live_waiter_cannot_both_consume_one_approval() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(97);
+        ship_ready_fixture(root, phase);
+        let probe = std::sync::Arc::new(ClaimProbe::default());
+
+        let waiter = {
+            let root = root.to_path_buf();
+            let probe = probe.clone();
+            std::thread::spawn(move || {
+                CLAIM_PROBE.set(Some(probe));
+                let mut state = workflow::load_state(&root, phase).unwrap();
+                // What `handle_ship_outcome` does with an approval.
+                match run_gate_with_timeout(&root, &mut state, Stage::Ship, "ctx", 30, None)? {
+                    GateAction::Advance => finish_workflow_with_gate_timeout(&root, &mut state, 2),
+                    other => panic!("the approval must read as an advance: {other:?}"),
+                }
+            })
+        };
+        wait_for_open_gate(root, phase, Stage::Ship);
+        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+        let shipper = {
+            let root = root.to_path_buf();
+            let probe = probe.clone();
+            std::thread::spawn(move || {
+                CLAIM_PROBE.set(Some(probe));
+                ship_override(&root, phase, false)
+            })
+        };
+        let waited = waiter.join().unwrap();
+        let shipped = shipper.join().unwrap();
+
+        assert_eq!(
+            (
+                probe.claimed.load(SeqCst),
+                probe.already_consumed.load(SeqCst)
+            ),
+            (1, 1),
+            "exactly one consumer claims: waiter {waited:?}, ship {shipped:?}"
+        );
+        assert_eq!(
+            events_named(root, "workflow_shipped").len(),
+            1,
+            "finalization ran once: waiter {waited:?}, ship {shipped:?}"
+        );
+        let refused = match (&waited, &shipped) {
+            (Ok(()), Err(refused)) | (Err(refused), Ok(())) => refused,
+            _ => panic!("exactly one consumer acts: waiter {waited:?}, ship {shipped:?}"),
+        };
+        assert!(
+            refused.to_string().contains("consumed"),
+            "the other consumer says the answer was consumed: {refused}"
+        );
     }
 
     /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`
