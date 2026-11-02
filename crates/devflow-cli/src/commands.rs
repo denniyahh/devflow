@@ -759,7 +759,8 @@ fn start_reserved(
     // state.json, died silently into /dev/null, and the save below then wrote
     // an in-progress state nothing would ever advance. Save first; if the
     // launch fails, clear the just-saved state so `devflow status`/`recover`
-    // don't report a phantom run (the failure WR-11 originally targeted).
+    // don't report a phantom run (the failure WR-11 originally targeted),
+    // unless the supervisor it spawned may still be running.
     create_run_state(project_root, phase, &mut state, launch_id)?;
     *created = false;
     events::emit(
@@ -769,6 +770,15 @@ fn start_reserved(
         workflow_started_payload(&state),
     );
     if let Err(err) = launch_stage(&mut state, None, None) {
+        // A reservation no launch took is this process's own lock, and would read live.
+        crate::pipeline_launch::abandon_reservation(project_root, phase, false);
+        if let Some(found) = failed_launch_may_still_run(project_root, phase, &state) {
+            eprintln!(
+                "warning: kept phase {phase}'s state after the failed launch: {found} may still \
+                 be running, and `devflow stop` needs the state to reach it"
+            );
+            return Err(err);
+        }
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -780,6 +790,37 @@ fn start_reserved(
     );
     println!("  watch live: devflow logs -f --phase {phase}");
     Ok(())
+}
+
+/// The supervisors a failed launch's own copy of the state names that may still be live,
+/// read as the launch guard reads them. The launcher's copy, not the file: the publish sets
+/// the record in it before the save, so it names a supervisor whose save failed. A launch
+/// that got a confirmed stop, or never spawned, has cleared the record from it.
+fn failed_launch_may_still_run(
+    project_root: &Path,
+    phase: PhaseId,
+    launcher_view: &State,
+) -> Option<String> {
+    let cache_dir = registry::cache_dir();
+    match possibly_live_sockets(
+        project_root,
+        phase,
+        Some(launcher_view),
+        cache_dir.as_deref(),
+    ) {
+        Ok(sockets) if sockets.is_empty() => None,
+        Ok(sockets) => Some(
+            sockets
+                .iter()
+                .map(|socket| format!("launch {} ({})", socket.launch_id, socket.liveness))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Err((dir, why)) => Some(format!(
+            "a supervisor (the socket directory {} could not be listed: {why})",
+            dir.display()
+        )),
+    }
 }
 
 /// Write a fresh run's state for `start`, under the write lock, over the state its
@@ -15204,6 +15245,119 @@ mod tests {
             liveness::Held::Abandoned,
             "the launcher released its copy once the publish was done"
         );
+    }
+
+    /// A `start` whose publish save fails, with `stop_supervisor` deciding whether the
+    /// launcher can get a confirmed stop out of the supervisor it spawned. Returns the
+    /// launch's error, the launch id, and whether a state file was left. The reservation
+    /// is cleared at the hold, which is what fails the save.
+    fn start_failing_its_publish_save(
+        root: &Path,
+        phase: PhaseId,
+        stop_supervisor: bool,
+    ) -> (String, String, bool) {
+        init_start_repo(root, phase);
+        let release = launch_hold_release();
+        let (result, launch_id, sidecar) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| start_for_test(root, phase));
+            assert!(reached_hold(&release, &worker), "start reached the publish");
+            let pending = workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .expect("nothing has promoted the reservation yet");
+            let sidecar =
+                supervisor::read_sidecar(&pending.socket_path.with_extension("json")).unwrap();
+            if stop_supervisor {
+                // SAFETY: names the supervisor this test's own start just launched, read
+                // from the sidecar it wrote while it is still running.
+                unsafe {
+                    libc::kill(
+                        libc::pid_t::try_from(sidecar.supervisor_pid).unwrap(),
+                        libc::SIGSTOP,
+                    );
+                }
+            }
+            workflow::update_state_with(root, phase, |existing| {
+                let workflow::Existing::Loaded(mut state) = existing else {
+                    panic!("the reservation's state loads");
+                };
+                state.pending_supervisor = None;
+                Ok::<_, CliError>((Some(state), ()))
+            })
+            .unwrap();
+            std::fs::write(&release, "").unwrap();
+            (worker.join().unwrap(), pending.launch_id, sidecar)
+        });
+        let kept = workflow::state_path(root, phase).exists();
+        // SAFETY: both name processes this test's own start launched; a SIGKILL also ends
+        // a stopped process. A group already gone only makes these fail.
+        unsafe {
+            libc::kill(
+                libc::pid_t::try_from(sidecar.supervisor_pid).unwrap(),
+                libc::SIGKILL,
+            );
+            libc::kill(
+                -libc::pid_t::try_from(sidecar.agent_pgid).unwrap(),
+                libc::SIGKILL,
+            );
+        }
+        (result.expect_err("the publish save fails"), launch_id, kept)
+    }
+
+    /// The error of a publish it cannot confirm stopped tells the operator to run
+    /// `devflow stop --phase N --launch ID`, which needs the run's state to still be there.
+    /// The supervisor is really stopped (SIGSTOP), so its answer never comes.
+    #[test]
+    fn a_start_keeps_the_state_when_its_supervisor_may_still_be_running() {
+        const NAME: &str =
+            "commands::tests::a_start_keeps_the_state_when_its_supervisor_may_still_be_running";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("before_publish_save", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (error, launch_id, kept) =
+            start_failing_its_publish_save(dir.path(), PhaseId::new(5033), true);
+        assert!(error.contains("did not confirm a stop"), "{error}");
+        assert!(error.contains(&format!("--launch {launch_id}")), "{error}");
+        assert!(kept, "the state the error relies on was deleted: {error}");
+    }
+
+    /// The same failed publish, with a supervisor that confirms its stop, still leaves no
+    /// phantom run. This is what shows the check above reads the supervisor, not the
+    /// failure.
+    #[test]
+    fn a_start_clears_the_state_when_its_supervisor_confirmed_the_stop() {
+        const NAME: &str =
+            "commands::tests::a_start_clears_the_state_when_its_supervisor_confirmed_the_stop";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let hold = tempfile::tempdir().unwrap();
+            let spec = launch_hold_spec("before_publish_save", hold.path());
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (error, _, kept) =
+            start_failing_its_publish_save(dir.path(), PhaseId::new(5034), false);
+        assert!(
+            error.contains("was shut down through its socket"),
+            "{error}"
+        );
+        assert!(!kept, "no supervisor is left, so no run should be: {error}");
     }
 
     /// A `start` that fails after reserving gives the reservation back: a state it
