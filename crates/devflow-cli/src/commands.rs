@@ -772,6 +772,11 @@ fn start_reserved(
         workflow_started_payload(&state),
     );
     if let Err(err) = launch_stage(&mut state, None, None) {
+        // A stop at a safe point is recorded and ends the launch with an error; a stopped
+        // run keeps its state for `devflow resume`.
+        if state.stopped {
+            return Err(err);
+        }
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -17688,6 +17693,84 @@ mod tests {
             holder_events_named(root, "stage_launched").is_empty(),
             "nothing was launched"
         );
+    }
+
+    /// A foreground `start` parked at a preflight gate and then signalled records a stop at
+    /// safe point 4, and that stop survives its own launch error, so `resume` has a state to
+    /// continue. The preflight fails because an Auto run needs a GSD config this repo lacks.
+    #[test]
+    fn a_signal_to_a_start_parked_at_a_preflight_gate_keeps_the_resumable_state() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str = "commands::tests::\
+                            a_signal_to_a_start_parked_at_a_preflight_gate_keeps_the_resumable_state";
+        let phase = PhaseId::new(5309);
+        if devflow_core::test_support::in_child_test(NAME) {
+            let err = start(
+                &holder_child_root(),
+                phase,
+                AgentKind::Claude,
+                Mode::Auto,
+                false,
+                false,
+                false,
+                None,
+                false,
+                true,
+            )
+            .expect_err("a stop at a safe point during the gate wait is an error")
+            .to_string();
+            assert!(err.contains("gate wait"), "{err}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_start_repo(root, phase);
+        let path_dir = crate::test_support::agent_free_dir_with_agent_stub("claude");
+        let cache = crate::test_support::hermetic_cache_dir();
+        let mut child = devflow_core::test_support::spawn_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[
+                ("DEVFLOW_CACHE_DIR", cache.path().as_os_str()),
+                (HOLDER_ROOT_ENV, root.as_os_str()),
+            ],
+        );
+        let gate = Gates::gate_path(root, phase, Stage::Define);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while !gate.exists() {
+            if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                panic!(
+                    "the start never parked at its gate: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // SAFETY: `kill` on the pid of a child this test has not reaped.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!(
+                    "the signalled start did not end: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+
+        let stopped = holder_events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
+        let state = workflow::load_state(root, phase).expect("the stop keeps the state");
+        assert!(state.stopped);
+        assert_eq!(state.supervisor, None);
+        assert_eq!(state.pending_supervisor, None);
     }
 
     /// A signalled launcher's child half: hold the phase, and with `pending` the launch's
