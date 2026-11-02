@@ -288,7 +288,7 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        output_text.contains("no confirmed waiter"),
+        output_text.contains("no registered waiter"),
         "unexpected output: {output_text}"
     );
 
@@ -387,14 +387,11 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     let live_ship_phase = PhaseId::new(4820);
     Gates::write_gate(root, phase, Stage::Code, "abandoned").unwrap();
     Gates::write_gate(root, ship_phase, Stage::Ship, "release").unwrap();
-    let pid = std::process::id();
-    let start = devflow_core::agent::process_start_time(pid).expect("test process start time");
-    let lock_path = root
-        .join(".devflow")
-        .join(format!("lock-{}", live_ship_phase.padded()));
-    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-    std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-    Gates::write_gate(root, live_ship_phase, Stage::Ship, "live poller").unwrap();
+    let live_ship_gate = Gates::open_gate(root, live_ship_phase, Stage::Ship, "live poller")
+        .unwrap()
+        .gate_id;
+    let _live_ship_waiter =
+        Gates::register_waiter(root, live_ship_phase, Stage::Ship, &live_ship_gate).unwrap();
 
     let output = common::hermetic_devflow(&home)
         .args([
@@ -424,15 +421,15 @@ fn dry_run_sweep_reports_no_waiter_gates_as_left_alone() {
     );
     assert!(
         stdout.contains(&format!("left phase {ship_phase} ship alone")),
-        "no-holder Ship gate must also be left alone: {stdout}"
+        "a no-waiter Ship gate must also be left alone: {stdout}"
     );
     assert!(
         !stdout.contains(&format!("would reap phase {ship_phase} ship")),
-        "no-holder dry-run must not claim it would reap the Ship gate: {stdout}"
+        "a no-waiter dry-run must not claim it would reap the Ship gate: {stdout}"
     );
     assert!(
         stdout.contains(&format!("would reap phase {live_ship_phase} ship")),
-        "a live Ship holder must remain the positive would-reap control: {stdout}"
+        "a registered Ship waiter must remain the positive would-reap control: {stdout}"
     );
     assert!(
         stdout.contains("1 would be reaped"),
@@ -511,8 +508,8 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
         "reject against an interrupted start unexpectedly succeeded: {output_text}"
     );
     assert!(
-        output_text.contains("no confirmed waiter"),
-        "reject must say no confirmed waiter: {output_text}"
+        output_text.contains("no registered waiter"),
+        "reject must say no registered waiter: {output_text}"
     );
     let recovery_hint = format!("devflow recover --clean --phase {phase}");
     assert!(
@@ -626,16 +623,16 @@ fn start_self_resolving_arm_live_start_consumes_the_define_rejection() {
         "live reject failed\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // `gate_respond` re-checks the holder after publishing: a start that has
-    // already consumed the answer and released its lock yields the no-holder
+    // `gate_respond` re-checks the waiter after publishing: a start that has
+    // already consumed the answer and finished its registration yields the no-waiter
     // wording. That is accepted only because the start must then be seen to
     // exit successfully below.
-    let reject_wording = if stdout.contains("a live lock holder may pick up this response") {
+    let reject_wording = if stdout.contains("a registered waiter may pick up this response") {
         "live"
-    } else if stdout.contains("response was written, but no confirmed live holder will act") {
-        "no_holder_after_exit"
+    } else if stdout.contains("response was written, but no registered waiter will act") {
+        "no_waiter_after_exit"
     } else {
-        panic!("reject reported neither a live holder nor a post-exit no-holder: {stdout}");
+        panic!("reject reported neither a registered waiter nor a post-exit no-waiter: {stdout}");
     };
     println!("reject_wording={reject_wording}");
 
