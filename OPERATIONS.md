@@ -50,8 +50,9 @@ Define → Plan → Code → Validate → Ship
 | `devflow evidence --phase N [--json] [--require-shipped] [--root PATH]` | **Read-only structural oracle (23-06):** reports DevFlow's own append-only record of whether a phase actually shipped, instead of trusting an agent-authored attestation document. `shipped` is strictly true only after the terminal-only `workflow_shipped` event has been emitted (the last step inside `finish_workflow_with_gate_timeout`, once the entire post-Ship hook batch has succeeded) — a phase halted by `--until <stage>` always reports `shipped: false`, even though it emits the older, ambiguous `workflow_finished` event too (surfaced separately as `workflow_finished_seen`/`finished_reason` for corroboration, never consulted by `shipped`). `--require-shipped` exits non-zero unless `shipped` is true, so it is declarable as a `verify::external_verify_commands` Layer 0 probe (opt-in per phase; a phase's PLAN must declare it and the operator must approve it via `DEVFLOW_TRUST_EXTERNAL_VERIFY`) — a failed declared probe outranks every agent-controlled signal. |
 
 (`devflow advance` is internal and takes `--phase N`. A supervisor does not
-run it as a command; it advances in-process. `devflow status` names it as a
-repair only for a gate-pending phase whose supervisor is GONE.)
+run it as a command; it advances in-process. `devflow status` does not suggest
+it, because answering a gate and then running it sets the answer aside, and a
+hand-run advance refuses while a supervisor of the phase is live.)
 
 (`devflow monitor` is internal and registered as the hidden `__monitor`
 subcommand — it is the stage supervisor's own process body. Every stage
@@ -81,15 +82,24 @@ and one `ping`) and get one of three answers:
 |---|---|---|
 | **ALIVE** | The socket answered the ping. The reply names the current owner (agent running, advancing, gate wait, …) and the launch shape. A moment between stages is ALIVE, because the supervisor advances in-process | None needed. To end the run: `devflow stop --phase N` |
 | **STALE** | The socket file is still there and owned by you, but nothing accepts the connect: the supervisor died without cleaning up, and its agent group may still be running | `devflow stop --phase N` (the backstop ends a validated agent group and removes the socket and sidecar), then `devflow resume --phase N` |
-| **GONE** | No file at the recorded path: the supervisor has exited. Normal when the phase is stopped; when it is not, nothing will advance the phase | `devflow resume --phase N` (when a gate is pending, answer it and run `devflow advance --phase N`) |
+| **GONE** | No file at the recorded path: the supervisor has exited. Normal when the phase is stopped; when it is not, nothing will advance the phase | `devflow resume --phase N`, which reruns the stage and asks again. When the Ship gate is pending, answer it and run `devflow ship --phase N`; any other pending gate is asked again by `resume`. When the agent is still running with no supervisor, `resume` refuses: `status` and `stop` name its pid and the manual kill (`kill -TERM -- -<pid>`, after `ps -o pid,pgid,lstart,args -p <pid>` when the pid is unconfirmed). `devflow stop` cannot end it (backlog 999.170), so end it by hand first |
 
 How each command shows them:
 
 - **`devflow status`** prints `supervisor: <socket path> — <state>` for each
   phase, and under it the repair: `devflow stop --phase N` then
-  `devflow resume --phase N` for STALE; `devflow resume --phase N` (plus
-  `devflow advance --phase N` when a gate is pending) for GONE while the phase
-  is not stopped. A phase with no supervisor recorded reads `not launched`.
+  `devflow resume --phase N` for STALE; for GONE while the phase is not
+  stopped, `devflow resume --phase N`, plus `devflow ship --phase N` when the
+  Ship gate is pending: when the Ship gate is pending, answer it and run
+  `devflow ship --phase N`; any other pending gate is asked again by `resume`.
+  When the supervisor is gone but the phase's agent still runs, it names the
+  agent's pid and the manual kill (`kill -TERM -- -<pid>`, after
+  `ps -o pid,pgid,lstart,args -p <pid>` when the pid is unconfirmed) instead of
+  `resume`, which refuses while that agent lives; `devflow stop` cannot end it
+  (backlog 999.170), so end it by hand first. The pid is unconfirmed when it
+  comes only from `.devflow/phase-NN-agent-pid`, which an unrelated process can
+  have reused; if `ps` shows that, end that process or remove the pid file. A
+  phase with no supervisor recorded reads `not launched`.
 - **`devflow doctor`** reports STALE, GONE-while-not-stopped and a failed probe
   as problems, naming the phase and launch id but no path. Its repairs:
   `devflow stop --phase N && devflow resume --phase N` for STALE,
@@ -185,11 +195,55 @@ devflow gate reject 15 --note "abort: wrong direction"             # ends the ph
 ```
 
 `--stage` is only needed when one phase somehow has several open gates.
-Under the hood this writes `.devflow/gates/NN-<stage>.response.json`
-atomically; the supervisor parked at the gate checks for it about once a
-second (a gate waited on outside a supervisor, such as `devflow ship`'s
-foreground wait, backs off up to ~60s), acks, and moves on. The CLI refuses to
-overwrite an unconsumed response.
+`--gate-id <ID>` binds the answer to the gate `gate list` or `gate show`
+displayed, and a gate opened since is refused; without it the command answers
+the gate open now.
+
+Every gate opened gets a fresh `gate_id`, named in its request file
+`.devflow/gates/NN-<stage>.json`. An answer belongs to that one gate. `gate
+approve` and `gate reject` write it to
+`.devflow/gates/NN-{stage}.{gate_id}.response.json`. Before they publish, they
+move an answer in that gate's own slot that does not bind to it aside, so a
+refused answer never blocks a valid one, and they refuse to overwrite an
+unconsumed answer that does bind. At a stage other than Ship with no registered
+waiter they write nothing and name the repair; a Ship answer with no waiter is
+stored for `devflow ship`.
+
+To answer by hand, copy `gate_id` from the gate file and publish the same path
+with the same body, renaming it into place so no reader sees it half written:
+
+```json
+{"gate_id": "<copied from the gate file>", "approved": true, "note": "lgtm"}
+```
+
+`approved` is `true` or `false`, and `note` is optional. A rejection loops back
+to Code, or ends the phase when its note contains `abort`. `devflow gate list`
+stops listing a gate once an answer bound to it is in its slot. The
+supervisor parked at the gate checks for it about once a second (a gate waited
+on outside a supervisor, such as `devflow ship`'s foreground wait, backs off up
+to ~60s), claims it with `.devflow/gates/NN-{stage}.{gate_id}.ack.json`, and
+moves on. The first process to publish that claim consumes the answer.
+
+**Answers that do not bind.** An answer with a missing or other id, an
+unparsable one, a legacy unkeyed `NN-<stage>.response.json`, or one left unused
+when its gate closes is never consumed or deleted. It is set aside as
+`NN-{stage}.{gate_id|noid}.{secs}.{pid}.{seq}.quarantined.json` and logged as
+`gate_answer_quarantined` with its reason. `status`, `doctor` and
+`recover --clean` list it. A set-aside file persists until removed by hand:
+nothing in DevFlow deletes it, so remove it once read.
+
+**A late answer.** `DEVFLOW_GATE_TIMEOUT_SECS` ends the wait, not the gate, and
+a run that timed out has ended at that gate. `devflow resume --phase N` reruns
+the stage and asks again. It reports any unused answer it set aside, and any
+answer that "was claimed, with no record that it was applied" (logged
+`resume_found_unapplied_answer`; the event's name means that record is missing,
+and the closed gate's claim is logged `gate_claimed_answer_removed`). The
+answer's consumer may have ended before acting on it, or it may have acted with
+the gate left open, so the line says only what is known, and the rerun asks
+again either way. At Ship the line adds that a merge, version bump or tag may
+already have run, so check them before answering again. A stored Ship approval
+is applied without a rerun by `devflow ship --phase N`; once `resume` has set
+that answer aside, `devflow ship` cannot apply it.
 
 ## Notify hook (never miss a gate)
 

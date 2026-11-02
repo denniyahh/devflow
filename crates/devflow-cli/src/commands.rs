@@ -1384,9 +1384,9 @@ fn probe_phase(state: &State) -> PhaseLiveness {
 /// the pure, testable counterpart to `status`'s hints. STALE names
 /// `devflow stop` (it ends the orphaned agent group and removes the socket)
 /// and then `devflow resume`; GONE while active names `devflow resume`, plus
-/// `devflow advance` when the phase is gate-pending (answer the gate, then
-/// advance — widening that predicate risks suggesting `advance` where
-/// nothing proves it is right, per 21-CONTEXT.md's Review Incorporation); a
+/// `devflow ship` when the Ship gate is pending, the one stage whose stored answer
+/// `ship_override` applies (D-06). No hint names `devflow advance`: its gate open sets
+/// an earlier answer aside, so answering and then advancing loses the answer. A
 /// failed probe names the socket to inspect. A live pending supervisor names only
 /// `devflow stop` (criterion 2). A stopped phase names `devflow resume`, since nothing
 /// else continues it; a phase that never launched and is not stopped names nothing, and
@@ -1401,8 +1401,8 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
         ],
         PhaseLiveness::GoneWhileActive => {
             let mut hints = vec![format!("devflow resume --phase {phase}")];
-            if state.gate_pending {
-                hints.push(format!("devflow advance --phase {phase}"));
+            if state.gate_pending && state.stage == Stage::Ship {
+                hints.push(format!("devflow ship --phase {phase}"));
             }
             hints
         }
@@ -11159,10 +11159,9 @@ mod tests {
     }
 
     /// 21a / 50-12: `recovery_hints` returns a `resume` hint for a phase
-    /// whose supervisor is GONE while it is not stopped, additionally an
-    /// `advance` hint when the phase is gate-pending (answer the gate, then
-    /// advance), `stop` then `resume` for a STALE socket, and nothing for an
-    /// ALIVE, stopped or unlaunched phase.
+    /// whose supervisor is GONE while it is not stopped, additionally a
+    /// `ship` hint when its Ship gate is pending (D-06), `stop` then `resume` for
+    /// a STALE socket, and nothing for an ALIVE or unlaunched phase.
     #[test]
     fn recovery_hints_includes_resume_for_gone_while_active() {
         let dir = tempfile::tempdir().unwrap();
