@@ -20,12 +20,13 @@
 use crate::CliError;
 use crate::commands::phase_artifact_on_base;
 use crate::pipeline_gate::{abort, run_gate};
+use crate::pipeline_launch::close_gate;
 use crate::pipeline_launch::commit;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_launch::stream_launch_enabled;
 use crate::pipeline_outcomes::truncate_reason;
-use devflow_core::gates::{GateAction, Gates};
+use devflow_core::gates::GateAction;
 use devflow_core::git::git_command;
 use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
@@ -1417,7 +1418,7 @@ pub(crate) fn run_preflight(
                 // D-18f: approval is an explicit override — skip the
                 // just-adjudicated check on the retry (see the function
                 // doc comment above).
-                let _ = Gates::close(project_root, state.phase, stage);
+                let _ = close_gate(project_root, state.phase, stage);
                 // 48-15 / R-8, T-48-15-01, T-48-07-02: in Auto mode a Code
                 // launch whose plans declare a human-only checkpoint is
                 // REFUSED, so the pass path below never runs for it. THIS is
@@ -1456,7 +1457,7 @@ pub(crate) fn run_preflight(
             GateAction::LoopBack(_) => {
                 // D-18f: "I will fix it, then retry" — re-check deliberately,
                 // bounded by the ceiling above.
-                let _ = Gates::close(project_root, state.phase, stage);
+                let _ = close_gate(project_root, state.phase, stage);
                 launch_stage(state, None, None)?;
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason)?,
@@ -1496,6 +1497,7 @@ pub(crate) fn run_preflight(
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use devflow_core::gates::Gates;
     use devflow_core::test_support::preanswer_gate;
     use devflow_core::workflow;
     // Named only by the recording assertions below; importing it at module

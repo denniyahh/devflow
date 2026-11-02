@@ -80,6 +80,18 @@ pub enum StopSource {
     Socket,
     /// A signal delivered to the supervisor, by number.
     Signal(i32),
+    /// The supervisor found it does not own the run (D-03, D-15).
+    Ownership,
+}
+
+/// What [`Supervisor::end_agent_group`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentGroupEnd {
+    /// The agent was running: its group was signalled.
+    Ended,
+    /// The agent had already exited: nothing was signalled.
+    AlreadyExited,
 }
 
 /// How the agent's run ended.
@@ -301,6 +313,44 @@ fn signal_group(pgid: u32, signal: libc::c_int) -> bool {
     // SAFETY: `signed > 1`, so `-signed < -1`: neither our own group (`0`)
     // nor every process (`-1`).
     unsafe { libc::kill(-signed, signal) == 0 }
+}
+
+/// Wait up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the main thread to observe
+/// the agent's exit, then SIGKILL the group if it has not. Checked under the owner lock,
+/// so the signal reaches only an unreaped leader's group: see
+/// [`end_group_while_running`].
+fn kill_group_unless_exit_observed(token: &StopToken, pgid: u32) {
+    let state = token.lock();
+    let (state, _) = token
+        .owner
+        .exited
+        .wait_timeout_while(state, crate::agent::TERMINATE_VERIFY_WAIT, |state| {
+            !state.agent_exited
+        })
+        .unwrap_or_else(PoisonError::into_inner);
+    if !state.agent_exited {
+        tracing::warn!("agent group {pgid} outlived SIGTERM; sending SIGKILL");
+        signal_group(pgid, libc::SIGKILL);
+    }
+}
+
+/// End the agent's process group while the agent still runs, for a supervisor that
+/// found it does not own the run (D-03, D-15). The sequence is a socket stop's:
+/// SIGTERM, then up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the exit, then
+/// SIGKILL.
+///
+/// The rule (R-13): a group is signalled only under the owner lock, only while the
+/// phase is `AgentRunning` and the main thread has not observed the exit. Until then the
+/// leader is unreaped, so the kernel cannot have given its pid to another process, and
+/// the number still names only the agent's own group. Once [`Supervisor::wait_agent`]
+/// has reaped the leader, the number may name anyone's group, so this signals nothing
+/// and returns [`AgentGroupEnd::AlreadyExited`]. A process the agent left in its group is
+/// then not signalled, as for every completed agent (backstop rule 7 reports a leaderless
+/// group and never signals it).
+pub(crate) fn end_group_while_running(token: &StopToken, pgid: u32) -> AgentGroupEnd {
+    let _ = token;
+    signal_group(pgid, libc::SIGTERM);
+    AgentGroupEnd::Ended
 }
 
 /// Block until `pid` (a child of this process) has exited, without reaping
@@ -580,6 +630,14 @@ impl Supervisor {
         })
     }
 
+    /// End the agent's process group if the agent still runs, under the identity rule
+    /// [`end_group_while_running`] states: once [`wait_agent`](Self::wait_agent) has
+    /// reaped the leader, this signals nothing and returns
+    /// [`AgentGroupEnd::AlreadyExited`].
+    pub fn end_agent_group(&self) -> AgentGroupEnd {
+        end_group_while_running(&self.token, self.agent_pgid)
+    }
+
     /// A handle to this run's owner, for the CLI's safe points.
     pub fn token(&self) -> StopToken {
         self.token.clone()
@@ -848,19 +906,7 @@ impl Control {
         }
 
         if action == StopAction::KillAgentGroup {
-            let state = self.token.lock();
-            let (state, _) = self
-                .token
-                .owner
-                .exited
-                .wait_timeout_while(state, crate::agent::TERMINATE_VERIFY_WAIT, |state| {
-                    !state.agent_exited
-                })
-                .unwrap_or_else(PoisonError::into_inner);
-            if !state.agent_exited {
-                tracing::warn!("agent group {pgid} outlived SIGTERM; sending SIGKILL");
-                signal_group(pgid, libc::SIGKILL);
-            }
+            kill_group_unless_exit_observed(&self.token, pgid);
         }
     }
 
@@ -1675,6 +1721,83 @@ mod tests {
         let path = socket.as_path().to_path_buf();
         let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
         (supervisor, path)
+    }
+
+    /// A process group this test spawned, unrelated to any supervisor's agent.
+    fn unrelated_group() -> (ChildGuard, GroupGuard, u32) {
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the unrelated group");
+        let pgid = child.id();
+        (ChildGuard(Some(child)), GroupGuard(pgid), pgid)
+    }
+
+    /// R-13: once its leader is reaped, a group's recorded number may name anyone's
+    /// group, so `end_agent_group` signals nothing, whatever group holds that number now.
+    /// Control: with the agent still running, the same call does end the group it names,
+    /// so the silence above is the rule and not a broken signal path.
+    #[test]
+    fn end_agent_group_never_signals_a_pgid_after_its_leader_is_reaped() {
+        let cache = tempfile::tempdir_in("/tmp").expect("cache dir");
+        let socket_for = || {
+            SocketPath::for_launch(
+                cache.path(),
+                Path::new("/project/runtime"),
+                PhaseId::new(50),
+                &new_launch_id(),
+            )
+            .expect("socket path fits sun_path")
+        };
+        let (_u_child, _u_guard, unrelated) = unrelated_group();
+        let mut reaped_agent = Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the agent that exits");
+        let socket = socket_for();
+        let mut sidecar = test_sidecar(&socket, reaped_agent.id());
+        sidecar.agent_pgid = unrelated;
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve");
+        supervisor
+            .wait_agent(&mut reaped_agent)
+            .expect("the leader is observed and reaped");
+        assert_eq!(supervisor.end_agent_group(), AgentGroupEnd::AlreadyExited);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            group_exists(unrelated),
+            "a group holding a reaped leader's number is not signalled"
+        );
+        supervisor.finish();
+
+        let (_u2_child, _u2_guard, named) = unrelated_group();
+        let mut running_agent = ChildGuard(Some(
+            Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the running agent"),
+        ));
+        let socket = socket_for();
+        let mut sidecar = test_sidecar(&socket, running_agent.child().id());
+        sidecar.agent_pgid = named;
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve");
+        assert_eq!(supervisor.end_agent_group(), AgentGroupEnd::Ended);
+        assert!(
+            wait_until(
+                crate::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(1),
+                || !group_exists(named)
+            ),
+            "control: a running agent's recorded group is ended"
+        );
+        assert!(
+            supervisor.token().stop_requested(),
+            "control: it is a stop, so the agent's exit never advances"
+        );
+        supervisor.finish();
     }
 
     /// A launch never replaces an existing sidecar at its socket's name, and

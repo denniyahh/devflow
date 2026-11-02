@@ -34,7 +34,7 @@ use crate::preflight::{
     worktree_writable_roots,
 };
 use devflow_core::config::capture_retention;
-use devflow_core::gates::{AwaitOutcome, GateAction, GateAnswer, GateId, Gates};
+use devflow_core::gates::{AwaitOutcome, CloseReport, GateAction, GateAnswer, GateId, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
@@ -42,7 +42,9 @@ use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::SupervisorRecord;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
-use devflow_core::supervisor::runtime::{AgentOutcome, OwnerPhase, SafePoint, StopToken};
+use devflow_core::supervisor::runtime::{
+    AgentGroupEnd, AgentOutcome, OwnerPhase, SafePoint, StopToken,
+};
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
     agent_result, agents, canary, events, gsd_config, mode, monitor, verify, workflow,
@@ -1073,6 +1075,61 @@ fn update_engaged_state<T>(
     }
 }
 
+/// Whether `err` is the ownership fence's refusal (D-03).
+pub(crate) fn is_not_owner(err: &CliError) -> bool {
+    matches!(
+        err,
+        CliError::Workflow(workflow::WorkflowError::NotOwner { .. })
+    )
+}
+
+/// Run a gate side effect under the ownership fence (D-03, R-09). Inside a supervisor's
+/// advance this is [`workflow::while_owner`], so the check and `op` share one hold of the
+/// state write lock: a supersession is itself a state write under that lock, and lands
+/// wholly before the check (`op` is refused with `NotOwner`) or wholly after `op`.
+/// Outside one (a hand-run `devflow advance`, the foreground `devflow ship`) it is `op`.
+///
+/// `op` is a bounded file operation that calls `Gates::*` directly. The gate lock is the
+/// only lock it may take, as the D-08 ruling of 2026-10-26 allows (see
+/// [`workflow::while_owner`]).
+///
+/// Not reentrant: engaged, this takes the state write lock, so it must not be called
+/// inside an `update_state`, `update_state_with`, `update_owned_state`,
+/// `clear_state_if_owned` or `while_owner` closure, and `op` must not call `fenced`,
+/// [`close_gate`] or [`commit`]. A second `flock` on the write-lock file from one process
+/// blocks forever. A site that needs a gate side effect and a state write does them one
+/// after the other, each under its own hold.
+pub(crate) fn fenced<T>(
+    project_root: &Path,
+    phase: PhaseId,
+    op: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let _ = (project_root, phase);
+    op()
+}
+
+/// `Gates::close` under the ownership fence ([`fenced`], and its non-reentrancy rule: this
+/// must not be called inside a state-write or `while_owner` closure). `commands::start`
+/// keeps its direct `Gates::close`: it runs before any supervisor exists.
+pub(crate) fn close_gate(
+    project_root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+) -> Result<CloseReport, CliError> {
+    fenced(project_root, phase, || {
+        Ok(Gates::close(project_root, phase, stage)?)
+    })
+}
+
+/// Remove the run's state: as the engaged supervisor when there is one
+/// ([`workflow::clear_state_if_owned`]), unfenced otherwise.
+pub(crate) fn clear_run_state(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
+    Ok(match engaged_launch_id() {
+        Some(launch_id) => workflow::clear_state_if_owned(project_root, phase, &launch_id)?,
+        None => workflow::clear_state(project_root, phase)?,
+    })
+}
+
 /// Remember `record` as the successor this advance published, so
 /// [`run_monitor`] marks this supervisor handed off once the advance has
 /// returned. A no-op when no supervisor's advance is engaged.
@@ -1292,12 +1349,14 @@ fn await_bound_answer(
         let left = timeout_secs.saturating_sub(started.elapsed().as_secs());
         match Gates::await_answer(project_root, phase, stage, gate_id, left, &cancel) {
             AwaitOutcome::Unbound { reason } => {
-                Gates::set_aside_unbound(project_root, phase, stage, gate_id).map_err(|err| {
-                    CliError::Message(format!(
-                        "phase {phase}: the wait for {stage} gate {gate_id} ended: the file in \
-                         its answer slot does not bind to it ({reason}) and was not set aside: \
-                         {err}"
-                    ))
+                fenced(project_root, phase, || {
+                    Gates::set_aside_unbound(project_root, phase, stage, gate_id).map_err(|err| {
+                        CliError::Message(format!(
+                            "phase {phase}: the wait for {stage} gate {gate_id} ended: the file \
+                             in its answer slot does not bind to it ({reason}) and was not set \
+                             aside: {err}"
+                        ))
+                    })
                 })?;
             }
             AwaitOutcome::Answered(answer) => return Ok(Some(answer)),
@@ -1478,18 +1537,37 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
                     }
                 }
                 drop(stop_guard);
-                advanced
+                match advanced {
+                    // D-03: the fence refused a write or a gate side effect.
+                    Err(CliError::Workflow(workflow::WorkflowError::NotOwner {
+                        recorded, ..
+                    })) if recorded.as_deref() == Some("scaffold") => {
+                        end_superseded(invocation, &run, recorded, SUPERSEDED_REASON);
+                        Ok(())
+                    }
+                    other => other,
+                }
             }
             Some(monitor::Promotion::Recorded) => Ok(()),
+            Some(monitor::Promotion::Superseded { recorded }) => {
+                end_superseded(invocation, &run, recorded.clone(), SUPERSEDED_REASON);
+                Ok(())
+            }
             other => Err(CliError::Message(format!(
                 "phase {phase}: launch {} did not advance: its promotion verdict is {other:?}",
                 invocation.launch_id
             ))),
         },
-        _ => {
-            record_supervisor_stop(project_root, phase, &invocation.launch_id);
-            Ok(())
-        }
+        _ => match &run.promotion {
+            Some(monitor::Promotion::Superseded { recorded }) => {
+                end_superseded(invocation, &run, recorded.clone(), SUPERSEDED_REASON);
+                Ok(())
+            }
+            _ => {
+                record_supervisor_stop(project_root, phase, &invocation.launch_id);
+                Ok(())
+            }
+        },
     };
     // Never a `stopped` line for a completed run: `finish` decides the final
     // line from the recorded outcome, so a shutdown that arrived while
@@ -1499,6 +1577,43 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
         remove_liveness_file(&hold);
     }
     result
+}
+
+/// The `supervisor_superseded` reason for a supervisor the state does not record.
+const SUPERSEDED_REASON: &str = "superseded";
+
+/// What a supervisor does on finding it does not own the run (D-03): end its agent's
+/// group if the agent still runs, and record that as a `supervisor_superseded` event,
+/// because a production supervisor's stderr is `/dev/null`. It writes no state and
+/// records no stop: a superseded but live supervisor cannot record its own stop
+/// ([`record_supervisor_stop`] writes nothing for a launch the state does not record).
+fn end_superseded(
+    invocation: &MonitorInvocation,
+    run: &monitor::StageRun,
+    recorded: Option<String>,
+    reason: &str,
+) {
+    let agent_group = match run.supervisor.end_agent_group() {
+        AgentGroupEnd::Ended => "ended",
+        _ => "already_exited",
+    };
+    warn!(
+        "phase {}: launch {} ends without writing ({reason}): the state records {recorded:?}; \
+         its agent group: {agent_group}",
+        invocation.phase, invocation.launch_id
+    );
+    events::emit(
+        &invocation.project_root,
+        invocation.phase,
+        "supervisor_superseded",
+        serde_json::json!({
+            "ours": invocation.launch_id,
+            "recorded": recorded,
+            "stage": invocation.stage.map(|stage| stage.to_string()),
+            "reason": reason,
+            "agent_group": agent_group,
+        }),
+    );
 }
 
 /// A supervisor's last act (D-01): remove its liveness file while it still holds
@@ -1916,9 +2031,12 @@ fn spawn_agent_and_record(
         Ok(Some(spawned)) => spawned,
         // A stop honoured at safe point 2 or 3 (50-13), already recorded.
         Ok(None) => return Ok(()),
+        // A superseded supervisor's launch ends here: the run is not its to mark.
+        Err(err) if is_not_owner(&err) => return Err(err),
         Err(err) => {
             return Err(match record_failed_launch(state) {
                 Ok(()) => err,
+                Err(clear_err) if is_not_owner(&clear_err) => clear_err,
                 Err(clear_err) => CliError::Message(format!(
                     "{err}; clearing the supervisor record after it also failed: {clear_err}"
                 )),
@@ -2138,6 +2256,17 @@ fn shut_down_unrecorded(
         "could not save the record of the next stage's supervisor (launch {}): {save_err}",
         record.launch_id
     );
+    // A superseded launcher promotes nothing and clears nothing. Its next supervisor is
+    // not needed; it ends through its own socket, and the refusal goes up as itself.
+    if is_not_owner(&save_err) {
+        let ended =
+            devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT);
+        info!(
+            "a superseded launcher asked launch {} to stop: {ended:?}",
+            record.launch_id
+        );
+        return save_err;
+    }
     match devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT) {
         Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. }) => {
             let cleared = record_failed_launch(state)
@@ -2455,7 +2584,7 @@ fn park_auto_rescan_repair(
             _ => reason,
         });
     })?;
-    Gates::close(project_root, state.phase, stage)?;
+    close_gate(project_root, state.phase, stage)?;
     events::emit(
         project_root,
         state.phase,
@@ -3159,7 +3288,7 @@ pub(crate) fn advance_with(
                                 GateAction::Advance => {
                                     // CR-01: close the gate now. The approval
                                     // was bound to this gate's id and is spent.
-                                    let _ = Gates::close(project_root, phase, stage);
+                                    let _ = close_gate(project_root, phase, stage);
                                     let approval = recorded_approval(&current);
                                     commit(&mut state, |s| {
                                         s.gate_pending = false;
@@ -9290,7 +9419,7 @@ mod tests {
     }
 
     /// Launch a gate fixture and return once N is parked at its Define gate:
-    /// the gate file exists and N holds the lock (its owner phase is the
+    /// the gate file exists and N holds its registration (its owner phase is the
     /// control's assertion, not a precondition here).
     fn launch_parked_at_gate(phase: PhaseId) -> HandoffRun {
         let run = HandoffRun::launch(phase);
@@ -9302,12 +9431,16 @@ mod tests {
             "N parks at the Define gate: {}",
             run.events()
         );
-        assert!(
-            matches!(
-                lock::holder_status(&run.root, phase),
-                lock::HolderStatus::Live { .. }
-            ),
-            "N holds the per-phase lock across the gate wait"
+        assert_eq!(
+            Gates::waiter_status(
+                &run.root,
+                phase,
+                Stage::Define,
+                &gate_id_at(&run.root, phase, Stage::Define)
+            )
+            .unwrap(),
+            devflow_core::gates::WaiterStatus::Live,
+            "N holds the gate's registration across the wait"
         );
         run
     }
@@ -10859,6 +10992,265 @@ mod tests {
             poll_until(HANDOFF_STEP_WAIT, || probes_gone(&pending.socket_path)),
             "N+1 finishes after its advance"
         );
+    }
+
+    /// The id of the gate open at `stage`.
+    fn gate_id_at(root: &Path, phase: PhaseId, stage: Stage) -> GateId {
+        let live = crate::commands::gate_file_id(root, phase, stage)
+            .unwrap()
+            .expect("a gate is open");
+        GateId::parse(&live).unwrap()
+    }
+
+    /// Rewrite the state's recorded supervisor to launch `id`, as a takeover would.
+    fn supersede(root: &Path, phase: PhaseId, id: &str) {
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.supervisor = Some(SupervisorRecord::new(
+                root.join("x.sock"),
+                id.to_string(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+    }
+
+    /// The one `supervisor_superseded` event, its `ours`, `recorded` and `reason` checked.
+    fn superseded_event(run: &HandoffRun, recorded: &str, reason: &str) -> serde_json::Value {
+        let events = events_named(&run.root, "supervisor_superseded");
+        assert_eq!(events.len(), 1, "one event: {}", run.events());
+        assert_eq!(events[0]["ours"], run.n.launch_id.as_str(), "{}", events[0]);
+        assert_eq!(events[0]["recorded"], recorded, "{}", events[0]);
+        assert_eq!(events[0]["reason"], reason, "{}", events[0]);
+        events[0].clone()
+    }
+
+    /// V-23 (D-03): a superseded supervisor writes nothing, consumes nothing and launches
+    /// nothing, says so in one event, leaves no live agent member, and exits. Run (a) is
+    /// superseded before its advance writes. Run (b) is superseded at a gate, which is
+    /// then answered: no claim, and the gate and its answer stay.
+    #[test]
+    fn a_superseded_supervisor_writes_no_state_ack_or_cleanup_and_ends_its_agent() {
+        const NAME: &str = "pipeline_launch::tests::a_superseded_supervisor_writes_no_state_ack_or_cleanup_and_ends_its_agent";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1902";
+
+        let run = HandoffRun::launch(PhaseId::new(1902));
+        run.go();
+        run.wait_held();
+        supersede(&run.root, run.phase, X);
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "the superseded supervisor exits: {}",
+            run.events()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        assert_eq!(stage_launched_count(&run.root, run.phase), 1, "no launch");
+        assert!(
+            !Gates::gate_path(&run.root, run.phase, Stage::Define).exists(),
+            "no gate opened: {}",
+            run.events()
+        );
+        let event = superseded_event(&run, X, "superseded");
+        assert_eq!(event["agent_group"], "already_exited", "{event}");
+        assert!(
+            !group_alive(run.n.agent_pgid),
+            "its agent group has no live member"
+        );
+
+        let gated = launch_parked_at_gate(PhaseId::new(1903));
+        supersede(&gated.root, gated.phase, X);
+        let path = workflow::state_path(&gated.root, gated.phase);
+        let before = std::fs::read(&path).unwrap();
+        let gate_path = Gates::gate_path(&gated.root, gated.phase, Stage::Define);
+        let gate_bytes = std::fs::read(&gate_path).unwrap();
+        let gate = gate_id_at(&gated.root, gated.phase, Stage::Define);
+        answer_open_gate(
+            &gated.root,
+            gated.phase,
+            Stage::Define,
+            &devflow_core::gates::GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        let answer = Gates::answer_path(&gated.root, gated.phase, Stage::Define, &gate);
+        let answer_bytes = std::fs::read(&answer).unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&gated.n.socket_path)),
+            "the superseded waiter exits: {}",
+            gated.events()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        assert!(
+            !Gates::claim_path(&gated.root, gated.phase, Stage::Define, &gate).exists(),
+            "no claim"
+        );
+        assert_eq!(std::fs::read(&gate_path).unwrap(), gate_bytes, "gate stays");
+        assert_eq!(
+            std::fs::read(&answer).unwrap(),
+            answer_bytes,
+            "answer stays"
+        );
+        superseded_event(&gated, X, "superseded");
+        assert_eq!(stage_launched_count(&gated.root, gated.phase), 1);
+    }
+
+    /// V-23's control: the same run with no rewrite writes, opens its gate, claims the
+    /// answer and logs no refusal.
+    #[test]
+    fn the_recorded_supervisor_writes_normally_and_logs_no_refusal() {
+        const NAME: &str =
+            "pipeline_launch::tests::the_recorded_supervisor_writes_normally_and_logs_no_refusal";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1904));
+        run.go();
+        run.wait_held();
+        run.release();
+        let gate_path = Gates::gate_path(&run.root, run.phase, Stage::Define);
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || gate_path.exists()),
+            "control: the recorded supervisor opens its gate: {}",
+            run.events()
+        );
+        assert!(run.state().gate_pending, "control: it writes state");
+        answer_open_gate(
+            &run.root,
+            run.phase,
+            Stage::Define,
+            &devflow_core::gates::GateResponse {
+                approved: false,
+                note: Some("abort: control answer".to_string()),
+                responded_by: Some("test".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "control: it ends after the answer: {}",
+            run.events()
+        );
+        assert_eq!(
+            events_named(&run.root, "gate_resolved").len(),
+            1,
+            "control: it claims the answer: {}",
+            run.events()
+        );
+        assert_eq!(events_named(&run.root, "workflow_aborted").len(), 1);
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "control: no refusal: {}",
+            run.events()
+        );
+    }
+
+    /// Every file under the gates directory, by name, with its bytes.
+    fn gates_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(Gates::dir(root))
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// R-09, the supervisor's half: a superseded waiter changes no byte of the current
+    /// gate's files, and a bound answer reaching its own old slot ends it without a claim.
+    /// The closing control closes the stage and the same comparison sees it, so the
+    /// comparison is not vacuous.
+    #[test]
+    fn a_superseded_waiter_leaves_the_next_gates_files_untouched() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_superseded_waiter_leaves_the_next_gates_files_untouched";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1905";
+        let run = launch_parked_at_gate(PhaseId::new(1905));
+        let (root, phase, stage) = (run.root.clone(), run.phase, Stage::Define);
+        let g1 = gate_id_at(&root, phase, stage);
+        supersede(&root, phase, X);
+
+        let (opened, registration) = Gates::open_registered(&root, phase, stage, "g2").unwrap();
+        let g2 = opened.gate_id.clone();
+        let response = devflow_core::gates::GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("test".to_string()),
+        };
+        Gates::answer(&root, phase, stage, &g2, &response).unwrap();
+        let snapshot = gates_snapshot(&root);
+        std::thread::sleep(Duration::from_millis(3500));
+        assert_eq!(
+            gates_snapshot(&root),
+            snapshot,
+            "S1's backoff reads changed nothing"
+        );
+
+        let g2_files = |root: &Path| {
+            (
+                std::fs::read(Gates::gate_path(root, phase, stage)).unwrap(),
+                std::fs::read(Gates::answer_path(root, phase, stage, &g2)).unwrap(),
+            )
+        };
+        let g2_before = g2_files(&root);
+        let stale = devflow_core::gates::GateAnswer {
+            gate_id: g1.to_string(),
+            response,
+        };
+        std::fs::write(
+            Gates::answer_path(&root, phase, stage, &g1),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "S1 ends: {}",
+            run.events()
+        );
+        superseded_event(&run, X, "superseded");
+        for gate in [&g1, &g2] {
+            assert!(
+                !Gates::claim_path(&root, phase, stage, gate).exists(),
+                "no claim for {gate}"
+            );
+        }
+        assert_eq!(g2_files(&root), g2_before, "G2's files are byte-identical");
+        assert_eq!(
+            Gates::waiter_status(&root, phase, stage, &g2).unwrap(),
+            devflow_core::gates::WaiterStatus::Live,
+            "G2's registration still reads Live"
+        );
+
+        let before_close = gates_snapshot(&root);
+        Gates::close(&root, phase, stage).unwrap();
+        assert_ne!(
+            gates_snapshot(&root),
+            before_close,
+            "control: the comparison sees a closed stage"
+        );
+        registration.finish();
     }
 
     /// Whether the promotion wait covers a live launcher's serve-to-promotion latency:

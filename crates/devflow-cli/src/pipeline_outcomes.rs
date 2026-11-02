@@ -19,8 +19,8 @@ use crate::pipeline_gate::{
     LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
     transition,
 };
-use crate::pipeline_launch::{commit, launch_stage};
-use devflow_core::gates::{GateAction, GateResponse, Gates};
+use crate::pipeline_launch::{close_gate, commit, launch_stage};
+use devflow_core::gates::{GateAction, GateResponse};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
@@ -926,7 +926,7 @@ pub(crate) fn handle_stage_failure(
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
             // CR-01: close the gate before retrying; its answer is spent.
-            let _ = Gates::close(project_root, state.phase, stage);
+            let _ = close_gate(project_root, state.phase, stage);
             state.gate_pending = false;
             launch_stage(state, None, Some(stage))
         }
@@ -935,7 +935,7 @@ pub(crate) fn handle_stage_failure(
             // target before planning exists for a Define/Plan failure
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
-            let _ = Gates::close(project_root, state.phase, stage);
+            let _ = close_gate(project_root, state.phase, stage);
             launch_stage(state, None, Some(stage))
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -1120,6 +1120,7 @@ pub(crate) fn run_checkout_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use devflow_core::gates::Gates;
     // Test-only: production code resolves its branch model from the
     // project (45-01), so the defaults survive here as fixture input only.
     use crate::pipeline_gate::prepare_loop_back_to_code;

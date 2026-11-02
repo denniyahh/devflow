@@ -21,7 +21,10 @@
 
 use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
-use crate::pipeline_launch::{ADVANCE_STOP_REASON, GateWaitEnd, commit, launch_stage};
+use crate::pipeline_launch::{
+    ADVANCE_STOP_REASON, GateWaitEnd, clear_run_state, close_gate, commit, fenced, is_not_owner,
+    launch_stage,
+};
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{
     self, AnswerRead, Claim, GateAction, GateError, GateId, GateResponse, Gates,
@@ -180,7 +183,7 @@ pub(crate) fn prepare_loop_back_to_code(
     // Capture the stage the gate actually fired on before it's mutated below,
     // so the close targets the right stage's gate files (see CR-01).
     let gate_stage = state.stage;
-    let _ = Gates::close(project_root, state.phase, gate_stage);
+    let _ = close_gate(project_root, state.phase, gate_stage);
     // F-11 (`select_loop_back_fix`): this is the write that persists the
     // verification observation that function records in the caller's copy, one
     // write per loop-back. Nothing else writes those two fields during an advance.
@@ -251,7 +254,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     // resumed run asks again. Outside a supervisor's advance (the foreground
     // `ship_override`) no stop token is engaged and this proceeds.
     if crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = Gates::close(project_root, state.phase, Stage::Ship);
+        let _ = close_gate(project_root, state.phase, Stage::Ship);
         crate::pipeline_launch::record_advance_stop(state, 6)?;
         return Err(CliError::Message(format!(
             "finalization did not run: {ADVANCE_STOP_REASON}"
@@ -264,7 +267,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
         // The original Ship approval has already been consumed. Reopen an
         // actionable gate and keep this monitor waiting so a terminal-hook
         // failure cannot turn into an invisible stalled Ship state.
-        let _ = Gates::close(project_root, state.phase, Stage::Ship);
+        let _ = close_gate(project_root, state.phase, Stage::Ship);
         let context = format!(
             "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
@@ -284,7 +287,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             None,
         )? {
             GateAction::Advance => {
-                let _ = Gates::close(project_root, state.phase, Stage::Ship);
+                let _ = close_gate(project_root, state.phase, Stage::Ship);
             }
             GateAction::LoopBack(_) => {
                 return loop_back_to_code(
@@ -297,9 +300,9 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             GateAction::Abort(reason) => return abort(project_root, state, &reason),
         }
     }
-    let _ = Gates::close(project_root, state.phase, Stage::Validate);
-    let _ = Gates::close(project_root, state.phase, Stage::Ship);
-    workflow::clear_state(project_root, state.phase)?;
+    let _ = close_gate(project_root, state.phase, Stage::Validate);
+    let _ = close_gate(project_root, state.phase, Stage::Ship);
+    clear_run_state(project_root, state.phase)?;
     // 23b: the workflow is genuinely over — deregister this (project_root,
     // phase) from the machine-global registry so `devflow gate list
     // --all-roots` stops naming a phase that no longer exists.
@@ -497,7 +500,14 @@ pub(crate) fn run_gate_with_timeout(
     commit(state, |s| s.gate_pending = true)?;
     // A crash inside this call before the publish leaves `gate_pending` with no gate
     // file, which `doctor`'s `check_gate_pending_without_gate` reports.
-    let (opened, registration) = Gates::open_registered(project_root, state.phase, stage, context)?;
+    let (opened, registration) = fenced(project_root, state.phase, || {
+        Ok(Gates::open_registered(
+            project_root,
+            state.phase,
+            stage,
+            context,
+        )?)
+    })?;
     let gate_id = &opened.gate_id;
     println!(
         "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
@@ -550,22 +560,25 @@ pub(crate) fn run_gate_with_timeout(
         // at safe point 4, the gate is closed, the stop recorded and an
         // error unwinds every caller.
         if crate::pipeline_launch::stop_requested_at_safe_point() {
-            let _ = Gates::close(project_root, state.phase, stage);
+            let _ = close_gate(project_root, state.phase, stage);
             registration.finish();
             crate::pipeline_launch::record_advance_stop(state, 5)?;
             return Err(CliError::Message(format!(
                 "the gate for stage {stage} was not auto-answered: {ADVANCE_STOP_REASON}"
             )));
         }
-        match Gates::answer(project_root, state.phase, stage, gate_id, response) {
-            Ok(_) => {}
-            // A human or 23b's stale-gate sweep may have answered first;
-            // first-writer-wins is the correct resolution, not an error.
-            Err(GateError::AlreadyResponded { .. }) => {}
-            Err(err) => {
-                registration.finish();
-                return Err(err.into());
+        let answered = fenced(project_root, state.phase, || {
+            match Gates::answer(project_root, state.phase, stage, gate_id, response) {
+                Ok(_) => Ok(()),
+                // A human or 23b's stale-gate sweep may have answered first;
+                // first-writer-wins is the correct resolution, not an error.
+                Err(GateError::AlreadyResponded { .. }) => Ok(()),
+                Err(err) => Err(err.into()),
             }
+        });
+        if let Err(err) = answered {
+            registration.finish();
+            return Err(err);
         }
     }
     let wait_end = match gate_wait_call(project_root, state.phase, stage, gate_id, timeout_secs) {
@@ -577,7 +590,17 @@ pub(crate) fn run_gate_with_timeout(
     };
     match wait_end {
         GateWaitEnd::Answered(response) => {
-            let claim = Gates::claim(project_root, state.phase, stage, gate_id);
+            let claim = fenced(project_root, state.phase, || {
+                Ok(Gates::claim(project_root, state.phase, stage, gate_id))
+            });
+            let claim = match claim {
+                Ok(claim) => claim,
+                // D-03: not the recorded supervisor, so nothing was claimed.
+                Err(err) => {
+                    registration.finish();
+                    return Err(err);
+                }
+            };
             #[cfg(test)]
             note_claim(&claim);
             match claim {
@@ -602,6 +625,8 @@ pub(crate) fn run_gate_with_timeout(
                 }
             }
             registration.finish();
+            #[cfg(test)]
+            crate::pipeline_launch::test_hold("after_claim");
             // D-08: whatever changed on disk during the wait (a `stop`, a
             // `yes_ship` revoke, an edited notify command) is kept, because this
             // write re-reads the state and sets only this field.
@@ -623,6 +648,9 @@ pub(crate) fn run_gate_with_timeout(
                     "responded_by": response.responded_by,
                 }),
             );
+            // `gate_pending` reads false here, and the caller has not applied the action.
+            #[cfg(test)]
+            crate::pipeline_launch::test_hold("after_commit");
             Ok(action)
         }
         GateWaitEnd::Stopped => {
@@ -633,7 +661,7 @@ pub(crate) fn run_gate_with_timeout(
             // every caller through `?`, which releases the per-phase lock.
             // Deliberately not `GateAction::Abort`: `abort()` deletes the state
             // file, and a stopped run keeps its state for `devflow resume`.
-            let _ = Gates::close(project_root, state.phase, stage);
+            let _ = close_gate(project_root, state.phase, stage);
             registration.finish();
             crate::pipeline_launch::record_advance_stop(state, 4)?;
             Err(CliError::Message(format!(
@@ -657,11 +685,20 @@ pub(crate) fn run_gate_with_timeout(
 
 /// Abort the workflow with a reason, clearing state.
 pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<(), CliError> {
-    println!("workflow aborted for phase {}: {reason}", state.phase);
     // See CR-01: an answer for this phase+stage must not outlive the run. An unused
-    // one is set aside, never deleted.
-    let _ = Gates::close(project_root, state.phase, state.stage);
-    let _ = workflow::clear_state(project_root, state.phase);
+    // one is set aside, never deleted. D-03: a superseded supervisor ends nothing, so its
+    // refusal goes up instead of the rest of the abort.
+    if let Err(err) = close_gate(project_root, state.phase, state.stage)
+        && is_not_owner(&err)
+    {
+        return Err(err);
+    }
+    if let Err(err) = clear_run_state(project_root, state.phase)
+        && is_not_owner(&err)
+    {
+        return Err(err);
+    }
+    println!("workflow aborted for phase {}: {reason}", state.phase);
     // 23b: an abort also ends the workflow — deregister the same as the
     // success path so an aborted phase does not linger in the registry.
     registry::deregister(project_root, state.phase);
@@ -806,7 +843,9 @@ fn claim_ship_answer(project_root: &Path, phase: PhaseId) -> Result<GateResponse
         }
         AnswerRead::Bound(answer) => answer,
     };
-    let claim = Gates::claim(project_root, phase, stage, &gate_id);
+    let claim = fenced(project_root, phase, || {
+        Ok(Gates::claim(project_root, phase, stage, &gate_id))
+    })?;
     #[cfg(test)]
     note_claim(&claim);
     match claim {
