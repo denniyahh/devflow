@@ -13849,6 +13849,51 @@ mod tests {
         assert!(workflow::load_state(&root, phase).unwrap().stopped);
     }
 
+    /// D-19's other source: no supervisor record, and a live pid in the agent pid file,
+    /// which a reused pid can satisfy. `stop` names it with the `ps` check to run first,
+    /// signals nothing and writes nothing. Control: once it is dead, `stopped` is recorded.
+    #[test]
+    fn stop_names_an_unconfirmed_agent_pid_with_the_check_to_run_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1422);
+        let (base, _sock) = stop_socket_dir();
+        let mut agent = OwnGroupSleep::spawn();
+        let pid = agent.0.id();
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        workflow::save_state(&state).unwrap();
+        std::fs::write(
+            devflow_core::agent_result::agent_pid_path(&root, phase),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+
+        let error = stop_in(&root, phase, Some(base.path()))
+            .expect_err("stop must not report a stop beside a live pid")
+            .to_string();
+
+        assert!(
+            error.contains(&format!("ps -o pid,pgid,lstart,args -p {pid}")),
+            "{error}"
+        );
+        assert!(!error.contains("nothing is running"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+        assert!(
+            matches!(agent.0.try_wait(), Ok(None)),
+            "the pid is not signalled"
+        );
+
+        agent.0.kill().unwrap();
+        agent.0.wait().unwrap();
+        stop_in(&root, phase, Some(base.path())).expect("control: nothing runs now");
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
+
     /// Crash row C13 (V-57): the state names supervisor A; A answers the
     /// shutdown by saving the state naming B (N+1's record is saved before N
     /// is marked handed off) and replying `handed_off`. `stop` reloads the
