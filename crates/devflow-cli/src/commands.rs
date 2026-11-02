@@ -1133,9 +1133,14 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
 
         // Fail-closed on a live run: refuse whenever the agent is alive
         // (whatever the supervisor's liveness) OR the supervisor answers
-        // ALIVE, `--force` or not. The verb that ends a live run is `stop`
-        // (50-14); `resume` refuses while one is live.
-        if agent_alive || matches!(phase_liveness, PhaseLiveness::Alive { .. }) {
+        // ALIVE or is a live pending launch, `--force` or not. The verb that
+        // ends a live run is `stop` (50-14); `resume` refuses while one is live.
+        if agent_alive
+            || matches!(
+                phase_liveness,
+                PhaseLiveness::Alive { .. } | PhaseLiveness::LaunchPending { .. }
+            )
+        {
             let phase_label = phase
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
@@ -1237,6 +1242,15 @@ pub(crate) enum PhaseLiveness {
     /// The probe could not answer; a path-free summary of why (see
     /// [`probe_error_summary`]). Neither ALIVE nor GONE is guessed.
     ProbeFailed(String),
+    /// The state names a pending supervisor that is live: its liveness lock is held,
+    /// or its socket is not GONE (D-02). It may not be the recorded one yet, so this
+    /// comes first, and its one repair is `devflow stop`.
+    LaunchPending {
+        /// The reserved launch's id.
+        launch_id: String,
+        /// Whether its socket has appeared.
+        published: bool,
+    },
 }
 
 impl PhaseLiveness {
@@ -1258,6 +1272,20 @@ impl PhaseLiveness {
             }
             PhaseLiveness::NotLaunched => "not launched (no supervisor recorded)".to_string(),
             PhaseLiveness::ProbeFailed(why) => format!("UNKNOWN — the probe failed: {why}"),
+            PhaseLiveness::LaunchPending {
+                launch_id,
+                published,
+            } => {
+                let published = if *published {
+                    "published"
+                } else {
+                    "not yet published"
+                };
+                format!(
+                    "PENDING — launch {launch_id} is reserved and its supervisor has {published}; \
+                     it is not yet the recorded supervisor"
+                )
+            }
         }
     }
 
@@ -1270,6 +1298,7 @@ impl PhaseLiveness {
             PhaseLiveness::GoneWhileActive => "gone_while_active",
             PhaseLiveness::NotLaunched => "not_launched",
             PhaseLiveness::ProbeFailed(_) => "probe_failed",
+            PhaseLiveness::LaunchPending { .. } => "launch_pending",
         }
     }
 }
@@ -1317,12 +1346,32 @@ fn probe_error_summary(error: &supervisor::ProbeError) -> String {
     }
 }
 
-/// Probe the socket `state.supervisor` records, once, and map the answer.
-/// The only I/O half of [`phase_liveness`]; reads no pid.
+/// A pending record as [`PhaseLiveness::LaunchPending`], or `None` when its
+/// reservation is abandoned. The launch guard's own predicate
+/// ([`pending_live_socket`]), so `status` and a refusal cannot disagree.
+fn pending_liveness(pending: &PendingSupervisor) -> Option<PhaseLiveness> {
+    pending_live_socket(pending).map(|live| PhaseLiveness::LaunchPending {
+        launch_id: pending.launch_id.clone(),
+        published: live.pending == PendingKind::Published,
+    })
+}
+
+/// A phase's supervisor liveness: a live pending supervisor first (D-02), else the
+/// socket `state.supervisor` records, probed once and mapped by [`phase_liveness`].
+/// Reads no pid. A reservation whose supervisor is gone left a launch behind, so with
+/// no record it reads GONE, not "not launched".
 fn probe_phase(state: &State) -> PhaseLiveness {
+    let pending = state.pending_supervisor.as_ref();
+    if let Some(live) = pending.and_then(pending_liveness) {
+        return live;
+    }
     let record = state.supervisor.as_ref();
     let probe = record.map(|record| supervisor::probe(&record.socket_path));
-    phase_liveness(record, probe, state.stopped)
+    match phase_liveness(record, probe, state.stopped) {
+        PhaseLiveness::NotLaunched if pending.is_some() && state.stopped => PhaseLiveness::Gone,
+        PhaseLiveness::NotLaunched if pending.is_some() => PhaseLiveness::GoneWhileActive,
+        liveness => liveness,
+    }
 }
 
 /// Recovery verbs discoverable from a phase's liveness (21a, D-03; 50-12) —
@@ -1332,11 +1381,12 @@ fn probe_phase(state: &State) -> PhaseLiveness {
 /// `devflow advance` when the phase is gate-pending (answer the gate, then
 /// advance — widening that predicate risks suggesting `advance` where
 /// nothing proves it is right, per 21-CONTEXT.md's Review Incorporation); a
-/// failed probe names the socket to inspect. Empty for ALIVE, a stopped
-/// GONE and NotLaunched.
+/// failed probe names the socket to inspect. A live pending supervisor names only
+/// `devflow stop` (criterion 2). Empty for ALIVE, a stopped GONE and NotLaunched.
 fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let phase = state.phase;
     match liveness {
+        PhaseLiveness::LaunchPending { .. } => vec![format!("devflow stop --phase {phase}")],
         PhaseLiveness::Stale => vec![
             format!("devflow stop --phase {phase}"),
             format!("devflow resume --phase {phase}"),
@@ -1379,14 +1429,26 @@ fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> S
 }
 
 /// `status`'s lines about a phase's supervisor. 50-12: liveness comes from the
-/// recorded socket, never a pid. `status` speaks only about the operator's own
-/// project, so it names the socket path (doctor does not, T-18-01).
+/// recorded socket, never a pid, and a live pending supervisor is named by its own
+/// socket. `status` speaks only about the operator's own project, so it names the
+/// socket path (doctor does not, T-18-01). An abandoned reservation gets a note.
 fn status_supervisor_lines(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
-    let socket = state.supervisor.as_ref().map_or_else(
-        || "none".to_string(),
-        |record| record.socket_path.display().to_string(),
-    );
-    vec![format!("  supervisor: {socket} — {}", liveness.describe())]
+    let pending = state.pending_supervisor.as_ref();
+    let live_pending = matches!(liveness, PhaseLiveness::LaunchPending { .. });
+    let socket = pending
+        .filter(|_| live_pending)
+        .map(|pending| &pending.socket_path)
+        .or(state.supervisor.as_ref().map(|record| &record.socket_path))
+        .map_or_else(|| "none".to_string(), |path| path.display().to_string());
+    let mut lines = vec![format!("  supervisor: {socket} — {}", liveness.describe())];
+    if let Some(pending) = pending.filter(|_| !live_pending) {
+        lines.push(format!(
+            "  note: launch reservation {} is abandoned (no process holds it); the next launch \
+             clears it",
+            pending.launch_id
+        ));
+    }
+    lines
 }
 
 /// `status`'s repair lines for a phase.
@@ -5452,7 +5514,10 @@ fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
         // `status` prints the operator's own socket path, which doctor
         // must not.
         PhaseLiveness::ProbeFailed(_) => "devflow status".to_string(),
-        PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
+        PhaseLiveness::Alive { .. }
+        | PhaseLiveness::Gone
+        | PhaseLiveness::NotLaunched
+        | PhaseLiveness::LaunchPending { .. } => {
             return None;
         }
     };
@@ -13702,6 +13767,14 @@ mod tests {
             let _hold = hold_pending(&state);
 
             let phase_liveness = probe_phase(&state);
+            assert_eq!(
+                phase_liveness,
+                PhaseLiveness::LaunchPending {
+                    launch_id: PENDING_LAUNCH.to_string(),
+                    published: false,
+                },
+                "{case}"
+            );
             assert_eq!(phase_liveness.label(), "launch_pending", "{case}");
             assert_eq!(
                 recovery_hints(&state, &phase_liveness),
