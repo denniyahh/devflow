@@ -274,10 +274,13 @@ pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, Workflow
 /// How often a bounded acquisition tries the write lock.
 pub const WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
 
-/// The wait a repair verb gives the write lock by default: longer than the longest
-/// legitimate closure, 50.1-16's reservation with up to two
-/// [`crate::supervisor::protocol::IO_TIMEOUT`] socket probes, and short enough that
-/// a repair verb always answers.
+/// The wait a repair verb gives the write lock by default: longer than a closure spends
+/// unless something it waits on is stalled, and short enough that a repair verb always
+/// answers. Stalled, a closure can outlast it: 10 s for a fenced gate answer, 13 s for a
+/// recovery decision (`recover::a_recover_decisions_worst_case_is_counted_on_its_real_paths`)
+/// and, by reading, 16 s for a reservation whose two
+/// [`crate::supervisor::protocol::IO_TIMEOUT`]-bounded socket probes both stall on both
+/// connects. The verb then names the holder and writes nothing.
 pub const WRITE_LOCK_REPAIR_WAIT: Duration = Duration::from_secs(10);
 
 /// The file the phase's state write lock lives on: `.devflow/.state-NN.lock`.
@@ -805,10 +808,12 @@ pub fn clear_state_within(
 /// A gate operation in `decide` waits for the gate lock inside this one, the bounded wait
 /// the operator's D-08 ruling of 2026-10-26 allows: write lock, then gate lock, never the
 /// reverse, and `gates::GATE_LOCK_WAIT` is below [`WRITE_LOCK_REPAIR_WAIT`].
-/// `recover::a_recover_decisions_worst_case_stays_under_the_repair_wait` counts what one
-/// recovery decision can wait for: two socket probes and one gate wait, 9 s against
-/// 10 s. That leaves fsync-bound file operations on a slow disk unmeasured, and a
-/// SIGSTOPped caller outside the bound, as for every writer.
+/// `recover::a_recover_decisions_worst_case_is_counted_on_its_real_paths` counts what one
+/// recovery decision can wait for: two socket probes and one gate wait, 13 s when both
+/// sockets die mid-ping and the gate lock is wedged, which outlasts the 10 s of
+/// [`WRITE_LOCK_REPAIR_WAIT`]; a repair verb then names the holder and writes nothing.
+/// That leaves fsync-bound file operations on a slow disk unmeasured, and a SIGSTOPped
+/// caller outside the bound, as for every writer.
 pub(crate) fn clear_state_if<E: From<WorkflowError>, A>(
     project_root: &Path,
     phase: PhaseId,

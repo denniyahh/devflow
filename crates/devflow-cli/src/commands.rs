@@ -1728,9 +1728,9 @@ fn status_hints(
 
 /// How to judge one reading of the state write lock, which `status` and `doctor` take
 /// once and do not time. The bounds are the holds D-08 allows (R2-12).
-const WRITE_LOCK_HOLD_NOTE: &str = "a state write usually takes milliseconds, up to about 5 s \
-     during a gate or reservation step and about 9 s while `recover` decides a phase; a hold past \
-     10 s is the fault";
+const WRITE_LOCK_HOLD_NOTE: &str = "a state write usually takes milliseconds, but a stalled gate \
+     lock or a socket dying mid-ping can stretch it to about 10 s in a gate answer, 13 s while \
+     `recover` decides a phase and 16 s in a reservation; a hold past 20 s is the fault";
 
 /// `status`'s line for a held state write lock (R-03); `None` when it is free.
 pub(crate) fn write_lock_line(status: &workflow::WriteLockStatus) -> Option<String> {
@@ -18078,9 +18078,10 @@ mod tests {
             .expect("a held lock is named");
         for expected in [
             format!("pid {pid}"),
-            "up to about 5 s".to_string(),
-            "about 9 s while".to_string(),
-            "past 10 s".to_string(),
+            "about 10 s in a gate answer".to_string(),
+            "13 s while".to_string(),
+            "16 s in a reservation".to_string(),
+            "past 20 s".to_string(),
         ] {
             assert!(line.contains(&expected), "missing {expected:?}: {line}");
         }
@@ -18098,7 +18099,7 @@ mod tests {
             "{}",
             finding.detail
         );
-        assert!(finding.detail.contains("past 10 s"), "{}", finding.detail);
+        assert!(finding.detail.contains("past 20 s"), "{}", finding.detail);
 
         drop(release);
         holder.join().unwrap();

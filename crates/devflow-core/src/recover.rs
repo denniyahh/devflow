@@ -534,9 +534,9 @@ fn hold_may_be_live(
 /// it is gone from the live gate files.
 ///
 /// It takes the gate lock once for the whole phase (R2-03). It runs inside a
-/// [`workflow::clear_state_if`] decision, so that one wait, with the decision's socket
-/// probes, is what keeps a write-lock hold under [`workflow::WRITE_LOCK_REPAIR_WAIT`]:
-/// see the test `a_recover_decisions_worst_case_stays_under_the_repair_wait`.
+/// [`workflow::clear_state_if`] decision, so that one wait, added to the decision's
+/// socket probes, is what a write-lock hold is made of: see the test
+/// `a_recover_decisions_worst_case_is_counted_on_its_real_paths`.
 fn remove_gate_files(
     project_root: &Path,
     phase: PhaseId,
@@ -561,7 +561,20 @@ fn probe_socket(path: &Path) -> Result<crate::supervisor::Liveness, crate::super
     crate::supervisor::probe(path)
 }
 
-/// The longest one decision can hold the write lock for, from its waits alone.
+/// `IO_TIMEOUT`s a socket probe that reads GONE can wait for: its connect and its ping's
+/// reply, which closes as the socket goes, so the probe's second look at the path is
+/// immediate. Only GONE lets a decision go on.
+#[cfg(test)]
+const IO_WAITS_PER_GONE_PROBE: u32 = 2;
+
+/// `IO_TIMEOUT`s a socket probe that keeps the phase can wait for: a connect and a reply
+/// on each of its two connects. A decision ends there, with no gate wait.
+#[cfg(test)]
+const IO_WAITS_PER_KEEPING_PROBE: u32 = 4;
+
+/// The longest one decision can hold the write lock for, from its waits alone: every
+/// probe reading GONE and then the gate waits, or all but the last reading GONE and the
+/// last keeping the phase, whichever is longer. Liveness-file probes take no wait.
 #[cfg(test)]
 fn decision_worst_case(
     io_timeout: Duration,
@@ -569,7 +582,11 @@ fn decision_worst_case(
     socket_probes: u32,
     gate_waits: u32,
 ) -> Duration {
-    io_timeout * socket_probes + gate_lock_wait * gate_waits
+    let gate_reached =
+        io_timeout * (socket_probes * IO_WAITS_PER_GONE_PROBE) + gate_lock_wait * gate_waits;
+    let kept =
+        io_timeout * ((socket_probes - 1) * IO_WAITS_PER_GONE_PROBE + IO_WAITS_PER_KEEPING_PROBE);
+    gate_reached.max(kept)
 }
 
 #[cfg(test)]
@@ -2118,15 +2135,16 @@ mod tests {
     /// R2-03: what one write-lock hold can wait for, counted on both paths and then
     /// summed on the shipped constants.
     ///
-    /// Not measured, stated from `supervisor::probe`'s contract (its doc, step 5): a
-    /// socket probe can read twice only when its first connection closed under it and a
-    /// still-serving listener took the fresh connect, and its result is then `Alive` or
-    /// `NoReply`, both of which keep the phase and end the decision before any gate wait.
-    /// So the path that reaches the gate wait spends at most one `IO_TIMEOUT` per probe.
-    /// Not established at all: fsync-bound file operations on a slow disk (the 1 s left
-    /// under the bound), or a `recover` process that is itself SIGSTOPped.
+    /// The probe's cost comes from `supervisor::probe`, whose step 5 reads a second time
+    /// after a closed ping: `probe_can_read_gone_after_a_slow_connect_and_a_closed_ping`
+    /// measures that path. With both sockets dying that way and a wedged gate lock, the
+    /// hold outlasts [`workflow::WRITE_LOCK_REPAIR_WAIT`], so a concurrent repair verb gets
+    /// a refusal naming the holder, not a hang. Every other reading ends sooner.
+    /// Not established: fsync-bound file operations on a slow disk, a peer dripping its
+    /// reply a byte at a time (the timeout is per read), or a `recover` process that is
+    /// itself SIGSTOPped.
     #[test]
-    fn a_recover_decisions_worst_case_stays_under_the_repair_wait() {
+    fn a_recover_decisions_worst_case_is_counted_on_its_real_paths() {
         let phase_with_every_gate = |root: &Path, phase: PhaseId| {
             save_stale(root, phase, |state| {
                 state.supervisor = Some(supervisor_record(root.join("gone.sock")));
@@ -2176,18 +2194,28 @@ mod tests {
             workflow::WRITE_LOCK_REPAIR_WAIT,
         );
         let worst = decision_worst_case(io, gate, SOCKET_PROBES_PER_DECISION, 1);
-        assert!(
-            worst < repair,
-            "{SOCKET_PROBES_PER_DECISION} x {io:?} + {gate:?} = {worst:?}, not below {repair:?}"
+        assert_eq!(
+            worst,
+            Duration::from_secs(13),
+            "the figure ARCHITECTURE.md and `status` state"
         );
-        // Control: one gate wait per stage, the shape before this, does not fit.
+        assert!(
+            worst >= repair,
+            "{worst:?} fits {repair:?}: the docs saying a repair verb can give up are stale"
+        );
+        // Sockets that read GONE at once leave the gate wait alone, which does fit.
+        assert!(gate < repair, "{gate:?} must fit {repair:?}");
+        // Control: one gate wait per stage, the shape before R2-03, is far longer.
         let per_stage = decision_worst_case(
             io,
             gate,
             SOCKET_PROBES_PER_DECISION,
             crate::gates::STAGES.len() as u32,
         );
-        assert!(per_stage >= repair, "{per_stage:?} must not fit {repair:?}");
+        assert!(
+            per_stage >= worst + gate * 4,
+            "{per_stage:?} against {worst:?}"
+        );
     }
 
     /// R-07: run A is stale when the sweep lists it, and run B has replaced it by the

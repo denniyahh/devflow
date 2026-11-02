@@ -171,11 +171,12 @@ gate wait (D-08):
 
 - **State write lock** (`.devflow/.state-{phase:02}.lock`, `workflow.rs`) — a
   `flock` taken for one read-modify-write of the state file, so it is short:
-  usually milliseconds, up to about 5 s during a gate or reservation step and
-  about 9 s while `recover` decides a phase. The file is never replaced or
-  removed, because a `flock` belongs to an inode. Repair verbs (`devflow stop`,
-  `devflow recover --clean`) wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then
-  name the holder and write nothing.
+  usually milliseconds. A stalled gate lock or a socket dying mid-ping can stretch
+  it to about 10 s in a gate answer, 13 s while `recover` decides a phase and 16 s
+  in a reservation. The file is never replaced or removed, because a `flock`
+  belongs to an inode. Repair verbs (`devflow stop`, `devflow recover --clean`)
+  wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then name the holder and write
+  nothing, so a hold that long costs them a refusal, not a hang.
 - **Launch reservation** (`state.pending_supervisor` and
   `.devflow/supervisor-<launch_id>.live`, `liveness.rs`) — a launcher takes the
   `flock` before it saves the pending record, and the spawned supervisor inherits
