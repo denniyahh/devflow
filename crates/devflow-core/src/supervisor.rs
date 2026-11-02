@@ -714,6 +714,12 @@ pub enum ShutdownOutcome {
         /// `false` for a stop honoured at an advance safe point.
         group_signalled: bool,
     },
+    /// The supervisor accepted the stop, and its final line did not arrive within the wait:
+    /// its next safe point is further away. The stop is flagged and it will honour it.
+    AcceptedPending {
+        /// The owner phase when the supervisor accepted the stop.
+        owner: String,
+    },
     /// The supervisor had already handed the run off and did not stop it.
     HandedOff,
     /// The supervisor refused the request with this error.
@@ -2164,6 +2170,44 @@ mod tests {
         assert!(
             matches!(not_a_socket, Err(ProbeError::NotASocket(_))),
             "a regular file is NotASocket, got {not_a_socket:?}"
+        );
+    }
+
+    /// D-13 item 1: a supervisor that accepted a stop and whose final line is late still
+    /// holds that stop, so `request_shutdown` reports it pending and not as a failure.
+    /// Control: with no `accepted` line either, nothing was accepted, and it stays an error.
+    #[test]
+    fn request_shutdown_reports_an_accepted_stop_whose_final_line_is_late() {
+        use std::io::Read;
+        use std::time::Duration;
+        let cache = short_cache();
+        let (socket, _, listener) = published(cache.path());
+        let server = serve_shutdown(listener, |stream| {
+            let accepted = Reply::Accepted(protocol::ShutdownAccepted {
+                owner: "advancing".to_string(),
+            });
+            protocol::write_reply(stream, &accepted).expect("write accepted");
+            // Hold the connection open until the client gives up and closes it.
+            let _ = (&mut &*stream).read(&mut [0_u8; 1]);
+        });
+        let late = request_shutdown(socket.as_path(), Duration::from_millis(300));
+        server.join().expect("scripted server thread");
+        assert_eq!(
+            late.ok(),
+            Some(ShutdownOutcome::AcceptedPending {
+                owner: "advancing".to_string()
+            })
+        );
+
+        let (socket, _, listener) = published(cache.path());
+        let server = serve_shutdown(listener, |stream| {
+            let _ = (&mut &*stream).read(&mut [0_u8; 1]);
+        });
+        let unanswered = request_shutdown(socket.as_path(), Duration::from_millis(300));
+        server.join().expect("scripted server thread");
+        assert!(
+            matches!(unanswered, Err(ProbeError::NoReply(_))),
+            "no accepted line is still an error, got {unanswered:?}"
         );
     }
 

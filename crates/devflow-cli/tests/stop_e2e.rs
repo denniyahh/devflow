@@ -404,9 +404,11 @@ fn a_real_stop_lets_a_real_ship_finish_the_pass_it_started() {
 /// `stop` never signals a pid read from state; it addresses the socket. The
 /// state plants a live test-owned process as the agent group of a
 /// `supervisor` record whose socket file does not exist, so the probe reads
-/// GONE: `stop` reports nothing running and the planted process is still
-/// alive afterwards. Also covers T-23-51's unit test (removed in 50-22): a
-/// pid recorded in state alone is never a signalling target or a blocker.
+/// GONE. That process is a confirmed live agent with no live supervisor
+/// (D-19), so `stop` names it and the manual kill, exits non-zero and records
+/// nothing; the planted process is still alive afterwards. Also covers
+/// T-23-51's unit test (removed in 50-22): a pid recorded in state alone is
+/// never a signalling target.
 #[test]
 fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
     let home = common::HermeticHome::new();
@@ -434,10 +436,12 @@ fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
         .output()
         .expect("run devflow stop");
     let text = describe(&output);
-    assert!(output.status.success(), "{text}");
+    assert!(!output.status.success(), "{text}");
+    assert!(!text.contains("nothing is running"), "{text}");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("nothing is running"),
-        "a GONE socket and no lock read as nothing running: {text}"
+        text.contains(&planted.id().to_string())
+            && text.contains(&format!("kill -TERM -- -{}", planted.id())),
+        "stop names the live agent and the manual kill: {text}"
     );
     assert!(
         planted
@@ -447,9 +451,10 @@ fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
         "the planted process named only by state is never signalled"
     );
     assert!(
-        devflow_core::workflow::load_state(root, phase)
+        !devflow_core::workflow::load_state(root, phase)
             .unwrap()
-            .stopped
+            .stopped,
+        "no stop is recorded beside a running agent: {text}"
     );
     common::kill_and_reap(&mut planted);
 }
@@ -2085,6 +2090,191 @@ fn stop_tears_down_a_stale_supervisor_through_the_backstop() {
             .unwrap()
             .stopped,
         "the performed stop is recorded"
+    );
+}
+
+/// `devflow status` on `run`.
+fn status_of(run: &LiveRun) -> std::process::Output {
+    common::hermetic_devflow(&run.home)
+        .arg("status")
+        .current_dir(&run.root)
+        .output()
+        .expect("run devflow status")
+}
+
+/// D-19, on real processes: a supervisor SIGKILLed whose socket and sidecar are then lost,
+/// so the probe reads GONE while its agent runs. `status` and `stop` both name the agent and
+/// the manual kill, `stop` exits non-zero and records nothing, and the agent is untouched.
+/// Control: once the group has ended, `status` suggests `devflow resume` and `stop` reports
+/// nothing running and records `stopped`.
+#[test]
+fn stop_and_status_name_an_agent_whose_supervisor_is_gone() {
+    let run = LiveRun::start(PhaseId::new(149));
+    let pgid = run.record.agent_pgid;
+    let phase = run.phase;
+    kill_supervisor(&run);
+    let socket = &run.record.socket_path;
+    std::fs::remove_file(socket).expect("remove the socket");
+    std::fs::remove_file(socket.with_extension("json")).expect("remove the sidecar");
+    assert!(
+        !group_members(pgid).is_empty(),
+        "precondition: the agent group {pgid} outlives its supervisor"
+    );
+    assert_eq!(
+        run.probe(),
+        Liveness::Gone,
+        "precondition: the probe reads GONE"
+    );
+
+    let status = status_of(&run);
+    let text = describe(&status);
+    assert!(status.status.success(), "{text}");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains(&pgid.to_string()) && stdout.contains(&format!("kill -TERM -- -{pgid}")),
+        "status names the live agent and the manual kill: {text}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.contains("→ devflow resume")),
+        "status names no resume that would refuse: {text}"
+    );
+
+    let stop = run.stop(&[]);
+    let text = describe(&stop);
+    assert!(!stop.status.success(), "{text}");
+    assert!(
+        text.contains(&pgid.to_string()) && text.contains("999.170"),
+        "stop names the agent and the backlog entry: {text}"
+    );
+    assert!(!text.contains("nothing is running"), "{text}");
+    assert!(
+        !devflow_core::workflow::load_state(&run.root, phase)
+            .unwrap()
+            .stopped,
+        "no stop is recorded beside a running agent: {text}"
+    );
+    assert!(
+        !group_members(pgid).is_empty(),
+        "stop signals nothing: the agent group {pgid} still runs"
+    );
+
+    let signed = libc::pid_t::try_from(pgid).expect("pgid fits pid_t");
+    assert!(signed > 1, "refusing to signal group {signed}");
+    // SAFETY: `signed > 1` is the group this test's run recorded, whose members were just
+    // listed; the kill is what an operator would do.
+    assert_eq!(unsafe { libc::kill(-signed, libc::SIGKILL) }, 0);
+    assert!(
+        holds_within(RUN_WAIT, || group_members(pgid).is_empty()),
+        "the agent group {pgid} ends"
+    );
+
+    let status = status_of(&run);
+    let text = describe(&status);
+    assert!(
+        String::from_utf8_lossy(&status.stdout)
+            .contains(&format!("devflow resume --phase {phase}")),
+        "control: with the agent gone, status suggests resume: {text}"
+    );
+    let stop = run.stop(&[]);
+    let text = describe(&stop);
+    assert!(stop.status.success(), "control: {text}");
+    assert!(
+        String::from_utf8_lossy(&stop.stdout).contains("nothing is running"),
+        "control: {text}"
+    );
+    assert!(
+        devflow_core::workflow::load_state(&run.root, phase)
+            .unwrap()
+            .stopped,
+        "control: the stop is recorded: {text}"
+    );
+}
+
+/// A socket standing in for a supervisor that accepted a stop and has not confirmed it: it
+/// answers one ping, then one shutdown with `accepted` only, and holds that connection until
+/// its peer closes it.
+fn serve_accepted_only(listener: std::os::unix::net::UnixListener, phase: PhaseId) {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let ping = serde_json::json!({
+        "ok": true,
+        "launch_id": "launch-pending",
+        "phase": phase.to_string(),
+        "stage": "code",
+        "launch": "stream",
+        "owner": "advancing",
+        "agent_pid": 1,
+        "agent_pgid": 1,
+        "agent_start_time": 0,
+        "boot_id": null,
+        "supervisor_pid": 1,
+    });
+    for stream in listener.incoming() {
+        let mut stream = stream.expect("accept a connection");
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone the stream"));
+        let mut request = String::new();
+        if reader.read_line(&mut request).is_err() {
+            continue;
+        }
+        if request.contains("\"ping\"") {
+            let _ = writeln!(stream, "{ping}");
+            continue;
+        }
+        let _ = writeln!(
+            stream,
+            r#"{{"ok":true,"accepted":true,"owner":"advancing"}}"#
+        );
+        let _ = reader.read(&mut [0_u8; 1]);
+        return;
+    }
+}
+
+/// D-13 item 1 on the real binary's stdout, since libtest captures a passing test's print: a
+/// stop the supervisor accepted and did not confirm within `stop`'s wait reads as pending.
+#[test]
+fn stop_prints_that_an_unconfirmed_accepted_stop_is_pending() {
+    let home = common::HermeticHome::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = PhaseId::new(150);
+    let socket_dir = tempfile::Builder::new()
+        .prefix("dfs")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = socket_dir.path().join("p.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket");
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.supervisor = Some(SupervisorRecord::new(
+        socket.clone(),
+        "launch-pending".to_string(),
+        1,
+        0,
+        "boot".to_string(),
+    ));
+    devflow_core::workflow::save_state(&state).unwrap();
+    let server = std::thread::spawn(move || serve_accepted_only(listener, phase));
+
+    let output = common::hermetic_devflow(&home)
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    server.join().expect("the scripted supervisor");
+
+    let text = describe(&output);
+    assert!(output.status.success(), "{text}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("accepted the stop")
+            && stdout.contains("next safe point")
+            && stdout.contains("`devflow status`"),
+        "{text}"
+    );
+    assert!(!text.contains("nothing was signalled"), "{text}");
+    assert!(
+        devflow_core::workflow::load_state(root, phase)
+            .unwrap()
+            .stopped,
+        "{text}"
     );
 }
 
