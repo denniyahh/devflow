@@ -14166,6 +14166,70 @@ mod tests {
         );
     }
 
+    /// A launcher still running can promote its launch while `stop` waits on it, which
+    /// ends the pending record and not the supervisor. `stop` must look at the record
+    /// again: here a STALE one, whose socket only that second look removes.
+    #[test]
+    fn stop_addresses_a_launch_promoted_during_its_wait() {
+        const PROMOTED: &str = "cccc0000cccc5186";
+        /// Above any pid, so the backstop proves the group gone and signals nothing.
+        const NO_SUCH_PGID: u32 = 99_999_997;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5186);
+        let state = state_with_pending(&root, phase, false);
+        let hold = hold_pending(&state);
+        let socket = root.join("promoted.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let boot = supervisor::boot_id().expect("a readable boot id");
+        let sidecar = serde_json::json!({
+            "launch_id": PROMOTED,
+            "project_root": root,
+            "phase": phase,
+            "stage": "define",
+            "agent": "claude",
+            "launch": "stream",
+            "agent_pid": NO_SUCH_PGID,
+            "agent_pgid": NO_SUCH_PGID,
+            "agent_start_time": 1,
+            "boot_id": boot,
+            "supervisor_pid": 99_999_998,
+            "supervisor_start_time": 1,
+            "created_at": "2026-11-02T00:00:00Z",
+        });
+        std::fs::write(socket.with_extension("json"), sidecar.to_string()).unwrap();
+        let promoter = {
+            let (root, socket) = (root.clone(), socket.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                workflow::update_state(&root, phase, |state| {
+                    state.pending_supervisor = None;
+                    state.supervisor = Some(SupervisorRecord::new(
+                        socket,
+                        PROMOTED.to_string(),
+                        NO_SUCH_PGID,
+                        1,
+                        boot,
+                    ));
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+                hold
+            })
+        };
+        let cache = tempfile::tempdir().unwrap();
+
+        let result = stop_in(&root, phase, Some(cache.path()));
+        drop(promoter.join().unwrap());
+
+        result.unwrap();
+        assert!(
+            !socket.exists(),
+            "the promoted launch's socket is addressed"
+        );
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
+
     /// Criterion 2 at a gate nothing waits on: `stop`'s own line names no `resume` while
     /// a pending supervisor lives, and names it again once that supervisor is gone.
     #[test]
