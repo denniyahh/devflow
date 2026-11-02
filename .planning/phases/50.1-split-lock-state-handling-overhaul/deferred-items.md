@@ -32,3 +32,9 @@
   **Measured:** 1 failure in 3 runs of the integration binary under its suite (the `check.sh all` run and the rerun passed), 0 in 60 run alone. With a temporary `sleep 1;` before the `trap`, the test failed every time it ran (1 of 1), with the same message.
   **Likely fix, not tested:** have the holder write a ready file after its `trap`, and wait for that file before running `stop`.
   **Why deferred:** 50.1-14 did not change this test or `stop`'s holder path, and the test plants no gate.
+
+- One `stop_e2e` failure at `361995e` whose test name was not captured (found during 50.1-18)
+  status: open
+  **What:** one run of `cargo nextest run -p devflow --test stop_e2e --no-tests=fail` reported `37/38 tests run: 36 passed, 1 failed`. A later loop overwrote the log, so the failing test is unknown.
+  **Measured:** 1 failure in 23 runs at that commit: the failure, then 8 clean runs alone and 14 clean runs beside another nextest run. It may be `stop_writes_no_state_while_the_lock_holder_survives_the_signal`, logged above, whose failure rate looks similar, but that is unverified.
+  **Why deferred:** it did not reproduce in 22 reruns. 50.1-18 changed `stop_in`, so its changes are not ruled out as the cause. Keep the failing log the next time this happens.
