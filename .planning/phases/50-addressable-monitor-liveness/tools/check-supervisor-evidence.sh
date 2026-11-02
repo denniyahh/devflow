@@ -2595,6 +2595,10 @@ st_rec_verdict_stopped() {
     local dir
     dir="$(st_rec_shipped_tree)"
     st_rec_jq "$dir/attempt-2/verdict.json" '.outcome = "stopped"'
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=DISAGREES attempt=2' || return 1
+    # The same line when the verdict names another attempt's number.
+    dir="$(st_rec_shipped_tree)"
+    st_rec_jq "$dir/attempt-2/verdict.json" '.attempt = 1'
     st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=DISAGREES attempt=2'
 }
 
@@ -2629,14 +2633,22 @@ st_rec_verdict_malformed() {
     local dir
     dir="$(st_rec_shipped_tree)"
     printf '{' >"$dir/attempt-2/verdict.json"
-    st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=MALFORMED attempt=2'
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=MALFORMED attempt=2' || return 1
+    # The same line from the cap branch's count, for an attempt other than N.
+    dir="$(st_rec_cap_tree)"
+    printf '{' >"$dir/attempt-2/verdict.json"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD verdict_json=MALFORMED attempt=2'
 }
 
 st_rec_no_workflow_started() {
     local dir
     dir="$(st_rec_shipped_tree)"
     printf '{"event":"stage_launched","commit":"c0ffee1"}\n' >"$dir/attempt-2/collected/devflow/events.jsonl"
-    st_rec_fails "$dir.md" "$dir" 2 'RECORD commit=ABSENT attempt=2'
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD commit=ABSENT attempt=2' || return 1
+    # The same line for a listed stop on the cap branch.
+    dir="$(st_rec_cap_tree)"
+    printf '{"event":"stage_launched","commit":"aaa1111"}\n' >"$dir/attempt-1/collected/devflow/events.jsonl"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD commit=ABSENT attempt=1'
 }
 
 st_rec_record_absent() {
@@ -2714,7 +2726,12 @@ st_rec_verdict_other_number() {
     local dir
     dir="$(st_rec_cap_tree)"
     st_rec_jq "$dir/attempt-2/verdict.json" '.attempt = 5'
-    st_rec_fails "$dir.md" "$dir" 3 'RECORD stopped_verdict=BAD attempt=2'
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD stopped_verdict=BAD attempt=2' || return 1
+    # The same line for a noted stop whose directory suffix is not a number.
+    dir="$(st_rec_cap_tree)"
+    st_rec_stopped "$dir" 2 bbb2222 'died at code'
+    mv -- "$dir/attempt-2" "$dir/attempt-x"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD stopped_verdict=BAD attempt=x' 'RECORD missing=stopped-attempt-x'
 }
 
 # A blank note is not a noted stop: attempt_gate would not count it either.
