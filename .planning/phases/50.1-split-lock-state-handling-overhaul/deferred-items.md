@@ -55,3 +55,8 @@
   **What:** another test's fork holds a duplicate of the descriptor, and so the flock, until its exec. Measured with 4 forking threads: a released lock read held in 9710 of 20000 rounds, 0 of 20000 with none. A temporary test forking for the first 120 s of the core lib suite failed the probe test in 2 of 2 runs and the `while_owner` control in 1 of 2; after the fix 0 failures in 2 runs.
   **Production:** read, not exercised: every production `try_lock` site polls with a bound, or fails toward "held". A fork can only make a lock read held for longer, never free, so the effect is a brief wait or a refusal.
   **Not established:** the storm covers the core lib suite only, and only tests that ran inside its 120 s.
+
+- Three comments and help lines still name the per-phase lock after 50.1-20 (found during 50.1-20)
+  status: open, wording only.
+  **What:** `pipeline_gate.rs`'s safe-point-4 comment ("which releases the per-phase lock"), `main.rs`'s `stop` help ("per-phase lock holder when GONE", "signals no lock holder") and `commands.rs`'s `recover --clean` comment ("cleaned when its lock holder is dead").
+  **Why deferred:** 50.1-22 owns the `stop` help and 50.1-21 deletes the lock API, so each goes with its owner. Nothing reads them as behaviour.
