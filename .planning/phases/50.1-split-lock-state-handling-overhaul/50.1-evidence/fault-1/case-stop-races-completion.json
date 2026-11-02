@@ -1,0 +1,25 @@
+{
+  "case": "stop-races-completion",
+  "live": true,
+  "bin_sha256": "055e86a85d71a8cf34699867d2328fc87900e0f5e86ef7662624fb154d9da0d7",
+  "launch_shape": "stream",
+  "socket_path": "/tmp/df50f.iUIZkb/c/sock/9e8566201ba9665d-01-18e4373f68d245e7.sock",
+  "launch_id": "18e4373f68d245e7",
+  "supervisor_pid": 2283768,
+  "probe_before": "ALIVE",
+  "probe_after": "GONE",
+  "members_before": [
+    "2283769 2283769 2281673 Mon Nov  2 06:34:56 2026 /bin/sh /tmp/df50f.iUIZkb/f-stop-races-completion/claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions"
+  ],
+  "members_after": [],
+  "next_agents_alive": [],
+  "advance_ran": false,
+  "next_stage_launched": false,
+  "stage_launched_count": 1,
+  "state_stopped": true,
+  "first_agent_exit": "143",
+  "stop_exit": 0,
+  "stop_output": "stop: stopped phase 1 through its supervisor (agent group ended, exit code 143, advance suppressed)",
+  "expected_met": true,
+  "unmet": []
+}

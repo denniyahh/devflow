@@ -1,0 +1,2 @@
+attempt 1: unexpected ship gate 18e438484b8f9786 (2026-11-02T11:54:08Z); inspecting, not answered; goes to operator per delegation
+attempt 1: unexpected ship gate is /gsd-ship PHASE_VERIFICATION_INCOMPLETE (verifier human_needed: agent-decided blocking-human budget). Operator chose 2026-11-02: settle the UAT from the fixture's plan by verify-work's steps, approve the retry, judge reads the last ship gate. Project tree written while parked at this gate, a departure from the runbook's no-manual-git rule.

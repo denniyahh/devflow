@@ -1,0 +1,28 @@
+{
+  "case": "kill9-stale-stop",
+  "live": true,
+  "bin_sha256": "055e86a85d71a8cf34699867d2328fc87900e0f5e86ef7662624fb154d9da0d7",
+  "launch_shape": "stream",
+  "socket_path": "/tmp/df50f.iUIZkb/c/sock/8174cd4cd1a05e75-01-18e4373b7b00c551.sock",
+  "launch_id": "18e4373b7b00c551",
+  "supervisor_pid": 2282381,
+  "probe_before": "ALIVE",
+  "supervisor_killed": true,
+  "probe_after_kill": "STALE",
+  "members_after_kill": [
+    "2282382 2282382 2281673 Mon Nov  2 06:34:39 2026 /bin/sh /tmp/df50f.iUIZkb/f-kill9-stale-stop/claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions"
+  ],
+  "probe_after": "GONE",
+  "members_before": [
+    "2282382 2282382 2281673 Mon Nov  2 06:34:39 2026 /bin/sh /tmp/df50f.iUIZkb/f-kill9-stale-stop/claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions"
+  ],
+  "members_after": [],
+  "advance_ran": false,
+  "next_stage_launched": false,
+  "stage_launched_count": 1,
+  "state_stopped": true,
+  "stop_exit": 0,
+  "stop_output": "stop: phase 1: its supervisor is gone (STALE socket); ended its agent group 2282382 (2 member(s): pid 2282382, 2282504) and removed /tmp/df50f.iUIZkb/c/sock/8174cd4cd1a05e75-01-18e4373b7b00c551.sock and its sidecar",
+  "expected_met": true,
+  "unmet": []
+}

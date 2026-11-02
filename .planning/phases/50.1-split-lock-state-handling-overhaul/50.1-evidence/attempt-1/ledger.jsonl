@@ -1,0 +1,4 @@
+{"seq":1,"stage":"define","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50.1/attempt-1/gates/001-define","manifest_sha256":"eb9fcd0050fb2783cd4d5ecd95bff1beda34d75a921eee6cd66bdec9840370d4","t":1793619344}
+{"seq":2,"stage":"code","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50.1/attempt-1/gates/002-code","manifest_sha256":"5c8aeba9c82647b778a7bc79c3120a70b2d9a162e6f118c8943a31a2e346dda3","t":1793619395}
+{"seq":3,"stage":"ship","phase":"1","non_silent":"0","dir":"~/.cache/devflow-phase50.1/attempt-1/gates/003-ship","manifest_sha256":"ef2bb3395a44510be07b2a2e91bc2d52ae1e87cb0f702ecceae64b282d5360ed","t":1793620435}
+{"seq":4,"stage":"ship","phase":"1","non_silent":"0","dir":"~/.cache/devflow-phase50.1/attempt-1/gates/004-ship","manifest_sha256":"c9317a33342028f0387588c90081e8131fe2d8af3a0acb54aa4bd06ccea0ffa1","t":1793621326}

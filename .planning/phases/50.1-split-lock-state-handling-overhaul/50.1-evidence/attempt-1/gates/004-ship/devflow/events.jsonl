@@ -1,0 +1,44 @@
+{"v":1,"ts":1793619344,"phase":1,"event":"workflow_started","agent":"claude","mode":"auto","worktree":"~/.cache/devflow-phase50.1/attempt-1/project/.worktrees/phase-01","version":"2.12.0","commit":"3e90c700f3a36d295e95709bd60f7b7cd097e468","dirty":"false","exe_path":"devflow-055e86a85d71"}
+{"v":1,"ts":1793619344,"phase":1,"event":"gate_fired","stage":"define","unexpected":true,"context":"[never-silent] preflight failed for stage define: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1793619344,"phase":1,"event":"notify_fired","stage":"define","unexpected":true}
+{"v":1,"ts":1793619369,"phase":1,"event":"gate_response_written","stage":"define","gate_id":"18e5374a67cea053","approved":true,"via":"cli"}
+{"v":1,"ts":1793619375,"phase":1,"event":"gate_resolved","stage":"define","gate_id":"18e5374a67cea053","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1793619375,"phase":1,"event":"gate_claimed_answer_removed","stage":"define","gate_id":"18e5374a67cea053","approved":true,"note":"attempt 1: seeded blocking-human checkpoint is intentional","responded_by":"denniyahh"}
+{"v":1,"ts":1793619383,"phase":1,"event":"claude_delivery_canary_confirmed","stage":"define","token_prefix":"DEVFLOW_DELIVERY_CANARY_","cli_version":"2.1.316 (Claude Code)","reason":null}
+{"v":1,"ts":1793619383,"phase":1,"event":"stage_launched","stage":"define","agent":"claude","supervisor_pid":2288938,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e4374a43490521.sock","launch_id":"18e4374a43490521","launch":"stream"}
+{"v":1,"ts":1793619388,"phase":1,"event":"advance_evaluated","stage":"define","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1793619388,"phase":1,"event":"transition","from":"define","to":"plan"}
+{"v":1,"ts":1793619388,"phase":1,"event":"capture_archived","stage":"define","to_stage":"plan","stamp":"1793619388834486902-0"}
+{"v":1,"ts":1793619388,"phase":1,"event":"stage_launched","stage":"plan","agent":"claude","supervisor_pid":2289464,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e43754c6329264.sock","launch_id":"18e43754c6329264","launch":"stream"}
+{"v":1,"ts":1793619395,"phase":1,"event":"advance_evaluated","stage":"plan","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1793619395,"phase":1,"event":"transition","from":"plan","to":"code"}
+{"v":1,"ts":1793619395,"phase":1,"event":"gate_fired","stage":"code","unexpected":true,"context":"[never-silent] preflight failed for stage code: unattended launch refused (D-07) — no plan declares a human-only checkpoint [DOES NOT HOLD] — a plan declares a `blocking-human` gate or a `human-action` checkpoint, which no mode auto-approves (checkpoints.md rule 6) — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1793619395,"phase":1,"event":"notify_fired","stage":"code","unexpected":true}
+{"v":1,"ts":1793619407,"phase":1,"event":"gate_response_written","stage":"code","gate_id":"18e4375648b5aade","approved":true,"via":"cli"}
+{"v":1,"ts":1793619410,"phase":1,"event":"gate_resolved","stage":"code","gate_id":"18e4375648b5aade","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1793619410,"phase":1,"event":"gate_claimed_answer_removed","stage":"code","gate_id":"18e4375648b5aade","approved":true,"note":"attempt 1: this approval records the checkpoint set","responded_by":"denniyahh"}
+{"v":1,"ts":1793619410,"phase":1,"event":"capture_archived","stage":"code","to_stage":"code","stamp":"1793619410637472247-0"}
+{"v":1,"ts":1793619410,"phase":1,"event":"stage_launched","stage":"code","agent":"claude","supervisor_pid":2292007,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e53759d978fbd9.sock","launch_id":"18e53759d978fbd9","launch":"stream"}
+{"v":1,"ts":1793619508,"phase":1,"event":"advance_evaluated","stage":"code","status":"failed","verdict":null,"decided_by_layer":1,"reason":"Plan 01-01 Task 1 (checkpoint:decision, gate=blocking-human) stopped execution: choose DEFAULT_RETRY_BUDGET_SECS from budget-30, budget-120 or budget-300. No option selected, no implementation done."}
+{"v":1,"ts":1793619508,"phase":1,"event":"checkpoint_auto_decided","stage":"code","session_id":"uuid-3","instruction":"This is phase 1 of a headless DevFlow run. You previously stopped at a blocking-human gate, but no human operator is available to answer it — this run is unattended, and none is coming. DevFlow resumed you specifically to resolve that gate: resolve it yourself,… [truncated; full output in .devflow/]","attempt":1,"policy":"D-03b: Auto-only checkpoint auto-decide"}
+{"v":1,"ts":1793619508,"phase":1,"event":"capture_archived","stage":"code","to_stage":"code","stamp":"1793619508666943360-0"}
+{"v":1,"ts":1793619508,"phase":1,"event":"stage_launched","stage":"code","agent":"claude","supervisor_pid":2301341,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e43770ac748207.sock","launch_id":"18e43770ac748207","launch":"capture"}
+{"v":1,"ts":1793620016,"phase":1,"event":"advance_evaluated","stage":"code","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1793620016,"phase":1,"event":"transition","from":"code","to":"validate"}
+{"v":1,"ts":1793620016,"phase":1,"event":"capture_archived","stage":"code","to_stage":"validate","stamp":"1793620016071304144-0"}
+{"v":1,"ts":1793620016,"phase":1,"event":"stage_launched","stage":"validate","agent":"claude","supervisor_pid":2344836,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e437e6d002c101.sock","launch_id":"18e437e6d002c101","launch":"stream"}
+{"v":1,"ts":1793620107,"phase":1,"event":"advance_evaluated","stage":"validate","status":"success","verdict":"pass","decided_by_layer":1,"reason":null}
+{"v":1,"ts":1793620107,"phase":1,"event":"hook_run","hook":"DocsUpdate","ok":true}
+{"v":1,"ts":1793620107,"phase":1,"event":"transition","from":"validate","to":"ship"}
+{"v":1,"ts":1793620108,"phase":1,"event":"capture_archived","stage":"validate","to_stage":"ship","stamp":"1793620108143675345-0"}
+{"v":1,"ts":1793620108,"phase":1,"event":"stage_launched","stage":"ship","agent":"claude","supervisor_pid":2352522,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e437fc3fd57b90.sock","launch_id":"18e437fc3fd57b90","launch":"stream"}
+{"v":1,"ts":1793620434,"phase":1,"event":"advance_evaluated","stage":"ship","status":"failed","verdict":null,"decided_by_layer":1,"reason":"ship: /gsd-ship 1 blocked with PHASE_VERIFICATION_INCOMPLETE because verification status is human_needed; a human must confirm the 90s failover and 240s pager figures behind the agent-chosen 120s budget via /gsd-verify-work 01. Review gate had 0 Critical after … [truncated; full output in .devflow/]"}
+{"v":1,"ts":1793620434,"phase":1,"event":"gate_fired","stage":"ship","unexpected":false,"context":"[never-silent] stage ship failed: ship: /gsd-ship 1 blocked with PHASE_VERIFICATION_INCOMPLETE because verification status is human_needed; a human must confirm the 90s failover and 240s pager figures behind the agent-chosen 120s budget via /gsd-verify-work 01. Review gate had 0 Critical after … [truncated; full output in .devflow/] — human review needed (retry, loop-to-code, or abort)"}
+{"v":1,"ts":1793620435,"phase":1,"event":"notify_fired","stage":"ship","unexpected":false}
+{"v":1,"ts":1793620843,"phase":1,"event":"gate_response_written","stage":"ship","gate_id":"18e438484b8f9786","approved":true,"via":"cli"}
+{"v":1,"ts":1793620858,"phase":1,"event":"gate_resolved","stage":"ship","gate_id":"18e438484b8f9786","approved":true,"action":"advance","responded_by":"denniyahh"}
+{"v":1,"ts":1793620858,"phase":1,"event":"gate_claimed_answer_removed","stage":"ship","gate_id":"18e438484b8f9786","approved":true,"note":"attempt 1: operator settled the verification sign-off; retry ship","responded_by":"denniyahh"}
+{"v":1,"ts":1793620858,"phase":1,"event":"capture_archived","stage":"ship","to_stage":"ship","stamp":"1793620858527908780-0"}
+{"v":1,"ts":1793620858,"phase":1,"event":"stage_launched","stage":"ship","agent":"claude","supervisor_pid":2417829,"socket_path":"~/.cache/devflow/sock/55d57a6af76f3f51-01-18e538aaf679aa5e.sock","launch_id":"18e538aaf679aa5e","launch":"stream"}
+{"v":1,"ts":1793621326,"phase":1,"event":"advance_evaluated","stage":"ship","status":"success","verdict":null,"decided_by_layer":1,"reason":null}
+{"v":1,"ts":1793621326,"phase":1,"event":"gate_fired","stage":"ship","unexpected":false,"context":"Ship complete — approve merge?"}

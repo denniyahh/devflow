@@ -1,0 +1,21 @@
+  ok   head is integration
+  ok   working tree clean
+  ok   main and integration exist
+  ok   devflow.toml sets base_branch integration
+  ok   devflow.toml sets capture_retention 64
+  ok   config.json is in pretty form
+  ok   config.json keys resolve as required
+  ok   config.json has no arrays or numbers
+  ok   roadmap has the phase 1 heading
+  ok   phase directory holds the payload plan
+  ok   plan opens with the blocking-human decision task
+  ok   RED test fails before the implementation
+  ok   validation map covers BUDGET-01
+  ok   no plan declares external_verify
+  ok   no breaking commit on integration
+  ok   no tags
+  ok   no ancestor Cargo.toml
+  ok   gsd: ship:pre has no security gate
+  ok   gsd: verify:post runs nyquist
+  ok   gsd: execute:wave:post has no ui or drift gate
+CHECK passed=20 failed=0

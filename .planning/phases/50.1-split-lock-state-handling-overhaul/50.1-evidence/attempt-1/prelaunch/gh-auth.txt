@@ -1,0 +1,2 @@
+  ✓ Logged in to github.com account denniyahh (keyring)
+  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'
