@@ -1,0 +1,23 @@
+{
+  "case": "alive-stop-stream",
+  "live": true,
+  "bin_sha256": "cbfef06a16cea3222e9ca70b1c84cfc11ee326c66ac94e6cf4595b0e267d5c5f",
+  "launch_shape": "stream",
+  "socket_path": "/tmp/df50f.1sIgF4/c/sock/ca9075c512644830-01-18e44e3f0f643aeb.sock",
+  "launch_id": "18e44e3f0f643aeb",
+  "supervisor_pid": 1683455,
+  "probe_before": "ALIVE",
+  "probe_after": "GONE",
+  "members_before": [
+    "1683456 1683456 1680234 Mon Nov  2 13:36:23 2026 /bin/sh /tmp/df50f.1sIgF4/f-alive-stop-stream/claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions"
+  ],
+  "members_after": [],
+  "advance_ran": false,
+  "next_stage_launched": false,
+  "stage_launched_count": 1,
+  "state_stopped": true,
+  "stop_exit": 0,
+  "stop_output": "stop: stopped phase 1 through its supervisor (agent group ended, exit code 143, advance suppressed)",
+  "expected_met": true,
+  "unmet": []
+}

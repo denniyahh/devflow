@@ -1,0 +1,23 @@
+{
+  "case": "alive-stop-capture",
+  "live": true,
+  "bin_sha256": "cbfef06a16cea3222e9ca70b1c84cfc11ee326c66ac94e6cf4595b0e267d5c5f",
+  "launch_shape": "capture",
+  "socket_path": "/tmp/df50f.1sIgF4/c/sock/66df63320e5ccb52-01-18e44e3fe677a65d.sock",
+  "launch_id": "18e44e3fe677a65d",
+  "supervisor_pid": 1686215,
+  "probe_before": "ALIVE",
+  "probe_after": "GONE",
+  "members_before": [
+    "1686222 1686222 1680234 Mon Nov  2 13:36:27 2026 /bin/sh /tmp/df50f.1sIgF4/f-alive-stop-capture/claude -p This is the Define stage of a headless DevFlow run for phase 1.  There is no agent work to perform here. Whether or not this phase's CONTEXT.md already exists, you must NOT run an interactive discuss-phase or interview command, and you must NOT ask for input — this run is headless and no operator is available to answer interactive questions. Do NOT modify any existing planning artifacts.  ## Completion Protocol (REQUIRED)  When all work is done, the LAST line of your FINAL message must be exactly:  DEVFLOW_RESULT: {\"status\": \"success\"}  If something prevents completion:  DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"specific explanation\"}  Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. DevFlow reads this line to decide whether the stage succeeded. Output nothing after it. --output-format json --dangerously-skip-permissions"
+  ],
+  "members_after": [],
+  "advance_ran": false,
+  "next_stage_launched": false,
+  "stage_launched_count": 1,
+  "state_stopped": true,
+  "stop_exit": 0,
+  "stop_output": "stop: stopped phase 1 through its supervisor (agent group ended, exit code 143, advance suppressed)",
+  "expected_met": true,
+  "unmet": []
+}

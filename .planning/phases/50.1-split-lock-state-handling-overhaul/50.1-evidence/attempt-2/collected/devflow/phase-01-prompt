@@ -1,0 +1,30 @@
+Run the Ship stage in two steps:
+
+1. Run `/gsd-code-review 1` (non-interactive). This writes a `REVIEW.md` artifact with severity-classified findings. Review at high depth from every angle below:
+
+- doc-accuracy cross-reference (do documented claims match source?)
+- security / leaked-data (does anything commit secrets, session data, or telemetry?)
+- CI/build correctness (can a failing step still report green?)
+- external-state claims (does the diff claim merges, tags, or deletions that are not actually true?)
+- one generalist deep pass
+
+If your harness supports parallel finder subagents, dispatch one per angle; otherwise run each angle as a focused sequential pass. Merge and deduplicate every angle's findings into one `REVIEW.md`.
+2. Check `REVIEW.md` for the Critical-severity gate:
+
+- If `REVIEW.md` contains ANY finding at Critical severity: do NOT run `/gsd-ship 1` at all. Your FINAL message must be exactly:
+
+DEVFLOW_RESULT: {"status": "failed", "reason": "review: <short summary of the Critical findings>"}
+
+- If `REVIEW.md` has NO Critical-severity findings: run `/gsd-ship 1`. When creating the pull request, target base branch `main` (the repository trunk), not the base branch DevFlow merges this phase into locally. Report the outcome via the normal completion protocol below.
+
+## Completion Protocol (REQUIRED)
+
+When all work is done, the LAST line of your FINAL message must be exactly:
+
+DEVFLOW_RESULT: {"status": "success"}
+
+If something prevents completion:
+
+DEVFLOW_RESULT: {"status": "failed", "reason": "specific explanation"}
+
+Anything else your final message must contain, such as the reasoning for a decision, goes above the DEVFLOW_RESULT line. DevFlow reads this line to decide whether the stage succeeded. Output nothing after it.

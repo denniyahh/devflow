@@ -1,0 +1,5 @@
+{"seq":1,"stage":"define","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50.1/attempt-2/gates/001-define","manifest_sha256":"796d0cb4e243e47d46940a4f4a4ecfe397f7cfffd595f179b81c2d0eb34e7b81","t":1793644650}
+{"seq":2,"stage":"code","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50.1/attempt-2/gates/002-code","manifest_sha256":"3cdae6f9636855d1944e520797d80e4c95b1d20a1a1ff1bb26f1458fc61ef742","t":1793644679}
+{"seq":3,"stage":"code","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50.1/attempt-2/gates/003-code","manifest_sha256":"f404630ae5b1582088f36bee65993aa172e5aa39afdacee0c99a7bacef48a796","t":1793645232}
+{"seq":4,"stage":"code","phase":"1","non_silent":"1","dir":"~/.cache/devflow-phase50.1/attempt-2/gates/004-code","manifest_sha256":"d024b0db316d7db79d2f47c79bc903b2964f6357e0e62cbe98f68a29ee0f7a46","t":1793646394}
+{"seq":5,"stage":"ship","phase":"1","non_silent":"0","dir":"~/.cache/devflow-phase50.1/attempt-2/gates/005-ship","manifest_sha256":"48be9557bb5162ac46c5b46e7aa7a9e68d68881411bb4140f3d4ad789f551b33","t":1793648333}
