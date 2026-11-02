@@ -994,13 +994,20 @@ mod tests {
         // escalation, within the bounded wait.
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg("trap '' TERM; sleep 30")
+            .arg("trap '' TERM; echo ready; sleep 30")
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn TERM-ignoring child");
         let pid = child.id();
 
-        // Give the shell a moment to install its trap before signalling.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // A TERM that lands before the trap kills the shell, which is not this case.
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().expect("the child's stdout")),
+            &mut ready,
+        )
+        .expect("read the child's ready line");
+        assert_eq!(ready, "ready\n");
 
         let cleared = terminate_and_verify(
             pid,
