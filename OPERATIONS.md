@@ -154,7 +154,11 @@ listed this way for a moment.
 promotion never came within its 15 s wait, writes no state and cannot record its
 own stop. It ends its agent's group if the agent still runs and logs
 `supervisor_superseded`, whose `agent_group` field says `ended` or
-`already_exited`.
+`already_exited`. A promoted supervisor keeps reading the state once a second
+until its agent exits, so editing the state to name another launch or none, or
+deleting it, ends a running agent. A state that does not load, or names the
+launch only as pending, ends nothing: the supervisor logs a warning at most once
+a minute, and its agent keeps running.
 
 **Where the sockets live.** Under `registry::cache_dir()/sock`: the cache
 directory is `DEVFLOW_CACHE_DIR` when set, then `$XDG_CACHE_HOME/devflow`,
