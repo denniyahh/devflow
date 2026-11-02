@@ -1040,7 +1040,7 @@ fn stage_launched_count(root: &Path) -> usize {
 fn resume_agent_fragments(phase: PhaseId) -> Vec<String> {
     vec![
         "A state already marked stopped does not mean these processes have exited".to_string(),
-        "`devflow status` names `devflow resume` for a phase whose supervisor is GONE even while its agent is still alive".to_string(),
+        "with no live supervisor, `devflow status` names a live agent's pid and the manual kill".to_string(),
         "resume refuses until every named process has exited".to_string(),
         "If a named pid is live but is not this phase's process (a recycled pid), `resume` refuses again".to_string(),
         "no DevFlow verb clears a recorded pid while keeping the phase's work".to_string(),

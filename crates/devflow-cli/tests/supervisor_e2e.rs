@@ -586,6 +586,30 @@ fn status_reports_each_liveness_state_with_its_repair_verb() {
     );
 
     fs::remove_file(&socket).expect("remove the stale socket");
+    // D-19: the SIGKILL orphaned the agent, so `resume` would refuse.
+    let orphaned = run_status(&home, &root);
+    assert!(orphaned.contains("GONE"), "the run reads GONE:\n{orphaned}");
+    let kill_line = format!("kill -TERM -- -{}", record.agent_pgid);
+    assert!(
+        orphaned.contains(&kill_line),
+        "GONE beside a live agent names `{kill_line}`:\n{orphaned}"
+    );
+    assert!(
+        !orphaned.contains(&resume_verb),
+        "GONE beside a live agent names no resume:\n{orphaned}"
+    );
+
+    assert!(
+        devflow_core::agent::is_same_process(record.agent_pgid, record.agent_start_time),
+        "the record's agent {} is the orphan",
+        record.agent_pgid
+    );
+    common::signal_group(record.agent_pgid, libc::SIGKILL);
+    assert!(
+        holds_within(RUN_WAIT, || group_members(record.agent_pgid).is_empty()),
+        "the agent group {} is gone after SIGKILL",
+        record.agent_pgid
+    );
     let gone = run_status(&home, &root);
     assert!(gone.contains("GONE"), "the run reads GONE:\n{gone}");
     assert!(
