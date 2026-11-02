@@ -9109,6 +9109,250 @@ mod tests {
         );
     }
 
+    /// Runs `body` in a child test process of its own, with a hermetic cache: a released
+    /// flock must read released at once, which another test's fork would falsify.
+    fn in_own_hermetic_process(name: &str, body: impl FnOnce()) {
+        if devflow_core::test_support::in_child_test(name) {
+            body();
+            return;
+        }
+        let path_dir = agent_free_git_only_path_dir();
+        let output = crate::test_support::run_hermetic_test_in_child(name, path_dir.path(), &[]);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// A short-pathed socket directory and the fixture the two live-supervisor refusal
+    /// tests share: a recorded supervisor that is really serving, and a reservation whose
+    /// liveness lock this test holds, with no socket.
+    struct LiveSupervisorFixture {
+        _sockets: tempfile::TempDir,
+        supervisor: devflow_core::supervisor::runtime::Supervisor,
+        record: SupervisorRecord,
+        pending: devflow_core::state::PendingSupervisor,
+        pending_hold: devflow_core::liveness::Hold,
+    }
+
+    const LIVE_RECORDED_LAUNCH: &str = "0000000000002908";
+    const LIVE_PENDING_LAUNCH: &str = "0000000000002909";
+
+    fn live_supervisor_fixture(root: &Path, phase: PhaseId) -> LiveSupervisorFixture {
+        let sockets = tempfile::Builder::new()
+            .prefix("dfs")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (supervisor, record) =
+            fake_supervisor(sockets.path(), root, phase, LIVE_RECORDED_LAUNCH);
+        let liveness_path =
+            devflow_core::liveness::launch_liveness_path(root, LIVE_PENDING_LAUNCH).unwrap();
+        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+        let pending_hold = devflow_core::liveness::Hold::take(&liveness_path).unwrap();
+        let pending = devflow_core::state::PendingSupervisor::new(
+            LIVE_PENDING_LAUNCH.to_string(),
+            sockets.path().join("never-published.sock"),
+            liveness_path,
+        );
+        LiveSupervisorFixture {
+            _sockets: sockets,
+            supervisor,
+            record,
+            pending,
+            pending_hold,
+        }
+    }
+
+    /// `error` is the live-supervisor refusal for `launch_id`.
+    fn assert_refused_over_a_live_supervisor(error: &str, phase: PhaseId, launch_id: &str) {
+        assert!(error.contains("live supervisor"), "{error}");
+        assert!(error.contains(launch_id), "names the launch: {error}");
+        assert!(
+            error.contains(&format!("devflow stop --phase {phase}")),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+    }
+
+    /// D-08, D-17 (V-32): a hand-run `advance` refuses beside a live supervisor of its
+    /// phase, recorded or pending. The state is at Plan and the advance binds to Define,
+    /// so the control proves that with the supervisor gone the same call reaches the
+    /// advance's own stage check, which writes nothing either.
+    #[test]
+    fn a_hand_run_advance_refuses_while_a_supervisor_of_the_phase_is_live() {
+        const NAME: &str = "pipeline_launch::tests::a_hand_run_advance_refuses_while_a_supervisor_of_the_phase_is_live";
+        in_own_hermetic_process(NAME, || {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(2908);
+            let fixture = live_supervisor_fixture(root, phase);
+            let state_file = workflow::state_path(root, phase);
+            let advance = || {
+                advance_command(root, Some(phase), Some(Stage::Define))
+                    .expect_err("this advance never succeeds")
+                    .to_string()
+            };
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+            state.stage = Stage::Plan;
+
+            state.supervisor = Some(fixture.record.clone());
+            workflow::save_state(&state).unwrap();
+            let before = std::fs::read(&state_file).unwrap();
+            let error = advance();
+            eprintln!("recorded: {error}");
+            assert_refused_over_a_live_supervisor(&error, phase, LIVE_RECORDED_LAUNCH);
+            assert_eq!(std::fs::read(&state_file).unwrap(), before, "recorded");
+            assert!(Gates::list_open(root).is_empty(), "no gate opens");
+            let failed = events_named(root, "advance_failed");
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert_eq!(failed[0]["reason"], "live supervisor", "{}", failed[0]);
+
+            state.supervisor = None;
+            state.pending_supervisor = Some(fixture.pending.clone());
+            workflow::save_state(&state).unwrap();
+            let before = std::fs::read(&state_file).unwrap();
+            let error = advance();
+            eprintln!("pending: {error}");
+            assert_refused_over_a_live_supervisor(&error, phase, LIVE_PENDING_LAUNCH);
+            assert_eq!(std::fs::read(&state_file).unwrap(), before, "pending");
+            assert!(Gates::list_open(root).is_empty(), "no gate opens");
+
+            let LiveSupervisorFixture {
+                _sockets,
+                supervisor,
+                record,
+                pending,
+                pending_hold,
+            } = fixture;
+            supervisor.finish();
+            drop(pending_hold);
+            assert_eq!(
+                devflow_core::supervisor::probe(&record.socket_path).unwrap(),
+                devflow_core::supervisor::Liveness::Gone
+            );
+            state.supervisor = Some(record);
+            state.pending_supervisor = Some(pending);
+            workflow::save_state(&state).unwrap();
+            let before = std::fs::read(&state_file).unwrap();
+            let error = advance();
+            eprintln!("gone: {error}");
+            assert!(error.contains("advance stage mismatch"), "{error}");
+            assert_eq!(
+                events_named(root, "advance_failed").last().unwrap()["reason"],
+                "stage mismatch",
+                "the call reached the advance"
+            );
+            assert_eq!(std::fs::read(&state_file).unwrap(), before, "gone");
+        });
+    }
+
+    /// R-17: `devflow ship` refuses beside a live supervisor of its phase, before it reads
+    /// or claims the answer that supervisor can still consume, and before a loop-back
+    /// could launch beside it. The control answers with an abort, because a loop-back that
+    /// passes the guard launches a real agent; the guard runs before any answer is read,
+    /// so the answer's kind cannot affect it.
+    #[test]
+    fn devflow_ship_refuses_while_a_supervisor_of_the_phase_is_live() {
+        const NAME: &str =
+            "pipeline_launch::tests::devflow_ship_refuses_while_a_supervisor_of_the_phase_is_live";
+        in_own_hermetic_process(NAME, || {
+            use devflow_core::gates::GateResponse;
+            use devflow_core::test_support::gate_answer_files;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(2910);
+            let fixture = live_supervisor_fixture(root, phase);
+            let state_file = workflow::state_path(root, phase);
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.into());
+            state.stage = Stage::Ship;
+            workflow::save_state(&state).unwrap();
+            let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
+                .unwrap()
+                .gate_id;
+            let answer = |note: &str| GateResponse {
+                approved: false,
+                note: Some(note.to_string()),
+                responded_by: Some("test".to_string()),
+            };
+            answer_open_gate(root, phase, Stage::Ship, &answer("review: fix it")).unwrap();
+            let claim = Gates::claim_path(root, phase, Stage::Ship, &gate);
+            let answer_file = gate_answer_files(root, phase, Stage::Ship)
+                .pop()
+                .expect("the answer is on disk");
+            let answer_bytes = std::fs::read(&answer_file).unwrap();
+            let live_files = || {
+                std::fs::read_dir(root.join(".devflow"))
+                    .unwrap()
+                    .filter(|entry| {
+                        let name = entry.as_ref().unwrap().file_name();
+                        name.to_string_lossy().ends_with(".live")
+                    })
+                    .count()
+            };
+
+            for (supervisor, pending, launch) in [
+                (Some(fixture.record.clone()), None, LIVE_RECORDED_LAUNCH),
+                (None, Some(fixture.pending.clone()), LIVE_PENDING_LAUNCH),
+            ] {
+                state.supervisor = supervisor;
+                state.pending_supervisor = pending;
+                workflow::save_state(&state).unwrap();
+                let before = std::fs::read(&state_file).unwrap();
+                let files = live_files();
+                let error = crate::pipeline_gate::ship_override(root, phase, false)
+                    .expect_err("a live supervisor refuses `devflow ship`")
+                    .to_string();
+                eprintln!("{launch}: {error}");
+                assert_refused_over_a_live_supervisor(&error, phase, launch);
+                assert_eq!(std::fs::read(&state_file).unwrap(), before, "{launch}");
+                assert_eq!(
+                    std::fs::read(&answer_file).unwrap(),
+                    answer_bytes,
+                    "{launch}: the live supervisor can still consume its answer"
+                );
+                assert!(!claim.exists(), "{launch}: the answer is not claimed");
+                assert_eq!(live_files(), files, "{launch}: no launch is reserved");
+            }
+            assert_eq!(
+                events_named(root, "ship_override_refused").len(),
+                2,
+                "each refusal is recorded"
+            );
+
+            let LiveSupervisorFixture {
+                _sockets,
+                supervisor,
+                record,
+                pending,
+                pending_hold,
+            } = fixture;
+            supervisor.finish();
+            drop(pending_hold);
+            state.supervisor = Some(record);
+            state.pending_supervisor = Some(pending);
+            workflow::save_state(&state).unwrap();
+            std::fs::remove_file(&answer_file).unwrap();
+            answer_open_gate(root, phase, Stage::Ship, &answer("abort this run")).unwrap();
+
+            // `note_claim` parks the consumer until a second claim outcome is counted, so
+            // the claim file can be read before the abort closes the gate and removes it.
+            let probe = std::sync::Arc::new(crate::pipeline_gate::ClaimProbe::default());
+            let shipped = std::thread::scope(|scope| {
+                let shipper = scope.spawn(|| {
+                    crate::pipeline_gate::CLAIM_PROBE.set(Some(probe.clone()));
+                    crate::pipeline_gate::ship_override(root, phase, false)
+                });
+                assert!(
+                    poll_until(Duration::from_secs(10), || claim.exists()),
+                    "with the supervisor gone the guard passes and the answer is claimed"
+                );
+                eprintln!("gone: the claim file appeared");
+                probe
+                    .already_consumed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                shipper.join().unwrap()
+            });
+            shipped.expect("the abort answer is driven through");
+        });
+    }
+
     /// A live in-process supervisor serving `launch_id` at a short socket
     /// path in `dir`, for the observer control.
     fn fake_supervisor(

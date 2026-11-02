@@ -15018,6 +15018,89 @@ mod tests {
         crate::pipeline_launch::abandon_reservation(root, phase, created);
     }
 
+    /// D-17 (V-29), D-02, D-18: a `start` busy before its spawn is reached once the bounded
+    /// wait for a socket expires. The launcher catches the signal, so `stop` marks nothing;
+    /// released, it stops at safe point 2 and gives its reservation back.
+    #[test]
+    fn stop_signals_a_start_that_has_not_spawned_its_supervisor() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "commands::tests::stop_signals_a_start_that_has_not_spawned_its_supervisor";
+        let phase = PhaseId::new(2911);
+        if devflow_core::test_support::in_child_test(NAME) {
+            start_for_test(&holder_child_root(), phase).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_start_repo(root, phase);
+        let mut child = ParkedHolder::spawn(
+            NAME,
+            root,
+            crate::test_support::agent_free_dir_with_agent_stub("claude"),
+        );
+        let pid = child.pid();
+        let pending = workflow::load_state(root, phase)
+            .unwrap()
+            .pending_supervisor
+            .expect("its reservation is pending");
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "the launcher holds its own reservation"
+        );
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = stop_with_an_empty_cache(root, phase)
+            .expect_err("a launcher still running is not a stop")
+            .to_string();
+        eprintln!("stop: {error}");
+
+        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
+        assert!(error.contains("not marked"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "gives its reservation for launch {} back itself at its next safe point",
+                pending.launch_id
+            )),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "`stop` writes no state"
+        );
+        assert!(
+            devflow_core::test_support::process_is_live(pid),
+            "the signal was caught, not fatal"
+        );
+
+        let output = child.release_and_finish();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        let state = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            state.pending_supervisor, None,
+            "the reservation is given back"
+        );
+        assert!(!pending.liveness_path.exists(), "and its liveness file");
+        assert_eq!(state.supervisor, None, "no supervisor was spawned");
+        assert!(state.stopped, "the launcher records the stop");
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(crate::pipeline_launch::HOLDER_STOP_REASON)
+        );
+        let stopped = holder_events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 2, "{}", stopped[0]);
+        assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
+        assert!(
+            holder_events_named(root, "stage_launched").is_empty(),
+            "nothing was launched"
+        );
+    }
+
     /// D-18: over a missing state, a signalled holder ended its run on its own, which is
     /// not "already stopped". With nothing signalled, the line is today's.
     #[test]
