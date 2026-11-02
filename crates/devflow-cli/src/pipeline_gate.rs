@@ -981,6 +981,7 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
+    use std::path::PathBuf;
 
     macro_rules! enter_path_isolated_child {
         ($name:expr, $path_dir:expr) => {
@@ -2704,5 +2705,634 @@ mod tests {
         assert!(!after.gate_pending);
         assert_eq!(after.last_verification_fingerprint, Some(FINGERPRINT));
         assert_eq!(after.last_verification_mtime_nanos, Some(MTIME_NANOS));
+    }
+
+    // ---- 50.1-22: where a stop lands around finalization (D-13 items 7 and 8, D-18) ----
+
+    /// A supervisor published in this process and recorded in `state`, so an advance
+    /// engaged on it passes the ownership fence. Its agent group is 0: nothing here ever
+    /// signals one.
+    struct RecordedSupervisor {
+        supervisor: devflow_core::supervisor::runtime::Supervisor,
+        launch_id: String,
+        _cache: tempfile::TempDir,
+    }
+
+    impl RecordedSupervisor {
+        fn serve(state: &mut State) -> Self {
+            use devflow_core::supervisor::{self, Sidecar, SocketPath};
+            let pid = std::process::id();
+            let cache = hermetic_cache_dir();
+            let launch_id = supervisor::new_launch_id();
+            let socket =
+                SocketPath::for_launch(cache.path(), &state.project_root, state.phase, &launch_id)
+                    .expect("the socket path fits");
+            let socket_path = socket.as_path().to_path_buf();
+            let boot_id = supervisor::boot_id().unwrap_or_default();
+            let start_time = devflow_core::agent::process_start_time(pid).unwrap_or(0);
+            // `Sidecar` is `non_exhaustive`, so a test outside its crate builds one the way a
+            // reader does.
+            let sidecar: Sidecar = serde_json::from_value(serde_json::json!({
+                "launch_id": launch_id,
+                "project_root": state.project_root,
+                "phase": state.phase,
+                "stage": state.stage.to_string(),
+                "agent": state.agent.to_string(),
+                "launch": "capture",
+                "agent_pid": pid,
+                "agent_pgid": 0,
+                "agent_start_time": start_time,
+                "boot_id": boot_id,
+                "supervisor_pid": pid,
+                "supervisor_start_time": start_time,
+                "created_at": "2026-11-01T00:00:00Z",
+            }))
+            .expect("a well-formed sidecar");
+            let supervisor = devflow_core::supervisor::runtime::Supervisor::serve(socket, sidecar)
+                .expect("serve the socket");
+            supervisor
+                .token()
+                .enter(devflow_core::supervisor::runtime::OwnerPhase::Advancing);
+            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                socket_path,
+                launch_id.clone(),
+                0,
+                start_time,
+                boot_id,
+            ));
+            Self {
+                supervisor,
+                launch_id,
+                _cache: cache,
+            }
+        }
+
+        /// What a `shutdown` on the socket does to an advancing run.
+        fn request_stop(&self) {
+            self.supervisor
+                .token()
+                .request_stop(devflow_core::supervisor::runtime::StopSource::Socket);
+        }
+    }
+
+    /// A phase at Ship whose every finalization pass fails at `VersionBump`, after a
+    /// `Merge` that succeeds: a tag no branch reaches makes `compute_version` refuse
+    /// (D-10). The state records a supervisor.
+    fn finalization_that_fails_each_pass(root: &Path, phase: PhaseId) -> RecordedSupervisor {
+        init_repo(root);
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        };
+        git(&["checkout", "-q", "--orphan", "unreachable-release"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "chore: orphan"]);
+        git(&["tag", "v9.9.9"]);
+        git(&["checkout", "-q", "develop"]);
+        git(&[
+            "branch",
+            &format!("feature/phase-{}", phase.padded()),
+            "develop",
+        ]);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        let engaged = RecordedSupervisor::serve(&mut state);
+        workflow::save_state(&state).unwrap();
+        engaged
+    }
+
+    /// Run finalization on a thread with `engaged` as its supervisor and `probe` counting
+    /// its claims, so a claim holds there until the test lets it go.
+    fn spawn_engaged_finalization(
+        root: &Path,
+        phase: PhaseId,
+        engaged: &RecordedSupervisor,
+        probe: &std::sync::Arc<ClaimProbe>,
+    ) -> std::thread::JoinHandle<Result<(), CliError>> {
+        let root = root.to_path_buf();
+        let token = engaged.supervisor.token();
+        let launch_id = engaged.launch_id.clone();
+        let probe = probe.clone();
+        std::thread::spawn(move || {
+            CLAIM_PROBE.set(Some(probe));
+            let _engaged = crate::pipeline_launch::StopTokenGuard::engage(token, launch_id);
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            finish_workflow_with_gate_timeout(&root, &mut state, 30)
+        })
+    }
+
+    /// Answer the retry gate that is open now with an approval, and return once the
+    /// finalization thread has claimed it and holds in `note_claim`, before it has acted.
+    fn approve_the_retry_gate_and_hold_its_claim(
+        root: &Path,
+        phase: PhaseId,
+        probe: &ClaimProbe,
+    ) -> gates::GateId {
+        use std::sync::atomic::Ordering::SeqCst;
+        const CLAIMED_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let gate = wait_for_open_gate(root, phase, Stage::Ship);
+        assert!(
+            gate_answer_files(root, phase, Stage::Ship).is_empty(),
+            "the retry gate is never auto-approved"
+        );
+        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+        let started = std::time::Instant::now();
+        while probe.claimed.load(SeqCst) == 0 {
+            assert!(
+                started.elapsed() < CLAIMED_WITHIN,
+                "the retry gate's answer was not claimed within {CLAIMED_WITHIN:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        gate
+    }
+
+    /// How many `hook` runs the event log records: one per finalization pass that reached it.
+    fn hook_runs(root: &Path, hook: &str) -> usize {
+        events_named(root, "hook_run")
+            .iter()
+            .filter(|event| event["hook"] == hook)
+            .count()
+    }
+
+    /// D-13 item 7: safe point 6 runs before every finalization pass. A stop that lands
+    /// while an approved retry is on its way back to the loop runs no second merge, version
+    /// bump, tag or push.
+    #[test]
+    fn a_stop_during_a_finalization_retry_is_honoured_before_the_next_pass() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2211);
+        let engaged = finalization_that_fails_each_pass(root, phase);
+        let probe = std::sync::Arc::new(ClaimProbe::default());
+        let finalizing = spawn_engaged_finalization(root, phase, &engaged, &probe);
+
+        approve_the_retry_gate_and_hold_its_claim(root, phase, &probe);
+        engaged.request_stop();
+        probe.already_consumed.fetch_add(1, SeqCst);
+        let result = finalizing.join().unwrap();
+
+        assert_eq!(
+            hook_runs(root, "Merge"),
+            1,
+            "the stop ran no second pass: {result:?}"
+        );
+        let error = result
+            .expect_err("a stopped finalization does not ship")
+            .to_string();
+        assert!(error.contains("finalization did not run"), "{error}");
+        let stopped = events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 6, "{}", stopped[0]);
+        assert_eq!(stopped[0]["source"], "supervisor", "{}", stopped[0]);
+        assert!(events_named(root, "workflow_shipped").is_empty());
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(state.stopped);
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(crate::pipeline_launch::ADVANCE_STOP_REASON)
+        );
+        assert!(!state.gate_pending);
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+    }
+
+    /// The control for the stop above: the same approved retry with no stop runs the next
+    /// pass and reopens the gate, so the hook count above is one because of the stop.
+    #[test]
+    fn without_a_stop_an_approved_finalization_retry_runs_the_next_pass() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const NEXT_PASS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2212);
+        let engaged = finalization_that_fails_each_pass(root, phase);
+        let probe = std::sync::Arc::new(ClaimProbe::default());
+        let finalizing = spawn_engaged_finalization(root, phase, &engaged, &probe);
+
+        let first_gate = approve_the_retry_gate_and_hold_its_claim(root, phase, &probe);
+        probe.already_consumed.fetch_add(1, SeqCst);
+
+        let started = std::time::Instant::now();
+        while hook_runs(root, "VersionBump") < 2
+            || !Gates::gate_path(root, phase, Stage::Ship).exists()
+            || live_gate_id(root, phase, Stage::Ship) == first_gate
+        {
+            assert!(
+                started.elapsed() < NEXT_PASS_WITHIN,
+                "the approved retry must run the next pass and reopen the gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(hook_runs(root, "Merge"), 2);
+        assert!(events_named(root, "advance_stopped").is_empty());
+
+        answer_open_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        finalizing.join().unwrap().unwrap();
+    }
+
+    /// Names the D-18 fixture's project root for its finalizing child. Not a DevFlow
+    /// setting, so it carries no `DEVFLOW_` prefix the doc check would require documented.
+    const MID_MERGE_ROOT_ENV: &str = "P50_1_22_ROOT";
+    /// Says which finalizing child this process is: [`MID_MERGE_SHIP`] or
+    /// [`MID_MERGE_NO_HANDLER`].
+    const MID_MERGE_ROLE_ENV: &str = "P50_1_22_ROLE";
+    /// `ship_override`, whose claim installs the D-18 stop handler.
+    const MID_MERGE_SHIP: &str = "ship";
+    /// A holder with no stop handler, so its SIGTERM has the default disposition.
+    const MID_MERGE_NO_HANDLER: &str = "no_handler";
+    /// The finalizing child's exit code when its call returned an error.
+    const MID_MERGE_CHILD_ERROR: i32 = 41;
+    /// The bound on each step the D-18 fixture waits for.
+    const MID_MERGE_STEP: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The script's bound on its pause, as 0.05 s sleeps: 30 s.
+    const MID_MERGE_PAUSE_POLLS: u32 = 600;
+
+    /// One repo the whole after-ship batch succeeds on, with an answered Ship gate, whose
+    /// `post-checkout` hook pauses inside `Merge`, between its `git checkout` and `git merge`.
+    struct MidMergeFixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        phase: PhaseId,
+        branch: String,
+        feature_tip: String,
+        tags_before: Vec<String>,
+        hook_dir: tempfile::TempDir,
+    }
+
+    impl MidMergeFixture {
+        fn new(phase: PhaseId) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            crate::test_support::init_repo_no_version_file(&root);
+            let branch = format!("feature/phase-{}", phase.padded());
+            let git = |args: &[&str]| {
+                let output = devflow_core::test_support::git_command(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?} failed: {output:?}");
+            };
+            git(&["branch", &branch, "develop"]);
+            std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+            git(&["checkout", "-q", &branch]);
+            std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "phase work"]);
+            git(&["checkout", "-q", "develop"]);
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+            state.stage = Stage::Ship;
+            workflow::save_state(&state).unwrap();
+            Gates::open_gate(&root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+            answer_open_gate(&root, phase, Stage::Ship, &approval()).unwrap();
+
+            let hook_dir = tempfile::tempdir().unwrap();
+            let fixture = Self {
+                feature_tip: Self::git_stdout(&root, &["rev-parse", &branch]),
+                tags_before: Self::tags_in(&root),
+                _dir: dir,
+                root,
+                phase,
+                branch,
+                hook_dir,
+            };
+            // Last, so nothing above runs it.
+            fixture.install_pausing_hook();
+            fixture
+        }
+
+        fn git_stdout(root: &Path, args: &[&str]) -> String {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed: {output:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        fn tags_in(root: &Path) -> Vec<String> {
+            Self::git_stdout(root, &["tag", "--list"])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// The tags this run added.
+        fn new_tags(&self) -> Vec<String> {
+            Self::tags_in(&self.root)
+                .into_iter()
+                .filter(|tag| !self.tags_before.contains(tag))
+                .collect()
+        }
+
+        fn git_succeeds(&self, args: &[&str]) -> bool {
+            devflow_core::test_support::git_command(&self.root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        }
+
+        fn develop_has_the_feature(&self) -> bool {
+            self.git_succeeds(&["merge-base", "--is-ancestor", &self.feature_tip, "develop"])
+        }
+
+        fn marker(&self, name: &str) -> PathBuf {
+            self.hook_dir.path().join(name)
+        }
+
+        /// `post-checkout` marks that it runs, waits (bounded) for the release, and marks
+        /// that it is leaving. The script names `sleep` by path: the child's PATH holds only
+        /// `git`.
+        fn install_pausing_hook(&self) {
+            use std::os::unix::fs::PermissionsExt;
+            let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+                .into_iter()
+                .find(|path| Path::new(path).is_file())
+                .expect("sleep must exist to run this test");
+            let hook = self.hook_dir.path().join("post-checkout");
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\n: > '{in_merge}'\ni=0\n\
+                     while [ ! -e '{release}' ] && [ \"$i\" -lt {MID_MERGE_PAUSE_POLLS} ]; do\n  \
+                     {sleep} 0.05\n  i=$((i+1))\ndone\n: > '{left}'\nexit 0\n",
+                    in_merge = self.marker("in-merge").display(),
+                    release = self.marker("release").display(),
+                    left = self.marker("left-merge").display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let hooks_path = self.hook_dir.path().display().to_string();
+            assert!(self.git_succeeds(&["config", "core.hooksPath", &hooks_path]));
+        }
+
+        /// Run the finalizing child `role`, and return it once it is inside `Merge`.
+        fn spawn_child_paused_in_merge(&self, test_name: &str, role: &str) -> MidMergeChild {
+            let path_dir = agent_free_git_only_path_dir();
+            let child = devflow_core::test_support::spawn_test_in_child(
+                test_name,
+                path_dir.path(),
+                &[
+                    (MID_MERGE_ROOT_ENV, self.root.as_os_str()),
+                    (MID_MERGE_ROLE_ENV, std::ffi::OsStr::new(role)),
+                ],
+            );
+            let mut child = MidMergeChild {
+                child: Some(child),
+                release: self.marker("release"),
+                _path_dir: path_dir,
+            };
+            let started = std::time::Instant::now();
+            while !self.marker("in-merge").exists() {
+                assert!(
+                    started.elapsed() < MID_MERGE_STEP && child.is_running(),
+                    "the child never paused inside Merge: {:?}",
+                    child.finish()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(
+                hook_runs(&self.root, "Merge"),
+                0,
+                "the pause is inside Merge, not after it"
+            );
+            child
+        }
+
+        /// Wait for the paused hook to leave, the one process here no one reaps once its
+        /// parent has died.
+        fn wait_for_the_hook_to_leave(&self) {
+            let started = std::time::Instant::now();
+            while !self.marker("left-merge").exists() {
+                assert!(
+                    started.elapsed() < MID_MERGE_STEP,
+                    "the paused hook never left after its release"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        /// The `hook_run` events, in order, as `(hook, ok)`.
+        fn hook_results(&self) -> Vec<(String, bool)> {
+            events_named(&self.root, "hook_run")
+                .iter()
+                .map(|event| {
+                    (
+                        event["hook"].as_str().expect("names its hook").to_string(),
+                        event["ok"].as_bool().expect("says whether it passed"),
+                    )
+                })
+                .collect()
+        }
+
+        /// The version `CHANGELOG.md`'s newest heading names.
+        fn newest_changelog_version(&self) -> String {
+            let changelog = std::fs::read_to_string(self.root.join("CHANGELOG.md")).unwrap();
+            changelog
+                .lines()
+                .find(|line| line.starts_with("## "))
+                .and_then(|line| line.trim_start_matches("## ").split(' ').next())
+                .expect("the changelog has a version heading")
+                .to_string()
+        }
+    }
+
+    /// A finalizing child, and the release of the hook it pauses in. On a failed assertion
+    /// too, dropping this releases the hook, then kills and reaps the child.
+    struct MidMergeChild {
+        child: Option<std::process::Child>,
+        release: PathBuf,
+        _path_dir: tempfile::TempDir,
+    }
+
+    impl MidMergeChild {
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("not yet finished").id()
+        }
+
+        fn is_running(&mut self) -> bool {
+            self.child
+                .as_mut()
+                .expect("not yet finished")
+                .try_wait()
+                .unwrap()
+                .is_none()
+        }
+
+        fn release_the_hook(&self) {
+            std::fs::write(&self.release, "").unwrap();
+        }
+
+        /// Wait for the child to end, within [`MID_MERGE_STEP`], and read its output. The
+        /// hook must already be released, or this waits out its pause.
+        fn finish(&mut self) -> std::process::Output {
+            let mut child = self.child.take().expect("finished once");
+            let started = std::time::Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if started.elapsed() > MID_MERGE_STEP {
+                    let _ = child.kill();
+                    panic!("the child did not end: {:?}", child.wait_with_output());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            child.wait_with_output().unwrap()
+        }
+    }
+
+    impl Drop for MidMergeChild {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, "");
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// The finalizing child of the D-18 fixture: exits 0 when its call returns `Ok`, and
+    /// [`MID_MERGE_CHILD_ERROR`] when it returns an error. Never returns.
+    fn run_the_finalizing_child(role: &std::ffi::OsStr, phase: PhaseId) -> ! {
+        let root = PathBuf::from(std::env::var_os(MID_MERGE_ROOT_ENV).expect("the parent sets it"));
+        let finished = if role == MID_MERGE_SHIP {
+            ship_override(&root, phase, false)
+        } else {
+            assert_eq!(role, MID_MERGE_NO_HANDLER);
+            let _hold = devflow_core::liveness::claim_phase_holder(&root, phase).unwrap();
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            finish_workflow_with_gate_timeout(&root, &mut state, 2)
+        };
+        match finished {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("the finalizing child's call failed: {err}");
+                std::process::exit(MID_MERGE_CHILD_ERROR)
+            }
+        }
+    }
+
+    /// D-18 (operator, narrowed 2026-10-26): `devflow ship` reads the stop flag only before
+    /// `Merge`. Stopped inside `Merge`, a real `ship_override` survives the signal, runs
+    /// every hook of the pass and ships, through the real `stop` entry. Control: a holder
+    /// without the handler, sent the same signal at the same point, dies with the merge
+    /// not done, the cut D-18 forbids.
+    ///
+    /// The limit: the flag is set inside `Merge` only, which is before every later hook
+    /// boundary, so this shows no boundary check exists. It does not drive a stop that
+    /// arrives during `VersionBump`, `ChangelogAppend` or `BranchCleanup`.
+    #[test]
+    fn a_stop_inside_the_ship_finalization_pass_lands_after_the_pass_ends() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str = "pipeline_gate::tests::a_stop_inside_the_ship_finalization_pass_lands_after_the_pass_ends";
+        const SHIP_PHASE: PhaseId = PhaseId::new(2213);
+        const NO_HANDLER_PHASE: PhaseId = PhaseId::new(2214);
+        // This outer child gives `stop` a hermetic cache dir to search.
+        enter_path_isolated_child!(NAME, agent_free_git_only_path_dir());
+        if let Some(role) = std::env::var_os(MID_MERGE_ROLE_ENV) {
+            let phase = if role == MID_MERGE_SHIP {
+                SHIP_PHASE
+            } else {
+                NO_HANDLER_PHASE
+            };
+            run_the_finalizing_child(&role, phase);
+        }
+
+        // Part 1: the stop lands after the pass.
+        let fixture = MidMergeFixture::new(SHIP_PHASE);
+        let (root, phase) = (fixture.root.clone(), fixture.phase);
+        let mut child = fixture.spawn_child_paused_in_merge(NAME, MID_MERGE_SHIP);
+        let pid = child.pid();
+
+        let error = crate::commands::stop(&root, phase)
+            .expect_err("a holder still running is not a stop")
+            .to_string();
+        eprintln!("stop returned: {error}");
+
+        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
+        assert!(error.contains("not marked"), "{error}");
+        assert!(error.contains("ships instead of stopping"), "{error}");
+        assert!(
+            child.is_running(),
+            "the signal was caught, not fatal: {error}"
+        );
+
+        child.release_the_hook();
+        let output = child.finish();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+        let hooks = fixture.hook_results();
+        eprintln!("hook_run results: {hooks:?}");
+        assert_eq!(
+            hooks,
+            ["Merge", "VersionBump", "ChangelogAppend", "BranchCleanup"]
+                .map(|hook| (hook.to_string(), true)),
+            "every hook of the pass ran to the end"
+        );
+        assert!(fixture.develop_has_the_feature());
+        let new_tags = fixture.new_tags();
+        eprintln!("new tags: {new_tags:?}");
+        assert_eq!(new_tags.len(), 1, "exactly one new tag: {new_tags:?}");
+        assert_eq!(
+            new_tags[0].strip_prefix('v'),
+            Some(fixture.newest_changelog_version().as_str()),
+            "the changelog names the tag's version"
+        );
+        assert!(
+            !fixture.git_succeeds(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", fixture.branch),
+            ]),
+            "the feature branch is gone"
+        );
+        assert_eq!(events_named(&root, "workflow_shipped").len(), 1);
+        assert_eq!(events_named(&root, "workflow_finished").len(), 1);
+        assert!(events_named(&root, "advance_stopped").is_empty());
+        assert!(matches!(
+            workflow::load_state(&root, phase),
+            Err(workflow::WorkflowError::MissingState(_))
+        ));
+
+        // Part 2, the control: without the handler the same signal cuts the merge.
+        let fixture = MidMergeFixture::new(NO_HANDLER_PHASE);
+        let mut child = fixture.spawn_child_paused_in_merge(NAME, MID_MERGE_NO_HANDLER);
+        assert!(devflow_core::agent::terminate(child.pid()));
+        let started = std::time::Instant::now();
+        while child.is_running() {
+            assert!(
+                started.elapsed() < MID_MERGE_STEP,
+                "a holder without the handler must die by the signal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.release_the_hook();
+        fixture.wait_for_the_hook_to_leave();
+        let output = child.finish();
+        eprintln!("no-handler child's status: {:?}", output.status);
+        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        assert_eq!(
+            hook_runs(&fixture.root, "Merge"),
+            0,
+            "the child died before its Merge hook could report"
+        );
+        assert!(!fixture.develop_has_the_feature(), "the merge was cut");
+        assert_eq!(fixture.new_tags(), Vec::<String>::new(), "no new tag");
     }
 }

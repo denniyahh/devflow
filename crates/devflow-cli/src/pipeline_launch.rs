@@ -1026,13 +1026,13 @@ thread_local! {
 /// advance running on this thread, for as long as the guard lives (RAII,
 /// the [`AutoChainGuard`] shape). Dropping it clears the token and the
 /// successor slot.
-struct StopTokenGuard {
+pub(crate) struct StopTokenGuard {
     /// Keeps the guard on the thread whose slot it set.
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl StopTokenGuard {
-    fn engage(token: StopToken, launch_id: String) -> Self {
+    pub(crate) fn engage(token: StopToken, launch_id: String) -> Self {
         ENGAGED_ADVANCE.with(|slot| {
             *slot.borrow_mut() = Some(EngagedAdvance {
                 token,
