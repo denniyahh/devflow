@@ -667,6 +667,18 @@ pub fn while_owner<T, E: From<WorkflowError>>(
     f()
 }
 
+/// What [`clear_state_if`] did.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Cleared<A> {
+    /// Whether a file was removed, by the removal or before its error.
+    pub(crate) removed: bool,
+    /// The removal's outcome; `Ok` when the decision kept the state.
+    pub(crate) result: Result<(), WorkflowError>,
+    /// `after_clear`'s value, when it ran.
+    pub(crate) after: Option<A>,
+}
+
 /// Enumerate every active phase state, sorted by phase number.
 ///
 /// Unparsable state files are skipped with a warning rather than failing the
@@ -765,6 +777,36 @@ pub fn clear_state_within(
     let (removed, result) =
         clear_state_with_partial_result_impl(project_root, phase, Some(wait), false, None);
     result.map(|()| removed)
+}
+
+/// RED stub: read, decide and remove with no hold of the lock across them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn clear_state_if<E: From<WorkflowError>, A>(
+    project_root: &Path,
+    phase: PhaseId,
+    _wait: Option<Duration>,
+    decide: impl FnOnce(Existing) -> Result<bool, E>,
+    after_clear: impl FnOnce() -> A,
+) -> Result<Cleared<A>, E> {
+    let existing = match load_state(project_root, phase) {
+        Ok(state) => Existing::Loaded(state),
+        Err(WorkflowError::MissingState(_)) => Existing::Missing,
+        Err(error) => Existing::Unloadable(error),
+    };
+    if !decide(existing)? {
+        return Ok(Cleared {
+            removed: false,
+            result: Ok(()),
+            after: None,
+        });
+    }
+    let (removed, result) = clear_state_with_partial_result(project_root, phase);
+    let after = result.is_ok().then(after_clear);
+    Ok(Cleared {
+        removed,
+        result,
+        after,
+    })
 }
 
 /// Clear state for recovery while retaining removals that happened before an
@@ -1607,6 +1649,115 @@ mod tests {
             std::thread::sleep(WRITE_LOCK_POLL);
         }
         assert_eq!(std::fs::read(&path).unwrap(), before, "it writes no state");
+    }
+
+    /// R-07's primitive: the decision sees what is on disk with the lock held, and the
+    /// removal and `after_clear` share that hold.
+    #[test]
+    fn clear_state_if_decides_on_a_fresh_read_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2105);
+        save_state(&state_in(root, phase, Stage::Code)).unwrap();
+        let path = state_path(root, phase);
+        let before = std::fs::read(&path).unwrap();
+        let held_by_us = WriteLockStatus::Held {
+            pid: Some(std::process::id()),
+        };
+
+        // `Ok(false)`: nothing removed, `after_clear` not run.
+        let after_ran = std::cell::Cell::new(false);
+        let kept = clear_state_if::<WorkflowError, ()>(
+            root,
+            phase,
+            None,
+            |existing| {
+                let Existing::Loaded(seen) = existing else {
+                    panic!("the saved state must read as loaded: {existing:?}");
+                };
+                let on_disk: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(serde_json::to_value(&seen).unwrap(), on_disk);
+                assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
+                Ok(false)
+            },
+            || after_ran.set(true),
+        )
+        .unwrap();
+        assert!(!kept.removed);
+        assert!(kept.result.is_ok());
+        assert!(kept.after.is_none());
+        assert!(!after_ran.get());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // `Err`: nothing removed, neither later step run.
+        let failed = clear_state_if::<WorkflowError, ()>(
+            root,
+            phase,
+            None,
+            |_| Err(WorkflowError::MissingState(PathBuf::from("the decision's"))),
+            || after_ran.set(true),
+        );
+        assert!(
+            matches!(&failed, Err(WorkflowError::MissingState(path))
+                if path.as_path() == Path::new("the decision's")),
+            "{failed:?}"
+        );
+        assert!(!after_ran.get());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A held lock with a bound: neither step runs and nothing changes.
+        let (entered, writer_is_inside) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let decided = std::cell::Cell::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                update_field(root, phase, |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+            });
+            writer_is_inside.recv().unwrap();
+            let timed_out = clear_state_if::<WorkflowError, ()>(
+                root,
+                phase,
+                Some(Duration::from_millis(200)),
+                |_| {
+                    decided.set(true);
+                    Ok(true)
+                },
+                || after_ran.set(true),
+            );
+            release.send(()).unwrap();
+            assert!(
+                matches!(
+                    &timed_out,
+                    Err(WorkflowError::WriteLockTimeout { holder: Some(pid), .. })
+                        if *pid == std::process::id()
+                ),
+                "{timed_out:?}"
+            );
+        });
+        assert!(!decided.get(), "a timed-out clear must not decide");
+        assert!(!after_ran.get());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // `Ok(true)`: removed, then `after_clear` with the lock still held.
+        let cleared = clear_state_if::<WorkflowError, &str>(
+            root,
+            phase,
+            None,
+            |_| Ok(true),
+            || {
+                assert!(!path.exists(), "the state goes before `after_clear` runs");
+                assert_eq!(write_lock_status(root, phase).unwrap(), held_by_us);
+                "after"
+            },
+        )
+        .unwrap();
+        assert!(cleared.removed);
+        assert!(cleared.result.is_ok());
+        assert_eq!(cleared.after, Some("after"));
     }
 
     #[test]
