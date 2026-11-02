@@ -1562,8 +1562,16 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
         },
     };
 
-    let run = monitor::run_supervised_stage(spec)
-        .map_err(|err| CliError::Message(format!("stage supervisor failed: {err}")))?;
+    let run = monitor::run_supervised_stage(spec).map_err(|err| {
+        // Its stderr is `/dev/null`, so the event is the only record of this failure.
+        events::emit(
+            project_root,
+            phase,
+            "supervisor_failed",
+            serde_json::json!({ "launch_id": invocation.launch_id, "error": err.to_string() }),
+        );
+        CliError::Message(format!("stage supervisor failed: {err}"))
+    })?;
     // D-03: another launch owns the run, and so the flag: its supervisor set it for its own
     // agent. With no other owner (no record, or a promotion that never came) nothing else
     // would clear it before the next launch's repair, so this supervisor still does.
@@ -13397,6 +13405,42 @@ mod tests {
         assert_eq!(events[0]["ours"], ours.as_str(), "{}", events[0]);
         assert_eq!(events[0]["agent_group"], "ended", "{}", events[0]);
         assert!(!state_file.exists(), "no state write");
+    }
+
+    /// An agent that exits right after `.devflow` went has no verdict against it, and its
+    /// exit file has nowhere to go. That failure is the supervisor's last word, and its
+    /// stderr is `/dev/null`, so it goes to the log `emit` recreates.
+    #[test]
+    fn a_removed_devflow_dir_with_the_agent_exiting_leaves_a_record_of_the_failure() {
+        const NAME: &str = "pipeline_launch::tests::a_removed_devflow_dir_with_the_agent_exiting_leaves_a_record_of_the_failure";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1940));
+        let (ours, _, _) = promoted_next(&run);
+        let state_file = workflow::state_path(&run.root, run.phase);
+
+        std::fs::remove_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(run.root.join("go2"), "").unwrap();
+
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || !events_named(
+                &run.root,
+                "supervisor_failed"
+            )
+            .is_empty()),
+            "the failure is on record: {}",
+            run.events()
+        );
+        let events = events_named(&run.root, "supervisor_failed");
+        assert_eq!(events[0]["launch_id"], ours.as_str(), "{}", events[0]);
+        assert!(
+            events[0]["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{}",
+            events[0]
+        );
     }
 
     /// A state that does not parse after the promotion says nothing about who owns the run,

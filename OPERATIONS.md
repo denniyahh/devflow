@@ -163,6 +163,13 @@ deleting it for more than 3 s, ends a running agent. A state that does not load,
 launch only as pending, ends nothing: the supervisor logs a warning at most once
 a minute, and its agent keeps running.
 
+**`git clean -fdx` under `--no-worktree`.** It removes `.devflow`, with the state,
+capture and history in it. If the file stays gone for 3 s the supervisor ends the
+agent's group and logs `supervisor_superseded` with `recorded: null`. If the agent
+exits first, the exit file has nowhere to go and it logs `supervisor_failed`. Both land
+in a `.devflow/events.jsonl` recreated at that moment, which is then all that remains
+of the run's log. A clean after that event removes it too, with nothing left to say why.
+
 **Where the sockets live.** Under `registry::cache_dir()/sock`: the cache
 directory is `DEVFLOW_CACHE_DIR` when set, then `$XDG_CACHE_HOME/devflow`,
 then `~/.cache/devflow`. A launch with none of `DEVFLOW_CACHE_DIR`,
