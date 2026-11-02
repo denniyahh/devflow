@@ -238,6 +238,40 @@ pub struct OpenedGate {
     pub path: PathBuf,
 }
 
+/// How often a gate wait repeats its warning about a slot it cannot read.
+const SLOT_READ_WARNING_EVERY: Duration = Duration::from_secs(600);
+
+/// Lets a repeating warning through once per [`SLOT_READ_WARNING_EVERY`].
+#[derive(Default)]
+struct RepeatLimit(std::cell::Cell<Option<std::time::Instant>>);
+
+impl RepeatLimit {
+    /// Whether a warning at `now` is due, and if so, restart the period.
+    fn allow(&self, now: std::time::Instant) -> bool {
+        let due = self
+            .0
+            .get()
+            .is_none_or(|last| now.duration_since(last) >= SLOT_READ_WARNING_EVERY);
+        if due {
+            self.0.set(Some(now));
+        }
+        due
+    }
+}
+
+/// One read of the answer slot at `path`. `Err` is a read that failed, which says nothing
+/// about what the slot holds.
+fn read_answer_slot(path: &Path, gate: &GateId) -> std::io::Result<AnswerRead> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(match classify_answer(&bytes, gate.as_str()) {
+            Ok(answer) => AnswerRead::Bound(answer),
+            Err(reason) => AnswerRead::Unbound(reason.to_string()),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AnswerRead::None),
+        Err(error) => Err(error),
+    }
+}
+
 /// What [`Gates::read_answer`] found in one gate's answer slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnswerRead {
@@ -592,13 +626,25 @@ impl Gates {
         timeout_secs: u64,
         cancel: impl Fn() -> bool,
     ) -> AwaitOutcome {
+        let unreadable = RepeatLimit::default();
         let end = backoff_wait(Duration::from_secs(timeout_secs), cancel, || {
             #[cfg(test)]
             SLOT_READS.with(|reads| reads.set(reads.get() + 1));
-            match Self::read_answer(project_root, phase, stage, gate) {
-                AnswerRead::None => None,
-                AnswerRead::Bound(answer) => Some(AwaitOutcome::Answered(answer)),
-                AnswerRead::Unbound(reason) => Some(AwaitOutcome::Unbound { reason }),
+            let path = Self::answer_path(project_root, phase, stage, gate);
+            match read_answer_slot(&path, gate) {
+                Ok(AnswerRead::None) => None,
+                Ok(AnswerRead::Bound(answer)) => Some(AwaitOutcome::Answered(answer)),
+                Ok(AnswerRead::Unbound(reason)) => Some(AwaitOutcome::Unbound { reason }),
+                // Says nothing about the answer, and the wait can outlast the episode.
+                Err(error) => {
+                    if unreadable.allow(std::time::Instant::now()) {
+                        warn!(
+                            "could not read gate answer {}: {error}; still waiting",
+                            path.display()
+                        );
+                    }
+                    None
+                }
             }
         });
         match end {
@@ -1123,17 +1169,10 @@ impl Gates {
         gate: &GateId,
     ) -> AnswerRead {
         let path = Self::answer_path(project_root, phase, stage, gate);
-        match std::fs::read(&path) {
-            Ok(bytes) => match classify_answer(&bytes, gate.as_str()) {
-                Ok(answer) => AnswerRead::Bound(answer),
-                Err(reason) => AnswerRead::Unbound(reason.to_string()),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => AnswerRead::None,
-            Err(error) => {
-                warn!("could not read gate answer {}: {error}", path.display());
-                AnswerRead::Unbound(REASON_UNPARSABLE.to_string())
-            }
-        }
+        read_answer_slot(&path, gate).unwrap_or_else(|error| {
+            warn!("could not read gate answer {}: {error}", path.display());
+            AnswerRead::Unbound(REASON_UNPARSABLE.to_string())
+        })
     }
 
     /// Claim a gate's answer for consumption: the first caller gets
@@ -1933,6 +1972,62 @@ mod tests {
                 gate_id: gate.to_string(),
                 response,
             })
+        );
+    }
+
+    /// A slot that cannot be read says nothing about the answer, so the wait goes on and
+    /// picks up the answer once the slot reads again. The slot is a directory, which reads
+    /// with an error other than `NotFound`, the shape of `EIO` or `EMFILE` here.
+    #[test]
+    fn await_answer_keeps_waiting_through_a_slot_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(12), Stage::Validate);
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        };
+        let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
+        let slot = Gates::answer_path(root, phase, stage, &gate);
+        std::fs::create_dir(&slot).unwrap();
+
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::remove_dir(&slot).unwrap();
+                Gates::answer(root, phase, stage, &gate, &response).unwrap();
+            });
+            Gates::await_answer(root, phase, stage, &gate, 30, || false)
+        });
+
+        assert_eq!(
+            got,
+            AwaitOutcome::Answered(GateAnswer {
+                gate_id: gate.to_string(),
+                response,
+            })
+        );
+    }
+
+    /// The wait's warning about an unreadable slot fires at once and then at most once per
+    /// period, since the wait can last days.
+    #[test]
+    fn an_unreadable_slot_warning_is_rate_limited() {
+        let start = std::time::Instant::now();
+        let warnings = RepeatLimit::default();
+        assert!(warnings.allow(start), "the first read error warns");
+        assert!(
+            !warnings.allow(start + SLOT_READ_WARNING_EVERY - Duration::from_secs(1)),
+            "within the period"
+        );
+        assert!(
+            warnings.allow(start + SLOT_READ_WARNING_EVERY),
+            "the period has passed"
+        );
+        assert!(
+            !warnings.allow(start + SLOT_READ_WARNING_EVERY),
+            "and the period restarted"
         );
     }
 
