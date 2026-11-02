@@ -39,8 +39,8 @@ use std::time::Duration;
 
 /// The exit code a stopped run reports: the shell convention for a death by
 /// SIGTERM, `128 + 15`. The monitor writes it to the exit file on
-/// [`AgentOutcome::Stopped`].
-pub(crate) const STOPPED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
+/// [`AgentOutcome::Stopped`], and the CLI after a stop honoured at an advance safe point.
+pub const STOPPED_EXIT_CODE: i32 = 128 + libc::SIGTERM;
 
 /// Who owns the run right now. Its [`as_str`](Self::as_str) label is the
 /// `owner` field of a ping reply.
@@ -256,7 +256,7 @@ impl StopToken {
 
     /// Whether the run ended as a stop, so a parked shutdown caller may be
     /// told `stopped`.
-    fn ended_stopped(&self) -> bool {
+    pub fn ended_stopped(&self) -> bool {
         self.lock().ended_stopped
     }
 

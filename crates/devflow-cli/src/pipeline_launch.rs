@@ -45,7 +45,7 @@ use devflow_core::stage::Stage;
 use devflow_core::state::SupervisorRecord;
 use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, State};
 use devflow_core::supervisor::runtime::{
-    AgentGroupEnd, AgentOutcome, OwnerPhase, SafePoint, StopToken,
+    AgentGroupEnd, AgentOutcome, OwnerPhase, STOPPED_EXIT_CODE, SafePoint, StopToken,
 };
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
@@ -1620,7 +1620,10 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
                             end_superseded(invocation, &run, recorded, SUPERSEDED_REASON);
                             Ok(())
                         }
-                        other => other,
+                        other => {
+                            record_safe_point_stop_exit(&run.supervisor.token(), invocation);
+                            other
+                        }
                     }
                 }
                 Some(monitor::Promotion::Recorded) => Ok(()),
@@ -1629,6 +1632,7 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
                 None if run.supervisor.token().stop_requested() => {
                     let _ = run.supervisor.token().safe_point();
                     record_supervisor_stop(project_root, phase, &invocation.launch_id);
+                    record_safe_point_stop_exit(&run.supervisor.token(), invocation);
                     Ok(())
                 }
                 other => Err(CliError::Message(format!(
@@ -1650,6 +1654,27 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
         remove_liveness_file(&hold);
     }
     result
+}
+
+/// D-16: a stop honoured after the agent completed leaves the exit file with the agent's own
+/// code, or none once the next stage's launch archived it, beside a reply saying 143. Record
+/// the stop outcome before `finish` sends that reply. A run handed off wrote nothing here,
+/// since its successor owns the file, and a superseded supervisor never gets here. Its stderr
+/// is `/dev/null`, so a failed write is an event, and it does not change the outcome.
+fn record_safe_point_stop_exit(token: &StopToken, invocation: &MonitorInvocation) {
+    if !token.ended_stopped() || token.phase() == OwnerPhase::HandedOff {
+        return;
+    }
+    let path = agent_result::exit_code_path(&invocation.project_root, invocation.phase);
+    if let Err(err) = std::fs::write(&path, format!("{STOPPED_EXIT_CODE}\n")) {
+        warn!("could not record the stop in {}: {err}", path.display());
+        events::emit(
+            &invocation.project_root,
+            invocation.phase,
+            "stop_exit_file_failed",
+            serde_json::json!({ "path": path.display().to_string(), "error": err.to_string() }),
+        );
+    }
 }
 
 /// The `supervisor_superseded` reason for a supervisor the state does not record.
@@ -10763,6 +10788,97 @@ mod tests {
         );
         assert_eq!(exit_file_of(&run), "0", "{}", run.events());
         assert!(events_named(&run.root, "advance_stopped").is_empty());
+    }
+
+    /// A stop that lands after a Validate gate was answered and its decision committed, while
+    /// the run still advances. The answer's one transition happens, the next safe point stops
+    /// the run before anything launches, and `stop`'s line and the exit file both say so.
+    #[test]
+    fn a_stop_after_a_gate_answer_stops_after_its_transition_and_reports_it() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_after_a_gate_answer_stops_after_its_transition_and_reports_it";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_commit"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(1320), |_, state| {
+            state.stage = Stage::Validate;
+            state.stop_until = None;
+        });
+        run.go();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                events_named(&run.root, "gate_fired").len() == 1
+            }),
+            "N parks at the Validate gate: {}",
+            run.events()
+        );
+        answer_open_gate(
+            &run.root,
+            run.phase,
+            Stage::Validate,
+            &gate_response(true, None),
+        )
+        .unwrap();
+        run.wait_held();
+        let (accepted, last) = shutdown_accepted_then(
+            &run.n.socket_path,
+            || run.release(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(accepted["owner"], "advancing", "{accepted}");
+        assert_eq!(last["stopped"], true, "{last}");
+        let transitions = events_named(&run.root, "transition");
+        assert_eq!(transitions.len(), 1, "{}", run.events());
+        assert_eq!(transitions[0]["to"], "ship", "{}", transitions[0]);
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            1,
+            "nothing launches after the stop: {}",
+            run.events()
+        );
+        let line = stop_line_for(&run, &last);
+        assert!(line.contains("honoured at an advance safe point"), "{line}");
+        assert_eq!(exit_file_of(&run), "143", "{}", run.events());
+        let state = run.state();
+        assert!(state.stopped, "{state:?}");
+        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+    }
+
+    /// A socket stop taken during a gate wait ends the wait at safe point 4, so an answer
+    /// written after it finds no gate and moves nothing. `stop`'s line and the exit file
+    /// name the stop.
+    #[test]
+    fn a_stop_during_a_gate_wait_beats_a_later_answer_and_reports_the_safe_point() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_during_a_gate_wait_beats_a_later_answer_and_reports_the_safe_point";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, None, FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = launch_parked_at_gate(PhaseId::new(1323));
+        let (accepted, last) =
+            shutdown_accepted_then(&run.n.socket_path, || {}, Duration::from_secs(30));
+        assert_eq!(accepted["owner"], "gate_wait", "{accepted}");
+        assert_eq!(last["stopped"], true, "{last}");
+        let stopped = events_named(&run.root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{}", run.events());
+        assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
+        let line = stop_line_for(&run, &last);
+        assert!(line.contains("honoured at an advance safe point"), "{line}");
+        assert_eq!(exit_file_of(&run), "143", "{}", run.events());
+        assert!(
+            answer_open_gate(
+                &run.root,
+                run.phase,
+                Stage::Define,
+                &gate_response(true, None)
+            )
+            .is_err(),
+            "the stop closed the gate, so a later answer has nothing to answer"
+        );
+        assert!(events_named(&run.root, "transition").is_empty());
+        assert_eq!(stage_launched_count(&run.root, run.phase), 1);
     }
 
     // ---- CR-01 (50-REVIEW.md): a stop before a `--yes-ship` merge ----
