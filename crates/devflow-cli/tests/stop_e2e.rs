@@ -1932,6 +1932,10 @@ fn stop_ends_a_live_run_with_no_foreground_holder_through_the_socket() {
         "stop says it stopped the phase through its supervisor: {text}"
     );
     assert!(
+        text.contains("agent group ended"),
+        "a stop taken while the agent runs says its group ended: {text}"
+    );
+    assert!(
         holds_within(Duration::from_secs(5), || group_members(pgid).is_empty()),
         "the agent group {pgid} is gone"
     );
