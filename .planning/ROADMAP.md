@@ -1047,7 +1047,7 @@ already is), so committed evidence shows which turn carried which rule.
 
 **Found:** 2026-11-02, external review of Phase 50.1; the in-process half fixed in `8c1dd3d`.
 
-**Defect:** a finalization retry now skips hooks that already succeeded, but only in memory. A retry after the process restarted reruns the whole batch, so a `VersionBump` that had succeeded tags a second version. From reading the code; not run. `devflow ship` is being replaced by wsx, so this may be retired with it.
+**Defect:** a finalization retry now skips hooks that already succeeded, but only in memory. A retry after the process restarted reruns the whole batch, so a `VersionBump` that had succeeded tags a second version. From reading the code; not run. `devflow ship` is being replaced by wsx, so this may be retired with it. A retry after a failed `ChangelogAppend` commit also writes the changelog entry twice, even in one process, because the hook prepends to a working tree that still holds the first entry (code review WR-11, 2026-11-02: deferred here, not fixed).
 
 ### Phase 999.174: `devflow stop` at an Open Gate Deletes State, While a Signal Keeps It Resumable (BACKLOG)
 
