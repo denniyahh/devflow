@@ -503,14 +503,15 @@ enum GateCmd {
         root: Option<PathBuf>,
         /// Also discover and clear devflow 2.x processes shaped like a
         /// monitor wrapper or an `advance` child (999.44), by scanning the OS
-        /// process table directly rather than trusting a lock file the
+        /// process table directly rather than trusting a record the
         /// process itself wrote. Both shapes are 2.x only: a 3.x binary
         /// starts neither, so this never matches a 3.x supervisor, which
         /// `devflow doctor` reports through its socket and
         /// `devflow stop --phase N --launch <id>` ends. Matches only two
         /// structural argv shapes, owned by the calling user, older than the
         /// minimum age, and NOT named by any registered root's state file or
-        /// lock file (CR-01, 25-15) — a pid a live registry entry still
+        /// held by one of its live liveness, gate-registration or foreground-holder files
+        /// (CR-01, 25-15) — a pid a live registry entry still
         /// reaches is never touched. Discovery itself stays
         /// registry-independent, so this still catches a 2.x process whose
         /// project root no longer exists on disk (`devflow stop`/the default

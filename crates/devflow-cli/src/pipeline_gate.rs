@@ -35,7 +35,7 @@ use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, lock, registry, ship, workflow};
+use devflow_core::{events, registry, ship, workflow};
 use std::path::Path;
 use tracing::info;
 
@@ -732,12 +732,12 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
 /// 2. Refuse while a recorded or pending supervisor of the phase is live (R-17): its own
 ///    wait can still consume the answer, and a loop-back here would launch beside it.
 ///    After the claim, no `start` or `resume` can reserve, so none appears while this runs.
-/// 3. Acquire the per-phase lock ([`lock::acquire`]) BEFORE touching state.
-/// 4. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
+/// 3. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
 ///    the stage to resolve first.
-/// 5. The live Ship gate must hold an answer bound to its id. A file that does not bind
+/// 4. The live Ship gate must hold an answer bound to its id. A file that does not bind
 ///    is refused and left where it is: this command reads and moves nothing (R-09).
-/// 6. The answer must be claimed before anything acts on it. A claim already there means
+/// 5. The answer must be claimed before anything acts on it, and the claim excludes a live
+///    waiter's own consumption of it (D-08). A claim already there means
 ///    another consumer took it and may have died mid-`finish_workflow`, and any claim
 ///    error (the gate closed or was replaced since this command read it, R-08, or its
 ///    lock was held too long) means nothing was consumed. All of them refuse here, so
@@ -746,7 +746,7 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
 /// `force` is accepted and echoed in the CLI output for explicit operator
 /// auditability (Hermes LOW: make `--force` semantics explicit), but is
 /// deliberately NOT consulted by any guard above — D-02 scopes `--force` to
-/// "skip Ship-gate re-verification," never to bypassing the stage, lock,
+/// "skip Ship-gate re-verification," never to bypassing the stage, holder,
 /// gate-existence, or claim checks themselves. This design has no separate
 /// Ship-gate re-verification step beyond those guards, so `--force`
 /// currently changes no observable behavior; it exists so the flag is never
@@ -759,16 +759,6 @@ pub(crate) fn ship_override(
 ) -> Result<(), CliError> {
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     crate::commands::refuse_ship_over_a_live_supervisor(project_root, phase)?;
-    let _lock = match lock::acquire(project_root, phase) {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, .. }) => {
-            return Err(CliError::Message(format!(
-                "phase {phase}: another devflow process (pid {pid}) holds the per-phase lock — \
-                 refusing to race its poll of the Ship gate response"
-            )));
-        }
-        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
-    };
 
     let mut state = workflow::load_state(project_root, phase)?;
 
@@ -2002,30 +1992,6 @@ mod tests {
                 "force={force}: {err}"
             );
             let _ = Gates::close(root, phase, Stage::Ship);
-        }
-    }
-
-    /// 20e Task 2 (review: Codex HIGH — lock race): a contended per-phase
-    /// lock refuses fail-closed, naming the holder pid, with `--force` both
-    /// true and false — `ship_override` must never race a live holder's
-    /// gate wait.
-    #[test]
-    fn ship_override_refuses_when_lock_contended() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(93);
-
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Ship;
-        workflow::save_state(&state).unwrap();
-
-        let _held = lock::acquire(root, phase).expect("hold the per-phase lock");
-        let this_pid = std::process::id().to_string();
-
-        for force in [true, false] {
-            let err = ship_override(root, phase, force).unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains(&this_pid), "force={force}: {msg}");
         }
     }
 
