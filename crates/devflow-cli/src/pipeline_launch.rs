@@ -1515,61 +1515,81 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
         .map_err(|err| CliError::Message(format!("stage supervisor failed: {err}")))?;
     drop(auto_chain_guard);
 
-    let result = match run.outcome {
-        AgentOutcome::Completed(_) => match &run.promotion {
-            Some(monitor::Promotion::Recorded) if advance => {
-                let stop_guard =
-                    StopTokenGuard::engage(run.supervisor.token(), invocation.launch_id.clone());
-                let advanced = advance_for_stage(project_root, Some(phase), stage);
-                // The advance has returned. Only a run whose advance published a
-                // successor is handed off.
-                if let Some(successor) = take_successor() {
-                    let token = run.supervisor.token();
-                    #[cfg(test)]
-                    test_hold("before_handoff_mark");
-                    token.enter(OwnerPhase::HandedOff);
-                    // RV-04 / R5-I1 (50-23): a stop that reached this supervisor
-                    // after safe point 3 was flagged (it stayed `Advancing`) and
-                    // must not be dropped. The one owner mutex orders every stop
-                    // request before the marking above (flagged, so seen here) or
-                    // after it (answered `handed_off`, acting on nothing), so one
-                    // check right after the marking drops no flagged stop.
-                    if token.stop_requested() {
-                        forward_stop_to_successor(&token, project_root, phase, &successor);
+    // D-03, D-15: a supervisor the state does not record never advances, writes no state
+    // and records no stop, however its agent ended. An orphan never promotes itself.
+    let not_owner = match &run.promotion {
+        Some(monitor::Promotion::Superseded { recorded }) => {
+            Some((recorded.clone(), SUPERSEDED_REASON))
+        }
+        Some(monitor::Promotion::OrphanedPending) => Some((
+            workflow::load_state(project_root, phase)
+                .ok()
+                .and_then(|state| state.supervisor)
+                .map(|record| record.launch_id),
+            ORPHANED_PENDING_REASON,
+        )),
+        _ => None,
+    };
+    let result = if let Some((recorded, reason)) = not_owner {
+        end_superseded(invocation, &run, recorded, reason);
+        Ok(())
+    } else {
+        match run.outcome {
+            AgentOutcome::Completed(_) => match &run.promotion {
+                Some(monitor::Promotion::Recorded) if advance => {
+                    let stop_guard = StopTokenGuard::engage(
+                        run.supervisor.token(),
+                        invocation.launch_id.clone(),
+                    );
+                    let advanced = advance_for_stage(project_root, Some(phase), stage);
+                    // The advance has returned. Only a run whose advance published a
+                    // successor is handed off.
+                    if let Some(successor) = take_successor() {
+                        let token = run.supervisor.token();
+                        #[cfg(test)]
+                        test_hold("before_handoff_mark");
+                        token.enter(OwnerPhase::HandedOff);
+                        // RV-04 / R5-I1 (50-23): a stop that reached this supervisor
+                        // after safe point 3 was flagged (it stayed `Advancing`) and
+                        // must not be dropped. The one owner mutex orders every stop
+                        // request before the marking above (flagged, so seen here) or
+                        // after it (answered `handed_off`, acting on nothing), so one
+                        // check right after the marking drops no flagged stop.
+                        if token.stop_requested() {
+                            forward_stop_to_successor(&token, project_root, phase, &successor);
+                        }
+                    }
+                    drop(stop_guard);
+                    match advanced {
+                        // D-03: the fence refused a write or a gate side effect.
+                        Err(CliError::Workflow(workflow::WorkflowError::NotOwner {
+                            recorded,
+                            ..
+                        })) => {
+                            end_superseded(invocation, &run, recorded, SUPERSEDED_REASON);
+                            Ok(())
+                        }
+                        other => other,
                     }
                 }
-                drop(stop_guard);
-                match advanced {
-                    // D-03: the fence refused a write or a gate side effect.
-                    Err(CliError::Workflow(workflow::WorkflowError::NotOwner {
-                        recorded, ..
-                    })) => {
-                        end_superseded(invocation, &run, recorded, SUPERSEDED_REASON);
-                        Ok(())
-                    }
-                    other => other,
+                Some(monitor::Promotion::Recorded) => Ok(()),
+                // A stop reached this supervisor while it waited for its promotion, with
+                // its agent already gone: the run ends as a stop, and `finish` says so.
+                None if run.supervisor.token().stop_requested() => {
+                    let _ = run.supervisor.token().safe_point();
+                    record_supervisor_stop(project_root, phase, &invocation.launch_id);
+                    Ok(())
                 }
-            }
-            Some(monitor::Promotion::Recorded) => Ok(()),
-            Some(monitor::Promotion::Superseded { recorded }) => {
-                end_superseded(invocation, &run, recorded.clone(), SUPERSEDED_REASON);
-                Ok(())
-            }
-            other => Err(CliError::Message(format!(
-                "phase {phase}: launch {} did not advance: its promotion verdict is {other:?}",
-                invocation.launch_id
-            ))),
-        },
-        _ => match &run.promotion {
-            Some(monitor::Promotion::Superseded { recorded }) => {
-                end_superseded(invocation, &run, recorded.clone(), SUPERSEDED_REASON);
-                Ok(())
-            }
+                other => Err(CliError::Message(format!(
+                    "phase {phase}: launch {} did not advance: its promotion verdict is {other:?}",
+                    invocation.launch_id
+                ))),
+            },
             _ => {
                 record_supervisor_stop(project_root, phase, &invocation.launch_id);
                 Ok(())
             }
-        },
+        }
     };
     // Never a `stopped` line for a completed run: `finish` decides the final
     // line from the recorded outcome, so a shutdown that arrived while
@@ -1584,6 +1604,10 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
 /// The `supervisor_superseded` reason for a supervisor the state does not record.
 const SUPERSEDED_REASON: &str = "superseded";
 
+/// The `supervisor_superseded` reason for a supervisor whose promotion never came
+/// (D-15): its promoter died.
+const ORPHANED_PENDING_REASON: &str = "orphaned_pending";
+
 /// What a supervisor does on finding it does not own the run (D-03): end its agent's
 /// group if the agent still runs, and record that as a `supervisor_superseded` event,
 /// because a production supervisor's stderr is `/dev/null`. It writes no state and
@@ -1595,7 +1619,10 @@ fn end_superseded(
     recorded: Option<String>,
     reason: &str,
 ) {
-    let agent_group = match run.supervisor.end_agent_group() {
+    let group_end = run
+        .agent_group_end
+        .unwrap_or_else(|| run.supervisor.end_agent_group());
+    let agent_group = match group_end {
         AgentGroupEnd::Ended => "ended",
         _ => "already_exited",
     };
@@ -8484,13 +8511,14 @@ mod tests {
     /// and then prints `first_marker` and exits 0. Every later run (stage
     /// N+1) waits for `go2` and then prints a success marker. Both waits are
     /// bounded (about 60 s), so no fake agent outlives a failed test by long,
-    /// and the fixture's `stop_until` ends the chain after N+1.
+    /// and the fixture's `stop_until` ends the chain after N+1. A `descendant` file
+    /// there makes N+1's run first start a `sleep 300` in its own process group.
     fn handoff_claude_dir(first_marker: &str) -> tempfile::TempDir {
         let path_dir = agent_free_dir_with_agent_stub("claude");
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
              if [ ! -e first-done ]; then\n  : > first-done\n  gate=go\n  marker='{first_marker}'\n\
-             else\n  gate=go2\n  marker='{SUCCESS_MARKER}'\nfi\n\
+             else\n  if [ -e descendant ]; then sleep 300 & fi\n  gate=go2\n  marker='{SUCCESS_MARKER}'\nfi\n\
              i=0\nwhile [ ! -e \"$gate\" ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n\
              printf '%s\\n' \"$marker\"\nexit 0\n"
         );
@@ -10994,6 +11022,11 @@ mod tests {
             poll_until(HANDOFF_STEP_WAIT, || probes_gone(&pending.socket_path)),
             "N+1 finishes after its advance"
         );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "no refusal: {}",
+            run.events()
+        );
     }
 
     /// The id of the gate open at `stage`.
@@ -11021,9 +11054,19 @@ mod tests {
 
     /// The one `supervisor_superseded` event, its `ours`, `recorded` and `reason` checked.
     fn superseded_event(run: &HandoffRun, recorded: &str, reason: &str) -> serde_json::Value {
+        superseded_event_of(run, &run.n.launch_id, recorded, reason)
+    }
+
+    /// [`superseded_event`] for a supervisor other than N.
+    fn superseded_event_of(
+        run: &HandoffRun,
+        ours: &str,
+        recorded: &str,
+        reason: &str,
+    ) -> serde_json::Value {
         let events = events_named(&run.root, "supervisor_superseded");
         assert_eq!(events.len(), 1, "one event: {}", run.events());
-        assert_eq!(events[0]["ours"], run.n.launch_id.as_str(), "{}", events[0]);
+        assert_eq!(events[0]["ours"], ours, "{}", events[0]);
         assert_eq!(events[0]["recorded"], recorded, "{}", events[0]);
         assert_eq!(events[0]["reason"], reason, "{}", events[0]);
         events[0].clone()
@@ -11321,6 +11364,279 @@ mod tests {
             "control: the comparison sees a closed stage"
         );
         registration.finish();
+    }
+
+    /// Whether a live member of group `pgid` is the fixture's `sleep 300` descendant.
+    fn descendant_runs_in_group(pgid: u32) -> bool {
+        devflow_core::test_support::live_group_members(pgid)
+            .into_iter()
+            .any(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).any(|arg| arg == b"300"))
+            })
+    }
+
+    /// A reservation's lock once its supervisor has ended: never live.
+    fn assert_not_live(pending: &devflow_core::state::PendingSupervisor) {
+        use devflow_core::liveness;
+        let read = liveness::probe(&pending.liveness_path).unwrap();
+        assert!(
+            matches!(read, liveness::Held::Abandoned | liveness::Held::Missing),
+            "the reservation reads {read:?}"
+        );
+    }
+
+    /// V-27 (D-15, R-12): N is SIGKILLed before its publish save, so N+1 is an orphan
+    /// whose agent never exits on its own. The promotion deadline runs from serving,
+    /// beside the agent, so within the bound the agent's whole group is gone, far inside
+    /// the agent's own 60 s. It writes no state and does not promote itself, says so in
+    /// one event, exits, and leaves the run for `resume`.
+    #[test]
+    fn an_orphaned_pending_supervisor_ends_itself_when_its_promotion_wait_expires() {
+        const NAME: &str = "pipeline_launch::tests::an_orphaned_pending_supervisor_ends_itself_when_its_promotion_wait_expires";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1908));
+        std::fs::write(run.root.join("descendant"), "").unwrap();
+        run.go();
+        run.wait_held();
+        let served = std::time::Instant::now();
+        kill_stage_n(&run);
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 as pending");
+        let sidecar =
+            devflow_core::supervisor::read_sidecar(&pending.socket_path.with_extension("json"))
+                .expect("N+1's sidecar");
+        let pgid = sidecar.agent_pgid;
+        assert!(
+            poll_until(Duration::from_secs(3), || descendant_runs_in_group(pgid)),
+            "precondition: the agent's descendant runs in its group"
+        );
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+
+        let bound =
+            PROMOTION_WAIT + devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(2);
+        let gone = poll_until(bound.saturating_sub(served.elapsed()), || {
+            devflow_core::test_support::live_group_members(pgid).is_empty()
+        });
+        assert!(
+            gone,
+            "the group has no live member within {bound:?} of serving: {:?}; events:\n{}",
+            devflow_core::test_support::live_group_members(pgid),
+            run.events()
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&pending.socket_path)),
+            "N+1 exits"
+        );
+        assert!(
+            poll_until(Duration::from_secs(5), || {
+                !liveness_files(&run.root)
+                    .iter()
+                    .any(|name| name.contains(&pending.launch_id))
+                    || !matches!(
+                        devflow_core::liveness::probe(&pending.liveness_path),
+                        Ok(devflow_core::liveness::Held::Live)
+                    )
+            }),
+            "N+1's lock is released"
+        );
+        assert_not_live(&pending);
+        let event = superseded_event_of(
+            &run,
+            &pending.launch_id,
+            &run.n.launch_id,
+            "orphaned_pending",
+        );
+        assert_eq!(event["agent_group"], "ended", "{event}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        let after = run.state();
+        assert_eq!(
+            after.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "no self-promotion: the state still names N"
+        );
+        assert_eq!(
+            after
+                .pending_supervisor
+                .as_ref()
+                .map(|p| p.launch_id.as_str()),
+            Some(pending.launch_id.as_str()),
+            "N+1 stays only pending"
+        );
+
+        let resumed = resume(&run.root, run.phase, None, true);
+        let state = run.state();
+        let _reap = ReapMonitorOnDrop::after_launch(&state);
+        resumed.expect("resume clears the abandoned reservation and proceeds");
+        assert_ne!(
+            state.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "resume launched a new supervisor"
+        );
+    }
+
+    /// V-27's other half, and the case 50.1-17 left at "refused at its next handoff": an
+    /// orphan whose agent already exited never reaches its advance, so it never reaches
+    /// a handoff to be refused at. It ends at the deadline, with nothing to signal.
+    #[test]
+    fn an_orphan_whose_agent_already_exited_ends_short_of_its_handoff() {
+        const NAME: &str = "pipeline_launch::tests::an_orphan_whose_agent_already_exited_ends_short_of_its_handoff";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1909));
+        std::fs::write(run.root.join("go2"), "").unwrap();
+        run.go();
+        run.wait_held();
+        kill_stage_n(&run);
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 as pending");
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&pending.socket_path)),
+            "N+1 exits: {}",
+            run.events()
+        );
+        let event = superseded_event_of(
+            &run,
+            &pending.launch_id,
+            &run.n.launch_id,
+            "orphaned_pending",
+        );
+        assert_eq!(event["agent_group"], "already_exited", "{event}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        assert!(
+            events_named(&run.root, "launch_refused_over_live_pending").is_empty(),
+            "it never reached a handoff: {}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "workflow_finished").is_empty(),
+            "it did not advance: {}",
+            run.events()
+        );
+        assert_eq!(stage_launched_count(&run.root, run.phase), 1, "no launch");
+    }
+
+    /// A stop ends the promotion wait of a supervisor whose agent has finished: it answers
+    /// `stopped` at once instead of sitting out the deadline, and its launcher, released
+    /// after, finds it gone and records the stop.
+    #[test]
+    fn a_stop_ends_the_promotion_wait_of_a_supervisor_whose_agent_finished() {
+        const NAME: &str = "pipeline_launch::tests::a_stop_ends_the_promotion_wait_of_a_supervisor_whose_agent_finished";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1910));
+        std::fs::write(run.root.join("go2"), "").unwrap();
+        run.go();
+        run.wait_held();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 as pending");
+        let exit_file = devflow_core::agent_result::exit_code_path(&run.root, run.phase);
+        assert!(
+            poll_until(Duration::from_secs(3), || exit_file.exists()),
+            "precondition: N+1's agent has exited"
+        );
+        let started = std::time::Instant::now();
+        let outcome =
+            devflow_core::supervisor::request_shutdown(&pending.socket_path, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "N+1 answers stopped: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it did not sit out the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "a stop is not a supersession: {}",
+            run.events()
+        );
+        release_and_wait_for_n(&run);
+        let state = run.state();
+        assert!(state.stopped, "the launcher records the stop: {state:?}");
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(NEXT_STOPPED_BEFORE_SAVE_REASON)
+        );
+    }
+
+    /// V-27's control (R-12): N is released in time, so N+1 is promoted, and it keeps its
+    /// running agent past the deadline an orphan would have died at.
+    #[test]
+    fn a_promoted_supervisor_keeps_its_running_agent_past_the_promotion_wait() {
+        const NAME: &str = "pipeline_launch::tests::a_promoted_supervisor_keeps_its_running_agent_past_the_promotion_wait";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1911));
+        run.go();
+        run.wait_held();
+        let served = std::time::Instant::now();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 as pending");
+        let pgid =
+            devflow_core::supervisor::read_sidecar(&pending.socket_path.with_extension("json"))
+                .expect("N+1's sidecar")
+                .agent_pgid;
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || run
+                .state()
+                .supervisor
+                .is_some_and(|r| r.launch_id == pending.launch_id)),
+            "N+1 is promoted: {}",
+            run.events()
+        );
+        std::thread::sleep(
+            (PROMOTION_WAIT + Duration::from_secs(2)).saturating_sub(served.elapsed()),
+        );
+        assert!(
+            !devflow_core::test_support::live_group_members(pgid).is_empty(),
+            "the promoted supervisor's agent still runs: {}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "no refusal: {}",
+            run.events()
+        );
+        std::fs::write(run.root.join("go2"), "").unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || !events_named(
+                &run.root,
+                "workflow_finished"
+            )
+            .is_empty()),
+            "the run reaches its --until stop: {}",
+            run.events()
+        );
     }
 
     /// Whether the promotion wait covers a live launcher's serve-to-promotion latency:
