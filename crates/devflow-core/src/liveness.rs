@@ -25,8 +25,10 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::phase_id::PhaseId;
 
 /// The descriptor number a hold has in the child `pass_to_child` spawns.
 pub const INHERITED_FD: RawFd = 3;
@@ -281,6 +283,64 @@ pub fn adopt_inherited(fd: RawFd, path: PathBuf) -> std::io::Result<Hold> {
     Ok(Hold { file, path })
 }
 
+/// The per-phase holder file (D-17): `.devflow/.holder-{padded}`.
+pub fn phase_holder_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!(".holder-{}", phase.padded()))
+}
+
+/// Why [`claim_phase_holder`] did not claim.
+#[derive(Debug)]
+pub enum HolderError {
+    /// Another process holds the phase; its recorded pid and start time, if they read.
+    Held { holder: Option<(u32, Option<u64>)> },
+    /// The file could not be created, locked or written.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for HolderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HolderError::Held {
+                holder: Some((pid, _)),
+            } => {
+                write!(f, "held by a foreground process (pid {pid})")
+            }
+            HolderError::Held { holder: None } => {
+                write!(f, "held by a foreground process whose record does not read")
+            }
+            HolderError::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for HolderError {
+    fn from(error: std::io::Error) -> Self {
+        HolderError::Io(error)
+    }
+}
+
+/// RED scaffold: claims nothing.
+pub fn claim_phase_holder(_project_root: &Path, _phase: PhaseId) -> Result<Hold, HolderError> {
+    Err(HolderError::Io(std::io::Error::other("not implemented")))
+}
+
+static HOLDER_STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// RED scaffold: installs nothing.
+pub fn install_holder_stop_handler() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The first... the signal number the holder's handler stored, if any.
+pub fn holder_stop_signal() -> Option<i32> {
+    match HOLDER_STOP_SIGNAL.load(Ordering::Relaxed) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
 /// Whose lock this is: the pid and start time the holder recorded, while the
 /// lock is held; `None` when nothing holds it. For telling an operator or the
 /// stray-reaper safety set who holds it, never for deciding liveness: [`probe`]
@@ -423,6 +483,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         assert_child_ran_exactly_one_passing_test, in_child_test, run_test_in_child,
+        spawn_test_in_child,
     };
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -528,6 +589,214 @@ mod tests {
                 Ok(())
             });
         }
+    }
+
+    /// The D-17 holder: one claim at a time, its record names the claimer, and the file
+    /// outlives every hold.
+    #[test]
+    fn a_phase_holder_records_its_identity_and_refuses_a_second_claim() {
+        in_own_process(
+            "liveness::tests::a_phase_holder_records_its_identity_and_refuses_a_second_claim",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let root = dir.path();
+                let phase = PhaseId::new(7);
+                let path = phase_holder_path(root, phase);
+                assert_eq!(path, root.join(".devflow/.holder-07"));
+                let me = std::process::id();
+                let start = crate::agent::process_start_time(me).expect("own start time");
+
+                let hold = claim_phase_holder(root, phase).expect("the first claim");
+                assert!(
+                    root.join(".devflow/.gitignore").exists(),
+                    "the claim goes through ensure_devflow_dir"
+                );
+                assert_eq!(
+                    live_holder(&path).expect("read the holder"),
+                    Some((me, Some(start)))
+                );
+
+                let second = claim_phase_holder(root, phase);
+                assert!(
+                    matches!(
+                        second,
+                        Err(HolderError::Held { holder: Some((pid, Some(recorded))) })
+                            if pid == me && recorded == start
+                    ),
+                    "a second open is refused, naming the holder: {second:?}"
+                );
+
+                drop(hold);
+                assert_eq!(live_holder(&path).expect("read the holder"), None);
+                assert!(path.exists(), "the file is never removed");
+
+                std::fs::write(&path, "junk that is no record").expect("spoil the record");
+                let again = claim_phase_holder(root, phase).expect("a claim after the release");
+                assert_eq!(
+                    live_holder(&path).expect("read the holder"),
+                    Some((me, Some(start))),
+                    "a new claim rewrites the record"
+                );
+                drop(again);
+            },
+        );
+    }
+
+    /// Clears `FD_CLOEXEC` on `fd`, so a spawned child inherits it.
+    fn clear_close_on_exec(fd: RawFd) {
+        // SAFETY: fcntl reads and sets a flag of a descriptor the caller owns.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            assert_ne!(flags, -1, "read the descriptor's flags");
+            assert_ne!(
+                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                -1,
+                "clear close-on-exec"
+            );
+        }
+    }
+
+    /// A spawned supervisor or agent must not keep the holder alive: the holder would
+    /// read held forever and `stop` would keep refusing.
+    #[test]
+    fn a_phase_holder_is_not_inherited_by_a_spawned_child() {
+        in_own_process(
+            "liveness::tests::a_phase_holder_is_not_inherited_by_a_spawned_child",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let root = dir.path();
+                let phase = PhaseId::new(8);
+                let path = phase_holder_path(root, phase);
+
+                let hold = claim_phase_holder(root, phase).expect("claim");
+                let child = ReapOnDrop(sleep_command().spawn().expect("spawn the child"));
+                drop(hold);
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Abandoned,
+                    "a close-on-exec holder ends with the claimer, whatever it spawned"
+                );
+                drop(child);
+
+                let hold = claim_phase_holder(root, phase).expect("claim again");
+                clear_close_on_exec(hold.as_raw_fd());
+                let child = ReapOnDrop(sleep_command().spawn().expect("spawn the child"));
+                drop(hold);
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Live,
+                    "control: with close-on-exec cleared the child keeps the lock"
+                );
+                drop(child);
+            },
+        );
+    }
+
+    /// Which child [`the_holder_stop_handler_turns_sigterm_and_sigint_into_a_flag`] runs.
+    /// Not a DevFlow setting, so it carries no `DEVFLOW_` prefix.
+    #[cfg(target_os = "linux")]
+    const HANDLER_CASE_ENV: &str = "P50_1_29_HANDLER_CASE";
+    /// The file that child writes once it is ready for its signal.
+    #[cfg(target_os = "linux")]
+    const HANDLER_READY_ENV: &str = "P50_1_29_HANDLER_READY";
+    /// How long a handler-test child waits for its signal, and the parent for that child.
+    #[cfg(target_os = "linux")]
+    const HANDLER_CHILD_WAIT: Duration = Duration::from_secs(10);
+
+    /// The named mask field of this process's `/proc` status. Panics when the field is
+    /// absent, so an unreadable mask never reads as clear.
+    #[cfg(target_os = "linux")]
+    fn own_signal_mask(field: &str) -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read own status");
+        let hex = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("no {field} line in /proc/self/status"))
+            .trim();
+        u64::from_str_radix(hex, 16).expect("signal masks are hex")
+    }
+
+    /// A handler-test child's body. It never returns to libtest: its exit code is the
+    /// signal number its flag read, or 0 if none arrived.
+    #[cfg(target_os = "linux")]
+    fn run_handler_child(install: bool) -> ! {
+        if install {
+            install_holder_stop_handler().expect("install the handler");
+            let bits = (1u64 << (libc::SIGTERM - 1)) | (1u64 << (libc::SIGINT - 1));
+            assert_eq!(own_signal_mask("SigCgt") & bits, bits, "both are caught");
+            assert_eq!(own_signal_mask("SigBlk") & bits, 0, "neither is blocked");
+        }
+        let ready = std::env::var_os(HANDLER_READY_ENV).expect("the parent names the ready file");
+        std::fs::write(ready, "").expect("write the ready file");
+        let deadline = Instant::now() + HANDLER_CHILD_WAIT;
+        while Instant::now() < deadline {
+            if let Some(signal) = holder_stop_signal() {
+                std::process::exit(signal);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(0);
+    }
+
+    /// One handler-test child to its end: spawn it, signal it once it is ready, and
+    /// return how it ended, reaped.
+    #[cfg(target_os = "linux")]
+    fn signalled_handler_child(
+        test_name: &str,
+        case: &str,
+        signal: libc::c_int,
+    ) -> std::process::ExitStatus {
+        let dir = tempfile::tempdir().expect("create a temp dir");
+        let ready = dir.path().join("ready");
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        let mut child = spawn_test_in_child(
+            test_name,
+            dir.path(),
+            &[
+                ("PATH", path.as_os_str()),
+                (HANDLER_CASE_ENV, std::ffi::OsStr::new(case)),
+                (HANDLER_READY_ENV, ready.as_os_str()),
+            ],
+        );
+        let deadline = Instant::now() + HANDLER_CHILD_WAIT;
+        while !ready.exists() {
+            if Instant::now() > deadline || child.try_wait().expect("poll the child").is_some() {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("reap the child");
+                panic!("{case}: the child never got ready: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = i32::try_from(child.id()).expect("a pid fits");
+        // SAFETY: `pid` is this test's own unreaped child.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal the child");
+        let output = child.wait_with_output().expect("reap the child");
+        eprintln!("{case}: {:?}", output.status);
+        output.status
+    }
+
+    /// D-18: a holder turns SIGTERM and SIGINT into a flag. The control installs nothing
+    /// and dies, so the survival is the handler's doing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_holder_stop_handler_turns_sigterm_and_sigint_into_a_flag() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "liveness::tests::the_holder_stop_handler_turns_sigterm_and_sigint_into_a_flag";
+        if in_child_test(NAME) {
+            let case = std::env::var(HANDLER_CASE_ENV).expect("the parent names the case");
+            run_handler_child(case != "no-handler");
+        }
+        let term = signalled_handler_child(NAME, "sigterm", libc::SIGTERM);
+        assert_eq!(term.code(), Some(libc::SIGTERM), "{term:?}");
+        let int = signalled_handler_child(NAME, "sigint", libc::SIGINT);
+        assert_eq!(int.code(), Some(libc::SIGINT), "{int:?}");
+        let control = signalled_handler_child(NAME, "no-handler", libc::SIGTERM);
+        assert_eq!(
+            control.signal(),
+            Some(libc::SIGTERM),
+            "control: with no handler the signal ends the child: {control:?}"
+        );
     }
 
     #[test]
