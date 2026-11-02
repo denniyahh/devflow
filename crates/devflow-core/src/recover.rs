@@ -26,10 +26,6 @@ pub enum RecoverError {
     /// State loading failed.
     #[error("{0}")]
     Workflow(#[from] WorkflowError),
-    /// A lock error. Nothing in this module returns it since `recover` stopped taking a
-    /// per-phase lock; it stays as a public variant until a release may remove it.
-    #[error("{0}")]
-    Lock(#[from] crate::lock::LockError),
     /// Gate cleanup failed.
     #[error("{0}")]
     Gate(#[from] crate::gates::GateError),
