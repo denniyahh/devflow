@@ -57,6 +57,16 @@
   **Not established:** the storm covers the core lib suite only, and only tests that ran inside its 120 s.
 
 - Three comments and help lines still name the per-phase lock after 50.1-20 (found during 50.1-20)
-  status: open, wording only.
+  status: partly resolved. 50.1-21 rewrote `commands.rs`'s `recover --clean` comment and the same file's "advance taking the lock" line. Open for 50.1-22, wording only: `pipeline_gate.rs`'s safe-point-4 comment and `main.rs`'s `stop` help, with the help snapshot.
   **What:** `pipeline_gate.rs`'s safe-point-4 comment ("which releases the per-phase lock"), `main.rs`'s `stop` help ("per-phase lock holder when GONE", "signals no lock holder") and `commands.rs`'s `recover --clean` comment ("cleaned when its lock holder is dead").
   **Why deferred:** 50.1-22 owns the `stop` help and 50.1-21 deletes the lock API, so each goes with its owner. Nothing reads them as behaviour.
+
+- `RecoverError::Lock` has no constructor left after 50.1-21 (found during 50.1-21)
+  status: open
+  **What:** nothing in `devflow-core` returns it now that `recover` takes no per-phase lock. Its `#[from] LockError` keeps it compiling and its doc says so.
+  **Why deferred:** removing a `pub` variant is a semver break no 50.1 plan declared. It goes on 50.1-28's list to keep or remove.
+
+- `recover --clean --phase N`'s guard can pass a STALE socket that the decision then refuses (found during 50.1-21)
+  status: open, by plan
+  **What:** `refuse_a_live_supervisor` lets through a STALE socket whose agent group the backstop proves gone, and `phase_may_be_live` keeps any STALE socket, as this plan specifies. So that case now prints the keep warning and exits non-zero until `devflow stop` removes the socket, where before it cleaned. `stop_stale_launch` runs the backstop that removes it (read, not run end to end here).
+  **Why deferred:** the plan says STALE is not resolved through the backstop in recover. 50.1-25's docs should say `stop` comes first.
