@@ -4405,8 +4405,12 @@ pub(crate) fn logs(
     // poll produced no new bytes — the natural end of a run. (An operator
     // can always Ctrl-C sooner.)
     let exit_path = agent_result::exit_code_path(project_root, phase);
+    let state_path = workflow::state_path(project_root, phase);
+    let mut saw_state = false;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
+        let state_exists = state_path.exists();
+        saw_state |= state_exists;
         // 14-CR-03: a stage transition archives and recreates the capture
         // file (launch_stage → archive_phase_files), so a shrunken file
         // means the next stage started — reset to the top instead of
@@ -4421,6 +4425,12 @@ pub(crate) fn logs(
             if let Ok(code) = std::fs::read_to_string(&exit_path) {
                 eprintln!("== agent exited with code {} ==", code.trim());
             }
+            return Ok(());
+        }
+        // A supervisor whose state vanished writes no exit file (D-03) and has no
+        // successor, so none will come.
+        if saw_state && !state_exists && base == offset && new_offset == offset {
+            eprintln!("== phase {phase}'s state is gone and no exit code was recorded ==");
             return Ok(());
         }
         offset = new_offset;
@@ -16018,6 +16028,35 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let hold = liveness::Hold::take(&path).unwrap();
         (state, hold)
+    }
+
+    /// A supervisor whose state vanished ends with no exit file and no successor, so a
+    /// follower must end too, saying why. Control: while the state exists it keeps following.
+    #[test]
+    fn logs_follow_ends_when_the_followed_state_is_gone_and_no_exit_file_will_come() {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5306);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        workflow::save_state(&state).unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let follower_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(logs(&follower_root, Some(phase), true, false));
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(1500))
+                .is_err(),
+            "control: a follower keeps following while the state exists"
+        );
+        std::fs::remove_file(workflow::state_path(&root, phase)).unwrap();
+        receiver
+            .recv_timeout(WAIT)
+            .expect("the follower ends once the state is gone")
+            .unwrap();
     }
 
     /// The launch guard refuses beside a recorded supervisor that holds its liveness file
