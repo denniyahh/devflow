@@ -1291,7 +1291,9 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         if agent_alive
             || matches!(
                 phase_liveness,
-                PhaseLiveness::Alive { .. } | PhaseLiveness::LaunchPending { .. }
+                PhaseLiveness::Alive { .. }
+                    | PhaseLiveness::LaunchPending { .. }
+                    | PhaseLiveness::HeldNoSocket { .. }
             )
         {
             let phase_label = phase
@@ -1404,6 +1406,12 @@ pub(crate) enum PhaseLiveness {
         /// Whether its socket has appeared.
         published: bool,
     },
+    /// The recorded socket is gone, but a process still holds the launch's liveness
+    /// lock, so `stop` cannot reach it and `resume` refuses it.
+    HeldNoSocket {
+        /// The holder's pid, when its record can be read.
+        pid: Option<u32>,
+    },
 }
 
 impl PhaseLiveness {
@@ -1439,6 +1447,10 @@ impl PhaseLiveness {
                      it is not yet the recorded supervisor"
                 )
             }
+            PhaseLiveness::HeldNoSocket { pid } => {
+                let holder = pid.map_or("a process".to_string(), |pid| format!("pid {pid}"));
+                format!("HELD — its socket is gone, but {holder} holds its liveness lock")
+            }
         }
     }
 
@@ -1452,6 +1464,7 @@ impl PhaseLiveness {
             PhaseLiveness::NotLaunched => "not_launched",
             PhaseLiveness::ProbeFailed(_) => "probe_failed",
             PhaseLiveness::LaunchPending { .. } => "launch_pending",
+            PhaseLiveness::HeldNoSocket { .. } => "held_no_socket",
         }
     }
 }
@@ -1521,11 +1534,28 @@ fn probe_phase(state: &State) -> PhaseLiveness {
     let record = state.supervisor.as_ref();
     let probe = record.map(|record| supervisor::probe(&record.socket_path));
     match phase_liveness(record, probe, state.stopped) {
+        PhaseLiveness::Gone | PhaseLiveness::GoneWhileActive
+            if record.is_some_and(|record| {
+                held_without_socket(&state.project_root, record).is_some()
+            }) =>
+        {
+            let path = record.and_then(|record| {
+                liveness::launch_liveness_path(&state.project_root, &record.launch_id)
+            });
+            let holder = path.and_then(|path| liveness::live_holder(&path).ok().flatten());
+            PhaseLiveness::HeldNoSocket {
+                pid: holder.map(|(pid, _)| pid),
+            }
+        }
         PhaseLiveness::NotLaunched if pending.is_some() && state.stopped => PhaseLiveness::Gone,
         PhaseLiveness::NotLaunched if pending.is_some() => PhaseLiveness::GoneWhileActive,
         liveness => liveness,
     }
 }
+
+/// The repair for [`PhaseLiveness::HeldNoSocket`], whose text names the process.
+const HELD_NO_SOCKET_REPAIR: &str =
+    "`devflow stop` cannot reach that process and `devflow resume` refuses it; end it first";
 
 /// Recovery verbs discoverable from a phase's liveness (21a, D-03; 50-12) —
 /// the pure, testable counterpart to `status`'s hints. STALE names
@@ -1558,6 +1588,7 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     };
     match liveness {
         PhaseLiveness::LaunchPending { .. } => vec![format!("devflow stop --phase {phase}")],
+        PhaseLiveness::HeldNoSocket { .. } => vec![HELD_NO_SOCKET_REPAIR.to_string()],
         PhaseLiveness::Stale => vec![format!("devflow stop --phase {phase}"), continue_verb],
         PhaseLiveness::GoneWhileActive => {
             let mut hints = vec![continue_verb];
@@ -6290,6 +6321,7 @@ fn repair_instead_of_resume(facts: &PhaseFacts, resume: String) -> String {
     let phase = facts.phase;
     match (&facts.supervisor, &facts.live_agent) {
         (PhaseLiveness::LaunchPending { .. }, _) => format!("devflow stop --phase {phase}"),
+        (PhaseLiveness::HeldNoSocket { .. }, _) => HELD_NO_SOCKET_REPAIR.to_string(),
         (PhaseLiveness::Alive { .. }, _) => {
             format!("wait for its live supervisor, or `devflow stop --phase {phase}`")
         }
@@ -6402,6 +6434,7 @@ fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
         PhaseLiveness::GoneWhileActive => {
             repair_instead_of_resume(facts, format!("devflow resume --phase {phase}"))
         }
+        PhaseLiveness::HeldNoSocket { .. } => HELD_NO_SOCKET_REPAIR.to_string(),
         // `status` prints the operator's own socket path, which doctor
         // must not.
         PhaseLiveness::ProbeFailed(_) => "devflow status".to_string(),
@@ -16021,6 +16054,43 @@ mod tests {
         wait_until_unheld(&path);
         stop_in(root, phase, Some(cache.path())).unwrap();
         assert!(workflow::load_state(root, phase).unwrap().stopped);
+    }
+
+    /// `status` and `doctor` report a held liveness lock with no socket as a process holding
+    /// the lock, by pid, and name no `resume`, which refuses it. Control: with the lock
+    /// released, both read the run as gone and name `resume` again.
+    #[test]
+    fn status_and_doctor_name_the_process_holding_a_lock_with_no_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5306);
+        let (state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let pid = format!("pid {}", std::process::id());
+        let resume = format!("devflow resume --phase {phase}");
+        let doctor = |state: &State| {
+            reconcile_phase(&facts_for(root, state))
+                .iter()
+                .map(|finding| format!("{} -> {:?}", finding.detail, finding.repair))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let status = rendered_status(&state);
+        assert!(status.contains("holds its liveness lock"), "{status}");
+        assert!(status.contains(&pid), "{status}");
+        assert!(!status.contains(&resume), "{status}");
+        let found = doctor(&state);
+        assert!(found.contains("holds its liveness lock"), "{found}");
+        assert!(found.contains(&pid), "{found}");
+        assert!(!found.contains(&resume), "{found}");
+
+        let path = hold.path().to_path_buf();
+        drop(hold);
+        wait_until_unheld(&path);
+        let status = rendered_status(&state);
+        assert!(status.contains(&resume), "{status}");
+        assert!(!status.contains("holds its liveness lock"), "{status}");
+        assert!(doctor(&state).contains(&resume), "{}", doctor(&state));
     }
 
     /// A stored Ship answer with a dead supervisor is `devflow ship`'s: `status` and `doctor`
