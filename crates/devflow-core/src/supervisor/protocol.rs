@@ -9,7 +9,7 @@
 //! | Request | Reply |
 //! |---|---|
 //! | `{"op":"ping"}` | `{"ok":true, ...PingReply fields}` |
-//! | `{"op":"shutdown"}` | `{"ok":true,"accepted":true,"owner":…}` then `{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true}`, or `{"ok":false,"error":"handed_off"}` |
+//! | `{"op":"shutdown"}` | `{"ok":true,"accepted":true,"owner":…}` then `{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":…}`, or `{"ok":false,"error":"handed_off"}` |
 //! | anything else | `{"ok":false,"error":"unknown_op"}` |
 //!
 //! The pids in a ping reply are for display only: nothing on the liveness
@@ -77,7 +77,7 @@ pub struct ShutdownAccepted {
 }
 
 /// The final shutdown reply, sent once the stop is persisted. On the wire,
-/// `{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true}`.
+/// `{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":false}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ShutdownStopped {
@@ -85,6 +85,9 @@ pub struct ShutdownStopped {
     pub exit_code: i32,
     /// Whether the stage advance was suppressed by the stop.
     pub advance_suppressed: bool,
+    /// Whether the supervisor signalled the agent's process group for this stop. `false`
+    /// for a stop honoured at an advance safe point, where nothing was signalled.
+    pub group_signalled: bool,
 }
 
 /// Every reply a server writes, one variant per wire shape.
@@ -312,10 +315,17 @@ mod tests {
         let stopped = wire(&Reply::Stopped(ShutdownStopped {
             exit_code: 143,
             advance_suppressed: true,
+            group_signalled: false,
         }));
         assert_eq!(
             stopped,
-            serde_json::json!({"ok": true, "stopped": true, "exit_code": 143, "advance_suppressed": true})
+            serde_json::json!({
+                "ok": true,
+                "stopped": true,
+                "exit_code": 143,
+                "advance_suppressed": true,
+                "group_signalled": false,
+            })
         );
         assert_eq!(
             wire(&Reply::Error("handed_off".to_string())),

@@ -710,6 +710,9 @@ pub enum ShutdownOutcome {
         exit_code: i32,
         /// Whether the stage advance was suppressed by the stop.
         advance_suppressed: bool,
+        /// Whether the supervisor signalled the agent's process group for this stop.
+        /// `false` for a stop honoured at an advance safe point.
+        group_signalled: bool,
     },
     /// The supervisor had already handed the run off and did not stop it.
     HandedOff,
@@ -767,6 +770,7 @@ pub fn request_shutdown(
         ShutdownLine::Stopped(stopped) => Ok(ShutdownOutcome::Stopped {
             exit_code: stopped.exit_code,
             advance_suppressed: stopped.advance_suppressed,
+            group_signalled: stopped.group_signalled,
         }),
         ShutdownLine::Refused(error) => Ok(refusal(error)),
         ShutdownLine::Accepted => Err(ProbeError::NoReply(
@@ -2056,6 +2060,7 @@ mod tests {
                     &Reply::Stopped(protocol::ShutdownStopped {
                         exit_code: 143,
                         advance_suppressed: true,
+                        group_signalled: true,
                     }),
                 )
                 .expect("write stopped");
@@ -2067,7 +2072,8 @@ mod tests {
                 stopped,
                 Ok(ShutdownOutcome::Stopped {
                     exit_code: 143,
-                    advance_suppressed: true
+                    advance_suppressed: true,
+                    group_signalled: true
                 })
             ),
             "accepted then stopped is Stopped, got {stopped:?}"
