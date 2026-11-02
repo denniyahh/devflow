@@ -37,7 +37,7 @@ use devflow_core::stage::Stage;
 use devflow_core::state::State;
 use devflow_core::{events, registry, ship, workflow};
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
 ///
@@ -606,6 +606,12 @@ pub(crate) fn run_gate_with_timeout(
                 // A human or 23b's stale-gate sweep may have answered first;
                 // first-writer-wins is the correct resolution, not an error.
                 Err(GateError::AlreadyResponded { .. }) => Ok(()),
+                // Published, with its re-check refused by a stalled gate lock. This waiter
+                // is the one that acts on a published answer, and the wait below reads it.
+                Err(err @ GateError::PublishedUnconfirmed { .. }) => {
+                    warn!("{err}");
+                    Ok(())
+                }
                 Err(err) => Err(err.into()),
             }
         });
@@ -3313,6 +3319,45 @@ mod tests {
             engaged.launch_id.clone(),
         );
         run_gate_with_timeout(root, &mut state, Stage::Ship, "ctx", 30, Some(&approval()))
+    }
+
+    /// A pre-authorized answer whose re-check could not take the gate lock is published
+    /// and left in place, and this waiter is the one that acts on it: a stalled gate lock
+    /// must not make it quit its own gate. The holder arrives in the one window with no
+    /// lock held, stays past the re-check's wait and goes before the claim's ends.
+    #[test]
+    fn a_pre_authorized_answer_left_unconfirmed_still_decides_its_own_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2217);
+        let lock = root
+            .join(".devflow")
+            .join(format!(".gates-{}.lock", phase.padded()));
+        let past_the_recheck = gates::GATE_LOCK_WAIT + std::time::Duration::from_secs(1);
+        let stall_the_recheck = move || {
+            let holder = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(lock)
+                .unwrap();
+            holder.lock().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(past_the_recheck);
+                drop(holder);
+            });
+        };
+
+        let action =
+            devflow_core::test_support::with_answer_before_publish(stall_the_recheck, || {
+                auto_answered_ship_gate(root, phase, false)
+            })
+            .expect("the waiter acts on its own published answer");
+
+        assert!(matches!(action, GateAction::Advance), "{action:?}");
+        let resolved = events_named(root, "gate_resolved");
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(resolved[0]["approved"], true);
     }
 
     fn notify_marker(root: &Path) -> PathBuf {
