@@ -105,7 +105,11 @@ fn wait_for_child_exit(
         }
         if start.elapsed() >= deadline {
             let pid = child.id();
-            let lock_present = devflow_core::lock::holder(root, phase).is_some();
+            let open_gate_waiter = Gates::list_open(root)
+                .into_iter()
+                .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+                .and_then(|gate| GateId::parse(&gate.gate_id).ok())
+                .map(|gate| Gates::waiter_status(root, phase, Stage::Code, &gate));
             let gate_present = Gates::gate_path(root, phase, Stage::Code).exists();
             let response_present = !gate_answer_files(root, phase, Stage::Code).is_empty();
             // Reap before panicking — see doc comment above for why this
@@ -113,7 +117,7 @@ fn wait_for_child_exit(
             let _ = child.wait();
             panic!(
                 "devflow advance (pid {pid}) did not exit within {deadline:?}; \
-                 on disk: lock_present={lock_present} gate_present={gate_present} \
+                 on disk: open_gate_waiter={open_gate_waiter:?} gate_present={gate_present} \
                  response_present={response_present}"
             );
         }
@@ -161,25 +165,19 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let phase = PhaseId::new(91);
     let stage = Stage::Ship;
 
-    // The poller runs in this test process. Record that live process as the
-    // gate holder so sweep has evidence that a consumer exists before it
-    // writes an abort response.
-    let pid = std::process::id();
-    let start = devflow_core::agent::process_start_time(pid).unwrap();
-    let lock_path = root
-        .join(".devflow")
-        .join(format!("lock-{}", phase.padded()));
-    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-    std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-
-    let gate = Gates::open_gate(root, phase, stage, "approve merge?")
-        .unwrap()
-        .gate_id;
+    // Registered before the gate file exists, as every production gate wait is, and held
+    // by the poller while it awaits, so the sweep can never see the gate before its waiter.
+    let (opened, registration) =
+        Gates::open_registered(root, phase, stage, "approve merge?").unwrap();
+    let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
     std::thread::scope(|scope| {
-        let waiter =
-            scope.spawn(move || Gates::await_answer(root, phase, stage, &gate, 30, || false));
+        let waiter = scope.spawn(move || {
+            let outcome = Gates::await_answer(root, phase, stage, &gate, 30, || false);
+            registration.finish();
+            outcome
+        });
 
         let output = common::hermetic_devflow(&home)
             .args(["gate", "sweep", "--root"])
