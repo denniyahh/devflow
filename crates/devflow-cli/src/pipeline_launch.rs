@@ -10761,6 +10761,43 @@ mod tests {
         );
     }
 
+    /// The 143 a safe-point stop leaves is not read as the next run's result: `resume` runs
+    /// the stage again, and its own success advances.
+    #[test]
+    fn a_resume_after_a_safe_point_stop_is_judged_on_its_own_exit_code() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_after_a_safe_point_stop_is_judged_on_its_own_exit_code";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1324));
+        run.go();
+        run.wait_held();
+        let (_, last) = shutdown_accepted_then(
+            &run.n.socket_path,
+            || run.release(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(last["stopped"], true, "{last}");
+        assert_eq!(exit_file_of(&run), "143", "{}", run.events());
+
+        resume(&run.root, run.phase, None, false).unwrap();
+
+        let evaluated = |status: &str| {
+            events_named(&run.root, "advance_evaluated")
+                .iter()
+                .any(|event| event["status"] == status)
+        };
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || evaluated("success")
+                && events_named(&run.root, "transition").len() == 1),
+            "the resumed stage succeeds and moves on: {}",
+            run.events()
+        );
+        assert!(!evaluated("failed"), "{}", run.events());
+    }
+
     /// The control for V-28: the same hold and no stop, with an `--until define` halt ending
     /// the run where it is, leaves the agent's own code.
     #[test]
