@@ -1122,22 +1122,53 @@ pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(
 /// Safe point 3's shutdown of a next supervisor that was spawned and
 /// answered its ping but is not published: ask it to stop through its own
 /// socket, bounded by [`SUPERVISOR_STOP_WAIT`]. It records nothing itself
-/// (the state does not name it), so this launcher's stop is the record.
-fn shut_down_unpublished(record: &SupervisorRecord) {
+/// (the state does not name it as supervisor), so this launcher's stop is the
+/// record. Whether the stop was confirmed.
+fn shut_down_unpublished(record: &SupervisorRecord) -> bool {
     match devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT) {
-        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. }) => info!(
-            "stopped the unpublished next supervisor at {}",
-            record.socket_path.display()
-        ),
-        Ok(other) => warn!(
-            "the unpublished next supervisor at {} answered {other:?} to shutdown",
-            record.socket_path.display()
-        ),
-        Err(err) => warn!(
-            "could not stop the unpublished next supervisor at {}: {err}",
-            record.socket_path.display()
-        ),
+        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. }) => {
+            info!(
+                "stopped the unpublished next supervisor at {}",
+                record.socket_path.display()
+            );
+            true
+        }
+        Ok(other) => {
+            warn!(
+                "the unpublished next supervisor at {} answered {other:?} to shutdown",
+                record.socket_path.display()
+            );
+            false
+        }
+        Err(err) => {
+            warn!(
+                "could not stop the unpublished next supervisor at {}: {err}",
+                record.socket_path.display()
+            );
+            false
+        }
     }
+}
+
+/// Safe point 3's stop: end the unpublished next supervisor through its socket, and
+/// record the stop. A confirmed shutdown clears its pending record and gives its
+/// reservation back. An unconfirmed one keeps the record, because that next supervisor
+/// may still run and the record is the only thing naming it: the lock it holds reads
+/// live until it exits, and abandoned after, when the next launch clears it.
+fn end_unpublished(
+    state: &mut State,
+    record: &SupervisorRecord,
+    reservation: monitor::Reservation,
+) -> Result<(), CliError> {
+    if shut_down_unpublished(record) {
+        commit(state, |s| {
+            if reservation_is_pending(s, &reservation) {
+                s.pending_supervisor = None;
+            }
+        })?;
+        reservation.discard();
+    }
+    record_advance_stop(state, 3)
 }
 
 /// How a gate wait ended (safe point 4).
@@ -2256,8 +2287,7 @@ fn spawn_next_supervisor(
     // published. On a stop, shut it down through its socket and never save
     // its record; the state keeps this run's record, marked stopped.
     if with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) {
-        shut_down_unpublished(&published.record);
-        record_advance_stop(state, 3)?;
+        end_unpublished(state, &published.record, reservation)?;
         return Ok(None);
     }
     Ok(Some(SpawnedLaunch {
@@ -10171,6 +10201,43 @@ mod tests {
         assert!(
             poll_until(Duration::from_secs(5), || !pending.liveness_path.exists()),
             "no liveness file is left for N+1"
+        );
+    }
+
+    /// A shutdown safe point 3 cannot confirm keeps the pending record, since that next
+    /// supervisor may still run, and it still records the stop. Once nothing holds the
+    /// lock it reads abandoned, so the next launch clears it. The confirmed case is
+    /// `a_stop_at_safe_point_3_clears_the_unpublished_next_pending_record`.
+    #[test]
+    fn an_unconfirmed_stop_at_safe_point_3_keeps_the_pending_record() {
+        use devflow_core::liveness;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1708);
+        let cache = tempfile::tempdir().unwrap();
+        let ctx = reservation_only_context(cache.path());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+        let reservation = monitor::Reservation::new(&ctx, &state).unwrap();
+        commit_pending_record(&mut state, &reservation).unwrap();
+        let pending = reservation.pending_record();
+        let no_answer = SupervisorRecord::new(
+            root.join("never-bound.sock"),
+            reservation.launch_id().to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        );
+
+        end_unpublished(&mut state, &no_answer, reservation).unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.pending_supervisor.as_ref(), Some(&pending));
+        assert!(after.stopped, "the stop is recorded either way");
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Abandoned,
+            "the launcher released its copy and kept the file"
         );
     }
 
