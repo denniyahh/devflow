@@ -2729,7 +2729,16 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let quarantined = events_named(root, "gate_answer_quarantined");
+        // The waiter moves the answer first and logs the move after it.
+        let mut quarantined = events_named(root, "gate_answer_quarantined");
+        while quarantined.is_empty() {
+            assert!(
+                started.elapsed() < SET_ASIDE_WITHIN,
+                "the wait must log the answer it set aside"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            quarantined = events_named(root, "gate_answer_quarantined");
+        }
         assert_eq!(quarantined.len(), 1, "{quarantined:?}");
         assert_eq!(quarantined[0]["reason"], "missing_gate_id");
         assert!(
