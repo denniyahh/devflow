@@ -1031,6 +1031,16 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.177: `gate approve` Can Report a Failure for an Approval That Was Applied (BACKLOG)
+
+**Found:** 2026-11-02, Phase 50.1's verifier; first seen in a test during the review fixes.
+
+**Defect:** a fast waiter can consume an answer and close its gate between the writer's publish and its re-check, so `devflow gate approve` exits 1 with "published after that gate closed" although the approval was applied and the next stage launches. Measured: `gate_notify_persist_e2e::agent_via_legacy_monitor_never_receives_the_notify_variable` failed 1 of 80 at eight at a time and 0 of 30 alone, with that message. The test now tolerates this message. The runbook says not to approve again, and how to check.
+
+**Not fixed in 50.1 because:** it would change the production binary after the live proof on it (attempt 2). No answer is lost or misapplied; only the report is wrong.
+
+**Fix shape (not tested):** at the re-check, tell a consumed answer from one set aside: a set-aside answer has a quarantine file labelled with the gate id, so no such file means it was consumed, and the writer reports success.
+
 ### Phase 999.176: Validate's Mutation Audit Has No Stopping Point on a Run With No Operator to Answer Its Gap Gate (BACKLOG)
 
 **Found:** 2026-11-02, Phase 50.1's live attempt 2. Nothing in DevFlow failed; the loop-back and its gate fired as designed.
