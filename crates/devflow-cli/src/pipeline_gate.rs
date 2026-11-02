@@ -249,6 +249,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
 ) -> Result<(), CliError> {
     #[cfg(test)]
     crate::pipeline_launch::test_hold("before_finalization");
+    let mut progress = crate::pipeline_outcomes::BatchProgress::default();
     loop {
         // Safe point 6 (CR-01, 50-REVIEW.md; D-13 item 7), before every pass: a stop taken
         // during the advance after the Ship gate was answered, or during a retry after its
@@ -270,7 +271,13 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             )));
         }
         ensure_still_recorded(project_root, state.phase)?;
-        if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
+        if crate::pipeline_outcomes::run_checkout_hooks_from(
+            project_root,
+            state,
+            &hooks::hooks_after_ship(),
+            Stage::Ship,
+            &mut progress,
+        ) {
             break;
         }
         // The original Ship approval has already been consumed. Reopen an
@@ -2162,6 +2169,59 @@ mod tests {
         assert_eq!(events_named(root, "workflow_shipped").len(), 1);
     }
 
+    /// An approved finalization retry after `ChangelogAppend` failed must not cut a second
+    /// release: the hooks that succeeded stay done, and the changelog written by the retry
+    /// names the one tag and carries the body computed before that tag existed.
+    #[test]
+    fn a_finalization_retry_does_not_repeat_the_version_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(93);
+        ship_ready_fixture(root, phase);
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["checkout", "-q", "feature/phase-93"]);
+        std::fs::write(root.join("work.txt"), "work\n").unwrap();
+        git(&["add", "work.txt"]);
+        git(&["commit", "-q", "-m", "feat: the phase's only change"]);
+        git(&["checkout", "-q", "develop"]);
+        // A directory where the changelog goes fails `ChangelogAppend` only.
+        std::fs::create_dir(root.join("CHANGELOG.md")).unwrap();
+
+        let finished = std::thread::scope(|scope| {
+            let finalizing = scope.spawn(|| {
+                let mut state = workflow::load_state(root, phase).unwrap();
+                finish_workflow_with_gate_timeout(root, &mut state, 30)
+            });
+            wait_for_open_gate(root, phase, Stage::Ship);
+            std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
+            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+            finalizing.join().unwrap()
+        });
+        finished.expect("the retry finishes the batch");
+
+        let tags = git(&["tag"]);
+        assert_eq!(tags.lines().count(), 1, "one release, got tags: {tags}");
+        assert_eq!(hook_runs(root, "VersionBump"), 1);
+        assert_eq!(hook_runs(root, "ChangelogAppend"), 2);
+        let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+        let version = tags.strip_prefix('v').unwrap();
+        assert!(
+            changelog.contains(&format!("## {version} ")),
+            "the heading names the tag {tags}: {changelog}"
+        );
+        assert!(
+            changelog.contains("the phase's only change"),
+            "the body computed before the tag reaches the retry: {changelog}"
+        );
+    }
+
     /// A recovery that has passed its liveness check, holding the state write lock, cannot
     /// see a holder claimed after that check. `devflow ship` must not read the state it is
     /// about to delete and run hooks beside it: the recovery lands wholly first, and Ship
@@ -3084,7 +3144,11 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(hook_runs(root, "Merge"), 2);
+        assert_eq!(
+            hook_runs(root, "Merge"),
+            1,
+            "the pass resumes at the hook that failed"
+        );
         assert!(events_named(root, "advance_stopped").is_empty());
 
         answer_open_gate(

@@ -1034,6 +1034,34 @@ pub(crate) fn run_checkout_hooks(
     batch: &[hooks::Hook],
     stage: Stage,
 ) -> bool {
+    run_checkout_hooks_from(
+        project_root,
+        state,
+        batch,
+        stage,
+        &mut BatchProgress::default(),
+    )
+}
+
+/// How far a batch got, kept in memory across the retry passes of one finalization: the
+/// hooks that succeeded, and what `VersionBump` handed forward. A retry that reran them
+/// would cut a second release. A retry in a later process starts over.
+#[derive(Debug, Default)]
+pub(crate) struct BatchProgress {
+    completed: usize,
+    shipped_version: Option<String>,
+    shipped_changelog_body: Option<String>,
+}
+
+/// [`run_checkout_hooks`], skipping the hooks `progress` has done and recording those it
+/// finishes.
+pub(crate) fn run_checkout_hooks_from(
+    project_root: &Path,
+    state: &State,
+    batch: &[hooks::Hook],
+    stage: Stage,
+    progress: &mut BatchProgress,
+) -> bool {
     if batch.is_empty() {
         return true;
     }
@@ -1089,15 +1117,22 @@ pub(crate) fn run_checkout_hooks(
         project_root: hook_root.clone(),
         stage,
         git_flow: git_flow.clone(),
-        shipped_version: None,
-        shipped_changelog_body: None,
+        shipped_version: progress.shipped_version.clone(),
+        shipped_changelog_body: progress.shipped_changelog_body.clone(),
     };
-    for hook in batch {
+    for hook in &batch[progress.completed..] {
         let outcome = hook.run(&mut ctx);
         if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
             all_succeeded = false;
         }
+        if all_succeeded {
+            progress.completed += 1;
+        }
+        progress.shipped_version.clone_from(&ctx.shipped_version);
+        progress
+            .shipped_changelog_body
+            .clone_from(&ctx.shipped_changelog_body);
         events::emit(
             project_root,
             state.phase,
