@@ -2162,6 +2162,106 @@ mod tests {
         assert_eq!(events_named(root, "workflow_shipped").len(), 1);
     }
 
+    /// A recovery that has passed its liveness check, holding the state write lock, cannot
+    /// see a holder claimed after that check. `devflow ship` must not read the state it is
+    /// about to delete and run hooks beside it: the recovery lands wholly first, and Ship
+    /// finds no run. The closure stands in for `recover --clean`'s decision and removal,
+    /// whose hold is in core and out of this crate's reach.
+    #[test]
+    fn ship_waits_out_a_recovery_past_its_liveness_check() {
+        /// Longer than this fixture's whole Ship takes without the wait, so a Ship that does
+        /// not wait has finished by the time the recovery deletes under it.
+        const RECOVERY_LINGERS: std::time::Duration = std::time::Duration::from_secs(2);
+        const CLAIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(95);
+        ship_ready_fixture(root, phase);
+        Gates::open_gate(root, phase, Stage::Ship, "ctx").unwrap();
+        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+        let holder = devflow_core::liveness::phase_holder_path(root, phase);
+
+        let shipped = std::thread::scope(|scope| {
+            let (in_lock, recovery_holds) = std::sync::mpsc::channel();
+            let holder = &holder;
+            scope.spawn(move || {
+                workflow::update_state_with(root, phase, |_| {
+                    in_lock.send(()).unwrap();
+                    let deadline = std::time::Instant::now() + CLAIM_WITHIN;
+                    while !matches!(
+                        devflow_core::liveness::probe(holder),
+                        Ok(devflow_core::liveness::Held::Live)
+                    ) && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    std::thread::sleep(RECOVERY_LINGERS);
+                    std::fs::remove_file(workflow::state_path(root, phase)).unwrap();
+                    Ok::<_, CliError>((None, ()))
+                })
+                .unwrap();
+            });
+            recovery_holds.recv().unwrap();
+            let ship = scope.spawn(move || ship_override(root, phase, false));
+            ship.join().unwrap()
+        });
+
+        assert!(
+            events_named(root, "workflow_shipped").is_empty(),
+            "Ship ran its hooks beside the recovery: {shipped:?}"
+        );
+        assert!(
+            matches!(
+                shipped,
+                Err(CliError::Workflow(workflow::WorkflowError::MissingState(_)))
+            ),
+            "{shipped:?}"
+        );
+    }
+
+    /// The wait for a recovery is bounded: a stuck write-lock holder refuses the claim and
+    /// names itself, and the refused process keeps no hold on the phase.
+    #[test]
+    fn a_foreground_claim_gives_up_on_a_held_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(94);
+        ship_ready_fixture(root, phase);
+        let holder = devflow_core::liveness::phase_holder_path(root, phase);
+
+        let refused = std::thread::scope(|scope| {
+            let (in_lock, locked) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            scope.spawn(move || {
+                workflow::update_state_with(root, phase, |_| {
+                    in_lock.send(()).unwrap();
+                    let _ = released.recv();
+                    Ok::<_, CliError>((None, ()))
+                })
+                .unwrap();
+            });
+            locked.recv().unwrap();
+            let claimed = crate::commands::claim_foreground_holder(root, phase);
+            release.send(()).unwrap();
+            claimed
+        })
+        .map(|_hold| ())
+        .expect_err("the claim gives up on the held lock");
+
+        let refused = refused.to_string();
+        assert!(refused.contains("write lock is still held"), "{refused}");
+        // Polled: another test's fork can keep a just-released flock until its exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while devflow_core::liveness::probe(&holder).unwrap() == devflow_core::liveness::Held::Live
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a refused claim keeps no hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// A process killed between deleting the state and recording the ship must not leave a
     /// shipped run that reads as not shipped: by the moment the state goes, the strict shipped
     /// predicate is already on disk. Runs the whole foreground finalization, reading the
