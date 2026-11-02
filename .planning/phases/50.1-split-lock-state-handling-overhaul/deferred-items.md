@@ -67,12 +67,12 @@
   **Why deferred:** removing a `pub` variant is a semver break no 50.1 plan declared. It goes on 50.1-28's list to keep or remove.
 
 - `recover --clean --phase N`'s guard can pass a STALE socket that the decision then refuses (found during 50.1-21)
-  status: open, by plan
+  status: open, by plan; OPERATIONS now says `stop` comes first (50.1-25, 98221ec). Behaviour unchanged.
   **What:** `refuse_a_live_supervisor` lets through a STALE socket whose agent group the backstop proves gone, and `phase_may_be_live` keeps any STALE socket, as this plan specifies. So that case now prints the keep warning and exits non-zero until `devflow stop` removes the socket, where before it cleaned. `stop_stale_launch` runs the backstop that removes it (read, not run end to end here).
   **Why deferred:** the plan says STALE is not resolved through the backstop in recover. 50.1-25's docs should say `stop` comes first.
 
 - `resume` calls an applied answer "claimed but never applied" in three reachable cases (found during 50.1-23)
-  status: open, raised to the orchestrator as the plan requires
+  status: settled below; the settled wording is documented in OPERATIONS (50.1-25, 7b4c9a8)
   **What:** 50.1-23 reports every claimed pair at `state.stage`, on R2-05's premise that an applied decision closes its gate before the stage runs again or moves `state.stage` on. The premise does not hold in these three cases, and each leaves the pair at `state.stage`:
   1. **`--until validate`:** an approved Validate gate reaches `transition`, whose `stop_until == Some(from)` early return records the stop and closes nothing (`pipeline_gate.rs`, the `stop_until` arm of `transition`).
   2. **SIGKILL during Ship finalization:** `finish_workflow` runs the terminal hooks with the claim still on disk and closes the gate only after they pass. The line then says "never applied" though a merge, bump or tag may have run.
@@ -90,6 +90,6 @@
   **Settled (orchestrator, wave 18):** no change in this phase, moved to backlog 999.172. Every production writer of `stopped` was read: each runs in the process that owns the run, or refuses a launch it did not end (`unaddressed_launch_refusal`). So only a hand edit reaches it.
 
 - `stop` over a live pid in the agent pid file cannot record `stopped` until that pid ends (found during 50.1-24, by plan)
-  status: open, by plan
+  status: open, by plan; OPERATIONS now names the case and both ways out (50.1-25, 7b4c9a8 and 98221ec). `stop`'s own line still does not name removing the file.
   **What:** D-19's no-holder branch uses 50.1-18's `live_phase_agent`, whose second source is the agent pid file. A pid reused by an unrelated process satisfies it, so `stop` exits non-zero with the `ps` check, and keeps doing so while that process lives. The launch guard already refuses `start` and `resume` on the same predicate. The operator's way out is to end the process or remove the pid file; the line does not name the second.
   **Why deferred:** the plan specifies this source, and wording of 50.1-18's shared line is not this plan's to change. 50.1-25's docs should name the case.
