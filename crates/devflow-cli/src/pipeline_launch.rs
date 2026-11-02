@@ -13119,6 +13119,300 @@ mod tests {
         );
     }
 
+    /// Longer than several of the watch's reads after a promotion (one a second), and far
+    /// short of the fake agent's own 60 s.
+    const PAST_THE_RECORDED_READS: Duration = Duration::from_millis(3500);
+
+    /// N+1 promoted, N gone, N+1's agent waiting for `go2`. Returns N+1's launch id, socket
+    /// and agent group. The pause is well past the 20 ms promotion poll, so its watch has
+    /// read `Recorded` before the caller changes the state; a stalled host would only send
+    /// the case through the earlier verdict's arm, which ends the group the same way.
+    fn promoted_next(run: &HandoffRun) -> (String, PathBuf, u32) {
+        run.go();
+        run.wait_held();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 as pending");
+        let pgid =
+            devflow_core::supervisor::read_sidecar(&pending.socket_path.with_extension("json"))
+                .expect("N+1's sidecar")
+                .agent_pgid;
+        release_and_wait_for_n(run);
+        assert!(
+            run.state()
+                .supervisor
+                .is_some_and(|r| r.launch_id == pending.launch_id),
+            "N+1 is promoted: {}",
+            run.events()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !devflow_core::test_support::live_group_members(pgid).is_empty(),
+            "precondition: N+1's agent runs"
+        );
+        (pending.launch_id, pending.socket_path, pgid)
+    }
+
+    /// How long a group the watch ends may stay: one read, then the terminate wait.
+    fn recorded_watch_end_bound() -> Duration {
+        Duration::from_secs(1) + devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(2)
+    }
+
+    /// Assert the group ends within [`recorded_watch_end_bound`] and the supervisor exits.
+    fn assert_group_ended_and_supervisor_gone(run: &HandoffRun, socket: &Path, pgid: u32) {
+        let bound = recorded_watch_end_bound();
+        assert!(
+            poll_until(bound, || devflow_core::test_support::live_group_members(
+                pgid
+            )
+            .is_empty()),
+            "the group has no live member within {bound:?}: {:?}; events:\n{}",
+            devflow_core::test_support::live_group_members(pgid),
+            run.events()
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(socket)),
+            "the supervisor exits: {}",
+            run.events()
+        );
+    }
+
+    /// Assert the promoted agent outlives [`PAST_THE_RECORDED_READS`] with no refusal logged.
+    fn assert_agent_outlives_the_reads(run: &HandoffRun, pgid: u32) {
+        std::thread::sleep(PAST_THE_RECORDED_READS);
+        assert!(
+            !devflow_core::test_support::live_group_members(pgid).is_empty(),
+            "the agent still runs: {}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "no refusal: {}",
+            run.events()
+        );
+    }
+
+    /// Let N+1's agent finish and assert the run reaches its `--until` stop, unrefused.
+    fn assert_run_finishes_normally(run: &HandoffRun) {
+        std::fs::write(run.root.join("go2"), "").unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || !events_named(
+                &run.root,
+                "workflow_finished"
+            )
+            .is_empty()),
+            "the run reaches its --until stop: {}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "no refusal: {}",
+            run.events()
+        );
+    }
+
+    /// SUPV-04: a takeover that lands after the promotion ends the running agent's group.
+    /// The supervisor logs it and writes nothing, and launches nothing.
+    #[test]
+    fn a_supervisor_superseded_after_its_promotion_ends_its_agents_group() {
+        const NAME: &str = "pipeline_launch::tests::a_supervisor_superseded_after_its_promotion_ends_its_agents_group";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1931";
+        let run = HandoffRun::launch(PhaseId::new(1931));
+        let (ours, socket, pgid) = promoted_next(&run);
+        let launched = stage_launched_count(&run.root, run.phase);
+
+        supersede(&run.root, run.phase, X);
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+
+        assert_group_ended_and_supervisor_gone(&run, &socket, pgid);
+        let event = superseded_event_of(&run, &ours, X, "superseded");
+        assert_eq!(event["agent_group"], "ended", "{event}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            launched,
+            "no launch"
+        );
+    }
+
+    /// A state file that is gone after the promotion names no launch, so it ends the group
+    /// too, and the event records that no launch replaced this one.
+    #[test]
+    fn a_state_gone_after_the_promotion_ends_the_agents_group() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_state_gone_after_the_promotion_ends_the_agents_group";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1932));
+        let (ours, socket, pgid) = promoted_next(&run);
+        let path = workflow::state_path(&run.root, run.phase);
+
+        std::fs::remove_file(&path).unwrap();
+
+        assert_group_ended_and_supervisor_gone(&run, &socket, pgid);
+        let events = events_named(&run.root, "supervisor_superseded");
+        assert_eq!(events.len(), 1, "one event: {}", run.events());
+        assert_eq!(events[0]["ours"], ours.as_str(), "{}", events[0]);
+        assert_eq!(
+            events[0].get("recorded"),
+            Some(&serde_json::Value::Null),
+            "{}",
+            events[0]
+        );
+        assert_eq!(events[0]["reason"], "superseded", "{}", events[0]);
+        assert_eq!(events[0]["agent_group"], "ended", "{}", events[0]);
+        assert!(!path.exists(), "no state write");
+    }
+
+    /// A state that does not parse after the promotion says nothing about who owns the run,
+    /// so a healthy agent keeps running, and the run goes on once the state reads again.
+    #[test]
+    fn an_unparsable_state_after_the_promotion_leaves_the_agent_running() {
+        const NAME: &str = "pipeline_launch::tests::an_unparsable_state_after_the_promotion_leaves_the_agent_running";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1933));
+        let (_, _, pgid) = promoted_next(&run);
+        let path = workflow::state_path(&run.root, run.phase);
+        let good = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_agent_outlives_the_reads(&run, pgid);
+
+        std::fs::write(&path, &good).unwrap();
+        assert_run_finishes_normally(&run);
+    }
+
+    /// A state path that cannot be examined (here a symlink loop, `ELOOP`, which also holds
+    /// for root) is an I/O failure and not a state that is gone, so it leaves a healthy
+    /// agent running.
+    #[test]
+    fn a_state_path_that_cannot_be_examined_leaves_the_agent_running() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_state_path_that_cannot_be_examined_leaves_the_agent_running";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1934));
+        let (_, _, pgid) = promoted_next(&run);
+        let path = workflow::state_path(&run.root, run.phase);
+        let good = std::fs::read(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        let loaded = workflow::load_state(&run.root, run.phase);
+        assert!(
+            matches!(&loaded, Err(workflow::WorkflowError::Io(_))),
+            "an I/O failure, not a missing state: {loaded:?}"
+        );
+        assert_agent_outlives_the_reads(&run, pgid);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, &good).unwrap();
+        assert_run_finishes_normally(&run);
+    }
+
+    /// A state that names this launch only as pending after its promotion still names it,
+    /// so it is no takeover and the agent keeps running. The ownership fence still refuses
+    /// what this supervisor would write next, once the agent has exited.
+    #[test]
+    fn a_state_naming_it_only_pending_after_the_promotion_leaves_the_agent_to_the_fence() {
+        const NAME: &str = "pipeline_launch::tests::a_state_naming_it_only_pending_after_the_promotion_leaves_the_agent_to_the_fence";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1935";
+        let run = HandoffRun::launch(PhaseId::new(1935));
+        let (ours, socket, pgid) = promoted_next(&run);
+        workflow::update_state(&run.root, run.phase, |on_disk| {
+            on_disk.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+                ours.clone(),
+                socket.clone(),
+                run.root.join("x.live"),
+            ));
+            on_disk.supervisor = Some(SupervisorRecord::new(
+                run.root.join("x.sock"),
+                X.to_string(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+
+        assert_agent_outlives_the_reads(&run, pgid);
+
+        std::fs::write(run.root.join("go2"), "").unwrap();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&socket)),
+            "the supervisor exits: {}",
+            run.events()
+        );
+        let event = superseded_event_of(&run, &ours, X, "superseded");
+        assert_eq!(event["agent_group"], "already_exited", "{event}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        assert!(
+            events_named(&run.root, "workflow_finished").is_empty(),
+            "it did not advance: {}",
+            run.events()
+        );
+    }
+
+    /// A stop that reaches a promoted supervisor while its agent runs ends as a stop: the
+    /// watch stays out of it, and the state records the stop.
+    #[test]
+    fn a_stop_after_the_promotion_is_not_a_supersession() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_stop_after_the_promotion_is_not_a_supersession";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1936));
+        let (_, socket, pgid) = promoted_next(&run);
+        let outcome = devflow_core::supervisor::request_shutdown(&socket, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "N+1 answers stopped: {outcome:?}"
+        );
+        assert!(
+            poll_until(recorded_watch_end_bound(), || {
+                devflow_core::test_support::live_group_members(pgid).is_empty()
+            }),
+            "the stop ended the group"
+        );
+        assert!(
+            events_named(&run.root, "supervisor_superseded").is_empty(),
+            "a stop is not a supersession: {}",
+            run.events()
+        );
+        assert!(run.state().stopped, "the stop is recorded");
+    }
+
     /// Whether the promotion wait covers a live launcher's serve-to-promotion latency:
     /// one probe's reply read, one contract-honouring write-lock holder ahead, and a 2 s
     /// allowance for the poll, the launcher's own closure and its fsyncs.
