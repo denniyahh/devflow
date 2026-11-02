@@ -9514,6 +9514,226 @@ mod tests {
         assert_eq!(leftover.launch_id, run.n.launch_id);
     }
 
+    // ---- 50.1-17: the stage handoff records its next supervisor first (D-01) ----
+
+    /// The `<stage>:<path>` hold core's supervisor reads before its agent spawn
+    /// (50.1-16): liveness lock adopted, no socket, no agent.
+    const AGENT_SPAWN_HOLD_ENV: &str = "DEVFLOW_TEST_AGENT_SPAWN_HOLD";
+
+    /// The parent half of a test whose next supervisor (Plan) is held before its
+    /// agent spawn, on the advance-running monitor entry.
+    fn run_spawn_held_handoff_child(name: &str) {
+        let path_dir = handoff_claude_dir(SUCCESS_MARKER);
+        let hold_dir = tempfile::Builder::new()
+            .prefix("dfh")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let hold = std::ffi::OsString::from(format!(
+            "plan:{}",
+            hold_dir.path().join("release").display()
+        ));
+        let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+            (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+            ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("120")),
+            (AGENT_SPAWN_HOLD_ENV, hold.as_os_str()),
+        ];
+        let output = run_hermetic_test_in_child(name, path_dir.path(), &env);
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+    }
+
+    /// The release file of the agent-spawn hold. Dropping it releases the hold, so a
+    /// failing assertion does not leave a supervisor waiting out its bound.
+    struct SpawnHold(PathBuf);
+
+    impl SpawnHold {
+        fn from_env() -> Self {
+            let hold = std::env::var(AGENT_SPAWN_HOLD_ENV).expect("the parent names the hold");
+            let (_, path) = hold.split_once(':').expect("<stage>:<path>");
+            Self(PathBuf::from(path))
+        }
+
+        fn wait_held(&self, run: &HandoffRun) {
+            let held = PathBuf::from(format!("{}.held", self.0.display()));
+            assert!(
+                poll_until(HANDOFF_STEP_WAIT, || held.exists()),
+                "the next supervisor never reached its agent-spawn hold; events:\n{}",
+                run.events()
+            );
+        }
+
+        fn release(&self) {
+            std::fs::write(&self.0, "").unwrap();
+        }
+    }
+
+    impl Drop for SpawnHold {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "");
+        }
+    }
+
+    /// SIGKILL stage N's supervisor and wait for its socket to read Stale.
+    fn kill_stage_n(run: &HandoffRun) {
+        signal_supervisor(run, libc::SIGKILL);
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || matches!(
+                devflow_core::supervisor::probe(&run.n.socket_path),
+                Ok(devflow_core::supervisor::Liveness::Stale)
+            )),
+            "N's leftover socket probes Stale after the kill"
+        );
+    }
+
+    /// V-02 (crash-table row C4, T-50-91): S(N) SIGKILLed after spawning N+1 and before
+    /// promoting it leaves a state that names N+1, so `resume` refuses. N+1 is held
+    /// before its agent spawn and N's agent has exited, so the agent pid file cannot be
+    /// what refuses.
+    #[test]
+    fn resume_refuses_while_the_unpromoted_next_supervisor_lives() {
+        use devflow_core::liveness;
+        const NAME: &str =
+            "pipeline_launch::tests::resume_refuses_while_the_unpromoted_next_supervisor_lives";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_spawn_held_handoff_child(NAME);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1701));
+        let hold = SpawnHold::from_env();
+        run.go();
+        hold.wait_held(&run);
+        kill_stage_n(&run);
+        assert!(
+            crate::commands::agent_pid_from_file(&run.root, run.phase)
+                .is_none_or(|pid| !devflow_core::agent::agent_running(pid)),
+            "the agent pid file must not be able to cause the refusal"
+        );
+        let state_file = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let result = resume(&run.root, run.phase, None, true);
+        // A resume that wrongly launched is ended before the assertions below fail.
+        let after = run.state();
+        let _reap = ReapMonitorOnDrop::after_launch(&after);
+
+        let text = result
+            .expect_err("resume must refuse while the unpromoted next supervisor lives")
+            .to_string();
+        let phase = run.phase;
+        assert!(
+            text.contains(&format!("devflow stop --phase {phase}")),
+            "the refusal names stop: {text}"
+        );
+        let pending = after
+            .pending_supervisor
+            .clone()
+            .expect("the state names N+1 as pending");
+        assert_ne!(pending.launch_id, run.n.launch_id, "the pending one is N+1");
+        assert!(
+            text.contains(&pending.launch_id),
+            "the refusal names N+1's launch id: {text}"
+        );
+        assert!(
+            !text.contains("devflow resume"),
+            "no resume hint while N+1 lives: {text}"
+        );
+        assert!(
+            !text.contains("agent pid"),
+            "the refusal must not come from the agent pid file: {text}"
+        );
+        assert_eq!(
+            after.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "the state still names the dead N, beside its pending N+1"
+        );
+        assert_eq!(
+            liveness::probe(&pending.liveness_path).unwrap(),
+            liveness::Held::Live,
+            "N+1 alone holds its lock now that N is dead"
+        );
+        assert!(
+            !pending.socket_path.exists(),
+            "N+1 is held before it publishes a socket"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "a refused resume writes no state"
+        );
+
+        hold.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || matches!(
+                devflow_core::supervisor::probe(&pending.socket_path),
+                Ok(devflow_core::supervisor::Liveness::Alive(_))
+            )),
+            "N+1 publishes once released; events:\n{}",
+            run.events()
+        );
+        let outcome =
+            devflow_core::supervisor::request_shutdown(&pending.socket_path, SUPERVISOR_STOP_WAIT);
+        assert!(
+            matches!(
+                outcome,
+                Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. })
+            ),
+            "N+1 ends through its socket: {outcome:?}"
+        );
+    }
+
+    /// D-01: both supervisors may be live during a handoff, and the state names both
+    /// until the publish save promotes the next one. N+1 has answered its ping by then.
+    #[test]
+    fn a_handoff_names_both_supervisors_until_the_promotion() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_handoff_names_both_supervisors_until_the_promotion";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1702));
+        assert_eq!(
+            run.state().pending_supervisor,
+            None,
+            "precondition: N's own launch was promoted"
+        );
+        run.go();
+        run.wait_held();
+
+        let held = run.state();
+        assert_eq!(
+            held.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "before the publish the state still records N"
+        );
+        let pending = held
+            .pending_supervisor
+            .expect("before the publish the state names N+1 as pending");
+        assert_ne!(pending.launch_id, run.n.launch_id, "the pending one is N+1");
+        match devflow_core::supervisor::probe(&pending.socket_path) {
+            Ok(devflow_core::supervisor::Liveness::Alive(reply)) => {
+                assert_eq!(reply.launch_id, pending.launch_id);
+            }
+            other => panic!("N+1 answered its ping before the publish, got {other:?}"),
+        }
+
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || run
+                .state()
+                .supervisor
+                .is_some_and(|r| r.launch_id == pending.launch_id)),
+            "the publish records N+1; events:\n{}",
+            run.events()
+        );
+        assert_eq!(
+            run.state().pending_supervisor,
+            None,
+            "the publish save that records N+1 also ends its reservation"
+        );
+    }
+
     // ---- 50-23: every launch failure path has a defined end state ----
 
     /// A previous stage's supervisor record whose socket does not exist and
