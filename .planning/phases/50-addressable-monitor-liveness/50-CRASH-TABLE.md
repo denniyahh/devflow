@@ -8,10 +8,10 @@ checker and the executor check them against, and the input Phase 50.1's ownershi
 50.1, with a trip-wire: if more than a handful of rows have no answerable outcome without deciding who owns the run,
 the ordering question goes back to the operator.
 
-**Actors and records.** L = the launcher (`devflow start` / `resume`, holds the per-phase lock). S, S(N), S(N+1) =
+**Actors and records.** L = the launcher (`devflow start` / `resume`; held the per-phase lock in Phase 50, and since Phase 50.1, which retired that lock, holds `.devflow/.holder-NN` before its spawn and a launch's reservation). S, S(N), S(N+1) =
 `__monitor` supervisors (own process group, 50-11). A = an agent group (`process_group(0)`, 50-08). Records:
 `state.supervisor` (50-06), the sidecar `<stem>.json`, the socket `<stem>.sock` (published from `<stem>.part`, 50-05),
-the per-phase lock, `state.stopped`.
+the per-phase lock (Phase 50 only), `state.stopped`.
 
 **Status values.** COVERED: a plan states the outcome and a named test proves it. STATED: a plan states it, no named
 test for this timing. ACCEPTED: a recorded residual (threat id or backlog). GAP: no plan states the outcome.

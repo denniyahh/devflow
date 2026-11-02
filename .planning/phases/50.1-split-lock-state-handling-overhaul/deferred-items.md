@@ -62,7 +62,7 @@
   **Why deferred:** 50.1-22 owns the `stop` help and 50.1-21 deletes the lock API, so each goes with its owner. Nothing reads them as behaviour.
 
 - `RecoverError::Lock` has no constructor left after 50.1-21 (found during 50.1-21)
-  status: open
+  status: resolved by c2523e3, which removed the variant.
   **What:** nothing in `devflow-core` returns it now that `recover` takes no per-phase lock. Its `#[from] LockError` keeps it compiling and its doc says so.
   **Why deferred:** removing a `pub` variant is a semver break no 50.1 plan declared. It goes on 50.1-28's list to keep or remove.
 
