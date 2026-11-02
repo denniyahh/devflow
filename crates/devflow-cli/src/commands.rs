@@ -10403,22 +10403,33 @@ mod tests {
     }
 
     /// Task 2 behavior: `--dry-run` computes and prints every decision but
-    /// writes nothing — the aged gate stays open with no response file.
+    /// writes nothing: an aged gate with a live waiter, which the sweep would
+    /// otherwise answer, stays open with no response file. The second sweep is
+    /// the control: without `--dry-run` the same gate is reaped.
     #[test]
     fn gate_sweep_dry_run_does_not_write_a_response() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, PhaseId::new(30), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(30), Stage::Ship, aged_past_threshold());
+        let (phase, stage) = (PhaseId::new(30), Stage::Ship);
+        let (_, registration) = Gates::open_registered(root, phase, stage, "ctx").unwrap();
+        backdate_gate(root, phase, stage, aged_past_threshold());
 
         gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
 
         assert!(
-            gate_answer_files(root, PhaseId::new(30), Stage::Ship).is_empty(),
+            gate_answer_files(root, phase, stage).is_empty(),
             "dry-run must never write a response file"
         );
         let open = Gates::list_open(root);
         assert_eq!(open.len(), 1, "dry-run must leave the gate open");
+
+        gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
+        assert_eq!(
+            gate_answer_files(root, phase, stage).len(),
+            1,
+            "the control: without --dry-run the same gate and waiter are reaped"
+        );
+        registration.finish();
     }
 
     /// Task 2 behavior: a gate that already has a response is a benign race
