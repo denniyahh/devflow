@@ -45,8 +45,8 @@ pub struct RecoveryStatus {
     pub is_stale: bool,
     /// Human-readable age of the state.
     pub age: String,
-    /// Whether a lock file is present (shows holder PID).
-    pub lock_held: Option<String>,
+    /// Why the run may still be live, or `None` when nothing says so.
+    pub live: Option<String>,
 }
 
 /// Inspect every active phase state, producing one recovery status per phase
@@ -67,14 +67,14 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
     let agent_running = agent_pid_for(&state).is_some_and(crate::agent::agent_running);
     let is_stale = is_stale_state(&state);
     let age = format_age(state.started_at.as_str());
-    let lock_held = crate::lock::holder(project_root, state.phase).map(|(pid, _)| pid);
+    let _ = project_root;
 
     RecoveryStatus {
         state,
         agent_running,
         is_stale,
         age,
-        lock_held,
+        live: None,
     }
 }
 
@@ -111,6 +111,9 @@ pub struct CleanReport {
     pub removal_failed: bool,
     /// Phases kept, and removals that failed, in human-readable form.
     pub warnings: Vec<String>,
+    /// Every set-aside gate answer found. None is removed (D-05): each stays until the
+    /// operator removes it by hand.
+    pub quarantined: Vec<std::path::PathBuf>,
 }
 
 impl CleanReport {
@@ -150,6 +153,8 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
         if workflow::state_path(project_root, instructions.phase).exists() {
             continue;
         }
+        #[cfg(test)]
+        recover_test_hook(RecoverPoint::CronListed, instructions.phase);
         let (removed, result) = crate::ship::delete_cron_instructions_with_partial_result(
             project_root,
             instructions.phase,
@@ -488,6 +493,10 @@ enum RecoverPoint {
     SweepListed,
     /// `clean_report` listed a phase's gate files and has not decided them.
     OrphanGatesListed,
+    /// `clean_report` listed a phase's cron record and has not decided it.
+    CronListed,
+    /// `clean_phase_report`'s `clear_state_if` returned: the write lock is released.
+    ExplicitClearReturned,
 }
 
 /// Run the hook this thread installed, with its slot free so the hook may run anything.
@@ -581,6 +590,8 @@ fn clean_phase_files(project_root: &Path, phase: PhaseId, report: &mut PhaseClea
             ));
         }
     }
+    #[cfg(test)]
+    recover_test_hook(RecoverPoint::ExplicitClearReturned, phase);
     let (cron_removed, cron_result) =
         crate::ship::delete_cron_instructions_with_partial_result(project_root, phase);
     report.removed_anything |= cron_removed;
@@ -2225,5 +2236,395 @@ mod tests {
         );
         assert_eq!(report.orphan_gates_cleared, vec![control]);
         assert!(!control_gate.exists());
+    }
+
+    /// Bound on a test's holder of the write lock, so that a clean which fails to give
+    /// up fails its assertion instead of hanging.
+    const WRITE_LOCK_HOLD_BOUND: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn inspect_reports_why_a_phase_may_be_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (held, idle) = (PhaseId::new(2120), PhaseId::new(2121));
+        let pending = pending_record(root, "aaaa0000aaaa2120");
+        let liveness_path = pending.liveness_path.clone();
+        save_stale(root, held, |state| state.pending_supervisor = Some(pending));
+        save_stale(root, idle, |_| {});
+        let _hold = crate::liveness::Hold::take(&liveness_path).unwrap();
+
+        let statuses = inspect_all(root).expect("two phases");
+
+        let live: Vec<_> = statuses
+            .iter()
+            .map(|s| (s.state.phase, s.live.clone()))
+            .collect();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].0, held);
+        let reason = live[0]
+            .1
+            .as_deref()
+            .expect("a held pending lock is a reason");
+        assert!(
+            reason.contains("pending supervisor")
+                && reason.contains(&liveness_path.display().to_string()),
+            "{reason}"
+        );
+        assert_eq!(live[1], (idle, None), "nothing is live for the other phase");
+    }
+
+    #[test]
+    fn explicit_clean_refuses_a_phase_with_a_registered_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2122);
+        workflow::save_state(&state_aged_phase(root, phase, 0, None)).unwrap();
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Code, "waiting").unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let (state_before, gate_before) = (
+            std::fs::read(&state_path).unwrap(),
+            std::fs::read(&opened.path).unwrap(),
+        );
+
+        let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
+
+        assert_eq!(std::fs::read(&state_path).ok(), Some(state_before));
+        assert_eq!(std::fs::read(&opened.path).ok(), Some(gate_before));
+        assert!(report.removal_failed, "a kept phase cannot read as cleaned");
+        assert!(!report.removed_anything);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("registered gate waiter")
+                    && w.contains(&format!("devflow stop --phase {phase}"))),
+            "{:?}",
+            report.warnings
+        );
+
+        // Control: with the registration released the same call clears it.
+        drop(registration);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let report = clean_phase_report(root, phase).expect("explicit clean");
+            if !state_path.exists() {
+                assert!(report.removed_anything, "{:?}", report.warnings);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                report.warnings
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!opened.path.exists());
+    }
+
+    /// 50.1-16: an explicit clean must not delete a launch whose supervisor holds its
+    /// reservation, even with no socket yet. The CLI refuses first through its own guard;
+    /// this is the decision under the lock, which a `start` racing that guard reaches.
+    #[test]
+    fn explicit_clean_refuses_a_live_pending_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2123);
+        let pending = pending_record(root, "aaaa0000aaaa2123");
+        let liveness_path = pending.liveness_path.clone();
+        let mut state = state_aged_phase(root, phase, 0, None);
+        state.pending_supervisor = Some(pending);
+        workflow::save_state(&state).unwrap();
+        let hold = crate::liveness::Hold::take(&liveness_path).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
+
+        assert_eq!(std::fs::read(&state_path).ok(), Some(before));
+        assert!(report.removal_failed);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("pending supervisor")
+                    && w.contains(&liveness_path.display().to_string())),
+            "{:?}",
+            report.warnings
+        );
+
+        drop(hold);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while state_path.exists() {
+            let report = clean_phase_report(root, phase).expect("explicit clean");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                report.warnings
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// With no state to read, a state that does not parse, or both, a live waiter or
+    /// holder still keeps the files: the lock this replaced refused whatever the state.
+    #[test]
+    fn explicit_clean_refuses_a_live_waiter_or_holder_without_a_loadable_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unparsable = PhaseId::new(2124);
+        let state_path = workflow::state_path(root, unparsable);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, "{\"stage\":").unwrap();
+        let hold = crate::liveness::claim_phase_holder(root, unparsable).unwrap();
+
+        let report = clean_phase_report(root, unparsable).expect("explicit clean");
+
+        assert_eq!(
+            std::fs::read_to_string(&state_path).ok().as_deref(),
+            Some("{\"stage\":"),
+            "a live holder keeps an unparsable state"
+        );
+        assert!(report.removal_failed, "{:?}", report.warnings);
+        drop(hold);
+
+        let missing = PhaseId::new(2125);
+        let (opened, registration) =
+            Gates::open_registered(root, missing, Stage::Code, "waiting").unwrap();
+
+        let report = clean_phase_report(root, missing).expect("explicit clean");
+
+        assert!(opened.path.exists(), "a waited-on gate file stays");
+        assert!(report.removal_failed, "{:?}", report.warnings);
+        drop(registration);
+    }
+
+    /// R-03: a repair verb never hangs on a holder of the write lock, and says who it is.
+    #[test]
+    fn explicit_clean_gives_up_on_a_held_write_lock_and_names_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2126);
+        save_stale(root, phase, |_| {});
+        let gate = Gates::write_gate(root, phase, Stage::Code, "left open").unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let (state_before, gate_before) = (
+            std::fs::read(&state_path).unwrap(),
+            std::fs::read(&gate).unwrap(),
+        );
+        let (entered, holder_is_inside) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                workflow::update_state(root, phase, |_| {
+                    entered.send(()).unwrap();
+                    let _ = released.recv_timeout(WRITE_LOCK_HOLD_BOUND);
+                    Ok::<(), WorkflowError>(())
+                })
+                .unwrap();
+            });
+            holder_is_inside.recv().unwrap();
+
+            let started = std::time::Instant::now();
+            let result = clean_phase_report(root, phase);
+            let took = started.elapsed();
+            let state_then = std::fs::read(&state_path).ok();
+            let gate_then = std::fs::read(&gate).ok();
+            let _ = release.send(());
+
+            let error = result.expect_err("a held write lock must end the clean with an error");
+            assert!(
+                matches!(
+                    &error,
+                    RecoverError::Workflow(WorkflowError::WriteLockTimeout {
+                        holder: Some(pid),
+                        ..
+                    }) if *pid == std::process::id()
+                ),
+                "{error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("pid {}", std::process::id())),
+                "{error}"
+            );
+            assert!(
+                took >= workflow::WRITE_LOCK_REPAIR_WAIT,
+                "gave up after {took:?}"
+            );
+            assert!(
+                took < workflow::WRITE_LOCK_REPAIR_WAIT + Duration::from_secs(2),
+                "gave up after {took:?}"
+            );
+            assert_eq!(state_then, Some(state_before));
+            assert_eq!(gate_then, Some(gate_before));
+        });
+
+        // Control: released, the same call clears the phase.
+        let report = clean_phase_report(root, phase).expect("explicit clean");
+        assert!(report.removed_anything, "{:?}", report.warnings);
+        assert!(!state_path.exists());
+        assert!(!gate.exists());
+    }
+
+    /// R2-07: a run that reserves right after the explicit clean let go of the write lock
+    /// writes its own rate-limit record. The clean's cron removal must already be done.
+    #[test]
+    fn explicit_clean_removes_the_cron_record_before_it_releases_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (replaced, control) = (PhaseId::new(2127), PhaseId::new(2128));
+        for phase in [replaced, control] {
+            save_stale(&root, phase, |_| {});
+            let record = crate::ship::build_single_agent_cron_instructions(&root, phase, "run A");
+            crate::ship::write_cron_instructions(&root, &record).unwrap();
+        }
+        let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hook_root, hook_run_b) = (root.clone(), run_b.clone());
+
+        let report = with_recover_hook(
+            move |point, phase| {
+                if point != RecoverPoint::ExplicitClearReturned || phase != replaced {
+                    return;
+                }
+                let root = hook_root.as_path();
+                workflow::update_state_with(root, phase, |_| {
+                    let run_b = state_aged_phase(root, phase, 0, None);
+                    Ok::<_, WorkflowError>((Some(run_b), ()))
+                })
+                .unwrap();
+                let record =
+                    crate::ship::build_single_agent_cron_instructions(root, phase, "run B");
+                crate::ship::write_cron_instructions(root, &record).unwrap();
+                *hook_run_b.borrow_mut() = Some((
+                    std::fs::read(workflow::state_path(root, phase)).unwrap(),
+                    std::fs::read(crate::ship::cron_instructions_path(root, phase)).unwrap(),
+                ));
+            },
+            || clean_phase_report(&root, replaced).expect("explicit clean"),
+        );
+
+        assert!(
+            report.removed_anything,
+            "run A was cleared: {:?}",
+            report.warnings
+        );
+        let (state_b, cron_b) = run_b.borrow_mut().take().expect("the hook ran");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, replaced)).ok(),
+            Some(state_b),
+            "run B's state must survive"
+        );
+        assert_eq!(
+            std::fs::read(crate::ship::cron_instructions_path(&root, replaced)).ok(),
+            Some(cron_b),
+            "run B's cron record must survive"
+        );
+
+        // Control: with nothing in the gap, both of the phase's files go.
+        clean_phase_report(&root, control).expect("explicit clean");
+        assert!(!workflow::state_path(&root, control).exists());
+        assert!(!crate::ship::cron_instructions_path(&root, control).exists());
+    }
+
+    /// R2-07, the sweep side: a record listed with no state may be a new run's by the
+    /// time the sweep decides. Q's orphan record, with nothing in the gap, goes.
+    #[test]
+    fn the_orphan_cron_sweep_keeps_the_record_of_a_run_that_reserved_after_its_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (started, control) = (PhaseId::new(2129), PhaseId::new(2130));
+        for phase in [started, control] {
+            let record = crate::ship::build_single_agent_cron_instructions(&root, phase, "orphan");
+            crate::ship::write_cron_instructions(&root, &record).unwrap();
+        }
+        let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hook_root, hook_run_b) = (root.clone(), run_b.clone());
+
+        let report = with_recover_hook(
+            move |point, phase| {
+                if point != RecoverPoint::CronListed || phase != started {
+                    return;
+                }
+                let root = hook_root.as_path();
+                workflow::update_state_with(root, phase, |_| {
+                    let run_b = state_aged_phase(root, phase, 0, None);
+                    Ok::<_, WorkflowError>((Some(run_b), ()))
+                })
+                .unwrap();
+                let record =
+                    crate::ship::build_single_agent_cron_instructions(root, phase, "run B");
+                crate::ship::write_cron_instructions(root, &record).unwrap();
+                *hook_run_b.borrow_mut() = Some((
+                    std::fs::read(workflow::state_path(root, phase)).unwrap(),
+                    std::fs::read(crate::ship::cron_instructions_path(root, phase)).unwrap(),
+                ));
+            },
+            || clean_report(&root).expect("clean"),
+        );
+
+        let (state_b, cron_b) = run_b.borrow_mut().take().expect("the hook ran");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, started)).ok(),
+            Some(state_b)
+        );
+        assert_eq!(
+            std::fs::read(crate::ship::cron_instructions_path(&root, started)).ok(),
+            Some(cron_b),
+            "run B's cron record must survive"
+        );
+        assert_eq!(report.orphan_cron_records_removed, vec![control]);
+        assert!(!crate::ship::cron_instructions_path(&root, control).exists());
+    }
+
+    /// pi S3: `recover` keeps every set-aside answer (D-05) and lists it, so an operator
+    /// learns it persists until removed by hand.
+    #[test]
+    fn clean_reports_quarantined_answers_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(clean_report(root).expect("clean").quarantined.is_empty());
+
+        let (cleared, kept) = (PhaseId::new(2131), PhaseId::new(2132));
+        save_stale(root, cleared, |_| {});
+        workflow::save_state(&state_aged_phase(root, kept, 60, None)).unwrap();
+        for phase in [cleared, kept] {
+            let gate = Gates::open_gate(root, phase, Stage::Code, "ctx")
+                .unwrap()
+                .gate_id;
+            Gates::answer(
+                root,
+                phase,
+                Stage::Code,
+                &gate,
+                &GateResponse {
+                    approved: true,
+                    note: None,
+                    responded_by: Some("test".into()),
+                },
+            )
+            .unwrap();
+            // Closing the gate sets its unconsumed answer aside.
+            Gates::close(root, phase, Stage::Code).unwrap();
+        }
+        let set_aside = Gates::quarantined(root);
+        assert_eq!(set_aside.len(), 2, "fixture: {set_aside:?}");
+        let paths: Vec<_> = set_aside.into_iter().map(|answer| answer.path).collect();
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+
+        let report = clean_report(root).expect("clean");
+
+        assert_eq!(report.cleared, vec![cleared], "{:?}", report.warnings);
+        assert_eq!(report.quarantined, paths);
+        let after: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert_eq!(after, before);
     }
 }
