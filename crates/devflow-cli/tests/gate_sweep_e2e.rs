@@ -334,10 +334,6 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         10,
         "the child to write the Code gate",
     );
-    // The reap itself: the same `Gates::reap_answer` primitive Task 1/2's tests
-    // exercise against a thread-based live poller. This test's job is to
-    // prove the OTHER end of that same write — a real, separate process
-    // consuming it.
     let listed = Gates::list_open(root)
         .into_iter()
         .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
@@ -351,15 +347,22 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         10,
         "the child's registration at the Code gate",
     );
-    Gates::reap_answer(
-        root,
-        phase,
-        Stage::Code,
-        &gate_id,
-        "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
-        "devflow-reap",
-    )
-    .expect("reap the aged Code gate");
+    // The reap itself: the real `devflow gate sweep`, with the age limit at zero because
+    // this gate is seconds old. Its own age and waiter checks are on this path. Whether it
+    // reports "reaped" depends on a race it tolerates (the child can consume the answer and
+    // close the gate before the sweep's re-check), so the proof is what the child records
+    // below, not the sweep's line.
+    let swept = common::hermetic_devflow(&home)
+        .args(["gate", "sweep", "--max-age-secs", "0", "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate sweep");
+    assert!(
+        swept.status.success(),
+        "devflow gate sweep failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&swept.stdout),
+        String::from_utf8_lossy(&swept.stderr)
+    );
 
     let status = wait_for_child_exit(&mut child, root, phase, e2e_child_timeout());
 
@@ -378,14 +381,21 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     assert!(
         events
             .lines()
+            .any(|line| line.contains("\"gate_resolved\"") && line.contains("devflow-reap")),
+        "the target process must have resolved its gate on the sweep's own answer\n\
+         events:\n{events}"
+    );
+    assert!(
+        events
+            .lines()
             .any(|line| line.contains("\"workflow_aborted\"")),
         "the target process must have run its own abort() path, recording \
          workflow_aborted — the whole claim this plan rests on\nevents:\n{events}"
     );
 
     // The negative that separates this plan from a reaper that terminates
-    // processes: neither the sweep's write path (`Gates::reap_answer`, exercised
-    // above) nor this test itself ever sent the child a signal. Checked
+    // processes: neither the sweep run above nor this test itself ever sent
+    // the child a signal. Checked
     // mechanically by this file's own acceptance grep for signalling call
     // forms (must be zero), not asserted at runtime — there is no API
     // surface here that could send one.

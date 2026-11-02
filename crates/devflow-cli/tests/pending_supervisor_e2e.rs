@@ -340,15 +340,69 @@ fn stop_waits_for_a_pending_supervisor_to_publish_and_ends_it() {
     fixture.assert_stopped(&output, &pending);
 }
 
+/// `pid` frozen with SIGSTOP until this drops, so a failing assertion leaves no process
+/// stopped.
+struct Frozen(libc::pid_t);
+
+impl Frozen {
+    fn new(child: &Child) -> Self {
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+        assert!(pid > 1, "refusing to signal pid {pid}");
+        // SAFETY: `pid > 1` names a child this test spawned and has not reaped.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        Self(pid)
+    }
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        // SAFETY: the pid was checked in `new`, and the child is still unreaped.
+        let _ = unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 /// A launcher still running may promote its launch while `stop` waits, which ends the
 /// pending record without ending the supervisor: `stop` must still end it.
+///
+/// `stop` is frozen during its wait until the promotion is on disk, because unfrozen it
+/// usually sees the published socket first and ends the supervisor as a pending one. Its
+/// wait is almost all sleep, so it resumes to a state with no pending record and only its
+/// re-probe of the recorded supervisor can reach it.
 #[test]
 fn stop_ends_a_launch_its_running_launcher_promotes_during_the_wait() {
     let fixture = Fixture::new(PhaseId::new(183), WAITING_CLAUDE);
     let mut launcher = fixture.spawn_held_launcher();
     let pending = fixture.pending();
 
-    let output = fixture.stop_across_the_release();
+    let mut stop = fixture
+        .stop_command()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn devflow stop");
+    std::thread::sleep(STOP_REACHES_ITS_WAIT);
+    assert_eq!(
+        stop.try_wait().expect("poll devflow stop"),
+        None,
+        "stop returned before the supervisor published"
+    );
+
+    let frozen = Frozen::new(&stop);
+    fixture.hold.release();
+    common::wait_for(
+        || {
+            let state = fixture.state();
+            state.pending_supervisor.is_none()
+                && state
+                    .supervisor
+                    .is_some_and(|record| record.launch_id == pending.launch_id)
+        },
+        REACH_WITHIN,
+        "the launcher to promote its launch to the recorded supervisor",
+    );
+    drop(frozen);
+
+    let output = stop.wait_with_output().expect("wait for devflow stop");
     fixture.assert_stopped(&output, &pending);
     common::wait_for(
         || launcher.try_wait().expect("poll the launcher").is_some(),
