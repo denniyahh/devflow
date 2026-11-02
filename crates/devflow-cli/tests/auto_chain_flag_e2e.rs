@@ -212,6 +212,19 @@ impl Fixture {
             &launch_id,
         )
         .expect("the hermetic socket path fits sun_path");
+        // The state must record this launch, as a launcher's publish does: this monitor
+        // has no launcher to promote it (D-15).
+        devflow_core::workflow::update_state(&self.root, self.phase, |state| {
+            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                socket.as_path().to_path_buf(),
+                launch_id.clone(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<(), devflow_core::workflow::WorkflowError>(())
+        })
+        .unwrap();
         common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
