@@ -117,3 +117,10 @@
   status: open
   **What:** since f929a30, `stop` refuses such a supervisor without recording `stopped`, and `status`, `doctor` and the launch guard name the process holding the lock. No DevFlow verb ends it: the operator ends that pid by hand, and then `stop` or `resume` goes through. The only known trigger is something outside DevFlow deleting the socket file.
   **Why deferred:** signalling a pid read from a liveness file is a design decision. `stop` signals only a foreground holder confirmed by start time today, and Phase 50 D-05/D-06 keep teardown to the socket.
+
+- A supervisor superseded after its promotion kept its running agent until it exited (validate-phase's Open Requirement Gap, R2-10, T-50.1-154)
+  status: fixed, bb70e94
+  **What changed:** the promotion watch reads the state once a second after `Recorded`, until the agent's exit is observed. A state naming another launch or none, or gone, ends the group and reports `Superseded`. A state that does not load, or names the launch only as pending, ends nothing and warns at most once a minute.
+  **Also fixed:** `load_state` read a path it could not examine as `MissingState` (`Path::exists` hides the error), which would have ended a healthy agent. It now returns `Io`. Every other `load_state` caller sees that error too, in place of "no state".
+  **Why only-pending ends nothing:** it still names this launch, so it is not a takeover. No production writer produces it after a promotion, and the fence refuses the supervisor's next write if the agent exits while it holds.
+  **Limits:** a state deleted or rewritten by anything outside DevFlow, such as a `git clean` in the project root, now ends a running agent within about 1 s. The tests write the takeover by hand; no production route to it was driven, and no live run has exercised this watch.
