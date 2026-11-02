@@ -11178,8 +11178,17 @@ mod tests {
         assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
     }
 
+    /// Whether a hint list sends the operator through a hand-run `advance`, whose gate open
+    /// sets an earlier answer aside (D-06).
+    fn hint_routes_an_answer_through_advance(hints: &[String]) -> bool {
+        hints.iter().any(|hint| hint.contains("devflow advance"))
+    }
+
+    /// V-33, D-06: a gate-pending phase whose supervisor is gone is repaired by `resume`, which
+    /// asks again, plus `devflow ship` at Ship, the one stage whose stored answer it applies.
+    /// No liveness, gate state or stage names `advance`.
     #[test]
-    fn recovery_hints_includes_advance_when_gone_while_active_and_gate_pending() {
+    fn recovery_hints_for_a_gone_gate_pending_phase_name_resume_or_ship_not_advance() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::new(
             PhaseId::new(7),
@@ -11189,14 +11198,56 @@ mod tests {
         );
         state.gate_pending = true;
 
-        let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
-
+        state.stage = Stage::Code;
         assert_eq!(
-            hints,
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
+            vec!["devflow resume --phase 7".to_string()]
+        );
+        state.stage = Stage::Ship;
+        assert_eq!(
+            recovery_hints(&state, &PhaseLiveness::GoneWhileActive),
             vec![
                 "devflow resume --phase 7".to_string(),
-                "devflow advance --phase 7".to_string(),
+                "devflow ship --phase 7".to_string(),
             ]
+        );
+
+        let every_liveness = [
+            PhaseLiveness::Alive {
+                owner: "gate_wait".to_string(),
+                launch: "stream".to_string(),
+            },
+            PhaseLiveness::Stale,
+            PhaseLiveness::Gone,
+            PhaseLiveness::GoneWhileActive,
+            PhaseLiveness::NotLaunched,
+            PhaseLiveness::LaunchPending {
+                launch_id: "launch".to_string(),
+                published: true,
+            },
+            PhaseLiveness::ProbeFailed("no reply".to_string()),
+        ];
+        for liveness in &every_liveness {
+            for gate_pending in [false, true] {
+                for stage in [Stage::Code, Stage::Ship] {
+                    state.gate_pending = gate_pending;
+                    state.stage = stage;
+                    let hints = recovery_hints(&state, liveness);
+                    assert!(
+                        !hint_routes_an_answer_through_advance(&hints),
+                        "{liveness:?} gate_pending={gate_pending} {stage}: {hints:?}"
+                    );
+                }
+            }
+        }
+
+        let hints_before_this_rule = [
+            "devflow resume --phase 7".to_string(),
+            "devflow advance --phase 7".to_string(),
+        ];
+        assert!(
+            hint_routes_an_answer_through_advance(&hints_before_this_rule),
+            "the check must catch the list that sent an answer through advance"
         );
     }
 
