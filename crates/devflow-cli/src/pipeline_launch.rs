@@ -1104,8 +1104,10 @@ pub(crate) fn fenced<T>(
     phase: PhaseId,
     op: impl FnOnce() -> Result<T, CliError>,
 ) -> Result<T, CliError> {
-    let _ = (project_root, phase);
-    op()
+    match engaged_launch_id() {
+        Some(launch_id) => workflow::while_owner(project_root, phase, &launch_id, op),
+        None => op(),
+    }
 }
 
 /// `Gates::close` under the ownership fence ([`fenced`], and its non-reentrancy rule: this
@@ -1541,7 +1543,7 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
                     // D-03: the fence refused a write or a gate side effect.
                     Err(CliError::Workflow(workflow::WorkflowError::NotOwner {
                         recorded, ..
-                    })) if recorded.as_deref() == Some("scaffold") => {
+                    })) => {
                         end_superseded(invocation, &run, recorded, SUPERSEDED_REASON);
                         Ok(())
                     }
@@ -11105,6 +11107,74 @@ mod tests {
         );
         superseded_event(&gated, X, "superseded");
         assert_eq!(stage_launched_count(&gated.root, gated.phase), 1);
+    }
+
+    /// D-03: the next stage's spawn is fenced by its `pending_supervisor` commit. A
+    /// supervisor superseded just before it spawns nothing, and its reservation goes.
+    #[test]
+    fn a_superseded_launcher_spawns_nothing_and_gives_its_reservation_back() {
+        const NAME: &str = "pipeline_launch::tests::a_superseded_launcher_spawns_nothing_and_gives_its_reservation_back";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_spawn"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1906";
+        let run = HandoffRun::launch(PhaseId::new(1906));
+        run.go();
+        run.wait_held();
+        supersede(&run.root, run.phase, X);
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "N exits: {}",
+            run.events()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        superseded_event(&run, X, "superseded");
+        assert!(run.other_sockets().is_empty(), "nothing was spawned");
+        assert_eq!(stage_launched_count(&run.root, run.phase), 1);
+        assert!(
+            poll_until(Duration::from_secs(5), || liveness_files(&run.root)
+                .is_empty()),
+            "no reservation is left behind: {:?}",
+            liveness_files(&run.root)
+        );
+    }
+
+    /// D-03: the promotion is N's last write as the recorded supervisor, so it is fenced.
+    /// A supervisor superseded before it promotes nothing, and the next supervisor it
+    /// spawned ends through its socket.
+    #[test]
+    fn a_superseded_launcher_promotes_nothing_and_ends_its_unpublished_next() {
+        const NAME: &str = "pipeline_launch::tests::a_superseded_launcher_promotes_nothing_and_ends_its_unpublished_next";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1907";
+        let run = HandoffRun::launch(PhaseId::new(1907));
+        run.go();
+        run.wait_held();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("at the hold the state names N+1 as pending");
+        supersede(&run.root, run.phase, X);
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)
+                && probes_gone(&pending.socket_path)),
+            "N and its unpublished next both exit: {}",
+            run.events()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        superseded_event(&run, X, "superseded");
     }
 
     /// V-23's control: the same run with no rewrite writes, opens its gate, claims the
