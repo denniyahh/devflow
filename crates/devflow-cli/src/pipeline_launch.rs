@@ -12896,6 +12896,72 @@ mod tests {
         );
     }
 
+    /// D-03: a supervisor superseded while its agent still runs ends that agent's group
+    /// beside it, rather than leaving the agent to keep changing the worktree. N is
+    /// SIGKILLed so only N+1 can act; the takeover is written inside N+1's promotion wait,
+    /// so the event's reason and `recorded` tell this from V-27's expiry, and the agent's
+    /// own 60 s is far past the bound.
+    #[test]
+    fn a_supervisor_superseded_while_its_agent_runs_ends_the_agents_group() {
+        const NAME: &str = "pipeline_launch::tests::a_supervisor_superseded_while_its_agent_runs_ends_the_agents_group";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1930";
+        let run = HandoffRun::launch(PhaseId::new(1930));
+        run.go();
+        run.wait_held();
+        kill_stage_n(&run);
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 as pending");
+        let pgid =
+            devflow_core::supervisor::read_sidecar(&pending.socket_path.with_extension("json"))
+                .expect("N+1's sidecar")
+                .agent_pgid;
+        assert!(
+            !devflow_core::test_support::live_group_members(pgid).is_empty(),
+            "precondition: N+1's agent runs"
+        );
+
+        // One write, so N+1 never reads a state that still records the dead N.
+        workflow::update_state(&run.root, run.phase, |on_disk| {
+            on_disk.pending_supervisor = None;
+            on_disk.supervisor = Some(SupervisorRecord::new(
+                run.root.join("x.sock"),
+                X.to_string(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+
+        let bound = devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(2);
+        assert!(
+            poll_until(bound, || devflow_core::test_support::live_group_members(
+                pgid
+            )
+            .is_empty()),
+            "the group has no live member within {bound:?}: {:?}; events:\n{}",
+            devflow_core::test_support::live_group_members(pgid),
+            run.events()
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&pending.socket_path)),
+            "N+1 exits"
+        );
+        let event = superseded_event_of(&run, &pending.launch_id, X, "superseded");
+        assert_eq!(event["agent_group"], "ended", "{event}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+    }
+
     /// V-27's other half, and the case 50.1-17 left at "refused at its next handoff": an
     /// orphan whose agent already exited never reaches its advance, so it never reaches
     /// a handoff to be refused at. It ends at the deadline, with nothing to signal.
