@@ -259,6 +259,15 @@ fn stop_writes_no_state_while_the_holder_survives_the_signal() {
     common::kill_and_reap(&mut holder);
 }
 
+/// A running `devflow ship`, killed and reaped when this drops.
+struct ShipChild(Child);
+
+impl Drop for ShipChild {
+    fn drop(&mut self) {
+        common::kill_and_reap(&mut self.0);
+    }
+}
+
 /// D-18 with both real binaries: `devflow stop` signals a `devflow ship` paused inside
 /// `Merge`, between its `git checkout` and `git merge`, by a `post-checkout` hook. The ship
 /// survives the signal, `stop` says so and marks nothing, and once released the ship runs
@@ -321,13 +330,16 @@ fn a_real_stop_lets_a_real_ship_finish_the_pass_it_started() {
         ],
     );
 
-    let mut ship = common::hermetic_devflow(&home)
-        .args(["ship", "--phase", &phase.to_string()])
-        .arg(root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("run devflow ship");
+    // Reaped on a failed assertion too.
+    let mut ship = ShipChild(
+        common::hermetic_devflow(&home)
+            .args(["ship", "--phase", &phase.to_string()])
+            .arg(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("run devflow ship"),
+    );
     wait_for(
         || in_merge.exists(),
         30,
@@ -340,12 +352,12 @@ fn a_real_stop_lets_a_real_ship_finish_the_pass_it_started() {
         .output()
         .expect("run devflow stop");
 
-    let survived = ship.try_wait().expect("poll devflow ship").is_none();
+    let survived = ship.0.try_wait().expect("poll devflow ship").is_none();
     std::fs::write(&release, "").unwrap();
     let stderr = String::from_utf8_lossy(&stop.stderr).to_string();
     assert!(!stop.status.success(), "{stop:?}");
     assert!(
-        stderr.contains(&format!("signalled pid {}", ship.id())),
+        stderr.contains(&format!("signalled pid {}", ship.0.id())),
         "{stderr}"
     );
     assert!(stderr.contains("ships instead of stopping"), "{stderr}");
@@ -353,13 +365,13 @@ fn a_real_stop_lets_a_real_ship_finish_the_pass_it_started() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
-        if let Some(status) = ship.try_wait().expect("poll devflow ship") {
+        if let Some(status) = ship.0.try_wait().expect("poll devflow ship") {
             break status;
         }
-        if Instant::now() > deadline {
-            common::kill_and_reap(&mut ship);
-            panic!("devflow ship did not finish its pass after the release");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "devflow ship did not finish its pass after the release"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(status.code(), Some(0), "{status:?}");
