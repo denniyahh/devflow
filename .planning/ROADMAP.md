@@ -1031,6 +1031,20 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.173: A Ship Retry After a Restart Can Still Bump the Version Twice (BACKLOG)
+
+**Found:** 2026-11-02, external review of Phase 50.1; the in-process half fixed in `8c1dd3d`.
+
+**Defect:** a finalization retry now skips hooks that already succeeded, but only in memory. A retry after the process restarted reruns the whole batch, so a `VersionBump` that had succeeded tags a second version. From reading the code; not run. `devflow ship` is being replaced by wsx, so this may be retired with it.
+
+### Phase 999.174: `devflow stop` at an Open Gate Deletes State, While a Signal Keeps It Resumable (BACKLOG)
+
+**Found:** 2026-11-02, external review of Phase 50.1. Documented and tested since 2026-07-25, not a regression.
+
+**Defect:** `stop` answers an open gate with an abort, and the waiter's `abort` path clears the state, so `resume` has nothing to resume. `SIGTERM` to the same supervisor clears the gate and records `stopped`, so the phase stays resumable (`OPERATIONS.md`, Signals). An operator who means "pause" gets "end" from `stop` only when a gate happens to be open.
+
+**Fix shape (not tested):** decide whether `stop` should mean what the signal means.
+
 ### Phase 999.172: A `stopped` Flag Written by Hand During a Gate Wait Does Not Stop the Run (BACKLOG)
 
 **Found:** 2026-11-02, Phase 50.1 plan 50.1-24, carried over from 50.1-10.
