@@ -14916,6 +14916,101 @@ mod tests {
         assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
     }
 
+    /// D-17 (V-31): `start` refuses while another process holds the phase, before it
+    /// reserves. The control is the same fixture through `reserve_launch` alone: the
+    /// reservation write the byte comparison would see from a `start` that claimed late.
+    #[test]
+    fn start_refuses_while_another_process_holds_the_phase_before_reserving() {
+        const NAME: &str =
+            "commands::tests::start_refuses_while_another_process_holds_the_phase_before_reserving";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_dir_with_agent_stub("claude");
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let assert_refused = |error: &str, phase: PhaseId| {
+            assert!(
+                error.contains(&format!("(pid {})", std::process::id())),
+                "the refusal names the holder's pid: {error}"
+            );
+            assert!(
+                error.contains(&format!("devflow stop --phase {phase}")),
+                "{error}"
+            );
+            assert!(!error.contains("devflow resume"), "{error}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2907);
+        init_start_repo(root, phase);
+        let mut dead = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        dead.stage = Stage::Plan;
+        workflow::save_state(&dead).unwrap();
+        let _hold = liveness::claim_phase_holder(root, phase).unwrap();
+        let state_file = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_file).unwrap();
+
+        let error = start_for_test(root, phase).expect_err("a held phase refuses");
+
+        assert_refused(&error, phase);
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "byte-identical"
+        );
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor,
+            None
+        );
+        assert!(liveness_files(root).is_empty(), "no liveness file is made");
+
+        let no_state = tempfile::tempdir().unwrap();
+        let empty = no_state.path();
+        init_start_repo(empty, phase);
+        let _empty_hold = liveness::claim_phase_holder(empty, phase).unwrap();
+        let error = start_for_test(empty, phase).expect_err("a held phase refuses");
+        assert_refused(&error, phase);
+        assert!(
+            !workflow::state_path(empty, phase).exists(),
+            "with no state, none is created"
+        );
+
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        let reserved = reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&dead),
+            cache.as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("the control reserves: {err}"));
+        assert_ne!(
+            std::fs::read(&state_file).unwrap(),
+            before,
+            "control: a reservation changes the file, so the comparison would see one"
+        );
+        assert!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .is_some(),
+            "control: the reservation is written while the holder is held"
+        );
+        let created = reserved.created;
+        crate::pipeline_launch::hold_reservation(reserved.reservation);
+        crate::pipeline_launch::abandon_reservation(root, phase, created);
+    }
+
     /// D-18: over a missing state, a signalled holder ended its run on its own, which is
     /// not "already stopped". With nothing signalled, the line is today's.
     #[test]

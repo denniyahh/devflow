@@ -2106,6 +2106,47 @@ mod tests {
         workflow::save_state(&state).unwrap();
     }
 
+    /// D-17 (V-31): `devflow ship` refuses while another process holds the phase, before
+    /// it reads or claims the answer, and writes nothing.
+    #[test]
+    fn ship_override_refuses_while_another_process_holds_the_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2906);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+        let gate = Gates::open_gate(root, phase, Stage::Ship, "ctx")
+            .unwrap()
+            .gate_id;
+        answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+        let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = ship_override(root, phase, false)
+            .expect_err("a held phase refuses")
+            .to_string();
+
+        assert!(
+            error.contains(&format!("(pid {})", std::process::id())),
+            "the refusal names the holder's pid: {error}"
+        );
+        assert!(
+            error.contains(&format!("devflow stop --phase {phase}")),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert!(
+            !Gates::claim_path(root, phase, Stage::Ship, &gate).exists(),
+            "the answer is not claimed"
+        );
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+    }
+
     /// The writer and the reader of a Ship approval agree: what `devflow gate approve`
     /// publishes is what `devflow ship` finds, claims and finishes on.
     #[test]

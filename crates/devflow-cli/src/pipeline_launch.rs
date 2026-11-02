@@ -9039,6 +9039,72 @@ mod tests {
         );
     }
 
+    /// The refusal a process meets when another foreground process holds the phase: it
+    /// names the holder's pid and `stop`, never `resume`.
+    fn assert_refused_by_the_holder(error: &str, phase: PhaseId) {
+        assert!(
+            error.contains(&format!("(pid {})", std::process::id())),
+            "the refusal names the holder's pid: {error}"
+        );
+        assert!(
+            error.contains(&format!("devflow stop --phase {phase}")),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+    }
+
+    /// D-17 (V-31): a hand-run `advance` refuses while another process holds the phase,
+    /// and writes nothing.
+    #[test]
+    fn a_hand_run_advance_refuses_while_another_process_holds_the_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2904);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+        let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = advance_command(root, Some(phase), Some(Stage::Plan))
+            .expect_err("a held phase refuses")
+            .to_string();
+
+        assert_refused_by_the_holder(&error, phase);
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+    }
+
+    /// D-17 (V-31): `resume` refuses while another process holds the phase, before it
+    /// reserves, so the state is untouched.
+    #[test]
+    fn resume_refuses_while_another_process_holds_the_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2905);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        state.stage = Stage::Plan;
+        state.stopped = true;
+        state.stop_reason = Some("stopped via `devflow stop`".to_string());
+        workflow::save_state(&state).unwrap();
+        let _hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = resume(root, phase, None, true)
+            .expect_err("a held phase refuses")
+            .to_string();
+
+        assert_refused_by_the_holder(&error, phase);
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is reserved"
+        );
+    }
+
     /// A live in-process supervisor serving `launch_id` at a short socket
     /// path in `dir`, for the observer control.
     fn fake_supervisor(
