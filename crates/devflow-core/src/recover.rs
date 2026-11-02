@@ -114,6 +114,8 @@ pub struct CleanReport {
     /// Every set-aside gate answer found. None is removed (D-05): each stays until the
     /// operator removes it by hand.
     pub quarantined: Vec<std::path::PathBuf>,
+    /// Every abandoned liveness file, waiter registration and orphan hold temp removed.
+    pub markers_removed: Vec<std::path::PathBuf>,
 }
 
 impl CleanReport {
@@ -2586,5 +2588,136 @@ mod tests {
             .map(|path| std::fs::read(path).unwrap())
             .collect();
         assert_eq!(after, before);
+    }
+
+    /// Sweep until `gone` has gone, gathering what each sweep says it removed. A hold
+    /// just dropped can read held while another test's fork is before its exec.
+    fn sweep_until_gone(root: &Path, gone: &Path) -> Vec<std::path::PathBuf> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut removed = Vec::new();
+        loop {
+            let report = clean_report(root).expect("clean");
+            removed.extend(report.markers_removed);
+            if !gone.exists() {
+                return removed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} was never removed: {:?}",
+                gone.display(),
+                report.warnings
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// R-06: an abandoned hold never reads live again and a hold's final name is never
+    /// visible unheld while its creator lives, so the sweep needs no age bound, even run
+    /// inside a take at each of its steps. The three lock files are never markers.
+    #[test]
+    fn clean_removes_unheld_liveness_files() {
+        use crate::liveness::{Held, Hold, TakeStep, probe, take_with_hook};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let devflow = workflow::devflow_dir(root);
+        std::fs::create_dir_all(&devflow).unwrap();
+        let lock_files = [
+            devflow.join(".holder-07"),
+            devflow.join(".state-07.lock"),
+            devflow.join(".gates-07.lock"),
+        ];
+        for path in &lock_files {
+            std::fs::write(path, path.to_string_lossy().as_bytes()).unwrap();
+        }
+        let locks_are_untouched = || {
+            for path in &lock_files {
+                assert_eq!(
+                    std::fs::read(path).ok().as_deref(),
+                    Some(path.to_string_lossy().as_bytes()),
+                    "{} must be byte-identical",
+                    path.display()
+                );
+            }
+        };
+        let abandoned = devflow.join("supervisor-aaaa0000aaaa0001.live");
+        drop(Hold::take(&abandoned).unwrap());
+        let held_path = devflow.join("supervisor-aaaa0000aaaa0002.live");
+        let held = Hold::take(&held_path).unwrap();
+
+        let removed = sweep_until_gone(root, &abandoned);
+
+        assert_eq!(removed, vec![abandoned.clone()], "whatever its age");
+        assert!(held_path.exists(), "a held file must be kept");
+        locks_are_untouched();
+
+        let taking = devflow.join("supervisor-aaaa0000aaaa0003.live");
+        let mut steps = Vec::new();
+        let taken = take_with_hook(&taking, &mut |step, temp| {
+            clean_report(root).expect("clean inside a take");
+            assert!(
+                temp.exists(),
+                "{step:?}: a live creator's temp must be kept"
+            );
+            assert_eq!(
+                taking.exists(),
+                matches!(step, TakeStep::Published),
+                "{step:?}: the final name appears only once published"
+            );
+            locks_are_untouched();
+            steps.push(step);
+        })
+        .expect("a sweep in its gaps must not break the take");
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        assert_eq!(probe(&taking).unwrap(), Held::Live);
+        drop((held, taken));
+    }
+
+    /// R-06, pi 5: nothing else sweeps an abandoned `.waiter`, or a hold temp a crash
+    /// left. The live registration and a live creator's temp stay. The phase has no
+    /// state, so the orphan-gate pass keeps it for the live registration: this removal is
+    /// the marker sweep's.
+    #[test]
+    fn clean_removes_abandoned_waiters_and_orphan_hold_temps_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(7), Stage::Code);
+        let live_gate = crate::gates::GateId::new();
+        let live = Gates::register_waiter(root, phase, stage, &live_gate).unwrap();
+        let dead_gate = crate::gates::GateId::new();
+        drop(Gates::register_waiter(root, phase, stage, &dead_gate).unwrap());
+        let abandoned = Gates::waiter_path(root, phase, stage, &dead_gate);
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let exited_pid = exited.id();
+        exited.wait().unwrap();
+        let waiter_temp = Gates::dir(root).join(format!(
+            ".07-code.{dead_gate}.waiter.{exited_pid}.0{}",
+            crate::liveness::HOLD_TEMP_SUFFIX
+        ));
+        let live_temp = Gates::dir(root).join(format!(
+            ".07-code.{dead_gate}.waiter.{}.0{}",
+            std::process::id(),
+            crate::liveness::HOLD_TEMP_SUFFIX
+        ));
+        let liveness_temp = workflow::devflow_dir(root).join(format!(
+            ".supervisor-x.live.{exited_pid}.0{}",
+            crate::liveness::HOLD_TEMP_SUFFIX
+        ));
+        for temp in [&waiter_temp, &live_temp, &liveness_temp] {
+            std::fs::write(temp, "").unwrap();
+        }
+
+        let mut removed = sweep_until_gone(root, &abandoned);
+
+        assert_eq!(
+            Gates::waiter_status(root, phase, stage, &live_gate).unwrap(),
+            crate::gates::WaiterStatus::Live,
+            "the live registration must be kept"
+        );
+        assert!(live_temp.exists(), "a live creator's temp must be kept");
+        removed.sort();
+        let mut expected = vec![abandoned, waiter_temp, liveness_temp];
+        expected.sort();
+        assert_eq!(removed, expected);
+        drop(live);
     }
 }
