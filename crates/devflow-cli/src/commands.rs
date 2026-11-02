@@ -5949,6 +5949,9 @@ pub(crate) struct PhaseFacts {
     /// Whether the phase's open gate has a held registration, computed in
     /// `build_phase_facts`; all its I/O stays there so reconciliation remains pure.
     pub(crate) waiter: WaiterStatus,
+    /// The stage and id of the open gate [`PhaseFacts::waiter`] describes; `None` when
+    /// the phase has no open gate. The id is the gate file's, unchecked.
+    pub(crate) waiter_gate: Option<(Stage, String)>,
     pub(crate) agent_pid: Option<u32>,
     pub(crate) agent_alive: bool,
     /// The supervisor's liveness, from one probe of the socket
@@ -6318,7 +6321,7 @@ fn build_phase_facts(
 ) -> PhaseFacts {
     let phase = state.phase;
     let stopped = state.stopped;
-    let waiter = phase_waiter_status(project_root, phase, open_gates);
+    let (waiter, waiter_gate) = phase_gate_waiter(project_root, phase, open_gates);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let supervisor = probe_phase(&state);
@@ -6365,6 +6368,7 @@ fn build_phase_facts(
         stage: state.stage,
         gate_pending: state.gate_pending,
         waiter,
+        waiter_gate,
         agent_pid,
         agent_alive,
         supervisor,
@@ -6381,26 +6385,30 @@ fn build_phase_facts(
     }
 }
 
-/// [`PhaseFacts::waiter`]: `Live` while one of the phase's open gates has a held
-/// registration, else `Absent`. The doctor reads this the way a writer reads
-/// [`waiter_is_live`].
-fn phase_waiter_status(
+/// [`PhaseFacts::waiter`] and [`PhaseFacts::waiter_gate`]: `Live` and the gate, while
+/// one of the phase's open gates has a held registration; else `Absent` and the
+/// phase's first open gate, the one its findings name. The doctor reads this the way
+/// a writer reads [`waiter_is_live`].
+fn phase_gate_waiter(
     project_root: &Path,
     phase: PhaseId,
     open_gates: &[OpenGate],
-) -> WaiterStatus {
-    let live = open_gates
-        .iter()
-        .filter(|gate| gate.phase == phase)
-        .any(|gate| {
-            GateId::parse(&gate.gate_id)
-                .is_ok_and(|id| waiter_is_live(project_root, phase, gate.stage, &id))
-        });
-    if live {
+) -> (WaiterStatus, Option<(Stage, String)>) {
+    let mut phase_gates = open_gates.iter().filter(|gate| gate.phase == phase);
+    let first = phase_gates.clone().next();
+    let live = phase_gates.find(|gate| {
+        GateId::parse(&gate.gate_id)
+            .is_ok_and(|id| waiter_is_live(project_root, phase, gate.stage, &id))
+    });
+    let status = if live.is_some() {
         WaiterStatus::Live
     } else {
         WaiterStatus::Absent
-    }
+    };
+    let gate = live
+        .or(first)
+        .map(|gate| (gate.stage, gate.gate_id.clone()));
+    (status, gate)
 }
 
 /// Derive the stage named by an event's `stage` field, but only when the
@@ -6566,6 +6574,7 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
                     "repair": finding.repair,
                     "last_event": phase_facts.last_event,
                     "supervisor": supervisor_json(phase_facts),
+                    "gate_waiter": gate_waiter_json(phase_facts),
                 })
             })
             .collect(),
@@ -6589,6 +6598,26 @@ fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
         "pending": facts.pending.as_ref().map(|(launch_id, liveness)| {
             serde_json::json!({"launch_id": launch_id, "liveness": liveness.label()})
         }),
+    })
+}
+
+/// A phase's open gate and its waiter for `doctor --json` (R2-01, D-04), the fact the
+/// Phase 50 fault arm reads: `stage` and `gate_id` are `null` and `status` is `absent`
+/// with no open gate; else the gate's stage label, its id, and `live` or `absent` from
+/// its registration. Ids and labels only, never a path (T-18-01): the id comes from
+/// the gate file unchecked, so one [`GateId::parse`] refuses reads `null`.
+fn gate_waiter_json(facts: &PhaseFacts) -> serde_json::Value {
+    let Some((stage, gate_id)) = &facts.waiter_gate else {
+        return serde_json::json!({"stage": null, "gate_id": null, "status": "absent"});
+    };
+    let status = match facts.waiter {
+        WaiterStatus::Live => "live",
+        WaiterStatus::Absent => "absent",
+    };
+    serde_json::json!({
+        "stage": stage.to_string(),
+        "gate_id": GateId::parse(gate_id).is_ok().then_some(gate_id),
+        "status": status,
     })
 }
 
@@ -7863,10 +7892,10 @@ mod tests {
         let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
         let open = Gates::list_open(root);
 
-        assert_eq!(phase_waiter_status(root, phase, &open), WaiterStatus::Live);
+        assert_eq!(phase_gate_waiter(root, phase, &open).0, WaiterStatus::Live);
         registration.finish();
         assert_eq!(
-            phase_waiter_status(root, phase, &open),
+            phase_gate_waiter(root, phase, &open).0,
             WaiterStatus::Absent
         );
     }
@@ -11892,6 +11921,7 @@ mod tests {
                 stage: Stage::Code,
                 gate_pending: false,
                 waiter: WaiterStatus::Absent,
+                waiter_gate: None,
                 agent_pid: Some(4242),
                 agent_alive: true,
                 supervisor: PhaseLiveness::Alive {
