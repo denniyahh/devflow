@@ -357,12 +357,30 @@ fn stop_ends_a_launch_its_running_launcher_promotes_during_the_wait() {
     );
 }
 
-/// Row C4: stage N's supervisor SIGKILLed after spawning N+1 and before promoting it.
-/// `stop` removes N's stale socket without suggesting `resume`, since N+1 still lives,
-/// then ends N+1 through its socket.
-#[test]
-fn stop_in_the_handoff_window_ends_the_next_supervisor_and_names_no_resume() {
-    let fixture = Fixture::new(PhaseId::new(184), FINISH_ONCE_CLAUDE);
+/// SIGKILL the supervisor `socket`'s sidecar names, identity-checked first, and wait for
+/// the socket to read STALE. Returns that sidecar.
+fn kill_supervisor_at(socket: &Path) -> supervisor::Sidecar {
+    let sidecar = supervisor::read_sidecar(&socket.with_extension("json")).expect("its sidecar");
+    let pid = sidecar.supervisor_pid;
+    assert!(
+        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
+        "the sidecar's supervisor {pid} is still that process"
+    );
+    let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    assert!(signed > 1, "refusing to signal pid {signed}");
+    // SAFETY: `signed > 1` names the supervisor just identity-checked.
+    assert_eq!(unsafe { libc::kill(signed, libc::SIGKILL) }, 0);
+    common::wait_for(
+        || matches!(supervisor::probe(socket), Ok(Liveness::Stale)),
+        REACH_WITHIN,
+        "the socket to read STALE",
+    );
+    sidecar
+}
+
+/// Row C4's state: N finished and spawned N+1, which is held before its agent spawn,
+/// and N has been SIGKILLed. Returns N+1's reservation.
+fn handoff_window(fixture: &Fixture) -> PendingSupervisor {
     let started = fixture
         .start("plan", &["--until", "plan"])
         .output()
@@ -379,25 +397,63 @@ fn stop_in_the_handoff_window_ends_the_next_supervisor_and_names_no_resume() {
         pending.launch_id, record.launch_id,
         "the pending one is N+1"
     );
-
-    let sidecar =
-        supervisor::read_sidecar(&record.socket_path.with_extension("json")).expect("N's sidecar");
-    let pid = sidecar.supervisor_pid;
-    assert!(
-        devflow_core::agent::is_same_process(pid, sidecar.supervisor_start_time),
-        "the sidecar's supervisor {pid} is N"
-    );
-    let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
-    assert!(signed > 1, "refusing to signal pid {signed}");
-    // SAFETY: `signed > 1` names the supervisor just identity-checked.
-    assert_eq!(unsafe { libc::kill(signed, libc::SIGKILL) }, 0);
-    common::wait_for(
-        || matches!(supervisor::probe(&record.socket_path), Ok(Liveness::Stale)),
-        REACH_WITHIN,
-        "N's socket to read STALE",
-    );
+    kill_supervisor_at(&record.socket_path);
     fixture.assert_status_names_stop_only(&pending);
+    pending
+}
+
+/// Row C4: stage N's supervisor SIGKILLed after spawning N+1 and before promoting it.
+/// `stop` removes N's stale socket without suggesting `resume`, since N+1 still lives,
+/// then ends N+1 through its socket.
+#[test]
+fn stop_in_the_handoff_window_ends_the_next_supervisor_and_names_no_resume() {
+    let fixture = Fixture::new(PhaseId::new(184), FINISH_ONCE_CLAUDE);
+    let pending = handoff_window(&fixture);
 
     let output = fixture.stop_across_the_release();
     fixture.assert_stopped(&output, &pending);
+}
+
+/// N+1 published and then died too: its socket is STALE, its lock is released and its
+/// agent still runs. Nothing but the pending record names that socket once N's is gone,
+/// so `stop` reaches its backstop through the record, which ends the agent group.
+#[test]
+fn stop_ends_the_agent_of_a_pending_supervisor_that_died() {
+    let fixture = Fixture::new(PhaseId::new(185), FINISH_ONCE_CLAUDE);
+    let pending = handoff_window(&fixture);
+    fixture.hold.release();
+    common::wait_for(
+        || {
+            matches!(
+                supervisor::probe(&pending.socket_path),
+                Ok(Liveness::Alive(_))
+            )
+        },
+        REACH_WITHIN,
+        "N+1 to publish",
+    );
+    let sidecar = kill_supervisor_at(&pending.socket_path);
+    let agent_group = sidecar.agent_pgid;
+    assert!(
+        !devflow_core::test_support::live_group_members(agent_group).is_empty(),
+        "the agent outlived its supervisor"
+    );
+    common::wait_for(
+        || {
+            matches!(
+                liveness::probe(&pending.liveness_path),
+                Ok(liveness::Held::Abandoned)
+            )
+        },
+        REACH_WITHIN,
+        "N+1's lock to be released",
+    );
+
+    let output = fixture.stop_command().output().expect("run devflow stop");
+    fixture.assert_stopped(&output, &pending);
+    assert_eq!(
+        devflow_core::test_support::live_group_members(agent_group),
+        Vec::<u32>::new(),
+        "the backstop ended the agent group"
+    );
 }
