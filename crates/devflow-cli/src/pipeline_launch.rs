@@ -1279,11 +1279,16 @@ pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(
 /// record. Whether the stop was confirmed.
 fn shut_down_unpublished(record: &SupervisorRecord) -> bool {
     match devflow_core::supervisor::request_shutdown(&record.socket_path, SUPERVISOR_STOP_WAIT) {
-        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped { .. }) => {
+        Ok(devflow_core::supervisor::ShutdownOutcome::Stopped {
+            group_signalled, ..
+        }) => {
             info!(
                 "stopped the unpublished next supervisor at {}",
                 record.socket_path.display()
             );
+            if group_signalled {
+                with_stop_token(StopToken::note_group_signalled);
+            }
             true
         }
         Ok(other) => {
@@ -1737,6 +1742,13 @@ fn forward_stop_to_successor(
     };
     if confirmed {
         let _ = token.safe_point();
+        if let Ok(devflow_core::supervisor::ShutdownOutcome::Stopped {
+            group_signalled: true,
+            ..
+        }) = outcome
+        {
+            token.note_group_signalled();
+        }
         eprintln!("forwarded a stop received after safe point 3 to launch {launch_id}: stopped");
     } else {
         eprintln!(
@@ -10283,6 +10295,10 @@ mod tests {
         let stopped = events_named(&run.root, "advance_stopped");
         assert_eq!(stopped.len(), 1, "{}", run.events());
         assert_eq!(stopped[0]["safe_point"], 3, "{}", stopped[0]);
+        assert_eq!(
+            last["group_signalled"], true,
+            "N+1's agent group was signalled for this stop: {last}"
+        );
     }
 
     /// Write a capture whose Layer 1 marker reads success, with exit code 0.
@@ -13125,6 +13141,10 @@ mod tests {
                 last["stopped"], true,
                 "run {label}: N answers the forwarded stop `stopped`, so its caller does not \
                  retry: {last}"
+            );
+            assert_eq!(
+                last["group_signalled"], true,
+                "run {label}: the successor's agent group was signalled for this stop: {last}"
             );
         } else {
             signal_supervisor(&run, libc::SIGTERM);

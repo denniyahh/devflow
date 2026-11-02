@@ -175,6 +175,8 @@ struct OwnerState {
     /// The run ended as a stop: [`AgentOutcome::Stopped`] or a safe point
     /// that returned [`SafePoint::StopHere`].
     ended_stopped: bool,
+    /// A stop signalled the agent's process group: the final `stopped` reply says so.
+    group_signalled: bool,
 }
 
 /// The owner mutex and the condition variable the control thread waits on
@@ -203,6 +205,7 @@ impl StopToken {
                     stop_source: None,
                     agent_exited: false,
                     ended_stopped: false,
+                    group_signalled: false,
                 }),
                 exited: Condvar::new(),
             }),
@@ -257,6 +260,13 @@ impl StopToken {
         self.lock().ended_stopped
     }
 
+    /// Record that this run's stop ended another supervisor's agent group, a successor's
+    /// or an unpublished next stage's, through its socket. The final `stopped` reply then
+    /// does not say nothing was signalled.
+    pub fn note_group_signalled(&self) {
+        self.lock().group_signalled = true;
+    }
+
     /// The main thread's exit decision. Under the owner lock: mark the exit
     /// observed (waking the control thread), run `reap` with the stop flag,
     /// decide with [`on_agent_exit`], and leave the phase at `Advancing` for
@@ -276,6 +286,15 @@ impl StopToken {
         }
         Ok(outcome)
     }
+}
+
+/// The final `stopped` reply. `group_signalled` is what [`OwnerState`] recorded.
+fn stopped_reply(group_signalled: bool) -> Reply {
+    Reply::Stopped(ShutdownStopped {
+        exit_code: STOPPED_EXIT_CODE,
+        advance_suppressed: true,
+        group_signalled,
+    })
 }
 
 /// [`StopToken::request_stop`] on an already locked owner, so the control
@@ -354,7 +373,7 @@ pub(crate) fn end_group_while_running(token: &StopToken, pgid: u32) -> AgentGrou
     }
     request_stop_locked(&mut state, StopSource::Ownership);
     tracing::info!("ending agent group {pgid}: this supervisor does not own the run");
-    signal_group(pgid, libc::SIGTERM);
+    state.group_signalled |= signal_group(pgid, libc::SIGTERM);
     drop(state);
     kill_group_unless_exit_observed(token, pgid);
     AgentGroupEnd::Ended
@@ -666,11 +685,7 @@ impl Supervisor {
     pub fn finish(mut self) {
         let parked = self.close();
         let reply = if self.token.ended_stopped() {
-            Reply::Stopped(ShutdownStopped {
-                exit_code: STOPPED_EXIT_CODE,
-                advance_suppressed: true,
-                group_signalled: false,
-            })
+            stopped_reply(self.token.lock().group_signalled)
         } else {
             Reply::Error("handed_off".to_string())
         };
@@ -859,7 +874,8 @@ impl Control {
     /// `shutdown`) and act on [`StopToken::request_stop`]'s decision.
     ///
     /// - `KillAgentGroup`: under the owner lock, and only while the exit has
-    ///   not been observed, SIGTERM the agent's group. Reply `accepted` and
+    ///   not been observed, SIGTERM the agent's group, recording whether that
+    ///   signal went out for the final reply. Reply `accepted` and
     ///   park the connection for [`Supervisor::finish`]'s final line. Then
     ///   wait up to [`crate::agent::TERMINATE_VERIFY_WAIT`] for the main
     ///   thread to observe the exit, and SIGKILL the group if it has not.
@@ -876,8 +892,9 @@ impl Control {
         let ended_stopped = state.ended_stopped;
         if action == StopAction::KillAgentGroup && !state.agent_exited {
             tracing::info!("stop requested by {source:?}: terminating agent group {pgid}");
-            signal_group(pgid, libc::SIGTERM);
+            state.group_signalled |= signal_group(pgid, libc::SIGTERM);
         }
+        let group_signalled = state.group_signalled;
         drop(state);
 
         let accepted = Reply::Accepted(ShutdownAccepted { owner });
@@ -886,14 +903,9 @@ impl Control {
                 std::slice::from_ref(&accepted)
             }
             StopAction::ReplyHandedOff => &[Reply::Error("handed_off".to_string())],
-            StopAction::AlreadyFinished if ended_stopped => &[
-                accepted.clone(),
-                Reply::Stopped(ShutdownStopped {
-                    exit_code: STOPPED_EXIT_CODE,
-                    advance_suppressed: true,
-                    group_signalled: false,
-                }),
-            ],
+            StopAction::AlreadyFinished if ended_stopped => {
+                &[accepted.clone(), stopped_reply(group_signalled)]
+            }
             StopAction::AlreadyFinished => &[Reply::Error("already_finished".to_string())],
         };
         if let Some(stream) = stream {

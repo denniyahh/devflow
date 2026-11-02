@@ -3139,14 +3139,21 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
     run_backstop(subject, &socket, sidecar, None, None)
 }
 
-/// `stop`'s line for a stop its supervisor confirmed. It claims a group ended only when the
-/// supervisor signalled one.
+/// `stop`'s line for a stop its supervisor confirmed (D-13 item 6). It claims a group ended
+/// only when the supervisor signalled one; otherwise the stop was honoured at an advance
+/// safe point and nothing was signalled.
 fn stopped_line(
     subject: &str,
     exit_code: i32,
     advance_suppressed: bool,
-    _group_signalled: bool,
+    group_signalled: bool,
 ) -> String {
+    if !group_signalled {
+        return format!(
+            "stop: stopped {subject} through its supervisor (honoured at an advance safe point; \
+             nothing was signalled; exit code {exit_code})"
+        );
+    }
     let advance = if advance_suppressed {
         "advance suppressed"
     } else {
