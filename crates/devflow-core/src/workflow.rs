@@ -643,10 +643,13 @@ pub fn update_owned_state<T, E: From<WorkflowError>>(
 /// lock it may take is the gate lock, a bounded wait the operator's D-08 ruling of
 /// 2026-10-26 allows inside the write lock: gate-lock holders run only file operations
 /// and never take the state write lock, so the order is always write lock, then gate
-/// lock, and the wait is capped by `gates::GATE_LOCK_WAIT`, below
+/// lock, and each wait is capped by `gates::GATE_LOCK_WAIT`, below
 /// [`WRITE_LOCK_REPAIR_WAIT`]. `gates::tests::gates_never_takes_the_state_write_lock`
 /// and `gates::tests::the_gate_lock_wait_stays_below_the_write_lock_repair_wait` pin
-/// both rules.
+/// both rules. A fenced `Gates::answer` makes two waits, 10 s in all, which reaches
+/// [`WRITE_LOCK_REPAIR_WAIT`] if a holder stalls both: a repair verb then gives up and
+/// names this lock's holder, and nothing hangs
+/// (`gates::tests::a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait`).
 ///
 /// Not reentrant: this must not be called inside an [`update_state`],
 /// [`update_state_with`], [`update_owned_state`] or [`clear_state_if_owned`] closure
