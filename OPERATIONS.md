@@ -151,8 +151,11 @@ A launch caught between publishing its socket and saving its record can be
 listed this way for a moment.
 
 **Superseded supervisors.** A supervisor the state no longer records, or whose
-promotion never came within its 15 s wait, writes no state and cannot record its
-own stop. It ends its agent's group if the agent still runs and logs
+promotion never came within its 15 s wait, writes no state or exit file and cannot
+record its own stop. When the state records another launch it also leaves
+`workflow._auto_chain_active` to that launch; otherwise it clears the flag as usual.
+`devflow logs --follow` ends on an exit file, so with no next run it keeps following
+until Ctrl-C. It ends its agent's group if the agent still runs and logs
 `supervisor_superseded`, whose `agent_group` field says `ended` or
 `already_exited`. A promoted supervisor keeps reading the state once a second
 until its agent exits, so editing the state to name another launch or none, or
