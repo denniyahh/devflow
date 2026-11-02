@@ -421,15 +421,15 @@ fn gate_wait_call(
 /// V-21's view of one approval's two consumers, shared by the threads that install it.
 #[cfg(test)]
 #[derive(Debug, Default)]
-struct ClaimProbe {
-    claimed: std::sync::atomic::AtomicUsize,
-    already_consumed: std::sync::atomic::AtomicUsize,
+pub(crate) struct ClaimProbe {
+    pub(crate) claimed: std::sync::atomic::AtomicUsize,
+    pub(crate) already_consumed: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
 thread_local! {
     /// Set on a consumer's thread to count its claim, see [`note_claim`].
-    static CLAIM_PROBE: std::cell::RefCell<Option<std::sync::Arc<ClaimProbe>>> =
+    pub(crate) static CLAIM_PROBE: std::cell::RefCell<Option<std::sync::Arc<ClaimProbe>>> =
         const { std::cell::RefCell::new(None) };
 }
 
