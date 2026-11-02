@@ -9742,7 +9742,7 @@ mod tests {
 
         /// A short cache dir directly under `/tmp`, so every socket path
         /// below it fits `sun_path`.
-        fn short_cache() -> tempfile::TempDir {
+        pub(super) fn short_cache() -> tempfile::TempDir {
             tempfile::Builder::new()
                 .prefix("dfs")
                 .tempdir_in("/tmp")
@@ -9751,7 +9751,7 @@ mod tests {
 
         /// Publish the socket for `(root, phase, launch_id)` under `cache`.
         /// Dropping the returned listener leaves the socket STALE.
-        fn publish_launch(
+        pub(super) fn publish_launch(
             cache: &Path,
             root: &Path,
             phase: u32,
@@ -9766,7 +9766,12 @@ mod tests {
 
         /// A complete sidecar for `(root, phase, launch_id)`, as a supervisor
         /// writes it.
-        fn write_sidecar_for(socket: &supervisor::SocketPath, root: &Path, phase: u32, id: &str) {
+        pub(super) fn write_sidecar_for(
+            socket: &supervisor::SocketPath,
+            root: &Path,
+            phase: u32,
+            id: &str,
+        ) {
             let sidecar = serde_json::json!({
                 "launch_id": id,
                 "project_root": root,
@@ -9788,7 +9793,7 @@ mod tests {
 
         /// A loadable state for `phase` whose supervisor record carries
         /// `launch_id`.
-        fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
+        pub(super) fn save_state_with_launch(root: &Path, phase: u32, launch_id: &str) {
             let mut state = State::new(
                 PhaseId::new(phase),
                 AgentKind::Claude,
@@ -12975,6 +12980,69 @@ mod tests {
             "the state file is back as it was before the start"
         );
         assert_eq!(liveness_files(root), Vec::<String>::new());
+    }
+
+    /// RESEARCH Pitfall 7: a socket whose launch id is the state's pending supervisor is
+    /// claimed, with or without a recorded supervisor beside it, so `doctor` does not
+    /// call a legitimate next supervisor an orphan. Controls: the same socket with no
+    /// pending record, the state naming another launch, is reported as superseded; and
+    /// with the pending record naming another launch, too.
+    #[test]
+    fn doctor_does_not_call_a_pending_next_supervisor_superseded() {
+        use doctor_reconciliation::{
+            publish_launch, save_state_with_launch, short_cache, write_sidecar_for,
+        };
+        const RECORDED: &str = "aaaa0000aaaa1709";
+        const NEXT: &str = "bbbb0000bbbb1709";
+        const OTHER: &str = "cccc0000cccc1709";
+        const PHASE: u32 = 1709;
+        let cache = short_cache();
+        let cache = cache.path();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let phase = PhaseId::new(PHASE);
+        let (next, _) = publish_launch(cache, root, PHASE, NEXT);
+        write_sidecar_for(&next, root, PHASE, NEXT);
+        save_state_with_launch(root, PHASE, RECORDED);
+        let set_pending = |id: Option<&str>| {
+            workflow::update_state(root, phase, |state| {
+                state.pending_supervisor = id.map(|id| {
+                    PendingSupervisor::new(
+                        id.to_string(),
+                        next.as_path().to_path_buf(),
+                        root.join(format!("{id}.live")),
+                    )
+                });
+                Ok::<(), workflow::WorkflowError>(())
+            })
+            .unwrap();
+        };
+        let details = || -> Vec<String> {
+            collect_orphan_supervisors(root, cache)
+                .into_iter()
+                .map(|orphan| orphan.finding.detail)
+                .collect()
+        };
+
+        set_pending(Some(NEXT));
+        assert_eq!(details(), Vec::<String>::new(), "beside a recorded one");
+        workflow::update_state(root, phase, |state| {
+            state.supervisor = None;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        assert_eq!(details(), Vec::<String>::new(), "with no recorded one");
+
+        save_state_with_launch(root, PHASE, RECORDED);
+        for (case, pending) in [("no pending record", None), ("another's", Some(OTHER))] {
+            set_pending(pending);
+            let listed = details();
+            assert_eq!(listed.len(), 1, "control, {case}: {listed:?}");
+            assert!(
+                listed[0].contains(NEXT) && listed[0].contains("superseded"),
+                "control, {case}: {listed:?}"
+            );
+        }
     }
 
     const AGENT_SPAWN_HOLD_ENV: &str = "DEVFLOW_TEST_AGENT_SPAWN_HOLD";
