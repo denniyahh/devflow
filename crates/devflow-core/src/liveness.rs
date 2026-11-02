@@ -771,47 +771,52 @@ mod tests {
 
     #[test]
     fn a_probe_in_flight_neither_reads_live_nor_fails_a_take() {
-        let dir = tempfile::tempdir().expect("create a temp dir");
-        let path = dir.path().join("x.live");
-        std::fs::write(&path, b"").expect("create the file");
+        in_own_process(
+            "liveness::tests::a_probe_in_flight_neither_reads_live_nor_fails_a_take",
+            || {
+                let dir = tempfile::tempdir().expect("create a temp dir");
+                let path = dir.path().join("x.live");
+                std::fs::write(&path, b"").expect("create the file");
 
-        let in_flight = File::open(&path).expect("open");
-        in_flight.try_lock_shared().expect("take the shared lock");
-        assert_eq!(
-            probe(&path).expect("probe"),
-            Held::Abandoned,
-            "a probe must not read another probe as live"
-        );
-        drop(in_flight);
-
-        // The first try always meets the shared lock, so an implementation
-        // that does not wait fails every attempt. Only a stalled releaser
-        // thread on a loaded machine can fail one that does, hence the retries.
-        let waited_out = (0..5).any(|_| {
-            let in_flight = File::open(&path).expect("open");
-            in_flight.try_lock_shared().expect("take the shared lock");
-            let releaser = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(10));
+                let in_flight = File::open(&path).expect("open");
+                in_flight.try_lock_shared().expect("take the shared lock");
+                assert_eq!(
+                    probe(&path).expect("probe"),
+                    Held::Abandoned,
+                    "a probe must not read another probe as live"
+                );
                 drop(in_flight);
-            });
-            let taker = File::open(&path).expect("open");
-            let taken = try_lock_past_probes(&taker);
-            releaser.join().expect("join the releaser");
-            taken.is_ok()
-        });
-        assert!(waited_out, "a take must wait out a probe's momentary lock");
 
-        let holder = File::open(&path).expect("open");
-        holder.try_lock().expect("take the exclusive lock");
-        assert_eq!(probe(&path).expect("probe"), Held::Live);
-        let second_taker = File::open(&path).expect("open");
-        let started = Instant::now();
-        let second = try_lock_past_probes(&second_taker);
-        assert!(
-            matches!(second, Err(TryLockError::WouldBlock)),
-            "a real holder must refuse a second taker, got {second:?}"
+                // The first try always meets the shared lock, so an implementation
+                // that does not wait fails every attempt. Only a stalled releaser
+                // thread on a loaded machine can fail one that does, hence the retries.
+                let waited_out = (0..5).any(|_| {
+                    let in_flight = File::open(&path).expect("open");
+                    in_flight.try_lock_shared().expect("take the shared lock");
+                    let releaser = std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(10));
+                        drop(in_flight);
+                    });
+                    let taker = File::open(&path).expect("open");
+                    let taken = try_lock_past_probes(&taker);
+                    releaser.join().expect("join the releaser");
+                    taken.is_ok()
+                });
+                assert!(waited_out, "a take must wait out a probe's momentary lock");
+
+                let holder = File::open(&path).expect("open");
+                holder.try_lock().expect("take the exclusive lock");
+                assert_eq!(probe(&path).expect("probe"), Held::Live);
+                let second_taker = File::open(&path).expect("open");
+                let started = Instant::now();
+                let second = try_lock_past_probes(&second_taker);
+                assert!(
+                    matches!(second, Err(TryLockError::WouldBlock)),
+                    "a real holder must refuse a second taker, got {second:?}"
+                );
+                assert!(started.elapsed() >= PROBE_RACE_WAIT);
+            },
         );
-        assert!(started.elapsed() >= PROBE_RACE_WAIT);
     }
 
     #[test]

@@ -1597,11 +1597,15 @@ mod tests {
             },
             "the closure runs inside the check's hold of the lock"
         );
-        assert_eq!(
-            write_lock_status(root, phase).unwrap(),
-            WriteLockStatus::Free,
-            "control: the probe reads the lock free once the hold ends"
-        );
+        // Another test's fork can keep the released lock busy until its exec.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while write_lock_status(root, phase).unwrap() != WriteLockStatus::Free {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "control: the probe reads the lock free once the hold ends"
+            );
+            std::thread::sleep(WRITE_LOCK_POLL);
+        }
         assert_eq!(std::fs::read(&path).unwrap(), before, "it writes no state");
     }
 

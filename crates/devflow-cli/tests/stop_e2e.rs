@@ -144,9 +144,18 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
     let state_path = root.join(format!(".devflow/state-{}.json", phase.padded()));
     let before = std::fs::read(&state_path).unwrap();
     let mut holder = Command::new("sh")
-        .args(["-c", "trap '' TERM; exec sleep 60"])
+        .args(["-c", "trap '' TERM; echo ready; exec sleep 60"])
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn TERM-ignoring holder");
+    // A TERM that lands before the trap kills the shell, which is not this case.
+    let mut ready = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(holder.stdout.as_mut().expect("the holder's stdout")),
+        &mut ready,
+    )
+    .expect("read the holder's ready line");
+    assert_eq!(ready, "ready\n");
     let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
     write_live_lock(root, phase, &holder, start);
 
