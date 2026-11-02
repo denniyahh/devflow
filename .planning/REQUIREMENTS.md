@@ -79,7 +79,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       What survives: `gate reject` and `stop` both print that a waiting process will pick up the
       response without ever checking whether one exists, and neither names the repair.
 
-- [ ] **SURV-03**: Every state change for a phase goes through one short OS lock and a re-read of
+- [x] **SURV-03**: Every state change for a phase goes through one short OS lock and a re-read of
       the state file, so an update made while another writer waited (including across a gate wait)
       is not lost. State and gate files are replaced, published first-wins or removed only through
       helpers that fsync the file and its directory. No gate wait holds the write lock.
@@ -91,7 +91,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       can still be lost: an accepted gap that 50.1 shrinks from a multi-day wait to one write and
       does not close (D-08).
 
-- [ ] **SURV-04**: A gate answer decides only the gate it names. Each gate carries a fresh gate id;
+- [x] **SURV-04**: A gate answer decides only the gate it names. Each gate carries a fresh gate id;
       an answer with a missing or different id is refused loudly and set aside under a quarantine
       name, never consumed and never silently deleted, and a valid answer to the live gate is then
       accepted. A `resume` rerun opens a new gate id and reports any unused answer. A late Ship
@@ -165,7 +165,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       agents; otherwise → `write_rate_limit_cron`.
       **Re-test the SUPV-01 dependency rather than assuming it.**
 
-- [ ] **SUPV-03**: A supervisor that is live but whose record was never saved is never joined by a
+- [x] **SUPV-03**: A supervisor that is live but whose record was never saved is never joined by a
       second one. The launcher records a pending supervisor, separate from the recorded one, under
       the write lock before it spawns, probeable through a per-launch liveness lock before its
       socket exists. `start` and `resume` check and reserve in one step and refuse over it, naming
@@ -182,7 +182,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       inside a `devflow ship` finalization hook) and D-19 (Operator: `stop` and `status` name an
       orphaned agent honestly).
 
-- [ ] **SUPV-04**: A supervisor whose launch id is not the recorded one writes no state, ack or gate
+- [x] **SUPV-04**: A supervisor whose launch id is not the recorded one writes no state, ack or gate
       cleanup, consumes no gate answer and spawns no next stage. It ends its agent group and logs
       why. The recorded supervisor writes normally.
       *Traces to 999.130 (part 3).*
@@ -190,7 +190,7 @@ The unattended merit-based decision policy DECN-01 shipped half-delivered in v2.
       Decisions: D-03 (Operator). Extending the fence past state writes to answers, acks, gate
       cleanup and the next-stage spawn is Claude (remit, from the review).
 
-- [ ] **SUPV-05**: The eight open Phase 50 code-review residuals (999.166 items 1, 2 and 4-9) are
+- [x] **SUPV-05**: The eight open Phase 50 code-review residuals (999.166 items 1, 2 and 4-9) are
       each fixed with a test that fails before the fix, or accepted with a reason the operator has
       approved (D-13; item 6 is fixed, not accepted, D-16). One full Phase 49-rig run reaches Ship
       on the 50.1 binary, with the Phase 50 fault arm re-run.
@@ -261,11 +261,11 @@ Populated during roadmap creation (2026-09-03). Wave order is load-bearing — s
 | TEST-01 | Phase 48 — Survivable State Writes and Honest Gate Recovery | 2 | Complete |
 | VERIFY-01 | Phase 49 — Live Unattended Run | 3 | Complete |
 | SUPV-01 | Phase 50 — Addressable Monitor Liveness | 4 | Complete |
-| SUPV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
-| SUPV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
-| SUPV-05 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
-| SURV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
-| SURV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Pending |
+| SUPV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
+| SUPV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
+| SUPV-05 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
+| SURV-03 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
+| SURV-04 | Phase 50.1 — Split-Lock State-Handling Overhaul | 4 (after 50) | Complete |
 | SUPV-02 | Phase 51 — Rate-Limit Agent Failover | 5 | Pending |
 
 **Coverage:**

@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v3.0.0
 milestone_name: milestone (ACTIVE — Unattended Run Survivability)
-current_phase: "50.1"
-current_phase_name: Split-Lock State-Handling Overhaul (INSERTED)
-current_plan: 1
-status: executing
-stopped_at: Phase 50.1 replanned after round-2 cross-AI review (30 plans, 22 waves)
-last_updated: "2026-11-01T14:49:00.694Z"
-last_activity: 2026-11-01
-last_activity_desc: Phase 50.1 execution started
-state_head: 4f6c8c0d85543f4c4e22b39362fbbad3d73759a4
+current_phase: 51
+current_phase_name: Rate-Limit Agent Failover
+current_plan: Not started
+status: planning
+stopped_at: Phase 50.1 complete, ready to plan Phase 51
+last_updated: "2026-11-02T20:32:06.607Z"
+last_activity: 2026-11-02
+last_activity_desc: Phase 50.1 complete, transitioned to Phase 51
+state_head: 1464f717dd1fc35031f94ca2ec1aff3ed48c03e9
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 107
-  completed_plans: 77
+  completed_plans: 107
   percent: 71
 ---
 
@@ -194,12 +194,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 50.1 (Split-Lock State-Handling Overhaul (INSERTED)) — EXECUTING
+Phase: 51 — Rate-Limit Agent Failover
 Plans: 30 (50.1-01…50.1-30, 22 waves; 50.1-27 is the one live-attempt checkpoint) — execute via `/gsd-execute-phase 50.1` from `.worktrees/phase-50.1`
-Current Plan: 1
+Current Plan: Not started
 Total Plans in Phase: 30
 Completed Plans: 0 of 30
-Status: Executing Phase 50.1
+Status: Ready to plan
 Previous phase: 48 — complete, 20/20 plans; verification passed 7/7 on 2026-09-23 after gap closure 48-20, with the operator ruling 999.139 on `start` outside criterion 2. Before that, 47 — complete, 7/7 plans (47-01..47-05 across 4 waves plus gap closures 47-06 and
 47-07). Verification recorded passed 39/39 with one operator-accepted override; reads `stale` since
 `4bb9504` (see `## Active Phase`).
@@ -209,7 +209,7 @@ for Phase 49; it is not settled by source inspection.
 Phase 46's own deferrals remain tracked: C-05/C-07 against GitHub #207, `cargo nextest` on the
 backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scanner) grandfathered
 by the scanner's staged-only scope.
-Last activity: 2026-11-01 — Phase 50.1 execution started
+Last activity: 2026-11-02 — Phase 50.1 complete, transitioned to Phase 51
 
 Progress: [███████░░░] 71% (5 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
@@ -966,7 +966,7 @@ Provenance for the entry removed 2026-09-13 at the Phase 47 transition:
 ## Session
 
 **Last session:** 2026-10-23T20:11:43.795Z
-**Stopped at:** Phase 50.1 context gathered
+**Stopped at:** Phase 50.1 complete, ready to plan Phase 51
 **Resume file:** .planning/phases/50.1-split-lock-state-handling-overhaul/50.1-CONTEXT.md
 
 ## Operator Next Steps
