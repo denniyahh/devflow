@@ -2169,6 +2169,16 @@ mod tests {
         assert_eq!(events_named(root, "workflow_shipped").len(), 1);
     }
 
+    /// Approve the Ship gate a live waiter is on. A waiter can consume the answer and close
+    /// the gate before the writer's re-check, which then reports the gate closed although the
+    /// answer was acted on. The caller's assertions on the outcome decide.
+    fn approve_a_gate_with_a_waiter(root: &Path, phase: PhaseId) {
+        match answer_open_gate(root, phase, Stage::Ship, &approval()) {
+            Ok(_) | Err(gates::GateError::GateClosedAfterPublish { .. }) => {}
+            Err(other) => panic!("the approval was not published: {other}"),
+        }
+    }
+
     /// An approved finalization retry after `ChangelogAppend` failed must not cut a second
     /// release: the hooks that succeeded stay done, and the changelog written by the retry
     /// names the one tag and carries the body computed before that tag existed.
@@ -2201,7 +2211,7 @@ mod tests {
             });
             wait_for_open_gate(root, phase, Stage::Ship);
             std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
-            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+            approve_a_gate_with_a_waiter(root, phase);
             finalizing.join().unwrap()
         });
         finished.expect("the retry finishes the batch");
@@ -2255,7 +2265,7 @@ mod tests {
             let repair = git(&["rev-parse", "HEAD"]);
             git(&["checkout", "-q", "develop"]);
             std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
-            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+            approve_a_gate_with_a_waiter(root, phase);
             (finalizing.join().unwrap(), repair)
         });
         finished.expect("the retry finishes the batch");
