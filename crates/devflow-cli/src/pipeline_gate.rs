@@ -309,8 +309,34 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             GateAction::Abort(reason) => return abort(project_root, state, &reason),
         }
     }
+    // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
+    // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
+    // reads — deliberately NOT `workflow_finished` below, which is also
+    // emitted by `transition`'s `--until` clean-stop branch (`pipeline_gate.rs`,
+    // `state.stop_until == Some(from)` arm) with a `"stopped_at"` reason,
+    // before any hook, stage assignment, or launch runs. A phase halted after
+    // one stage must never read as shipped. Ordering here is load-bearing in
+    // three directions: after the hook-success loop `break` above, so it can
+    // only fire once the entire `hooks_after_ship` batch has succeeded; before
+    // the state is cleared below, so a kill between the two cannot leave a
+    // shipped run with no state and no record that it shipped; and before
+    // `workflow_finished` below, because existing tests assert a phase's event
+    // stream ENDS in `workflow_finished` — do not move this emission after
+    // either of them.
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_shipped",
+        serde_json::json!({
+            "stage": Stage::Ship.to_string(),
+        }),
+    );
     let _ = close_gate(project_root, state.phase, Stage::Validate);
     let _ = close_gate(project_root, state.phase, Stage::Ship);
+    #[cfg(test)]
+    if let Some(probe) = BEFORE_RUN_STATE_CLEAR.take() {
+        probe();
+    }
     clear_run_state(project_root, state.phase)?;
     // 23b: the workflow is genuinely over — deregister this (project_root,
     // phase) from the machine-global registry so `devflow gate list
@@ -336,26 +362,6 @@ pub(crate) fn finish_workflow_with_gate_timeout(
         Ok(None) => {}
         Err(err) => info!(phase = %state.phase, "could not consume cron instructions: {err}"),
     }
-    // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
-    // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
-    // reads — deliberately NOT `workflow_finished` below, which is also
-    // emitted by `transition`'s `--until` clean-stop branch (`pipeline_gate.rs`,
-    // `state.stop_until == Some(from)` arm) with a `"stopped_at"` reason,
-    // before any hook, stage assignment, or launch runs. A phase halted after
-    // one stage must never read as shipped. Ordering here is load-bearing in
-    // both directions: after the hook-success loop `break` above, so it can
-    // only fire once the entire `hooks_after_ship` batch has succeeded; and
-    // before `workflow_finished` below, because existing tests assert a
-    // phase's event stream ENDS in `workflow_finished` — do not move this
-    // emission after it.
-    events::emit(
-        project_root,
-        state.phase,
-        "workflow_shipped",
-        serde_json::json!({
-            "stage": Stage::Ship.to_string(),
-        }),
-    );
     events::emit(
         project_root,
         state.phase,
@@ -364,6 +370,14 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     );
     println!("phase {} shipped — workflow complete", state.phase);
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread once, at the last instant before finalization removes the state,
+    /// standing in for a kill at that point.
+    static BEFORE_RUN_STATE_CLEAR: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 // A gate wait is a plain call in a normal build. The test build routes it through
@@ -2145,6 +2159,43 @@ mod tests {
             workflow::load_state(root, phase),
             Err(workflow::WorkflowError::MissingState(_))
         ));
+        assert_eq!(events_named(root, "workflow_shipped").len(), 1);
+    }
+
+    /// A process killed between deleting the state and recording the ship must not leave a
+    /// shipped run that reads as not shipped: by the moment the state goes, the strict shipped
+    /// predicate is already on disk. Runs the whole foreground finalization, reading the
+    /// evidence at the last instant before the state is removed.
+    #[test]
+    fn workflow_shipped_is_recorded_before_the_state_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(96);
+        ship_ready_fixture(root, phase);
+        Gates::open_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        crate::commands::gate_respond(root, phase, Some(Stage::Ship), true, None, None).unwrap();
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        BEFORE_RUN_STATE_CLEAR.set(Some(Box::new({
+            let seen = seen.clone();
+            let root = root.to_path_buf();
+            move || {
+                let evidence = devflow_core::ship_evidence::collect(&root, phase);
+                seen.set(Some((evidence.state_present, evidence.shipped)));
+            }
+        })));
+        ship_override(root, phase, false).unwrap();
+
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "(state_present, shipped) at the instant before the state is cleared"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, phase).unwrap();
+        assert_eq!(
+            last["event"], "workflow_finished",
+            "the stream still ends in the finish"
+        );
         assert_eq!(events_named(root, "workflow_shipped").len(), 1);
     }
 
