@@ -3631,6 +3631,14 @@ fn stop_reap_observed_gate(
             return Ok(None);
         }
     };
+    if Gates::claim_path(project_root, phase, gate.stage, &observed).exists() {
+        println!(
+            "stop: phase {phase}'s {} gate (gate {observed}) was already answered and its answer \
+             claimed by its consumer; stop did not answer it",
+            gate.stage
+        );
+        return Ok(None);
+    }
     let run = workflow::load_state(project_root, phase)
         .ok()
         .filter(|state| state.gate_pending && state.stage == gate.stage);
@@ -3897,21 +3905,28 @@ fn persist_stopped_state(
     if signal_sent && !wait_for_holder_release(project_root, phase) {
         return Err(CliError::Message(holder_still_running(project_root, phase)));
     }
-    let found_state = workflow::update_state_with(project_root, phase, |existing| {
-        let mut state = match existing {
-            workflow::Existing::Loaded(state) => state,
-            workflow::Existing::Missing => return Ok((None, false)),
-            workflow::Existing::Unloadable(err) => return Err(CliError::from(err)),
-        };
-        let _ = (unaddressed_launch_refusal, known_launches);
-        state.stopped = true;
-        let reason = "stopped via `devflow stop`".to_string();
-        state.stop_reason = Some(match state.stop_reason.take() {
-            Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
-            _ => reason,
-        });
-        Ok((Some(state), true))
-    })?;
+    let found_state = workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| {
+            let mut state = match existing {
+                workflow::Existing::Loaded(state) => state,
+                workflow::Existing::Missing => return Ok((None, false)),
+                workflow::Existing::Unloadable(err) => return Err(CliError::from(err)),
+            };
+            if let Some(refusal) = unaddressed_launch_refusal(&state, known_launches) {
+                return Err(refusal);
+            }
+            state.stopped = true;
+            let reason = "stopped via `devflow stop`".to_string();
+            state.stop_reason = Some(match state.stop_reason.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+                _ => reason,
+            });
+            Ok((Some(state), true))
+        },
+    )?;
     if !found_state {
         println!("{}", missing_state_line(phase, signal_sent));
     }
@@ -6748,12 +6763,12 @@ pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
             // `.devflow/` already covers every phase.
             continue;
         }
-        let _ = held_launch_and_phase_holders;
-        for state in workflow::list_states(root) {
-            if let Some((pid, _start_time)) = lock::holder_identity(root, state.phase) {
-                reachable.insert(pid);
-            }
-        }
+        reachable.extend(held_launch_and_phase_holders(root));
+        reachable.extend(
+            Gates::live_waiter_holders(root)
+                .into_iter()
+                .map(|(pid, _start_time)| pid),
+        );
     }
     reachable
 }
@@ -8454,6 +8469,19 @@ mod tests {
         stop_in(&root, marked, Some(cache.path())).expect("both launches were addressed");
         assert_eq!(b.shutdowns(), 1, "the pending launch was ended");
         assert!(workflow::load_state(&root, marked).unwrap().stopped);
+
+        // Its lock outlives its reply, so the reservation is still recorded when `stop` writes.
+        let lingering = PhaseId::new(5030);
+        let (b3, b_path) = ("bbbb0000bbbb5030", sock.join("b30.sock"));
+        state_with_dead_recorded_and_pending(&root, lingering, A, b3, &b_path);
+        let _lingering_hold =
+            liveness::Hold::take(&liveness::launch_liveness_path(&root, b3).unwrap()).unwrap();
+        let b = ScriptedSupervisor::serve(&b_path, b3, lingering, "agent_running", |_| {
+            stopped_and_gone()
+        });
+        stop_in(&root, lingering, Some(cache.path())).expect("this stop ended the reservation");
+        assert_eq!(b.shutdowns(), 1, "the pending launch was ended");
+        assert!(workflow::load_state(&root, lingering).unwrap().stopped);
 
         let refused = PhaseId::new(5027);
         let (b2, b_path) = ("bbbb0000bbbb5027", sock.join("b27.sock"));
