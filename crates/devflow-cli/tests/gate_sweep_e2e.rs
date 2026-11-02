@@ -274,7 +274,7 @@ fn sweep_help_documents_max_age_and_dry_run() {
 
 /// Task 3's strongest proof: a **real, separate `devflow advance` process**
 /// parked on a gate is ended by a file write, unwinds through its own
-/// `abort()` path, releases its per-phase lock, and leaves an audit record —
+/// `abort()` path, finishes its gate registration, and leaves an audit record —
 /// the orphan class `23-ORPHAN-FORENSICS.md` documented, now remedied
 /// without `kill(1)`.
 ///
@@ -310,28 +310,16 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         .spawn()
         .expect("spawn devflow advance");
 
-    // Wait for the child to acquire the per-phase lock (proves it is
-    // genuinely inside `advance()`, holding it across the gate wait) and to
-    // write the Code gate (proves it reached `run_gate_with_timeout` and is
-    // now polling for a response) — the two on-disk facts the plan's
-    // objective names as the "live poller" evidence.
-    wait_for(
-        || devflow_core::lock::holder(root, phase).is_some(),
-        10,
-        "the child to acquire .devflow/lock-95",
-    );
+    // Wait for the child to write the Code gate (proves it reached
+    // `run_gate_with_timeout`) and for that gate's waiter registration to read
+    // live (proves it is now waiting for a response): the two on-disk facts that
+    // are the "live poller" evidence.
     let gate_path = Gates::gate_path(root, phase, Stage::Code);
     wait_for(
         || gate_path.exists(),
         10,
         "the child to write the Code gate",
     );
-    assert!(
-        devflow_core::lock::holder(root, phase).is_some(),
-        "lock must still be held once the gate is written — this is the \
-         proof that a live poller is genuinely blocking on it"
-    );
-
     // The reap itself: the same `Gates::reap_answer` primitive Task 1/2's tests
     // exercise against a thread-based live poller. This test's job is to
     // prove the OTHER end of that same write — a real, separate process
@@ -340,11 +328,20 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         .into_iter()
         .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
         .expect("the child's Code gate is listed");
+    let gate_id = GateId::parse(&listed.gate_id).expect("the child's gate has a gate id");
+    wait_for(
+        || {
+            Gates::waiter_status(root, phase, Stage::Code, &gate_id)
+                .is_ok_and(|status| status == devflow_core::gates::WaiterStatus::Live)
+        },
+        10,
+        "the child's registration at the Code gate",
+    );
     Gates::reap_answer(
         root,
         phase,
         Stage::Code,
-        &GateId::parse(&listed.gate_id).expect("the child's gate has a gate id"),
+        &gate_id,
         "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
         "devflow-reap",
     )
@@ -357,10 +354,10 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         "devflow advance must exit cleanly once its own abort() path runs, got {status:?}"
     );
     assert!(
-        devflow_core::lock::holder(root, phase).is_none(),
-        "LockGuard's Drop must have released the per-phase lock — proof the \
-         process unwound cleanly through its own code, not by being \
-         terminated from outside"
+        !Gates::waiter_path(root, phase, Stage::Code, &gate_id).exists(),
+        "the waiter must have finished its registration, removing the file: proof the \
+         process unwound cleanly through its own code, since one ended from outside \
+         leaves it in place"
     );
 
     let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();

@@ -12,7 +12,7 @@
 
 mod common;
 
-use devflow_core::gates::{GateResponse, Gates};
+use devflow_core::gates::{GateId, GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -495,10 +495,25 @@ fn wait_for_child_exit(
     }
 }
 
+/// The id of the gate open at `stage`.
+fn open_gate_id(root: &Path, phase: PhaseId, stage: Stage) -> GateId {
+    let listed = Gates::list_open(root)
+        .into_iter()
+        .find(|gate| gate.phase == phase && gate.stage == stage)
+        .expect("the gate is listed");
+    GateId::parse(&listed.gate_id).expect("the gate has a gate id")
+}
+
+/// Whether a process holds `gate`'s waiter registration.
+fn gate_registration_is_live(root: &Path, phase: PhaseId, stage: Stage, gate: &GateId) -> bool {
+    Gates::waiter_status(root, phase, stage, gate)
+        .is_ok_and(|status| status == devflow_core::gates::WaiterStatus::Live)
+}
+
 /// Task 1's core proof: a real, separate `devflow advance` process parked on
 /// a Code gate is ended by `devflow stop` writing a rejection file — no
-/// signal sent — unwinds through its own `abort()` path, releases its
-/// per-phase lock, and leaves a `workflow_aborted` audit event. The orphan
+/// signal sent — unwinds through its own `abort()` path, finishes its gate
+/// registration, and leaves a `workflow_aborted` audit event. The orphan
 /// class `23-ORPHAN-FORENSICS.md` documented, now remedied.
 #[test]
 fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
@@ -524,25 +539,20 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
         .spawn()
         .expect("spawn devflow advance");
 
-    // Wait for the child to acquire the per-phase lock (proves it is inside
-    // `advance()`, holding the lock across the gate wait) and to write the
-    // Code gate (proves it reached `run_gate_with_timeout` and is now
-    // polling for a response).
-    wait_for(
-        || devflow_core::lock::holder(root, phase).is_some(),
-        10,
-        "the child to acquire .devflow/lock-95",
-    );
+    // Wait for the child to write the Code gate (proves it reached
+    // `run_gate_with_timeout`) and for that gate's waiter registration to read
+    // live (proves it is now waiting for a response).
     let gate_path = Gates::gate_path(root, phase, Stage::Code);
     wait_for(
         || gate_path.exists(),
         10,
         "the child to write the Code gate",
     );
-    assert!(
-        devflow_core::lock::holder(root, phase).is_some(),
-        "lock must still be held once the gate is written — proof a live poller is genuinely \
-         blocking on it"
+    let gate_id = open_gate_id(root, phase, Stage::Code);
+    wait_for(
+        || gate_registration_is_live(root, phase, Stage::Code, &gate_id),
+        10,
+        "the child's registration at the Code gate",
     );
 
     let output = common::hermetic_devflow(&home)
@@ -564,9 +574,9 @@ fn stop_ends_a_gated_phase_through_its_own_abort_path_with_no_signal_sent() {
         "devflow advance must exit cleanly once its own abort() path runs, got {status:?}"
     );
     assert!(
-        devflow_core::lock::holder(root, phase).is_none(),
-        "LockGuard's Drop must have released the per-phase lock — proof the process unwound \
-         cleanly through its own code, not by being terminated from outside"
+        !Gates::waiter_path(root, phase, Stage::Code, &gate_id).exists(),
+        "the waiter must have finished its registration, removing the file: proof the process \
+         unwound cleanly through its own code, since one ended from outside leaves it in place"
     );
 
     let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
@@ -1478,15 +1488,15 @@ i=0
 while [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
 exit 0";
 
-/// A stopped supervisor records its stop under the per-phase lock, waiting
+/// A stopped supervisor records its stop under the state write lock, waiting
 /// up to 11 s for it, before it sends the final `stopped` line, and its kill
 /// of an agent that ignores SIGTERM first takes the 3 s SIGTERM grace. So
 /// `stop`'s wait for that line must cover both: here this test holds the
-/// lock for 12.5 s after the shutdown is sent, past an 11 s wait and within
+/// write lock for 12.5 s after the shutdown is sent, past an 11 s wait and within
 /// the supervisor's 14 s. A wait too short reads the still-answering
 /// supervisor as one that "did not answer the shutdown" although it stopped.
 #[test]
-fn stop_waits_out_a_supervisor_whose_stop_record_waits_on_the_lock() {
+fn stop_waits_out_a_supervisor_whose_stop_record_waits_on_the_write_lock() {
     const HOLD_AFTER_SHUTDOWN: Duration = Duration::from_millis(12_500);
     let run = LiveRun::start_with(PhaseId::new(156), IGNORES_TERM);
     std::fs::write(&run.trigger, "").unwrap();
@@ -1497,7 +1507,17 @@ fn stop_waits_out_a_supervisor_whose_stop_record_waits_on_the_lock() {
             .exists()),
         "precondition: the agent ignores SIGTERM"
     );
-    let lock = devflow_core::lock::acquire(&run.root, run.phase).expect("hold the phase lock");
+    let (held, is_held) = std::sync::mpsc::channel();
+    let (hold_root, hold_phase) = (run.root.clone(), run.phase);
+    let hold = std::thread::spawn(move || {
+        devflow_core::workflow::update_state_with(&hold_root, hold_phase, |_| {
+            held.send(()).expect("the test waits for the hold");
+            std::thread::sleep(HOLD_AFTER_SHUTDOWN);
+            Ok::<_, devflow_core::workflow::WorkflowError>((None, ()))
+        })
+        .expect("the hold writes nothing");
+    });
+    is_held.recv().expect("the write lock is held");
     let stop = common::hermetic_devflow(&run.home)
         .args(["stop", "--phase", &run.phase.to_string()])
         .current_dir(&run.root)
@@ -1505,9 +1525,8 @@ fn stop_waits_out_a_supervisor_whose_stop_record_waits_on_the_lock() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn devflow stop");
-    std::thread::sleep(HOLD_AFTER_SHUTDOWN);
-    drop(lock);
     let output = stop.wait_with_output().expect("wait for devflow stop");
+    hold.join().expect("the hold's thread");
     let text = describe(&output);
     assert!(
         output.status.success(),
@@ -1724,24 +1743,30 @@ fn stop_tears_down_a_stale_supervisor_through_the_backstop() {
     );
 }
 
-/// R-10: a supervise-mode run parked at a gate, holding the per-phase lock,
+/// R-10: a supervise-mode run parked at a gate, holding its registration,
 /// whose supervisor is SIGKILLed. `stop` writes no gate response (no live
 /// waiter), tears the STALE socket down to GONE (the agent had already
 /// exited, so nothing is signalled), names `devflow resume --phase N` (R-8),
-/// and leaves the lock reclaimable.
+/// and the dead waiter's registration reads absent.
 #[test]
 fn stop_after_a_supervisor_killed_at_a_gate_reaps_and_reports_gone() {
     let run = LiveRun::start_with(PhaseId::new(144), FAILS_TO_A_GATE);
     std::fs::write(&run.trigger, "go\n").unwrap();
     let gate = Gates::gate_path(&run.root, run.phase, Stage::Define);
     assert!(
-        holds_within(RUN_WAIT, || gate.exists()
-            && matches!(
-                devflow_core::lock::holder_status(&run.root, run.phase),
-                devflow_core::lock::HolderStatus::Live { .. }
-            )),
-        "precondition: the run parks at the Define gate holding the lock:\n{}",
+        holds_within(RUN_WAIT, || gate.exists()),
+        "precondition: the run parks at the Define gate:\n{}",
         std::fs::read_to_string(devflow_core::events::events_path(&run.root)).unwrap_or_default()
+    );
+    let gate_id = open_gate_id(&run.root, run.phase, Stage::Define);
+    assert!(
+        holds_within(RUN_WAIT, || gate_registration_is_live(
+            &run.root,
+            run.phase,
+            Stage::Define,
+            &gate_id
+        )),
+        "precondition: the run holds the gate's registration"
     );
     kill_supervisor(&run);
 
@@ -1760,17 +1785,10 @@ fn stop_after_a_supervisor_killed_at_a_gate_reaps_and_reports_gone() {
         "no gate response is written without a live waiter"
     );
     assert_eq!(run.probe(), Liveness::Gone, "the socket is torn down");
-    assert!(
-        matches!(
-            devflow_core::lock::holder_status(&run.root, run.phase),
-            devflow_core::lock::HolderStatus::NoHolder
-                | devflow_core::lock::HolderStatus::Recycled { .. }
-        ),
-        "the dead holder's lock is reclaimable"
-    );
-    drop(
-        devflow_core::lock::acquire(&run.root, run.phase)
-            .expect("the per-phase lock can be taken after the stop"),
+    assert_eq!(
+        Gates::waiter_status(&run.root, run.phase, Stage::Define, &gate_id).unwrap(),
+        devflow_core::gates::WaiterStatus::Absent,
+        "the killed waiter's registration reads absent"
     );
 }
 

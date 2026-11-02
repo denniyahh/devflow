@@ -3075,7 +3075,7 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
 
 /// How long `stop` waits for a supervisor's final shutdown line: the
 /// supervisor's own terminate-and-verify wait, twice, then its wait for the
-/// per-phase lock before it records its stop and answers
+/// state write lock before it records its stop and answers
 /// ([`crate::pipeline_launch::SUPERVISOR_STOP_WAIT`]), plus time to persist.
 /// Shorter, and a busy lock reads a supervisor that did stop as one that did
 /// not answer.

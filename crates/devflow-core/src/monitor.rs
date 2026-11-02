@@ -1644,7 +1644,13 @@ const PROMOTION_POLL: Duration = Duration::from_millis(20);
 ///    when the wait has passed with this launch still only pending. A state file
 ///    that is gone is `Superseded { recorded: None }` at once. Any other load error
 ///    is retried, and still failing at the deadline ends the same way: no readable
-///    state names this launch. After `Recorded` the watch stops reading, so a
+///    state names this launch. A `Superseded` or `OrphanedPending` verdict while the
+///    agent still runs ends the agent's group through
+///    `end_group_while_running` (the leader is unreaped, so the signal reaches only
+///    the agent's own group, R-13); the agent then exits as a stop. The deadline
+///    therefore runs from serving: an orphan whose agent never exits ends that agent
+///    at the deadline. A verdict reached after the agent exited signals nothing.
+///    After `Recorded` the watch stops reading, so a
 ///    supersession that lands while the agent runs is seen only at this
 ///    supervisor's next guarded side effect after the agent exits, which writes
 ///    nothing (R2-10). Until then that agent keeps running. Every launch route
@@ -1698,7 +1704,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     // Before the disarm, so a watch that cannot start still ends the agent's group.
     let watch = spec
         .promotion_wait
-        .map(|wait| PromotionWatch::start(&spec, wait))
+        .map(|wait| PromotionWatch::start(&spec, wait, supervisor.token(), pid))
         .transpose()?;
     let mut child = guard.disarm();
 
@@ -1750,26 +1756,38 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         "supervised {} agent {pid} ended: {outcome:?}",
         spec.io.label()
     );
-    let promotion = watch.and_then(|watch| watch.finish(&supervisor.token()));
+    let (promotion, agent_group_end) = watch
+        .map(|watch| watch.finish(&supervisor.token()))
+        .unwrap_or_default();
     Ok(StageRun {
         outcome,
         supervisor,
         liveness,
         promotion,
-        agent_group_end: None,
+        agent_group_end,
     })
 }
 
-/// The thread that decides a supervisor's [`Promotion`], beside its agent (R-12).
-/// Dropping it tells the thread to quit and joins it.
+/// The thread that decides a supervisor's [`Promotion`], beside its agent (R-12), and
+/// ends the agent's group on a verdict other than [`Promotion::Recorded`]. Dropping it
+/// tells the thread to quit and joins it.
 struct PromotionWatch {
     quit: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<Option<Promotion>>>,
+    thread: Option<std::thread::JoinHandle<PromotionEnd>>,
 }
 
+/// The watch's verdict, and what ending the agent's group did, if it tried.
+type PromotionEnd = (Option<Promotion>, Option<AgentGroupEnd>);
+
 impl PromotionWatch {
-    /// Start the watch. `wait` runs from now, the moment the supervisor serves.
-    fn start(spec: &StageSpec, wait: Duration) -> Result<Self, std::io::Error> {
+    /// Start the watch. `wait` runs from now, the moment the supervisor serves. `pgid` is
+    /// the agent's, confirmed as its group leader's pid before the supervisor served.
+    fn start(
+        spec: &StageSpec,
+        wait: Duration,
+        token: crate::supervisor::runtime::StopToken,
+        pgid: u32,
+    ) -> Result<Self, std::io::Error> {
         let quit = Arc::new(AtomicBool::new(false));
         let (project_root, phase, launch_id) = (
             spec.project_root.clone(),
@@ -1779,16 +1797,30 @@ impl PromotionWatch {
         let thread_quit = Arc::clone(&quit);
         let thread = std::thread::Builder::new()
             .name("promotion-watch".to_string())
-            .spawn(move || await_promotion(&project_root, phase, &launch_id, wait, &thread_quit))?;
+            .spawn(move || {
+                let promotion =
+                    await_promotion(&project_root, phase, &launch_id, wait, &thread_quit);
+                // The leader is unreaped while the agent runs, so this reaches only its
+                // group (R-13). A verdict reached after the agent exited signals nothing.
+                let group_end = match promotion {
+                    Some(Promotion::Superseded { .. } | Promotion::OrphanedPending) => Some(
+                        crate::supervisor::runtime::end_group_while_running(&token, pgid),
+                    ),
+                    _ => None,
+                };
+                (promotion, group_end)
+            })?;
         Ok(Self {
             quit,
             thread: Some(thread),
         })
     }
 
-    /// The watch's verdict once it has one. A stop tells a watch without one to quit.
-    fn finish(mut self, token: &crate::supervisor::runtime::StopToken) -> Option<Promotion> {
-        let thread = self.thread.take()?;
+    /// The watch's result once it has one. A stop tells a watch without a verdict to quit.
+    fn finish(mut self, token: &crate::supervisor::runtime::StopToken) -> PromotionEnd {
+        let Some(thread) = self.thread.take() else {
+            return (None, None);
+        };
         while !thread.is_finished() {
             if token.stop_requested() {
                 self.quit.store(true, Ordering::Release);
@@ -1797,7 +1829,7 @@ impl PromotionWatch {
         }
         thread.join().unwrap_or_else(|_| {
             warn!("the promotion watch panicked; no verdict");
-            None
+            (None, None)
         })
     }
 }
