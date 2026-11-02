@@ -44,8 +44,6 @@ KNOWN_CASES=(alive-stop-stream alive-stop-capture kill9-stale-stop kill9-at-gate
 # at the fixture that reaches it deterministically.
 WINDOW_FIXTURE=pipeline_launch::tests::a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor
 GATE_REL=.devflow/gates/01-define.json
-GATE_RESPONSE_REL=.devflow/gates/01-define.response.json
-LOCK_REL=.devflow/lock-01
 EXIT_REL=.devflow/phase-01-exit
 KILL_WAIT=30
 GATE_WAIT=60
@@ -428,18 +426,68 @@ record_case() {
     fi
 }
 
-# The per-phase lock's holder: none (no lock file, unparsable, or its pid is not
-# running), live (running with the recorded start time), recycled (running
-# with another start time) or unconfirmable (running, no start time recorded).
-lock_status() {
-    local file="$1/$LOCK_REL" pid="" start="" now
-    [ -f "$file" ] || { echo none; return 0; }
-    { read -r pid; read -r start; } <"$file" || true
-    case "$pid" in '' | *[!0-9]*) echo none; return 0 ;; esac
-    is_running "$pid" || { echo none; return 0; }
-    [ -n "$start" ] || { echo unconfirmable; return 0; }
-    now="$(start_time "$pid")" || { echo none; return 0; }
-    if [ "$now" = "$start" ]; then echo live; else echo recycled; fi
+# The Define gate's waiter, from one `devflow doctor --json` document on stdin:
+# in the `reconciliation` entries whose `phase` is $PHASE, `gate_waiter.status`
+# when `gate_waiter.stage` is `define`, else `absent` (no open gate, or the gate
+# named is another stage's). `no_phase` when the phase has no entry. Anything
+# else is a `FAILED <why>` line, never `absent`: a field this reads going missing
+# must not look like a gone waiter. `gate_id` is not read: it is null for a gate
+# file whose id does not parse, and that gate can only read `absent`.
+waiter_from_doctor_json() {
+    local reading
+    reading="$(jq -rs --argjson phase "$PHASE" '
+        if length != 1 then "FAILED doctor --json did not print one document"
+        elif (.[0] | type) != "object" or (.[0].reconciliation | type) != "array" then
+            "FAILED doctor --json has no reconciliation array"
+        else
+            (.[0].reconciliation | map(select(.phase == $phase))) as $entries
+            | if ($entries | length) == 0 then "no_phase"
+              elif ($entries | all(has("gate_waiter")) | not) then
+                  "FAILED a reconciliation entry for the phase has no gate_waiter"
+              else
+                  $entries[0].gate_waiter as $waiter
+                  | if ($waiter | type) != "object" or ($waiter.status | IN("live", "absent") | not)
+                        or ($waiter | has("stage") | not) then
+                        "FAILED gate_waiter has no stage and live or absent status"
+                    elif $waiter.stage == "define" then $waiter.status
+                    else "absent"
+                    end
+              end
+        end
+    ' 2>/dev/null)" || {
+        echo "FAILED doctor --json output does not parse"
+        return 0
+    }
+    printf '%s\n' "$reading"
+}
+
+# The Define gate's waiter for <project>, as `doctor --json` reports it. That is
+# the only producer of this fact: `devflow status` takes no JSON flag. A failed
+# command is a FAILED line, whatever it printed.
+waiter_status() {
+    local project="$1" fake="$2" out rc=0
+    out="$(devflow_in "$project" "$fake" doctor --json "$project" 2>"$S/doctor.err")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "FAILED doctor --json exited $rc: $(tail -n 1 "$S/doctor.err")"
+        return 0
+    fi
+    printf '%s\n' "$out" | waiter_from_doctor_json
+}
+
+# Whether a waiter reading says nothing waits; a stop that cleared the state
+# leaves no phase to wait. A FAILED reading says nothing of the kind.
+waiter_gone() {
+    case "$1" in absent | no_phase) return 0 ;; *) return 1 ;; esac
+}
+
+# Whether <project> holds a keyed answer for the Define gate, under any gate id.
+# A set-aside answer has its own name and is not one.
+keyed_answer_written() {
+    local file
+    for file in "$1"/.devflow/gates/01-define.*.response.json; do
+        [ ! -e "$file" ] || return 0
+    done
+    return 1
 }
 
 supervisor_gone() {
@@ -451,7 +499,7 @@ probe_is() {
 }
 
 gate_parked() {
-    [ -f "$P/$GATE_REL" ] && [ "$(lock_status "$P")" = live ]
+    [ -f "$P/$GATE_REL" ] && [ "$(waiter_status "$P" "$F")" = live ]
 }
 
 # SIGKILL the case's supervisor by the pid its sidecar records, after the
@@ -503,18 +551,18 @@ case_kill9_stale_stop() {
         }')" "${unmet[@]+"${unmet[@]}"}"
 }
 
-# kill9-at-gate: a supervise-mode Define that fails parks at its gate holding
-# the per-phase lock; SIGKILL the supervisor → STALE → `stop` → GONE, with no
-# gate response written and the lock holder gone or recycled.
+# kill9-at-gate: a supervise-mode Define that fails parks at its gate with a
+# live registered waiter; SIGKILL the supervisor → STALE → `stop` → GONE, with
+# no keyed answer written and no waiter left.
 case_kill9_at_gate() {
-    local name=kill9-at-gate gate_open=false lock_before probe_before members_before killed=true
-    local probe_after_kill stop_out stop_rc=0 probe_after members_after lock_after response=false
+    local name=kill9-at-gate gate_open=false waiter_before probe_before members_before killed=true
+    local probe_after_kill stop_out stop_rc=0 probe_after members_after waiter_after response=false
     local launched advance unmet=()
     launch "$name" "$RELEASE_FAILS_TO_A_GATE" || return 1
     : >"$TRIG"
     wait_until "$GATE_WAIT" gate_parked || true
     [ ! -f "$P/$GATE_REL" ] || gate_open=true
-    lock_before="$(lock_status "$P")"
+    waiter_before="$(waiter_status "$P" "$F")"
     probe_before="$(probe "$P" "$F")"
     members_before="$(members_json "$PGID")"
     kill_supervisor || killed=false
@@ -525,28 +573,28 @@ case_kill9_at_gate() {
     remember_agents "$AGENTS"
     probe_after="$(probe "$P" "$F")"
     members_after="$(members_json "$PGID")"
-    lock_after="$(lock_status "$P")"
-    [ ! -e "$P/$GATE_RESPONSE_REL" ] || response=true
+    waiter_after="$(waiter_status "$P" "$F")"
+    ! keyed_answer_written "$P" || response=true
     launched="$(event_count "$P" stage_launched)"
     advance="$(advance_ran "$P")"
     [ "$gate_open" = true ] || unmet+=("the Define gate never opened")
-    [ "$lock_before" = live ] || unmet+=("the per-phase lock holder before the kill was $lock_before")
+    [ "$waiter_before" = live ] || unmet+=("the Define gate's waiter before the kill read $waiter_before")
     [ "$killed" = true ] || unmet+=("the supervisor was not killed or did not exit")
     [ "$probe_after_kill" = STALE ] || unmet+=("probe after the kill $probe_after_kill")
     [ "$stop_rc" -eq 0 ] || unmet+=("devflow stop exited $stop_rc")
     [ "$probe_after" = GONE ] || unmet+=("probe after stop $probe_after")
     [ "$members_after" = '[]' ] || unmet+=("agent group member survived")
-    case "$lock_after" in none | recycled) ;; *) unmet+=("lock holder after stop is $lock_after") ;; esac
-    [ "$response" = false ] || unmet+=("a gate response was written with no live waiter")
+    waiter_gone "$waiter_after" || unmet+=("the Define gate's waiter after stop read $waiter_after")
+    [ "$response" = false ] || unmet+=("a keyed answer was written with no live waiter")
     [ "$launched" -eq 1 ] || unmet+=("$launched stage_launched events, expected 1")
-    record_case "$name" "$(jq -n --argjson go "$gate_open" --arg lb "$lock_before" --arg pb "$probe_before" \
+    record_case "$name" "$(jq -n --argjson go "$gate_open" --arg wb "$waiter_before" --arg pb "$probe_before" \
         --arg pk "$probe_after_kill" --arg pa "$probe_after" --argjson mb "$members_before" \
-        --argjson ma "$members_after" --arg la "$lock_after" --argjson resp "$response" \
+        --argjson ma "$members_after" --arg wa "$waiter_after" --argjson resp "$response" \
         --argjson adv "$advance" --argjson n "$launched" --argjson rc "$stop_rc" --arg out "$stop_out" \
         --argjson killed "$killed" '{
-            gate_open_before: $go, lock_holder_before: $lb, lock_held_before: ($lb == "live"),
+            gate_open_before: $go, waiter_before: $wb,
             probe_before: $pb, supervisor_killed: $killed, probe_after_kill: $pk, probe_after: $pa,
-            members_before: $mb, members_after: $ma, lock_holder_after: $la,
+            members_before: $mb, members_after: $ma, waiter_after: $wa,
             gate_response_written: $resp, advance_ran: $adv, next_stage_launched: ($n > 1),
             stage_launched_count: $n, stop_exit: $rc, stop_output: $out
         }')" "${unmet[@]+"${unmet[@]}"}"
@@ -862,6 +910,118 @@ st_probe_word() {
     [ "$got" = ABSENT ] || { echo "no supervisor line read as $got"; return 1; }
 }
 
+# A stand-in for the binary: records its arguments in <dir>/argv, prints
+# <dir>/reply and exits with <dir>/rc.
+st_plant_bin() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat >"$dir/bin" <<PLANT
+#!/bin/sh
+printf '%s\n' "\$*" >'$dir/argv'
+cat '$dir/reply'
+exit "\$(cat '$dir/rc')"
+PLANT
+    chmod 0755 "$dir/bin"
+    : >"$dir/reply"
+    echo 0 >"$dir/rc"
+}
+
+# st_doc <gate_waiter json>: a `doctor --json` document whose one phase-1 entry
+# carries that waiter, shaped as `render_reconciliation_json` prints it.
+st_doc() {
+    jq -n --argjson waiter "$1" '{environment: [], reconciliation: [
+        {phase: 1, severity: "ok", detail: "phase 1: ok", repair: null, last_event: null,
+         supervisor: {liveness: "ALIVE"}, gate_waiter: $waiter}]}'
+}
+
+# st_reads <name> <exit code> <reply> <wanted>: waiter_status over the planted
+# reply reads <wanted>; a wanted `FAILED` matches any FAILED line.
+st_reads() {
+    local name="$1" rc="$2" reply="$3" wanted="$4" got
+    printf '%s\n' "$reply" >"$PLANT/reply"
+    echo "$rc" >"$PLANT/rc"
+    got="$(waiter_status "$P" "$F")"
+    case "$wanted" in
+        FAILED) [ "${got%% *}" = FAILED ] || { echo "$name read '$got', expected a FAILED line"; return 1; } ;;
+        *) [ "$got" = "$wanted" ] || { echo "$name read '$got', expected $wanted"; return 1; } ;;
+    esac
+}
+
+# The globals waiter_status needs, with its binary replaced by a plant.
+st_waiter_setup() {
+    S="$ST_TMP/$1"
+    PLANT="$S/plant"
+    P="$S/project"
+    F="$S/fake"
+    BIN="$PLANT/bin"
+    mkdir -p "$P/.devflow/gates" "$F"
+    st_plant_bin "$PLANT"
+}
+
+ST_WAITER_LIVE='{"stage":"define","gate_id":"g-1","status":"live"}'
+ST_WAITER_ABSENT='{"stage":"define","gate_id":"g-1","status":"absent"}'
+
+st_waiter_readings() {
+    st_waiter_setup readings
+    st_reads 'a live Define waiter' 0 "$(st_doc "$ST_WAITER_LIVE")" live || return 1
+    [ "$(cat "$PLANT/argv")" = "doctor --json $P" ] || { echo "the binary was asked: $(cat "$PLANT/argv")"; return 1; }
+    st_reads 'a Define gate with no waiter' 0 "$(st_doc "$ST_WAITER_ABSENT")" absent || return 1
+    st_reads 'a gate id that did not parse' 0 "$(st_doc '{"stage":"define","gate_id":null,"status":"absent"}')" absent || return 1
+    st_reads 'no open gate' 0 "$(st_doc '{"stage":null,"gate_id":null,"status":"absent"}')" absent || return 1
+    st_reads "another stage's live waiter" 0 "$(st_doc '{"stage":"code","gate_id":"g-2","status":"live"}')" absent || return 1
+    st_reads 'no entry for the phase' 0 '{"reconciliation":[{"phase":2,"gate_waiter":{"stage":"define","gate_id":"g","status":"live"}}]}' no_phase || return 1
+    st_reads 'an empty reconciliation' 0 '{"reconciliation":[]}' no_phase
+}
+
+st_waiter_failed_readings() {
+    st_waiter_setup failed
+    st_reads 'an entry with no gate_waiter key' 0 '{"reconciliation":[{"phase":1,"severity":"ok"}]}' FAILED || return 1
+    st_reads 'a later entry with no gate_waiter key' 0 "{\"reconciliation\":[{\"phase\":1,\"gate_waiter\":$ST_WAITER_LIVE},{\"phase\":1}]}" FAILED || return 1
+    st_reads 'a non-JSON reply' 0 'doctor: something went wrong' FAILED || return 1
+    st_reads 'an empty reply' 0 '' FAILED || return 1
+    st_reads 'two documents' 0 "$(st_doc "$ST_WAITER_LIVE")$(st_doc "$ST_WAITER_LIVE")" FAILED || return 1
+    st_reads 'a document with no reconciliation' 0 '{"environment":[]}' FAILED || return 1
+    st_reads 'a null gate_waiter' 0 "$(st_doc null)" FAILED || return 1
+    st_reads 'a gate_waiter with no status' 0 "$(st_doc '{"stage":"define","gate_id":"g"}')" FAILED || return 1
+    st_reads 'a gate_waiter with no stage' 0 "$(st_doc '{"gate_id":"g","status":"live"}')" FAILED || return 1
+    st_reads 'an unknown status' 0 "$(st_doc '{"stage":"define","gate_id":"g","status":"recycled"}')" FAILED || return 1
+    st_reads 'a failed command printing a live waiter' 3 "$(st_doc "$ST_WAITER_LIVE")" FAILED
+}
+
+st_gate_parked() {
+    st_waiter_setup parked
+    printf '%s\n' "$(st_doc "$ST_WAITER_LIVE")" >"$PLANT/reply"
+    ! gate_parked || { echo "parked with no gate file"; return 1; }
+    : >"$P/$GATE_REL"
+    gate_parked || { echo "not parked with a gate file and a live waiter"; return 1; }
+    printf '%s\n' "$(st_doc "$ST_WAITER_ABSENT")" >"$PLANT/reply"
+    ! gate_parked || { echo "parked with no live waiter"; return 1; }
+    printf 'not json\n' >"$PLANT/reply"
+    ! gate_parked || { echo "parked on a FAILED reading"; return 1; }
+}
+
+st_waiter_gone() {
+    waiter_gone absent || { echo "absent did not read gone"; return 1; }
+    waiter_gone no_phase || { echo "no_phase did not read gone"; return 1; }
+    ! waiter_gone live || { echo "live read gone"; return 1; }
+    ! waiter_gone 'FAILED doctor --json exited 1' || { echo "a FAILED reading read gone"; return 1; }
+    ! waiter_gone '' || { echo "an empty reading read gone"; return 1; }
+}
+
+st_keyed_answer() {
+    local project="$ST_TMP/keyed" gates="$ST_TMP/keyed/.devflow/gates"
+    mkdir -p "$gates"
+    ! keyed_answer_written "$project" || { echo "an empty gates directory held an answer"; return 1; }
+    : >"$gates/01-define.json"
+    : >"$gates/01-define.g-1.waiter"
+    : >"$gates/01-define.g-1.ack.json"
+    : >"$gates/01-define.g-1.1700000000.42.0.quarantined.json"
+    : >"$gates/01-code.g-2.response.json"
+    ! keyed_answer_written "$project" || { echo "a file that is no Define answer read as one"; return 1; }
+    : >"$gates/01-define.g-1.response.json"
+    keyed_answer_written "$project" || { echo "a keyed Define answer was not seen"; return 1; }
+}
+
 run_selftest() {
     ST_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$ST_TMP"' EXIT
@@ -873,6 +1033,11 @@ run_selftest() {
     st_case 'signal refuses a pid whose start time does not match' st_signal_refuses_start_mismatch
     st_case 'src record holds the four ids of a resolving commit and unknown otherwise' st_src_record
     st_case 'probe reads each liveness word from status text' st_probe_word
+    st_case 'waiter reads each doctor --json gate_waiter' st_waiter_readings
+    st_case 'waiter is a FAILED line for a failed command, bad output or a missing field' st_waiter_failed_readings
+    st_case 'gate parked needs a gate file and a live waiter' st_gate_parked
+    st_case 'waiter gone accepts absent and no_phase only' st_waiter_gone
+    st_case 'keyed answer sees a Define answer under any gate id and nothing else' st_keyed_answer
 
     echo "SELFTEST passed=$ST_PASS failed=$ST_FAIL"
     [ "$ST_FAIL" -eq 0 ] && [ "$ST_PASS" -gt 0 ]
