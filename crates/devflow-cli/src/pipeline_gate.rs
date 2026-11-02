@@ -729,12 +729,15 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
 /// 1. Claim the D-17 holder, with the D-18 stop handler installed first
 ///    ([`crate::commands::claim_foreground_holder`]), so `stop` can reach this process and
 ///    no other foreground process acts on the phase.
-/// 2. Acquire the per-phase lock ([`lock::acquire`]) BEFORE touching state.
-/// 3. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
+/// 2. Refuse while a recorded or pending supervisor of the phase is live (R-17): its own
+///    wait can still consume the answer, and a loop-back here would launch beside it.
+///    After the claim, no `start` or `resume` can reserve, so none appears while this runs.
+/// 3. Acquire the per-phase lock ([`lock::acquire`]) BEFORE touching state.
+/// 4. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is refused, naming
 ///    the stage to resolve first.
-/// 4. The live Ship gate must hold an answer bound to its id. A file that does not bind
+/// 5. The live Ship gate must hold an answer bound to its id. A file that does not bind
 ///    is refused and left where it is: this command reads and moves nothing (R-09).
-/// 5. The answer must be claimed before anything acts on it. A claim already there means
+/// 6. The answer must be claimed before anything acts on it. A claim already there means
 ///    another consumer took it and may have died mid-`finish_workflow`, and any claim
 ///    error (the gate closed or was replaced since this command read it, R-08, or its
 ///    lock was held too long) means nothing was consumed. All of them refuse here, so
@@ -755,6 +758,7 @@ pub(crate) fn ship_override(
     force: bool,
 ) -> Result<(), CliError> {
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
+    crate::commands::refuse_ship_over_a_live_supervisor(project_root, phase)?;
     let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, .. }) => {
@@ -821,7 +825,7 @@ pub(crate) fn ship_override(
     }
 }
 
-/// Read the live Ship gate's answer and claim it: guards 4 and 5 of [`ship_override`].
+/// Read the live Ship gate's answer and claim it: guards 5 and 6 of [`ship_override`].
 /// Every refusal here consumes nothing.
 fn claim_ship_answer(project_root: &Path, phase: PhaseId) -> Result<GateResponse, CliError> {
     let stage = Stage::Ship;
