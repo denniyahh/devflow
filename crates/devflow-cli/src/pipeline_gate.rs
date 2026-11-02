@@ -253,10 +253,10 @@ pub(crate) fn finish_workflow_with_gate_timeout(
         // Safe point 6 (CR-01, 50-REVIEW.md; D-13 item 7), before every pass: a stop taken
         // during the advance after the Ship gate was answered, or during a retry after its
         // gate was answered, is honoured before the merge, version bump, tag and push. The
-        // consumed approval is cleared with it, so a
-        // resumed run asks again. Outside a supervisor's advance (the foreground
-        // `ship_override`) no stop token is engaged, and the holder's stop flag decides
-        // (D-18).
+        // consumed approval is set aside with the gate (D-06), and a resumed run reruns Ship,
+        // whose new gate a saved `yes_ship` auto-approves. Outside a supervisor's advance (the
+        // foreground `ship_override`) no stop token is engaged, and the holder's stop flag
+        // decides (D-18).
         //
         // This is the last point a stop lands before finalization, and the only stop check
         // around a pass (D-18). Once a pass starts every hook runs to the end: a failed
@@ -518,6 +518,22 @@ pub(crate) fn run_gate_with_timeout(
         )?)
     })?;
     let gate_id = &opened.gate_id;
+    // Safe point 5 (CR-01, 50-REVIEW.md; D-13 item 8): an answer already on disk wins over
+    // a stop in the wait below, so a stop taken during the advance is honoured before the
+    // pre-authorized one is written, and before the notify and events, which would otherwise
+    // ask an operator to answer a gate this run withdraws at once. As at safe point 4, the
+    // gate is closed, the stop recorded and an error unwinds every caller. A stop that
+    // arrives after this point is honoured at safe point 6. A real human gate has no check
+    // here: its wait below ends on the stop.
+    if auto_response.is_some() && crate::pipeline_launch::stop_requested_at_safe_point() {
+        let _ = close_gate(project_root, state.phase, stage);
+        registration.finish();
+        crate::pipeline_launch::record_advance_stop(state, 5)?;
+        return Err(CliError::Message(format!(
+            "the gate for stage {stage} was not auto-answered: {}",
+            crate::pipeline_launch::safe_point_stop_reason()
+        )));
+    }
     println!(
         "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
         state.phase.padded()
@@ -563,20 +579,6 @@ pub(crate) fn run_gate_with_timeout(
     // `gate_fired`/`notify_fired` events, so the event stream still reads as a real gate
     // that was really answered, and before the wait below, whose first read finds it.
     if let Some(response) = auto_response {
-        // Safe point 5 (CR-01, 50-REVIEW.md): an answer already on disk
-        // wins over a stop in the wait below, so a stop taken during the
-        // advance is honoured before the pre-authorized one is written. As
-        // at safe point 4, the gate is closed, the stop recorded and an
-        // error unwinds every caller.
-        if crate::pipeline_launch::stop_requested_at_safe_point() {
-            let _ = close_gate(project_root, state.phase, stage);
-            registration.finish();
-            crate::pipeline_launch::record_advance_stop(state, 5)?;
-            return Err(CliError::Message(format!(
-                "the gate for stage {stage} was not auto-answered: {}",
-                crate::pipeline_launch::safe_point_stop_reason()
-            )));
-        }
         let answered = fenced(project_root, state.phase, || {
             match Gates::answer(project_root, state.phase, stage, gate_id, response) {
                 Ok(_) => Ok(()),
@@ -668,7 +670,7 @@ pub(crate) fn run_gate_with_timeout(
             // was stopped during the wait. The gate has no waiter any more, so
             // it is closed (an unconsumed answer is set aside, nothing outlives
             // the run in its slot), the stop is recorded, and an error unwinds
-            // every caller through `?`, which releases the per-phase lock.
+            // every caller through `?`, which releases a foreground process's holder.
             // Deliberately not `GateAction::Abort`: `abort()` deletes the state
             // file, and a stopped run keeps its state for `devflow resume`.
             let _ = close_gate(project_root, state.phase, stage);
