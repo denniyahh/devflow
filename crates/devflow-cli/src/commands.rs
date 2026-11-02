@@ -2640,7 +2640,9 @@ type AnsweredGate = (Stage, GateId, Option<String>);
 /// 3. Only when no live socket remains (GONE, or nothing recorded) does the
 ///    identity-confirmed foreground holder of `.devflow/.holder-NN` get signalled
 ///    ([`stop_via_holder`]). It catches the signal and ends at its next safe point
-///    (D-18), so `stop` waits for it, boundedly, and marks nothing while it runs.
+///    (D-18), so `stop` waits for it, boundedly, and marks nothing while it runs. With no
+///    holder either, a phase agent that still runs is named with its manual kill, and
+///    nothing is signalled or marked (D-19).
 ///
 /// A pending supervisor comes after the recorded one, whose own safe point 3 ends an
 /// unpublished successor: only its socket reaches it ([`stop_pending_launch`]), an
@@ -3174,8 +3176,13 @@ pub(crate) fn stopped_line(
 }
 
 /// `stop`'s line for a stop the supervisor accepted and has not confirmed yet (D-13 item 1).
-fn accepted_pending_line(_subject: &str, _owner: &str) -> String {
-    String::new()
+fn accepted_pending_line(subject: &str, owner: &str) -> String {
+    format!(
+        "stop: {subject}'s supervisor accepted the stop (owner {owner}) and its final answer did \
+         not arrive within {secs}s; it will honour the stop at its next safe point — `devflow \
+         status` shows when it has",
+        secs = shutdown_final_timeout().as_secs()
+    )
 }
 
 /// How long `stop` waits for a supervisor's final shutdown line: the
@@ -3845,6 +3852,18 @@ fn stop_via_holder(project_root: &Path, phase: PhaseId) -> Result<bool, CliError
     // time distinct from its parent's.
     let pid = match holder {
         Ok(None) => {
+            // D-19: with no supervisor left to ask, the phase's agent may still run. This
+            // signals nothing, and `stopped` is not written beside an agent that still edits
+            // the worktree; once the operator ends it, `devflow stop` records the stop.
+            if let Ok(state) = workflow::load_state(project_root, phase)
+                && let Some(agent) = live_phase_agent(project_root, &state)
+            {
+                return Err(CliError::Message(format!(
+                    "stop: no live supervisor socket, pending launch or foreground holder for \
+                     phase {phase}, but {}; phase state was not marked stopped",
+                    orphaned_agent_line(phase, &agent)
+                )));
+            }
             println!(
                 "stop: no live supervisor socket, pending launch or foreground holder for phase \
                  {phase} — nothing is running"
