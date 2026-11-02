@@ -2275,6 +2275,259 @@ st_pub_attempt_no_source() {
         expect 1 'PUBLISHED attempt_current_source=no' st_pub_attempt "$dir" 2
 }
 
+# --attempt-record cases (50.1-28). Run under ST_PUB_HOME like the --published
+# cases, so the nested published check passes on a sanitized tree. A plant's
+# record sits beside its tree as "<tree>.md", outside what the check reads.
+st_rec() {
+    env HOME="$ST_PUB_HOME" bash "$SELF" --attempt-record "$1" --published "$2" --attempt "$3"
+}
+
+# st_rec_fails <record> <dir> <N> <line>...: exit 1, the fail verdict and each line.
+st_rec_fails() {
+    local record="$1" dir="$2" number="$3" line
+    shift 3
+    expect 1 'RECORD verdict=fail' st_rec "$record" "$dir" "$number" || return 1
+    for line in "$@"; do
+        expect 1 "$line" st_rec "$record" "$dir" "$number" || return 1
+    done
+}
+
+# st_rec_jq <file> <filter>: rewrite a planted JSON file.
+st_rec_jq() {
+    jq "$2" "$1" >"$1.edit"
+    mv "$1.edit" "$1"
+}
+
+# Attempt 2 shipped, paired with fault-7, its first workflow_started on c0ffee1;
+# prints the tree's path.
+st_rec_shipped_tree() {
+    local dir
+    dir="$(st_pub_attempt_tree)"
+    mkdir -p "$dir/attempt-2/collected/devflow"
+    printf '{"attempt": 2, "outcome": "shipped", "workflow_shipped": true, "stop_note": null}\n' \
+        >"$dir/attempt-2/verdict.json"
+    printf '{"event":"workflow_started","commit":"c0ffee1"}\n{"event":"workflow_started","commit":"deadbee"}\n' \
+        >"$dir/attempt-2/collected/devflow/events.jsonl"
+    printf '# Record\n- attempt: 2\n- commit: c0ffee1\n## What this attempt does not establish\n' >"$dir.md"
+    printf '%s\n' "$dir"
+}
+
+# One stopped attempt's verdict and events, for the cap plant.
+st_rec_stopped() {
+    local dir="$1" attempt="$2" commit="$3" note="$4"
+    mkdir -p "$dir/attempt-$attempt/collected/devflow"
+    jq -n --argjson attempt "$attempt" --arg note "$note" \
+        '{attempt: $attempt, outcome: "stopped", workflow_shipped: false, stop_note: $note}' \
+        >"$dir/attempt-$attempt/verdict.json"
+    printf '{"event":"workflow_started","commit":"%s"}\n' "$commit" \
+        >"$dir/attempt-$attempt/collected/devflow/events.jsonl"
+}
+
+# Three stopped attempts and a passing fault-1; only attempt-3 holds a gate
+# verdict. Attempt 2's note holds a newline, which its record line collapses.
+st_rec_cap_tree() {
+    local dir
+    dir="$(st_pub_tree)"
+    rm -- "$dir/attempt-1/verdict-attempt-gate.txt"
+    st_rec_stopped "$dir" 1 aaa1111 'died at plan'
+    st_rec_stopped "$dir" 2 bbb2222 $'died\n  at code'
+    st_rec_stopped "$dir" 3 ccc3333 'parked at ship'
+    printf 'ATTEMPT_GATE verdict=cap_reached stopped_attempts=3\n' >"$dir/attempt-3/verdict-attempt-gate.txt"
+    {
+        printf '# Record\n## Not shipped: attempt cap reached\n'
+        printf -- '- stopped attempt 1: commit aaa1111; stop note: died at plan\n'
+        printf -- '- stopped attempt 2: commit bbb2222; stop note: died at code\n'
+        printf -- '- stopped attempt 3: commit ccc3333; stop note: parked at ship\n'
+        printf '## Operator decision needed\n## What this attempt does not establish\n'
+    } >"$dir.md"
+    printf '%s\n' "$dir"
+}
+
+st_rec_shipped_pass() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    expect 0 'RECORD verdict=pass' st_rec "$dir.md" "$dir" 2 &&
+        expect 0 'RECORD branch=shipped attempt=2 commit=c0ffee1' st_rec "$dir.md" "$dir" 2
+}
+
+st_rec_cap_pass() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    expect 0 'RECORD verdict=pass' st_rec "$dir.md" "$dir" 3 &&
+        expect 0 'RECORD branch=cap_reached attempt=3 stopped_attempts=3' st_rec "$dir.md" "$dir" 3
+}
+
+st_rec_cap_beside_no_verdict() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    mkdir -p "$dir/attempt-4/collected"
+    expect 0 'RECORD verdict=pass' st_rec "$dir.md" "$dir" 3 &&
+        expect 0 'RECORD branch=cap_reached attempt=3 stopped_attempts=3' st_rec "$dir.md" "$dir" 3
+}
+
+st_rec_later_commit() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    sed -i 's/^- commit: c0ffee1$/- commit: deadbee/' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD missing=commit-line commit=c0ffee1'
+}
+
+st_rec_other_attempt_line() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    sed -i 's/^- attempt: 2$/- attempt: 1/' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD missing=attempt-line'
+}
+
+st_rec_verdict_stopped() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    st_rec_jq "$dir/attempt-2/verdict.json" '.outcome = "stopped"'
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=DISAGREES attempt=2'
+}
+
+st_rec_no_limits() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    sed -i '/What this attempt does not establish/d' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD missing=limits-section'
+}
+
+st_rec_no_such_attempt() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    st_rec_fails "$dir.md" "$dir" 9 'RECORD branch=ABSENT attempt=9'
+}
+
+st_rec_shipped_with_cap_section() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    printf '## Not shipped: attempt cap reached\n' >>"$dir.md"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD contradicts=cap-section'
+}
+
+st_rec_verdict_absent() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    rm -- "$dir/attempt-2/verdict.json"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=ABSENT attempt=2'
+}
+
+st_rec_verdict_malformed() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    printf '{' >"$dir/attempt-2/verdict.json"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD verdict_json=MALFORMED attempt=2'
+}
+
+st_rec_no_workflow_started() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    printf '{"event":"stage_launched","commit":"c0ffee1"}\n' >"$dir/attempt-2/collected/devflow/events.jsonl"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD commit=ABSENT attempt=2'
+}
+
+st_rec_record_absent() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    rm -- "$dir.md"
+    expect 1 'RECORD verdict=fail' st_rec "$dir.md" "$dir" 2 &&
+        expect_re 1 'RECORD file=ABSENT .*' st_rec "$dir.md" "$dir" 2
+}
+
+st_rec_published_fails() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    printf 'found under %s\n' "$ST_PUB_HOME" >"$dir/attempt-2/leak.txt"
+    st_rec_fails "$dir.md" "$dir" 2 'RECORD published=fail'
+}
+
+st_rec_listed_not_published() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    rm -r -- "$dir/attempt-1"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD uncounted=stopped-attempt-1' 'RECORD stopped_count=MISMATCH gate=3 counted=2'
+}
+
+st_rec_stopped_line_missing() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    sed -i '/^- stopped attempt 2:/d' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD missing=stopped-attempt-2'
+}
+
+st_rec_note_altered() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    sed -i 's/^\(- stopped attempt 2:.*stop note: \).*$/\1it was fine/' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD stop_note=MISMATCH attempt=2'
+}
+
+st_rec_commit_altered() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    sed -i 's/commit aaa1111;/commit bbb2222;/' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD commit=MISMATCH attempt=1'
+}
+
+st_rec_no_escalation() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    sed -i '/^## Operator decision needed$/d' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD missing=escalation'
+}
+
+st_rec_cap_with_shipped_claim() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    printf -- '- attempt: 3\n' >>"$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD contradicts=shipped-claim'
+}
+
+st_rec_no_cap_section() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    sed -i '/^## Not shipped: attempt cap reached$/d' "$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD missing=cap-section'
+}
+
+st_rec_listed_twice() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    printf -- '- stopped attempt 2: commit bbb2222; stop note: died at code\n' >>"$dir.md"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD duplicate=stopped-attempt-2'
+}
+
+st_rec_verdict_other_number() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    st_rec_jq "$dir/attempt-2/verdict.json" '.attempt = 5'
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD stopped_verdict=BAD attempt=2'
+}
+
+# A blank note is not a noted stop: attempt_gate would not count it either.
+st_rec_blank_note() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    st_rec_jq "$dir/attempt-2/verdict.json" '.stop_note = "  "'
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD uncounted=stopped-attempt-2' 'RECORD stopped_count=MISMATCH gate=3 counted=2'
+}
+
+st_rec_gate_without_count() {
+    local dir
+    dir="$(st_rec_cap_tree)"
+    printf 'ATTEMPT_GATE verdict=cap_reached\n' >"$dir/attempt-3/verdict-attempt-gate.txt"
+    st_rec_fails "$dir.md" "$dir" 3 'RECORD stopped_count=MISMATCH gate=ABSENT counted=3'
+}
+
+# Passes before the mode exists too: an unknown mode also prints the usage
+# block and exits 2. It pins the shape check, not the mode's existence.
+st_rec_attempt_zero() {
+    local dir
+    dir="$(st_rec_shipped_tree)"
+    expect 2 '# Usage:' st_rec "$dir.md" "$dir" 0
+}
+
 run_selftest() {
     ST_TMP="$(mktemp -d)"
     trap 'rm -rf -- "$ST_TMP"' EXIT
@@ -2358,6 +2611,32 @@ run_selftest() {
     st_case 'published fails an attempt verdict naming another attempt' st_pub_attempt_other
     st_case 'published fails an attempt whose paired fault directory records another bin_sha256' st_pub_attempt_other_sha
     st_case 'published fails a shipped attempt verdict without the current source line' st_pub_attempt_no_source
+    st_case 'attempt record passes a shipped record bound to its attempt and first commit' st_rec_shipped_pass
+    st_case 'attempt record passes a cap record listing every noted stop' st_rec_cap_pass
+    st_case 'attempt record passes a cap record beside a directory with no verdict' st_rec_cap_beside_no_verdict
+    st_case 'attempt record fails a shipped record naming a later commit' st_rec_later_commit
+    st_case 'attempt record fails a shipped record naming another attempt' st_rec_other_attempt_line
+    st_case 'attempt record fails a shipped verdict line whose verdict.json says stopped' st_rec_verdict_stopped
+    st_case 'attempt record fails a record without the limits section' st_rec_no_limits
+    st_case 'attempt record reads ABSENT for an attempt that was not published' st_rec_no_such_attempt
+    st_case 'attempt record fails a shipped record also holding the cap section' st_rec_shipped_with_cap_section
+    st_case 'attempt record fails when the attempt has no verdict.json' st_rec_verdict_absent
+    st_case 'attempt record fails when the attempt verdict.json does not parse' st_rec_verdict_malformed
+    st_case 'attempt record fails when the attempt events hold no workflow_started' st_rec_no_workflow_started
+    st_case 'attempt record fails when the record file is absent' st_rec_record_absent
+    st_case 'attempt record fails when the nested published check fails' st_rec_published_fails
+    st_case 'attempt record fails a listed stop that is not published' st_rec_listed_not_published
+    st_case 'attempt record fails a cap record omitting a noted stop' st_rec_stopped_line_missing
+    st_case 'attempt record fails a listed stop note the verdict does not hold' st_rec_note_altered
+    st_case 'attempt record fails a listed commit the attempt events do not hold' st_rec_commit_altered
+    st_case 'attempt record fails a cap record without the escalation section' st_rec_no_escalation
+    st_case 'attempt record fails a cap record also claiming a shipped attempt' st_rec_cap_with_shipped_claim
+    st_case 'attempt record fails a cap record without the cap section' st_rec_no_cap_section
+    st_case 'attempt record fails a stop listed twice' st_rec_listed_twice
+    st_case 'attempt record fails a counted verdict naming another attempt number' st_rec_verdict_other_number
+    st_case 'attempt record does not count a stop whose note is blank' st_rec_blank_note
+    st_case 'attempt record fails a cap gate line without its stopped count' st_rec_gate_without_count
+    st_case 'attempt record refuses attempt 0 as a usage error' st_rec_attempt_zero
 
     echo "SELFTEST passed=$ST_PASS failed=$ST_FAIL"
     [ "$ST_FAIL" -eq 0 ] && [ "$ST_PASS" -gt 0 ]
