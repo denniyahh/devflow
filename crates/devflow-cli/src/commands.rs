@@ -782,6 +782,15 @@ fn start_reserved(
         }
         return Err(err);
     }
+    // A stop honoured before the spawn is an `Ok` from `launch_stage`, with nothing running.
+    if state.stopped {
+        println!(
+            "phase {phase} stopped before anything was launched ({}); run `devflow resume --phase \
+             {phase}` to continue it",
+            state.stop_reason.as_deref().unwrap_or("no reason recorded")
+        );
+        return Ok(());
+    }
     println!(
         "started phase {} in {mode} mode at {} — monitor will auto-advance",
         state.phase, state.started_at
@@ -17343,6 +17352,8 @@ mod tests {
                     ("DEVFLOW_CACHE_DIR", hold_dir.path().as_os_str()),
                     (LAUNCH_HOLD_ENV, spec.as_os_str()),
                     (HOLDER_ROOT_ENV, root.as_os_str()),
+                    // libtest would otherwise swallow what a child prints.
+                    ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
                 ],
             );
             let held = held_marker(&release);
@@ -17673,6 +17684,18 @@ mod tests {
         let output = child.release_and_finish();
         assert_eq!(output.status.signal(), None, "{output:?}");
         devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(!printed.contains("monitor will auto-advance"), "{printed}");
+        assert!(
+            printed.contains(&format!(
+                "phase {phase} stopped before anything was launched"
+            )),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(&format!("devflow resume --phase {phase}")),
+            "{printed}"
+        );
         let state = workflow::load_state(root, phase).unwrap();
         assert_eq!(
             state.pending_supervisor, None,
