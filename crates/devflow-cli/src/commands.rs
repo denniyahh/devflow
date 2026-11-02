@@ -4251,8 +4251,8 @@ impl LaunchVerb {
 /// otherwise block `start` with no DevFlow repair. The supervisor sockets of this
 /// root and phase are still swept.
 ///
-/// Out of scope: the lock-free window between agent exit and `advance` taking the
-/// lock stays backlog 999.136. This check says nothing about a gate waiter.
+/// Out of scope: the window between agent exit and `advance` taking over stays backlog
+/// 999.136. This check says nothing about a gate waiter.
 fn refuse_launch_over_a_live_run(
     project_root: &Path,
     phase: PhaseId,
@@ -4950,9 +4950,13 @@ pub(crate) fn recover_cmd(
                         join(&report.orphan_cron_records_removed)
                     );
                 }
+                for path in &report.markers_removed {
+                    println!("removed abandoned marker {}", path.display());
+                }
                 if report.cleared.is_empty()
                     && report.orphan_gates_cleared.is_empty()
                     && report.orphan_cron_records_removed.is_empty()
+                    && report.markers_removed.is_empty()
                 {
                     println!("no stale workflow state was cleaned");
                 }

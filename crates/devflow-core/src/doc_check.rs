@@ -320,7 +320,6 @@ fn gitignore_covers_all_devflow_paths() {
             workflow::state_path(root, PhaseId::new(16)),
         ),
         ("Gates::dir", Gates::dir(root)),
-        ("lock::lock_path", lock::lock_path(root, PhaseId::new(16))),
         ("lock::project_lock_path", lock::project_lock_path(root)),
         (
             "ship::cron_instructions_path",
