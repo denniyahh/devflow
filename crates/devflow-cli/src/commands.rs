@@ -2685,8 +2685,9 @@ type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 ///    (D-18), so `stop` waits for it, boundedly, and marks nothing while it runs.
 ///
 /// A pending supervisor comes after the recorded one, whose own safe point 3 ends an
-/// unpublished successor: only its socket reaches it ([`stop_pending_launch`]), and an
-/// abandoned reservation is cleared with a report.
+/// unpublished successor: only its socket reaches it ([`stop_pending_launch`]), an
+/// abandoned reservation is cleared with a report, and a launcher still busy before its
+/// spawn is reached through the holder file ([`stop_pending_launcher`]).
 ///
 /// No pid read from state is ever signalled. `stopped` is recorded only for
 /// a stop performed or confirmed not live, and never into a state file that
@@ -2714,19 +2715,37 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
             return Ok(());
         }
     };
-    if let Some(pending_ended) = stop_pending_launch(project_root, phase)? {
-        ended |= pending_ended;
+    let mut launcher_signalled = false;
+    if let Some(pending) = stop_pending_launch(project_root, phase)? {
+        ended |= pending == PendingStop::SupervisorEnded;
+        launcher_signalled = pending == PendingStop::LauncherSignalled;
         // A launch promoted while `stop` waited on it is the recorded supervisor now.
         ended |= !matches!(
             stop_via_socket(project_root, phase, cache_dir)?,
             SocketStop::NoLiveSocket
         );
     }
+    if launcher_signalled {
+        return persist_stopped_state(project_root, phase, None, true);
+    }
     if ended {
         return persist_stopped_state(project_root, phase, None, false);
     }
     let signal_sent = stop_via_holder(project_root, phase)?;
     persist_stopped_state(project_root, phase, None, signal_sent)
+}
+
+/// What the pending half of [`stop`] did about a launch the state names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingStop {
+    /// No supervisor was ended and nothing was signalled, such as an abandoned reservation
+    /// that was cleared.
+    NothingEnded,
+    /// A pending supervisor was ended through its socket.
+    SupervisorEnded,
+    /// The launcher holding the reservation was signalled through the holder file, and it
+    /// has exited.
+    LauncherSignalled,
 }
 
 /// How long `stop` waits for a live pending supervisor to publish its socket: the
@@ -2741,12 +2760,16 @@ const PENDING_PUBLISH_POLL: std::time::Duration = std::time::Duration::from_mill
 /// gets a `shutdown`; a held liveness lock with no answering socket is waited for
 /// (`Live`, never signalled, Phase 50 D-05/D-06); a STALE socket no lock vouches for goes
 /// to the backstop; with neither left, the reservation is abandoned and cleared. A live
-/// lock beats a STALE socket because the backstop is for a supervisor that is gone.
+/// lock beats a STALE socket because the backstop is for a supervisor that is gone. When
+/// the wait expires, the launcher may simply be busy before its spawn, so it is reached
+/// through the holder file ([`stop_pending_launcher`]).
 ///
-/// `Ok(None)` when the state names no pending launch, else whether a supervisor was
-/// ended. The caller looks at the recorded socket again, since the record can end by
-/// promotion.
-fn stop_pending_launch(project_root: &Path, phase: PhaseId) -> Result<Option<bool>, CliError> {
+/// `Ok(None)` when the state names no pending launch, else what was done about it. The
+/// caller looks at the recorded socket again, since the record can end by promotion.
+fn stop_pending_launch(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<Option<PendingStop>, CliError> {
     let mut outcome = None;
     let mut ended = false;
     let mut handed_off = 0;
@@ -2758,7 +2781,11 @@ fn stop_pending_launch(project_root: &Path, phase: PhaseId) -> Result<Option<boo
         else {
             return Ok(outcome);
         };
-        outcome = Some(ended);
+        outcome = Some(if ended {
+            PendingStop::SupervisorEnded
+        } else {
+            PendingStop::NothingEnded
+        });
         let located = LocatedSocket {
             socket: pending.socket_path.clone(),
             record: None,
@@ -2794,15 +2821,14 @@ fn stop_pending_launch(project_root: &Path, phase: PhaseId) -> Result<Option<boo
                     std::thread::sleep(PENDING_PUBLISH_POLL);
                 }
             },
-            // The live-pending branch. 50.1-29 extends its expiry with the holder arm.
             (_, liveness::Held::Live) => {
                 let until = *deadline
                     .get_or_insert_with(|| std::time::Instant::now() + PENDING_PUBLISH_WAIT);
                 if std::time::Instant::now() >= until {
                     return if ended {
-                        Ok(Some(true))
+                        Ok(Some(PendingStop::SupervisorEnded))
                     } else {
-                        Err(pending_not_published(phase, &pending.launch_id))
+                        stop_pending_launcher(project_root, phase, &pending).map(Some)
                     };
                 }
                 std::thread::sleep(PENDING_PUBLISH_POLL);
@@ -2813,10 +2839,64 @@ fn stop_pending_launch(project_root: &Path, phase: PhaseId) -> Result<Option<boo
             }
             (supervisor::Liveness::Gone, _) => {
                 clear_abandoned_reservation(project_root, phase, &pending)?;
-                return Ok(Some(ended));
+                return Ok(Some(if ended {
+                    PendingStop::SupervisorEnded
+                } else {
+                    PendingStop::NothingEnded
+                }));
             }
         }
     }
+}
+
+/// The expiry of [`stop_pending_launch`]'s wait: no socket came, and the pending liveness
+/// lock is still held. If a foreground launcher holds the phase, it is signalled, and it
+/// stops at safe point 2, before its spawn, or at safe point 3, shutting an unpublished
+/// supervisor down (D-02, D-18). The pending supervisor itself is reached only through
+/// its socket: the process signalled here is its launcher. With no holder, nothing is
+/// signalled and [`pending_not_published`] stands.
+fn stop_pending_launcher(
+    project_root: &Path,
+    phase: PhaseId,
+    pending: &PendingSupervisor,
+) -> Result<PendingStop, CliError> {
+    let unheld = matches!(
+        liveness::probe(&liveness::phase_holder_path(project_root, phase)),
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+    );
+    if unheld || !stop_via_holder(project_root, phase)? {
+        return Err(pending_not_published(phase, &pending.launch_id));
+    }
+    let launch_id = &pending.launch_id;
+    if !wait_for_holder_release(project_root, phase) {
+        return Err(CliError::Message(format!(
+            "{}; it gives its reservation for launch {launch_id} back itself at its next safe \
+             point, before its supervisor is spawned",
+            holder_still_running(project_root, phase)
+        )));
+    }
+    // The launcher has exited. Its own safe point gave the reservation back, or its exit
+    // released a lock that now reads abandoned. A lock still held belongs to a supervisor
+    // it spawned, and that is no stop to claim.
+    let fresh = workflow::load_state(project_root, phase)
+        .ok()
+        .and_then(|state| state.pending_supervisor)
+        .filter(|fresh| fresh.launch_id == *launch_id);
+    if let Some(fresh) = fresh {
+        let held = liveness::probe(&fresh.liveness_path);
+        if !matches!(
+            held,
+            Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+        ) {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase}'s signalled foreground holder exited, but launch {launch_id} \
+                 still holds its liveness lock and has not published a supervisor; phase state \
+                 was not marked stopped — run `devflow stop --phase {phase}` again"
+            )));
+        }
+        clear_abandoned_reservation(project_root, phase, &fresh)?;
+    }
+    Ok(PendingStop::LauncherSignalled)
 }
 
 /// `stop`'s refusal over a live pending lock with no socket by the end of the wait.
@@ -4234,6 +4314,83 @@ fn refuse_launch_over_a_live_run(
     }
     Err(CliError::Message(live_run_refusal(
         phase, verb, &sockets, agent,
+    )))
+}
+
+/// What a foreground process's live-supervisor check found: the phase's recorded and
+/// pending supervisors, read as [`refuse_launch_over_a_live_run`] reads them, as refusal
+/// text and launch ids. `None` when none is live. A socket directory that cannot be listed
+/// cannot rule one out, so it refuses too (fail closed). It only reads: the
+/// abandoned-reservation clearing stays in [`reserve_launch`], and it reads no agent pid
+/// file, because the property here is "no live supervisor".
+fn find_live_supervisors(project_root: &Path, phase: PhaseId) -> Option<(String, Vec<String>)> {
+    let state = workflow::load_state(project_root, phase).ok();
+    let cache_dir = registry::cache_dir();
+    match possibly_live_sockets(project_root, phase, state.as_ref(), cache_dir.as_deref()) {
+        Ok(sockets) if sockets.is_empty() => None,
+        Ok(sockets) => {
+            let listed: Vec<String> = sockets
+                .iter()
+                .map(|socket| format!("launch {} ({})", socket.launch_id, socket.liveness))
+                .collect();
+            Some((
+                format!("has a live supervisor ({})", listed.join(", ")),
+                sockets.into_iter().map(|socket| socket.launch_id).collect(),
+            ))
+        }
+        Err((dir, why)) => Some((
+            format!(
+                "may have a live supervisor: the socket directory {} could not be listed ({why})",
+                dir.display()
+            ),
+            Vec::new(),
+        )),
+    }
+}
+
+/// D-08, D-17: a hand-run `devflow advance` refuses beside a live supervisor of its phase.
+/// The long advance lock gave this exclusion until it was deleted. It writes no state.
+pub(crate) fn refuse_advance_over_a_live_supervisor(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<(), CliError> {
+    let Some((found, launch_ids)) = find_live_supervisors(project_root, phase) else {
+        return Ok(());
+    };
+    events::emit(
+        project_root,
+        phase,
+        "advance_failed",
+        serde_json::json!({ "reason": "live supervisor", "launch_ids": launch_ids }),
+    );
+    Err(CliError::Message(format!(
+        "advance refused: phase {phase} {found}; a hand-run advance would run beside it. Run \
+         `devflow stop --phase {phase}` to end it"
+    )))
+}
+
+/// R-17: `devflow ship` drives a Ship answer only when the monitor that would consume it
+/// is dead, so it refuses beside a live supervisor of its phase. It would otherwise win
+/// that answer from it and, on a loop-back, launch a second supervisor beside it. It
+/// writes no state.
+pub(crate) fn refuse_ship_over_a_live_supervisor(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<(), CliError> {
+    let Some((found, launch_ids)) = find_live_supervisors(project_root, phase) else {
+        return Ok(());
+    };
+    events::emit(
+        project_root,
+        phase,
+        "ship_override_refused",
+        serde_json::json!({ "reason": "live supervisor", "launch_ids": launch_ids }),
+    );
+    Err(CliError::Message(format!(
+        "ship refused: phase {phase} {found}; `devflow ship` drives a Ship answer only when the \
+         monitor that would consume it is dead. Answer the Ship gate with `devflow gate approve` \
+         or `devflow gate reject` and the live supervisor consumes it, or run `devflow stop \
+         --phase {phase}` first"
     )))
 }
 

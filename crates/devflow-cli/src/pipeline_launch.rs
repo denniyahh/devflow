@@ -3105,8 +3105,9 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
 }
 
 /// The hand-run `devflow advance`: hold the phase for the whole advance (D-17), so
-/// `stop` can reach this process and no other foreground process acts on the phase, then
-/// advance. A supervisor's own advance calls [`advance_for_stage`] and claims nothing.
+/// `stop` can reach this process and no other foreground process acts on the phase,
+/// refuse beside a live supervisor (D-08), then advance. A supervisor's own advance calls
+/// [`advance_for_stage`] and claims nothing.
 pub(crate) fn advance_command(
     project_root: &Path,
     phase: Option<PhaseId>,
@@ -3114,6 +3115,9 @@ pub(crate) fn advance_command(
 ) -> Result<(), CliError> {
     let phase = resolve_advance_phase(project_root, phase)?;
     let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
+    // After the claim, so no `start` or `resume` can reserve until this advance returns,
+    // and its own launch meets no live pending record.
+    crate::commands::refuse_advance_over_a_live_supervisor(project_root, phase)?;
     #[cfg(test)]
     launch_test_hold("holder_claimed");
     advance_for_stage(project_root, Some(phase), stage)
