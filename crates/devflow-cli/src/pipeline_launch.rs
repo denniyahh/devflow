@@ -45,16 +45,49 @@ use devflow_core::state::{AgentKind, ApprovedCheckpoint, CheckpointApproval, Sta
 use devflow_core::supervisor::runtime::{AgentOutcome, OwnerPhase, SafePoint, StopToken};
 use devflow_core::verify::CheckpointDeclaration;
 use devflow_core::{
-    agent_result, agents, canary, events, gsd_config, lock, mode, monitor, verify, workflow,
+    agent_result, agents, canary, events, gsd_config, mode, monitor, verify, workflow,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// `advance` waits for a post-spawn lock holder because it normally finishes
-/// in seconds; after ten chosen (not measured) minutes the holder is likely at
-/// a gate or wedged, and doctor then resume is the explicit recovery path.
-pub(crate) const ADVANCE_LOCK_WAIT: Duration = Duration::from_secs(600);
+/// How long a supervisor may stay only pending, from the moment it serves, in a
+/// release build (D-15). Past it the launcher is taken to have died.
+///
+/// The margin: the launcher's `wait_for_publish` polls every `PUBLISH_POLL` (20 ms) and
+/// sees the serve within one probe, whose reply read is bounded by
+/// `supervisor::protocol::IO_TIMEOUT` (2 s). `PUBLISH_WAIT` (10 s) bounds spawn-to-serve,
+/// before this wait starts, so it is not on this path. The promotion write then waits
+/// for at most one write-lock holder that honours the closure contract, shorter than
+/// `workflow::WRITE_LOCK_REPAIR_WAIT` (10 s), then does its own load, write and fsyncs.
+/// 2 s + 10 s leaves at least 3 s of 15 s for the poll, the launcher's own closure and
+/// its fsyncs, and `promotion_wait_covers_a_live_launchers_serve_to_promotion_latency`
+/// pins `IO_TIMEOUT + WRITE_LOCK_REPAIR_WAIT + 2 s <= PROMOTION_WAIT_RELEASE`.
+///
+/// What it does not cover, and why that fails closed: it assumes one holder ahead of the
+/// launcher, and the promotion is a blocking workflow write. A holder that breaks the
+/// closure contract (SIGSTOPped or in D-state), or several queued ahead, delay it past
+/// the wait. Then the supervisor ends its agent group and exits writing nothing. When
+/// the promotion lands, `publish_record` probes the successor and records `stopped` with
+/// [`NEXT_STOPPED_BEFORE_SAVE_REASON`], or, if the probe still caught it running, the
+/// state names a supervisor that then reads GONE and `status` suggests `resume`. No
+/// second writer and no lost update either way. Bounding the promotion write was weighed
+/// and not chosen: its failure path is itself a blocking workflow write behind the same
+/// holder.
+const PROMOTION_WAIT_RELEASE: Duration = Duration::from_secs(15);
+
+/// How long a supervisor may stay only pending: [`PROMOTION_WAIT_RELEASE`], or 5 s in a
+/// test build so a test can reach the expiry.
+///
+/// The margin in [`PROMOTION_WAIT_RELEASE`]'s doc holds for the release value only:
+/// `IO_TIMEOUT` and `WRITE_LOCK_REPAIR_WAIT` keep their release values under test, and
+/// `WRITE_LOCK_REPAIR_WAIT` is not shrunk there because the bounded-wait tests need the
+/// real 10 s. So a test whose supervisor must be promoted never holds the state write
+/// lock, or delays its launcher's promotion write any other way, for more than about 3 s.
+#[cfg(not(test))]
+const PROMOTION_WAIT: Duration = PROMOTION_WAIT_RELEASE;
+#[cfg(test)]
+const PROMOTION_WAIT: Duration = Duration::from_secs(5);
 
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
 /// and spawning the monitor. (25b, D-03: this function no longer performs
@@ -956,7 +989,7 @@ pub(crate) const SUPERVISOR_STOP_REASON: &str =
 pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
 
 /// The bound on the two waits a stop can put between two supervisors
-/// (50-13, T-50-54): a stopped supervisor's wait for the per-phase lock
+/// (50-13, T-50-54): a stopped supervisor's wait for the state write lock
 /// before it records its stop, and safe point 3's wait for an unpublished
 /// next supervisor's final `stopped` line. `2 × TERMINATE_VERIFY_WAIT + 5 s`:
 /// the next supervisor's kill grace plus margin. `stop`'s own wait for a
@@ -965,9 +998,11 @@ pub(crate) const SUPERVISOR_STOP_WAIT: Duration =
     Duration::from_secs(2 * devflow_core::agent::TERMINATE_VERIFY_WAIT.as_secs() + 5);
 
 /// What a supervisor's advance reads on this thread (50-13): its stop token,
-/// for the advance's safe points, and the successor the advance recorded.
+/// for the advance's safe points, its launch id, for the ownership fence (D-03),
+/// and the successor the advance recorded.
 struct EngagedAdvance {
     token: StopToken,
+    launch_id: String,
     successor: Option<SupervisorRecord>,
 }
 
@@ -991,10 +1026,11 @@ struct StopTokenGuard {
 }
 
 impl StopTokenGuard {
-    fn engage(token: StopToken) -> Self {
+    fn engage(token: StopToken, launch_id: String) -> Self {
         ENGAGED_ADVANCE.with(|slot| {
             *slot.borrow_mut() = Some(EngagedAdvance {
                 token,
+                launch_id,
                 successor: None,
             });
         });
@@ -1015,6 +1051,26 @@ impl Drop for StopTokenGuard {
 fn with_stop_token<R>(f: impl FnOnce(&StopToken) -> R) -> Option<R> {
     let token = ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().map(|e| e.token.clone()));
     token.map(|token| f(&token))
+}
+
+/// The launch id of the supervisor whose advance runs on this thread, or `None` for
+/// any other advance (a hand-run `devflow advance`, which stays unfenced).
+fn engaged_launch_id() -> Option<String> {
+    ENGAGED_ADVANCE.with(|slot| slot.borrow().as_ref().map(|e| e.launch_id.clone()))
+}
+
+/// [`workflow::update_state`], fenced to the engaged supervisor's launch id inside a
+/// supervisor's advance (D-03): a supervisor the state no longer records gets
+/// [`workflow::WorkflowError::NotOwner`] and writes nothing.
+fn update_engaged_state<T>(
+    project_root: &Path,
+    phase: PhaseId,
+    apply: impl FnOnce(&mut State) -> Result<T, CliError>,
+) -> Result<(State, T), CliError> {
+    match engaged_launch_id() {
+        Some(launch_id) => workflow::update_owned_state(project_root, phase, &launch_id, apply),
+        None => workflow::update_state(project_root, phase, apply),
+    }
 }
 
 /// Remember `record` as the successor this advance published, so
@@ -1049,12 +1105,16 @@ fn take_successor() -> Option<SupervisorRecord> {
 /// replace. That is on purpose: a field a site forgot to commit shows up in its
 /// tests rather than reaching disk by luck through a later write.
 ///
+/// Inside a supervisor's advance this is an owned write (D-03): a supervisor the state
+/// no longer records gets [`workflow::WorkflowError::NotOwner`] and writes nothing. A
+/// hand-run `devflow advance` stays unfenced.
+///
 /// `apply` runs under the state write lock, so it never spawns a process, runs
 /// hooks, waits on a gate or takes another lock.
 pub(crate) fn commit(state: &mut State, apply: impl FnOnce(&mut State)) -> Result<(), CliError> {
-    let (committed, ()) = workflow::update_state(&state.project_root, state.phase, |s| {
+    let (committed, ()) = update_engaged_state(&state.project_root, state.phase, |s| {
         apply(s);
-        Ok::<(), workflow::WorkflowError>(())
+        Ok(())
     })?;
     *state = committed;
     Ok(())
@@ -1074,9 +1134,8 @@ fn commit_notify_env(state: &mut State) -> Result<(), CliError> {
 
 /// An advance safe point (50-13, R-2): when the engaged supervisor's stop
 /// has been requested, record the stop in `state` and return `true`, so the
-/// caller returns at once without launching anything (the per-phase lock
-/// guard drops on the way out, and the supervisor's `finish` answers a
-/// parked caller `stopped`). `false` with no stop requested, or outside a
+/// caller returns at once without launching anything (the supervisor's
+/// `finish` answers a parked caller `stopped`). `false` with no stop requested, or outside a
 /// supervisor's advance.
 fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliError> {
     if with_stop_token(StopToken::safe_point) != Some(SafePoint::StopHere) {
@@ -1319,10 +1378,16 @@ pub(crate) fn launch_test_hold(point: &str) {
 /// in-process (D-02). A stopped run is recorded as stopped and never
 /// advances.
 ///
+/// The promotion (D-15, Pitfall 5): a supervisor advances only once the state records
+/// it. The promotion watch in `run_supervised_stage` reads "only pending" as wait, so a
+/// fast agent's advance cannot run before its launcher's publish save; with no long
+/// lock this is what orders the two.
+///
 /// The handoff (50-13, R-1): the advance runs with this supervisor's stop
-/// token engaged for its safe points and, when it launches the next stage,
-/// records the next supervisor under the per-phase lock before it returns.
-/// Only after it has returned (the lock released) is this supervisor marked
+/// token engaged for its safe points and its launch id engaged for the ownership
+/// fence (D-03) and, when it launches the next stage, records the next supervisor
+/// before it returns.
+/// Only after it has returned is this supervisor marked
 /// handed off, so every stop that reaches it during the advance is a
 /// flagged `Advancing` stop (RV-04), and only then does `finish` unlink its
 /// socket: the state never names a socket that is gone.
@@ -1390,39 +1455,37 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
     drop(auto_chain_guard);
 
     let result = match run.outcome {
-        AgentOutcome::Completed(_) if advance => {
-            wait_while_launch_is_pending(
-                project_root,
-                phase,
-                &invocation.launch_id,
-                LAUNCH_RECORD_WAIT,
-            );
-            let stop_guard = StopTokenGuard::engage(run.supervisor.token());
-            let advanced = advance_for_stage(project_root, Some(phase), stage);
-            // The advance has returned and released the per-phase lock. Only
-            // a run whose advance published a successor is handed off.
-            if let Some(successor) = take_successor() {
-                let token = run.supervisor.token();
-                #[cfg(test)]
-                test_hold("before_handoff_mark");
-                token.enter(OwnerPhase::HandedOff);
-                // RV-04 / R5-I1 (50-23): a stop that reached this supervisor
-                // after safe point 3 was flagged (it stayed `Advancing`) and
-                // must not be dropped. The one owner mutex orders every stop
-                // request before the marking above (flagged, so seen here) or
-                // after it (answered `handed_off`, acting on nothing), so one
-                // check right after the marking drops no flagged stop.
-                if token.stop_requested() {
-                    forward_stop_to_successor(&token, project_root, phase, &successor);
+        AgentOutcome::Completed(_) => match &run.promotion {
+            Some(monitor::Promotion::Recorded) if advance => {
+                let stop_guard =
+                    StopTokenGuard::engage(run.supervisor.token(), invocation.launch_id.clone());
+                let advanced = advance_for_stage(project_root, Some(phase), stage);
+                // The advance has returned. Only a run whose advance published a
+                // successor is handed off.
+                if let Some(successor) = take_successor() {
+                    let token = run.supervisor.token();
+                    #[cfg(test)]
+                    test_hold("before_handoff_mark");
+                    token.enter(OwnerPhase::HandedOff);
+                    // RV-04 / R5-I1 (50-23): a stop that reached this supervisor
+                    // after safe point 3 was flagged (it stayed `Advancing`) and
+                    // must not be dropped. The one owner mutex orders every stop
+                    // request before the marking above (flagged, so seen here) or
+                    // after it (answered `handed_off`, acting on nothing), so one
+                    // check right after the marking drops no flagged stop.
+                    if token.stop_requested() {
+                        forward_stop_to_successor(&token, project_root, phase, &successor);
+                    }
                 }
+                drop(stop_guard);
+                advanced
             }
-            drop(stop_guard);
-            advanced
-        }
-        AgentOutcome::Completed(_) => {
-            wait_for_launch_record(project_root, phase, &invocation.launch_id);
-            Ok(())
-        }
+            Some(monitor::Promotion::Recorded) => Ok(()),
+            other => Err(CliError::Message(format!(
+                "phase {phase}: launch {} did not advance: its promotion verdict is {other:?}",
+                invocation.launch_id
+            ))),
+        },
         _ => {
             record_supervisor_stop(project_root, phase, &invocation.launch_id);
             Ok(())
@@ -1551,6 +1614,7 @@ fn stage_spec(invocation: &MonitorInvocation) -> Result<monitor::StageSpec, CliE
     spec.args = args.to_vec();
     spec.envs = kept_env(&invocation.keep_env);
     spec.liveness_fd = invocation.liveness_fd;
+    spec.promotion_wait = Some(PROMOTION_WAIT);
     Ok(spec)
 }
 
@@ -1575,14 +1639,13 @@ fn kept_env(names: &[String]) -> Vec<(String, String)> {
 }
 
 /// Record a run its supervisor stopped: `state.stopped = true` with
-/// [`SUPERVISOR_STOP_REASON`], under the per-phase lock. Never advances.
+/// [`SUPERVISOR_STOP_REASON`], under the state write lock. Never advances.
 ///
 /// Only when the state names THIS launch (50-13, T-50-54): checked without
 /// the lock first, then again under it. A next supervisor that was never
-/// published (safe point 3 stops it while its launcher holds the lock and
-/// records the stop itself) and a superseded supervisor (the state names its
-/// successor, whose run it must not mark stopped) both write nothing, so
-/// neither waits on a lock its stopper holds.
+/// published (safe point 3 stops it and its launcher records the stop itself)
+/// and a superseded supervisor (the state names its successor, whose run it
+/// must not mark stopped) both write nothing.
 ///
 /// Never fails (T-50-68): a state that will not load, a lock wait that
 /// times out or a save that fails is logged, naming the state path and why
@@ -1613,12 +1676,8 @@ fn record_supervisor_stop(project_root: &Path, phase: PhaseId, launch_id: &str) 
         }
         Ok(_) => {}
     }
-    let _lock = match lock::acquire_blocking(project_root, phase, SUPERVISOR_STOP_WAIT) {
-        Ok(guard) => guard,
-        Err(err) => return not_recorded(&format!("the per-phase lock was not acquired ({err})")),
-    };
-    // Bounded like the lock wait above (T-50-68): a wedged write-lock holder must
-    // not keep this supervisor from reaching `finish`.
+    // Bounded (T-50-68): a wedged write-lock holder must not keep this supervisor from
+    // reaching `finish`.
     let written =
         workflow::update_state_with_within(project_root, phase, SUPERVISOR_STOP_WAIT, |existing| {
             match existing {
@@ -1641,59 +1700,6 @@ fn record_supervisor_stop(project_root: &Path, phase: PhaseId, launch_id: &str) 
         }
         Err(err) => not_recorded(&format!("the state was not updated ({err})")),
     }
-}
-
-/// How long the supervise-only entry waits for its launcher's record.
-const LAUNCH_RECORD_WAIT: Duration = Duration::from_secs(15);
-
-/// A fast agent's advance must not run before its launcher promotes it: the
-/// launcher's publish save would then overwrite whatever record the advance wrote.
-/// `start` and `resume` no longer hold the long lock that ordered the two (D-08), so
-/// wait (bounded by `wait`) while the state names `launch_id` only as pending. A
-/// launcher that died never promotes, and the advance goes on when the wait expires.
-/// A stage handoff's launch waits too: its launcher records it as pending before it
-/// spawns it (D-01). 50.1-19 replaces this with the promotion watch.
-fn wait_while_launch_is_pending(
-    project_root: &Path,
-    phase: PhaseId,
-    launch_id: &str,
-    wait: Duration,
-) {
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        let pending = workflow::load_state(project_root, phase)
-            .ok()
-            .and_then(|state| state.pending_supervisor)
-            .is_some_and(|pending| pending.launch_id == launch_id);
-        if !pending {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            warn!("launch {launch_id} was not promoted within {wait:?}; advancing anyway");
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// The supervise-only path (test build): keep serving until the launcher has
-/// recorded THIS launch in the state file (bounded), so a launcher still
-/// waiting for the publish cannot miss a socket that finished first. A
-/// production supervisor gets the same ordering from
-/// [`wait_while_launch_is_pending`].
-fn wait_for_launch_record(project_root: &Path, phase: PhaseId, launch_id: &str) {
-    let deadline = std::time::Instant::now() + LAUNCH_RECORD_WAIT;
-    while std::time::Instant::now() < deadline {
-        let recorded = workflow::load_state(project_root, phase)
-            .ok()
-            .and_then(|state| state.supervisor)
-            .is_some_and(|record| record.launch_id == launch_id);
-        if recorded {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    warn!("launch {launch_id} was not recorded within {LAUNCH_RECORD_WAIT:?}");
 }
 
 /// Resolve, once per launch, the cache directory and the monitor executable
@@ -2023,8 +2029,8 @@ enum PublishOutcome {
 ///   A successor still running is handed off. One that already ended (a
 ///   stop sent straight to it takes 50-13's no-write path while the state
 ///   still names this launcher's run) is recorded here: `stopped` with
-///   [`NEXT_STOPPED_BEFORE_SAVE_REASON`], saved again under the per-phase
-///   lock the caller holds.
+///   [`NEXT_STOPPED_BEFORE_SAVE_REASON`]. That second write is made as the
+///   successor ([`save_successor_stop`]), because the state records it by then.
 ///
 /// A successor that has accepted a stop but is still in its kill grace
 /// answers owner `agent_running` and is handed off: this save lands before
@@ -2048,7 +2054,7 @@ fn publish_record<E: Into<CliError>>(
     }
     state.stopped = true;
     state.stop_reason = Some(NEXT_STOPPED_BEFORE_SAVE_REASON.to_string());
-    save(state).map_err(Into::into)?;
+    save_successor_stop(state)?;
     info!(
         "phase {}: {NEXT_STOPPED_BEFORE_SAVE_REASON} (launch {})",
         state.phase, record.launch_id
@@ -2069,18 +2075,18 @@ fn promote_pending(state: &mut State) {
     }
 }
 
-/// [`publish_record`]'s production save: the record, its promotion and, once
-/// `publish_record` has set one, its stop. It only ever sets `stopped`: a `stop`
-/// another writer landed while this launch ran is on disk and is not this launcher's
-/// to clear.
+/// [`publish_record`]'s production save: the record and its promotion, the last write
+/// a supervisor makes as the recorded one. A `stop` another writer landed while this
+/// launch ran is on disk and is not this launcher's to clear.
 ///
 /// The promotion happens only while the state still names this launch (D-01): a
 /// reservation another writer cleared or replaced refuses the save, and
-/// [`publish_record`] then shuts this supervisor down through its socket. `publish_record`'s
-/// second save, for its stop, finds the launch already recorded.
+/// [`publish_record`] then shuts this supervisor down through its socket. Inside a
+/// supervisor's advance it is also an owned write (D-03), so a superseded supervisor
+/// promotes nothing.
 fn save_publish_fields(published: &State) -> Result<(), CliError> {
     let launch_id = published.supervisor.as_ref().map(|r| r.launch_id.as_str());
-    workflow::update_state(&published.project_root, published.phase, |s| {
+    update_engaged_state(&published.project_root, published.phase, |s| {
         let pending_id = s.pending_supervisor.as_ref().map(|p| p.launch_id.as_str());
         let recorded_id = s.supervisor.as_ref().map(|r| r.launch_id.as_str());
         if launch_id.is_none() || (pending_id != launch_id && recorded_id != launch_id) {
@@ -2092,10 +2098,22 @@ fn save_publish_fields(published: &State) -> Result<(), CliError> {
         }
         s.supervisor = published.supervisor.clone();
         promote_pending(s);
-        if published.stopped {
-            s.stopped = true;
-            s.stop_reason = published.stop_reason.clone();
-        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// [`publish_record`]'s second write: `stopped` for a successor that had already ended.
+/// The state records that successor by now, so it is made as the successor (D-03), not
+/// as the engaged supervisor, which the fence would refuse. It only ever sets `stopped`.
+fn save_successor_stop(published: &State) -> Result<(), CliError> {
+    let launch_id = published
+        .supervisor
+        .as_ref()
+        .map_or("", |record| record.launch_id.as_str());
+    workflow::update_owned_state(&published.project_root, published.phase, launch_id, |s| {
+        s.stopped = true;
+        s.stop_reason = published.stop_reason.clone();
         Ok::<(), CliError>(())
     })
     .map(|_| ())
@@ -2307,9 +2325,11 @@ fn spawn_next_supervisor(
 /// when it reads abandoned. A held one is a live launch this launcher knows nothing of,
 /// so this launch stops, naming both ids: `start` and `resume` are kept off a live
 /// supervisor by their guard, and a hand-run `advance` and `devflow ship`'s loop-back by
-/// theirs (50.1-29). Until 50.1-19, this also refuses a supervisor whose own promotion
-/// never came and whose bounded wait expired ([`wait_while_launch_is_pending`]): it holds
-/// the lock its own record names.
+/// theirs (50.1-29). A supervisor whose own promotion never came never reaches this: it
+/// does not advance (D-15).
+///
+/// Inside a supervisor's advance this is an owned write (D-03): a superseded supervisor
+/// gets `NotOwner` and spawns nothing.
 ///
 /// On `Err` this launch wrote nothing, so the caller's copy stops naming any pending
 /// record: [`record_failed_launch`] clears the record its copy names, and a record on
@@ -2321,7 +2341,7 @@ fn commit_pending_record(
     use devflow_core::liveness::{self, Held};
     let pending = reservation.pending_record();
     let (mut refused_over, mut cleared) = (None, None);
-    let written = workflow::update_state(&state.project_root, state.phase, |s| {
+    let written = update_engaged_state(&state.project_root, state.phase, |s| {
         if let Some(existing) = &s.pending_supervisor
             && !matches!(
                 liveness::probe(&existing.liveness_path),
@@ -2908,47 +2928,21 @@ pub(crate) fn advance_for_stage(
             }
         },
     };
-    advance_with(project_root, phase, stage, ADVANCE_LOCK_WAIT)
+    advance_with(project_root, phase, stage)
 }
 
 pub(crate) fn advance_with(
     project_root: &Path,
     phase: PhaseId,
     stage: Option<Stage>,
-    lock_wait: Duration,
 ) -> Result<(), CliError> {
-    // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
-    // advance() holds it across a gate's multi-day blocking wait, and every
-    // successful run ends at a mandatory Ship gate — a project-wide lock
-    // would starve `devflow parallel`'s sibling phases with no retry.
-    let _lock = match lock::acquire_blocking(project_root, phase, lock_wait) {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, path: _ }) => {
-            events::emit(
-                project_root,
-                phase,
-                "advance_failed",
-                serde_json::json!({
-                    "reason": "lock wait expired",
-                    "holder_pid": pid,
-                    "waited_secs": lock_wait.as_secs_f64(),
-                }),
-            );
-            return Err(CliError::Message(format!(
-                "advance lock wait expired after {} seconds; holder pid {pid}",
-                lock_wait.as_secs_f64()
-            )));
-        }
-        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
-    };
-    // Load under the lock: with per-phase state files keyed by the same
-    // phase as the lock, there is no cross-phase TOCTOU left by
-    // construction — a concurrent advance of another phase touches a
-    // different file. A duplicate advance of THIS phase queues behind the
-    // lock, then stage binding below handles a launch that has moved on.
+    // No long lock (D-08): a fresh supervisor's advance is ordered behind its launcher's
+    // publish by the promotion wait, and each write takes the state write lock for
+    // itself. A duplicate advance of this phase is refused by stage binding below once
+    // the first has moved the stage on.
     let mut state = workflow::load_state(project_root, phase)?;
     // Safe point 1 (50-13): a stop taken while this supervisor waited for
-    // the lock ends the advance before it evaluates anything.
+    // its promotion ends the advance before it evaluates anything.
     if stopped_at_safe_point(&mut state, 1)? {
         return Ok(());
     }
@@ -3291,6 +3285,7 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use devflow_core::gates::Gates;
+    use devflow_core::lock;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
@@ -5152,50 +5147,6 @@ mod tests {
     }
 
     #[test]
-    fn advance_waits_for_a_held_lock_then_proceeds() {
-        const NAME: &str = "pipeline_launch::tests::advance_waits_for_a_held_lock_then_proceeds";
-        enter_agent_free_child!(NAME, "claude");
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(48);
-        init_repo(root);
-        write_unreported_failure_capture(root, phase);
-        write_abort_gate_response(root, phase, Stage::Code);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-        workflow::save_state(&state).unwrap();
-        let held = lock::acquire(root, phase).expect("test holder acquires phase lock");
-
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                drop(held);
-            });
-            let result = advance_with(root, phase, None, Duration::from_secs(10));
-            assert!(result.is_ok(), "advance result: {result:?}");
-        });
-    }
-
-    #[test]
-    fn advance_lock_wait_expiry_emits_advance_failed() {
-        const NAME: &str = "pipeline_launch::tests::advance_lock_wait_expiry_emits_advance_failed";
-        enter_agent_free_child!(NAME, "claude");
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(49);
-        let _held = lock::acquire(root, phase).expect("test holder acquires phase lock");
-
-        let err = advance_with(root, phase, None, Duration::from_millis(300))
-            .expect_err("advance must time out behind a live holder");
-        assert!(err.to_string().contains("holder pid"));
-        let failed = events_of_kind(root, "advance_failed");
-        assert_eq!(failed.len(), 1, "one durable failure event: {failed:?}");
-        assert_eq!(failed[0]["phase"], 49);
-        assert_eq!(failed[0]["reason"], "lock wait expired");
-        assert!(failed[0]["holder_pid"].as_str().is_some());
-    }
-
-    #[test]
     fn advance_refuses_when_the_saved_stage_moved_on() {
         const NAME: &str = "pipeline_launch::tests::advance_refuses_when_the_saved_stage_moved_on";
         enter_agent_free_child!(NAME, "claude");
@@ -5211,7 +5162,7 @@ mod tests {
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
 
-        let err = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(1))
+        let err = advance_with(root, phase, Some(Stage::Define))
             .expect_err("advance must reject a stage that has moved on");
         assert!(err.to_string().contains("stage mismatch"));
         assert_eq!(std::fs::read(&state_path).unwrap(), before);
@@ -5236,7 +5187,7 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        advance_with(root, phase, None, Duration::from_secs(1)).unwrap();
+        advance_with(root, phase, None).unwrap();
         assert_eq!(events_of_kind(root, "advance_stage_unbound").len(), 1);
     }
 
@@ -5255,7 +5206,7 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        advance_with(root, phase, Some(Stage::Code), Duration::from_secs(1)).unwrap();
+        advance_with(root, phase, Some(Stage::Code)).unwrap();
         assert!(events_of_kind(root, "advance_failed").is_empty());
         assert!(events_of_kind(root, "advance_stage_unbound").is_empty());
     }
@@ -9238,7 +9189,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             write_success_capture(root, phase);
 
-            let result = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(5));
+            let result = advance_with(root, phase, Some(Stage::Define));
             let failed = events_named(root, "advance_failed");
             if stopped {
                 let err = result.expect_err("a stopped state must not advance");
@@ -9905,8 +9856,8 @@ mod tests {
         assert_eq!(promoted.supervisor, launcher.supervisor);
         assert_eq!(promoted.pending_supervisor, None, "promoted");
 
-        launcher.stopped = true;
-        save_publish_fields(&launcher).expect("control: the stop's save finds it recorded");
+        launcher.stop_reason = Some(NEXT_STOPPED_BEFORE_SAVE_REASON.to_string());
+        save_successor_stop(&launcher).expect("control: the stop's save finds it recorded");
         assert!(workflow::load_state(root, phase).unwrap().stopped);
     }
 
@@ -10347,70 +10298,6 @@ mod tests {
         ));
         workflow::save_state(&state).unwrap();
         state
-    }
-
-    /// With no long lock between them, a fast agent's advance waits for its launcher's
-    /// promotion, so the launcher's publish cannot overwrite what the advance writes.
-    #[test]
-    fn an_advance_waits_while_its_launch_is_only_pending() {
-        const LAUNCH: &str = "aaaa0000aaaa1610";
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(1610);
-        state_with_pending(root, phase, LAUNCH);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(200));
-                workflow::update_state(root, phase, |state| {
-                    state.pending_supervisor = None;
-                    Ok::<(), workflow::WorkflowError>(())
-                })
-                .unwrap();
-            });
-            wait_while_launch_is_pending(root, phase, LAUNCH, Duration::from_secs(30));
-            assert_eq!(
-                workflow::load_state(root, phase)
-                    .unwrap()
-                    .pending_supervisor,
-                None,
-                "the wait ends only once the promotion is on disk"
-            );
-        });
-    }
-
-    /// The wait is bounded: a launcher that died never promotes, and the advance goes on.
-    #[test]
-    fn an_advance_stops_waiting_for_a_promotion_when_its_bound_expires() {
-        const LAUNCH: &str = "aaaa0000aaaa1611";
-        const BOUND: Duration = Duration::from_millis(100);
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(1611);
-        state_with_pending(root, phase, LAUNCH);
-        let started = std::time::Instant::now();
-        wait_while_launch_is_pending(root, phase, LAUNCH, BOUND);
-        assert!(started.elapsed() >= BOUND, "it waited out its bound");
-        assert!(
-            workflow::load_state(root, phase)
-                .unwrap()
-                .pending_supervisor
-                .is_some(),
-            "precondition: the promotion never happened"
-        );
-    }
-
-    /// Another launch's reservation is no reason to wait, so a handoff's supervisor
-    /// does not sit out the bound behind a reservation that is not its own.
-    #[test]
-    fn an_advance_does_not_wait_on_another_launchs_reservation() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(1612);
-        state_with_pending(root, phase, "bbbb0000bbbb1612");
-        let bound = Duration::from_secs(30);
-        let started = std::time::Instant::now();
-        wait_while_launch_is_pending(root, phase, "aaaa0000aaaa1612", bound);
-        assert!(started.elapsed() < bound, "it returned without waiting");
     }
 
     /// Names which run of `a_failed_monitor_spawn_clears_the_supervisor_record`
@@ -10918,6 +10805,87 @@ mod tests {
             poll_until(SUPERVISOR_STOP_WAIT, || probes_gone(&run.n.socket_path)),
             "N finishes once released: {}",
             run.events()
+        );
+    }
+
+    /// V-24 (D-15, Pitfall 5): N+1's agent exits while N is held before the publish
+    /// save, so its supervisor's id is only pending. Its promotion watch reads that as
+    /// wait, and once the test releases N (within `PROMOTION_WAIT`) N+1 is recorded and
+    /// advances to its `--until` stop.
+    #[test]
+    fn a_fast_agent_advances_after_its_launcher_promotes_it() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_fast_agent_advances_after_its_launcher_promotes_it";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1901));
+        std::fs::write(run.root.join("go2"), "").unwrap();
+        run.go();
+        run.wait_held();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("at the hold the state names N+1 as pending");
+        let exit_file = devflow_core::agent_result::exit_code_path(&run.root, run.phase);
+        assert!(
+            poll_until(Duration::from_secs(3), || exit_file.exists()),
+            "N+1's agent exits while N is held; events:\n{}",
+            run.events()
+        );
+        assert_eq!(
+            run.state().supervisor.map(|r| r.launch_id),
+            Some(run.n.launch_id.clone()),
+            "precondition: N+1 is not recorded yet"
+        );
+        assert!(
+            events_named(&run.root, "workflow_finished").is_empty(),
+            "N+1 does not advance while it is only pending: {}",
+            run.events()
+        );
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || !events_named(
+                &run.root,
+                "workflow_finished"
+            )
+            .is_empty()),
+            "N+1 advances to its --until stop once promoted: {}",
+            run.events()
+        );
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&pending.socket_path)),
+            "N+1 finishes after its advance"
+        );
+    }
+
+    /// Whether the promotion wait covers a live launcher's serve-to-promotion latency:
+    /// one probe's reply read, one contract-honouring write-lock holder ahead, and a 2 s
+    /// allowance for the poll, the launcher's own closure and its fsyncs.
+    fn promotion_margin_holds(probe: Duration, write_lock: Duration, promotion: Duration) -> bool {
+        probe + write_lock + Duration::from_secs(2) <= promotion
+    }
+
+    /// D-15's margin: raising `IO_TIMEOUT` or `WRITE_LOCK_REPAIR_WAIT` by more than 1 s,
+    /// or lowering the release wait below 14 s, fails here until the derivation in
+    /// [`PROMOTION_WAIT_RELEASE`]'s doc is revisited.
+    #[test]
+    fn promotion_wait_covers_a_live_launchers_serve_to_promotion_latency() {
+        let probe = devflow_core::supervisor::protocol::IO_TIMEOUT;
+        assert!(promotion_margin_holds(
+            probe,
+            workflow::WRITE_LOCK_REPAIR_WAIT,
+            PROMOTION_WAIT_RELEASE
+        ));
+        assert!(
+            !promotion_margin_holds(
+                probe,
+                workflow::WRITE_LOCK_REPAIR_WAIT * 2,
+                PROMOTION_WAIT_RELEASE
+            ),
+            "control: doubling the write-lock term breaks the margin"
         );
     }
 
@@ -11540,10 +11508,9 @@ mod tests {
         assert_eq!(after.stop_reason.as_deref(), Some(CONCURRENT_STOP));
         assert_eq!(after.gate_notify_cmd.as_deref(), Some(": edited"));
 
-        launcher.stopped = true;
         launcher.stop_reason = Some(NEXT_STOPPED_BEFORE_SAVE_REASON.to_string());
 
-        save_publish_fields(&launcher).unwrap();
+        save_successor_stop(&launcher).unwrap();
 
         let after = workflow::load_state(root, phase).unwrap();
         assert_eq!(
@@ -11594,7 +11561,7 @@ mod tests {
         let bytes_before = std::fs::read(&path).unwrap();
         let inode_before = std::fs::metadata(&path).unwrap().ino();
 
-        let err = advance_with(root, phase, Some(Stage::Define), Duration::from_secs(1))
+        let err = advance_with(root, phase, Some(Stage::Define))
             .expect_err("the stage mismatch fails the advance before any later write");
         assert!(err.to_string().contains("stage mismatch"), "{err}");
 

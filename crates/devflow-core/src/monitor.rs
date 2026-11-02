@@ -23,6 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -1532,6 +1533,10 @@ pub struct StageSpec {
     pub launch_id: String,
     /// The inherited per-launch liveness descriptor to adopt, if any.
     pub liveness_fd: Option<std::os::fd::RawFd>,
+    /// How long, from serving, this supervisor may stay only pending before it reads
+    /// [`Promotion::OrphanedPending`]. `None` starts no watch, and
+    /// [`StageRun::promotion`] is `None`.
+    pub promotion_wait: Option<Duration>,
 }
 
 impl StageSpec {
@@ -1559,8 +1564,23 @@ impl StageSpec {
             socket,
             launch_id,
             liveness_fd: None,
+            promotion_wait: None,
         }
     }
+}
+
+/// What a supervisor's promotion watch decided about its launch (D-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Promotion {
+    /// The state records this launch as its supervisor.
+    Recorded,
+    /// The state names this launch nowhere, or no readable state names it.
+    Superseded {
+        /// The launch the state records instead, if any.
+        recorded: Option<String>,
+    },
+    /// The wait passed with this launch still only pending: its promoter died.
+    OrphanedPending,
 }
 
 /// A supervised stage whose agent has exited.
@@ -1575,11 +1595,17 @@ pub struct StageRun {
     /// The launch's liveness lock, when this process adopted one. The caller
     /// keeps it until its last act.
     pub liveness: Option<crate::liveness::Hold>,
+    /// The promotion watch's verdict. `None` when no watch ran
+    /// ([`StageSpec::promotion_wait`]), or a stop ended it before it had one.
+    pub promotion: Option<Promotion>,
 }
 
 /// How long [`confirm_own_group`] waits for a just-spawned agent's
 /// `setpgid` to become visible before it declares a mismatch.
 const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
+
+/// How often the promotion watch reads the state.
+const PROMOTION_POLL: Duration = Duration::from_millis(20);
 
 /// Supervise one stage's agent under an addressed [`Supervisor`], in either
 /// supervision shape, and return once the agent has exited.
@@ -1608,15 +1634,35 @@ const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 ///    process it started still holds its stdout (WR-03). An idle-timeout
 ///    group kill is a natural outcome, `Completed(128 + n)` with the
 ///    idle-timeout verdict file, never a stop.
-/// 5. [`Supervisor::wait_agent`], then the exit file: the agent's code for
+/// 5. When [`StageSpec::promotion_wait`] is set, a promotion watch has run since
+///    `serve` returned, beside the agent, so its deadline never waits for the
+///    agent (R-12). It reads the state every [`PROMOTION_POLL`] until it has a
+///    [`Promotion`] verdict: `Recorded` or `Superseded` at once, `OrphanedPending`
+///    when the wait has passed with this launch still only pending. A state file
+///    that is gone is `Superseded { recorded: None }` at once. Any other load error
+///    is retried, and still failing at the deadline ends the same way: no readable
+///    state names this launch. After `Recorded` the watch stops reading, so a
+///    supersession that lands while the agent runs is seen only at this
+///    supervisor's next guarded side effect after the agent exits, which writes
+///    nothing (R2-10). Until then that agent keeps running. Every launch route
+///    refuses over a live supervisor, so only an operator escape hatch or a hand
+///    edit reaches this.
+/// 6. [`Supervisor::wait_agent`], then the exit file: the agent's code for
 ///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`]. For
 ///    either outcome the stream threads are then waited for at most
 ///    [`READER_DRAIN_WAIT`]; at the bound the capture is closed, the
 ///    unfinished threads are detached (nothing is signalled), and the bound
 ///    is recorded as a `stream_wait_bounded` event.
+/// 7. Wait for the watch's verdict, for [`StageRun::promotion`]. It ends by its
+///    deadline at the latest. A stop ends the wait early: the run is over, and a
+///    stopped supervisor must not sit out the deadline before it answers. On every
+///    early return the watch is ended first, before the agent is reaped outside
+///    [`Supervisor::wait_agent`], so it can never act on a reaped leader's number
+///    (R-13).
 ///
 /// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
-/// advances only on [`AgentOutcome::Completed`].
+/// advances only on [`AgentOutcome::Completed`] with [`Promotion::Recorded`] when a
+/// watch ran.
 pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     crate::supervisor::runtime::install_signal_pipe()?;
     let liveness = adopt_liveness(&spec)?;
@@ -1646,6 +1692,11 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     #[cfg(test)]
     monitor_test_hold("after_sidecar");
     let supervisor = Supervisor::serve_written(spec.socket.clone(), sidecar)?;
+    // Before the disarm, so a watch that cannot start still ends the agent's group.
+    let watch = spec
+        .promotion_wait
+        .map(|wait| PromotionWatch::start(&spec, wait))
+        .transpose()?;
     let mut child = guard.disarm();
 
     let threads = match (&spec.io, stream_capture) {
@@ -1663,6 +1714,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
             match driven {
                 Ok(threads) => Some(threads),
                 Err(err) => {
+                    drop(watch);
                     abandon_agent(&mut child);
                     return Err(err);
                 }
@@ -1674,6 +1726,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
     let outcome = match supervisor.wait_agent(&mut child) {
         Ok(outcome) => outcome,
         Err(err) => {
+            drop(watch);
             abandon_agent(&mut child);
             return Err(err.into());
         }
@@ -1694,11 +1747,86 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         "supervised {} agent {pid} ended: {outcome:?}",
         spec.io.label()
     );
+    let promotion = watch.and_then(|watch| watch.finish(&supervisor.token()));
     Ok(StageRun {
         outcome,
         supervisor,
         liveness,
+        promotion,
     })
+}
+
+/// The thread that decides a supervisor's [`Promotion`], beside its agent (R-12).
+/// Dropping it tells the thread to quit and joins it.
+struct PromotionWatch {
+    quit: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Option<Promotion>>>,
+}
+
+impl PromotionWatch {
+    /// Start the watch. `wait` runs from now, the moment the supervisor serves.
+    fn start(spec: &StageSpec, wait: Duration) -> Result<Self, std::io::Error> {
+        let quit = Arc::new(AtomicBool::new(false));
+        let (project_root, phase, launch_id) = (
+            spec.project_root.clone(),
+            spec.phase,
+            spec.launch_id.clone(),
+        );
+        let thread_quit = Arc::clone(&quit);
+        let thread = std::thread::Builder::new()
+            .name("promotion-watch".to_string())
+            .spawn(move || await_promotion(&project_root, phase, &launch_id, wait, &thread_quit))?;
+        Ok(Self {
+            quit,
+            thread: Some(thread),
+        })
+    }
+
+    /// The watch's verdict once it has one. A stop tells a watch without one to quit.
+    fn finish(mut self, token: &crate::supervisor::runtime::StopToken) -> Option<Promotion> {
+        let thread = self.thread.take()?;
+        while !thread.is_finished() {
+            if token.stop_requested() {
+                self.quit.store(true, Ordering::Release);
+            }
+            std::thread::sleep(PROMOTION_POLL);
+        }
+        thread.join().unwrap_or_else(|_| {
+            warn!("the promotion watch panicked; no verdict");
+            None
+        })
+    }
+}
+
+impl Drop for PromotionWatch {
+    fn drop(&mut self) {
+        self.quit.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Read the state until it gives `launch_id` a verdict (see [`run_supervised_stage`]).
+/// `None` only when told to quit first.
+fn await_promotion(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    wait: Duration,
+    quit: &AtomicBool,
+) -> Option<Promotion> {
+    let _ = (wait, quit);
+    match crate::workflow::load_state(project_root, phase) {
+        Ok(state) => Some(match crate::workflow::ownership(&state, launch_id) {
+            crate::workflow::Ownership::Recorded => Promotion::Recorded,
+            crate::workflow::Ownership::Superseded { recorded } => {
+                Promotion::Superseded { recorded }
+            }
+            crate::workflow::Ownership::PendingOnly => Promotion::OrphanedPending,
+        }),
+        Err(_) => Some(Promotion::Superseded { recorded: None }),
+    }
 }
 
 /// Take over the liveness descriptor `spec` names, if it names one.
