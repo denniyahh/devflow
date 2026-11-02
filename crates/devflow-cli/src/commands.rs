@@ -1494,25 +1494,91 @@ pub(crate) struct LiveAgent {
     pub(crate) confirmed: bool,
 }
 
-pub(crate) fn live_phase_agent(_project_root: &Path, _state: &State) -> Option<LiveAgent> {
-    None
+/// The phase's agent, if it runs: the recorded supervisor's agent group in this boot,
+/// confirmed by its start time; else a live pid in the agent pid file, the launch guard's
+/// own predicate, which a reused pid can satisfy. Reads no socket, so callers ask only
+/// when no supervisor is live. Pid 0 or 1 is never returned, because the caller prints it
+/// as a process group to signal.
+pub(crate) fn live_phase_agent(project_root: &Path, state: &State) -> Option<LiveAgent> {
+    let is_group = |pid: &u32| *pid > 1;
+    if let Some(record) = &state.supervisor
+        && is_group(&record.agent_pgid)
+        && supervisor::boot_id().as_deref() == Some(record.boot_id.as_str())
+        && agent::agent_running(record.agent_pgid)
+        && agent::is_same_process(record.agent_pgid, record.agent_start_time)
+    {
+        return Some(LiveAgent {
+            pid: record.agent_pgid,
+            confirmed: true,
+        });
+    }
+    agent_pid_from_file(project_root, state.phase)
+        .filter(is_group)
+        .filter(|&pid| agent::agent_running(pid))
+        .map(|pid| LiveAgent {
+            pid,
+            confirmed: false,
+        })
 }
 
-#[allow(dead_code, reason = "a scaffold the next commit wires up")]
-pub(crate) fn orphaned_agent_line(_phase: PhaseId, _agent: &LiveAgent) -> String {
-    String::new()
+/// What to do about a live agent with no live supervisor (D-19). Only the operator
+/// signals it; an unconfirmed pid comes with the check to run first.
+pub(crate) fn orphaned_agent_line(phase: PhaseId, agent: &LiveAgent) -> String {
+    let pid = agent.pid;
+    if agent.confirmed {
+        format!(
+            "phase {phase}'s agent (pid {pid}) is still running with no live supervisor (its \
+             supervisor was killed or its socket is gone); `devflow stop` cannot end it (backlog \
+             999.170) — end its process group by hand with `kill -TERM -- -{pid}`, then run \
+             `devflow status`"
+        )
+    } else {
+        format!(
+            "pid {pid} from .devflow/phase-{padded}-agent-pid is alive and no supervisor of phase \
+             {phase} is live; it may be the phase's orphaned agent or an unrelated process that \
+             reused the pid — check it with `ps -o pid,pgid,lstart,args -p {pid}`, and if it is \
+             the agent end its process group with `kill -TERM -- -{pid}`; `devflow stop` cannot \
+             end it (backlog 999.170), and `devflow start`/`resume` refuse while it lives",
+            padded = phase.padded()
+        )
+    }
 }
 
+/// The repairs `status` prints: the manual kill while an agent outlives its supervisor
+/// (D-19), since the launch guard refuses the `resume` it would otherwise name; else
+/// [`recovery_hints`].
 fn status_hints(
     state: &State,
     liveness: &PhaseLiveness,
-    _live_agent: Option<&LiveAgent>,
+    live_agent: Option<&LiveAgent>,
 ) -> Vec<String> {
-    recovery_hints(state, liveness)
+    match live_agent {
+        Some(agent) if no_supervisor_live(liveness) => {
+            vec![orphaned_agent_line(state.phase, agent)]
+        }
+        _ => recovery_hints(state, liveness),
+    }
 }
 
-pub(crate) fn write_lock_line(_status: &workflow::WriteLockStatus) -> Option<String> {
-    None
+/// How to judge one reading of the state write lock, which `status` and `doctor` take
+/// once and do not time. The bounds are the holds D-08 allows (R2-12).
+const WRITE_LOCK_HOLD_NOTE: &str = "a state write usually takes milliseconds, up to about 5 s \
+     during a gate or reservation step and about 9 s while `recover` decides a phase; a hold past \
+     10 s is the fault";
+
+/// `status`'s line for a held state write lock (R-03); `None` when it is free.
+pub(crate) fn write_lock_line(status: &workflow::WriteLockStatus) -> Option<String> {
+    match status {
+        workflow::WriteLockStatus::Free => None,
+        workflow::WriteLockStatus::Held { pid: Some(pid) } => Some(format!(
+            "  state write lock: held by pid {pid} — {WRITE_LOCK_HOLD_NOTE}: that process is \
+             stuck (`ps -p {pid}`)"
+        )),
+        workflow::WriteLockStatus::Held { pid: None } => Some(format!(
+            "  state write lock: held by an unknown holder — {WRITE_LOCK_HOLD_NOTE}: that process \
+             is stuck"
+        )),
+    }
 }
 
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
@@ -4379,10 +4445,10 @@ fn live_run_refusal(
         text.push_str(&agent_refusal_guidance(phase, verb, pid));
     }
     if pending_blocks_resume {
-        text.push_str(&format!(
-            "\nOnce every supervisor and process named above is gone, `devflow status --phase \
-             {phase}` names what to do next."
-        ));
+        text.push_str(
+            "\nOnce every supervisor and process named above is gone, `devflow status` names \
+             what to do next.",
+        );
     } else {
         text.push_str(&format!(
             "\nOnce every supervisor and process named above is gone, run `{}` again.",
@@ -4400,9 +4466,8 @@ fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String 
         LaunchVerb::Start => "",
         LaunchVerb::Resume => {
             " A state already marked stopped does not mean these processes have exited: \
-             `devflow status` names `devflow resume` for a phase whose supervisor is GONE even \
-             while its agent is still alive, and resume refuses until every named process has \
-             exited."
+             with no live supervisor, `devflow status` names a live agent's pid and the manual \
+             kill, and resume refuses until every named process has exited."
         }
     };
     let recycled = match verb {
@@ -5601,7 +5666,6 @@ impl Severity {
 /// The read-only facts `doctor` gathers for one active phase before
 /// reconciling them. Collected by `collect_phase_facts` (all I/O); consumed
 /// with zero I/O by `reconcile_phase`.
-#[allow(dead_code, reason = "a scaffold the next commit wires up")]
 pub(crate) struct PhaseFacts {
     pub(crate) phase: PhaseId,
     pub(crate) stage: Stage,
@@ -5667,8 +5731,27 @@ fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
             "phase {}: gate_pending is true at stage {} but no gate file is open",
             facts.phase, facts.stage
         ),
-        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+        repair: Some(repair_instead_of_resume(
+            facts,
+            format!("devflow resume --phase {}", facts.phase),
+        )),
     })
+}
+
+/// A repair that would send the operator to `devflow resume`, unless the launch guard
+/// would refuse it: `stop` while a supervisor of the phase is live (criterion 2), and the
+/// manual kill while an agent outlives its supervisor (D-19). An ALIVE supervisor may be
+/// healthy and between stages, so `stop` is offered, not prescribed.
+fn repair_instead_of_resume(facts: &PhaseFacts, resume: String) -> String {
+    let phase = facts.phase;
+    match (&facts.supervisor, &facts.live_agent) {
+        (PhaseLiveness::LaunchPending { .. }, _) => format!("devflow stop --phase {phase}"),
+        (PhaseLiveness::Alive { .. }, _) => {
+            format!("wait for its live supervisor, or `devflow stop --phase {phase}`")
+        }
+        (_, Some(agent)) => orphaned_agent_line(phase, agent),
+        _ => resume,
+    }
 }
 
 /// An open gate has no process that may still be waiting to consume an
@@ -5686,7 +5769,11 @@ fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
             "phase {}: gate open for stage {} but no waiter may still be waiting",
             facts.phase, gate_stage
         ),
-        repair: Some(no_waiter_repair(facts.phase, gate_stage)),
+        repair: Some(if gate_stage == Stage::Ship {
+            no_waiter_repair(facts.phase, gate_stage)
+        } else {
+            repair_instead_of_resume(facts, no_waiter_repair(facts.phase, gate_stage))
+        }),
     })
 }
 
@@ -5726,7 +5813,10 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
             "phase {}: agent pid {pid} recorded but not running at stage {}",
             facts.phase, facts.stage
         ),
-        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+        repair: Some(repair_instead_of_resume(
+            facts,
+            format!("devflow resume --phase {}", facts.phase),
+        )),
     })
 }
 
@@ -5736,15 +5826,31 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// answer. Reuses [`phase_liveness`]'s result from the facts rather than
 /// re-deriving it, so `status` and `doctor` cannot drift. ALIVE, a stopped
 /// GONE and NotLaunched are never findings (T-18-11: an unrecorded
-/// supervisor is never a problem). Identifies the supervisor by phase and
-/// launch id, never by its socket path (T-18-01).
+/// supervisor is never a problem), unless its agent still runs (D-19). A live
+/// pending launch is [`check_pending_launch`]'s. Identifies the supervisor by phase
+/// and launch id, never by its socket path (T-18-01).
 fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
     let phase = facts.phase;
+    if let (PhaseLiveness::Gone | PhaseLiveness::NotLaunched, Some(agent)) =
+        (&facts.supervisor, &facts.live_agent)
+    {
+        return Some(PhaseFinding {
+            phase,
+            severity: Severity::Problem,
+            detail: format!(
+                "phase {phase}: no supervisor is live but its agent (pid {}) still runs",
+                agent.pid
+            ),
+            repair: Some(orphaned_agent_line(phase, agent)),
+        });
+    }
     let repair = match &facts.supervisor {
         PhaseLiveness::Stale => {
             format!("devflow stop --phase {phase} && devflow resume --phase {phase}")
         }
-        PhaseLiveness::GoneWhileActive => format!("devflow resume --phase {phase}"),
+        PhaseLiveness::GoneWhileActive => {
+            repair_instead_of_resume(facts, format!("devflow resume --phase {phase}"))
+        }
         // `status` prints the operator's own socket path, which doctor
         // must not.
         PhaseLiveness::ProbeFailed(_) => "devflow status".to_string(),
@@ -5755,7 +5861,11 @@ fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
             return None;
         }
     };
-    let launch = facts.supervisor_launch_id.as_deref().unwrap_or("?");
+    let launch = facts
+        .supervisor_launch_id
+        .as_deref()
+        .or(facts.pending.as_ref().map(|(id, _)| id.as_str()))
+        .unwrap_or("?");
     Some(PhaseFinding {
         phase,
         severity: Severity::Problem,
@@ -5765,6 +5875,74 @@ fn check_supervisor(facts: &PhaseFacts) -> Option<PhaseFinding> {
             facts.supervisor.describe()
         ),
         repair: Some(repair),
+    })
+}
+
+/// A reservation the state names (D-02). While its supervisor lives, `stop` is the
+/// repair. A `Warn`, since a healthy launch reads this way until it is promoted. Once
+/// abandoned it blocks nothing, so it is a note with no repair of its own.
+fn check_pending_launch(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let phase = facts.phase;
+    let (launch_id, liveness) = facts.pending.as_ref()?;
+    let (detail, repair) = if matches!(liveness, PhaseLiveness::LaunchPending { .. }) {
+        (
+            format!("phase {phase}: {}", liveness.describe()),
+            Some(format!("devflow stop --phase {phase}")),
+        )
+    } else {
+        (
+            format!(
+                "phase {phase}: launch reservation {launch_id} is abandoned (no process holds \
+                 it); the next launch or `devflow stop --phase {phase}` clears it"
+            ),
+            None,
+        )
+    };
+    Some(PhaseFinding {
+        phase,
+        severity: Severity::Warn,
+        detail,
+        repair,
+    })
+}
+
+/// A held state write lock (R-03), from one reading that did not wait; a lock that could
+/// not be read is named too. A `Warn`, because a single reading cannot tell a brief hold
+/// from a stuck one: [`WRITE_LOCK_HOLD_NOTE`] says how to judge it.
+fn check_write_lock(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let phase = facts.phase;
+    let (detail, repair) = if let Some(error) = &facts.write_lock_error {
+        (
+            format!("phase {phase}: could not read the state write lock ({error})"),
+            None,
+        )
+    } else {
+        let workflow::WriteLockStatus::Held { pid } = facts.write_lock else {
+            return None;
+        };
+        let give_up = "`devflow stop` and `devflow recover --clean` give up after 10 s naming it";
+        match pid {
+            Some(pid) => (
+                format!(
+                    "phase {phase}: the state write lock is held by pid {pid} — \
+                     {WRITE_LOCK_HOLD_NOTE}"
+                ),
+                Some(format!("inspect it with `ps -p {pid}`; {give_up}")),
+            ),
+            None => (
+                format!(
+                    "phase {phase}: the state write lock is held by an unknown holder — \
+                     {WRITE_LOCK_HOLD_NOTE}"
+                ),
+                Some(give_up.to_string()),
+            ),
+        }
+    };
+    Some(PhaseFinding {
+        phase,
+        severity: Severity::Warn,
+        detail,
+        repair,
     })
 }
 
@@ -5820,8 +5998,10 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
         check_orphan_gate(facts),
         check_dead_agent(facts),
         check_supervisor(facts),
+        check_pending_launch(facts),
         check_stage_event_drift(facts),
         check_missing_branch(facts),
+        check_write_lock(facts),
     ]
     .into_iter()
     .flatten()
@@ -5864,6 +6044,20 @@ fn build_phase_facts(
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let supervisor = probe_phase(&state);
+    let pending = state.pending_supervisor.as_ref().map(|pending| {
+        let gone = if stopped {
+            PhaseLiveness::Gone
+        } else {
+            PhaseLiveness::GoneWhileActive
+        };
+        (
+            pending.launch_id.clone(),
+            pending_liveness(pending).unwrap_or(gone),
+        )
+    });
+    let live_agent = no_supervisor_live(&supervisor)
+        .then(|| live_phase_agent(project_root, &state))
+        .flatten();
     let (write_lock, write_lock_error) = match workflow::write_lock_status(project_root, phase) {
         Ok(status) => (status, None),
         Err(error) => (workflow::WriteLockStatus::Free, Some(error.to_string())),
@@ -5902,8 +6096,8 @@ fn build_phase_facts(
         open_gate_stages,
         feature_branch_exists,
         stopped,
-        pending: None,
-        live_agent: None,
+        pending,
+        live_agent,
         write_lock,
         write_lock_error,
     }
@@ -6012,8 +6206,9 @@ fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
 }
 
 /// A phase's supervisor facts for `doctor --json` (50-12): its liveness
-/// label, the owner and launch shape an ALIVE ping reported, and the
-/// recorded launch id. Never the socket path (T-18-01, T-50-32).
+/// label, the owner and launch shape an ALIVE ping reported, the recorded
+/// launch id, and the pending launch (`null`, or its id and liveness label, R2-01).
+/// Never a socket or liveness-file path (T-18-01, T-50-32).
 fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
     let (owner, launch) = match &facts.supervisor {
         PhaseLiveness::Alive { owner, launch } => (Some(owner), Some(launch)),
@@ -6024,6 +6219,9 @@ fn supervisor_json(facts: &PhaseFacts) -> serde_json::Value {
         "owner": owner,
         "launch": launch,
         "launch_id": facts.supervisor_launch_id,
+        "pending": facts.pending.as_ref().map(|(launch_id, liveness)| {
+            serde_json::json!({"launch_id": launch_id, "liveness": liveness.label()})
+        }),
     })
 }
 
@@ -10069,10 +10267,15 @@ mod tests {
                 ))),
                 false,
             );
+            let pending = PhaseLiveness::LaunchPending {
+                launch_id: SUPERVISOR_LAUNCH_ID.to_string(),
+                published: false,
+            };
             let facts = vec![
                 agreeing_facts(PhaseId::new(27)),
                 PhaseFacts {
                     supervisor: failed,
+                    pending: Some((SUPERVISOR_LAUNCH_ID.to_string(), pending)),
                     ..agreeing_facts(PhaseId::new(28))
                 },
             ];
@@ -10088,6 +10291,7 @@ mod tests {
                 .find(|entry| entry["phase"] == 28)
                 .expect("phase 28's finding")["supervisor"];
             assert_eq!(failed["liveness"], "probe_failed", "{body}");
+            assert_eq!(failed["pending"]["liveness"], "launch_pending", "{body}");
             assert!(failed["owner"].is_null(), "{body}");
             let mut strings = Vec::new();
             strings_in(&body, &mut strings);
@@ -10554,6 +10758,7 @@ mod tests {
             let facts = PhaseFacts {
                 gate_pending: true,
                 open_gate_stages: Vec::new(),
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(PhaseId::new(2))
             };
             let findings = reconcile_phase(&facts);
@@ -10571,6 +10776,7 @@ mod tests {
             let facts = PhaseFacts {
                 gate_pending: false,
                 open_gate_stages: vec![Stage::Validate],
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(PhaseId::new(3))
             };
             let findings = reconcile_phase(&facts);
@@ -10589,6 +10795,7 @@ mod tests {
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Validate],
                 waiter: lock::HolderStatus::NoHolder,
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(phase)
             };
 
@@ -10632,6 +10839,7 @@ mod tests {
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Validate],
                 waiter: lock::HolderStatus::Recycled { pid: 1234 },
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(phase)
             };
 
@@ -10660,11 +10868,80 @@ mod tests {
             }));
         }
 
+        /// Criterion 2 for the doctor repairs that name `resume`: none does while a
+        /// supervisor of the phase is live or an agent outlives its supervisor (D-19).
+        /// Control: with neither, each one does.
+        #[test]
+        fn no_repair_names_resume_while_a_supervisor_or_agent_lives() {
+            let phase = PhaseId::new(29);
+            let gate_pending = |facts: PhaseFacts| PhaseFacts {
+                gate_pending: true,
+                ..facts
+            };
+            let dead_agent = |facts: PhaseFacts| PhaseFacts {
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                ..facts
+            };
+            let open_gate = |facts: PhaseFacts| PhaseFacts {
+                gate_pending: true,
+                open_gate_stages: vec![Stage::Code],
+                ..facts
+            };
+            let shapes: [&dyn Fn(PhaseFacts) -> PhaseFacts; 3] =
+                [&gate_pending, &dead_agent, &open_gate];
+            let pending = PhaseLiveness::LaunchPending {
+                launch_id: SUPERVISOR_LAUNCH_ID.to_string(),
+                published: true,
+            };
+            let agent = LiveAgent {
+                pid: 4242,
+                confirmed: true,
+            };
+            for (index, shape) in shapes.iter().enumerate() {
+                for (case, supervisor, live_agent) in [
+                    ("alive", agreeing_facts(phase).supervisor, None),
+                    ("pending", pending.clone(), None),
+                    (
+                        "orphan",
+                        PhaseLiveness::GoneWhileActive,
+                        Some(agent.clone()),
+                    ),
+                ] {
+                    let findings = reconcile_phase(&shape(PhaseFacts {
+                        supervisor,
+                        live_agent,
+                        ..agreeing_facts(phase)
+                    }));
+                    assert!(!findings.is_empty(), "shape {index}, {case}");
+                    for finding in &findings {
+                        let repair = finding.repair.as_deref().unwrap_or_default();
+                        assert!(
+                            !repair.contains("devflow resume"),
+                            "shape {index}, {case}: {repair}"
+                        );
+                    }
+                }
+                let findings = reconcile_phase(&shape(PhaseFacts {
+                    supervisor: PhaseLiveness::NotLaunched,
+                    ..agreeing_facts(phase)
+                }));
+                assert!(
+                    findings.iter().any(|finding| finding
+                        .repair
+                        .as_deref()
+                        .is_some_and(|repair| repair.contains("devflow resume"))),
+                    "control, shape {index}"
+                );
+            }
+        }
+
         #[test]
         fn reconcile_phase_flags_dead_agent_at_agent_stage() {
             let facts = PhaseFacts {
                 agent_pid: Some(999_999),
                 agent_alive: false,
+                supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(PhaseId::new(4))
             };
             let findings = reconcile_phase(&facts);
@@ -13631,7 +13908,7 @@ mod tests {
             let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(pending)], Some(77));
             assert!(!text.contains("devflow resume"), "{text}");
             assert!(text.contains("agent pid 77 alive"), "{text}");
-            assert!(text.contains("devflow status --phase"), "{text}");
+            assert!(text.contains("`devflow status` names"), "{text}");
         }
         let text = live_run_refusal(phase, LaunchVerb::Resume, &[live(PendingKind::No)], None);
         assert!(text.contains("devflow resume"), "control: {text}");
