@@ -733,8 +733,10 @@ pub enum ShutdownOutcome {
 ///
 /// Only a final `stopped` line is [`ShutdownOutcome::Stopped`]; a
 /// `handed_off` answer is [`ShutdownOutcome::HandedOff`] and any other
-/// refusal is [`ShutdownOutcome::Refused`]. A missing, late or malformed
-/// line is an error, never a stop.
+/// refusal is [`ShutdownOutcome::Refused`]. An `accepted` line with no final
+/// line within `final_timeout` is [`ShutdownOutcome::AcceptedPending`], since
+/// the supervisor still holds that stop. A connection closed before the final
+/// line, or a missing or malformed line, is an error, never a stop.
 pub fn request_shutdown(
     path: &Path,
     final_timeout: std::time::Duration,
@@ -760,26 +762,44 @@ pub fn request_shutdown(
         .map_err(|error| ProbeError::NoReply(format!("could not send shutdown: {error}")))?;
     // One reader across both lines: it may already hold the final line.
     let mut reader = io::BufReader::new(&stream);
-    match read_shutdown_line(&mut reader, "accepted")? {
-        ShutdownLine::Accepted => {}
+    let line = protocol::read_line(&mut reader)
+        .map_err(|error| ProbeError::NoReply(format!("no accepted shutdown line: {error}")))?;
+    let owner = match parse_shutdown_line(&line, "accepted")? {
+        ShutdownLine::Accepted(accepted) => accepted.owner,
         ShutdownLine::Refused(error) => return Ok(refusal(error)),
         ShutdownLine::Stopped(_) => {
             return Err(ProbeError::NoReply(
                 "a stopped line arrived before the accepted line".to_string(),
             ));
         }
-    }
+    };
     stream
         .set_read_timeout(Some(final_timeout))
         .map_err(timeout_error)?;
-    match read_shutdown_line(&mut reader, "final")? {
+    let line = match protocol::read_line(&mut reader) {
+        Ok(line) => line,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(ShutdownOutcome::AcceptedPending { owner });
+        }
+        Err(error) => {
+            return Err(ProbeError::NoReply(format!(
+                "no final shutdown line: {error}"
+            )));
+        }
+    };
+    match parse_shutdown_line(&line, "final")? {
         ShutdownLine::Stopped(stopped) => Ok(ShutdownOutcome::Stopped {
             exit_code: stopped.exit_code,
             advance_suppressed: stopped.advance_suppressed,
             group_signalled: stopped.group_signalled,
         }),
         ShutdownLine::Refused(error) => Ok(refusal(error)),
-        ShutdownLine::Accepted => Err(ProbeError::NoReply(
+        ShutdownLine::Accepted(_) => Err(ProbeError::NoReply(
             "a second accepted line arrived instead of the final line".to_string(),
         )),
     }
@@ -787,7 +807,7 @@ pub fn request_shutdown(
 
 /// One parsed shutdown reply line.
 enum ShutdownLine {
-    Accepted,
+    Accepted(protocol::ShutdownAccepted),
     Stopped(protocol::ShutdownStopped),
     Refused(String),
 }
@@ -801,16 +821,11 @@ fn refusal(error: String) -> ShutdownOutcome {
     }
 }
 
-/// Read and classify one shutdown reply line. A missing, oversized or
-/// malformed line, `"ok":true` with neither marker, and `"ok":false` with no
+/// Classify one shutdown reply line. A malformed line, `"ok":true` with
+/// neither marker, or a marker without its fields, and `"ok":false` with no
 /// error string are all errors.
-fn read_shutdown_line(
-    reader: &mut impl io::BufRead,
-    which: &str,
-) -> Result<ShutdownLine, ProbeError> {
-    let line = protocol::read_line(reader)
-        .map_err(|error| ProbeError::NoReply(format!("no {which} shutdown line: {error}")))?;
-    let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+fn parse_shutdown_line(line: &str, which: &str) -> Result<ShutdownLine, ProbeError> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
         ProbeError::NoReply(format!(
             "{which} shutdown line is not JSON ({error}): {line}"
         ))
@@ -835,7 +850,13 @@ fn read_shutdown_line(
             });
     }
     if ok && accepted {
-        return Ok(ShutdownLine::Accepted);
+        return serde_json::from_value(value)
+            .map(ShutdownLine::Accepted)
+            .map_err(|error| {
+                ProbeError::NoReply(format!(
+                    "{which} shutdown line is missing fields ({error}): {line}"
+                ))
+            });
     }
     Err(ProbeError::NoReply(format!(
         "{which} shutdown line is neither accepted nor stopped: {line}"
@@ -2131,21 +2152,6 @@ mod tests {
         assert!(
             matches!(closed, Err(ProbeError::NoReply(_))),
             "a close after accepted is an error, never Stopped, got {closed:?}"
-        );
-
-        let silent = run(
-            Box::new(move |stream| {
-                use std::io::Read;
-                protocol::write_reply(stream, &accepted()).expect("write accepted");
-                // Hold the connection open until the client gives up and
-                // closes it, past its final timeout.
-                let _ = (&mut &*stream).read(&mut [0_u8; 1]);
-            }),
-            Duration::from_millis(300),
-        );
-        assert!(
-            matches!(silent, Err(ProbeError::NoReply(_))),
-            "no final line within the timeout is an error, got {silent:?}"
         );
 
         let malformed = run(
