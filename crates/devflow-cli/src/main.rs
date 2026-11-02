@@ -339,16 +339,18 @@ enum Command {
     ///
     /// A second, out-of-process trigger of the SAME terminal effect
     /// (`finish_workflow`) the live poll loop would have run (20e, D-01) —
-    /// requires `state.stage == Stage::Ship` and an existing Ship gate
-    /// request+response pair with no prior ack; `--force` never skips an
-    /// earlier stage, the lock, or those existence checks (D-02).
+    /// requires `state.stage == Stage::Ship` and an open Ship gate holding an
+    /// answer bound to it, not yet claimed; `--force` never skips an earlier
+    /// stage, the foreground holder, the refusal while a supervisor of the
+    /// phase is live, the answer claim, or those existence checks (D-02).
     Ship {
         /// Phase to ship.
         #[arg(long)]
         phase: PhaseId,
         /// Accepted for explicit, auditable operator intent. Does NOT skip
-        /// the stage, lock, gate-existence, or ack checks (D-02) — see
-        /// `pipeline_gate::ship_override`'s doc comment for exact scope.
+        /// the stage, holder, live-supervisor, gate-existence, or answer-claim
+        /// checks (D-02) — see `pipeline_gate::ship_override`'s doc comment for
+        /// exact scope.
         #[arg(long)]
         force: bool,
         /// Project root.
@@ -356,9 +358,12 @@ enum Command {
         project: PathBuf,
     },
     /// End a running phase cleanly: answers its open gate with a rejection
-    /// when a live waiter holds it; otherwise addresses the run's supervisor
-    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE, the
-    /// per-phase lock holder when GONE. `--launch <id>` tears down only the
+    /// when a live waiter holds it (a Ship gate with no waiter stores the
+    /// rejection for `devflow ship`); otherwise addresses the run's supervisor
+    /// socket — `shutdown` when ALIVE, the guarded backstop when STALE. When
+    /// no socket answers, it signals the phase's foreground holder (a `start`
+    /// or `resume` before its spawn, `devflow ship`, a hand-run `advance`)
+    /// once its identity is confirmed. `--launch <id>` tears down only the
     /// socket with that launch id (the form `devflow doctor` prints for an
     /// orphan). Never signals a pid recorded in state. Idempotent: safe to
     /// run against an already-stopped, never-started, or already-dead
@@ -368,7 +373,7 @@ enum Command {
         #[arg(long)]
         phase: PhaseId,
         /// Tear down only the supervisor socket with this launch id; answers
-        /// no gate, signals no lock holder and writes no state.
+        /// no gate, signals no holder and writes no state.
         #[arg(long)]
         launch: Option<String>,
         /// Project root. Overrides the positional argument when supplied.

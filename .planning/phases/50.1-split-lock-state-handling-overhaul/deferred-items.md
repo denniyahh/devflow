@@ -57,7 +57,7 @@
   **Not established:** the storm covers the core lib suite only, and only tests that ran inside its 120 s.
 
 - Three comments and help lines still name the per-phase lock after 50.1-20 (found during 50.1-20)
-  status: partly resolved. 50.1-21 rewrote `commands.rs`'s `recover --clean` comment and the same file's "advance taking the lock" line. Open for 50.1-22, wording only: `pipeline_gate.rs`'s safe-point-4 comment and `main.rs`'s `stop` help, with the help snapshot.
+  status: resolved. 50.1-21 rewrote `commands.rs`'s `recover --clean` comment and the same file's "advance taking the lock" line. 50.1-22 rewrote `pipeline_gate.rs`'s safe-point-4 comment and `main.rs`'s `stop`, `--launch`, `ship` and `--force` help, and regenerated the help snapshot.
   **What:** `pipeline_gate.rs`'s safe-point-4 comment ("which releases the per-phase lock"), `main.rs`'s `stop` help ("per-phase lock holder when GONE", "signals no lock holder") and `commands.rs`'s `recover --clean` comment ("cleaned when its lock holder is dead").
   **Why deferred:** 50.1-22 owns the `stop` help and 50.1-21 deletes the lock API, so each goes with its owner. Nothing reads them as behaviour.
 
