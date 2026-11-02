@@ -1045,6 +1045,41 @@ mod tests {
         (returned, started.elapsed())
     }
 
+    /// A socket going away mid-ping is the slowest way to read GONE: a connect that waited
+    /// for room in the backlog, a ping left unanswered, then a closed connection and a
+    /// second look at a path that has gone. This is what `recover`'s worst case charges
+    /// each socket probe for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_can_read_gone_after_a_slow_connect_and_a_closed_ping() {
+        const EACH_STALL: std::time::Duration = std::time::Duration::from_secs(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dying.sock");
+        let (listener, waiting) = listener_with_a_full_backlog(&path);
+        let target = path.clone();
+        let started = std::time::Instant::now();
+        let prober = std::thread::spawn(move || probe(&target));
+
+        std::thread::sleep(EACH_STALL);
+        let accepted = listener.accept().unwrap();
+        std::thread::sleep(EACH_STALL);
+        std::fs::remove_file(&path).unwrap();
+        drop(listener);
+
+        let outcome = prober.join().unwrap();
+        let took = started.elapsed();
+        drop((accepted, waiting));
+        assert!(matches!(outcome, Ok(Liveness::Gone)), "{outcome:?}");
+        assert!(
+            took >= EACH_STALL * 2,
+            "the probe outlasted both stalls: {took:?}"
+        );
+        assert!(
+            took < protocol::IO_TIMEOUT * 2,
+            "one connect wait and one reply wait: {took:?}"
+        );
+    }
+
     /// A full backlog is what a SIGSTOPped supervisor shows, and it means "cannot tell":
     /// neither GONE nor STALE, and not a wait that outlives the caller's write lock.
     #[cfg(target_os = "linux")]

@@ -743,9 +743,8 @@ impl Gates {
         Self::close_phase_with_partial_result(project_root, phase)
     }
 
-    /// [`close_phase`](Self::close_phase) for recovery's write-lock decision, whose one
-    /// gate wait is what keeps the decision under
-    /// [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`] (R2-03).
+    /// [`close_phase`](Self::close_phase) for recovery's write-lock decision, which
+    /// holds that lock across this one gate wait, not one per stage (R2-03).
     pub(crate) fn close_phase_with_partial_result(
         project_root: &Path,
         phase: PhaseId,
