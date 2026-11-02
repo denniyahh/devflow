@@ -887,6 +887,13 @@ pub(crate) fn reserve_launch(
     let pending = reservation.pending_record();
     let written = workflow::update_state_with(project_root, phase, |existing| {
         refuse_launch_over_a_live_run(project_root, phase, verb, &existing, cache_dir)?;
+        if fresh.is_some() && matches!(existing, workflow::Existing::Unloadable(_)) {
+            refuse_unloadable_state_beside_a_live_lock(
+                project_root,
+                phase,
+                reservation.launch_id(),
+            )?;
+        }
         #[cfg(test)]
         crate::pipeline_launch::launch_test_hold("guarded");
         let state_file = workflow::state_path(project_root, phase);
@@ -935,6 +942,51 @@ pub(crate) fn reserve_launch(
         created: outcome.created,
         state: outcome.state,
     })
+}
+
+/// A state that does not load names no pending launch, and a supervisor that has not
+/// published shows in no socket sweep, so replacing the state could launch a second one
+/// beside it. Only its held liveness lock shows. That file names no phase, so another
+/// phase's live supervisor refuses this too: fail closed, with the repair named. A lock
+/// that cannot be read counts as held (T-50-40).
+fn refuse_unloadable_state_beside_a_live_lock(
+    project_root: &Path,
+    phase: PhaseId,
+    own_launch_id: &str,
+) -> Result<(), CliError> {
+    let dir = project_root.join(".devflow");
+    let unlisted = |error: std::io::Error| {
+        CliError::Message(format!(
+            "phase {phase}: its state file does not load, and {} could not be listed for live \
+             launches ({error}); nothing was launched",
+            dir.display()
+        ))
+    };
+    for entry in std::fs::read_dir(&dir).map_err(unlisted)? {
+        let entry = entry.map_err(unlisted)?;
+        let name = entry.file_name();
+        let Some(launch_id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("supervisor-"))
+            .and_then(|name| name.strip_suffix(".live"))
+            .filter(|launch_id| *launch_id != own_launch_id)
+        else {
+            continue;
+        };
+        if !matches!(
+            liveness::probe(&entry.path()),
+            Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+        ) {
+            return Err(CliError::Message(format!(
+                "phase {phase}: its state file does not load, so it cannot say whose launch \
+                 {launch_id} is, and that launch's liveness lock is held: it may be this phase's \
+                 supervisor before it publishes. Nothing was launched. Retry once it has \
+                 published; if it is another phase's, run `devflow recover --clean --phase \
+                 {phase}` first"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// What [`reserve_launch`]'s write-lock closure hands back to print and return.
@@ -15257,6 +15309,90 @@ mod tests {
             liveness::probe(&liveness_path).unwrap(),
             liveness::Held::Abandoned,
             "the launcher released its copy once the publish was done"
+        );
+    }
+
+    /// What a `start`'s reservation does over a state file that does not load. On success
+    /// the reservation's lock is released and the state it wrote stays.
+    fn reserve_over_an_unloadable_state(root: &Path, phase: PhaseId) -> Result<(), String> {
+        let path = workflow::state_path(root, phase);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not a state").unwrap();
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let cache_dir = registry::cache_dir();
+        reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            cache_dir.as_deref(),
+        )
+        .map(|reserved| reserved.reservation.discard())
+        .map_err(|err| err.to_string())
+    }
+
+    /// No state names a pending launch when the state does not load, and a supervisor that
+    /// has not published shows in no socket sweep: only its held lock says it is there. A
+    /// `start` must not overwrite the state and launch a second one beside it.
+    #[test]
+    fn a_start_refuses_an_unloadable_state_beside_an_unpublished_supervisors_lock() {
+        const NAME: &str = "commands::tests::a_start_refuses_an_unloadable_state_beside_an_unpublished_supervisors_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5035);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let launch_id = supervisor::new_launch_id();
+        let lock = liveness::launch_liveness_path(root, &launch_id).unwrap();
+        let _unpublished = liveness::Hold::take(&lock).unwrap();
+
+        let error = reserve_over_an_unloadable_state(root, phase)
+            .expect_err("a live lock no state can account for refuses the start");
+
+        assert!(error.contains(&launch_id), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workflow::state_path(root, phase)).unwrap(),
+            "{ this is not a state",
+            "the refused start left the state file as it was"
+        );
+        assert_eq!(
+            liveness_files(root),
+            vec![format!("supervisor-{launch_id}.live")],
+            "the refused reservation left no liveness file"
+        );
+    }
+
+    /// The control: with no live lock, or only a released one, a `start` still replaces a
+    /// state file that does not load, the repair the reservation's note names.
+    #[test]
+    fn a_start_replaces_an_unloadable_state_beside_a_released_lock() {
+        const NAME: &str =
+            "commands::tests::a_start_replaces_an_unloadable_state_beside_a_released_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5036);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let lock = liveness::launch_liveness_path(root, &supervisor::new_launch_id()).unwrap();
+        drop(liveness::Hold::take(&lock).unwrap());
+
+        reserve_over_an_unloadable_state(root, phase).expect("a released lock refuses nothing");
+
+        assert!(
+            workflow::load_state(root, phase).is_ok(),
+            "the reservation replaced the state file"
         );
     }
 
