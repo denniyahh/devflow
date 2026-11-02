@@ -83,10 +83,11 @@
   **Settled (orchestrator, wave 17):** the three cases stay, because each is a claim the run cannot classify and the rerun asks again either way. `resume` now says only what is known: "claimed, with no record that it was applied", and at Ship that a merge, version bump or tag may already have run. The event name `resume_found_unapplied_answer` stays, meaning that record is missing. 50.1-25 documents this wording.
 
 - A `stopped` flag written to disk during a gate wait does not stop the run (found during 50.1-24, carried over from 50.1-10)
-  status: open
+  status: moved to backlog 999.172
   **What:** the supervisor's safe points read its stop token, not the state's `stopped` field. Measured with a temporary test on a real supervisor parked at a failed Define gate: writing `stopped = true` through `update_state`, then approving the gate. The answer was applied and the stage was launched again (`stage_launched` twice, no `advance_stopped`), so a new agent ran under a state that reads `stopped`. The exit file was absent, because the launch archived it. 50.1-10 predicted the next advance refuses; that last step was not measured here.
   **Reach:** by reading, `devflow stop` does not produce this against a live waiter: arm 1 answers the gate with an abort, and the socket and holder arms set the token or the holder's flag. A flag written by hand, or by a path added later, would. No fix is proposed here.
   **Why deferred:** 50.1-24's reporting covers the token path only (see its SUMMARY). This needs a ruling on whether a safe point should also read the state.
+  **Settled (orchestrator, wave 18):** no change in this phase, moved to backlog 999.172. Every production writer of `stopped` was read: each runs in the process that owns the run, or refuses a launch it did not end (`unaddressed_launch_refusal`). So only a hand edit reaches it.
 
 - `stop` over a live pid in the agent pid file cannot record `stopped` until that pid ends (found during 50.1-24, by plan)
   status: open, by plan
