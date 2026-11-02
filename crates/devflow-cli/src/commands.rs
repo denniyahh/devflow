@@ -1675,6 +1675,9 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
         println!("\n{banner}");
     }
+    if let Some(block) = render_set_aside_answers(&Gates::quarantined(project_root)) {
+        println!("\n{block}");
+    }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
     for hint in cron_instruction_hints(project_root) {
@@ -5268,6 +5271,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
         .map(|cache| collect_orphan_supervisors(project_root, cache))
         .unwrap_or_default();
     let sweep_unlistable = cache_dir.and_then(socket_dir_unlistable);
+    let set_aside = set_aside_answer_findings(project_root, &Gates::quarantined(project_root));
 
     if json {
         // WR-01 (18-fix): a single top-level JSON document —
@@ -5287,6 +5291,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
             &doc_findings,
             &stray_findings,
             (&orphans, sweep_unlistable.as_deref()),
+            &set_aside,
         );
         println!(
             "{}",
@@ -5311,6 +5316,7 @@ fn doctor_in(project_root: &Path, json: bool, cache_dir: Option<&Path>) -> Resul
             println!();
         }
         print!("{}", render_reconciliation_text(&facts));
+        print!("{}", render_set_aside_findings_text(&set_aside));
         print!("{}", render_planning_doc_text(&doc_findings));
         print!("{}", render_stray_process_text(&stray_findings));
         print!(
@@ -5852,6 +5858,8 @@ fn check_sync_done(project_root: &Path) -> Check {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Severity {
     Ok,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Info,
     Warn,
     Problem,
 }
@@ -5860,6 +5868,7 @@ impl Severity {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Severity::Ok => "ok",
+            Severity::Info => "info",
             Severity::Warn => "warn",
             Severity::Problem => "problem",
         }
@@ -6359,6 +6368,29 @@ fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     }]
 }
 
+/// RED stub.
+fn set_aside_answer_findings(
+    _project_root: &Path,
+    _answers: &[devflow_core::gates::QuarantinedAnswer],
+) -> Vec<PhaseFinding> {
+    Vec::new()
+}
+
+/// RED stub.
+fn render_set_aside_findings_text(_findings: &[PhaseFinding]) -> String {
+    String::new()
+}
+
+/// RED stub.
+fn render_set_aside_findings_json(_findings: &[PhaseFinding]) -> serde_json::Value {
+    serde_json::Value::Array(Vec::new())
+}
+
+/// RED stub.
+fn render_set_aside_answers(_answers: &[devflow_core::gates::QuarantinedAnswer]) -> Option<String> {
+    None
+}
+
 /// Build `doctor`'s per-phase reconciliation section (after the existing
 /// tool/env checks), read-only: it never writes state or calls
 /// `events::emit`, `Gates::close`/`Gates::open_gate`, or any `recover::clean*`
@@ -6463,13 +6495,14 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// 50-12 adds `"orphan_supervisors"` (the socket sweep's findings) and
 /// `"orphan_supervisor_sweep_error"` (`null`, or why the socket directory
 /// could not be listed, so an empty array is never mistaken for a clean
-/// sweep).
+/// sweep). D-05 adds `"set_aside_gate_answers"`, an empty array when there are none.
 fn doctor_json_body(
     checks: &[Check],
     facts: &[PhaseFacts],
     doc_findings: &[PlanningDocFinding],
     stray_findings: &[StrayProcessFinding],
     (orphans, sweep_unlistable): (&[OrphanSupervisorFinding], Option<&str>),
+    set_aside: &[PhaseFinding],
 ) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
@@ -6478,6 +6511,7 @@ fn doctor_json_body(
         "stray_processes": render_stray_process_findings_json(stray_findings),
         "orphan_supervisors": render_orphan_supervisors_json(orphans),
         "orphan_supervisor_sweep_error": sweep_unlistable,
+        "set_aside_gate_answers": render_set_aside_findings_json(set_aside),
     })
 }
 
@@ -8743,6 +8777,94 @@ mod tests {
         assert_eq!(quarantined[0].label, g1.as_str());
         assert!(!Gates::answer_path(root, phase, stage, &g1).exists());
         registration.finish();
+    }
+
+    /// D-05: a set-aside answer is reported per phase by `status` and `doctor`, and nothing
+    /// is said when there is none. `status` names the full path; `doctor`'s findings name it
+    /// from the project root, because they never carry a username (T-18-01).
+    #[test]
+    fn status_and_doctor_list_quarantined_gate_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(7);
+        let doctor_json = |findings: &[PhaseFinding]| {
+            doctor_json_body(&[], &[], &[], &[], (&[], None), findings)["set_aside_gate_answers"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        let none = Gates::quarantined(root);
+        assert_eq!(render_set_aside_answers(&none), None);
+        let no_findings = set_aside_answer_findings(root, &none);
+        assert!(no_findings.is_empty());
+        assert_eq!(render_set_aside_findings_text(&no_findings), "");
+        assert_eq!(doctor_json(&no_findings), Vec::<serde_json::Value>::new());
+
+        let opened = Gates::open_gate(root, phase, Stage::Code, "ctx").unwrap();
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: None,
+        };
+        Gates::answer(root, phase, Stage::Code, &opened.gate_id, &response).unwrap();
+        Gates::close(root, phase, Stage::Code).unwrap();
+        // A legacy unkeyed answer: the form that names no gate.
+        std::fs::write(
+            Gates::dir(root).join(format!("{}-plan.response.json", phase.padded())),
+            serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap();
+        Gates::close(root, phase, Stage::Plan).unwrap();
+        let answers = Gates::quarantined(root);
+        let mut labels: Vec<&str> = answers.iter().map(|a| a.label.as_str()).collect();
+        labels.sort_unstable();
+        let mut expected = vec![opened.gate_id.as_str(), "noid"];
+        expected.sort_unstable();
+        assert_eq!(labels, expected, "one for a gate id, one with none");
+
+        let block = render_set_aside_answers(&answers).expect("two answers are listed");
+        assert!(block.starts_with("set-aside gate answers:"), "{block}");
+        assert!(block.contains("phase 7:"), "{block}");
+        for answer in &answers {
+            assert!(
+                block.contains(&format!("{}", answer.path.display())),
+                "{block}"
+            );
+        }
+
+        let findings = set_aside_answer_findings(root, &answers);
+        assert_eq!(findings.len(), 2);
+        let root_text = root.display().to_string();
+        let text = render_set_aside_findings_text(&findings);
+        assert!(text.contains("set-aside gate answers:"), "{text}");
+        let json = doctor_json(&findings);
+        assert_eq!(json.len(), 2, "{json:?}");
+        for (index, answer) in answers.iter().enumerate() {
+            let relative = answer
+                .path
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string();
+            let finding = &findings[index];
+            assert_eq!(finding.phase, phase);
+            assert_eq!(finding.severity, Severity::Info);
+            assert!(finding.detail.contains(&relative), "{}", finding.detail);
+            assert!(!finding.detail.contains(&root_text), "{}", finding.detail);
+            assert!(text.contains(&relative), "{text}");
+            assert_eq!(
+                finding.repair.as_deref(),
+                Some("inspect it; answer the live gate with `devflow gate approve|reject`")
+            );
+            assert_eq!(json[index]["severity"], "info");
+            assert_eq!(json[index]["phase"], serde_json::json!(phase));
+            assert!(
+                json[index]["detail"].as_str().unwrap().contains(&relative),
+                "{json:?}"
+            );
+        }
+        assert!(!text.contains(&root_text), "{text}");
     }
 
     /// The doctor check's rendering maps the `pi list` capability probe onto a
@@ -11536,7 +11658,7 @@ mod tests {
                 text.contains("could not be listed") && text.contains(&why),
                 "{text}"
             );
-            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)));
+            let body = doctor_json_body(&[], &[], &[], &[], (&[], Some(&why)), &[]);
             assert_eq!(body["orphan_supervisor_sweep_error"], why.as_str());
         }
 
@@ -12120,7 +12242,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None));
+            let body = doctor_json_body(&checks, &facts, &[], &[], (&[], None), &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -12149,8 +12271,8 @@ mod tests {
             );
             assert_eq!(
                 reparsed.as_object().unwrap().len(),
-                6,
-                "doctor --json must have exactly six top-level keys: {reparsed}"
+                7,
+                "doctor --json must have exactly seven top-level keys: {reparsed}"
             );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
@@ -12325,9 +12447,9 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None));
+            let body = doctor_json_body(&checks, &facts, &[], &stray_findings, (&[], None), &[]);
             let obj = body.as_object().unwrap();
-            assert_eq!(obj.len(), 6, "must be exactly six top-level keys: {body}");
+            assert_eq!(obj.len(), 7, "must be exactly seven top-level keys: {body}");
             assert!(obj.contains_key("stray_processes"));
             let strays = obj["stray_processes"].as_array().unwrap();
             assert_eq!(strays.len(), 1);
@@ -13066,13 +13188,14 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None));
+            let body = doctor_json_body(&checks, &facts, &doc_findings, &[], (&[], None), &[]);
             let obj = body.as_object().unwrap();
             assert_eq!(
                 obj.len(),
-                6,
+                7,
                 "must be exactly {{environment, reconciliation, planning_doc_staleness, \
-                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error}}: {body}"
+                 stray_processes, orphan_supervisors, orphan_supervisor_sweep_error, \
+                 set_aside_gate_answers}}: {body}"
             );
             assert!(obj.contains_key("environment"));
             assert!(obj.contains_key("reconciliation"));
