@@ -81,3 +81,14 @@
   **Effect:** a wrong line and event on a run that is about to ask again. No answer is applied or lost by it. Case 2's wording is the one that could mislead an operator about a merge.
   **Why deferred:** the plan says to raise a counter-example and not to work around it, and these files are not 50.1-23's.
   **Settled (orchestrator, wave 17):** the three cases stay, because each is a claim the run cannot classify and the rerun asks again either way. `resume` now says only what is known: "claimed, with no record that it was applied", and at Ship that a merge, version bump or tag may already have run. The event name `resume_found_unapplied_answer` stays, meaning that record is missing. 50.1-25 documents this wording.
+
+- A `stopped` flag written to disk during a gate wait does not stop the run (found during 50.1-24, carried over from 50.1-10)
+  status: open
+  **What:** the supervisor's safe points read its stop token, not the state's `stopped` field. Measured with a temporary test on a real supervisor parked at a failed Define gate: writing `stopped = true` through `update_state`, then approving the gate. The answer was applied and the stage was launched again (`stage_launched` twice, no `advance_stopped`), so a new agent ran under a state that reads `stopped`. The exit file was absent, because the launch archived it. 50.1-10 predicted the next advance refuses; that last step was not measured here.
+  **Reach:** by reading, `devflow stop` does not produce this against a live waiter: arm 1 answers the gate with an abort, and the socket and holder arms set the token or the holder's flag. A flag written by hand, or by a path added later, would. No fix is proposed here.
+  **Why deferred:** 50.1-24's reporting covers the token path only (see its SUMMARY). This needs a ruling on whether a safe point should also read the state.
+
+- `stop` over a live pid in the agent pid file cannot record `stopped` until that pid ends (found during 50.1-24, by plan)
+  status: open, by plan
+  **What:** D-19's no-holder branch uses 50.1-18's `live_phase_agent`, whose second source is the agent pid file. A pid reused by an unrelated process satisfies it, so `stop` exits non-zero with the `ps` check, and keeps doing so while that process lives. The launch guard already refuses `start` and `resume` on the same predicate. The operator's way out is to end the process or remove the pid file; the line does not name the second.
+  **Why deferred:** the plan specifies this source, and wording of 50.1-18's shared line is not this plan's to change. 50.1-25's docs should name the case.
