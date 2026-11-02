@@ -210,8 +210,10 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
 }
 
 /// The fail-safe counterpart: a gate younger than the threshold is left
-/// completely untouched by an invoked sweep — no response file, no state
-/// change.
+/// completely untouched by an invoked sweep, even with a live waiter the sweep
+/// would otherwise answer. The second sweep is the control: with the age limit
+/// at zero the same gate is reaped, so the first sweep's silence came from the
+/// age and from nothing else.
 #[test]
 fn sweep_leaves_a_fresh_gate_untouched() {
     let home = common::HermeticHome::new();
@@ -220,20 +222,26 @@ fn sweep_leaves_a_fresh_gate_untouched() {
     let phase = PhaseId::new(92);
     let stage = Stage::Validate;
 
-    // Freshly written — `unix_now()`'s age is ~0s, well under the 6h default.
-    Gates::write_gate(root, phase, stage, "review gaps").unwrap();
+    // Freshly written, so its age is about 0 s, and the registration stays held: only
+    // the age filter stands between this gate and a reap.
+    let (_, registration) = Gates::open_registered(root, phase, stage, "review gaps").unwrap();
 
-    let output = common::hermetic_devflow(&home)
-        .args(["gate", "sweep", "--root"])
-        .arg(root)
-        .output()
-        .expect("run devflow gate sweep");
-    assert!(
-        output.status.success(),
-        "devflow gate sweep failed\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let sweep = |extra: &[&str]| {
+        let output = common::hermetic_devflow(&home)
+            .args(["gate", "sweep", "--root"])
+            .arg(root)
+            .args(extra)
+            .output()
+            .expect("run devflow gate sweep");
+        assert!(
+            output.status.success(),
+            "devflow gate sweep failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    sweep(&[]);
 
     let open = Gates::list_open(root);
     assert_eq!(
@@ -247,6 +255,14 @@ fn sweep_leaves_a_fresh_gate_untouched() {
         gate_answer_files(root, phase, stage).is_empty(),
         "a fresh gate must get no response file at all"
     );
+
+    sweep(&["--max-age-secs", "0"]);
+    assert_eq!(
+        gate_answer_files(root, phase, stage).len(),
+        1,
+        "the control: with no age limit the same gate and waiter are reaped"
+    );
+    registration.finish();
 }
 
 /// CLI discoverability: `--max-age-secs` and `--dry-run` must be documented
