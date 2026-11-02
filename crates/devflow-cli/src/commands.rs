@@ -6232,7 +6232,7 @@ pub(crate) struct OrphanSupervisorFinding {
 /// Every ALIVE or STALE supervisor socket under `cache_dir` that nothing
 /// claims (50-12, D-06): (1) this root's sockets whose phase has no loadable
 /// state, or whose state records no supervisor or another launch
-/// (superseded); (2) machine-wide, sockets whose sidecar names a project
+/// (superseded) and does not name it as pending; (2) machine-wide, sockets whose sidecar names a project
 /// root that no longer exists (the 999.44 deleted-root class the 2.x `/proc`
 /// census used to cover); (3) (R5-I3) sockets of this root whose sidecar is
 /// missing or does not parse, attributed by file name through
@@ -6344,7 +6344,9 @@ impl OrphanReason {
 }
 
 /// Whether this root's state for `phase` claims `launch_id`; the reason
-/// when it does not. Reads the state file only.
+/// when it does not. A launch the state names as pending is claimed, since it may
+/// be the next stage's supervisor before its promotion (D-01). Reads the state file
+/// only.
 fn unclaimed_by_state(
     project_root: &Path,
     phase: PhaseId,
@@ -6353,6 +6355,14 @@ fn unclaimed_by_state(
     match workflow::load_state(project_root, phase) {
         Err(workflow::WorkflowError::MissingState(_)) => Some(OrphanReason::NoState),
         Err(_) => Some(OrphanReason::StateUnloadable),
+        Ok(state)
+            if state
+                .pending_supervisor
+                .as_ref()
+                .is_some_and(|pending| pending.launch_id == launch_id) =>
+        {
+            None
+        }
         Ok(state) => match state.supervisor {
             None => Some(OrphanReason::NoRecord),
             Some(record) if record.launch_id != launch_id => Some(OrphanReason::Superseded),
