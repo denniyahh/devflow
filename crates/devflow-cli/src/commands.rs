@@ -15269,6 +15269,141 @@ mod tests {
         );
     }
 
+    /// A signalled launcher's child half: hold the phase, and with `pending` the launch's
+    /// liveness lock too, with no D-18 handler, so the signal ends this process.
+    fn hold_as_a_launcher_child(phase: PhaseId, pending: bool) {
+        let root = holder_child_root();
+        let _holder = liveness::claim_phase_holder(&root, phase).unwrap();
+        let _pending = pending.then(|| {
+            liveness::Hold::take(&liveness::launch_liveness_path(&root, PENDING_LAUNCH).unwrap())
+                .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        panic!("the launcher child was never signalled");
+    }
+
+    /// This test binary re-run on `name`, once it holds the phase and `liveness_path` reads
+    /// live, whoever holds that.
+    fn spawn_launcher_child(
+        name: &str,
+        root: &Path,
+        phase: PhaseId,
+        liveness_path: &Path,
+    ) -> std::process::Child {
+        let path_dir = tempfile::tempdir().unwrap();
+        let mut child = devflow_core::test_support::spawn_test_in_child(
+            name,
+            path_dir.path(),
+            &[(HOLDER_ROOT_ENV, root.as_os_str())],
+        );
+        let holder_path = liveness::phase_holder_path(root, phase);
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while !matches!(liveness::live_holder(&holder_path), Ok(Some((pid, _))) if pid == child.id())
+            || !matches!(liveness::probe(liveness_path), Ok(liveness::Held::Live))
+        {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!(
+                    "the launcher child never got ready: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child
+    }
+
+    /// D-02, D-18: a signalled launcher that exits within `stop`'s wait leaves its
+    /// reservation abandoned, so `stop` clears it and records the stop itself.
+    #[test]
+    fn stop_records_the_stop_when_a_signalled_launcher_exits_within_the_wait() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str = "commands::tests::stop_records_the_stop_when_a_signalled_launcher_exits_within_the_wait";
+        let phase = PhaseId::new(2912);
+        if devflow_core::test_support::in_child_test(NAME) {
+            hold_as_a_launcher_child(phase, true);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state_with_pending(root, phase, false);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        let mut child = spawn_launcher_child(NAME, root, phase, &liveness_path);
+
+        let result = stop_with_an_empty_cache(root, phase);
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+
+        result.unwrap_or_else(|err| panic!("the launcher exited, so this is a stop: {err}"));
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the launcher was signalled"
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.pending_supervisor, None, "its reservation is cleared");
+        assert!(!liveness_path.exists(), "and its liveness file removed");
+        assert!(after.stopped, "the stop is recorded");
+        assert!(
+            after
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("devflow stop")),
+            "by `stop`: {:?}",
+            after.stop_reason
+        );
+    }
+
+    /// D-02: if the launch's lock outlives the signalled launcher, a supervisor it spawned
+    /// holds it, so `stop` claims no stop and writes nothing.
+    #[test]
+    fn stop_claims_no_stop_when_a_launch_outlives_its_signalled_launcher() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "commands::tests::stop_claims_no_stop_when_a_launch_outlives_its_signalled_launcher";
+        let phase = PhaseId::new(2913);
+        if devflow_core::test_support::in_child_test(NAME) {
+            hold_as_a_launcher_child(phase, false);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = state_with_pending(root, phase, false);
+        let _hold = hold_pending(&state);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        let mut child = spawn_launcher_child(NAME, root, phase, &liveness_path);
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let result = stop_with_an_empty_cache(root, phase);
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+
+        let error = result.expect_err("a live launch is no stop").to_string();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the launcher was signalled"
+        );
+        assert!(error.contains("still holds its liveness lock"), "{error}");
+        assert!(error.contains(PENDING_LAUNCH), "{error}");
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+    }
+
     /// D-18: over a missing state, a signalled holder ended its run on its own, which is
     /// not "already stopped". With nothing signalled, the line is today's.
     #[test]
