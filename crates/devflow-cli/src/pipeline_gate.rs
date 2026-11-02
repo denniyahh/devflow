@@ -22,8 +22,8 @@
 use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::{
-    ADVANCE_STOP_REASON, GateWaitEnd, clear_run_state, close_gate, commit, fenced, is_not_owner,
-    launch_stage,
+    ADVANCE_STOP_REASON, GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded,
+    fenced, is_not_owner, launch_stage,
 };
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{
@@ -95,6 +95,7 @@ pub(crate) fn transition(
         return Ok(());
     }
 
+    ensure_still_recorded(project_root, state.phase)?;
     let _ = run_checkout_hooks(
         project_root,
         state,
@@ -261,6 +262,7 @@ pub(crate) fn finish_workflow_with_gate_timeout(
         )));
     }
     loop {
+        ensure_still_recorded(project_root, state.phase)?;
         if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
             break;
         }
