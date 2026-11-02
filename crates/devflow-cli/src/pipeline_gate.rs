@@ -249,21 +249,26 @@ pub(crate) fn finish_workflow_with_gate_timeout(
 ) -> Result<(), CliError> {
     #[cfg(test)]
     crate::pipeline_launch::test_hold("before_finalization");
-    // Safe point 6 (CR-01, 50-REVIEW.md): a stop taken during the advance
-    // after the Ship gate was answered is honoured before the merge, version
-    // bump, tag and push. The consumed approval is cleared with it, so a
-    // resumed run asks again. Outside a supervisor's advance (the foreground
-    // `ship_override`) no stop token is engaged, and the holder's stop flag decides
-    // (D-18). Once this has passed, the pass runs every hook to the end.
-    if crate::pipeline_launch::stop_requested_at_safe_point() {
-        let _ = close_gate(project_root, state.phase, Stage::Ship);
-        crate::pipeline_launch::record_advance_stop(state, 6)?;
-        return Err(CliError::Message(format!(
-            "finalization did not run: {}",
-            crate::pipeline_launch::safe_point_stop_reason()
-        )));
-    }
     loop {
+        // Safe point 6 (CR-01, 50-REVIEW.md; D-13 item 7), before every pass: a stop taken
+        // during the advance after the Ship gate was answered, or during a retry after its
+        // gate was answered, is honoured before the merge, version bump, tag and push. The
+        // consumed approval is cleared with it, so a
+        // resumed run asks again. Outside a supervisor's advance (the foreground
+        // `ship_override`) no stop token is engaged, and the holder's stop flag decides
+        // (D-18).
+        //
+        // This is the last point a stop lands before finalization, and the only stop check
+        // around a pass (D-18). Once a pass starts every hook runs to the end: a failed
+        // pass's retry gate honours the stop at safe point 4, and a successful pass ships.
+        if crate::pipeline_launch::stop_requested_at_safe_point() {
+            let _ = close_gate(project_root, state.phase, Stage::Ship);
+            crate::pipeline_launch::record_advance_stop(state, 6)?;
+            return Err(CliError::Message(format!(
+                "finalization did not run: {}",
+                crate::pipeline_launch::safe_point_stop_reason()
+            )));
+        }
         ensure_still_recorded(project_root, state.phase)?;
         if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
             break;
