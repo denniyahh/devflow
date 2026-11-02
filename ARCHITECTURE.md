@@ -173,7 +173,10 @@ gate wait (D-08):
   `flock` taken for one read-modify-write of the state file, so it is short:
   usually milliseconds. A stalled gate lock or a socket dying mid-ping can stretch
   it to about 10 s in a gate answer, 13 s while `recover` decides a phase and 16 s
-  in a reservation. The file is never replaced or removed, because a `flock`
+  in a reservation that loads a state. The 16 s is counted from the code's timeouts,
+  not measured: two socket probes at 8 s, or a 6 s probe that finds a dead group, the
+  2 s wait for a supervisor exiting, then an 8 s probe. A missing or unloadable state
+  instead probes each socket left for the phase, up to 8 s each. The file is never replaced or removed, because a `flock`
   belongs to an inode. Repair verbs (`devflow stop`, `devflow recover --clean`)
   wait at most `WRITE_LOCK_REPAIR_WAIT` (10 s), then name the holder and write
   nothing, so a hold that long costs them a refusal, not a hang.
