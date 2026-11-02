@@ -4136,7 +4136,7 @@ fn agent_refusal_guidance(phase: PhaseId, verb: LaunchVerb, pid: u32) -> String 
 }
 
 /// Read the launched agent PID the monitor recorded for `phase`, if present.
-fn agent_pid_from_file(project_root: &Path, phase: PhaseId) -> Option<u32> {
+pub(crate) fn agent_pid_from_file(project_root: &Path, phase: PhaseId) -> Option<u32> {
     let path = agent_result::agent_pid_path(project_root, phase);
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
