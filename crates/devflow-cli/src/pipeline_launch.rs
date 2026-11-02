@@ -1110,6 +1110,14 @@ pub(crate) fn fenced<T>(
     }
 }
 
+/// Refuse with `NotOwner` a supervisor the state no longer records, before a side effect
+/// the fence cannot hold its lock across (D-08), such as a checkout hook that merges, tags
+/// and pushes. A check, not a fence: a supersession landing after it is not seen until the
+/// next fenced step. It writes nothing, and passes outside a supervisor's advance.
+pub(crate) fn ensure_still_recorded(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
+    fenced(project_root, phase, || Ok(()))
+}
+
 /// `Gates::close` under the ownership fence ([`fenced`], and its non-reentrancy rule: this
 /// must not be called inside a state-write or `while_owner` closure). `commands::start`
 /// keeps its direct `Gates::close`: it runs before any supervisor exists.
@@ -11210,6 +11218,58 @@ mod tests {
             poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)
                 && probes_gone(&pending.socket_path)),
             "N and its unpublished next both exit: {}",
+            run.events()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
+        superseded_event(&run, X, "superseded");
+    }
+
+    /// D-03: a hook can merge, bump, tag and push, so a supervisor the state no longer
+    /// records does not start one. Superseded at the last hold before finalization, it
+    /// ships nothing and keeps the feature branch.
+    #[test]
+    fn a_superseded_supervisor_runs_no_finalization_hooks() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_superseded_supervisor_runs_no_finalization_hooks";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_finalization"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        const X: &str = "aaaa0000aaaa1915";
+        let phase = PhaseId::new(1915);
+        let branch = format!("feature/phase-{}", phase.padded());
+        let run = HandoffRun::launch_with(phase, |root, state| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(["branch", &branch, "develop"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            state.stage = Stage::Ship;
+            state.yes_ship = true;
+            state.stop_until = None;
+        });
+        run.go();
+        run.wait_held();
+        supersede(&run.root, run.phase, X);
+        let path = workflow::state_path(&run.root, run.phase);
+        let before = std::fs::read(&path).unwrap();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || probes_gone(&run.n.socket_path)),
+            "it exits: {}",
+            run.events()
+        );
+        assert!(
+            branch_exists(&run.root, &branch),
+            "no after-ship hook ran: the feature branch is kept: {}",
+            run.events()
+        );
+        assert!(
+            events_named(&run.root, "workflow_shipped").is_empty(),
+            "{}",
             run.events()
         );
         assert_eq!(std::fs::read(&path).unwrap(), before, "no state write");
