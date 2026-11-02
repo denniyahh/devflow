@@ -261,7 +261,14 @@ written durably):
   — an answer set aside rather than consumed or deleted (`Gates::quarantined()`):
   a missing or other id, an unparsable body, a legacy unkeyed
   `{phase:02}-{stage}.response.json`, or one left unused when its gate closed. It
-  stays until removed by hand.
+  stays until removed by hand, and `devflow status`, `devflow doctor` and
+  `devflow recover --clean` list it.
+
+`devflow gate approve|reject` answer the gate open now, or with `--gate-id <ID>`
+the one `gate list` or `gate show` displayed, and first move aside an answer in
+that gate's own slot that does not bind to it, so a refused answer never blocks a
+valid one. A hand-written answer copies `gate_id` from the gate file into the keyed
+path and body.
 
 `run_gate()` (`crates/devflow-cli/src/pipeline_gate.rs`) writes the gate,
 fires the notify hook (`fire_gate_notify()` — runs `$DEVFLOW_GATE_NOTIFY_CMD`
