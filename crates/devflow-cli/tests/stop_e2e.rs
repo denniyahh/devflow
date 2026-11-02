@@ -89,6 +89,19 @@ fn e2e_child_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// `pid`'s start time, read once it is readable: a freshly forked child may not have
+/// exec'd yet (999.47).
+fn wait_for_start_time(pid: u32) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(start) = devflow_core::agent::process_start_time(pid) {
+            return start;
+        }
+        assert!(Instant::now() < deadline, "no start time for pid {pid}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn write_live_lock(root: &Path, phase: PhaseId, child: &Child, recorded_start: u64) {
     let lock = root
         .join(".devflow")
@@ -97,20 +110,81 @@ fn write_live_lock(root: &Path, phase: PhaseId, child: &Child, recorded_start: u
     std::fs::write(lock, format!("{}\n{recorded_start}", child.id())).unwrap();
 }
 
+/// Hold `phase`'s holder file in this test process, its record naming `pid`. The record
+/// is rewritten through a separate truncating open, never the hold's own descriptor, whose
+/// offset sits past the claim's record. Bind the hold to a named local: `_` drops it.
+fn hold_phase_with_record(
+    root: &Path,
+    phase: PhaseId,
+    pid: u32,
+    start: Option<u64>,
+) -> devflow_core::liveness::Hold {
+    let hold = devflow_core::liveness::claim_phase_holder(root, phase).unwrap();
+    let record = match start {
+        Some(start) => format!("{pid} {start}\n"),
+        None => format!("{pid}\n"),
+    };
+    std::fs::write(
+        devflow_core::liveness::phase_holder_path(root, phase),
+        record,
+    )
+    .unwrap();
+    hold
+}
+
+/// Carries the fixture's project root to a holder child. Not a DevFlow setting.
+const HOLDER_ROOT_ENV: &str = "P50_1_29_ROOT";
+
+/// The child half of a test whose holder claims the file itself: claim, deliberately with
+/// no D-18 handler, so this models a holder the signal ends, and wait to be signalled.
+fn hold_the_phase_as_a_child(phase: PhaseId) {
+    let root = PathBuf::from(std::env::var_os(HOLDER_ROOT_ENV).expect("the parent sets the root"));
+    let _hold = devflow_core::liveness::claim_phase_holder(&root, phase).unwrap();
+    std::thread::sleep(Duration::from_secs(60));
+    panic!("the holder child was never signalled");
+}
+
+/// This test binary re-run on `test_name`, once the holder names it.
+fn spawn_holder_child(test_name: &str, root: &Path, phase: PhaseId) -> Child {
+    let path_dir = tempfile::tempdir().unwrap();
+    let mut child = devflow_core::test_support::spawn_test_in_child(
+        test_name,
+        path_dir.path(),
+        &[(HOLDER_ROOT_ENV, root.as_os_str())],
+    );
+    let holder_path = devflow_core::liveness::phase_holder_path(root, phase);
+    let named = |pid: u32| {
+        devflow_core::liveness::live_holder(&holder_path)
+            .ok()
+            .flatten()
+            .is_some_and(|(holder, _)| holder == pid)
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !named(child.id()) {
+        if Instant::now() > deadline {
+            common::kill_and_reap(&mut child);
+            panic!("the holder child never claimed the phase");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
 #[test]
-fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
+fn stop_marks_stopped_after_the_signalled_holder_exits() {
+    use std::os::unix::process::ExitStatusExt;
+    const NAME: &str = "stop_marks_stopped_after_the_signalled_holder_exits";
+    let phase = PhaseId::new(103);
+    if devflow_core::test_support::in_child_test(NAME) {
+        hold_the_phase_as_a_child(phase);
+        return;
+    }
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = PhaseId::new(103);
     let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     devflow_core::workflow::save_state(&state).unwrap();
-    let mut holder = Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn holder");
-    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
-    write_live_lock(root, phase, &holder, start);
+    let mut holder = spawn_holder_child(NAME, root, phase);
 
     let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -122,7 +196,11 @@ fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
         "stop failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!holder.wait().expect("reap holder").success());
+    assert_eq!(
+        holder.wait().expect("reap holder").signal(),
+        Some(libc::SIGTERM),
+        "the signal ends a holder with no handler"
+    );
     let state = devflow_core::workflow::load_state(root, phase).unwrap();
     assert!(state.stopped);
     assert!(
@@ -134,7 +212,7 @@ fn stop_marks_stopped_after_the_signalled_lock_holder_exits() {
 }
 
 #[test]
-fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
+fn stop_writes_no_state_while_the_holder_survives_the_signal() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -157,7 +235,7 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
     .expect("read the holder's ready line");
     assert_eq!(ready, "ready\n");
     let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
-    write_live_lock(root, phase, &holder, start);
+    let _hold = hold_phase_with_record(root, phase, holder.id(), Some(start));
 
     let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -171,7 +249,9 @@ fn stop_writes_no_state_while_the_lock_holder_survives_the_signal() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&holder.id().to_string()) && stderr.contains("not marked"));
+    assert!(stderr.contains(&holder.id().to_string()), "{stderr}");
+    assert!(stderr.contains("not marked"), "{stderr}");
+    assert!(stderr.contains("next safe point"), "{stderr}");
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
     assert!(holder.try_wait().expect("poll holder").is_none());
     common::kill_and_reap(&mut holder);
@@ -232,7 +312,7 @@ fn stop_never_signals_a_recorded_pid_it_addresses_the_socket() {
 }
 
 #[test]
-fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
+fn stop_refuses_to_signal_a_holder_whose_start_time_does_not_match() {
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -245,9 +325,8 @@ fn stop_refuses_to_signal_a_lock_holder_whose_start_time_does_not_match() {
         .arg("60")
         .spawn()
         .expect("spawn holder");
-    let wrong_start =
-        devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
-    write_live_lock(root, phase, &holder, wrong_start);
+    let wrong_start = wait_for_start_time(holder.id()) + 1;
+    let _hold = hold_phase_with_record(root, phase, holder.id(), Some(wrong_start));
 
     let output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", &phase.to_string(), "--root"])
@@ -294,9 +373,9 @@ fn stop_at_a_ship_gate_with_a_recycled_holder_refuses_without_writing_a_response
     state.gate_pending = true;
     devflow_core::workflow::save_state(&state).unwrap();
     let before = std::fs::read(&state_path).unwrap();
-    let wrong_start =
-        devflow_core::agent::process_start_time(holder.id()).expect("holder start time") + 1;
+    let wrong_start = wait_for_start_time(holder.id()) + 1;
     write_live_lock(root, phase, &holder, wrong_start);
+    let _hold = hold_phase_with_record(root, phase, holder.id(), Some(wrong_start));
     Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
 
     let output = common::hermetic_devflow(&home)
@@ -346,6 +425,7 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
         .join(".devflow")
         .join(format!("lock-{}", phase.padded()));
     std::fs::write(lock, holder.id().to_string()).unwrap();
+    let _hold = hold_phase_with_record(root, phase, holder.id(), None);
     Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
 
     let output = common::hermetic_devflow(&home)
@@ -386,21 +466,22 @@ fn stop_at_a_gate_with_an_unconfirmable_holder_refuses_unevidenced_success() {
 /// writing an abort response and reporting an unevidenced successful stop.
 #[test]
 fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
+    use std::os::unix::process::ExitStatusExt;
+    const NAME: &str = "stop_does_not_treat_a_stale_gate_as_the_live_holders_wait";
+    let phase = PhaseId::new(112);
+    if devflow_core::test_support::in_child_test(NAME) {
+        hold_the_phase_as_a_child(phase);
+        return;
+    }
     let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = PhaseId::new(112);
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stage = Stage::Code;
     state.gate_pending = false;
     devflow_core::workflow::save_state(&state).unwrap();
 
-    let mut holder = Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn live non-waiting holder");
-    let start = devflow_core::agent::process_start_time(holder.id()).expect("holder start time");
-    write_live_lock(root, phase, &holder, start);
+    let mut holder = spawn_holder_child(NAME, root, phase);
     Gates::write_gate(root, phase, Stage::Code, "stale request").unwrap();
 
     let output = common::hermetic_devflow(&home)
@@ -414,11 +495,23 @@ fn stop_does_not_treat_a_stale_gate_as_the_live_holders_wait() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let Some(status) = holder.try_wait().expect("poll holder") else {
-        common::kill_and_reap(&mut holder);
-        panic!("stop must signal the live holder instead of trusting the stale gate");
+    // `stop` saw the holder's lock released, which comes just before its exit status.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = holder.try_wait().expect("poll holder") {
+            break status;
+        }
+        if Instant::now() > deadline {
+            common::kill_and_reap(&mut holder);
+            panic!("stop must signal the live holder instead of trusting the stale gate");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(!status.success(), "SIGTERM must end the live holder");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "SIGTERM must end the live holder"
+    );
     assert!(
         gate_answer_files(root, phase, Stage::Code).is_empty(),
         "a stale gate must not receive a response"

@@ -7386,10 +7386,22 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
         Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
+        // Not the test process: a broken identity check signals this child, not the runner.
+        let (mut holder, holder_start) = sleep_child_with_start();
+        let _hold = hold_phase_with_record(root, phase, holder.id(), Some(holder_start + 1));
         // A recycled pid is an unrelated process, not Ship's manual-recovery
         // no-holder case. `stop` must not leave it an abort response that no
         // legitimate waiter can consume.
-        let err = stop(root, phase).unwrap_err().to_string();
+        let result = stop(root, phase);
+        let holder_alive = devflow_core::test_support::process_is_live(holder.id());
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            holder_alive,
+            "the recycled record's process is not signalled"
+        );
+        assert!(!err.contains("is waiting on the gate"), "{err}");
         assert!(
             err.contains("refusing to signal") && err.contains("recycled"),
             "{err}"
@@ -7449,7 +7461,15 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, pid.to_string()).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
-        let error = stop(root, phase).unwrap_err().to_string();
+        // Not the test process: a broken identity check signals this child, not the runner.
+        let (mut holder, _) = sleep_child_with_start();
+        let _hold = hold_phase_with_record(root, phase, holder.id(), None);
+        let result = stop(root, phase);
+        let holder_alive = devflow_core::test_support::process_is_live(holder.id());
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let error = result.unwrap_err().to_string();
+        assert!(holder_alive, "a record with no start time signals nothing");
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
         assert!(error.contains("refusing to signal"), "{error}");
         let message =
@@ -9259,11 +9279,8 @@ mod tests {
     /// requires `/proc/uptime` or `sysconf(_SC_CLK_TCK)` to fail while
     /// `/proc/<pid>/stat` succeeds for the SAME live pid — a combination
     /// no black-box process fixture in this suite can construct without
-    /// faking `/proc`. Left uncovered by assertion, following this file's
-    /// own established precedent for an unreachable-by-black-box-test
-    /// match arm (`stop_via_lock`'s wildcard arm, documented above this
-    /// test group rather than faked). Covered by source reasoning
-    /// instead: `reap_stray_candidates`'s age check —
+    /// faking `/proc`. Left uncovered by assertion rather than faked. Covered
+    /// by source reasoning instead: `reap_stray_candidates`'s age check —
     /// `agent::process_age(candidate.pid).is_some_and(|age| age >= min_age)`
     /// — treats `None` as `false` by construction of `Option::is_some_and`,
     /// so an unresolvable age can never accidentally satisfy the `>=`
@@ -9369,204 +9386,110 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Retargeted (999.47/D-13). This test used to spawn a real `sleep`
-    /// child and assert `stop()` refused to signal it, instrumented with
-    /// the now-deprecated cmdline-basename predicate and a page of
-    /// `/proc`-forensics helpers built to diagnose a CI flake
-    /// ("MECHANISM CONFIRMED 2026-07-26": between `spawn()` returning and
-    /// the child completing `execve`, its cmdline transiently reads as its
-    /// parent's, which is what made a cmdline-based guard race). It is the
-    /// serious one of 999.47's two tests: in CI it panicked on the error
-    /// expectation, meaning the identity guard passed and `devflow stop`
-    /// sent `SIGTERM` to an unrelated process — the guard's stated purpose
-    /// failing end-to-end, not merely inferred.
+    /// V-30: a held record with no start time cannot be confirmed, so `stop` refuses and
+    /// signals nothing. `(pid, starttime)` is the guard because a cmdline check races a
+    /// forked child that has not finished `execve` (999.47/D-13). The child is a real,
+    /// live `sleep`, so a `stop` that signalled it would be seen.
     ///
-    /// The retarget removes the race by construction rather than making it
-    /// rarer: it asserts the `(pid, starttime)` guard `stop_via_lock`
-    /// ACTUALLY uses today (the deprecated predicate is no longer even
-    /// consulted for a decision — the cmdline-based mechanism it embodied
-    /// was superseded before this retarget, and D-13 records that
-    /// tightening it further to a single argv position was considered and
-    /// rejected as ineffective, since the breaking marker sits inside the
-    /// same inherited data). A LEGACY lock file — recording a pid with no
-    /// start time at all, the format every lock file had before identity
-    /// recording existed — must be refused, because identity cannot be
-    /// confirmed for it. Uses this test's own pid, which is genuinely alive
-    /// throughout, so there is no `spawn()` and therefore no `execve` to
-    /// race.
-    ///
-    /// This is one of `stop_via_lock`'s three fail-closed match arms. The
-    /// other two:
-    /// - a recorded start time that no longer matches — covered
-    ///   deterministically, no-spawn, by
-    ///   `stop_refuses_when_the_recorded_start_time_does_not_match` below.
-    /// - the match's final wildcard arm ("the lock file's holder could not
-    ///   be read back for identity confirmation") — NOT exercised by any
-    ///   test in this file. Source analysis: by the time `stop_via_lock`
-    ///   reaches this match, `lock::holder()` has already confirmed this
-    ///   SAME lock file's first line parses as a pid, via the identical
-    ///   `read_holder_pid` helper `lock::holder_identity` calls again
-    ///   moments later over UNCHANGED file content — so `holder_identity`'s
-    ///   `recorded_pid` is guaranteed to equal the pid already in hand, and
-    ///   its `Option<u64>` half is caught by the `Some((_, None))` arm
-    ///   whenever it's absent. The wildcard arm is reachable only if the
-    ///   lock file's content changes between those two sequential reads —
-    ///   a genuine external race that no deterministic black-box test of
-    ///   `stop()` can construct without reintroducing exactly the class of
-    ///   flake this retarget exists to remove. Recorded here rather than
-    ///   faked with a timing-dependent fixture.
+    /// This is one of `stop_via_holder`'s three fail-closed arms. The others:
+    /// - a recorded start time that no longer matches, covered by
+    ///   `stop_e2e::stop_refuses_to_signal_a_holder_whose_start_time_does_not_match`.
+    /// - a held record that does not read. `liveness::live_holder` returns `InvalidData`
+    ///   for an empty record, which a reader racing the rewrite can get, so that arm is
+    ///   reachable from a black box and the second half here reaches it.
     #[test]
-    fn stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check() {
+    fn stop_refuses_a_holder_record_with_no_start_time() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(200);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        ))
+        .unwrap();
+        let (mut child, _) = sleep_child_with_start();
+        let pid = child.id();
+        let hold = hold_phase_with_record(root, phase, pid, None);
 
-        // Our own pid is genuinely alive throughout — no spawn, so no
-        // execve to race. The lock records ONLY the pid, matching every
-        // lock file written before start times were recorded (999.47).
-        let pid = std::process::id();
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, pid.to_string()).unwrap();
-
-        // Confirm the fixture is genuinely the legacy shape this test
-        // exercises — `lock::holder_identity` (what `stop_via_lock` itself
-        // consults) must report the pid with NO recorded start time, the
-        // exact input that drives `stop_via_lock`'s `Some((_, None))` arm.
-        assert_eq!(
-            lock::holder_identity(root, phase),
-            Some((pid, None)),
-            "the fixture must be a legacy lock (pid recorded, no start time) — the shape \
-             stop_via_lock's identity guard treats as unconfirmable"
-        );
-
-        let err = stop_with_an_empty_cache(root, phase)
-            .expect_err("a legacy lock with no recorded start time must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains(&pid.to_string()),
-            "error must name the pid it refused to signal, got: {message}"
-        );
-        assert!(
-            message.contains("records no start time"),
-            "error must say identity cannot be confirmed for a legacy lock, got: {message}"
-        );
-        assert!(
-            lock_path.exists(),
-            "the lock file must be untouched — stop must not signal anything"
-        );
-    }
-
-    /// 999.47: a lock recording a start time that does not match the live
-    /// process must be refused. This is the pid-recycling case — the lock
-    /// named pid N, N died, and something unrelated now holds it.
-    ///
-    /// Unlike the cmdline check this replaced, the verdict does not depend
-    /// on what the process *looks* like, so a `sleep` and a real devflow
-    /// binary are rejected identically.
-    #[test]
-    fn stop_refuses_when_the_recorded_start_time_does_not_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(201);
-
-        // Our own pid is genuinely alive and genuinely devflow-named, so the
-        // old cmdline check would have happily signalled it. Only the start
-        // time distinguishes "this process" from "whatever holds this pid".
-        let pid = std::process::id();
-        let real_start = devflow_core::agent::process_start_time(pid)
-            .expect("read our own start time from /proc");
-        let wrong_start = real_start + 1;
-
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
-
-        let err = stop_with_an_empty_cache(root, phase)
-            .expect_err("a start-time mismatch must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains(&pid.to_string()),
-            "error must name the pid it refused to signal, got: {message}"
-        );
-        assert!(
-            message.contains("not the process that took the lock"),
-            "error must say the identity did not match, got: {message}"
-        );
-        assert!(
-            lock_path.exists(),
-            "the lock file must be untouched — stop must not signal anything"
-        );
-    }
-
-    /// The positive case: when the lock's recorded identity matches the live
-    /// process, `stop` proceeds. Without this, the refusal test above would
-    /// pass equally well against a `stop` that refused unconditionally.
-    #[test]
-    fn stop_signals_the_holder_when_the_recorded_identity_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(202);
-
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let child_pid = child.id();
-
-        // Record the child's OWN identity — the honest case, where the lock
-        // holder really is the process named. Poll for the start time: a
-        // freshly forked child may not have exec'd yet (999.47).
-        let mut child_start = None;
-        for _ in 0..100 {
-            child_start = devflow_core::agent::process_start_time(child_pid);
-            if child_start.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let child_start = child_start.expect("read the child's start time");
-
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
-
-        let result = stop_with_an_empty_cache(root, phase);
-
+        let no_start = stop_with_an_empty_cache(root, phase);
+        let live_after_no_start = devflow_core::test_support::process_is_live(pid);
+        std::fs::write(liveness::phase_holder_path(root, phase), "").unwrap();
+        let unreadable = stop_with_an_empty_cache(root, phase);
+        let live_after_unreadable = devflow_core::test_support::process_is_live(pid);
+        drop(hold);
         let _ = child.kill();
         let _ = child.wait();
 
+        let message = no_start.expect_err("no start time refuses").to_string();
         assert!(
-            result.is_ok(),
-            "a matching identity must be signalled, not refused: {result:?}"
+            message.contains(&pid.to_string()),
+            "names the pid: {message}"
+        );
+        assert!(message.contains("records no start time"), "{message}");
+        assert!(live_after_no_start, "the child is not signalled");
+        let message = unreadable.expect_err("an empty record refuses").to_string();
+        assert!(message.contains("could not be read back"), "{message}");
+        assert!(live_after_unreadable, "the child is not signalled");
+        assert!(
+            !workflow::load_state(root, phase).unwrap().stopped,
+            "the state is not marked stopped"
         );
     }
 
-    /// Task 2 behavior: a lock file naming a dead pid is stale — reclaimed
-    /// silently, never signalled, and never an error. An explicit state
-    /// file is present so this test exercises only the lock-fallback path
-    /// under test, not Task 3's separate missing-state tolerance.
+    /// V-30: with no process holding the file, nothing is signalled, even though the
+    /// record names a live process with its correct start time: the record a held file
+    /// would have `stop` signal. No file at all is the other case.
     #[test]
-    fn stop_is_a_success_no_op_when_the_lock_names_a_dead_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(202);
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        // Above default kernel pid_max — guaranteed not alive.
-        std::fs::write(&lock_path, "9999999").unwrap();
-        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        workflow::save_state(&state).unwrap();
+    fn stop_signals_nothing_when_no_process_holds_the_phase() {
+        const NAME: &str = "commands::tests::stop_signals_nothing_when_no_process_holds_the_phase";
+        // A released flock could still read held while another test forks.
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = tempfile::tempdir().unwrap();
+            let path = std::env::var_os("PATH").expect("PATH is set");
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("PATH", path.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        for planted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(202);
+            workflow::save_state(&State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Auto,
+                root.to_path_buf(),
+            ))
+            .unwrap();
+            let (mut child, start) = sleep_child_with_start();
+            let pid = child.id();
+            if planted {
+                drop(hold_phase_with_record(root, phase, pid, Some(start)));
+                assert_eq!(
+                    liveness::probe(&liveness::phase_holder_path(root, phase)).unwrap(),
+                    liveness::Held::Abandoned,
+                    "the file is there and unheld"
+                );
+            }
 
-        stop(root, phase).expect("stop against a stale lock must succeed, not error");
+            let result = stop_with_an_empty_cache(root, phase);
+            let child_alive = devflow_core::test_support::process_is_live(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+
+            result.unwrap_or_else(|err| panic!("planted={planted}: nothing to stop: {err}"));
+            assert!(child_alive, "planted={planted}: nothing is signalled");
+            assert!(
+                workflow::load_state(root, phase).unwrap().stopped,
+                "planted={planted}: `stopped` is recorded as today"
+            );
+        }
     }
 
     /// Task 3 behavior: no open gate, no lock file, and no persisted state
@@ -13028,39 +12951,21 @@ mod tests {
         );
     }
 
-    /// A `sleep` child recorded as the holder of `root`'s lock for `phase`,
-    /// with its own pid and start time: the identity `stop_via_lock`
-    /// signals. Returns the child and the lock file.
-    fn hold_lock_by_a_child(root: &Path, phase: PhaseId) -> (std::process::Child, PathBuf) {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let mut start = None;
-        for _ in 0..100 {
-            start = agent::process_start_time(pid);
-            if start.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let start = start.expect("read the child's start time");
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{padded}", padded = phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, format!("{pid}\n{start}")).unwrap();
-        (child, lock_path)
+    /// `root`'s holder file for `phase` held here, its record naming a `sleep` child with
+    /// its real pid and start time: the identity `stop_via_holder` would signal. Returns
+    /// the child and the hold.
+    fn hold_lock_by_a_child(root: &Path, phase: PhaseId) -> (std::process::Child, liveness::Hold) {
+        let (child, start) = sleep_child_with_start();
+        let hold = hold_phase_with_record(root, phase, child.id(), Some(start));
+        (child, hold)
     }
 
     /// `stop` during a `start` launcher's publish wait: the state loads but
     /// records no supervisor yet, the spawned supervisor already serves its
-    /// socket, and the launcher holds the lock. `stop` must end that
-    /// supervisor through its socket, not signal the launcher (which would
-    /// die and leave the supervisor and its agent running unrecorded). The
-    /// scripted supervisor drops the lock as it stops, as the launcher does
-    /// once its supervisor is gone.
+    /// socket, and the launcher holds the phase. `stop` must end that
+    /// supervisor through its socket, not signal the launcher. The scripted
+    /// supervisor drops the hold as it stops, as the launcher does once its
+    /// supervisor is gone.
     #[test]
     fn stop_ends_an_unrecorded_supervisor_through_its_socket_not_the_launcher() {
         let dir = tempfile::tempdir().unwrap();
@@ -13077,12 +12982,12 @@ mod tests {
         let launch_id = "aaaa0000aaaa1405";
         let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
             .expect("socket path fits sun_path");
-        let (mut launcher, lock_path) = hold_lock_by_a_child(&root, phase);
-        let released = lock_path.clone();
+        let (mut launcher, hold) = hold_lock_by_a_child(&root, phase);
+        let mut hold = Some(hold);
         let unrecorded =
             ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", {
                 move |_| {
-                    let _ = std::fs::remove_file(&released);
+                    drop(hold.take());
                     ShutdownScript {
                         lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
                         unlink_after: true,
@@ -13107,9 +13012,77 @@ mod tests {
         );
     }
 
+    /// D-18 (V-83): a socket stop is not a signalled holder. The launcher keeps its hold
+    /// for the whole `stop`, as one still in its publish wait does, and the run leaves no
+    /// state: `stop` neither waits on the holder nor calls its pid signalled. The planted
+    /// holder reads `Live` before and after, so a release wait could not have passed.
+    ///
+    /// Limit: an in-process test cannot read `stop`'s printed line. Which line prints is
+    /// pinned by `a_holder_that_ended_its_run_after_the_signal_is_not_reported_as_stopped`.
+    #[test]
+    fn a_supervisor_stopped_through_its_socket_is_never_reported_as_a_signalled_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1407);
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.clone(),
+        ))
+        .unwrap();
+        let (base, _sock) = stop_socket_dir();
+        let launch_id = "aaaa0000aaaa1407";
+        let socket = supervisor::SocketPath::for_launch(base.path(), &root, phase, launch_id)
+            .expect("socket path fits sun_path");
+        let (mut launcher, _hold) = hold_lock_by_a_child(&root, phase);
+        let holder_path = liveness::phase_holder_path(&root, phase);
+        assert_eq!(
+            liveness::probe(&holder_path).unwrap(),
+            liveness::Held::Live,
+            "the planted holder reads live before `stop`"
+        );
+        let unrecorded =
+            ScriptedSupervisor::serve(socket.as_path(), launch_id, phase, "agent_running", {
+                let root = root.clone();
+                move |_| {
+                    workflow::clear_state(&root, phase).expect("the run ends and leaves no state");
+                    ShutdownScript {
+                        lines: vec![ACCEPTED_LINE.to_string(), STOPPED_LINE.to_string()],
+                        unlink_after: true,
+                    }
+                }
+            });
+
+        let started = std::time::Instant::now();
+        let result = stop_in(&root, phase, Some(base.path()));
+        let elapsed = started.elapsed();
+        let launcher_alive = devflow_core::test_support::process_is_live(launcher.id());
+        let after = liveness::probe(&holder_path).unwrap();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+
+        result.unwrap_or_else(|err| panic!("after {elapsed:?}: {err}"));
+        assert!(
+            elapsed < agent::TERMINATE_VERIFY_WAIT,
+            "`stop` does not wait on a holder it did not signal: {elapsed:?}"
+        );
+        assert_eq!(unrecorded.shutdowns(), 1, "exactly one shutdown");
+        assert!(launcher_alive, "the launcher is never signalled");
+        assert_eq!(
+            after,
+            liveness::Held::Live,
+            "a holder wait would have bitten"
+        );
+        assert!(
+            !workflow::state_path(&root, phase).exists(),
+            "nothing is written over the cleared state"
+        );
+    }
+
     /// The several-sockets refusal also covers a loaded state with no
     /// record: with two live sockets for the phase, `stop` cannot tell which
-    /// is the run, so it asks neither and signals no lock holder.
+    /// is the run, so it asks neither and signals no holder.
     #[test]
     fn stop_refuses_several_unrecorded_sockets_and_signals_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -13134,7 +13107,7 @@ mod tests {
             })
         };
         let (a, b) = (serve("aaaa0000aaaa140a"), serve("aaaa0000aaaa140b"));
-        let (mut launcher, _lock_path) = hold_lock_by_a_child(&root, phase);
+        let (mut launcher, _hold) = hold_lock_by_a_child(&root, phase);
 
         let result = stop_in(&root, phase, Some(base.path()));
         let launcher_alive = launcher.try_wait().unwrap().is_none();
@@ -13148,7 +13121,7 @@ mod tests {
             "{text}"
         );
         assert_eq!((a.shutdowns(), b.shutdowns()), (0, 0), "neither is asked");
-        assert!(launcher_alive, "no lock holder is signalled");
+        assert!(launcher_alive, "no holder is signalled");
     }
 
     /// 50-15: the start/resume guard over a state file that will not load
@@ -14996,6 +14969,44 @@ mod tests {
                 let _ = child.wait();
             }
         }
+    }
+
+    /// A `sleep` child with its own start time, read once it is readable: a freshly forked
+    /// child may not have exec'd yet (999.47).
+    fn sleep_child_with_start() -> (std::process::Child, u64) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut start = None;
+        for _ in 0..100 {
+            start = agent::process_start_time(pid);
+            if start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (child, start.expect("read the child's start time"))
+    }
+
+    /// Hold `phase`'s holder file in this process, with its record naming `pid`. The
+    /// record is rewritten through a separate truncating open, never the hold's own
+    /// descriptor, whose offset sits past the claim's record. Bind the hold to a named
+    /// local: `_` would drop it at once.
+    fn hold_phase_with_record(
+        root: &Path,
+        phase: PhaseId,
+        pid: u32,
+        start: Option<u64>,
+    ) -> liveness::Hold {
+        let hold = liveness::claim_phase_holder(root, phase).unwrap();
+        let record = match start {
+            Some(start) => format!("{pid} {start}\n"),
+            None => format!("{pid}\n"),
+        };
+        std::fs::write(liveness::phase_holder_path(root, phase), record).unwrap();
+        hold
     }
 
     /// The `name` events of `root`'s event log, parsed.
