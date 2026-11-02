@@ -13159,9 +13159,28 @@ mod tests {
         Duration::from_secs(1) + devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(2)
     }
 
+    /// How long past a short absence a state that stays gone may leave the group running:
+    /// the watch's own bound on an absence (3 s, private to `monitor`), then one read and
+    /// the terminate wait.
+    const STATE_GONE_END_BOUND: Duration = Duration::from_secs(8);
+
     /// Assert the group ends within [`recorded_watch_end_bound`] and the supervisor exits.
     fn assert_group_ended_and_supervisor_gone(run: &HandoffRun, socket: &Path, pgid: u32) {
-        let bound = recorded_watch_end_bound();
+        assert_group_ended_and_supervisor_gone_within(
+            run,
+            socket,
+            pgid,
+            recorded_watch_end_bound(),
+        );
+    }
+
+    /// Assert the group ends within `bound` and the supervisor exits.
+    fn assert_group_ended_and_supervisor_gone_within(
+        run: &HandoffRun,
+        socket: &Path,
+        pgid: u32,
+        bound: Duration,
+    ) {
         assert!(
             poll_until(bound, || devflow_core::test_support::live_group_members(
                 pgid
@@ -13259,7 +13278,13 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
 
-        assert_group_ended_and_supervisor_gone(&run, &socket, pgid);
+        std::thread::sleep(SHORT_STATE_ABSENCE);
+        assert!(
+            !devflow_core::test_support::live_group_members(pgid).is_empty(),
+            "within the bound the agent still runs: {}",
+            run.events()
+        );
+        assert_group_ended_and_supervisor_gone_within(&run, &socket, pgid, STATE_GONE_END_BOUND);
         let events = events_named(&run.root, "supervisor_superseded");
         assert_eq!(events.len(), 1, "one event: {}", run.events());
         assert_eq!(events[0]["ours"], ours.as_str(), "{}", events[0]);
@@ -13272,6 +13297,63 @@ mod tests {
         assert_eq!(events[0]["reason"], "superseded", "{}", events[0]);
         assert_eq!(events[0]["agent_group"], "ended", "{}", events[0]);
         assert!(!path.exists(), "no state write");
+    }
+
+    /// Less than the watch's bound on a state file that stays absent, and longer than its
+    /// one-second read interval, so at least one read lands in the absence.
+    const SHORT_STATE_ABSENCE: Duration = Duration::from_millis(1500);
+
+    /// Move the state file away for [`SHORT_STATE_ABSENCE`], then put it back.
+    fn absent_for_a_moment(path: &Path) {
+        let away = path.with_extension("away");
+        std::fs::rename(path, &away).unwrap();
+        std::thread::sleep(SHORT_STATE_ABSENCE);
+        std::fs::rename(&away, path).unwrap();
+    }
+
+    /// Something that renames the state away and back during its own save reads as absent
+    /// for a moment. That says nothing about who owns the run, so the agent keeps running
+    /// and the run goes on. `a_state_gone_after_the_promotion_ends_the_agents_group` is the
+    /// control: the same absence, past the bound, ends the group.
+    #[test]
+    fn a_state_absent_for_a_moment_after_the_promotion_leaves_the_agent_running() {
+        const NAME: &str = "pipeline_launch::tests::a_state_absent_for_a_moment_after_the_promotion_leaves_the_agent_running";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1937));
+        let (_, _, pgid) = promoted_next(&run);
+
+        absent_for_a_moment(&workflow::state_path(&run.root, run.phase));
+        assert_agent_outlives_the_reads(&run, pgid);
+
+        assert_run_finishes_normally(&run);
+    }
+
+    /// The absence must persist across consecutive reads: a read that finds the state again
+    /// starts the count over, so two short absences never add up to the bound.
+    #[test]
+    fn a_state_seen_between_two_absences_starts_the_count_over() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_state_seen_between_two_absences_starts_the_count_over";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1938));
+        let (_, _, pgid) = promoted_next(&run);
+        let path = workflow::state_path(&run.root, run.phase);
+
+        absent_for_a_moment(&path);
+        // Longer than the read interval, so a read finds the state between the absences.
+        std::thread::sleep(Duration::from_millis(1200));
+        absent_for_a_moment(&path);
+        assert_agent_outlives_the_reads(&run, pgid);
+
+        assert_run_finishes_normally(&run);
     }
 
     /// A state that does not parse after the promotion says nothing about who owns the run,
