@@ -12,7 +12,7 @@
   **Why deferred:** the message is the only effect, nothing is signalled or written, and it needs two foreground commands racing inside 3 s. `signal_sent` is a bool by plan.
 
 - `liveness::tests::a_probe_in_flight_neither_reads_live_nor_fails_a_take` can fail under `cargo test` (found during 50.1-12)
-  status: open
+  status: resolved (f1b7859); see the entry below on reading a lock right after its release
   **What:** one `scripts/check.sh all` at `d6003e2` failed it at `liveness.rs:805`: `take the exclusive lock: "WouldBlock"`, right after the test dropped its own shared-lock handles.
   **Measured:** 1 failure in 3 `check.sh` runs, 0 in 5 `cargo test -p devflow-core --lib` runs. 50.1-12 changed no `devflow-core` file.
   **Likely cause, not tested:** another test's fork holding a duplicate descriptor of the lock file, the case 50.1-08 moved its lock tests into child processes for. If so, running this test in a child would fix it.
@@ -123,4 +123,10 @@
   **What changed:** the promotion watch reads the state once a second after `Recorded`, until the agent's exit is observed. A state naming another launch or none, or gone, ends the group and reports `Superseded`. A state that does not load, or names the launch only as pending, ends nothing and warns at most once a minute.
   **Also fixed:** `load_state` read a path it could not examine as `MissingState` (`Path::exists` hides the error), which would have ended a healthy agent. It now returns `Io`. Every other `load_state` caller sees that error too, in place of "no state".
   **Why only-pending ends nothing:** it still names this launch, so it is not a takeover. No production writer produces it after a promotion, and the fence refuses the supervisor's next write if the agent exits while it holds.
-  **Limits:** a state deleted or rewritten by anything outside DevFlow, such as a `git clean` in the project root, now ends a running agent within about 1 s. The tests write the takeover by hand; no production route to it was driven, and no live run has exercised this watch.
+  **Limits:** a state deleted or rewritten by anything outside DevFlow, such as a `git clean` in the project root, now ends a running agent within about 4 s (59c409d: the file must stay gone for 3 s, read once a second). The tests write the takeover by hand; no production route to it was driven, and no live run has exercised this watch.
+
+- `the_holder_stop_handler_...` read the main thread's signal mask instead of its own thread's
+  status: resolved (a6a3227)
+
+- A launch beside a supervisor exiting with its socket gone was refused, in the gap before its liveness lock is released
+  status: resolved (252739c)
