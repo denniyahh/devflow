@@ -34,7 +34,9 @@ use crate::preflight::{
     worktree_writable_roots,
 };
 use devflow_core::config::capture_retention;
-use devflow_core::gates::{AwaitOutcome, CloseReport, GateAction, GateAnswer, GateId, Gates};
+use devflow_core::gates::{
+    AwaitOutcome, ClaimedAnswer, CloseReport, GateAction, GateAnswer, GateId, Gates,
+};
 use devflow_core::mode::Mode;
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::phase_id::PhaseId;
@@ -2904,6 +2906,10 @@ pub(crate) fn handle_ambiguous_outcome(
 /// that check; see [`crate::commands::reserve_launch`]. A resume that fails, or
 /// returns without spawning from it, gives the reservation back. The phase's holder is
 /// claimed first (D-17), so a resume another foreground process refuses reserves nothing.
+///
+/// D-06: a rerun asks again. Before it relaunches, `resume` closes the phase's gates and
+/// reports each answer it set aside and each claimed answer it found unapplied
+/// ([`close_gates_for_resume`]). It never applies a pending answer to the rerun's gate.
 pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
@@ -2932,16 +2938,154 @@ pub(crate) fn resume(
     result
 }
 
-/// RED stub: every line `resume` prints about one closed stage.
-#[cfg(test)]
+/// The label field of a quarantine file's name, `NN-{stage}.{label}.{secs}.{pid}.{seq}.quarantined.json`.
+fn quarantine_file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+        .and_then(|(_, rest)| rest.split('.').nth(1))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// What `resume` says of a claimed answer it removed at the run's stage (R-02). The note
+/// is printed escaped, because an operator typed it and this goes to a terminal.
+fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
+    let gate_id = &claimed.gate_id;
+    let subject = match &claimed.answer {
+        None => format!("an answer of unknown content for the {stage} gate (gate {gate_id})"),
+        Some(answer) => {
+            let decision = if answer.response.approved {
+                "approved"
+            } else {
+                "rejected"
+            };
+            let note = answer
+                .response
+                .note
+                .as_ref()
+                .map_or_else(String::new, |note| format!(", note {note:?}"));
+            format!("an answer for the {stage} gate (gate {gate_id}: {decision}{note})")
+        }
+    };
+    format!(
+        "resume: {subject} was claimed but never applied — its consumer ended before recording \
+         it; the rerun asks again"
+    )
+}
+
+/// Every line `resume` prints about one stage it closed. `gate_id` is what the stage's gate
+/// file named before the close; a stage with no gate file names an answer by the
+/// quarantined file's own label.
+///
+/// `at_current_stage` is whether the run's state names this stage. A claimed pair there is
+/// an answer whose consumer ended before acting on it, whatever `gate_pending` reads: the
+/// consumer writes `gate_pending = false` before its caller acts (R2-05). A claimed pair at
+/// any other stage is the leftover of an answer the run acted on and moved past, so it gets
+/// no line here; `Gates::close` has logged its removal either way.
 fn resume_gate_lines(
-    _phase: PhaseId,
-    _stage: Stage,
-    _gate_id: Option<&str>,
-    _report: &CloseReport,
-    _at_current_stage: bool,
+    phase: PhaseId,
+    stage: Stage,
+    gate_id: Option<&str>,
+    report: &CloseReport,
+    at_current_stage: bool,
 ) -> Vec<String> {
-    Vec::new()
+    let mut lines: Vec<String> = report
+        .quarantined
+        .iter()
+        .map(|path| {
+            let label = gate_id.map_or_else(|| quarantine_file_label(path), str::to_string);
+            format!(
+                "resume: set aside an unused answer for the {stage} gate (gate {label}): {} — the \
+                 rerun asks again",
+                path.display()
+            )
+        })
+        .collect();
+    // The answer just set aside is out of `devflow ship`'s reach, so this names only what
+    // is left: the rerun's gate, and `devflow ship` for a later stored approval (D-06).
+    if stage == Stage::Ship && !report.quarantined.is_empty() {
+        lines.push(format!(
+            "resume: the rerun's Ship gate asks again — answer it with `devflow gate approve \
+             {phase} ship`; next time, to apply a stored Ship approval without a rerun, run \
+             `devflow ship --phase {phase}` instead of `resume`"
+        ));
+    }
+    if at_current_stage {
+        lines.extend(
+            report
+                .claimed
+                .iter()
+                .map(|claimed| unapplied_answer_line(stage, claimed)),
+        );
+    }
+    lines
+}
+
+/// Close every stage's gate of the phase `resume` is about to rerun, under one gate-lock
+/// acquisition, and return the lines that report it (D-06, R2-05). Every stage, not only
+/// those with a gate file: a pair can outlive its gate file, and it is still closed and
+/// reported. Each claimed answer at `current_stage` also leaves a
+/// `resume_found_unapplied_answer` event.
+///
+/// A close error is a warning, not a refusal: the rerun's own gate sets the answer aside
+/// when it opens, and what was closed before the error is still reported.
+fn close_gates_for_resume(
+    project_root: &Path,
+    phase: PhaseId,
+    current_stage: Stage,
+) -> Vec<String> {
+    // Read before the close, which removes the files that name them.
+    let gate_ids = [
+        Stage::Define,
+        Stage::Plan,
+        Stage::Code,
+        Stage::Validate,
+        Stage::Ship,
+    ]
+    .map(|stage| {
+        let gate_id = crate::commands::gate_file_id(project_root, phase, stage)
+            .ok()
+            .flatten();
+        (stage, gate_id)
+    });
+    let (reports, result) = Gates::close_phase(project_root, phase);
+    if let Err(err) = result {
+        eprintln!(
+            "warning: resume could not close every gate of phase {phase}: {err}; the rerun's \
+             own gate sets aside any answer left behind"
+        );
+    }
+    let mut lines = Vec::new();
+    for (stage, report) in &reports {
+        let gate_id = gate_ids
+            .iter()
+            .find(|(candidate, _)| candidate == stage)
+            .and_then(|(_, gate_id)| gate_id.as_deref());
+        let at_current_stage = *stage == current_stage;
+        lines.extend(resume_gate_lines(
+            phase,
+            *stage,
+            gate_id,
+            report,
+            at_current_stage,
+        ));
+        if at_current_stage {
+            for claimed in &report.claimed {
+                events::emit(
+                    project_root,
+                    phase,
+                    "resume_found_unapplied_answer",
+                    serde_json::json!({
+                        "stage": stage.to_string(),
+                        "gate_id": claimed.gate_id,
+                        "approved": claimed.answer.as_ref().map(|answer| answer.response.approved),
+                    }),
+                );
+            }
+        }
+    }
+    lines
 }
 
 /// [`resume`] after its reservation: `state` is the copy that wrote, which may already
@@ -3033,12 +3177,19 @@ fn resume_loaded(
     // later word on a stop that landed after this copy loaded, and a run launched
     // while still marked stopped could never advance.
     let legacy_claude_launch = state.legacy_claude_launch;
+    // D-06: the rerun asks again, so the gate this run abandons is closed before the
+    // relaunch and its unused answer set aside. After every refusal above, so a refused
+    // resume leaves the gate as it found it.
+    for line in close_gates_for_resume(project_root, phase, state.stage) {
+        println!("{line}");
+    }
     commit(&mut state, |s| {
         if s.stopped {
             s.stopped = false;
             s.stop_reason = None;
             s.stop_until = None;
         }
+        s.gate_pending = false;
         s.legacy_claude_launch = legacy_claude_launch;
     })?;
     match launch_stage(&mut state, None, None) {
@@ -4594,7 +4745,7 @@ mod tests {
         );
 
         let claimed = |answer| CloseReport {
-            claimed: vec![devflow_core::gates::ClaimedAnswer {
+            claimed: vec![ClaimedAnswer {
                 gate_id: "G1".to_string(),
                 answer,
             }],
