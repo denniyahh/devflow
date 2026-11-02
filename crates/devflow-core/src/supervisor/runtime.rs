@@ -1730,7 +1730,7 @@ mod tests {
 
     /// A supervisor served from this test process for an agent that is
     /// never signalled: its sidecar pgid is `0`, which `signal_group`
-    /// refuses, and no test here stops it in `AgentRunning`.
+    /// refuses, so a stop in `AgentRunning` reaches no process.
     fn in_process_supervisor(cache: &Path) -> (Supervisor, PathBuf) {
         let socket = SocketPath::for_launch(
             cache,
