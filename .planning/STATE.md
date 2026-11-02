@@ -93,7 +93,7 @@ See: `.planning/PROJECT.md` (updated 2026-09-23)
 
 **Core value:** `devflow start --phase N` and walk away — reliably drive the agent through the full
 pipeline, never silently corrupt state or lose a human's gate decision.
-**Current focus:** Phase 50.1 — Split-Lock State-Handling Overhaul (INSERTED)
+**Current focus:** Phase 51 — Rate-Limit Agent Failover
 
 ## Operator Next Steps
 
@@ -211,7 +211,7 @@ backlog, deferred-items.md #46-05-#2 (seven tracked plans fail the bashism scann
 by the scanner's staged-only scope.
 Last activity: 2026-11-02 — Phase 50.1 complete, transitioned to Phase 51
 
-Progress: [███████░░░] 71% (5 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
+Progress: [████████░░] 86% (6 of 7 phases complete in the ROADMAP progress table — 46, 47, 48, 49, 50, 50.1; 49.1 inserted and removed 2026-10-09; 50.1 inserted 2026-10-10. `roadmap.analyze` reports 2 because it reads 47 and 48 as executed, and `progress.bar` counts plans, 48/48)
 
 ## Recently Shipped
 

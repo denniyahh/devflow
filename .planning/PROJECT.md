@@ -615,6 +615,8 @@ Research skipped by operator decision — every item is a verified defect in thi
 known fix direction, and the #185 socket design is already spike-proven.*
 
 ---
+*Last updated: 2026-11-02 after Phase 50.1 (Split-Lock State-Handling Overhaul) — 30/30 plans; verification passed 12/12. Every state write takes one short lock and is durable, and a gate answer decides only the gate it names. SUPV-03, SUPV-04, SUPV-05, SURV-03 and SURV-04 validated. Live attempt 2 shipped on the final production source but was not unattended: the operator answered two extra Code gates. Backlog 999.172-177 holds what stays open, including 999.175 and 999.176, which can stop a headless run short of Ship.*
+
 *Last updated: 2026-10-09 after Phase 49 (Live Unattended Run) — 12/12 plans; verification passed
 5/5; VERIFY-01 moved to Validated with its closure limits. Review fixes during close-out reworked the
 gate-notify command (state file as the single source, operator decision) and removed a fixture branch
