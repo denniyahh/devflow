@@ -1378,6 +1378,25 @@ fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> S
     }
 }
 
+/// `status`'s lines about a phase's supervisor. 50-12: liveness comes from the
+/// recorded socket, never a pid. `status` speaks only about the operator's own
+/// project, so it names the socket path (doctor does not, T-18-01).
+fn status_supervisor_lines(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+    let socket = state.supervisor.as_ref().map_or_else(
+        || "none".to_string(),
+        |record| record.socket_path.display().to_string(),
+    );
+    vec![format!("  supervisor: {socket} — {}", liveness.describe())]
+}
+
+/// `status`'s repair lines for a phase.
+fn status_hint_lines(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+    recovery_hints(state, liveness)
+        .into_iter()
+        .map(|hint| format!("    → {hint}"))
+        .collect()
+}
+
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -1433,15 +1452,10 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 }
                 None => println!("  agent_pid: none"),
             }
-            // 50-12: liveness comes from the recorded socket, never a pid.
-            // `status` speaks only about the operator's own project, so it
-            // names the socket path (doctor does not, T-18-01).
             let phase_liveness = probe_phase(state);
-            let socket = state.supervisor.as_ref().map_or_else(
-                || "none".to_string(),
-                |record| record.socket_path.display().to_string(),
-            );
-            println!("  supervisor: {socket} — {}", phase_liveness.describe());
+            for line in status_supervisor_lines(state, &phase_liveness) {
+                println!("{line}");
+            }
             let phase_summary = last_events.remove(&state.phase);
             println!(
                 "{}",
@@ -1450,8 +1464,8 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                     phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
-            for hint in recovery_hints(state, &phase_liveness) {
-                println!("    → {hint}");
+            for line in status_hint_lines(state, &phase_liveness) {
+                println!("{line}");
             }
             if let Some(summary) = phase_summary {
                 let ago = summary
@@ -13627,5 +13641,106 @@ mod tests {
             std::fs::read(workflow::state_path(root, phase)).unwrap(),
             before
         );
+    }
+
+    // ---- 50.1-18: status, doctor and stop see the pending supervisor (D-02) ----
+
+    const PENDING_LAUNCH: &str = "bbbb0000bbbb5018";
+
+    /// A saved, not-stopped state naming `PENDING_LAUNCH` as pending, its socket never
+    /// published and its liveness file not yet created. With `recorded`, it also names
+    /// a supervisor whose socket does not exist (GONE).
+    fn state_with_pending(root: &Path, phase: PhaseId, recorded: bool) -> State {
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        if recorded {
+            state.supervisor = Some(SupervisorRecord::new(
+                root.join("gone.sock"),
+                "aaaa0000aaaa5018".to_string(),
+                1,
+                0,
+                "boot".to_string(),
+            ));
+        }
+        let liveness_path = liveness::launch_liveness_path(root, PENDING_LAUNCH).unwrap();
+        std::fs::create_dir_all(liveness_path.parent().unwrap()).unwrap();
+        state.pending_supervisor = Some(PendingSupervisor::new(
+            PENDING_LAUNCH.to_string(),
+            root.join("never-published.sock"),
+            liveness_path,
+        ));
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// Take the lock a live pending supervisor would hold.
+    fn hold_pending(state: &State) -> liveness::Hold {
+        let pending = state.pending_supervisor.as_ref().unwrap();
+        liveness::Hold::take(&pending.liveness_path).unwrap()
+    }
+
+    /// The lines `status` prints about `state`'s supervisor and its repair.
+    fn rendered_status(state: &State) -> String {
+        let phase_liveness = probe_phase(state);
+        let mut lines = status_supervisor_lines(state, &phase_liveness);
+        lines.extend(status_hint_lines(state, &phase_liveness));
+        lines.join("\n")
+    }
+
+    /// V-07 (criterion 2): while the pending supervisor's lock is held, `status` names
+    /// `stop` and never `resume`, whether the state records a GONE supervisor or none.
+    #[test]
+    fn status_names_stop_not_resume_for_a_live_pending_supervisor() {
+        for (case, recorded) in [("a GONE record", true), ("no record", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(5180);
+            let state = state_with_pending(dir.path(), phase, recorded);
+            let _hold = hold_pending(&state);
+
+            let phase_liveness = probe_phase(&state);
+            assert_eq!(phase_liveness.label(), "launch_pending", "{case}");
+            assert_eq!(
+                recovery_hints(&state, &phase_liveness),
+                vec![format!("devflow stop --phase {phase}")],
+                "{case}"
+            );
+            let rendered = rendered_status(&state);
+            assert!(
+                rendered.contains(&format!("devflow stop --phase {phase}")),
+                "{case}: {rendered}"
+            );
+            assert!(rendered.contains(PENDING_LAUNCH), "{case}: {rendered}");
+            assert!(!rendered.contains("devflow resume"), "{case}: {rendered}");
+        }
+    }
+
+    /// V-08, criterion 2's negative control: the same state once the pending
+    /// supervisor is gone (its lock released) suggests `resume` again and notes the
+    /// abandoned reservation.
+    #[test]
+    fn status_suggests_resume_once_the_pending_supervisor_is_gone() {
+        for (case, recorded) in [("a GONE record", true), ("no record", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let phase = PhaseId::new(5181);
+            let state = state_with_pending(dir.path(), phase, recorded);
+            drop(hold_pending(&state));
+
+            let phase_liveness = probe_phase(&state);
+            assert_eq!(phase_liveness, PhaseLiveness::GoneWhileActive, "{case}");
+            let resume = format!("devflow resume --phase {phase}");
+            assert_eq!(
+                recovery_hints(&state, &phase_liveness),
+                vec![resume.clone()],
+                "{case}"
+            );
+            let rendered = rendered_status(&state);
+            assert!(rendered.contains(&resume), "{case}: {rendered}");
+            assert!(rendered.contains(PENDING_LAUNCH), "{case}: {rendered}");
+            assert!(rendered.contains("abandoned"), "{case}: {rendered}");
+        }
     }
 }
