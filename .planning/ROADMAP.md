@@ -1031,6 +1031,18 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.175: An Approved Auto-Decided Checkpoint Can Still Park an Unattended Run at Ship (BACKLOG)
+
+**Found:** 2026-11-02, Phase 50.1's live attempt 1. Nothing in DevFlow failed; the gate fired as designed.
+
+**Defect:** with `--mode auto --yes-ship`, the operator approves the Code gate and DevFlow resumes the agent to decide a `blocking-human` checkpoint. That authority is told only to the resumed orchestrator: `checkpoint_auto_decide_prompt` says no human is coming and to use its judgment, and it does not say an operator approved. The executor and verifier see a plan requiring a human and no human answer. In this run the SUMMARY marked the decision `human_judgment: true`, the verifier wrote `human_needed`, and `/gsd-ship`, which allows only `passed`, refused. The run then waits at a failure gate whose choices are retry, loop back or abort; a retry alone would meet the same refusal (inferred, not run).
+
+**Why it is intermittent:** one judgment call decides it. The same payload shipped in Phase 49 attempt 3 and Phase 50 attempts 1 and 2. Phase 50 attempt 1's verifier wrote that the agent's choice "is not a human_needed item"; attempt 2's reviewers said it should be. That is 1 park in 4 runs, a small sample.
+
+**Not established:** whether GSD's rules got stricter. `~/.claude/gsd-core` was updated on 2026-11-01, after those runs, and none of them reached this refusal, so they cannot show the older behavior. The operator's global instructions also reach the agents in these runs, and the executor cited them, so they may shift the rate.
+
+**Fix shape (not tested):** carry the operator's approval into the resume prompt and have the agent record it as the authority for the decision, so the record is true and the verifier can see it, without routing around `/gsd-ship`. Name `/gsd-verify-work` in the gate's choices. The payload's facts stay the fixture's own, so a real project's unverifiable figures should still reach a human.
+
 ### Phase 999.173: A Ship Retry After a Restart Can Still Bump the Version Twice (BACKLOG)
 
 **Found:** 2026-11-02, external review of Phase 50.1; the in-process half fixed in `8c1dd3d`.

@@ -142,6 +142,8 @@ with tempfile.TemporaryDirectory() as tmp:
         ('control: merge onto main instead of integration refuses','merge','merged into integration'),
         ('control: absent ship snapshot refuses with ABSENT','ship','fork point is one value'),
         ('control: operator-answered ship gate refuses','answer','ship gate answered by --yes-ship'),
+        ('positive: an operator-answered failure gate before the --yes-ship one passes','retry',None),
+        ('control: a last ship gate answered by an operator refuses after an earlier --yes-ship one','retrylast','ship gate answered by --yes-ship'),
         ('positive: extra gate is a deviation not a failure','extra',None),
         ('pair passes','pair',None),
         ('control: differing binary sha refuses the pair','binary','same binary in both arms'),
@@ -174,6 +176,11 @@ with tempfile.TemporaryDirectory() as tmp:
         elif mutation=='ship': shutil.rmtree(ship)
         elif mutation=='answer':
             next(e for e in rows if e['event']=='gate_resolved' and e['stage']=='ship')['responded_by']='tester'
+        elif mutation in ['retry','retrylast']:
+            final=next(e for e in rows if e['event']=='gate_resolved' and e['stage']=='ship')
+            earlier='tester' if mutation=='retry' else '--yes-ship'
+            rows.insert(rows.index(final),{'event':'gate_resolved','phase':1,'stage':'ship','responded_by':earlier})
+            if mutation=='retrylast': final['responded_by']='tester'
         elif mutation=='extra': rows.insert(-1,{'event':'gate_fired','stage':'validate','phase':1})
         elif mutation=='binary': (copy/'negctl/bin_sha256').write_text('d'*64+'\n')
         elif mutation=='agree': (define/'devflow/state-01.json').write_text('{"base_branch":"develop"}')
@@ -382,8 +389,11 @@ def gate_order():
 def answers():
     resolved=phase_events('gate_resolved')
     for stage in ['define','code','ship']:
-        entry=next((e for _,e in resolved if e['stage']==stage),None)
-        if entry is None: raise KeyError(stage+' gate_resolved')
+        # Ship can fire a failure gate first, which an operator answers; the run
+        # ships through the last one, the only one `--yes-ship` may answer.
+        entries=[e for _,e in resolved if e['stage']==stage]
+        if not entries: raise KeyError(stage+' gate_resolved')
+        entry=entries[-1] if stage=='ship' else entries[0]
         if (entry['responded_by']=='--yes-ship') != (stage=='ship'): return False
     return True
 
