@@ -67,14 +67,14 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
     let agent_running = agent_pid_for(&state).is_some_and(crate::agent::agent_running);
     let is_stale = is_stale_state(&state);
     let age = format_age(state.started_at.as_str());
-    let _ = project_root;
+    let live = phase_may_be_live(project_root, &state);
 
     RecoveryStatus {
         state,
         agent_running,
         is_stale,
         age,
-        live: None,
+        live,
     }
 }
 
@@ -147,34 +147,60 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
             crate::lock::StaleLockRemovalOutcome::Failure(warning) => report.fail(warning),
         }
     }
-    // Drop cron records only for phases without surviving state, so a kept
-    // phase's pending re-run record is preserved.
+    sweep_orphan_cron_records(project_root, &mut report);
+    report.quarantined = crate::gates::Gates::quarantined(project_root)
+        .into_iter()
+        .map(|answer| answer.path)
+        .collect();
+    Ok(report)
+}
+
+/// Drop cron records only for phases without surviving state, so a kept phase's pending
+/// re-run record is preserved. A phase with a state file is skipped at the listing: that
+/// read can only keep. The deletion is decided on a fresh read under the write lock, so
+/// a run that reserved after the listing keeps its record (R2-07).
+fn sweep_orphan_cron_records(project_root: &Path, report: &mut CleanReport) {
     for instructions in crate::ship::list_cron_instructions(project_root) {
-        if workflow::state_path(project_root, instructions.phase).exists() {
+        let phase = instructions.phase;
+        if workflow::state_path(project_root, phase).exists() {
             continue;
         }
         #[cfg(test)]
-        recover_test_hook(RecoverPoint::CronListed, instructions.phase);
-        let (removed, result) = crate::ship::delete_cron_instructions_with_partial_result(
+        recover_test_hook(RecoverPoint::CronListed, phase);
+        let swept = workflow::clear_state_if(
             project_root,
-            instructions.phase,
+            phase,
+            Some(workflow::WRITE_LOCK_REPAIR_WAIT),
+            |existing| {
+                if matches!(existing, workflow::Existing::Missing) {
+                    remove_orphan_cron_record(project_root, phase, report);
+                }
+                Ok::<_, WorkflowError>(false)
+            },
+            || (),
         );
-        if removed {
-            report.orphan_cron_records_removed.push(instructions.phase);
-        }
-        if let Err(err) = result {
-            let partial = if removed {
-                " after removing its per-phase record"
-            } else {
-                ""
-            };
-            report.fail(format!(
-                "could not remove cron-instructions for phase {}{partial}: {err}",
-                instructions.phase,
-            ));
+        if let Err(err) = swept {
+            report_a_lock_failure(&format!("phase {phase}'s cron record"), err, report);
         }
     }
-    Ok(report)
+}
+
+fn remove_orphan_cron_record(project_root: &Path, phase: PhaseId, report: &mut CleanReport) {
+    let (removed, result) =
+        crate::ship::delete_cron_instructions_with_partial_result(project_root, phase);
+    if removed {
+        report.orphan_cron_records_removed.push(phase);
+    }
+    if let Err(err) = result {
+        let partial = if removed {
+            " after removing its per-phase record"
+        } else {
+            ""
+        };
+        report.fail(format!(
+            "could not remove cron-instructions for phase {phase}{partial}: {err}"
+        ));
+    }
 }
 
 /// Clear one listed phase if, on a fresh read under its write lock, it is stale and
@@ -512,10 +538,11 @@ fn recover_test_hook(point: RecoverPoint, phase: PhaseId) {
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
 /// escape hatch for a wedged-but-fresh run. Clears its state and cron
 /// record; warns (but proceeds) when the recorded agent still looks alive.
-/// Deletes nothing and returns [`RecoverError::Lock`] with
-/// [`crate::lock::LockError::Contended`] when the per-phase lock is live or
-/// contended, so a refused clean cannot read as a successful one. A removal
-/// that fails is among the warnings; [`clean_phase_report`] flags it.
+/// Keeps everything, and says why among the warnings, when its supervisor,
+/// pending supervisor, gate waiter or foreground holder may be live; returns
+/// [`RecoverError::Workflow`] with [`WorkflowError::WriteLockTimeout`], having
+/// removed nothing, when its write lock stays held. A removal that fails or a
+/// phase that was kept is among the warnings; [`clean_phase_report`] flags it.
 pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
     clean_phase_report(project_root, phase).map(|report| report.warnings)
 }
@@ -526,10 +553,11 @@ pub struct PhaseCleanReport {
     /// Whether this call removed any of the phase's state, gate files, cron
     /// record, or their orphaned write temps.
     pub removed_anything: bool,
-    /// Whether a removal failed. Each failure is also in `warnings`.
+    /// Whether a removal failed or the phase was kept as live. Each is also in
+    /// `warnings`.
     pub removal_failed: bool,
-    /// Removals that failed and agents that looked alive, in human-readable
-    /// form.
+    /// Removals that failed, phases kept as live and agents that looked alive,
+    /// in human-readable form.
     pub warnings: Vec<String>,
 }
 
@@ -538,25 +566,43 @@ pub struct PhaseCleanReport {
 /// clean" after deleting something (48-REVIEW WR-03). A failure stops the
 /// clean where it is: gate files that could not go keep the state that
 /// explains them, and state that could not go keeps its cron record.
+///
+/// The decision, the gate files, the state and the cron record share one hold of the
+/// write lock, on a fresh read (R-07, R2-07), so a `start` that reserves meanwhile loses
+/// nothing. Only the leftover `lock-*` files are swept outside it.
 pub fn clean_phase_report(
     project_root: &Path,
     phase: PhaseId,
 ) -> Result<PhaseCleanReport, RecoverError> {
-    let guard = crate::lock::acquire(project_root, phase)?;
     let mut report = PhaseCleanReport::default();
-    if let Ok(state) = workflow::load_state(project_root, phase) {
-        if let Some(reason) = phase_may_be_live(project_root, &state) {
-            report.fail(kept_as_live(&format!("phase {phase}"), phase, &reason));
-            return Ok(report);
-        }
-        if agent_pid_for(&state).is_some_and(crate::agent::agent_running) {
-            report.warnings.push(format!(
-                "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
-            ));
+    let cleared = workflow::clear_state_if(
+        project_root,
+        phase,
+        Some(workflow::WRITE_LOCK_REPAIR_WAIT),
+        |existing| {
+            Ok::<_, RecoverError>(explicit_decision(
+                project_root,
+                phase,
+                &existing,
+                &mut report,
+            ))
+        },
+        || crate::ship::delete_cron_instructions_with_partial_result(project_root, phase),
+    )?;
+    #[cfg(test)]
+    recover_test_hook(RecoverPoint::ExplicitClearReturned, phase);
+    report.removed_anything |= cleared.removed;
+    if let Err(err) = cleared.result {
+        report.fail(format!(
+            "kept phase {phase}'s cron record — could not clear its state: {err}"
+        ));
+    }
+    if let Some((cron_removed, cron_result)) = cleared.after {
+        report.removed_anything |= cron_removed;
+        if let Err(err) = cron_result {
+            report.fail(format!("could not remove cron-instructions: {err}"));
         }
     }
-    clean_phase_files(project_root, phase, &mut report);
-    drop(guard);
     for outcome in crate::lock::remove_stale_locks_with_outcomes(project_root) {
         match outcome {
             crate::lock::StaleLockRemovalOutcome::Notice(warning) => {
@@ -568,36 +614,41 @@ pub fn clean_phase_report(
     Ok(report)
 }
 
-fn clean_phase_files(project_root: &Path, phase: PhaseId, report: &mut PhaseCleanReport) {
+/// The explicit clean's decision: whether to clear the state, having removed the gate
+/// files if so. A phase with no state, or one that does not parse, still has its
+/// leftovers removed, unless a waiter or foreground holder may be live.
+fn explicit_decision(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: &workflow::Existing,
+    report: &mut PhaseCleanReport,
+) -> bool {
+    let live = match existing {
+        workflow::Existing::Loaded(fresh) => phase_may_be_live(project_root, fresh),
+        workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
+            phase_activity_may_be_live(project_root, phase)
+        }
+    };
+    if let Some(reason) = live {
+        report.fail(kept_as_live(&format!("phase {phase}"), phase, &reason));
+        return false;
+    }
+    if let workflow::Existing::Loaded(fresh) = existing
+        && agent_pid_for(fresh).is_some_and(crate::agent::agent_running)
+    {
+        report.warnings.push(format!(
+            "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
+        ));
+    }
     let (gates_removed, gate_result) = remove_gate_files(project_root, phase);
     report.removed_anything |= gates_removed;
-    match gate_result {
-        Ok(()) => {}
-        Err(err) => {
-            return report.fail(format!(
-                "kept phase {phase}'s state — could not remove all of its gate files: {err}"
-            ));
-        }
+    if let Err(err) = gate_result {
+        report.fail(format!(
+            "kept phase {phase}'s state — could not remove all of its gate files: {err}"
+        ));
+        return false;
     }
-    let (state_removed, state_result) =
-        workflow::clear_state_with_partial_result(project_root, phase);
-    report.removed_anything |= state_removed;
-    match state_result {
-        Ok(()) => {}
-        Err(err) => {
-            return report.fail(format!(
-                "kept phase {phase}'s cron record — could not clear its state: {err}"
-            ));
-        }
-    }
-    #[cfg(test)]
-    recover_test_hook(RecoverPoint::ExplicitClearReturned, phase);
-    let (cron_removed, cron_result) =
-        crate::ship::delete_cron_instructions_with_partial_result(project_root, phase);
-    report.removed_anything |= cron_removed;
-    if let Err(err) = cron_result {
-        report.fail(format!("could not remove cron-instructions: {err}"));
-    }
+    true
 }
 
 impl PhaseCleanReport {
@@ -735,13 +786,6 @@ mod tests {
             ]);
         }
         paths
-    }
-
-    fn artifact_bytes(paths: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        paths
-            .iter()
-            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
-            .collect()
     }
 
     #[test]
@@ -1218,7 +1262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cleaned_phase = PhaseId::new(65);
-        let stale_lock = crate::lock::lock_path(root, PhaseId::new(66));
+        let stale_lock = root.join(".devflow/lock-66");
         std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
         std::fs::write(&stale_lock, DEAD_PID.to_string()).unwrap();
         let coordination = stale_lock.with_file_name(format!(
@@ -1255,129 +1299,45 @@ mod tests {
     }
 
     #[test]
-    fn clean_phase_removes_gate_files_when_no_process_holds_the_lock() {
+    fn clean_phase_removes_gate_files_when_nothing_is_live() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(48);
         let paths = write_phase_artifacts(root, phase);
 
-        clean_phase(root, phase).expect("clean lock-free phase");
+        clean_phase(root, phase).expect("clean a phase with nothing live");
 
         for path in paths {
             assert!(
                 !path.exists(),
-                "cleaning a lock-free phase must remove {}",
+                "cleaning a phase with nothing live must remove {}",
                 path.display()
             );
         }
-        assert!(
-            !crate::lock::lock_path(root, phase).exists(),
-            "the cleanup lock must be dropped before stale-lock sweeping"
-        );
     }
 
+    /// An older binary's `lock-NN` means nothing now, whatever pid it names, so it
+    /// blocks no explicit clean. This one names a live pid with another start time.
     #[test]
-    fn clean_phase_returns_without_cleanup_while_the_per_phase_lock_is_contended() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(49);
-        let paths = write_phase_artifacts(root, phase);
-        let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
-        let lock_path = crate::lock::lock_path(root, phase);
-        let mut before = artifact_bytes(&paths);
-        before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
-
-        let err = clean_phase(root, phase).expect_err("a contended clean must be refused");
-
-        assert!(
-            matches!(
-                err,
-                RecoverError::Lock(crate::lock::LockError::Contended { .. })
-            ),
-            "contention must be reported as a lock refusal: {err:?}"
-        );
-        for (path, contents) in before {
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                contents,
-                "contention must leave {} byte-identical",
-                path.display()
-            );
-        }
-        drop(guard);
-    }
-
-    /// 999.128 (D-08): a lock whose recorded pid is alive with a different
-    /// start time names a holder that exited and whose pid was reused, so the
-    /// explicit clean reclaims it and cleans the phase.
-    #[test]
-    fn clean_phase_reclaims_a_recycled_pid_lock_and_cleans() {
+    fn a_leftover_recycled_pid_lock_file_does_not_block_an_explicit_clean() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(50);
         let paths = write_phase_artifacts(root, phase);
-        let lock_path = crate::lock::lock_path(root, phase);
         let observed =
             crate::agent::process_start_time(std::process::id()).expect("test pid start time");
         std::fs::write(
-            &lock_path,
+            root.join(format!(".devflow/lock-{}", phase.padded())),
             format!("{}\n{}", std::process::id(), observed + 1),
         )
         .unwrap();
-        assert!(matches!(
-            crate::lock::holder_status(root, phase),
-            crate::lock::HolderStatus::Recycled { .. }
-        ));
 
-        clean_phase(root, phase).expect("a recycled-pid lock must be reclaimed and cleaned");
+        clean_phase(root, phase).expect("a leftover lock file must not block the clean");
 
         for path in paths {
             assert!(
                 !path.exists(),
-                "cleaning at a recycled-pid lock must remove {}",
-                path.display()
-            );
-        }
-        assert!(
-            !lock_path.exists(),
-            "the reclaimed lock must be released when the clean's guard drops"
-        );
-    }
-
-    /// Control for the reclaim above: the same hand-written record with the
-    /// observed start time names this live process, so classification (not the
-    /// coordination flock — no guard is held here) must refuse the clean.
-    #[test]
-    fn clean_phase_refuses_a_live_pid_lock_and_cleans_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(50);
-        let paths = write_phase_artifacts(root, phase);
-        let lock_path = crate::lock::lock_path(root, phase);
-        let observed =
-            crate::agent::process_start_time(std::process::id()).expect("test pid start time");
-        std::fs::write(&lock_path, format!("{}\n{}", std::process::id(), observed)).unwrap();
-        assert!(matches!(
-            crate::lock::holder_status(root, phase),
-            crate::lock::HolderStatus::Live { .. }
-        ));
-        let mut before = artifact_bytes(&paths);
-        before.push((lock_path.clone(), std::fs::read(&lock_path).unwrap()));
-
-        let err = clean_phase(root, phase).expect_err("a live identity-matched lock must refuse");
-
-        assert!(
-            matches!(
-                err,
-                RecoverError::Lock(crate::lock::LockError::Contended { .. })
-            ),
-            "a live holder must be reported as a lock refusal: {err:?}"
-        );
-        for (path, contents) in before {
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                contents,
-                "a live-pid lock must preserve {}",
+                "cleaning past a leftover lock file must remove {}",
                 path.display()
             );
         }
@@ -1575,7 +1535,7 @@ mod tests {
     fn clean_report_flags_a_stale_lock_with_unusable_coordination() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let stale_lock = crate::lock::lock_path(root, PhaseId::new(67));
+        let stale_lock = root.join(".devflow/lock-67");
         std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
         std::fs::write(&stale_lock, DEAD_PID.to_string()).unwrap();
         let coordination = stale_lock.with_file_name(format!(
@@ -1617,7 +1577,7 @@ mod tests {
     fn clean_report_does_not_flag_a_live_stale_lock_notice_as_a_removal_failure() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let live_lock = crate::lock::lock_path(root, PhaseId::new(68));
+        let live_lock = root.join(".devflow/lock-68");
         std::fs::create_dir_all(live_lock.parent().unwrap()).unwrap();
         std::fs::write(&live_lock, std::process::id().to_string()).unwrap();
 

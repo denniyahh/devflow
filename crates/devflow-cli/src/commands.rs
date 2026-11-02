@@ -33,7 +33,6 @@ use devflow_core::gates::{
 use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
 use devflow_core::liveness;
-use devflow_core::lock;
 use devflow_core::mode::Mode;
 use devflow_core::monitor;
 use devflow_core::phase_id::PhaseId;
@@ -4889,24 +4888,14 @@ pub(crate) fn recover_cmd(
 ) -> Result<(), CliError> {
     if do_clean {
         match phase {
-            // Explicit phase: cleaned when its lock holder is dead or its pid
-            // was recycled (a live pid whose start time differs from the one
-            // recorded, 999.128). A live, identity-confirmed holder still
-            // refuses, so a wedged live run needs `devflow stop` first.
+            // Explicit phase: cleaned unless its supervisor, pending supervisor, gate
+            // waiter or foreground holder may be live, so a wedged live run needs
+            // `devflow stop` first. This guard is the one that can read a STALE socket
+            // through the backstop; `clean_phase_report` decides again under the write
+            // lock, with what is on disk by then.
             Some(phase) => {
                 refuse_a_live_supervisor(project_root, phase, registry::cache_dir().as_deref())?;
-                let report = match recover::clean_phase_report(project_root, phase) {
-                    Ok(report) => report,
-                    Err(recover::RecoverError::Lock(lock::LockError::Contended {
-                        pid, ..
-                    })) => {
-                        return Err(CliError::Message(format!(
-                            "phase {phase} is live or contended by pid {pid}; recover --clean \
-                             deleted neither state nor gate files — nothing was cleaned"
-                        )));
-                    }
-                    Err(err) => return Err(err.into()),
-                };
+                let report = recover::clean_phase_report(project_root, phase)?;
                 for warning in &report.warnings {
                     println!("warning: {warning}");
                 }
@@ -4967,6 +4956,12 @@ pub(crate) fn recover_cmd(
                 {
                     println!("no stale workflow state was cleaned");
                 }
+                if !report.quarantined.is_empty() {
+                    println!("set-aside gate answers kept (D-05; remove each by hand once read):");
+                    for path in &report.quarantined {
+                        println!("  {}", path.display());
+                    }
+                }
                 if report.removal_failed {
                     return Err(CliError::Message(
                         "recover --clean could not remove everything — see the warnings above"
@@ -5012,6 +5007,9 @@ pub(crate) fn recover_cmd(
                 }
             }
             None => println!("  agent_pid: none"),
+        }
+        if let Some(reason) = &status.live {
+            println!("  may be live: {reason}");
         }
         if status.is_stale {
             any_stale = true;
@@ -14164,6 +14162,42 @@ mod tests {
                 text.contains("recover --clean deleted nothing") && text.contains("probe failed"),
                 "{text}"
             );
+        }
+
+        /// 50.1-16: a pending supervisor holding its reservation, with no socket yet,
+        /// refuses `recover`. Control: released, the same call lets it through.
+        #[test]
+        fn recover_refuses_a_live_pending_supervisor() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(1604);
+            let id = "aaaa0000aaaa1604".to_string();
+            let liveness_path = root.join(format!(".devflow/supervisor-{id}.live"));
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.pending_supervisor = Some(PendingSupervisor::new(
+                id.clone(),
+                root.join("no-such.sock"),
+                liveness_path.clone(),
+            ));
+            workflow::save_state(&state).unwrap();
+            let hold = liveness::Hold::take(&liveness_path).unwrap();
+
+            let result = refuse_a_live_supervisor(root, phase, None);
+            let Err(CliError::Message(text)) = result else {
+                panic!("a live pending supervisor must refuse: {result:?}");
+            };
+            assert!(
+                text.contains("recover --clean deleted nothing") && text.contains(&id),
+                "{text}"
+            );
+
+            // A released flock can read held while another test's fork is before its exec.
+            drop(hold);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while let Err(error) = refuse_a_live_supervisor(root, phase, None) {
+                assert!(std::time::Instant::now() < deadline, "{error:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
 
         /// Controls: a GONE socket, and a STALE one whose group the backstop

@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+/// A lock file as an older binary left it, naming a pid that is not running.
+const DEAD_LOCK_HOLDER: &str = "2147483646";
+
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
         .args(args)
@@ -292,6 +295,12 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "unexpected output: {output_text}"
     );
 
+    let leftover_lock = root
+        .join(".devflow")
+        .join(format!("lock-{}", phase.padded()));
+    fs::write(&leftover_lock, DEAD_LOCK_HOLDER).unwrap();
+    assert!(leftover_lock.exists(), "precondition: the leftover lock");
+
     let recovery = common::hermetic_devflow(&home)
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
@@ -332,11 +341,8 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         "recovery must remove orphaned temporary files"
     );
     assert!(
-        !root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()))
-            .exists(),
-        "recovery must not leave its own lock behind"
+        !leftover_lock.exists(),
+        "recovery must remove a lock file an older binary left"
     );
 }
 
@@ -534,6 +540,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     let gates_dir = Gates::dir(root);
     let state_path = devflow_core::workflow::state_path(root, phase);
     let lock_path = devflow_dir.join(format!("lock-{}", phase.padded()));
+    fs::write(&lock_path, DEAD_LOCK_HOLDER).unwrap();
     let state_temp = devflow_dir.join(format!(
         ".{}.1.0.tmp",
         state_path.file_name().unwrap().to_string_lossy()
@@ -548,7 +555,13 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     fs::write(&state_temp, b"orphaned state write").unwrap();
     fs::write(&gate_temp, b"orphaned gate write").unwrap();
     let waiter_path = Gates::waiter_path(root, phase, Stage::Define, &gate_id);
-    for precondition in [&state_temp, &gate_temp, &state_path, &waiter_path] {
+    for precondition in [
+        &state_temp,
+        &gate_temp,
+        &state_path,
+        &waiter_path,
+        &lock_path,
+    ] {
         assert!(
             precondition.exists(),
             "precondition: {} must exist before recovery, or its removal proves nothing",
@@ -598,7 +611,7 @@ fn start_wedge_arm_interrupted_start_leaves_a_define_gate_nothing_answers() {
     }
     assert!(
         !lock_path.exists(),
-        "recovery must not leave lock-{} behind",
+        "recovery must remove the lock-{} an older binary left",
         phase.padded()
     );
 }

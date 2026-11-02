@@ -679,7 +679,6 @@ pub(crate) struct Cleared<A> {
     /// The removal's outcome; `Ok` when the decision kept the state.
     pub(crate) result: Result<(), WorkflowError>,
     /// `after_clear`'s value, when it ran.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) after: Option<A>,
 }
 
@@ -829,15 +828,6 @@ pub(crate) fn clear_state_if<E: From<WorkflowError>, A>(
         result,
         after,
     })
-}
-
-/// Clear state for recovery while retaining removals that happened before an
-/// error, including a failed orphaned-temp removal.
-pub(crate) fn clear_state_with_partial_result(
-    project_root: &Path,
-    phase: PhaseId,
-) -> (bool, Result<(), WorkflowError>) {
-    clear_state_with_partial_result_impl(project_root, phase, None, true, None)
 }
 
 fn clear_state_with_partial_result_impl(
