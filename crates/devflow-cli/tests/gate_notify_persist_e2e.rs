@@ -367,6 +367,7 @@ fn resume_with(notify: NotifyEnv<'_>) -> Option<String> {
     init_start_repo(root, phase);
     let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.gate_notify_cmd = Some("old".to_string());
+    state.verification_baseline_captured = true;
     devflow_core::workflow::save_state(&state).unwrap();
     let fake_bin = fake_bin_dir();
     let _reaper = MarkedReaper(root.to_string_lossy().into_owned());

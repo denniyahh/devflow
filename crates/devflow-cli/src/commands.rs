@@ -785,6 +785,38 @@ fn start_reserved(
     Ok(())
 }
 
+/// Whether `state` is only what a `start`'s reservation wrote: that `start` died before
+/// preparing the run, so no worktree was forked, no base resolved and none of its guards
+/// passed. Every prepared run captures its verification baseline in [`start_reserved`], and
+/// nothing resets it. `worktree_path` cannot say this, because `--no-worktree` leaves it
+/// `None` for a prepared run.
+pub(crate) fn run_never_prepared(state: &State) -> bool {
+    state.stage == Stage::Define && !state.verification_baseline_captured
+}
+
+/// The `start` that prepares what [`run_never_prepared`] says is missing.
+fn restart_verb(state: &State) -> String {
+    format!(
+        "devflow start --phase {} --agent {} --mode {}",
+        state.phase, state.agent, state.mode
+    )
+}
+
+/// `resume`'s and a hand-run `advance`'s refusal of a run [`run_never_prepared`] names.
+/// Launching it would run the agent in the primary checkout, on whatever branch is
+/// checked out.
+pub(crate) fn refuse_unprepared_run(state: &State) -> Result<(), CliError> {
+    if !run_never_prepared(state) {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "phase {phase}: its `devflow start` never finished preparing the run, so it has no \
+         worktree and nothing to continue; run `{verb}`",
+        phase = state.phase,
+        verb = restart_verb(state),
+    )))
+}
+
 /// Write a fresh run's state for `start`, under the write lock, over the state its
 /// reservation left. This is the one documented write of a whole state: it replaces
 /// what is on disk, keeping the reservation, and only while the state still names
@@ -1445,9 +1477,18 @@ fn probe_phase(state: &State) -> PhaseLiveness {
 /// failed probe names the socket to inspect. A live pending supervisor names only
 /// `devflow stop` (criterion 2). A stopped phase names `devflow resume`, since nothing
 /// else continues it; a phase that never launched and is not stopped names nothing, and
-/// neither does ALIVE.
+/// neither does ALIVE. A `start` that died before its run was prepared names `start`, as
+/// `resume` would refuse it ([`run_never_prepared`]).
 fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let phase = state.phase;
+    if run_never_prepared(state)
+        && matches!(
+            liveness,
+            PhaseLiveness::GoneWhileActive | PhaseLiveness::Gone | PhaseLiveness::NotLaunched
+        )
+    {
+        return vec![restart_verb(state)];
+    }
     match liveness {
         PhaseLiveness::LaunchPending { .. } => vec![format!("devflow stop --phase {phase}")],
         PhaseLiveness::Stale => vec![
@@ -6043,6 +6084,8 @@ pub(crate) struct PhaseFacts {
     /// marker instead of reporting a `Problem` (review: Codex HIGH — the
     /// doctor gap is bigger than `check_dead_agent` alone).
     pub(crate) stopped: bool,
+    /// The `start` to run instead of `resume` when [`run_never_prepared`] holds.
+    pub(crate) unprepared_restart: Option<String>,
     /// The pending launch's id and liveness, from `state.pending_supervisor`. The
     /// liveness is `LaunchPending` while it lives and a GONE state once abandoned.
     pub(crate) pending: Option<(String, PhaseLiveness)>,
@@ -6098,7 +6141,7 @@ fn repair_instead_of_resume(facts: &PhaseFacts, resume: String) -> String {
             format!("wait for its live supervisor, or `devflow stop --phase {phase}`")
         }
         (_, Some(agent)) => orphaned_agent_line(phase, agent),
-        _ => resume,
+        _ => facts.unprepared_restart.clone().unwrap_or(resume),
     }
 }
 
@@ -6389,6 +6432,7 @@ fn build_phase_facts(
 ) -> PhaseFacts {
     let phase = state.phase;
     let stopped = state.stopped;
+    let unprepared_restart = run_never_prepared(&state).then(|| restart_verb(&state));
     let (waiter, waiter_gate) = phase_gate_waiter(project_root, phase, open_gates);
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
@@ -6446,6 +6490,7 @@ fn build_phase_facts(
         open_gate_stages,
         feature_branch_exists,
         stopped,
+        unprepared_restart,
         pending,
         live_agent,
         write_lock,
@@ -11233,12 +11278,13 @@ mod tests {
     #[test]
     fn recovery_hints_includes_resume_for_gone_while_active() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(
+        let mut state = State::new(
             PhaseId::new(7),
             AgentKind::Claude,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
+        state.verification_baseline_captured = true;
 
         let hints = recovery_hints(&state, &PhaseLiveness::GoneWhileActive);
 
@@ -11340,12 +11386,13 @@ mod tests {
     #[test]
     fn recovery_hints_empty_for_alive_and_unlaunched() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(
+        let mut state = State::new(
             PhaseId::new(7),
             AgentKind::Claude,
             Mode::Auto,
             dir.path().to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         let alive = PhaseLiveness::Alive {
             owner: "agent_running".to_string(),
             launch: "stream".to_string(),
@@ -11370,6 +11417,7 @@ mod tests {
             Mode::Auto,
             dir.path().to_path_buf(),
         );
+        state.verification_baseline_captured = true;
         state.stopped = true;
 
         for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
@@ -12207,6 +12255,7 @@ mod tests {
                 last_event: Some("stage_launched".into()),
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
+                unprepared_restart: None,
                 feature_branch_exists: true,
                 stopped: false,
                 pending: None,
@@ -12427,6 +12476,7 @@ mod tests {
             let facts = PhaseFacts {
                 stage: Stage::Plan,
                 last_launched_stage: Some(Stage::Plan),
+                unprepared_restart: None,
                 feature_branch_exists: false,
                 ..agreeing_facts(PhaseId::new(6))
             };
@@ -12559,6 +12609,7 @@ mod tests {
                 supervisor: PhaseLiveness::GoneWhileActive,
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
+                unprepared_restart: None,
                 feature_branch_exists: false,
                 ..agreeing_facts(PhaseId::new(7))
             };
@@ -15692,6 +15743,136 @@ mod tests {
         assert_eq!(liveness_files(root), Vec::<String>::new());
     }
 
+    /// The state a `start` leaves when it is killed during preparation: its real
+    /// reservation, with the lock released as a dead process's is.
+    fn state_of_a_start_killed_during_preparation(root: &Path, phase: PhaseId) -> State {
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let cache = tempfile::tempdir().unwrap();
+        let reserved = reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            Some(cache.path()),
+        )
+        .unwrap();
+        reserved.reservation.discard();
+        workflow::load_state(root, phase).unwrap()
+    }
+
+    /// `resume` over a `start` killed during preparation refuses before anything is
+    /// written, and names `start`: the state has no worktree, so a launch would run the
+    /// agent in the primary checkout. Control: the same state once preparation has run
+    /// gets past the refusal to the agent binary check, so the refusal is about this
+    /// state and not about every `resume`.
+    #[test]
+    fn resume_refuses_a_start_killed_during_preparation() {
+        const NAME: &str = "commands::tests::resume_refuses_a_start_killed_during_preparation";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // No `claude` on this PATH, so a resume that gets past the refusal fails
+            // on the binary check and spawns nothing.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5301);
+        let killed = state_of_a_start_killed_during_preparation(root, phase);
+        assert!(killed.pending_supervisor.is_some(), "the start reserved");
+
+        let err = crate::pipeline_launch::resume(root, phase, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never finished preparing"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "devflow start --phase {phase} --agent claude --mode auto"
+            )),
+            "{err}"
+        );
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.stage, Stage::Define);
+        assert!(after.supervisor.is_none());
+        assert!(!after.stopped, "the refusal marks nothing");
+
+        let err = crate::pipeline_launch::advance_command(root, Some(phase), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never finished preparing"), "{err}");
+        assert_eq!(
+            workflow::load_state(root, phase).unwrap().stage,
+            Stage::Define,
+            "a hand-run advance launched nothing"
+        );
+
+        let prepared = PhaseId::new(5302);
+        let mut state = State::new(prepared, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.verification_baseline_captured = true;
+        workflow::save_state(&state).unwrap();
+        let err = crate::pipeline_launch::resume(root, prepared, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// `status` and `doctor` name `start`, never `resume`, for a `start` killed during
+    /// preparation, stopped or not. Control: with preparation done, both name `resume`.
+    #[test]
+    fn status_and_doctor_name_start_for_a_start_killed_during_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5303);
+        let start_verb = format!("devflow start --phase {phase} --agent claude --mode supervise");
+        let resume_verb = format!("devflow resume --phase {phase}");
+        let killed = state_with_pending(root, phase, false);
+        let mut stopped = killed.clone();
+        stopped.stopped = true;
+        let mut unreserved = killed.clone();
+        unreserved.pending_supervisor = None;
+
+        for (case, state) in [
+            ("killed", &killed),
+            ("stopped after", &stopped),
+            ("a refused resume after", &unreserved),
+        ] {
+            let liveness = probe_phase(state);
+            assert_eq!(
+                recovery_hints(state, &liveness),
+                vec![start_verb.clone()],
+                "{case}"
+            );
+        }
+        let findings = reconcile_phase(&facts_for(root, &killed));
+        let repairs: Vec<&str> = findings
+            .iter()
+            .filter_map(|finding| finding.repair.as_deref())
+            .collect();
+        assert!(repairs.contains(&start_verb.as_str()), "{repairs:?}");
+        assert!(
+            !repairs
+                .iter()
+                .any(|repair| repair.contains("devflow resume")),
+            "{repairs:?}"
+        );
+
+        let mut prepared = killed.clone();
+        prepared.verification_baseline_captured = true;
+        assert_eq!(
+            recovery_hints(&prepared, &probe_phase(&prepared)),
+            vec![resume_verb.clone()]
+        );
+        let findings = reconcile_phase(&facts_for(root, &prepared));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.repair.as_deref() == Some(resume_verb.as_str())),
+            "control: a prepared run names resume"
+        );
+    }
+
     /// RESEARCH Pitfall 7: a socket whose launch id is the state's pending supervisor is
     /// claimed, with or without a recorded supervisor beside it, so `doctor` does not
     /// call a legitimate next supervisor an orphan. Controls: the same socket with no
@@ -15840,6 +16021,7 @@ mod tests {
                 root.to_path_buf(),
             );
             stopped.stopped = true;
+            stopped.verification_baseline_captured = true;
             stopped.legacy_claude_launch = true;
             workflow::save_state(&stopped).unwrap();
         }
@@ -16421,7 +16603,8 @@ mod tests {
         for (case, recorded) in [("a GONE record", true), ("no record", false)] {
             let dir = tempfile::tempdir().unwrap();
             let phase = PhaseId::new(5181);
-            let state = state_with_pending(dir.path(), phase, recorded);
+            let mut state = state_with_pending(dir.path(), phase, recorded);
+            state.verification_baseline_captured = true;
             drop(hold_pending(&state));
 
             let phase_liveness = probe_phase(&state);
@@ -16902,13 +17085,14 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        workflow::save_state(&State::new(
+        let mut state = State::new(
             phase,
             AgentKind::Claude,
             Mode::Supervise,
             root.to_path_buf(),
-        ))
-        .unwrap();
+        );
+        state.verification_baseline_captured = true;
+        workflow::save_state(&state).unwrap();
         let mut child = ParkedHolder::spawn(NAME, root, tempfile::tempdir().unwrap());
         let pid = child.pid();
         let holder_path = liveness::phase_holder_path(root, phase);
@@ -17302,6 +17486,7 @@ mod tests {
         let resume = format!("devflow resume --phase {phase}");
 
         let mut confirmed = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        confirmed.verification_baseline_captured = true;
         confirmed.supervisor = Some(SupervisorRecord::new(
             root.join("gone.sock"),
             "aaaa0000aaaa5188".to_string(),
