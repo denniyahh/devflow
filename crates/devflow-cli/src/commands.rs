@@ -2001,11 +2001,10 @@ pub(crate) fn gate_respond(
         }),
     );
     let pickup = if waiter_is_live(project_root, phase, stage, &observed) {
-        let waiter = waiter_holder_status(project_root, phase, stage, &observed);
-        response_pickup_message(stage, waiter).to_owned()
+        response_pickup_message(stage, WaiterStatus::Live).to_owned()
     } else {
         format!(
-            "response was written, but no confirmed live holder will act. {}",
+            "response was written, but no registered waiter will act. {}",
             no_waiter_repair(phase, stage)
         )
     };
@@ -2109,25 +2108,19 @@ fn classify_listed_gate(project_root: &Path, gate: &OpenGate) -> ListedGate {
     }
 }
 
-/// The liveness half of [`gate_respond`]. Ship's stored-response exception is for
-/// no waiter of any kind (T-48-16-03): a recycled pid is an unrelated process, not
-/// manual-recovery territory.
+/// The liveness half of [`gate_respond`] (D-04). With no registered waiter, a Ship
+/// answer is still stored for `devflow ship`; any other stage has nothing to act on it.
 fn refuse_a_gate_with_no_waiter(
     project_root: &Path,
     phase: PhaseId,
     stage: Stage,
     observed: &GateId,
 ) -> Result<(), CliError> {
-    let lock_holder = lock::holder_status(project_root, phase);
-    let may_be_waiting =
-        waiter_is_live(project_root, phase, stage, observed) || lock_holder.may_be_waiting();
-    let ship_without_holder =
-        stage == Stage::Ship && matches!(lock_holder, lock::HolderStatus::NoHolder);
-    if may_be_waiting || ship_without_holder {
+    if stage == Stage::Ship || waiter_is_live(project_root, phase, stage, observed) {
         return Ok(());
     }
     Err(CliError::Message(format!(
-        "no confirmed waiter holds phase {phase}'s lock for {stage}; no response was written. {}",
+        "no registered waiter for phase {phase} {stage}; no response was written. {}",
         no_waiter_repair(phase, stage)
     )))
 }
@@ -2154,18 +2147,14 @@ fn gate_answer_error(error: GateError) -> CliError {
     }
 }
 
-/// Whether `observed`'s gate has a live waiter: its registration reads live, or the
-/// per-phase lock holder does.
+/// Whether `observed`'s gate has a live waiter: its registration reads live, and
+/// nothing else counts (D-04).
 ///
 /// A writer may read the registration the instant it sees a gate file, because
 /// every waiter registers before it publishes ([`Gates::open_registered`], which
 /// every gate wait uses from 50.1-14).
-///
-/// The lock half is a transition, deleted in 50.1-20: waiters still hold the lock
-/// until 50.1-16 and 50.1-19 remove it, so without it a writer would refuse a live
-/// waiter in any wave between.
 fn waiter_is_live(project_root: &Path, phase: PhaseId, stage: Stage, observed: &GateId) -> bool {
-    let registered = match Gates::waiter_status(project_root, phase, stage, observed) {
+    match Gates::waiter_status(project_root, phase, stage, observed) {
         Ok(status) => status == WaiterStatus::Live,
         Err(error) => {
             eprintln!(
@@ -2174,46 +2163,6 @@ fn waiter_is_live(project_root: &Path, phase: PhaseId, stage: Stage, observed: &
             );
             false
         }
-    };
-    registered
-        || matches!(
-            lock::holder_status(project_root, phase),
-            lock::HolderStatus::Live { .. }
-        )
-}
-
-/// The pid recorded by whoever holds `gate`'s registration, if anyone does and its
-/// record can be read.
-fn registered_waiter_pid(
-    project_root: &Path,
-    phase: PhaseId,
-    stage: Stage,
-    gate: &GateId,
-) -> Option<u32> {
-    let path = Gates::waiter_path(project_root, phase, stage, gate);
-    match liveness::live_holder(&path) {
-        Ok(holder) => holder.map(|(pid, _)| pid),
-        Err(error) => {
-            eprintln!(
-                "warning: could not read the waiter registration {}: {error}",
-                path.display()
-            );
-            None
-        }
-    }
-}
-
-/// [`waiter_is_live`]'s two halves as a [`lock::HolderStatus`], for the wording and
-/// the doctor facts that still take one until 50.1-20.
-fn waiter_holder_status(
-    project_root: &Path,
-    phase: PhaseId,
-    stage: Stage,
-    gate: &GateId,
-) -> lock::HolderStatus {
-    match registered_waiter_pid(project_root, phase, stage, gate) {
-        Some(pid) => lock::HolderStatus::Live { pid },
-        None => lock::holder_status(project_root, phase),
     }
 }
 
@@ -2247,15 +2196,12 @@ fn no_waiter_repair(phase: PhaseId, stage: Stage) -> String {
 
 /// Conservative post-publication wording. The second status observation only
 /// narrows the message race; it cannot establish a waiter's lifetime.
-fn response_pickup_message(stage: Stage, status: lock::HolderStatus) -> &'static str {
+fn response_pickup_message(stage: Stage, status: WaiterStatus) -> &'static str {
     match status {
-        lock::HolderStatus::Live { .. } => {
-            "a live lock holder may pick up this response; this is not a lifetime guarantee"
+        WaiterStatus::Live => {
+            "a registered waiter may pick up this response; this is not a lifetime guarantee"
         }
-        lock::HolderStatus::Unconfirmable { .. } => {
-            "a process holds the lock but its identity cannot be confirmed; no waiter is claimed"
-        }
-        lock::HolderStatus::NoHolder | lock::HolderStatus::Recycled { .. } => {
+        WaiterStatus::Absent => {
             if stage == Stage::Ship {
                 "no confirmed waiter remains; use `devflow ship --phase` for Ship recovery"
             } else {
@@ -2325,7 +2271,7 @@ pub(crate) fn gate_sweep(
                 left_alone += 1;
                 continue;
             }
-            match sweep_one_gate(project_root, &gate, age, threshold, dry_run) {
+            match sweep_one_gate(project_root, &gate, age, threshold, dry_run)? {
                 SweepStep::Reaped => reaped += 1,
                 SweepStep::Skipped => skipped += 1,
                 SweepStep::LeftAlone => left_alone += 1,
@@ -2469,13 +2415,17 @@ enum SweepStep {
 
 /// The sweep's per-gate step, for the gate as it was listed: compare its id with
 /// the gate file, read its waiter, then answer that id and no other.
+///
+/// A held gate lock ends the sweep rather than being reported as a skip, and so does an
+/// answer published while the lock stayed held: later gates are never reported reaped
+/// past one the sweep could not settle.
 fn sweep_one_gate(
     project_root: &Path,
     gate: &OpenGate,
     age: u64,
     threshold: u64,
     dry_run: bool,
-) -> SweepStep {
+) -> Result<SweepStep, CliError> {
     let at = project_root.display();
     let (phase, stage) = (gate.phase, gate.stage);
     let observed = match classify_listed_gate(project_root, gate) {
@@ -2484,13 +2434,13 @@ fn sweep_one_gate(
             println!(
                 "skipped phase {phase} {stage} at {at} — its gate file has no valid gate id; not reaped"
             );
-            return SweepStep::Skipped;
+            return Ok(SweepStep::Skipped);
         }
         ListedGate::Changed => {
             println!(
                 "skipped phase {phase} {stage} at {at} — gate changed since it was listed; not reaped"
             );
-            return SweepStep::Skipped;
+            return Ok(SweepStep::Skipped);
         }
     };
     let waiter_live = waiter_is_live(project_root, phase, stage, &observed);
@@ -2499,11 +2449,11 @@ fn sweep_one_gate(
             "left phase {phase} {stage} alone at {at} — no confirmed waiter; {}",
             no_waiter_repair(phase, stage)
         );
-        return SweepStep::LeftAlone;
+        return Ok(SweepStep::LeftAlone);
     }
     if dry_run {
         println!("would reap phase {phase} {stage} (age {age}s) at {at}");
-        return SweepStep::Reaped;
+        return Ok(SweepStep::Reaped);
     }
     match Gates::reap_answer(
         project_root,
@@ -2525,21 +2475,24 @@ fn sweep_one_gate(
                 }),
             );
             println!("reaped phase {phase} {stage} (age {age}s) at {at}");
-            SweepStep::Reaped
+            Ok(SweepStep::Reaped)
         }
         Err(err @ GateError::GateIdMismatch { .. }) => {
             println!(
                 "skipped phase {phase} {stage} at {at} — gate changed since it was listed; not reaped ({err})"
             );
-            SweepStep::Skipped
+            Ok(SweepStep::Skipped)
         }
         Err(err @ (GateError::AlreadyResponded { .. } | GateError::NoOpenGate { .. })) => {
             println!("skipped phase {phase} {stage} at {at} — already answered ({err})");
-            SweepStep::Skipped
+            Ok(SweepStep::Skipped)
+        }
+        Err(err @ (GateError::GateLockTimeout { .. } | GateError::PublishedUnconfirmed { .. })) => {
+            Err(err.into())
         }
         Err(err) => {
             println!("skipped phase {phase} {stage} at {at} — {err}");
-            SweepStep::Skipped
+            Ok(SweepStep::Skipped)
         }
     }
 }
@@ -3670,7 +3623,11 @@ fn stop_reap_observed_gate(
         "devflow-stop",
     ) {
         Ok(path) => {
-            let waiter = waiter_holder_status(project_root, phase, gate.stage, &observed);
+            let waiter = if waiter_is_live(project_root, phase, gate.stage, &observed) {
+                WaiterStatus::Live
+            } else {
+                WaiterStatus::Absent
+            };
             println!(
                 "stop: wrote a rejection for phase {phase} {} at {} — {}",
                 gate.stage,
@@ -3708,6 +3665,30 @@ fn stop_reap_observed_gate(
         Err(err @ GateError::GateClosedAfterPublish { .. }) => {
             println!("stop: {err}");
             Ok((false, None))
+        }
+        // A wedged gate-lock holder, such as a suspended `gate approve`, must not leave
+        // the run unstoppable: nothing was published, so the other arms may still act.
+        Err(err @ GateError::GateLockTimeout { .. }) => {
+            println!(
+                "stop: phase {phase}'s {} gate was not answered — {err}; trying its supervisor \
+                 socket and foreground holder",
+                gate.stage
+            );
+            Ok((false, None))
+        }
+        // The abort is out, so this stop has acted: one `stop`, one action (R2-04). If the
+        // gate had in fact closed, the persisted `stopped` flag halts the run at its next
+        // safe point.
+        Err(err @ GateError::PublishedUnconfirmed { .. }) => {
+            println!(
+                "stop: phase {phase}'s {} gate (gate {observed}): the abort was published, but \
+                 stop could not confirm the gate was still open — {err}",
+                gate.stage
+            );
+            Ok((
+                true,
+                Some((gate.stage, holder_before_reap, holder_identity_before_reap)),
+            ))
         }
         Err(err) => Err(err.into()),
     }
@@ -5905,9 +5886,9 @@ pub(crate) struct PhaseFacts {
     pub(crate) phase: PhaseId,
     pub(crate) stage: Stage,
     pub(crate) gate_pending: bool,
-    /// Read-only phase-lock status, computed in `build_phase_facts`; all
-    /// lock I/O stays there so reconciliation remains pure.
-    pub(crate) waiter: lock::HolderStatus,
+    /// Whether the phase's open gate has a held registration, computed in
+    /// `build_phase_facts`; all its I/O stays there so reconciliation remains pure.
+    pub(crate) waiter: WaiterStatus,
     pub(crate) agent_pid: Option<u32>,
     pub(crate) agent_alive: bool,
     /// The supervisor's liveness, from one probe of the socket
@@ -5993,7 +5974,7 @@ fn repair_instead_of_resume(facts: &PhaseFacts, resume: String) -> String {
 /// answer. Report the same recovery command the gate verbs already name;
 /// doctor remains report-only.
 fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.open_gate_stages.is_empty() || facts.waiter.may_be_waiting() {
+    if facts.open_gate_stages.is_empty() || facts.waiter == WaiterStatus::Live {
         return None;
     }
     let gate_stage = facts.open_gate_stages[0];
@@ -6015,7 +5996,8 @@ fn check_open_gate_without_waiter(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// An open gate file exists but `gate_pending` is false — an unanswered
 /// operator question that `status`/`doctor` isn't surfacing as pending.
 fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if facts.gate_pending || facts.open_gate_stages.is_empty() || !facts.waiter.may_be_waiting() {
+    if facts.gate_pending || facts.open_gate_stages.is_empty() || facts.waiter != WaiterStatus::Live
+    {
         return None;
     }
     let gate_stage = facts.open_gate_stages[0];
@@ -6338,25 +6320,26 @@ fn build_phase_facts(
     }
 }
 
-/// [`PhaseFacts::waiter`]: `Live` for the holder of a registration on one of the
-/// phase's open gates, else the lock half. The doctor reads this the way a writer
-/// reads [`waiter_is_live`]; the field stays a [`lock::HolderStatus`] until 50.1-20.
+/// [`PhaseFacts::waiter`]: `Live` while one of the phase's open gates has a held
+/// registration, else `Absent`. The doctor reads this the way a writer reads
+/// [`waiter_is_live`].
 fn phase_waiter_status(
     project_root: &Path,
     phase: PhaseId,
     open_gates: &[OpenGate],
-) -> lock::HolderStatus {
-    open_gates
+) -> WaiterStatus {
+    let live = open_gates
         .iter()
         .filter(|gate| gate.phase == phase)
-        .find_map(|gate| {
-            let gate_id = GateId::parse(&gate.gate_id).ok()?;
-            registered_waiter_pid(project_root, phase, gate.stage, &gate_id)
-        })
-        .map_or_else(
-            || lock::holder_status(project_root, phase),
-            |pid| lock::HolderStatus::Live { pid },
-        )
+        .any(|gate| {
+            GateId::parse(&gate.gate_id)
+                .is_ok_and(|id| waiter_is_live(project_root, phase, gate.stage, &id))
+        });
+    if live {
+        WaiterStatus::Live
+    } else {
+        WaiterStatus::Absent
+    }
 }
 
 /// Derive the stage named by an event's `stage` field, but only when the
@@ -7227,10 +7210,11 @@ mod tests {
     use devflow_core::test_support::{gate_answer_files, with_answer_before_publish};
 
     #[test]
-    fn gate_response_message_does_not_claim_pickup_after_live_becomes_no_holder() {
-        let live = response_pickup_message(Stage::Code, lock::HolderStatus::Live { pid: 42 });
+    fn gate_response_message_does_not_claim_pickup_after_the_waiter_goes() {
+        let live = response_pickup_message(Stage::Code, WaiterStatus::Live);
         assert!(live.contains("may pick up"), "live message: {live}");
-        let gone = response_pickup_message(Stage::Code, lock::HolderStatus::NoHolder);
+        assert!(!live.contains("lock"), "live message: {live}");
+        let gone = response_pickup_message(Stage::Code, WaiterStatus::Absent);
         assert!(
             gone.contains("no confirmed waiter"),
             "no-holder message: {gone}"
@@ -7267,16 +7251,10 @@ mod tests {
         state.stage = Stage::Code;
         state.gate_pending = true;
         workflow::save_state(&state).unwrap();
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{start}")).unwrap();
-        Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
+        let (_, registration) = Gates::open_registered(root, phase, Stage::Code, "paused").unwrap();
         assert!(stop_via_gate(root, phase).unwrap().0);
         assert!(!gate_answer_files(root, phase, Stage::Code).is_empty());
+        registration.finish();
     }
 
     #[test]
@@ -7309,17 +7287,10 @@ mod tests {
     }
 
     #[test]
-    fn gate_respond_with_a_recycled_lock_pid_at_a_non_ship_gate_writes_nothing() {
+    fn gate_respond_with_no_registered_waiter_at_a_non_ship_gate_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4804);
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
         Gates::write_gate(root, phase, Stage::Code, "paused").unwrap();
         let err = gate_respond(
             root,
@@ -7329,44 +7300,12 @@ mod tests {
             Some("abort".into()),
             None,
         )
-        .expect_err("a recycled non-Ship holder must not receive a response");
+        .expect_err("an unregistered non-Ship gate must not receive a response");
         assert!(
             err.to_string().contains("devflow resume --phase 4804"),
             "repair must name the concrete phase: {err}"
         );
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
-    }
-
-    /// T-48-16-03 at the `gate` verbs, not only at `stop`: Ship's
-    /// stored-response exception is for `NoHolder` alone. A recycled pid is
-    /// an unrelated live process, and a response left for it cannot be
-    /// consumed by `devflow ship` while that pid holds the lock.
-    /// `gate_approve_with_no_waiter_at_the_ship_gate_writes_and_names_ship`
-    /// is the `NoHolder` control that must still write.
-    #[test]
-    fn gate_respond_with_a_recycled_lock_pid_at_the_ship_gate_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let phase = PhaseId::new(4848);
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, format!("{pid}\n{}", start + 1)).unwrap();
-        assert!(matches!(
-            lock::holder_status(root, phase),
-            lock::HolderStatus::Recycled { .. }
-        ));
-        Gates::write_gate(root, phase, Stage::Ship, "merge").unwrap();
-        let err = gate_respond(root, phase, Some(Stage::Ship), true, None, None)
-            .expect_err("a recycled Ship holder must not receive a response");
-        assert!(
-            err.to_string().contains("no response was written"),
-            "the refusal must say nothing was written: {err}"
-        );
-        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
     }
 
     #[test]
@@ -7415,7 +7354,7 @@ mod tests {
             "without a confirmed waiter, stop must leave the live phase state untouched"
         );
         assert!(
-            response_pickup_message(Stage::Ship, lock::HolderStatus::Recycled { pid: 42 })
+            response_pickup_message(Stage::Ship, WaiterStatus::Absent)
                 .contains("no confirmed waiter")
         );
     }
@@ -7472,10 +7411,6 @@ mod tests {
         assert!(holder_alive, "a record with no start time signals nothing");
         assert!(gate_answer_files(root, phase, Stage::Code).is_empty());
         assert!(error.contains("refusing to signal"), "{error}");
-        let message =
-            response_pickup_message(Stage::Code, lock::HolderStatus::Unconfirmable { pid: 42 });
-        assert!(message.contains("cannot be confirmed"));
-        assert!(!message.contains("waiting monitor"));
     }
 
     /// T-48-16-02 / T-48-16-03: after `stop` answers a gate it cannot take the
@@ -7661,7 +7596,7 @@ mod tests {
         let g2 = g2.gate_id;
 
         assert_eq!(
-            sweep_one_gate(root, &g1_entry, 1, 0, false),
+            sweep_one_gate(root, &g1_entry, 1, 0, false).unwrap(),
             SweepStep::Skipped,
             "a gate changed since it was listed is reported, not left as waiterless"
         );
@@ -7673,7 +7608,7 @@ mod tests {
 
         let g2_entry = listed_gate(root, phase);
         assert_eq!(
-            sweep_one_gate(root, &g2_entry, 1, 0, false),
+            sweep_one_gate(root, &g2_entry, 1, 0, false).unwrap(),
             SweepStep::Reaped
         );
         let AnswerRead::Bound(answer) = Gates::read_answer(root, phase, stage, &g2) else {
@@ -7708,7 +7643,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            sweep_one_gate(root, &entry, 1, 0, false),
+            sweep_one_gate(root, &entry, 1, 0, false).unwrap(),
             SweepStep::Skipped
         );
         assert_eq!(
@@ -7827,7 +7762,7 @@ mod tests {
         );
         assert!(err.contains("devflow gate list"), "{err}");
         assert!(
-            !err.contains("no confirmed waiter"),
+            !err.contains("no registered waiter"),
             "a changed gate must not read as a missing waiter: {err}"
         );
         assert_eq!(
@@ -7919,16 +7854,11 @@ mod tests {
         let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
         let open = Gates::list_open(root);
 
-        assert_eq!(
-            phase_waiter_status(root, phase, &open),
-            lock::HolderStatus::Live {
-                pid: std::process::id()
-            }
-        );
+        assert_eq!(phase_waiter_status(root, phase, &open), WaiterStatus::Live);
         registration.finish();
         assert_eq!(
             phase_waiter_status(root, phase, &open),
-            lock::HolderStatus::NoHolder
+            WaiterStatus::Absent
         );
     }
 
@@ -8136,6 +8066,78 @@ mod tests {
         registration.finish();
     }
 
+    /// `gate sweep` stops at a gate lock it cannot take, rather than skipping that gate
+    /// and reporting the rest. Control: with the lock free, the same sweep reaps it.
+    #[test]
+    fn gate_sweep_ends_on_a_held_gate_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5008), Stage::Code);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let gate_lock = hold_gate_lock(root, phase);
+
+        let error = gate_sweep(Some(0), false, Some(root.to_path_buf()), false)
+            .expect_err("a held gate lock ends the sweep");
+
+        assert!(
+            matches!(error, CliError::Gate(GateError::GateLockTimeout { .. })),
+            "{error}"
+        );
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+
+        drop(gate_lock);
+        gate_sweep(Some(0), false, Some(root.to_path_buf()), false).unwrap();
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::Bound(answer) if !answer.response.approved
+        ));
+        registration.finish();
+    }
+
+    /// R2-04: a writer whose answer was published but could not be confirmed exits
+    /// non-zero and never says nothing changed, and the answer stays where it is.
+    #[test]
+    fn gate_writers_report_a_published_but_unconfirmed_answer() {
+        let check = |phase: PhaseId, write: &dyn Fn(&Path) -> Result<(), CliError>| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let (opened, registration) =
+                Gates::open_registered(root, phase, Stage::Code, "g").unwrap();
+            let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let (hook_root, hook_parked) = (root.to_path_buf(), parked.clone());
+            let error = with_answer_before_publish(
+                move || {
+                    *hook_parked.borrow_mut() = Some(hold_gate_lock(&hook_root, phase));
+                },
+                || write(root),
+            )
+            .expect_err("an unconfirmed answer exits non-zero");
+            let message = error.to_string();
+            assert!(
+                matches!(
+                    error,
+                    CliError::Gate(GateError::PublishedUnconfirmed { .. })
+                ),
+                "{message}"
+            );
+            assert!(message.contains("published"), "{message}");
+            assert!(!message.contains("nothing was changed"), "{message}");
+            drop(parked.borrow_mut().take());
+            assert!(matches!(
+                Gates::read_answer(root, phase, Stage::Code, &opened.gate_id),
+                AnswerRead::Bound(_)
+            ));
+            registration.finish();
+        };
+        let responding = PhaseId::new(5009);
+        check(responding, &|root| {
+            gate_respond(root, responding, Some(Stage::Code), true, None, None)
+        });
+        check(PhaseId::new(5010), &|root| {
+            gate_sweep(Some(0), false, Some(root.to_path_buf()), false)
+        });
+    }
+
     /// R2-04: one `stop`, one action. An abort published with its re-check timed out is
     /// answered: `stop` goes on to record the stop and never reaches the holder.
     #[test]
@@ -8193,30 +8195,6 @@ mod tests {
 
         plant_live_lock_record(root, phase);
         assert!(!waiter_is_live(root, phase, stage, &gate), "a lock record");
-    }
-
-    /// The lock half is why this test plants a `lock-NN`: that half is its subject,
-    /// and 50.1-20 deletes both.
-    #[test]
-    fn a_waiter_is_live_by_its_registration_or_its_lock_during_the_transition() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let (phase, stage) = (PhaseId::new(4904), Stage::Code);
-        let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
-        assert!(!waiter_is_live(root, phase, stage, &gate), "neither half");
-
-        let registration = Gates::register_waiter(root, phase, stage, &gate).unwrap();
-        assert!(waiter_is_live(root, phase, stage, &gate), "registration");
-        registration.finish();
-        assert!(!waiter_is_live(root, phase, stage, &gate), "finished");
-
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-        assert!(waiter_is_live(root, phase, stage, &gate), "lock holder");
     }
 
     #[test]
@@ -9264,7 +9242,7 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
 
         let result = gate_sweep(None, false, Some(root.to_path_buf()), false);
-        let raced = sweep_one_gate(root, &listed_before_the_answer, 1, 0, false);
+        let raced = sweep_one_gate(root, &listed_before_the_answer, 1, 0, false).unwrap();
 
         assert!(result.is_ok(), "an already-answered gate must not error");
         assert_eq!(raced, SweepStep::Skipped, "the race is a skip");
@@ -9284,14 +9262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(32);
-        let pid = std::process::id();
-        let start = agent::process_start_time(pid).unwrap();
-        let lock_path = root
-            .join(".devflow")
-            .join(format!("lock-{}", phase.padded()));
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(lock_path, format!("{pid}\n{start}")).unwrap();
-        Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
+        let (_, registration) = Gates::open_registered(root, phase, Stage::Ship, "ctx").unwrap();
         backdate_gate(root, phase, Stage::Ship, aged_past_threshold());
 
         gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
@@ -9299,6 +9270,7 @@ mod tests {
         let event = devflow_core::events::last_event_for_phase(root, phase).unwrap();
         assert_eq!(event["event"], "gate_reaped");
         assert_eq!(event["stage"], "ship");
+        registration.finish();
     }
 
     /// Wrap a real, test-owned pid as the `agent::StrayProcess` shape
@@ -11148,7 +11120,7 @@ mod tests {
                 phase,
                 stage: Stage::Code,
                 gate_pending: false,
-                waiter: lock::HolderStatus::NoHolder,
+                waiter: WaiterStatus::Absent,
                 agent_pid: Some(4242),
                 agent_alive: true,
                 supervisor: PhaseLiveness::Alive {
@@ -11215,7 +11187,7 @@ mod tests {
             let phase = PhaseId::new(13);
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Validate],
-                waiter: lock::HolderStatus::NoHolder,
+                waiter: WaiterStatus::Absent,
                 supervisor: PhaseLiveness::NotLaunched,
                 ..agreeing_facts(phase)
             };
@@ -11235,7 +11207,7 @@ mod tests {
             let phase = PhaseId::new(14);
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Ship],
-                waiter: lock::HolderStatus::NoHolder,
+                waiter: WaiterStatus::Absent,
                 ..agreeing_facts(phase)
             };
 
@@ -11255,30 +11227,11 @@ mod tests {
         }
 
         #[test]
-        fn reconcile_phase_flags_open_gate_with_a_recycled_waiter_as_no_waiter() {
-            let phase = PhaseId::new(15);
-            let facts = PhaseFacts {
-                open_gate_stages: vec![Stage::Validate],
-                waiter: lock::HolderStatus::Recycled { pid: 1234 },
-                supervisor: PhaseLiveness::NotLaunched,
-                ..agreeing_facts(phase)
-            };
-
-            let findings = reconcile_phase(&facts);
-
-            assert_eq!(findings.len(), 1);
-            assert_eq!(
-                findings[0].repair.as_deref(),
-                Some(no_waiter_repair(phase, Stage::Validate).as_str())
-            );
-        }
-
-        #[test]
         fn reconcile_phase_open_gate_with_a_live_waiter_is_not_a_no_waiter_finding() {
             let phase = PhaseId::new(16);
             let facts = PhaseFacts {
                 open_gate_stages: vec![Stage::Validate],
-                waiter: lock::HolderStatus::Live { pid: 1234 },
+                waiter: WaiterStatus::Live,
                 ..agreeing_facts(phase)
             };
 
@@ -11594,11 +11547,7 @@ mod tests {
             let facts = collect_phase_facts(root);
 
             assert_eq!(facts.len(), 2);
-            assert!(
-                facts
-                    .iter()
-                    .all(|fact| fact.waiter == lock::HolderStatus::NoHolder)
-            );
+            assert!(facts.iter().all(|fact| fact.waiter == WaiterStatus::Absent));
             assert_eq!(
                 std::fs::read_to_string(root.join(".devflow/lock-93")).unwrap(),
                 ""
