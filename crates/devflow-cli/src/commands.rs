@@ -2610,7 +2610,7 @@ fn reap_stray_candidates(
         .map(|candidate| {
             // Re-confirm identity immediately before acting, closing the
             // discovery-to-signal TOCTOU window (999.47's "Related
-            // TOCTOU") — copies `stop_via_lock`'s fail-closed posture:
+            // TOCTOU") — copies `stop_via_holder`'s fail-closed posture:
             // refuse on any uncertainty, never signal on a mismatch.
             if !agent::is_same_process(candidate.pid, candidate.start_time) {
                 return StrayReapResult {
@@ -2673,8 +2673,9 @@ type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 ///    ALIVE gets a `shutdown`, which ends a run that holds no per-phase lock
 ///    (999.138).
 /// 3. Only when no live socket remains (GONE, or nothing recorded) does the
-///    identity-confirmed per-phase lock holder get signalled
-///    ([`stop_via_lock`]).
+///    identity-confirmed foreground holder of `.devflow/.holder-NN` get signalled
+///    ([`stop_via_holder`]). It catches the signal and ends at its next safe point
+///    (D-18), so `stop` waits for it, boundedly, and marks nothing while it runs.
 ///
 /// A pending supervisor comes after the recorded one, whose own safe point 3 ends an
 /// unpublished successor: only its socket reaches it ([`stop_pending_launch`]), and an
@@ -2714,9 +2715,10 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
             SocketStop::NoLiveSocket
         );
     }
-    // A supervisor may still be releasing the per-phase lock as it exits, so wait it
-    // out like a signalled holder.
-    let signal_sent = ended || stop_via_lock(project_root, phase)?;
+    if ended {
+        return persist_stopped_state(project_root, phase, None, false);
+    }
+    let signal_sent = stop_via_holder(project_root, phase)?;
     persist_stopped_state(project_root, phase, None, signal_sent)
 }
 
@@ -2865,7 +2867,7 @@ fn clear_abandoned_reservation(
 /// is missing or does not parse, whose file name carries it (RV-05b). If this
 /// project's state loads and records that same launch, the plain [`stop`]
 /// runs. Otherwise only that socket is acted on: no gate is answered, no
-/// lock holder signalled and no state written.
+/// holder signalled and no state written.
 pub(crate) fn stop_launch(
     project_root: &Path,
     phase: PhaseId,
@@ -3500,7 +3502,7 @@ fn run_backstop(
 ///
 /// Returns `Ok(true)` when a gate was found and handled — either reaped
 /// here, or discovered already answered by a race — telling the caller not
-/// to fall through to [`stop_via_lock`]. Returns `Ok(false)` when there is
+/// to fall through to [`stop_via_holder`]. Returns `Ok(false)` when there is
 /// no open gate for `phase` at all, including the race where `Gates::reap_answer`
 /// reports `NoOpenGate` after this function's own `Gates::list_open` scan
 /// found one; that is the signal to fall through, not an error (cross-AI
@@ -3678,86 +3680,107 @@ fn stop_with_existing_response(
     }
 }
 
-/// The fallback once no live supervisor socket remains (GONE, or none
-/// recorded): signal the process recorded in `phase`'s per-phase lock file,
-/// such as a foreground `advance()` holding the lock. Fail-closed on
-/// identity (T-23-52): the pid is signalled only when it matches the start
-/// time the lock recorded, since the lock may be stale with a recycled pid.
-/// The lock file is the only place this reads a pid from; state is never
-/// one.
-fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
-    let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
-        println!(
-            "stop: no live supervisor socket and no lock held for phase {phase} — nothing is \
-             running"
-        );
-        return Ok(false);
-    };
-    let Ok(pid) = pid_str.parse::<u32>() else {
-        println!(
-            "stop: phase {phase}'s lock file holds a corrupt pid ({pid_str}) — treating it \
-             as stale"
-        );
-        return Ok(false);
-    };
-    if !agent::agent_running(pid) {
-        println!(
-            "stop: phase {phase}'s lock names pid {pid}, which is not alive — stale lock, \
-             nothing to signal"
-        );
-        return Ok(false);
-    }
-    // Identity must be MATCHED against what the lock recorded, never inferred
-    // from /proc (999.47). A bare cmdline-basename check alone returns true
-    // for any freshly forked child of a devflow process that has not finished
-    // execve — during that window the child carries its parent's cmdline and
-    // exe — so it would authorise signalling an unrelated process. Confirmed
-    // in CI, not theorised.
+/// The fallback once no live supervisor socket remains (GONE, or none recorded): signal
+/// the process that holds `phase`'s holder file (D-17), a foreground `start`, `resume`,
+/// `devflow ship` or hand-run `advance`. Fail-closed on identity (T-23-52): the pid is
+/// signalled only while the lock is held and only when it still has the start time the
+/// record names, since a record can name a recycled pid. The holder file is the only
+/// place this reads a pid from; state is never one.
+///
+/// `Ok(true)` when a holder was signalled.
+fn stop_via_holder(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
+    let padded = phase.padded();
+    let holder = liveness::live_holder(&liveness::phase_holder_path(project_root, phase));
+    // Identity must be MATCHED against what the holder recorded, never inferred from
+    // /proc (999.47). A bare cmdline-basename check alone returns true for any freshly
+    // forked child of a devflow process that has not finished execve — during that window
+    // the child carries its parent's cmdline and exe — so it would authorise signalling
+    // an unrelated process. Confirmed in CI, not theorised.
     //
-    // `(pid, starttime)` is unique for the life of a boot: a recycled pid
-    // necessarily starts later than the one it replaced, and a mid-execve
-    // child has its own start time distinct from its parent's.
-    match lock::holder_identity(project_root, phase) {
-        Some((recorded_pid, Some(recorded_start))) if recorded_pid == pid => {
+    // `(pid, starttime)` is unique for the life of a boot: a recycled pid necessarily
+    // starts later than the one it replaced, and a mid-execve child has its own start
+    // time distinct from its parent's.
+    let pid = match holder {
+        Ok(None) => {
+            println!(
+                "stop: no live supervisor socket, pending launch or foreground holder for phase \
+                 {phase} — nothing is running"
+            );
+            return Ok(false);
+        }
+        Ok(Some((pid, None))) => {
+            return Err(CliError::Message(format!(
+                "refusing to signal pid {pid} for phase {phase} — .devflow/.holder-{padded} \
+                 records no start time, so this process's identity cannot be confirmed. If the \
+                 run is genuinely stuck, inspect the pid manually (e.g. `ps -p {pid}`) before \
+                 ending it yourself."
+            )));
+        }
+        Ok(Some((pid, Some(recorded_start)))) => {
             if !agent::is_same_process(pid, recorded_start) {
                 return Err(CliError::Message(format!(
-                    "refusing to signal pid {pid} for phase {phase} — it is not the \
-                     process that took the lock. The lock recorded start time \
-                     {recorded_start}, but pid {pid} now reports {:?}, so the pid has \
-                     been recycled and belongs to something else. Inspect it manually \
-                     (e.g. `ps -p {pid}`) before proceeding.",
+                    "refusing to signal pid {pid} for phase {phase} — it is not the process that \
+                     claimed .devflow/.holder-{padded}. The record names start time \
+                     {recorded_start}, but pid {pid} now reports {:?}, so the pid has been \
+                     recycled and belongs to something else. Inspect it manually (e.g. `ps -p \
+                     {pid}`) before proceeding.",
                     agent::process_start_time(pid)
                 )));
             }
+            pid
         }
-        Some((_, None)) => {
-            // Legacy single-line lock, written before start times were
-            // recorded. Identity cannot be confirmed, so fail closed rather
-            // than fall back to the unsound cmdline check.
+        Err(err) => {
             return Err(CliError::Message(format!(
-                "refusing to signal pid {pid} for phase {phase} — the lock file records \
-                 no start time, so this process's identity cannot be confirmed. The lock \
-                 predates identity recording; if the run is genuinely stuck, inspect the \
-                 pid manually (e.g. `ps -p {pid}`) and remove \
-                 .devflow/lock-{padded} once you are satisfied.",
-                padded = phase.padded()
+                "refusing to signal anything for phase {phase} — .devflow/.holder-{padded} could \
+                 not be read back for identity confirmation ({err}), so nothing was signalled. \
+                 Run `devflow stop --phase {phase}` again, or inspect the process holding it."
             )));
         }
-        _ => {
-            return Err(CliError::Message(format!(
-                "refusing to signal pid {pid} for phase {phase} — the lock file's holder \
-                 could not be read back for identity confirmation. Inspect it manually \
-                 (e.g. `ps -p {pid}`) before proceeding."
-            )));
-        }
-    }
+    };
     if agent::terminate(pid) {
-        println!("stop: signalled pid {pid}, phase {phase}'s lock holder");
+        println!("stop: signalled pid {pid}, phase {phase}'s foreground holder");
         Ok(true)
     } else {
         println!("stop: pid {pid} could not be signalled (it may have just exited)");
         Ok(false)
     }
+}
+
+/// Wait up to [`agent::TERMINATE_VERIFY_WAIT`] for `phase`'s holder file to stop reading
+/// live: `true` once nothing holds it. A probe that fails counts as held.
+fn wait_for_holder_release(project_root: &Path, phase: PhaseId) -> bool {
+    let path = liveness::phase_holder_path(project_root, phase);
+    let released = || {
+        matches!(
+            liveness::probe(&path),
+            Ok(liveness::Held::Abandoned | liveness::Held::Missing)
+        )
+    };
+    let deadline = std::time::Instant::now() + agent::TERMINATE_VERIFY_WAIT;
+    while std::time::Instant::now() < deadline {
+        if released() {
+            return true;
+        }
+        std::thread::sleep(agent::TERMINATE_VERIFY_POLL);
+    }
+    released()
+}
+
+/// `stop`'s report over a signalled holder that is still running (D-18): the expected
+/// case while it finishes a hook or a git step, and no stop `stop` can claim.
+fn holder_still_running(project_root: &Path, phase: PhaseId) -> String {
+    let pid = liveness::live_holder(&liveness::phase_holder_path(project_root, phase))
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown".to_string(), |(pid, _)| pid.to_string());
+    format!(
+        "stop: signalled pid {pid}, phase {phase}'s foreground holder, which is still running \
+         {secs}s later, so phase state was not marked stopped. A DevFlow foreground process ends \
+         at its next safe point and records the stop itself, except a `devflow ship` that has \
+         started its finalization pass: it runs the pass to the end and, if the pass succeeds, \
+         ships instead of stopping",
+        secs = agent::TERMINATE_VERIFY_WAIT.as_secs()
+    )
 }
 
 /// Persist the operator's intent: mark `stopped` and record why, preserving
@@ -3770,18 +3793,21 @@ fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> 
 ///
 /// `answered_gate` is the stage and holder status [`stop_via_gate`] observed
 /// when it answered a gate, or `None` when no gate was answered.
+///
+/// `signal_sent` means one fact: [`stop_via_holder`] signalled a foreground holder. A
+/// supervisor ended through its socket is not that, because a supervisor claims no holder
+/// (D-17). It decides both the wait for the holder's release and the line printed over a
+/// missing state.
 fn persist_stopped_state(
     project_root: &Path,
     phase: PhaseId,
     answered_gate: Option<AnsweredGate>,
     signal_sent: bool,
 ) -> Result<(), CliError> {
-    let _phase_lock = if signal_sent {
-        lock::acquire_blocking(project_root, phase, agent::TERMINATE_VERIFY_WAIT)
-    } else {
-        lock::acquire(project_root, phase)
-    };
-    let _phase_lock = match (_phase_lock, answered_gate) {
+    if signal_sent && !wait_for_holder_release(project_root, phase) {
+        return Err(CliError::Message(holder_still_running(project_root, phase)));
+    }
+    let _phase_lock = match (lock::acquire(project_root, phase), answered_gate) {
         (Ok(guard), _) => guard,
         (Err(lock::LockError::Contended { pid, .. }), Some((stage, holder, identity))) => {
             println!(
@@ -3826,9 +3852,20 @@ fn persist_stopped_state(
     Ok(())
 }
 
-/// RED scaffold: today's line whoever `stop` signalled.
-fn missing_state_line(phase: PhaseId, _signal_sent: bool) -> String {
-    format!("stop: no persisted state for phase {phase} — already stopped")
+/// What `stop` prints when the fresh read finds no state. With a signalled holder that
+/// exited, the run ended on its own rather than at a safe point: a `devflow ship` already
+/// in its pass shipped and cleared it, or it aborted. Nobody stopped it (D-18).
+fn missing_state_line(phase: PhaseId, signal_sent: bool) -> String {
+    if signal_sent {
+        format!(
+            "stop: phase {phase}'s signalled foreground holder exited and left no phase state: \
+             the run ended on its own rather than at a safe point (a `devflow ship` that had \
+             started its finalization pass runs it to the end and ships), so nothing was marked \
+             stopped"
+        )
+    } else {
+        format!("stop: no persisted state for phase {phase} — already stopped")
+    }
 }
 
 /// What `stop` can honestly say after answering a gate whose lock it then
