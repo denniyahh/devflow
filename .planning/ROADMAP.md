@@ -522,7 +522,7 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 24/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+**Plans:** 25/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
 plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
 runs in wave 19
 
@@ -603,7 +603,7 @@ runs in wave 19
 
 **Wave 18**
 
-- [ ] 50.1-24-PLAN.md *(depends on 50.1-23)* — 999.166 items 1 and 6 (D-16: exit file 143) (V-28)
+- [x] 50.1-24-PLAN.md *(depends on 50.1-23)* — 999.166 items 1 and 6 (D-16: exit file 143) (V-28)
 
 **Wave 19**
 
@@ -802,7 +802,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
-| 50.1 | 24/30 | In Progress | — |
+| 50.1 | 25/30 | In Progress | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -1030,6 +1030,16 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
+
+### Phase 999.172: A `stopped` Flag Written by Hand During a Gate Wait Does Not Stop the Run (BACKLOG)
+
+**Found:** 2026-11-02, Phase 50.1 plan 50.1-24, carried over from 50.1-10.
+
+**Defect:** a supervisor's safe points read its stop token, not the state's `stopped` field. With `stopped = true` written through `update_state` beside a real supervisor parked at a failed Define gate, approving the gate launched the stage again, so an agent ran under a state that reads `stopped`.
+
+**Reach:** only a hand edit. The production writers were read, not exercised: each runs in the process that owns the run, and `devflow stop`'s write refuses a launch it did not end. A new writer would reach it.
+
+**Fix shape (not tested):** have a safe point also read the state's `stopped` field.
 
 ### Phase 999.171: `agent_running` Can Report a Just-Reaped Process as Running (BACKLOG)
 
