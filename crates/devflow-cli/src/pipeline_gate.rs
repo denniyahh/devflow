@@ -2948,6 +2948,132 @@ mod tests {
         finalizing.join().unwrap().unwrap();
     }
 
+    /// One auto-answered Ship gate at `root`, with a stop token engaged on this thread and
+    /// its stop requested first when `stop`. The notify command writes [`notify_marker`].
+    fn auto_answered_ship_gate(
+        root: &Path,
+        phase: PhaseId,
+        stop: bool,
+    ) -> Result<GateAction, CliError> {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.yes_ship = true;
+        state.gate_notify_cmd = Some(format!(": > '{}'", notify_marker(root).display()));
+        let engaged = RecordedSupervisor::serve(&mut state);
+        workflow::save_state(&state).unwrap();
+        if stop {
+            engaged.request_stop();
+        }
+        let _engaged = crate::pipeline_launch::StopTokenGuard::engage(
+            engaged.supervisor.token(),
+            engaged.launch_id.clone(),
+        );
+        run_gate_with_timeout(root, &mut state, Stage::Ship, "ctx", 30, Some(&approval()))
+    }
+
+    fn notify_marker(root: &Path) -> PathBuf {
+        root.join("notify-ran")
+    }
+
+    /// D-13 item 8: safe point 5 runs before the notify, so a stopped `--yes-ship` run sends
+    /// no "Ship gate awaiting" message for a gate it withdraws at once. Control: with no stop
+    /// the same gate notifies. Its own child, because `DEVFLOW_GATE_NOTIFY_CMD` in the
+    /// runner's environment would replace the state's command.
+    #[test]
+    fn a_stopped_yes_ship_run_sends_no_ship_notify() {
+        const NAME: &str = "pipeline_gate::tests::a_stopped_yes_ship_run_sends_no_ship_notify";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--test-threads=1"])
+                .env(devflow_core::test_support::CHILD_TEST_ENV, NAME)
+                .env_remove(devflow_core::gates::GATE_NOTIFY_CMD_ENV)
+                .output()
+                .unwrap();
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = dir.path().join("stopped");
+        std::fs::create_dir(&stopped).unwrap();
+        let phase = PhaseId::new(2215);
+        let error = auto_answered_ship_gate(&stopped, phase, true)
+            .expect_err("a stopped run does not answer its gate")
+            .to_string();
+        assert!(error.contains("was not auto-answered"), "{error}");
+        assert!(
+            !notify_marker(&stopped).exists(),
+            "no message about a gate the run withdraws"
+        );
+        assert!(events_named(&stopped, "gate_fired").is_empty());
+        assert!(events_named(&stopped, "notify_fired").is_empty());
+        let stops = events_named(&stopped, "advance_stopped");
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0]["safe_point"], 5, "{}", stops[0]);
+        assert!(!Gates::gate_path(&stopped, phase, Stage::Ship).exists());
+
+        let running = dir.path().join("running");
+        std::fs::create_dir(&running).unwrap();
+        let action = auto_answered_ship_gate(&running, phase, false).unwrap();
+        assert_eq!(action, GateAction::Advance);
+        assert!(notify_marker(&running).exists(), "control: the notify runs");
+        assert_eq!(events_named(&running, "gate_fired").len(), 1);
+    }
+
+    /// Comment text as it reads: each line's indent and comment marker dropped, the lines
+    /// joined, whitespace collapsed, so a sentence wrapped over two lines still matches.
+    fn comment_normal_form(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| {
+                let line = line.trim_start();
+                ["///", "//!", "//"]
+                    .iter()
+                    .find_map(|marker| line.strip_prefix(marker))
+                    .unwrap_or(line)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// D-13 item 8, the comment: under D-06 a resumed run reruns Ship, and a saved `yes_ship`
+    /// auto-approves its new gate, so it does not "ask again". The planted control is the
+    /// comment as it stood, whose sentence wraps, so a search of the raw text never finds it.
+    #[test]
+    fn the_safe_point_6_comment_states_what_a_resumed_run_does() {
+        const STALE: &str = "a resumed run asks again";
+        const WRAPPED_AS_IT_STOOD: &str = "    // bump, tag and push. The consumed approval is cleared with it, so a\n    // resumed run asks again. Outside a supervisor's advance (the foreground\n";
+        assert!(
+            !WRAPPED_AS_IT_STOOD.contains(STALE),
+            "control: the raw search misses the wrapped sentence"
+        );
+        assert!(
+            comment_normal_form(WRAPPED_AS_IT_STOOD).contains(STALE),
+            "control: the normal form catches it"
+        );
+
+        let (non_test, _) = include_str!("pipeline_gate.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        assert!(
+            !comment_normal_form(non_test).contains(STALE),
+            "the stale sentence is gone"
+        );
+        let safe_point_6: Vec<&str> = non_test
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("// Safe point 6"))
+            .take_while(|line| line.trim_start().starts_with("//"))
+            .collect();
+        assert!(!safe_point_6.is_empty(), "the safe point 6 comment exists");
+        assert!(
+            comment_normal_form(&safe_point_6.join("\n")).contains("`yes_ship`"),
+            "{safe_point_6:?}"
+        );
+    }
+
     /// Names the D-18 fixture's project root for its finalizing child. Not a DevFlow
     /// setting, so it carries no `DEVFLOW_` prefix the doc check would require documented.
     const MID_MERGE_ROOT_ENV: &str = "P50_1_22_ROOT";
