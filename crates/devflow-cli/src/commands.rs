@@ -3479,6 +3479,7 @@ fn stop_via_socket(
         };
         let ended = match supervisor::probe(&located.socket) {
             Ok(supervisor::Liveness::Gone) => {
+                refuse_stop_beside_a_held_lock(project_root, phase, &located)?;
                 return Ok(SocketStop::NoLiveSocket {
                     gone: located.launch_id,
                 });
@@ -3512,6 +3513,37 @@ fn stop_via_socket(
          record a fresh state reload named); nothing was stopped or recorded — run `devflow \
          status` and `devflow stop --phase {phase}` again"
     )))
+}
+
+/// How long `stop` lets a GONE socket's supervisor release its liveness lock: it unlinks
+/// its socket before it exits, and a shutdown just sent can land in that gap.
+const STOP_LOCK_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Refuse to count a launch as gone while it still holds its liveness lock. `stop` has no
+/// socket to end it through, and marking the run `stopped` would claim it had.
+fn refuse_stop_beside_a_held_lock(
+    project_root: &Path,
+    phase: PhaseId,
+    located: &LocatedSocket,
+) -> Result<(), CliError> {
+    let Some(launch_id) = located.launch_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(path) = liveness::launch_liveness_path(project_root, launch_id) else {
+        return Ok(());
+    };
+    let deadline = std::time::Instant::now() + STOP_LOCK_RELEASE_WAIT;
+    while let Some(holder) = held_liveness_holder(&path) {
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::Message(format!(
+                "stop: phase {phase} launch {launch_id} ({holder}): `devflow stop` cannot reach \
+                 it; nothing was signalled or recorded. End that process, then run `devflow \
+                 stop --phase {phase}` again"
+            )));
+        }
+        std::thread::sleep(PENDING_PUBLISH_POLL);
+    }
+    Ok(())
 }
 
 /// What one shutdown attempt in [`stop_via_socket`] came to.
@@ -4552,7 +4584,9 @@ fn possibly_live_sockets(
         return Ok(state
             .supervisor
             .as_ref()
-            .and_then(recorded_live_socket)
+            .and_then(|record| {
+                recorded_live_socket(record).or_else(|| held_without_socket(project_root, record))
+            })
             .into_iter()
             .chain(
                 state
@@ -4599,6 +4633,9 @@ enum PendingKind {
     Published,
     /// Pending, with no socket yet: only its held liveness lock says it is live.
     Reserved,
+    /// Recorded, with its socket gone: only its held liveness lock says it is live, and
+    /// `stop` has no socket to reach it through.
+    RecordedNoSocket,
 }
 
 /// The liveness a refusal names for a pending supervisor with no socket yet.
@@ -4611,6 +4648,11 @@ impl LiveSocket {
         // No `--launch`: `stop --launch` validates a sidecar, and this has none yet.
         if self.pending == PendingKind::Reserved {
             return format!("launch {id} ({liveness}): run `devflow stop --phase {phase}` first");
+        }
+        if self.pending == PendingKind::RecordedNoSocket {
+            return format!(
+                "launch {id} ({liveness}): `devflow stop` cannot reach it; end that process first"
+            );
         }
         match &self.sidecar_problem {
             None => format!(
@@ -4632,6 +4674,33 @@ impl LiveSocket {
 /// is GONE or STALE over a group the backstop proves gone.
 fn recorded_live_socket(record: &SupervisorRecord) -> Option<LiveSocket> {
     socket_live_socket(&record.socket_path, &record.launch_id, Some(record))
+}
+
+/// The live supervisor `record` names when its GONE socket cannot say so: it holds its
+/// launch's liveness file for its whole life. `None` when nothing holds that file. A probe
+/// that fails is live (fail closed, T-50-40).
+fn held_without_socket(project_root: &Path, record: &SupervisorRecord) -> Option<LiveSocket> {
+    let path = liveness::launch_liveness_path(project_root, &record.launch_id)?;
+    let holder = held_liveness_holder(&path)?;
+    Some(LiveSocket {
+        socket: record.socket_path.clone(),
+        launch_id: record.launch_id.clone(),
+        liveness: holder,
+        sidecar_problem: None,
+        pending: PendingKind::RecordedNoSocket,
+    })
+}
+
+/// Who holds the liveness file at `path`, in words, or `None` when nothing does.
+fn held_liveness_holder(path: &Path) -> Option<String> {
+    match liveness::probe(path) {
+        Ok(liveness::Held::Abandoned | liveness::Held::Missing) => None,
+        Ok(liveness::Held::Live) => Some(match liveness::live_holder(path) {
+            Ok(Some((pid, _))) => format!("socket gone, pid {pid} holds {}", path.display()),
+            _ => format!("socket gone, {} is held", path.display()),
+        }),
+        Err(error) => Some(format!("liveness probe failed ({error})")),
+    }
 }
 
 /// A state's pending supervisor as a [`LiveSocket`], or `None` when its reservation
@@ -15741,6 +15810,78 @@ mod tests {
             "the state file is back as it was before the start"
         );
         assert_eq!(liveness_files(root), Vec::<String>::new());
+    }
+
+    /// The state of a run whose recorded supervisor's socket is gone, with the launch's
+    /// liveness file taken as that supervisor would hold it.
+    fn state_with_a_held_lock_and_no_socket(
+        root: &Path,
+        phase: PhaseId,
+    ) -> (State, liveness::Hold) {
+        let mut state = state_with_pending(root, phase, true);
+        state.pending_supervisor = None;
+        state.verification_baseline_captured = true;
+        workflow::save_state(&state).unwrap();
+        let launch_id = &state.supervisor.as_ref().unwrap().launch_id;
+        let path = liveness::launch_liveness_path(root, launch_id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let hold = liveness::Hold::take(&path).unwrap();
+        (state, hold)
+    }
+
+    /// The launch guard refuses beside a recorded supervisor that holds its liveness file
+    /// with its socket gone, names that process rather than a `stop` that cannot reach it,
+    /// and stops refusing once the lock is released.
+    #[test]
+    fn a_launch_refuses_beside_a_held_lock_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5304);
+        let (state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let existing = workflow::Existing::Loaded(state);
+
+        let refusal =
+            refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None)
+                .unwrap_err()
+                .to_string();
+        assert!(refusal.contains("aaaa0000aaaa5018"), "{refusal}");
+        assert!(
+            refusal.contains(&format!("pid {}", std::process::id())),
+            "{refusal}"
+        );
+        assert!(refusal.contains("cannot reach it"), "{refusal}");
+        assert!(
+            !refusal.contains("devflow stop --phase 5304 --launch"),
+            "{refusal}"
+        );
+
+        let path = hold.path().to_path_buf();
+        drop(hold);
+        wait_until_unheld(&path);
+        refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None).unwrap();
+    }
+
+    /// `stop` does not record `stopped` and exit 0 beside a supervisor whose socket is
+    /// gone, which it could not have ended. Control: with the lock released, it does.
+    #[test]
+    fn stop_refuses_a_held_lock_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5305);
+        let (_state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let cache = tempfile::tempdir().unwrap();
+
+        let err = stop_in(root, phase, Some(cache.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot reach it"), "{err}");
+        assert!(!workflow::load_state(root, phase).unwrap().stopped);
+
+        let path = hold.path().to_path_buf();
+        drop(hold);
+        wait_until_unheld(&path);
+        stop_in(root, phase, Some(cache.path())).unwrap();
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
     }
 
     /// The state a `start` leaves when it is killed during preparation: its real

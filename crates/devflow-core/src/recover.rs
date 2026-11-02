@@ -444,10 +444,18 @@ fn remove_orphan_gate_files(
 /// It reads its socket probes in order and ends at the first that keeps the phase, so
 /// the two [`SOCKET_PROBES_PER_DECISION`] are all a decision makes.
 fn phase_may_be_live(project_root: &Path, state: &State) -> Option<String> {
-    if let Some(record) = &state.supervisor
-        && let Some(reason) = socket_may_be_live("supervisor", &record.socket_path)
-    {
-        return Some(reason);
+    if let Some(record) = &state.supervisor {
+        if let Some(reason) = socket_may_be_live("supervisor", &record.socket_path) {
+            return Some(reason);
+        }
+        // A supervisor holds this for its whole life, so it outlives a socket file that
+        // something outside DevFlow removed.
+        if let Some(path) = crate::liveness::launch_liveness_path(project_root, &record.launch_id) {
+            let held = crate::liveness::probe(&path);
+            if let Some(reason) = hold_may_be_live("supervisor", &path, held) {
+                return Some(reason);
+            }
+        }
     }
     if let Some(pending) = &state.pending_supervisor {
         if let Some(reason) = socket_may_be_live("pending supervisor", &pending.socket_path) {
@@ -2411,6 +2419,49 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("pending supervisor")
+                    && w.contains(&liveness_path.display().to_string())),
+            "{:?}",
+            report.warnings
+        );
+
+        drop(hold);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while state_path.exists() {
+            let report = clean_phase_report(root, phase).expect("explicit clean");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                report.warnings
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A supervisor whose socket file vanished still holds its launch's liveness file, so
+    /// an explicit clean keeps its state. Control: the same record once the lock is
+    /// released is cleaned, so a GONE socket alone was never what kept it.
+    #[test]
+    fn explicit_clean_refuses_a_recorded_supervisor_holding_its_lock_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2131);
+        let record = supervisor_record(root.join("vanished.sock"));
+        let liveness_path = crate::liveness::launch_liveness_path(root, &record.launch_id).unwrap();
+        let mut state = state_aged_phase(root, phase, 0, None);
+        state.supervisor = Some(record);
+        workflow::save_state(&state).unwrap();
+        let hold = crate::liveness::Hold::take(&liveness_path).unwrap();
+        let state_path = workflow::state_path(root, phase);
+
+        let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
+
+        assert!(state_path.exists(), "{:?}", report.warnings);
+        assert!(report.removal_failed);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("supervisor")
                     && w.contains(&liveness_path.display().to_string())),
             "{:?}",
             report.warnings
