@@ -4088,6 +4088,12 @@ fn missing_state_line(phase: PhaseId, signal_sent: bool) -> String {
 /// place first (D-18), so no recorded holder is ever a default-disposition SIGTERM target.
 /// The one path all four foreground entry points claim through. A supervisor never calls
 /// it: it has its own signal pipe, and its process holds a liveness file, not this.
+///
+/// Passing once through the state write lock after the claim is a barrier against a
+/// recovery: one already past its liveness check, under that lock, could not see this
+/// holder and may be deleting the state, so it finishes first and a state read after this
+/// returns sees what it left. Any later recovery sees the holder. Bounded, because a
+/// stuck lock holder must not hang a foreground verb, and refusing then releases the claim.
 pub(crate) fn claim_foreground_holder(
     project_root: &Path,
     phase: PhaseId,
@@ -4098,7 +4104,7 @@ pub(crate) fn claim_foreground_holder(
              because `devflow stop` could then end this process inside a finalization hook"
         ))
     })?;
-    liveness::claim_phase_holder(project_root, phase).map_err(|err| match err {
+    let holder = liveness::claim_phase_holder(project_root, phase).map_err(|err| match err {
         liveness::HolderError::Held { holder } => {
             let pid = holder.map_or_else(|| "unknown".to_string(), |(pid, _)| pid.to_string());
             CliError::Message(format!(
@@ -4110,7 +4116,14 @@ pub(crate) fn claim_foreground_holder(
             "phase {phase}: could not claim the holder file {}: {err}",
             liveness::phase_holder_path(project_root, phase).display()
         )),
-    })
+    })?;
+    workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |_| Ok::<_, CliError>((None, ())),
+    )?;
+    Ok(holder)
 }
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
