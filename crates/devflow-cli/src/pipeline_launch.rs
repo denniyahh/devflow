@@ -2276,7 +2276,12 @@ fn publish_record<E: Into<CliError>>(
     let record = published.record;
     state.supervisor = Some(record.clone());
     if let Err(err) = save(state) {
-        return Err(shut_down_unrecorded(state, &record, err.into()));
+        return Err(shut_down_unrecorded(
+            state,
+            &record,
+            published.supervisor_pid,
+            err.into(),
+        ));
     }
     promote_pending(state);
     if successor_runs_on(&record.socket_path) {
@@ -2358,10 +2363,12 @@ fn save_successor_stop(published: &State) -> Result<(), CliError> {
 /// nothing is cleared or saved, so the in-memory record keeps naming it and
 /// no save erases the handle the file holds, and the error names its socket,
 /// its launch id and the `devflow stop --phase N --launch <id>` repair, which
-/// finds it by its sidecar whatever the state says (50-14).
+/// finds it by its sidecar whatever the state says (50-14). That repair refuses a
+/// suspended supervisor, which cannot answer, so the error also names `kill -CONT`.
 fn shut_down_unrecorded(
     state: &mut State,
     record: &SupervisorRecord,
+    supervisor_pid: u32,
     save_err: CliError,
 ) -> CliError {
     let failed = format!(
@@ -2396,7 +2403,9 @@ fn shut_down_unrecorded(
             };
             CliError::Message(format!(
                 "{failed}; shutting it down at {} did not confirm a stop ({outcome}), so it may \
-                 still be running; run `devflow stop --phase {} --launch {}` to end it",
+                 still be running; run `devflow stop --phase {} --launch {}` to end it. If `stop` \
+                 says it could not probe the socket or the supervisor did not answer, the \
+                 supervisor may be suspended: `kill -CONT {supervisor_pid}` lets the stop proceed",
                 record.socket_path.display(),
                 state.phase,
                 record.launch_id

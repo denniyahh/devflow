@@ -759,8 +759,10 @@ fn start_reserved(
     // state.json, died silently into /dev/null, and the save below then wrote
     // an in-progress state nothing would ever advance. Save first; if the
     // launch fails, clear the just-saved state so `devflow status`/`recover`
-    // don't report a phantom run (the failure WR-11 originally targeted),
-    // unless the supervisor it spawned may still be running.
+    // don't report a phantom run (the failure WR-11 originally targeted).
+    // That holds even for a supervisor that did not confirm a stop: with no
+    // state the next launch sweeps the sockets, which finds it, and a state
+    // naming neither record would skip that sweep.
     create_run_state(project_root, phase, &mut state, launch_id)?;
     *created = false;
     events::emit(
@@ -770,15 +772,6 @@ fn start_reserved(
         workflow_started_payload(&state),
     );
     if let Err(err) = launch_stage(&mut state, None, None) {
-        // A reservation no launch took is this process's own lock, and would read live.
-        crate::pipeline_launch::abandon_reservation(project_root, phase, false);
-        if let Some(found) = failed_launch_may_still_run(project_root, phase, &state) {
-            eprintln!(
-                "warning: kept phase {phase}'s state after the failed launch: {found} may still \
-                 be running, and `devflow stop` needs the state to reach it"
-            );
-            return Err(err);
-        }
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -790,37 +783,6 @@ fn start_reserved(
     );
     println!("  watch live: devflow logs -f --phase {phase}");
     Ok(())
-}
-
-/// The supervisors a failed launch's own copy of the state names that may still be live,
-/// read as the launch guard reads them. The launcher's copy, not the file: the publish sets
-/// the record in it before the save, so it names a supervisor whose save failed. A launch
-/// that got a confirmed stop, or never spawned, has cleared the record from it.
-fn failed_launch_may_still_run(
-    project_root: &Path,
-    phase: PhaseId,
-    launcher_view: &State,
-) -> Option<String> {
-    let cache_dir = registry::cache_dir();
-    match possibly_live_sockets(
-        project_root,
-        phase,
-        Some(launcher_view),
-        cache_dir.as_deref(),
-    ) {
-        Ok(sockets) if sockets.is_empty() => None,
-        Ok(sockets) => Some(
-            sockets
-                .iter()
-                .map(|socket| format!("launch {} ({})", socket.launch_id, socket.liveness))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        Err((dir, why)) => Some(format!(
-            "a supervisor (the socket directory {} could not be listed: {why})",
-            dir.display()
-        )),
-    }
 }
 
 /// Write a fresh run's state for `start`, under the write lock, over the state its
@@ -15396,18 +15358,39 @@ mod tests {
         );
     }
 
+    /// What [`start_failing_its_publish_save`] left. Dropping it ends the supervisor and
+    /// its agent, so a failed assertion leaks neither.
+    struct FailedStart {
+        error: String,
+        launch_id: String,
+        socket: PathBuf,
+        supervisor_pid: libc::pid_t,
+        agent_pgid: libc::pid_t,
+        state_left: bool,
+    }
+
+    impl Drop for FailedStart {
+        fn drop(&mut self) {
+            // SAFETY: both name processes this test's own start launched; a SIGKILL also
+            // ends a stopped process. A group already gone only makes these fail.
+            unsafe {
+                libc::kill(self.supervisor_pid, libc::SIGKILL);
+                libc::kill(-self.agent_pgid, libc::SIGKILL);
+            }
+        }
+    }
+
     /// A `start` whose publish save fails, with `stop_supervisor` deciding whether the
-    /// launcher can get a confirmed stop out of the supervisor it spawned. Returns the
-    /// launch's error, the launch id, and whether a state file was left. The reservation
+    /// launcher can get a confirmed stop out of the supervisor it spawned. The reservation
     /// is cleared at the hold, which is what fails the save.
     fn start_failing_its_publish_save(
         root: &Path,
         phase: PhaseId,
         stop_supervisor: bool,
-    ) -> (String, String, bool) {
+    ) -> FailedStart {
         init_start_repo(root, phase);
         let release = launch_hold_release();
-        let (result, launch_id, sidecar) = std::thread::scope(|scope| {
+        let (result, pending, sidecar) = std::thread::scope(|scope| {
             let worker = scope.spawn(|| start_for_test(root, phase));
             assert!(reached_hold(&release, &worker), "start reached the publish");
             let pending = workflow::load_state(root, phase)
@@ -15435,49 +15418,183 @@ mod tests {
             })
             .unwrap();
             std::fs::write(&release, "").unwrap();
-            (worker.join().unwrap(), pending.launch_id, sidecar)
+            (worker.join().unwrap(), pending, sidecar)
         });
-        let kept = workflow::state_path(root, phase).exists();
-        // SAFETY: both name processes this test's own start launched; a SIGKILL also ends
-        // a stopped process. A group already gone only makes these fail.
-        unsafe {
-            libc::kill(
-                libc::pid_t::try_from(sidecar.supervisor_pid).unwrap(),
-                libc::SIGKILL,
-            );
-            libc::kill(
-                -libc::pid_t::try_from(sidecar.agent_pgid).unwrap(),
-                libc::SIGKILL,
-            );
+        FailedStart {
+            error: result.expect_err("the publish save fails"),
+            launch_id: pending.launch_id,
+            socket: pending.socket_path,
+            supervisor_pid: libc::pid_t::try_from(sidecar.supervisor_pid).unwrap(),
+            agent_pgid: libc::pid_t::try_from(sidecar.agent_pgid).unwrap(),
+            state_left: workflow::state_path(root, phase).exists(),
         }
-        (result.expect_err("the publish save fails"), launch_id, kept)
     }
 
-    /// The error of a publish it cannot confirm stopped tells the operator to run
-    /// `devflow stop --phase N --launch ID`, which needs the run's state to still be there.
-    /// The supervisor is really stopped (SIGSTOP), so its answer never comes.
+    /// The `start --force` an operator runs after a failed one: the failed start left its
+    /// feature branch, which a plain `start` refuses only after the live-run guard has passed.
+    fn start_again_with_force(root: &Path, phase: PhaseId) -> Result<(), String> {
+        start(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            true,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// Run the test `name` in a hermetic child with the publish hold set, returning `true`
+    /// in the parent, whose work is done, and `false` in the child.
+    fn parent_of_a_failed_publish_child(name: &str) -> bool {
+        if devflow_core::test_support::in_child_test(name) {
+            return false;
+        }
+        let path_dir = crate::test_support::go_waiting_claude_dir();
+        let hold = tempfile::tempdir().unwrap();
+        let spec = launch_hold_spec("before_publish_save", hold.path());
+        let output = crate::test_support::run_hermetic_test_in_child(
+            name,
+            path_dir.path(),
+            &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, name);
+        true
+    }
+
+    /// A failed `start` whose supervisor never confirmed a stop leaves no state, so the
+    /// next `start` reads `Missing` and sweeps the sockets. A state naming neither the record
+    /// nor the reservation would skip that sweep and launch beside the supervisor.
     #[test]
-    fn a_start_keeps_the_state_when_its_supervisor_may_still_be_running() {
+    fn a_second_start_refuses_beside_a_failed_starts_stopped_supervisor() {
         const NAME: &str =
-            "commands::tests::a_start_keeps_the_state_when_its_supervisor_may_still_be_running";
-        if !devflow_core::test_support::in_child_test(NAME) {
-            let path_dir = crate::test_support::go_waiting_claude_dir();
-            let hold = tempfile::tempdir().unwrap();
-            let spec = launch_hold_spec("before_publish_save", hold.path());
-            let output = crate::test_support::run_hermetic_test_in_child(
-                NAME,
-                path_dir.path(),
-                &[(LAUNCH_HOLD_ENV, spec.as_os_str())],
-            );
-            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            "commands::tests::a_second_start_refuses_beside_a_failed_starts_stopped_supervisor";
+        if parent_of_a_failed_publish_child(NAME) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let (error, launch_id, kept) =
-            start_failing_its_publish_save(dir.path(), PhaseId::new(5033), true);
-        assert!(error.contains("did not confirm a stop"), "{error}");
-        assert!(error.contains(&format!("--launch {launch_id}")), "{error}");
-        assert!(kept, "the state the error relies on was deleted: {error}");
+        let (root, phase) = (dir.path(), PhaseId::new(5033));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        assert!(
+            failed.error.contains("did not confirm a stop"),
+            "{}",
+            failed.error
+        );
+        // Only the supervisor is left, so its socket is all that can refuse: a live agent
+        // would also trip the agent pid file check on any state that kept that check on.
+        // SAFETY: names the agent group this test's own start launched.
+        unsafe { libc::kill(-failed.agent_pgid, libc::SIGKILL) };
+
+        let second = start_again_with_force(root, phase);
+        let _reap = workflow::load_state(root, phase)
+            .ok()
+            .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
+
+        let refused = second.expect_err("a second supervisor was launched beside the first");
+        assert!(refused.contains(&failed.launch_id), "{refused}");
+    }
+
+    /// With the socket and sidecar gone the stopped supervisor is still there and nothing
+    /// can find it, and the same second `start` goes through: the refusal above comes
+    /// from the sweep, not from the supervisor or anything else the failed start left.
+    #[test]
+    fn a_second_start_launches_when_the_sweep_has_nothing_to_find() {
+        const NAME: &str =
+            "commands::tests::a_second_start_launches_when_the_sweep_has_nothing_to_find";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5037));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        std::fs::remove_file(&failed.socket).unwrap();
+        std::fs::remove_file(failed.socket.with_extension("json")).unwrap();
+
+        let second = start_again_with_force(root, phase);
+        let _reap = workflow::load_state(root, phase)
+            .ok()
+            .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
+
+        second.expect("nothing to find, so nothing refuses");
+    }
+
+    /// The sidecar alone is not what the sweep needs: the socket's name still attributes it
+    /// to this root and phase, so a missing sidecar refuses too.
+    #[test]
+    fn a_second_start_refuses_when_only_the_sidecar_is_gone() {
+        const NAME: &str = "commands::tests::a_second_start_refuses_when_only_the_sidecar_is_gone";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5038));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        std::fs::remove_file(failed.socket.with_extension("json")).unwrap();
+
+        let second = start_again_with_force(root, phase);
+        let _reap = workflow::load_state(root, phase)
+            .ok()
+            .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
+
+        let refused = second.expect_err("the socket's name still attributes it");
+        assert!(refused.contains(&failed.launch_id), "{refused}");
+    }
+
+    /// A known limit, and what the failed `start`'s error has to stay true about: `stop`
+    /// finds a suspended supervisor with no state file but cannot get an answer out of it,
+    /// so it refuses and changes nothing. The error names the way out.
+    #[test]
+    fn the_stop_a_failed_start_names_refuses_over_a_suspended_supervisor() {
+        const NAME: &str =
+            "commands::tests::the_stop_a_failed_start_names_refuses_over_a_suspended_supervisor";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5039));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        assert!(!failed.state_left, "the run's state is gone");
+        for named in [
+            format!("devflow stop --phase {phase} --launch {}", failed.launch_id),
+            format!("kill -CONT {}", failed.supervisor_pid),
+        ] {
+            assert!(failed.error.contains(&named), "{named}: {}", failed.error);
+        }
+
+        let refused = stop_launch(root, phase, &failed.launch_id)
+            .expect_err("no answer comes from a suspended supervisor")
+            .to_string();
+
+        assert!(refused.contains("could not probe socket"), "{refused}");
+        assert!(refused.contains("nothing was signalled"), "{refused}");
+    }
+
+    /// Once a suspended supervisor runs again it ends. Which way is a race and not asserted:
+    /// the shutdown still queued from the failed `start` can end it under this `stop`, which
+    /// then returns Ok, or an error when its sidecar has gone mid-lookup.
+    #[test]
+    fn a_failed_starts_suspended_supervisor_ends_once_it_runs_and_is_stopped() {
+        const NAME: &str = "commands::tests::a_failed_starts_suspended_supervisor_ends_once_it_runs_and_is_stopped";
+        if parent_of_a_failed_publish_child(NAME) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5040));
+        let failed = start_failing_its_publish_save(root, phase, true);
+        // SAFETY: names the supervisor this test's own start launched.
+        unsafe { libc::kill(failed.supervisor_pid, libc::SIGCONT) };
+
+        let _either_outcome = stop_launch(root, phase, &failed.launch_id);
+
+        let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+        while agent::agent_running(u32::try_from(failed.supervisor_pid).unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "the supervisor ended");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// The same failed publish, with a supervisor that confirms its stop, still leaves no
@@ -15500,13 +15617,17 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let (error, _, kept) =
-            start_failing_its_publish_save(dir.path(), PhaseId::new(5034), false);
+        let failed = start_failing_its_publish_save(dir.path(), PhaseId::new(5034), false);
         assert!(
-            error.contains("was shut down through its socket"),
-            "{error}"
+            failed.error.contains("was shut down through its socket"),
+            "{}",
+            failed.error
         );
-        assert!(!kept, "no supervisor is left, so no run should be: {error}");
+        assert!(
+            !failed.state_left,
+            "no supervisor is left: {}",
+            failed.error
+        );
     }
 
     /// A `start` that fails after reserving gives the reservation back: a state it
