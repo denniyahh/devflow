@@ -15,6 +15,7 @@
 #   check-supervisor-evidence.sh --attempt-gate <P50 home> [--p49-check <script>]
 #                                [--current-source [--repo <checkout>]]
 #   check-supervisor-evidence.sh --published <dir> [--attempt <N>]
+#   check-supervisor-evidence.sh --attempt-record <record> --published <dir> --attempt <N>
 #   check-supervisor-evidence.sh --identity-scan <dir> [--tokens <file> | --repo <checkout>]
 #   check-supervisor-evidence.sh --live-run <50-LIVE-RUN.md> [--attempt <N>]
 #   check-supervisor-evidence.sh --handoff <50-LIVE-RUN.md> --plan <50-20-PLAN.md>
@@ -99,6 +100,25 @@
 # `PUBLISHED attempt_current_source=yes|no|n/a` and `PUBLISHED
 # attempt_fault=<name|ABSENT>` (ABSENT for cap_reached, which pairs no fault
 # directory), then the one verdict line. Without --attempt nothing changes.
+#
+# --attempt-record <record> --published <dir> --attempt <N> (50.1-28, R2-02)
+# binds a live-run record to one published attempt. It runs `--published <dir>
+# --attempt <N>` unchanged and prints its output (`RECORD published=fail` when
+# that exits non-zero), takes the branch from its `verdict_line=`, and requires
+# a line holding `What this attempt does not establish` and attempt N's
+# `verdict.json` with `.attempt` equal to N. Shipped: `outcome` shipped,
+# `workflow_shipped` true, the exact lines `- attempt: <N>` and `- commit: <C>`
+# (C from attempt N's first `workflow_started` event) and no cap section. Cap
+# reached: the exact lines `## Not shipped: attempt cap reached` and `## Operator
+# decision needed`, no `- attempt: ` line, and one `- stopped attempt K: commit
+# C; stop note: S` line for each attempt in the set `attempt_gate` counts (every
+# `attempt-*/verdict.json` that is a noted stop), with K's own commit, its own
+# note with whitespace runs collapsed, and that set's size in attempt N's gate
+# line. A directory with no verdict is neither counted nor required. Prints
+# `RECORD branch=shipped|cap_reached|ABSENT ...`, one `RECORD <problem>` line per
+# problem and `RECORD verdict=pass|fail`. It re-reads published files and re-runs
+# nothing: it does not judge the record's prose, its named-check table or any
+# other value in it, and an extra `- commit: ` line beside the right one passes.
 #
 # --identity-scan (50-29, T-50-107) refuses a tree holding any fragment of an
 # email address. Addresses come from <file> (one per line, blank lines
@@ -809,6 +829,198 @@ print(f'PUBLISHED attempt={number} verdict_line=ABSENT')
 print('PUBLISHED attempt_current_source=n/a')
 print('PUBLISHED attempt_fault=ABSENT')
 sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# --attempt-record (50.1-28): bind a live-run record to one published attempt.
+# One `RECORD <problem>` line per problem, then `RECORD verdict=pass|fail`.
+# ---------------------------------------------------------------------------
+attempt_record_check() {
+    python3 - "$SELF" "$1" "$2" "$3" <<'PY'
+import json, pathlib, re, subprocess, sys
+
+CAP_SECTION = '## Not shipped: attempt cap reached'
+ESCALATION = '## Operator decision needed'
+LIMITS = 'What this attempt does not establish'
+LISTED = re.compile(r'- stopped attempt ([1-9][0-9]*): commit (\S+); stop note: (.*)')
+GATE_COUNT = re.compile(r'ATTEMPT_GATE verdict=cap_reached stopped_attempts=([0-9]+)')
+
+script, record_path, root, number = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+problems = []
+
+
+def problem(line):
+    if line not in problems:
+        problems.append(line)
+        print(line)
+
+
+def read_verdict(path):
+    """(the JSON object, None), or (None, 'ABSENT' | 'MALFORMED')."""
+    try:
+        value = json.loads(path.read_bytes())
+    except OSError:
+        return None, 'ABSENT'
+    except (ValueError, RecursionError):
+        return None, 'MALFORMED'
+    return (value, None) if isinstance(value, dict) else (None, 'MALFORMED')
+
+
+def names_attempt(value, attempt):
+    field = value.get('attempt')
+    return type(field) is int and str(field) == attempt
+
+
+def commit_of(attempt):
+    """The commit of attempt's first workflow_started event, or None."""
+    path = root / f'attempt-{attempt}' / 'collected' / 'devflow' / 'events.jsonl'
+    try:
+        lines = path.read_text(errors='replace').split('\n')
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(event, dict) and event.get('event') == 'workflow_started':
+            commit = event.get('commit')
+            return commit if isinstance(commit, str) and commit else None
+    return None
+
+
+def run_published():
+    """Run the unchanged --published check; print its output; return the branch."""
+    try:
+        result = subprocess.run(['bash', script, '--published', str(root), '--attempt', number],
+                                capture_output=True, text=True, errors='replace', timeout=120)
+    except subprocess.TimeoutExpired:
+        problem('RECORD published=fail')
+        return 'ABSENT'
+    print(result.stdout, end='')
+    print(result.stderr, end='')
+    if result.returncode != 0:
+        problem('RECORD published=fail')
+    wanted = re.compile(rf'PUBLISHED attempt={number} verdict_line=(shipped|cap_reached|ABSENT)')
+    found = [m.group(1) for m in map(wanted.fullmatch, result.stdout.split('\n')) if m]
+    return found[0] if found else 'ABSENT'
+
+
+def read_record():
+    try:
+        return record_path.read_text(errors='replace').split('\n')
+    except OSError:
+        problem(f'RECORD file=ABSENT {record_path}')
+        return None
+
+
+def judge_shipped(lines, verdict):
+    if verdict is not None and (verdict.get('outcome') != 'shipped' or verdict.get('workflow_shipped') is not True):
+        problem(f'RECORD verdict_json=DISAGREES attempt={number}')
+    commit = commit_of(number)
+    if commit is None:
+        problem(f'RECORD commit=ABSENT attempt={number}')
+    if lines is not None:
+        if f'- attempt: {number}' not in lines:
+            problem('RECORD missing=attempt-line')
+        if commit is not None and f'- commit: {commit}' not in lines:
+            problem(f'RECORD missing=commit-line commit={commit}')
+        if CAP_SECTION in lines:
+            problem('RECORD contradicts=cap-section')
+    print(f"RECORD branch=shipped attempt={number} commit={commit or 'ABSENT'}")
+
+
+def counted_stops():
+    """The set attempt_gate counts: suffix to stop note, for each noted stop."""
+    counted = {}
+    for path in sorted(root.glob('attempt-*/verdict.json')):
+        suffix = path.parent.name[len('attempt-'):]
+        value, state = read_verdict(path)
+        if state == 'MALFORMED':
+            problem(f'RECORD verdict_json=MALFORMED attempt={suffix}')
+        if value is None:
+            continue
+        note = value.get('stop_note')
+        if value.get('outcome') == 'stopped' and isinstance(note, str) and note.strip():
+            counted[suffix] = note
+            if not (re.fullmatch(r'[1-9][0-9]*', suffix) and names_attempt(value, suffix)):
+                problem(f'RECORD stopped_verdict=BAD attempt={suffix}')
+    return counted
+
+
+def gate_count():
+    """stopped_attempts from attempt N's own cap_reached line, or 'ABSENT'."""
+    values = set()
+    attempt_dir = root / f'attempt-{number}'
+    for path in sorted(attempt_dir.iterdir()) if attempt_dir.is_dir() else []:
+        if path.is_file() and not path.is_symlink():
+            for line in path.read_text(errors='replace').split('\n'):
+                match = GATE_COUNT.fullmatch(line)
+                if match:
+                    values.add(match.group(1))
+    return values.pop() if len(values) == 1 else 'ABSENT'
+
+
+def judge_listed(lines, counted):
+    seen = set()
+    for line in lines:
+        match = LISTED.fullmatch(line)
+        if not match:
+            continue
+        attempt, commit, note = match.groups()
+        if attempt in seen:
+            problem(f'RECORD duplicate=stopped-attempt-{attempt}')
+            continue
+        seen.add(attempt)
+        if attempt not in counted:
+            problem(f'RECORD uncounted=stopped-attempt-{attempt}')
+            continue
+        actual = commit_of(attempt)
+        if actual is None:
+            problem(f'RECORD commit=ABSENT attempt={attempt}')
+        elif actual != commit:
+            problem(f'RECORD commit=MISMATCH attempt={attempt}')
+        if note != ' '.join(counted[attempt].split()):
+            problem(f'RECORD stop_note=MISMATCH attempt={attempt}')
+    for attempt in counted:
+        if attempt not in seen:
+            problem(f'RECORD missing=stopped-attempt-{attempt}')
+
+
+def judge_cap(lines):
+    counted = counted_stops()
+    gate = gate_count()
+    if gate != str(len(counted)):
+        problem(f'RECORD stopped_count=MISMATCH gate={gate} counted={len(counted)}')
+    if lines is not None:
+        if CAP_SECTION not in lines:
+            problem('RECORD missing=cap-section')
+        if ESCALATION not in lines:
+            problem('RECORD missing=escalation')
+        if any(line.startswith('- attempt: ') for line in lines):
+            problem('RECORD contradicts=shipped-claim')
+        judge_listed(lines, counted)
+    print(f'RECORD branch=cap_reached attempt={number} stopped_attempts={len(counted)}')
+
+
+branch = run_published()
+record = read_record()
+if record is not None and not any(LIMITS in line for line in record):
+    problem('RECORD missing=limits-section')
+verdict, state = read_verdict(root / f'attempt-{number}' / 'verdict.json')
+if state:
+    problem(f'RECORD verdict_json={state} attempt={number}')
+elif not names_attempt(verdict, number):
+    problem(f'RECORD verdict_json=DISAGREES attempt={number}')
+if branch == 'shipped':
+    judge_shipped(record, verdict)
+elif branch == 'cap_reached':
+    judge_cap(record)
+else:
+    problem(f'RECORD branch=ABSENT attempt={number}')
+print(f"RECORD verdict={'fail' if problems else 'pass'}")
+sys.exit(1 if problems else 0)
 PY
 }
 
@@ -2749,6 +2961,10 @@ main() {
             [ -n "$dir" ] || usage
             [ -z "$number" ] || [[ "$number" =~ ^[1-9][0-9]*$ ]] || usage
             published_check "$dir" "$number"
+            ;;
+        --attempt-record)
+            [ "$#" -eq 6 ] && [ "$3" = --published ] && [ "$5" = --attempt ] && [[ "$6" =~ ^[1-9][0-9]*$ ]] || usage
+            attempt_record_check "$2" "$4" "$6"
             ;;
         --identity-scan)
             local dir="" tokens="" repo=""
