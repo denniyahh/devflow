@@ -205,6 +205,96 @@ fn explicit_clean_with_an_unheld_registration_cleans() {
     assert!(!waiter.exists(), "the unheld registration must be removed");
 }
 
+/// `recover` with no flags says why a phase may be live; a phase with nothing live prints
+/// no such line.
+#[test]
+fn inspect_prints_why_a_phase_may_be_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let (waited, idle) = (PhaseId::new(73), PhaseId::new(74));
+    save_state_aged(root, waited, 60);
+    save_state_aged(root, idle, 60);
+    let (_opened, registration) = Gates::open_registered(root, waited, Stage::Code, "waiting")
+        .expect("register as the gate's waiter");
+    let home = common::HermeticHome::new();
+
+    let output = common::hermetic_devflow(&home)
+        .arg("recover")
+        .arg(root)
+        .output()
+        .expect("run devflow recover");
+    drop(registration);
+
+    let text = combined(&output);
+    assert!(output.status.success(), "inspect failed: {text}");
+    let idle_at = text.find("phase: 74").expect(&text);
+    let (waited_part, idle_part) = text.split_at(idle_at);
+    assert!(
+        waited_part.contains("may be live:") && waited_part.contains("registered gate waiter"),
+        "{text}"
+    );
+    assert!(!idle_part.contains("may be live:"), "{text}");
+}
+
+/// The sweep names each abandoned marker it removed, and lists a set-aside answer it left.
+#[test]
+fn sweep_names_the_markers_it_removed_and_the_answers_it_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    let phase = PhaseId::new(75);
+    let gate = Gates::open_gate(root, phase, Stage::Code, "ctx")
+        .unwrap()
+        .gate_id;
+    Gates::answer(
+        root,
+        phase,
+        Stage::Code,
+        &gate,
+        &devflow_core::gates::GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("test".into()),
+        },
+    )
+    .unwrap();
+    Gates::close(root, phase, Stage::Code).unwrap();
+    let answers = Gates::quarantined(root);
+    assert_eq!(answers.len(), 1, "fixture: {answers:?}");
+    let marker = root.join(".devflow/supervisor-aaaa0000aaaa0075.live");
+    drop(devflow_core::liveness::Hold::take(&marker).unwrap());
+
+    // A released flock can read held while another test's fork is before its exec.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = combined(&recover_clean(root, None));
+        if !marker.exists() {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "never removed: {text}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(
+        text.contains(&format!("removed abandoned marker {}", marker.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains("set-aside gate answers kept")
+            && text.contains(&answers[0].path.display().to_string()),
+        "{text}"
+    );
+    assert!(
+        answers[0].path.exists(),
+        "a set-aside answer is never removed"
+    );
+    assert!(
+        !text.contains("no stale workflow state was cleaned"),
+        "a sweep that removed a marker must not say it cleaned nothing: {text}"
+    );
+}
+
 /// Fix-review finding C-3: `clean_phase` is idempotent, so an explicit clean
 /// of a phase with nothing on disk succeeded and printed "cleaned up".
 /// `explicit_clean_of_a_phase_with_nothing_live_cleans_and_says_so` is the control.
