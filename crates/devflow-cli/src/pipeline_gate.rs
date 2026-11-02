@@ -2222,6 +2222,55 @@ mod tests {
         );
     }
 
+    /// The retry gate asks the operator to resolve the failure and approve. A repair committed
+    /// to the feature branch must be merged by the retry, or the same failure comes back,
+    /// and it must still not cut a second release.
+    #[test]
+    fn a_finalization_retry_merges_a_repair_without_a_second_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(92);
+        ship_ready_fixture(root, phase);
+        let git = |args: &[&str]| {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        // A directory where the changelog goes fails `ChangelogAppend` only.
+        std::fs::create_dir(root.join("CHANGELOG.md")).unwrap();
+
+        let (finished, repair) = std::thread::scope(|scope| {
+            let finalizing = scope.spawn(|| {
+                let mut state = workflow::load_state(root, phase).unwrap();
+                finish_workflow_with_gate_timeout(root, &mut state, 30)
+            });
+            wait_for_open_gate(root, phase, Stage::Ship);
+            git(&["checkout", "-q", "feature/phase-92"]);
+            std::fs::write(root.join("repair.txt"), "repair\n").unwrap();
+            git(&["add", "repair.txt"]);
+            git(&["commit", "-q", "-m", "fix: the repair"]);
+            let repair = git(&["rev-parse", "HEAD"]);
+            git(&["checkout", "-q", "develop"]);
+            std::fs::remove_dir(root.join("CHANGELOG.md")).unwrap();
+            answer_open_gate(root, phase, Stage::Ship, &approval()).unwrap();
+            (finalizing.join().unwrap(), repair)
+        });
+        finished.expect("the retry finishes the batch");
+
+        let on_develop = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", &repair, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(on_develop, "the repair was never merged");
+        let tags = git(&["tag"]);
+        assert_eq!(tags.lines().count(), 1, "one release, got tags: {tags}");
+        assert_eq!(hook_runs(root, "VersionBump"), 1);
+    }
+
     /// A recovery that has passed its liveness check, holding the state write lock, cannot
     /// see a holder claimed after that check. `devflow ship` must not read the state it is
     /// about to delete and run hooks beside it: the recovery lands wholly first, and Ship
@@ -3153,11 +3202,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(
-            hook_runs(root, "Merge"),
-            1,
-            "the pass resumes at the hook that failed"
-        );
+        assert_eq!(hook_runs(root, "Merge"), 2);
         assert!(events_named(root, "advance_stopped").is_empty());
 
         answer_open_gate(
