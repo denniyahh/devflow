@@ -788,11 +788,13 @@ mod tests {
     /// absent, so an unreadable mask never reads as clear.
     #[cfg(target_os = "linux")]
     fn own_signal_mask(field: &str) -> u64 {
-        let status = std::fs::read_to_string("/proc/self/status").expect("read own status");
+        // This thread's, not `/proc/self`'s: that shows the main thread, which blocks
+        // nearly every signal for a moment while libtest spawns this test's thread.
+        let status = std::fs::read_to_string("/proc/thread-self/status").expect("read own status");
         let hex = status
             .lines()
             .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
-            .unwrap_or_else(|| panic!("no {field} line in /proc/self/status"))
+            .unwrap_or_else(|| panic!("no {field} line in /proc/thread-self/status"))
             .trim();
         u64::from_str_radix(hex, 16).expect("signal masks are hex")
     }
