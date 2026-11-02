@@ -2902,13 +2902,15 @@ pub(crate) fn handle_ambiguous_outcome(
 /// The reservation at the top (D-01, D-08) refuses to resume while the phase's
 /// supervisor or agent remains live, and writes the pending record in one step with
 /// that check; see [`crate::commands::reserve_launch`]. A resume that fails, or
-/// returns without spawning from it, gives the reservation back.
+/// returns without spawning from it, gives the reservation back. The phase's holder is
+/// claimed first (D-17), so a resume another foreground process refuses reserves nothing.
 pub(crate) fn resume(
     project_root: &Path,
     phase: PhaseId,
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
+    let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
     let reserved = crate::commands::reserve_launch(
         project_root,
         phase,
@@ -2917,6 +2919,8 @@ pub(crate) fn resume(
         devflow_core::registry::cache_dir().as_deref(),
     )?;
     hold_reservation(reserved.reservation);
+    #[cfg(test)]
+    launch_test_hold("holder_claimed");
     let result = resume_loaded(
         project_root,
         phase,

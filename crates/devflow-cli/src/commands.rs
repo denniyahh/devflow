@@ -405,6 +405,11 @@ pub(crate) fn start(
         return Ok(());
     }
 
+    // D-17: hold the phase from before the reservation until this returns, so `stop`
+    // reaches this process before its spawn. A launcher refused here has reserved nothing,
+    // so a racing holder's own launch never meets a pending record left by it.
+    let _phase_holder = claim_foreground_holder(project_root, phase)?;
+
     // D-01, D-08: the reservation excludes a second launcher. Its guard runs before
     // any gate cleanup, git mutation or run state, so a refusal changes nothing.
     let reserved = reserve_launch(
@@ -417,6 +422,8 @@ pub(crate) fn start(
     let launch_id = reserved.reservation.launch_id().to_string();
     let mut created = reserved.created;
     crate::pipeline_launch::hold_reservation(reserved.reservation);
+    #[cfg(test)]
+    crate::pipeline_launch::launch_test_hold("holder_claimed");
     let result = start_reserved(
         project_root,
         state,

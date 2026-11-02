@@ -828,11 +828,20 @@ fn two_concurrent_starts_yield_exactly_one_live_supervisor() {
         "the loser's refusal must name `devflow stop`\n{}",
         report(loser)
     );
-    assert!(
-        stderr.contains("a run is still live"),
-        "the loser must be refused by the reservation's live-run guard\n{}",
-        report(loser)
-    );
+    // While the winner is before its spawn its holder decides; once its supervisor is live
+    // the reservation's guard does. Either is a correct refusal, and which one depends on
+    // the timing of this run.
+    let refused_by = if stderr.contains("is held by a foreground DevFlow process") {
+        "the holder"
+    } else if stderr.contains("a run is still live") {
+        "the reservation's live-run guard"
+    } else {
+        panic!(
+            "the loser must be refused by the holder or the live-run guard\n{}",
+            report(loser)
+        );
+    };
+    println!("the loser was refused by {refused_by}");
 
     let (alive, pgids) = live_supervisors(&home);
     assert_eq!(
