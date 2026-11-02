@@ -18,7 +18,7 @@ use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use crate::state::{AgentKind, State};
 use crate::supervisor::SocketPath;
-use crate::supervisor::runtime::{AgentOutcome, Supervisor};
+use crate::supervisor::runtime::{AgentGroupEnd, AgentOutcome, Supervisor};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -1598,6 +1598,9 @@ pub struct StageRun {
     /// The promotion watch's verdict. `None` when no watch ran
     /// ([`StageSpec::promotion_wait`]), or a stop ended it before it had one.
     pub promotion: Option<Promotion>,
+    /// What ending the agent's group did, when the promotion watch's verdict led it to
+    /// end the group (a verdict other than [`Promotion::Recorded`]).
+    pub agent_group_end: Option<AgentGroupEnd>,
 }
 
 /// How long [`confirm_own_group`] waits for a just-spawned agent's
@@ -1753,6 +1756,7 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         supervisor,
         liveness,
         promotion,
+        agent_group_end: None,
     })
 }
 
