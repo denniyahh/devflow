@@ -990,6 +990,10 @@ pub(crate) const SUPERVISOR_STOP_REASON: &str =
 /// (50-13, R-2).
 pub(crate) const ADVANCE_STOP_REASON: &str = "stopped through the supervisor during advance";
 
+/// The stop reason a foreground holder records when it stops at a safe point because
+/// `devflow stop` signalled it (D-18).
+pub(crate) const HOLDER_STOP_REASON: &str = "stopped by devflow stop at a foreground safe point";
+
 /// The bound on the two waits a stop can put between two supervisors
 /// (50-13, T-50-54): a stopped supervisor's wait for the state write lock
 /// before it records its stop, and safe point 3's wait for an unpublished
@@ -1220,13 +1224,29 @@ pub(crate) fn stop_requested_at_safe_point() -> bool {
     with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere)
 }
 
+/// The reason a stop at a safe point on this thread records: [`ADVANCE_STOP_REASON`]
+/// inside a supervisor's advance, [`HOLDER_STOP_REASON`] anywhere else (D-18).
+pub(crate) fn safe_point_stop_reason() -> &'static str {
+    if with_stop_token(|_| ()).is_some() {
+        ADVANCE_STOP_REASON
+    } else {
+        HOLDER_STOP_REASON
+    }
+}
+
 /// Persist a stop an advance honoured at `safe_point`: `stopped` with
-/// [`ADVANCE_STOP_REASON`] and `gate_pending` cleared in one write, and an
-/// `advance_stopped` event naming the point.
+/// [`safe_point_stop_reason`] and `gate_pending` cleared in one write, and an
+/// `advance_stopped` event naming the point and whose stop it was.
 pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(), CliError> {
+    let reason = safe_point_stop_reason();
+    let source = if with_stop_token(|_| ()).is_some() {
+        "supervisor"
+    } else {
+        "foreground_holder"
+    };
     commit(state, |s| {
         s.stopped = true;
-        s.stop_reason = Some(ADVANCE_STOP_REASON.to_string());
+        s.stop_reason = Some(reason.to_string());
         s.gate_pending = false;
     })?;
     events::emit(
@@ -1236,12 +1256,10 @@ pub(crate) fn record_advance_stop(state: &mut State, safe_point: u8) -> Result<(
         serde_json::json!({
             "stage": state.stage.to_string(),
             "safe_point": safe_point,
+            "source": source,
         }),
     );
-    info!(
-        "phase {}: {ADVANCE_STOP_REASON} (safe point {safe_point})",
-        state.phase
-    );
+    info!("phase {}: {reason} (safe point {safe_point})", state.phase);
     Ok(())
 }
 
@@ -1412,8 +1430,10 @@ pub(crate) fn test_hold(point: &str) {
 /// for this `point`, append a line to `<path>.held` and wait (bounded by
 /// [`TEST_HOLD_WAIT`]) until `<path>` exists. One line per arrival, so a test can
 /// count the launchers that reached it. Points: `guarded`, after the live-run guard
-/// inside the reservation's write-lock closure; `reserved`, after that write; and
-/// `before_publish_save`, once the supervisor has answered its ping.
+/// inside the reservation's write-lock closure; `reserved`, after that write;
+/// `holder_claimed`, once a foreground process holds the phase (for `start` and `resume`,
+/// with its reservation pending and no supervisor yet); and `before_publish_save`, once
+/// the supervisor has answered its ping.
 /// Compiled out of non-test builds, together with every call.
 #[cfg(test)]
 pub(crate) fn launch_test_hold(point: &str) {
@@ -3064,36 +3084,51 @@ pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(),
     advance_for_stage(project_root, phase, None)
 }
 
+/// The hand-run `devflow advance`: hold the phase for the whole advance (D-17), so
+/// `stop` can reach this process and no other foreground process acts on the phase, then
+/// advance. A supervisor's own advance calls [`advance_for_stage`] and claims nothing.
+pub(crate) fn advance_command(
+    project_root: &Path,
+    phase: Option<PhaseId>,
+    stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let phase = resolve_advance_phase(project_root, phase)?;
+    let _phase_holder = crate::commands::claim_foreground_holder(project_root, phase)?;
+    #[cfg(test)]
+    launch_test_hold("holder_claimed");
+    advance_for_stage(project_root, Some(phase), stage)
+}
+
+/// The phase an advance acts on: the given one, or the sole active one.
+///
+/// 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor (recorded at
+/// spawn time), so advance's identity never depends on a shared state singleton — under
+/// `devflow parallel`, each monitor advances exactly its own phase. The Option fallback
+/// only serves monitors spawned by an older binary.
+fn resolve_advance_phase(project_root: &Path, phase: Option<PhaseId>) -> Result<PhaseId, CliError> {
+    if let Some(phase) = phase {
+        return Ok(phase);
+    }
+    resolve_sole_active_phase(project_root).inspect_err(|err| {
+        // 14-CR-06: a legacy monitor's bare `advance` failing here would otherwise be
+        // invisible (its output goes to /dev/null) and its phase silently stalls — record
+        // the failure in events.jsonl. Phase 0 is the "could not attribute a phase"
+        // sentinel; no real phase is 0.
+        events::emit(
+            project_root,
+            PhaseId::new(0),
+            "advance_failed",
+            serde_json::json!({ "reason": err.to_string() }),
+        );
+    })
+}
+
 pub(crate) fn advance_for_stage(
     project_root: &Path,
     phase: Option<PhaseId>,
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
-    // 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor
-    // (recorded at spawn time), so advance's identity never depends on a
-    // shared state singleton — under `devflow parallel`, each monitor
-    // advances exactly its own phase. The Option fallback only serves
-    // monitors spawned by an older binary.
-    let phase = match phase {
-        Some(phase) => phase,
-        None => match resolve_sole_active_phase(project_root) {
-            Ok(phase) => phase,
-            Err(err) => {
-                // 14-CR-06: a legacy monitor's bare `advance` failing here
-                // would otherwise be invisible (its output goes to
-                // /dev/null) and its phase silently stalls — record the
-                // failure in events.jsonl. Phase 0 is the "could not
-                // attribute a phase" sentinel; no real phase is 0.
-                events::emit(
-                    project_root,
-                    PhaseId::new(0),
-                    "advance_failed",
-                    serde_json::json!({ "reason": err.to_string() }),
-                );
-                return Err(err);
-            }
-        },
-    };
+    let phase = resolve_advance_phase(project_root, phase)?;
     advance_with(project_root, phase, stage)
 }
 
@@ -8868,6 +8903,123 @@ mod tests {
         assert!(
             gaps.is_empty(),
             "state read GONE or no record across the handoff: {gaps:?}"
+        );
+    }
+
+    /// Names a holder-test child's project root and which arm it runs. Not DevFlow
+    /// settings, so they carry no `DEVFLOW_` prefix the doc check would require documented.
+    const HOLDER_ROOT_ENV: &str = "P50_1_29_ROOT";
+    const HOLDER_CASE_ENV: &str = "P50_1_29_CASE";
+    const FOREGROUND_GATE_PHASE: PhaseId = PhaseId::new(2901);
+
+    /// One foreground gate wait in a child process, signalled once its gate file exists:
+    /// how it ended, reaped, with its output.
+    fn signalled_foreground_gate_wait(name: &str, root: &Path, case: &str) -> std::process::Output {
+        let phase = FOREGROUND_GATE_PHASE;
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        ))
+        .unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let mut child = devflow_core::test_support::spawn_test_in_child(
+            name,
+            path_dir.path(),
+            &[
+                (HOLDER_ROOT_ENV, root.as_os_str()),
+                (HOLDER_CASE_ENV, std::ffi::OsStr::new(case)),
+            ],
+        );
+        let gate = Gates::gate_path(root, phase, Stage::Code);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !gate.exists() {
+            if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                panic!(
+                    "{case}: the child never opened its gate: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(devflow_core::agent::terminate(child.id()), "{case}: signal");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!(
+                    "{case}: the child did not end within 10 s of the signal: {:?}",
+                    child.wait_with_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
+    }
+
+    /// D-18: a foreground gate wait ends at safe point 4 when its holder is signalled: the
+    /// gate closes and the stop is recorded. The control has no handler: it dies and
+    /// leaves its gate open, the outcome D-18 removes.
+    #[test]
+    fn a_holder_stop_ends_a_foreground_gate_wait_at_safe_point_4() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "pipeline_launch::tests::a_holder_stop_ends_a_foreground_gate_wait_at_safe_point_4";
+        let phase = FOREGROUND_GATE_PHASE;
+        if devflow_core::test_support::in_child_test(NAME) {
+            let root = PathBuf::from(std::env::var_os(HOLDER_ROOT_ENV).unwrap());
+            let _hold = if std::env::var(HOLDER_CASE_ENV).unwrap() == "handler" {
+                crate::commands::claim_foreground_holder(&root, phase).unwrap()
+            } else {
+                devflow_core::liveness::claim_phase_holder(&root, phase).unwrap()
+            };
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            let end = crate::pipeline_gate::run_gate_with_timeout(
+                &root,
+                &mut state,
+                Stage::Code,
+                "a foreground gate",
+                300,
+                None,
+            );
+            let error = end.expect_err("a stopped wait is an error").to_string();
+            assert!(error.contains(HOLDER_STOP_REASON), "{error}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let output = signalled_foreground_gate_wait(NAME, root, "handler");
+        eprintln!("handler: {:?}", output.status);
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "the gate closes with the wait"
+        );
+        let state = workflow::load_state(root, phase).unwrap();
+        assert!(state.stopped, "the stop is recorded");
+        assert!(!state.gate_pending, "and the gate no longer pending");
+        assert_eq!(state.stop_reason.as_deref(), Some(HOLDER_STOP_REASON));
+        let stopped = events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
+        assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
+
+        let control = tempfile::tempdir().unwrap();
+        let root = control.path();
+        let output = signalled_foreground_gate_wait(NAME, root, "no-handler");
+        eprintln!("no handler: {:?}", output.status);
+        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        assert!(
+            Gates::gate_path(root, phase, Stage::Code).exists(),
+            "control: a holder the signal ends leaves its gate open"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().gate_pending,
+            "control: and still pending"
         );
     }
 

@@ -3821,9 +3821,14 @@ fn persist_stopped_state(
         Ok((Some(state), true))
     })?;
     if !found_state {
-        println!("stop: no persisted state for phase {phase} — already stopped");
+        println!("{}", missing_state_line(phase, signal_sent));
     }
     Ok(())
+}
+
+/// RED scaffold: today's line whoever `stop` signalled.
+fn missing_state_line(phase: PhaseId, _signal_sent: bool) -> String {
+    format!("stop: no persisted state for phase {phase} — already stopped")
 }
 
 /// What `stop` can honestly say after answering a gate whose lock it then
@@ -3879,6 +3884,35 @@ fn answered_gate_contention_message(
             no_waiter_repair(phase, stage)
         ))),
     }
+}
+
+/// Hold `phase` for this foreground process's lifetime (D-17), with the stop handler in
+/// place first (D-18), so no recorded holder is ever a default-disposition SIGTERM target.
+/// The one path all four foreground entry points claim through. A supervisor never calls
+/// it: it has its own signal pipe, and its process holds a liveness file, not this.
+pub(crate) fn claim_foreground_holder(
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<liveness::Hold, CliError> {
+    liveness::install_holder_stop_handler().map_err(|err| {
+        CliError::Message(format!(
+            "phase {phase}: could not install the stop handler ({err}); refusing to run, \
+             because `devflow stop` could then end this process inside a finalization hook"
+        ))
+    })?;
+    liveness::claim_phase_holder(project_root, phase).map_err(|err| match err {
+        liveness::HolderError::Held { holder } => {
+            let pid = holder.map_or_else(|| "unknown".to_string(), |(pid, _)| pid.to_string());
+            CliError::Message(format!(
+                "phase {phase} is held by a foreground DevFlow process (pid {pid}); run \
+                 `devflow stop --phase {phase}`"
+            ))
+        }
+        liveness::HolderError::Io(err) => CliError::Message(format!(
+            "phase {phase}: could not claim the holder file {}: {err}",
+            liveness::phase_holder_path(project_root, phase).display()
+        )),
+    })
 }
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
@@ -14674,6 +14708,195 @@ mod tests {
         fn drop(&mut self) {
             self.kill_and_reap();
         }
+    }
+
+    // The phase holder (50.1-29, D-17, D-18). A holder that `stop` signals runs as its own
+    // process: `stop` would otherwise be signalling the test runner.
+
+    /// Names a holder-test child's project root. Not a DevFlow setting, so it carries no
+    /// `DEVFLOW_` prefix the doc check would require documented.
+    const HOLDER_ROOT_ENV: &str = "P50_1_29_ROOT";
+
+    /// The project root a holder-test child was given.
+    fn holder_child_root() -> PathBuf {
+        PathBuf::from(std::env::var_os(HOLDER_ROOT_ENV).expect("the parent names the root"))
+    }
+
+    /// A process of this test binary, on the test named `name`, parked at the launch hold
+    /// point `holder_claimed`. It is killed and reaped when this drops, on a failed
+    /// assertion too.
+    struct ParkedHolder {
+        child: Option<std::process::Child>,
+        release: PathBuf,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl ParkedHolder {
+        /// Spawn it and wait until it reaches the hold. `path_dir` is the child's PATH.
+        fn spawn(name: &str, root: &Path, path_dir: tempfile::TempDir) -> Self {
+            let hold_dir = crate::test_support::hermetic_cache_dir();
+            let release = hold_dir.path().join("release");
+            let spec: std::ffi::OsString = format!("holder_claimed:{}", release.display()).into();
+            let mut child = devflow_core::test_support::spawn_test_in_child(
+                name,
+                path_dir.path(),
+                &[
+                    ("DEVFLOW_CACHE_DIR", hold_dir.path().as_os_str()),
+                    (LAUNCH_HOLD_ENV, spec.as_os_str()),
+                    (HOLDER_ROOT_ENV, root.as_os_str()),
+                ],
+            );
+            let held = held_marker(&release);
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while !held.exists() {
+                if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!(
+                        "the child never reached holder_claimed: {:?}",
+                        child.wait_with_output()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Self {
+                child: Some(child),
+                release,
+                _dirs: (hold_dir, path_dir),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("not yet finished").id()
+        }
+
+        /// Release the hold and wait for the child to end, within `REACH_HOLD_WITHIN`.
+        fn release_and_finish(&mut self) -> std::process::Output {
+            std::fs::write(&self.release, "").unwrap();
+            let mut child = self.child.take().expect("finished once");
+            let deadline = std::time::Instant::now() + REACH_HOLD_WITHIN;
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!(
+                        "the child did not end after its release: {:?}",
+                        child.wait_with_output()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            child.wait_with_output().unwrap()
+        }
+    }
+
+    impl Drop for ParkedHolder {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// The `name` events of `root`'s event log, parsed.
+    fn holder_events_named(root: &Path, name: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    /// D-17 (V-29), D-18: `stop` reaches a hand-run `advance` through its holder after the
+    /// identity check. The holder catches the signal, so it is still running when `stop`
+    /// gives up and marks nothing; released, it stops at safe point 1 and records it.
+    #[test]
+    fn stop_signals_a_hand_run_advance_through_its_phase_holder() {
+        use std::os::unix::process::ExitStatusExt;
+        const NAME: &str =
+            "commands::tests::stop_signals_a_hand_run_advance_through_its_phase_holder";
+        let phase = PhaseId::new(2902);
+        if devflow_core::test_support::in_child_test(NAME) {
+            crate::pipeline_launch::advance_command(
+                &holder_child_root(),
+                Some(phase),
+                Some(Stage::Define),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        workflow::save_state(&State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        ))
+        .unwrap();
+        let mut child = ParkedHolder::spawn(NAME, root, tempfile::tempdir().unwrap());
+        let pid = child.pid();
+        let holder_path = liveness::phase_holder_path(root, phase);
+        assert_eq!(
+            liveness::live_holder(&holder_path).unwrap(),
+            Some((pid, agent::process_start_time(pid))),
+            "the holder names the child"
+        );
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let error = stop_with_an_empty_cache(root, phase)
+            .expect_err("a holder still running is not a stop")
+            .to_string();
+        eprintln!("stop: {error}");
+
+        assert!(error.contains(&format!("signalled pid {pid}")), "{error}");
+        assert!(error.contains("foreground holder"), "{error}");
+        assert!(error.contains("not marked"), "{error}");
+        assert!(error.contains("next safe point"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "`stop` writes no state"
+        );
+        assert!(
+            devflow_core::test_support::process_is_live(pid),
+            "the signal was caught, not fatal"
+        );
+
+        let output = child.release_and_finish();
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+        let state = workflow::load_state(root, phase).unwrap();
+        assert_eq!(state.stage, Stage::Define, "the stage does not move");
+        assert!(state.stopped, "the holder records the stop");
+        assert_eq!(
+            state.stop_reason.as_deref(),
+            Some(crate::pipeline_launch::HOLDER_STOP_REASON)
+        );
+        let stopped = holder_events_named(root, "advance_stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["safe_point"], 1, "{}", stopped[0]);
+        assert_eq!(stopped[0]["source"], "foreground_holder", "{}", stopped[0]);
+    }
+
+    /// D-18: over a missing state, a signalled holder ended its run on its own, which is
+    /// not "already stopped". With nothing signalled, the line is today's.
+    #[test]
+    fn a_holder_that_ended_its_run_after_the_signal_is_not_reported_as_stopped() {
+        let phase = PhaseId::new(2903);
+        let signalled = missing_state_line(phase, true);
+        assert!(signalled.contains("ended on its own"), "{signalled}");
+        assert!(
+            signalled.contains("nothing was marked stopped"),
+            "{signalled}"
+        );
+        assert!(!signalled.contains("already stopped"), "{signalled}");
+        let not_signalled = missing_state_line(phase, false);
+        assert_eq!(
+            not_signalled,
+            format!("stop: no persisted state for phase {phase} — already stopped"),
+            "control: with no signal sent the line is today's"
+        );
     }
 
     /// D-19: no supervisor is live and the agent still runs, so `status` and `doctor`

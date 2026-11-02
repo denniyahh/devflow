@@ -614,7 +614,7 @@ fn run() -> Result<(), CliError> {
             project,
             phase,
             stage,
-        } => pipeline_launch::advance_for_stage(&project_root(project)?, phase, stage),
+        } => pipeline_launch::advance_command(&project_root(project)?, phase, stage),
         Command::Monitor {
             project,
             phase,
