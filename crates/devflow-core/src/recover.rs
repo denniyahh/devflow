@@ -128,13 +128,11 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
     let mut report = CleanReport::default();
     let states = workflow::list_states(project_root);
     for state in &states {
-        sweep_phase(project_root, state, &mut report);
+        sweep_phase(project_root, state.phase, &mut report);
     }
     for phase in workflow::state_file_phases(project_root) {
         if !states.iter().any(|state| state.phase == phase) {
-            report.warnings.push(format!(
-                "kept phase {phase} — its state file cannot be parsed (clear explicitly with --phase {phase})"
-            ));
+            report.warnings.push(unparsable_state_warning(phase));
         }
     }
     sweep_orphan_gates(project_root, &mut report);
@@ -174,53 +172,32 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
     Ok(report)
 }
 
-/// Clear one listed phase if it is stale and its lock is free.
-fn sweep_phase(project_root: &Path, state: &State, report: &mut CleanReport) {
-    let phase = state.phase;
+/// Clear one listed phase if, on a fresh read under its write lock, it is stale and
+/// nothing about it may be live. The listing only names the phase: a run that reserved
+/// after it needs the same lock, so the decision sees that run (R-07). A lock still held
+/// after [`workflow::WRITE_LOCK_REPAIR_WAIT`] keeps the phase and names its holder (R-03).
+fn sweep_phase(project_root: &Path, phase: PhaseId, report: &mut CleanReport) {
     #[cfg(test)]
     recover_test_hook(RecoverPoint::SweepListed, phase);
-    if agent_pid_for(state).is_some_and(crate::agent::agent_running) {
-        report.warnings.push(format!(
-            "kept phase {phase} — its agent is still running (clear explicitly with --phase {phase})"
-        ));
-        return;
-    }
-    if !is_stale_state(state) {
-        report.warnings.push(format!(
-            "kept phase {phase} — state is not stale yet (clear explicitly with --phase {phase})"
-        ));
-        return;
-    }
-    // A monitor waiting at a gate holds this lock after its agent exited,
-    // so staleness by agent pid alone cannot license the delete.
-    let Some(_guard) = lock_for_sweep(project_root, phase, "phase", report) else {
-        return;
+    let cleared = workflow::clear_state_if(
+        project_root,
+        phase,
+        Some(workflow::WRITE_LOCK_REPAIR_WAIT),
+        |existing| Ok::<_, WorkflowError>(sweep_decision(project_root, phase, existing, report)),
+        || (),
+    );
+    let cleared = match cleared {
+        Ok(cleared) => cleared,
+        Err(err) => return report_a_lock_failure(&format!("phase {phase}"), err, report),
     };
-    // Same order as `clean_phase_report`: a gate left behind would outlive
-    // the state that explains it, and no command would answer it. So a
-    // failed gate removal keeps the state.
-    let (gates_removed, gate_result) = remove_gate_files(project_root, phase);
-    if let Err(err) = gate_result {
-        let partial = if gates_removed {
-            " after removing some of its gate files"
-        } else {
-            ""
-        };
-        report.fail(format!(
-            "kept phase {phase}'s state{partial} — could not remove all of its gate files: {err}"
-        ));
-        return;
-    }
-    let (state_removed, state_result) =
-        workflow::clear_state_with_partial_result(project_root, phase);
-    match state_result {
-        Ok(()) if state_removed => report.cleared.push(phase),
+    match cleared.result {
+        Ok(()) if cleared.removed => report.cleared.push(phase),
         Ok(()) => {}
         Err(err) => {
-            if state_removed {
+            if cleared.removed {
                 report.cleared.push(phase);
             }
-            let partial = if state_removed {
+            let partial = if cleared.removed {
                 " after removing some of its state files"
             } else {
                 ""
@@ -232,9 +209,88 @@ fn sweep_phase(project_root: &Path, state: &State, report: &mut CleanReport) {
     }
 }
 
+/// The sweep's decision for one phase, on what its write lock's holder just read. Whether
+/// to clear the state; a kept phase or a failed gate removal is in `report`.
+fn sweep_decision(
+    project_root: &Path,
+    phase: PhaseId,
+    existing: workflow::Existing,
+    report: &mut CleanReport,
+) -> bool {
+    let fresh = match existing {
+        workflow::Existing::Loaded(state) => state,
+        workflow::Existing::Missing => return false,
+        workflow::Existing::Unloadable(_) => {
+            report.warnings.push(unparsable_state_warning(phase));
+            return false;
+        }
+    };
+    if agent_pid_for(&fresh).is_some_and(crate::agent::agent_running) {
+        report.warnings.push(format!(
+            "kept phase {phase} — its agent is still running (clear explicitly with --phase {phase})"
+        ));
+        return false;
+    }
+    if !is_stale_state(&fresh) {
+        report.warnings.push(format!(
+            "kept phase {phase} — state is not stale yet (clear explicitly with --phase {phase})"
+        ));
+        return false;
+    }
+    if let Some(reason) = phase_may_be_live(project_root, &fresh) {
+        report
+            .warnings
+            .push(kept_as_live(&format!("phase {phase}"), phase, &reason));
+        return false;
+    }
+    // Same order as `clean_phase_report`: a gate left behind would outlive the state
+    // that explains it, and no command would answer it. So a failed gate removal keeps
+    // the state.
+    let (gates_removed, gate_result) = remove_gate_files(project_root, phase);
+    if let Err(err) = gate_result {
+        let partial = if gates_removed {
+            " after removing some of its gate files"
+        } else {
+            ""
+        };
+        report.fail(format!(
+            "kept phase {phase}'s state{partial} — could not remove all of its gate files: {err}"
+        ));
+        return false;
+    }
+    true
+}
+
+fn unparsable_state_warning(phase: PhaseId) -> String {
+    format!(
+        "kept phase {phase} — its state file cannot be parsed (clear explicitly with --phase {phase})"
+    )
+}
+
+fn kept_as_live(what: &str, phase: PhaseId, reason: &str) -> String {
+    format!("kept {what} — {reason}; run `devflow stop --phase {phase}` first")
+}
+
+/// Record why a sweep step never reached its decision. A held lock is a keep, naming the
+/// holder (R-03); any other error taking it is a failure.
+fn report_a_lock_failure(what: &str, err: WorkflowError, report: &mut CleanReport) {
+    match err {
+        WorkflowError::WriteLockTimeout { .. } => {
+            report.warnings.push(format!("kept {what} — {err}"));
+        }
+        err => report.fail(format!(
+            "kept {what} — could not take its state write lock: {err}"
+        )),
+    }
+}
+
 /// Remove gate files whose phase has no state file (48-REVIEW WR-02): left by
 /// a sweep that predates gate cleanup, or by `abort` for another stage. They
 /// show as open gates nothing will ever answer.
+///
+/// A phase with a state file is skipped at the listing: that read can only keep. The
+/// removal itself is decided on a fresh read under the write lock, which holds off a
+/// reservation (R-07), so it has no state to remove and always keeps.
 fn sweep_orphan_gates(project_root: &Path, report: &mut CleanReport) {
     for phase in crate::gates::Gates::phases_on_disk(project_root) {
         if workflow::state_path(project_root, phase).exists() {
@@ -242,59 +298,141 @@ fn sweep_orphan_gates(project_root: &Path, report: &mut CleanReport) {
         }
         #[cfg(test)]
         recover_test_hook(RecoverPoint::OrphanGatesListed, phase);
-        let what = "the orphan gate files of phase";
-        let Some(_guard) = lock_for_sweep(project_root, phase, what, report) else {
-            continue;
-        };
-        // A run may have started between the listing and the lock.
-        if workflow::state_path(project_root, phase).exists() {
-            continue;
-        }
-        let (removed, result) = remove_gate_files(project_root, phase);
-        match result {
-            Ok(()) if removed => report.orphan_gates_cleared.push(phase),
-            Ok(()) => {}
-            Err(err) => {
-                let partial = if removed {
-                    " after removing some of them"
-                } else {
-                    ""
-                };
-                report.fail(format!(
-                    "could not remove all of {what} {phase}{partial}: {err}"
-                ));
-            }
+        let what = format!("the orphan gate files of phase {phase}");
+        let swept = workflow::clear_state_if(
+            project_root,
+            phase,
+            Some(workflow::WRITE_LOCK_REPAIR_WAIT),
+            |existing| {
+                if matches!(existing, workflow::Existing::Missing) {
+                    remove_orphan_gate_files(project_root, phase, &what, report);
+                }
+                Ok::<_, WorkflowError>(false)
+            },
+            || (),
+        );
+        if let Err(err) = swept {
+            report_a_lock_failure(&what, err, report);
         }
     }
 }
 
-/// Take `phase`'s lock for the sweep, or record why `what` was kept.
-fn lock_for_sweep(
+fn remove_orphan_gate_files(
     project_root: &Path,
     phase: PhaseId,
     what: &str,
     report: &mut CleanReport,
-) -> Option<crate::lock::LockGuard> {
-    match crate::lock::acquire(project_root, phase) {
-        Ok(guard) => Some(guard),
-        Err(crate::lock::LockError::Contended { pid, .. }) => {
-            report.warnings.push(format!(
-                "kept {what} {phase} — its per-phase lock is live or contended by pid {pid}"
-            ));
-            None
+) {
+    if let Some(reason) = phase_activity_may_be_live(project_root, phase) {
+        report.warnings.push(kept_as_live(what, phase, &reason));
+        return;
+    }
+    let (removed, result) = remove_gate_files(project_root, phase);
+    if removed && result.is_ok() {
+        report.orphan_gates_cleared.push(phase);
+    }
+    if let Err(err) = result {
+        let partial = if removed {
+            " after removing some of them"
+        } else {
+            ""
+        };
+        report.fail(format!("could not remove all of {what}{partial}: {err}"));
+    }
+}
+
+/// Why `state`'s run may still be live, or `None` when nothing says so. A probe that
+/// cannot finish counts as live (fail closed, Phase 50 T-50-40), and a STALE socket is
+/// not resolved through the backstop here: `devflow stop` does that.
+///
+/// It reads its socket probes in order and ends at the first that keeps the phase, so
+/// the two [`SOCKET_PROBES_PER_DECISION`] are all a decision makes.
+fn phase_may_be_live(project_root: &Path, state: &State) -> Option<String> {
+    if let Some(record) = &state.supervisor
+        && let Some(reason) = socket_may_be_live("supervisor", &record.socket_path)
+    {
+        return Some(reason);
+    }
+    if let Some(pending) = &state.pending_supervisor {
+        if let Some(reason) = socket_may_be_live("pending supervisor", &pending.socket_path) {
+            return Some(reason);
         }
-        Err(err) => {
-            report.fail(format!(
-                "kept {what} {phase} — could not take its per-phase lock: {err}"
-            ));
-            None
+        let held = crate::liveness::probe(&pending.liveness_path);
+        if let Some(reason) = hold_may_be_live("pending supervisor", &pending.liveness_path, held) {
+            return Some(reason);
         }
+    }
+    phase_activity_may_be_live(project_root, state.phase)
+}
+
+/// The part of [`phase_may_be_live`] that needs no state: a registered gate waiter, or
+/// D-17's foreground holder.
+fn phase_activity_may_be_live(project_root: &Path, phase: PhaseId) -> Option<String> {
+    let waiters = match crate::gates::Gates::waiter_files(project_root, phase) {
+        Ok(waiters) => waiters,
+        Err(error) => {
+            return Some(format!(
+                "its gate waiter registrations could not be listed ({error})"
+            ));
+        }
+    };
+    for waiter in waiters {
+        let held = crate::liveness::probe(&waiter);
+        if let Some(reason) = hold_may_be_live("registered gate waiter", &waiter, held) {
+            return Some(reason);
+        }
+    }
+    let holder = crate::liveness::phase_holder_path(project_root, phase);
+    match crate::liveness::probe(&holder) {
+        Ok(crate::liveness::Held::Live) => Some(match crate::liveness::live_holder(&holder) {
+            Ok(Some((pid, _))) => format!("its foreground holder pid {pid} is live"),
+            _ => format!("its foreground holder {} is held", holder.display()),
+        }),
+        held => hold_may_be_live("foreground holder", &holder, held),
+    }
+}
+
+/// Why a socket's probe keeps a phase, or `None` for a GONE socket.
+fn socket_may_be_live(what: &str, socket: &Path) -> Option<String> {
+    let socket_text = socket.display();
+    match probe_socket(socket) {
+        Ok(crate::supervisor::Liveness::Gone) => None,
+        Ok(crate::supervisor::Liveness::Alive(_)) => {
+            Some(format!("its {what} answers on socket {socket_text}"))
+        }
+        Ok(crate::supervisor::Liveness::Stale) => Some(format!(
+            "its {what}'s socket {socket_text} is STALE, so its agent may still run"
+        )),
+        Err(error) => Some(format!(
+            "its {what}'s socket {socket_text} could not be probed ({error})"
+        )),
+    }
+}
+
+/// Why a liveness file's probe keeps a phase, or `None` for an abandoned or missing one.
+fn hold_may_be_live(
+    what: &str,
+    path: &Path,
+    held: std::io::Result<crate::liveness::Held>,
+) -> Option<String> {
+    let path_text = path.display();
+    match held {
+        Ok(crate::liveness::Held::Live) => Some(format!("its {what} holds {path_text}")),
+        Ok(crate::liveness::Held::Abandoned | crate::liveness::Held::Missing) => None,
+        Err(error) => Some(format!(
+            "its {what}'s {path_text} could not be probed ({error})"
+        )),
     }
 }
 
 /// Close every stage's gate for `phase`, retaining partial removal on error. An
 /// unconsumed answer is set aside rather than deleted (D-05), and counts as removed:
 /// it is gone from the live gate files.
+///
+/// It takes the gate lock once for the whole phase (R2-03). It runs inside a
+/// [`workflow::clear_state_if`] decision, so that one wait, with the decision's socket
+/// probes, is what keeps a write-lock hold under [`workflow::WRITE_LOCK_REPAIR_WAIT`]:
+/// see [`a_recover_decisions_worst_case_stays_under_the_repair_wait`](tests).
 fn remove_gate_files(
     project_root: &Path,
     phase: PhaseId,
@@ -309,11 +447,10 @@ fn remove_gate_files(
 
 /// How many socket probes one decision makes: `phase_may_be_live` probes the recorded
 /// and the pending socket, and nothing else in a decision probes a socket.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const SOCKET_PROBES_PER_DECISION: u32 = 2;
 
 /// [`crate::supervisor::probe`], counted in a test build.
-#[allow(dead_code)]
 fn probe_socket(path: &Path) -> Result<crate::supervisor::Liveness, crate::supervisor::ProbeError> {
     #[cfg(test)]
     SOCKET_PROBES.with(|count| count.set(count.get() + 1));
@@ -321,7 +458,7 @@ fn probe_socket(path: &Path) -> Result<crate::supervisor::Liveness, crate::super
 }
 
 /// The longest one decision can hold the write lock for, from its waits alone.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn decision_worst_case(
     io_timeout: Duration,
     gate_lock_wait: Duration,
@@ -398,12 +535,16 @@ pub fn clean_phase_report(
 ) -> Result<PhaseCleanReport, RecoverError> {
     let guard = crate::lock::acquire(project_root, phase)?;
     let mut report = PhaseCleanReport::default();
-    if let Ok(state) = workflow::load_state(project_root, phase)
-        && agent_pid_for(&state).is_some_and(crate::agent::agent_running)
-    {
-        report.warnings.push(format!(
-            "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
-        ));
+    if let Ok(state) = workflow::load_state(project_root, phase) {
+        if let Some(reason) = phase_may_be_live(project_root, &state) {
+            report.fail(kept_as_live(&format!("phase {phase}"), phase, &reason));
+            return Ok(report);
+        }
+        if agent_pid_for(&state).is_some_and(crate::agent::agent_running) {
+            report.warnings.push(format!(
+                "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
+            ));
+        }
     }
     clean_phase_files(project_root, phase, &mut report);
     drop(guard);

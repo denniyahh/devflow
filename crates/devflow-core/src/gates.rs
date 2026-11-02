@@ -702,9 +702,17 @@ impl Gates {
         project_root: &Path,
         phase: PhaseId,
     ) -> (Vec<(Stage, CloseReport)>, Result<(), GateError>) {
+        if !Self::dir(project_root).is_dir() {
+            return (Vec::new(), Ok(()));
+        }
+        let lock = match gate_lock(project_root, phase) {
+            Ok(lock) => lock,
+            Err(error) => return (Vec::new(), Err(error)),
+        };
         let mut reports = Vec::new();
         for stage in STAGES {
-            let (report, result) = Self::close_with_partial_result(project_root, phase, stage);
+            let (report, result) =
+                Self::close_stage_locked(project_root, phase, stage, &lock, &mut |_| {});
             reports.push((stage, report));
             if let Err(error) = result {
                 return (reports, Err(error));
@@ -919,7 +927,6 @@ impl Gates {
     ///
     /// # Errors
     /// The gates directory exists and could not be read.
-    #[allow(dead_code)]
     pub(crate) fn waiter_files(
         project_root: &Path,
         phase: PhaseId,

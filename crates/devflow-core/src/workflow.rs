@@ -443,6 +443,15 @@ pub fn update_state_with_within<T, E: From<WorkflowError>>(
     update_state_with_wait(project_root, phase, Some(wait), apply)
 }
 
+/// What is on disk for `phase`, as a caller holding the write lock sees it.
+fn read_existing(project_root: &Path, phase: PhaseId) -> Existing {
+    match load_state(project_root, phase) {
+        Ok(state) => Existing::Loaded(state),
+        Err(WorkflowError::MissingState(_)) => Existing::Missing,
+        Err(error) => Existing::Unloadable(error),
+    }
+}
+
 fn update_state_with_wait<T, E: From<WorkflowError>>(
     project_root: &Path,
     phase: PhaseId,
@@ -450,12 +459,7 @@ fn update_state_with_wait<T, E: From<WorkflowError>>(
     apply: impl FnOnce(Existing) -> Result<(Option<State>, T), E>,
 ) -> Result<T, E> {
     let _lock = lock_for_write(project_root, phase, wait)?;
-    let existing = match load_state(project_root, phase) {
-        Ok(state) => Existing::Loaded(state),
-        Err(WorkflowError::MissingState(_)) => Existing::Missing,
-        Err(error) => Existing::Unloadable(error),
-    };
-    let (next, value) = apply(existing)?;
+    let (next, value) = apply(read_existing(project_root, phase))?;
     if let Some(state) = next {
         if state.phase != phase {
             return Err(WorkflowError::PhaseMismatch {
@@ -669,13 +673,13 @@ pub fn while_owner<T, E: From<WorkflowError>>(
 
 /// What [`clear_state_if`] did.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Cleared<A> {
     /// Whether a file was removed, by the removal or before its error.
     pub(crate) removed: bool,
     /// The removal's outcome; `Ok` when the decision kept the state.
     pub(crate) result: Result<(), WorkflowError>,
     /// `after_clear`'s value, when it ran.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) after: Option<A>,
 }
 
@@ -779,28 +783,46 @@ pub fn clear_state_within(
     result.map(|()| removed)
 }
 
-/// RED stub: read, decide and remove with no hold of the lock across them.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Decide on a fresh read of the state and remove it, in one hold of the write lock
+/// (R-07), so a `start` or `resume` whose reservation needs that lock lands wholly
+/// before the read or wholly after the removal. The general form of
+/// [`clear_state_if_owned`], which stays as it is.
+///
+/// `decide` gets what is on disk: `Ok(false)` keeps it, `Ok(true)` removes the state and
+/// its orphaned write temps, and `Err` removes nothing and is returned as it is. After a
+/// removal that succeeded, `after_clear` runs still under the lock, for a step that must
+/// follow the removal with no reservation in between (R2-07); a failed removal skips it.
+/// With `wait` set, a lock still held then is [`WorkflowError::WriteLockTimeout`] with
+/// neither closure run.
+///
+/// Neither closure may take this lock: a second `flock` on the file from this process is
+/// a second open file description and blocks on the first. So neither calls
+/// [`update_state`], [`update_state_with`], [`update_owned_state`], [`clear_state`],
+/// [`while_owner`] or [`clear_state_if_owned`].
+///
+/// A gate operation in `decide` waits for the gate lock inside this one, the bounded wait
+/// the operator's D-08 ruling of 2026-10-26 allows: write lock, then gate lock, never the
+/// reverse, and `gates::GATE_LOCK_WAIT` is below [`WRITE_LOCK_REPAIR_WAIT`].
+/// `recover::a_recover_decisions_worst_case_stays_under_the_repair_wait` counts what one
+/// recovery decision can wait for: two socket probes and one gate wait, 9 s against
+/// 10 s. That leaves fsync-bound file operations on a slow disk unmeasured, and a
+/// SIGSTOPped caller outside the bound, as for every writer.
 pub(crate) fn clear_state_if<E: From<WorkflowError>, A>(
     project_root: &Path,
     phase: PhaseId,
-    _wait: Option<Duration>,
+    wait: Option<Duration>,
     decide: impl FnOnce(Existing) -> Result<bool, E>,
     after_clear: impl FnOnce() -> A,
 ) -> Result<Cleared<A>, E> {
-    let existing = match load_state(project_root, phase) {
-        Ok(state) => Existing::Loaded(state),
-        Err(WorkflowError::MissingState(_)) => Existing::Missing,
-        Err(error) => Existing::Unloadable(error),
-    };
-    if !decide(existing)? {
+    let _lock = lock_for_write(project_root, phase, wait)?;
+    if !decide(read_existing(project_root, phase))? {
         return Ok(Cleared {
             removed: false,
             result: Ok(()),
             after: None,
         });
     }
-    let (removed, result) = clear_state_with_partial_result(project_root, phase);
+    let (removed, result) = remove_state_files(project_root, phase, true);
     let after = result.is_ok().then(after_clear);
     Ok(Cleared {
         removed,
@@ -842,6 +864,15 @@ fn clear_state_with_partial_result_impl(
             return (false, Err(refusal));
         }
     }
+    remove_state_files(project_root, phase, report_temp_removal_failure)
+}
+
+/// Remove the state file and its orphaned write temps. The caller holds the write lock.
+fn remove_state_files(
+    project_root: &Path,
+    phase: PhaseId,
+    report_temp_removal_failure: bool,
+) -> (bool, Result<(), WorkflowError>) {
     let path = state_path(project_root, phase);
     let mut removed = false;
     if path.exists() {
