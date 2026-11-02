@@ -1031,6 +1031,20 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.176: Validate's Mutation Audit Has No Stopping Point on a Run With No Operator to Answer Its Gap Gate (BACKLOG)
+
+**Found:** 2026-11-02, Phase 50.1's live attempt 2. Nothing in DevFlow failed; the loop-back and its gate fired as designed.
+
+**Defect:** on a headless run, the Validate stage's `/gsd-validate-phase` audit can keep finding surviving mutants, and nothing bounds that search. Each `gaps` verdict loops back to Code, which fires the seeded checkpoint's preflight gate and waits for an operator. In attempt 2 Validate returned `gaps` twice (`attempt-2/deviations.txt`, in `50.1-evidence/`), the first on real test gaps in the fixture's trivial suite and the second on harder mutants. It returned `pass` only after the operator hand-added assertions to the project's `tests/test_budget.py` and recorded in its `01-VALIDATION.md` that further mutation search is out of scope (`50.1-LIVE-RUN.md`). The agent's own incident entry says the workflow has no route for its `AskUserQuestion` gap gate in an unattended run.
+
+**How often:** 2 of the last 2 live runs needed an operator at a stage the payload was expected to pass: Ship in attempt 1 (999.175), Validate in attempt 2. Two runs bound no rate, and these are different causes.
+
+**Also:** a throwaway run's agents inherit the operator's global rules and can write to the operator's real files. Attempt 2's agents appended six entries about the throwaway project to `~/.config/agents/gsd-manual-fix-incidents.md`, and attempt 1's two. Nothing isolates a live run's agents from that configuration.
+
+**Not established:** whether a real project's audit would stop sooner. The fixture's suite is trivial on purpose, so it may overstate how many gaps an audit finds; a real suite may simply offer more mutants.
+
+**Fix shape (not tested):** bound the audit by requirement for headless runs, or give the agent the operator's answer ahead of time. Separately decide whether a live run's agents should see the operator's global rules and real files at all.
+
 ### Phase 999.175: An Approved Auto-Decided Checkpoint Can Still Park an Unattended Run at Ship (BACKLOG)
 
 **Found:** 2026-11-02, Phase 50.1's live attempt 1. Nothing in DevFlow failed; the gate fired as designed.
