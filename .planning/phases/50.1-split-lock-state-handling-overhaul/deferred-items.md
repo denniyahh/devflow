@@ -70,3 +70,13 @@
   status: open, by plan
   **What:** `refuse_a_live_supervisor` lets through a STALE socket whose agent group the backstop proves gone, and `phase_may_be_live` keeps any STALE socket, as this plan specifies. So that case now prints the keep warning and exits non-zero until `devflow stop` removes the socket, where before it cleaned. `stop_stale_launch` runs the backstop that removes it (read, not run end to end here).
   **Why deferred:** the plan says STALE is not resolved through the backstop in recover. 50.1-25's docs should say `stop` comes first.
+
+- `resume` calls an applied answer "claimed but never applied" in three reachable cases (found during 50.1-23)
+  status: open, raised to the orchestrator as the plan requires
+  **What:** 50.1-23 reports every claimed pair at `state.stage`, on R2-05's premise that an applied decision closes its gate before the stage runs again or moves `state.stage` on. The premise does not hold in these three cases, and each leaves the pair at `state.stage`:
+  1. **`--until validate`:** an approved Validate gate reaches `transition`, whose `stop_until == Some(from)` early return records the stop and closes nothing (`pipeline_gate.rs`, the `stop_until` arm of `transition`).
+  2. **SIGKILL during Ship finalization:** `finish_workflow` runs the terminal hooks with the claim still on disk and closes the gate only after they pass. The line then says "never applied" though a merge, bump or tag may have run.
+  3. **A close that fails:** `handle_stage_failure`'s two arms (`pipeline_outcomes.rs` ~L929, ~L938) still `let _ = close_gate(..)` at an unchanged stage. So do the preflight arms (`preflight.rs` ~L1421, ~L1460), the re-scan arm (`pipeline_launch.rs`, "CR-01: close the gate now") and the finalization retry (`pipeline_gate.rs` ~L299).
+  **Measured:** case 1 with a temporary test (`run_gate_with_timeout` with an approval, `transition`, then a real `resume`): the claim survived and one `resume_found_unapplied_answer` event was written. The test was not committed and did not go through a real supervisor. Cases 2 and 3 are from reading the code, not exercised.
+  **Effect:** a wrong line and event on a run that is about to ask again. No answer is applied or lost by it. Case 2's wording is the one that could mislead an operator about a merge.
+  **Why deferred:** the plan says to raise a counter-example and not to work around it, and these files are not 50.1-23's.
