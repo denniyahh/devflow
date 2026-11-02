@@ -1301,9 +1301,9 @@ fn a_completed_stream_run_reaches_its_advance_once_its_leftover_process_released
 /// with its agent's stdout held ends the run at advance safe point 1: no
 /// `--until` halt, no next stage, the socket removed, the supervisor gone.
 /// The hold parks the supervisor in `advancing` and releases on the stop
-/// request, so the stop lands there deterministically. The exit file keeps
-/// the agent's own `0` (backlog 999.166 item 6), asserted so the record says
-/// what happened.
+/// request, so the stop lands there deterministically. The exit file records
+/// the stop outcome, `143`, in place of the agent's own `0`, and `stop`'s line
+/// says nothing was signalled (D-16).
 #[test]
 fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_point_1() {
     let phase = PhaseId::new(74);
@@ -1352,9 +1352,14 @@ fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_poin
     }
     assert!(
         stop_stdout.contains(&format!(
-            "stop: stopped phase {phase} through its supervisor"
+            "stop: stopped phase {phase} through its supervisor (honoured at an advance safe \
+             point; nothing was signalled; exit code 143)"
         )),
         "stdout: {stop_stdout}\nstderr: {stop_stderr}"
+    );
+    assert!(
+        !stop_stdout.contains("agent group ended"),
+        "nothing was signalled: {stop_stdout}"
     );
 
     let Some(status) = run.wait_exit(Duration::from_secs(20)) else {
@@ -1393,7 +1398,7 @@ fn a_stop_sent_while_a_completed_run_waits_on_a_held_stdout_ends_it_at_safe_poin
     ));
     assert_eq!(
         run.exit_file(),
-        "0",
-        "the exit file keeps the agent's own code (999.166 item 6)"
+        "143",
+        "the exit file records the stop outcome, not the agent's own code (D-16)"
     );
 }

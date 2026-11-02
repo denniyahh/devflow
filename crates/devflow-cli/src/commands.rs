@@ -3142,7 +3142,7 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
 /// `stop`'s line for a stop its supervisor confirmed (D-13 item 6). It claims a group ended
 /// only when the supervisor signalled one; otherwise the stop was honoured at an advance
 /// safe point and nothing was signalled.
-fn stopped_line(
+pub(crate) fn stopped_line(
     subject: &str,
     exit_code: i32,
     advance_suppressed: bool,

@@ -10673,6 +10673,98 @@ mod tests {
         assert!(events_named(&run.root, "advance_stopped").is_empty());
     }
 
+    // ---- D-16 (999.166 item 6): the exit file records a safe-point stop ----
+
+    /// The exit file's contents, trimmed, or the read error: the next stage's launch archives
+    /// the file, so it can be missing.
+    fn exit_file_of(run: &HandoffRun) -> String {
+        let path = devflow_core::agent_result::exit_code_path(&run.root, run.phase);
+        std::fs::read_to_string(path)
+            .map_or_else(|error| format!("<{error}>"), |code| code.trim().to_string())
+    }
+
+    /// `stop`'s success line for a final `stopped` reply. A missing field panics.
+    fn stop_line_for(run: &HandoffRun, last: &serde_json::Value) -> String {
+        crate::commands::stopped_line(
+            &format!("phase {}", run.phase),
+            i32::try_from(last["exit_code"].as_i64().expect("exit_code")).unwrap(),
+            last["advance_suppressed"]
+                .as_bool()
+                .expect("advance_suppressed"),
+            last["group_signalled"].as_bool().expect("group_signalled"),
+        )
+    }
+
+    /// V-28 (D-16): an agent that completed with `0`, stopped while its supervisor advances.
+    /// The exit file records the stop's 143, not the agent's own code, and the line `stop`
+    /// prints names the safe point. Precondition: it read `0` before the stop.
+    #[test]
+    fn a_safe_point_stop_records_143_in_the_exit_file_and_names_the_safe_point() {
+        const NAME: &str = "pipeline_launch::tests::a_safe_point_stop_records_143_in_the_exit_file_and_names_the_safe_point";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1317));
+        run.go();
+        run.wait_held();
+        assert_eq!(
+            exit_file_of(&run),
+            "0",
+            "precondition: the agent's own code"
+        );
+        let (accepted, last) = shutdown_accepted_then(
+            &run.n.socket_path,
+            || run.release(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(accepted["owner"], "advancing", "{accepted}");
+        assert_eq!(last["stopped"], true, "{last}");
+        assert_eq!(last["group_signalled"], false, "{last}");
+        let state = run.state();
+        assert!(state.stopped, "{state:?}");
+        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+        let line = stop_line_for(&run, &last);
+        assert!(line.contains("honoured at an advance safe point"), "{line}");
+        assert!(!line.contains("agent group ended"), "{line}");
+        assert_eq!(
+            exit_file_of(&run),
+            "143",
+            "the exit file records the stop, as the reply does: {}",
+            run.events()
+        );
+    }
+
+    /// The control for V-28: the same hold and no stop, with an `--until define` halt ending
+    /// the run where it is, leaves the agent's own code.
+    #[test]
+    fn without_a_stop_the_exit_file_keeps_the_agents_code() {
+        const NAME: &str =
+            "pipeline_launch::tests::without_a_stop_the_exit_file_keeps_the_agents_code";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_safe_point_1"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch_with(PhaseId::new(1319), |_, state| {
+            state.stop_until = Some(Stage::Define);
+        });
+        run.go();
+        run.wait_held();
+        run.release();
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|alive| alive == devflow_core::supervisor::Liveness::Gone)
+            }),
+            "the run ends at its halt: {}",
+            run.events()
+        );
+        assert_eq!(exit_file_of(&run), "0", "{}", run.events());
+        assert!(events_named(&run.root, "advance_stopped").is_empty());
+    }
+
     // ---- CR-01 (50-REVIEW.md): a stop before a `--yes-ship` merge ----
 
     /// Whether `branch` exists in the repo at `root`.
