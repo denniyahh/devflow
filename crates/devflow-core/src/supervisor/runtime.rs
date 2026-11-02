@@ -348,8 +348,15 @@ fn kill_group_unless_exit_observed(token: &StopToken, pgid: u32) {
 /// then not signalled, as for every completed agent (backstop rule 7 reports a leaderless
 /// group and never signals it).
 pub(crate) fn end_group_while_running(token: &StopToken, pgid: u32) -> AgentGroupEnd {
-    let _ = token;
+    let mut state = token.lock();
+    if state.phase != OwnerPhase::AgentRunning || state.agent_exited {
+        return AgentGroupEnd::AlreadyExited;
+    }
+    request_stop_locked(&mut state, StopSource::Ownership);
+    tracing::info!("ending agent group {pgid}: this supervisor does not own the run");
     signal_group(pgid, libc::SIGTERM);
+    drop(state);
+    kill_group_unless_exit_observed(token, pgid);
     AgentGroupEnd::Ended
 }
 
