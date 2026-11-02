@@ -49,10 +49,14 @@ existing directory and never rewrites a record; a failing run is kept and the ne
     (`ALIVE`, `STALE`, `GONE`, or `ABSENT`/`ERROR`). Members are `ps -o pid,pgid,sid,lstart,args` lines for every
     process whose process group (`/proc/<pid>/stat` field 5) is the sidecar's `agent_pgid`; `ps -g` is not used,
     because procps-ng selects sessions with it. Case-specific fields: `probe_after_kill`, `supervisor_killed` and
-    `members_after_kill` (the kill cases); `gate_open_before`, `lock_holder_before`, `lock_held_before`,
-    `lock_holder_after` (`none`, `live`, `recycled` or `unconfirmable`) and `gate_response_written`
+    `members_after_kill` (the kill cases); `gate_open_before`, `waiter_before`, `waiter_after` (the Define gate's
+    waiter from `devflow doctor --json`'s `reconciliation[].gate_waiter`: `live`, `absent`, `no_phase`, or a
+    `FAILED <why>` line) and `gate_response_written` (a keyed answer for the Define gate exists)
     (`kill9-at-gate`); `state_stopped` (all but `kill9-at-gate`); `next_agents_alive` and `first_agent_exit`
     (`stop-races-completion`).
+    Records taken before Phase 50.1 (the published `50-evidence/fault-*`) carry `lock_holder_before`,
+    `lock_held_before` and `lock_holder_after` instead of the two waiter fields, because the per-phase lock no
+    longer exists. `--fault` now refuses them as missing fields; their saved `verdict-*.txt` stay the record.
   - the window pointer (`"live": false`): `publish-unlink-window` with `fixture`, the fixture test that reaches the
     publish/unlink window
     (`pipeline_launch::tests::a_kill_between_the_next_publish_and_the_old_unlink_leaves_state_on_the_live_next_supervisor`),

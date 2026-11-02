@@ -241,10 +241,10 @@ def live_problems(name, record):
     elif name == 'kill9-at-gate':
         expect(record, 'probe_after_kill', 'STALE', why)
         expect(record, 'gate_open_before', True, why)
-        expect(record, 'lock_held_before', True, why)
-        holder = need(record, 'lock_holder_after', why)
-        if 'lock_holder_after' in record and holder not in ('none', 'recycled'):
-            why.append(f'lock_holder_after is {json.dumps(holder)}, expected none or recycled')
+        expect(record, 'waiter_before', 'live', why)
+        waiter = need(record, 'waiter_after', why)
+        if 'waiter_after' in record and waiter not in ('absent', 'no_phase'):
+            why.append(f'waiter_after is {json.dumps(waiter)}, expected absent or no_phase')
     elif name == 'stop-races-completion':
         expect(record, 'state_stopped', True, why)
         expect(record, 'next_agents_alive', [], why)
@@ -1164,7 +1164,7 @@ st_record() {
         probe_before: "ALIVE", probe_after_kill: "STALE", probe_after: "GONE",
         members_before: ["    101     101     100 Sat Oct 18 12:00:00 2026 /bin/sh /tmp/df50f.AAAAAA/f/claude"],
         members_after: [],
-        gate_open_before: true, lock_held_before: true, lock_holder_after: "none",
+        gate_open_before: true, waiter_before: "live", waiter_after: "absent",
         state_stopped: true, next_agents_alive: [],
         advance_ran: false, next_stage_launched: false, expected_met: true
     }' | jq "$edit"
@@ -1353,6 +1353,23 @@ st_fault_unmet() {
     st_record alive-stop-stream "$ST_SHA" '.expected_met = false' >"$dir/case-alive-stop-stream.json"
     expect 1 'FAULT verdict=fail' bash "$SELF" --fault "$dir" &&
         expect_re 1 'FAULT case=alive-stop-stream FAIL .*expectation not met.*' bash "$SELF" --fault "$dir"
+}
+
+st_fault_kill9_at_gate_waiter() {
+    local dir record="case-kill9-at-gate.json"
+    dir="$(st_fault_dir "$ST_SHA")"
+    st_record kill9-at-gate "$ST_SHA" >"$dir/$record"
+    expect 0 'FAULT case=kill9-at-gate ok live' bash "$SELF" --fault "$dir" || return 1
+    st_record kill9-at-gate "$ST_SHA" '.waiter_after = "no_phase"' >"$dir/$record"
+    expect 0 'FAULT case=kill9-at-gate ok live' bash "$SELF" --fault "$dir" || return 1
+    st_record kill9-at-gate "$ST_SHA" '.waiter_before = "absent"' >"$dir/$record"
+    expect_re 1 'FAULT case=kill9-at-gate FAIL waiter_before is "absent", expected "live"' bash "$SELF" --fault "$dir" || return 1
+    st_record kill9-at-gate "$ST_SHA" '.waiter_after = "live"' >"$dir/$record"
+    expect_re 1 'FAULT case=kill9-at-gate FAIL waiter_after is "live", expected absent or no_phase' bash "$SELF" --fault "$dir" || return 1
+    st_record kill9-at-gate "$ST_SHA" '.waiter_after = "FAILED doctor --json exited 1"' >"$dir/$record"
+    expect_re 1 'FAULT case=kill9-at-gate FAIL waiter_after is "FAILED doctor --json exited 1", expected absent or no_phase' bash "$SELF" --fault "$dir" || return 1
+    st_record kill9-at-gate "$ST_SHA" 'del(.waiter_before, .waiter_after) | .lock_held_before = true | .lock_holder_after = "none"' >"$dir/$record"
+    expect_re 1 'FAULT case=kill9-at-gate FAIL missing waiter_before; missing waiter_after' bash "$SELF" --fault "$dir"
 }
 
 st_require_all_window_live() {
@@ -2279,6 +2296,7 @@ run_selftest() {
     st_case 'attempt fails a monitor_pid key' st_attempt_monitor_pid
     st_case 'attempt fails a 108-byte socket path' st_attempt_108
     st_case 'fault fails a record whose expectation was not met' st_fault_unmet
+    st_case 'fault judges kill9-at-gate on its waiter fields' st_fault_kill9_at_gate_waiter
     st_case 'attempt gate is not ready on a fault directory from another binary' st_gate_other_binary
     st_case 'attempt gate ships with a full fault directory on its binary' st_gate_ships
     st_case 'attempt gate reports cap reached after three noted stops' st_gate_cap
