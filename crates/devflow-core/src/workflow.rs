@@ -594,6 +594,21 @@ pub fn ownership(state: &State, launch_id: &str) -> Ownership {
     }
 }
 
+/// The refusal for a launch `state` does not record, or `None` when it records it.
+fn not_owner(state: &State, phase: PhaseId, launch_id: &str) -> Option<WorkflowError> {
+    let (recorded, pending_only) = match ownership(state, launch_id) {
+        Ownership::Recorded => return None,
+        Ownership::PendingOnly => (state.supervisor.as_ref().map(|r| r.launch_id.clone()), true),
+        Ownership::Superseded { recorded } => (recorded, false),
+    };
+    Some(WorkflowError::NotOwner {
+        phase,
+        ours: launch_id.to_string(),
+        recorded,
+        pending_only,
+    })
+}
+
 /// [`update_state`] fenced to the launch the state records (D-03): unless the
 /// state records `launch_id` as its supervisor, this returns
 /// [`WorkflowError::NotOwner`] with `apply` not run and nothing written. The check
@@ -605,21 +620,47 @@ pub fn update_owned_state<T, E: From<WorkflowError>>(
     apply: impl FnOnce(&mut State) -> Result<T, E>,
 ) -> Result<(State, T), E> {
     update_state(project_root, phase, |state| {
-        let (recorded, pending_only) = match ownership(state, launch_id) {
-            Ownership::Recorded => return apply(state),
-            Ownership::PendingOnly => {
-                (state.supervisor.as_ref().map(|r| r.launch_id.clone()), true)
-            }
-            Ownership::Superseded { recorded } => (recorded, false),
-        };
-        Err(WorkflowError::NotOwner {
-            phase,
-            ours: launch_id.to_string(),
-            recorded,
-            pending_only,
+        match not_owner(state, phase, launch_id) {
+            None => apply(state),
+            Some(refusal) => Err(refusal.into()),
         }
-        .into())
     })
+}
+
+/// Run `f` while the state records `launch_id`, sharing one hold of the write lock
+/// between the check and `f` (D-03, R-09). A launch the state does not record gets
+/// [`WorkflowError::NotOwner`] with `f` not called. It writes no state.
+///
+/// There is no window between the check and `f`: a supersession is itself a state
+/// write under this lock, so it lands wholly before the check or wholly after `f`.
+///
+/// This takes the lock in its blocking form, as every workflow writer does. `f` must
+/// be a bounded file operation. It never waits on a human or an agent (D-08). The only
+/// lock it may take is the gate lock, a bounded wait the operator's D-08 ruling of
+/// 2026-10-26 allows inside the write lock: gate-lock holders run only file operations
+/// and never take the state write lock, so the order is always write lock, then gate
+/// lock, and the wait is capped by `gates::GATE_LOCK_WAIT`, below
+/// [`WRITE_LOCK_REPAIR_WAIT`]. `gates::tests::gates_never_takes_the_state_write_lock`
+/// and `gates::tests::the_gate_lock_wait_stays_below_the_write_lock_repair_wait` pin
+/// both rules.
+///
+/// Not reentrant: this must not be called inside an [`update_state`],
+/// [`update_state_with`], [`update_owned_state`] or [`clear_state_if_owned`] closure
+/// or another `while_owner` closure, and `f` must not call any of them. A second
+/// `flock` on the write-lock file from one process is a second open file description,
+/// so the blocking form waits forever.
+///
+/// # Errors
+/// [`WorkflowError::NotOwner`], the state's load error, an error taking the lock, or
+/// whatever `f` returns.
+pub fn while_owner<T, E: From<WorkflowError>>(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let _ = (project_root, phase, launch_id);
+    f()
 }
 
 /// Enumerate every active phase state, sorted by phase number.
@@ -683,6 +724,28 @@ pub fn state_file_phases(project_root: &Path) -> Vec<PhaseId> {
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
     let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, None, false);
     result.map(|()| removed)
+}
+
+/// [`clear_state`] for a supervisor (D-03): unless the state records `launch_id`, this
+/// returns [`WorkflowError::NotOwner`] and removes nothing. The check and the removal
+/// share one hold of the write lock. Returns whether a file was removed.
+///
+/// Not reentrant, under the rule [`while_owner`] states: this must not be called inside
+/// an [`update_state`], [`update_state_with`], [`update_owned_state`] or `while_owner`
+/// closure, because a second `flock` on the write-lock file from one process blocks
+/// forever. The D-08 ruling of 2026-10-26 on the gate lock does not reach here: nothing
+/// in this removal takes another lock.
+///
+/// # Errors
+/// [`WorkflowError::NotOwner`], the state's load error, an error taking the lock, or a
+/// failed removal.
+pub fn clear_state_if_owned(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+) -> Result<bool, WorkflowError> {
+    let _ = launch_id;
+    clear_state(project_root, phase)
 }
 
 /// [`clear_state`] for the verbs whose job is to diagnose a wedge, as
@@ -1475,6 +1538,86 @@ mod tests {
         assert!(ran.get());
         assert!(committed.stopped);
         assert!(load_state(root, phase).unwrap().stopped);
+    }
+
+    /// R-09's check-to-side-effect gap: the closure runs only for the recorded launch,
+    /// inside the one hold of the lock the check made, and nothing is written.
+    #[test]
+    fn while_owner_runs_its_closure_only_for_the_recorded_launch_under_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1901);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = Some(crate::state::SupervisorRecord::new(
+            root.join("x.sock"),
+            "xxxx".to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        ));
+        save_state(&state).unwrap();
+        let path = state_path(root, phase);
+        let before = std::fs::read(&path).unwrap();
+
+        let mut called = false;
+        let refused = while_owner(root, phase, "yyyy", || {
+            called = true;
+            Ok::<(), WorkflowError>(())
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(WorkflowError::NotOwner { ref ours, ref recorded, pending_only: false, .. })
+                    if ours == "yyyy" && recorded.as_deref() == Some("xxxx")
+            ),
+            "{refused:?}"
+        );
+        assert!(!called, "a launch the state does not record runs nothing");
+
+        let held = while_owner(root, phase, "xxxx", || write_lock_status(root, phase));
+        assert_eq!(
+            held.unwrap(),
+            WriteLockStatus::Held {
+                pid: Some(std::process::id())
+            },
+            "the closure runs inside the check's hold of the lock"
+        );
+        assert_eq!(
+            write_lock_status(root, phase).unwrap(),
+            WriteLockStatus::Free,
+            "control: the probe reads the lock free once the hold ends"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "it writes no state");
+    }
+
+    #[test]
+    fn clear_state_if_owned_refuses_a_launch_the_state_does_not_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1902);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = Some(crate::state::SupervisorRecord::new(
+            root.join("x.sock"),
+            "xxxx".to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        ));
+        save_state(&state).unwrap();
+        let path = state_path(root, phase);
+
+        let refused = clear_state_if_owned(root, phase, "yyyy");
+        assert!(
+            matches!(refused, Err(WorkflowError::NotOwner { .. })),
+            "{refused:?}"
+        );
+        assert!(path.exists(), "a refused clear leaves the file");
+
+        assert!(
+            clear_state_if_owned(root, phase, "xxxx").unwrap(),
+            "control: the recorded launch's clear removes it"
+        );
+        assert!(!path.exists(), "control: the file is gone");
     }
 
     #[test]
