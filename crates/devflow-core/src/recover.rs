@@ -532,7 +532,7 @@ fn hold_may_be_live(
 /// It takes the gate lock once for the whole phase (R2-03). It runs inside a
 /// [`workflow::clear_state_if`] decision, so that one wait, with the decision's socket
 /// probes, is what keeps a write-lock hold under [`workflow::WRITE_LOCK_REPAIR_WAIT`]:
-/// see [`a_recover_decisions_worst_case_stays_under_the_repair_wait`](tests).
+/// see the test `a_recover_decisions_worst_case_stays_under_the_repair_wait`.
 fn remove_gate_files(
     project_root: &Path,
     phase: PhaseId,
@@ -1965,6 +1965,44 @@ mod tests {
         assert_eq!(report.cleared, vec![phase], "{:?}", report.warnings);
         assert!(!state_path.exists());
         assert!(!gate.exists());
+    }
+
+    /// D-13 item 2 fails closed: a STALE socket is not resolved through the backstop here,
+    /// and a path that cannot be probed cannot say the supervisor is gone. Each keeps the
+    /// phase, naming the socket. `clean_without_a_phase_keeps_a_phase_whose_supervisor_is_live`
+    /// has the GONE control.
+    #[test]
+    fn clean_keeps_a_phase_whose_recorded_socket_is_stale_or_cannot_be_probed() {
+        let sockets = tempfile::Builder::new()
+            .prefix("dfr")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let stale = sockets.path().join("stale");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let unprobeable = sockets.path().join("file");
+        std::fs::write(&unprobeable, "not a socket").unwrap();
+
+        for (socket, expected) in [(stale, "STALE"), (unprobeable, "could not be probed")] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = PhaseId::new(2107);
+            let record = supervisor_record(socket.clone());
+            save_stale(root, phase, |state| state.supervisor = Some(record));
+            let state_path = workflow::state_path(root, phase);
+            let before = std::fs::read(&state_path).unwrap();
+
+            let report = clean_report(root).expect("clean");
+
+            assert_eq!(std::fs::read(&state_path).ok(), Some(before), "{expected}");
+            assert!(
+                report.warnings.iter().any(|w| w.contains(expected)
+                    && w.contains(&socket.display().to_string())
+                    && w.contains(&format!("devflow stop --phase {phase}"))),
+                "{expected}: {:?}",
+                report.warnings
+            );
+            assert!(report.cleared.is_empty());
+        }
     }
 
     /// 50.1-16's refusal over a live pending supervisor had no test; each of a held
