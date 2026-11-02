@@ -261,6 +261,54 @@ fn start_clears_leftover_gate_files_after_reserving() {
     common::kill_and_reap(&mut process);
 }
 
+/// D-06, at the boundary an operator reads: `devflow resume` prints the answer it set
+/// aside. The route is the Auto refusal that opens the rerun's gate in the foreground, so
+/// nothing is left running, and the gate's short timeout is what ends the command.
+#[test]
+fn resume_prints_the_answer_it_set_aside() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(93);
+    init_repo(root, phase);
+    let fake_bin = common::fake_bin_dir("exit 0");
+    let planted = plant_leftover_run(root, phase, None);
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let path = format!("{}:{}", fake_bin.path.display(), existing.to_string_lossy());
+
+    let output = common::hermetic_devflow(&home)
+        .args([
+            "resume",
+            "--phase",
+            &phase.to_string(),
+            "--legacy-claude-launch",
+        ])
+        .arg(root)
+        .current_dir(root)
+        .env("PATH", path)
+        .env("DEVFLOW_GATE_TIMEOUT_SECS", "1")
+        .output()
+        .expect("run devflow resume");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !planted.response.exists(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let set_aside = Gates::quarantined(root);
+    assert_eq!(set_aside.len(), 1, "stdout: {stdout}\nstderr: {stderr}");
+    let line = format!(
+        "resume: set aside an unused answer for the code gate (gate {}): {} — the rerun asks again",
+        set_aside[0].label,
+        set_aside[0].path.display()
+    );
+    assert!(
+        stdout.lines().any(|printed| printed == line),
+        "{line} not on stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 48-19 (criterion 2, D-01, D-02): `start` must not overwrite a live run.
 //

@@ -2932,6 +2932,18 @@ pub(crate) fn resume(
     result
 }
 
+/// RED stub: every line `resume` prints about one closed stage.
+#[cfg(test)]
+fn resume_gate_lines(
+    _phase: PhaseId,
+    _stage: Stage,
+    _gate_id: Option<&str>,
+    _report: &CloseReport,
+    _at_current_stage: bool,
+) -> Vec<String> {
+    Vec::new()
+}
+
 /// [`resume`] after its reservation: `state` is the copy that wrote, which may already
 /// be behind the file.
 fn resume_loaded(
@@ -4365,17 +4377,19 @@ mod tests {
         );
     }
 
-    /// A phase parked at an open, answered Code gate whose waiter was killed before it
+    /// A phase parked at an open, answered `stage` gate whose waiter was killed before it
     /// consumed the answer: the state says `gate_pending`, the gate file is on disk,
     /// and an unconsumed answer for that gate sits beside it. Returns the gate's id
     /// and the answer's bytes as planted.
-    fn seed_code_gate_with_pending_answer(
+    fn seed_gate_with_pending_answer(
         root: &Path,
         phase: PhaseId,
+        stage: Stage,
         mode: Mode,
+        response: &devflow_core::gates::GateResponse,
     ) -> (devflow_core::gates::GateId, Vec<u8>) {
         let mut state = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
-        state.stage = Stage::Code;
+        state.stage = stage;
         state.gate_pending = true;
         state.stopped = true;
         state.stop_reason = Some("stage failed; gate open".to_string());
@@ -4385,34 +4399,74 @@ mod tests {
         let opened = Gates::open_gate(
             root,
             phase,
-            Stage::Code,
-            "[never-silent] stage code failed — human review needed",
+            stage,
+            "[never-silent] stage failed — human review needed",
         )
         .unwrap();
-        let answer_path = Gates::answer(
-            root,
-            phase,
-            Stage::Code,
-            &opened.gate_id,
-            &gate_response(false, Some("abort: stale answer nobody polled")),
-        )
-        .unwrap();
+        let answer_path = Gates::answer(root, phase, stage, &opened.gate_id, response).unwrap();
         let bytes = std::fs::read(&answer_path).unwrap();
         (opened.gate_id, bytes)
     }
 
-    /// SURV-02 / Phase 48 criterion 3: a `resume` whose relaunch opens no gate
-    /// relaunches the saved stage and leaves a pending answer exactly as it found it.
-    /// The gate here is a stage-failure gate, not a preflight refusal: the relaunch's
-    /// preflight PASSES (Supervise mode), so nothing opens a new gate, and the planted
-    /// answer stays byte-identical: not read, not claimed, not set aside.
+    /// [`seed_gate_with_pending_answer`] at Code, with an aborting answer.
+    fn seed_code_gate_with_pending_answer(
+        root: &Path,
+        phase: PhaseId,
+        mode: Mode,
+    ) -> (devflow_core::gates::GateId, Vec<u8>) {
+        seed_gate_with_pending_answer(
+            root,
+            phase,
+            Stage::Code,
+            mode,
+            &gate_response(false, Some("abort: stale answer nobody polled")),
+        )
+    }
+
+    /// A gate at `stage`, answered with an approval and claimed, as a consumer that then
+    /// died leaves it. Returns the gate's id.
+    fn plant_claimed_answer(
+        root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+    ) -> devflow_core::gates::GateId {
+        let opened = Gates::open_gate(root, phase, stage, "planted claimed answer").unwrap();
+        Gates::answer(
+            root,
+            phase,
+            stage,
+            &opened.gate_id,
+            &gate_response(true, None),
+        )
+        .unwrap();
+        assert_eq!(
+            Gates::claim(root, phase, stage, &opened.gate_id).unwrap(),
+            devflow_core::gates::Claim::Claimed
+        );
+        opened.gate_id
+    }
+
+    /// The names of every event in the log, in order.
+    fn event_order(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|event| event["event"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// SURV-02 / Phase 48 criterion 3, as D-06 revised it: a `resume` whose relaunch opens
+    /// no gate relaunches the saved stage, and neither applies nor deletes a pending
+    /// answer. The gate here is a stage-failure gate, not a preflight refusal: the
+    /// relaunch's preflight PASSES (Supervise mode), so nothing opens a new gate, and the
+    /// close at the top of `resume` is the only thing that moved the answer.
     ///
-    /// Scope: asserts on the state immediately after `resume()` returns. What happens
-    /// to the answer once a later gate opens is
+    /// What happens when the relaunch does open a gate is
     /// `resume_quarantines_an_unused_gate_answer_and_opens_a_new_gate_id`.
     #[test]
-    fn a_resume_that_opens_no_gate_leaves_a_pending_answer_where_it_is() {
-        const NAME: &str = "pipeline_launch::tests::a_resume_that_opens_no_gate_leaves_a_pending_answer_where_it_is";
+    fn a_resume_that_opens_no_gate_sets_the_pending_answer_aside_and_relaunches() {
+        const NAME: &str = "pipeline_launch::tests::a_resume_that_opens_no_gate_sets_the_pending_answer_aside_and_relaunches";
         enter_agent_free_child!(NAME, "claude");
         let _guard = env_lock();
 
@@ -4422,7 +4476,6 @@ mod tests {
         let phase = PhaseId::new(91);
         let (gate, answer_before) =
             seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
-        let request_before = std::fs::read(Gates::gate_path(root, phase, Stage::Code)).unwrap();
 
         let result = resume(root, phase, None, false);
         let reloaded_for_reap = workflow::load_state(root, phase).ok();
@@ -4448,16 +4501,23 @@ mod tests {
             "resume must launch the saved stage exactly once"
         );
 
-        // (b) the pending answer was neither consumed nor moved.
+        // (b) the pending answer was set aside whole, and nothing consumed it.
+        let quarantined = Gates::quarantined(root);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].label, gate.as_str());
         assert_eq!(
-            std::fs::read(Gates::answer_path(root, phase, Stage::Code, &gate)).ok(),
-            Some(answer_before),
-            "resume must leave the pending gate answer on disk byte-identical"
+            std::fs::read(&quarantined[0].path).unwrap(),
+            answer_before,
+            "the set-aside file holds the answer's bytes"
         );
         assert_eq!(
-            std::fs::read(Gates::gate_path(root, phase, Stage::Code)).ok(),
-            Some(request_before),
-            "resume must leave the gate request untouched"
+            gate_answer_files(root, phase, Stage::Code),
+            Vec::<PathBuf>::new(),
+            "the answer is out of the answer slots"
+        );
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "the abandoned gate is closed"
         );
         assert!(
             gate_claim_files(root, phase, Stage::Code).is_empty(),
@@ -4467,6 +4527,268 @@ mod tests {
             events_of_kind(root, "gate_resolved").is_empty(),
             "resume must not resolve the gate"
         );
+    }
+
+    /// D-06 and R-02: `resume` closes the gate before it relaunches, keeps the answer's
+    /// bytes, and says so. libtest captures a passing test's `println!`, so the wording is
+    /// pinned here on `resume_gate_lines` and the print itself by the e2e
+    /// `resume_prints_the_answer_it_set_aside`.
+    #[test]
+    fn resume_reports_the_answers_it_set_aside_for_the_closed_gate() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_reports_the_answers_it_set_aside_for_the_closed_gate";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(93);
+        let (gate, answer) = seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        let quarantined = Gates::quarantined(root);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(std::fs::read(&quarantined[0].path).unwrap(), answer);
+        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
+        assert!(!workflow::load_state(root, phase).unwrap().gate_pending);
+        let order = event_order(root);
+        let set_aside = order.iter().position(|e| e == "gate_answer_quarantined");
+        let launched = order.iter().position(|e| e == "stage_launched");
+        assert!(
+            set_aside.is_some() && launched.is_some() && set_aside < launched,
+            "the gate closes before the relaunch: {order:?}"
+        );
+        assert!(
+            events_of_kind(root, "resume_found_unapplied_answer").is_empty(),
+            "an answer nobody claimed is reported as unused, not as unapplied"
+        );
+
+        let path = &quarantined[0].path;
+        let unused = CloseReport {
+            quarantined: vec![path.clone()],
+            ..CloseReport::default()
+        };
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, Some(gate.as_str()), &unused, true),
+            vec![format!(
+                "resume: set aside an unused answer for the code gate (gate {gate}): {} — the \
+                 rerun asks again",
+                path.display()
+            )]
+        );
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, None, &unused, true),
+            vec![format!(
+                "resume: set aside an unused answer for the code gate (gate {gate}): {} — the \
+                 rerun asks again",
+                path.display()
+            )],
+            "with no gate file the quarantined file's own label names the gate"
+        );
+
+        let claimed = |answer| CloseReport {
+            claimed: vec![devflow_core::gates::ClaimedAnswer {
+                gate_id: "G1".to_string(),
+                answer,
+            }],
+            ..CloseReport::default()
+        };
+        let approved = claimed(Some(GateAnswer {
+            gate_id: "G1".to_string(),
+            response: gate_response(true, None),
+        }));
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, true),
+            vec![
+                "resume: an answer for the code gate (gate G1: approved) was claimed but never \
+                 applied — its consumer ended before recording it; the rerun asks again"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, false),
+            Vec::<String>::new(),
+            "a claimed pair at a stage the run left is an applied answer's leftover"
+        );
+        let rejected = claimed(Some(GateAnswer {
+            gate_id: "G1".to_string(),
+            response: gate_response(false, Some("fix it")),
+        }));
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, None, &rejected, true),
+            vec![
+                "resume: an answer for the code gate (gate G1: rejected, note \"fix it\") was \
+                 claimed but never applied — its consumer ended before recording it; the rerun \
+                 asks again"
+                    .to_string()
+            ],
+            "the claimed entry names itself, whatever the gate file said"
+        );
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, None, &claimed(None), true),
+            vec![
+                "resume: an answer of unknown content for the code gate (gate G1) was claimed but \
+                 never applied — its consumer ended before recording it; the rerun asks again"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Code, None, &CloseReport::default(), true),
+            Vec::<String>::new(),
+            "a stage with nothing to report prints nothing"
+        );
+    }
+
+    /// D-06: once `resume` has set a Ship answer aside, `devflow ship` cannot apply it, so
+    /// the report names what is still available. The Code lines above carry none of this.
+    #[test]
+    fn resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside() {
+        const NAME: &str = "pipeline_launch::tests::resume_names_only_the_actions_left_for_a_ship_answer_it_set_aside";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_dir_with_agent_stub("claude");
+            let output = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1"))],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(94);
+        let (gate, answer) = seed_gate_with_pending_answer(
+            root,
+            phase,
+            Stage::Ship,
+            Mode::Supervise,
+            &gate_response(true, None),
+        );
+
+        let result = resume(root, phase, None, false);
+        {
+            let reloaded = workflow::load_state(root, phase).ok();
+            let _reap_guard = reloaded.as_ref().map(ReapMonitorOnDrop::after_launch);
+        }
+        drop(result);
+
+        let quarantined = Gates::quarantined(root);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].label, gate.as_str());
+        assert_eq!(std::fs::read(&quarantined[0].path).unwrap(), answer);
+        let err = crate::pipeline_gate::ship_override(root, phase, false)
+            .expect_err("the answer set aside can no longer be applied by `devflow ship`");
+        assert!(err.to_string().contains("no Ship gate response"), "{err}");
+
+        let report = CloseReport {
+            quarantined: vec![quarantined[0].path.clone()],
+            ..CloseReport::default()
+        };
+        let lines = resume_gate_lines(phase, Stage::Ship, Some(gate.as_str()), &report, true);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("the ship gate") && lines[0].contains("the rerun asks again"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "resume: the rerun's Ship gate asks again — answer it with `devflow gate approve \
+                 {phase} ship`; next time, to apply a stored Ship approval without a rerun, run \
+                 `devflow ship --phase {phase}` instead of `resume`"
+            )
+        );
+        assert!(
+            resume_gate_lines(phase, Stage::Code, Some(gate.as_str()), &report, true)
+                .iter()
+                .all(|line| !line.contains("devflow ship")),
+            "control: only a Ship answer gets the Ship line"
+        );
+    }
+
+    /// R-02's condition, end to end: a claimed pair at a stage the run left is an applied
+    /// answer's leftover. `resume` closes it, and core's event is all that is said of it.
+    #[test]
+    fn resume_says_nothing_of_a_claimed_pair_at_another_stage() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_says_nothing_of_a_claimed_pair_at_another_stage";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(95);
+        seed_code_gate_with_pending_answer(root, phase, Mode::Supervise);
+        let left_behind = plant_claimed_answer(root, phase, Stage::Plan);
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        assert!(!Gates::claim_path(root, phase, Stage::Plan, &left_behind).exists());
+        assert!(!Gates::answer_path(root, phase, Stage::Plan, &left_behind).exists());
+        let removed = events_of_kind(root, "gate_claimed_answer_removed");
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert_eq!(removed[0]["gate_id"], left_behind.as_str());
+        assert_eq!(
+            events_of_kind(root, "resume_found_unapplied_answer"),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    /// R2-05: a claimed pair at the run's stage is reported though `gate_pending` reads
+    /// false and its gate file is already gone. A filter on either would skip it.
+    #[test]
+    fn resume_reports_a_claimed_pair_whose_gate_file_is_gone() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_reports_a_claimed_pair_whose_gate_file_is_gone";
+        enter_agent_free_child!(NAME, "claude");
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(96);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Code;
+        state.stopped = true;
+        state.legacy_claude_launch = true;
+        workflow::save_state(&state).unwrap();
+        let gate = plant_claimed_answer(root, phase, Stage::Code);
+        std::fs::remove_file(Gates::gate_path(root, phase, Stage::Code)).unwrap();
+
+        let result = resume(root, phase, None, false);
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+        result.unwrap();
+
+        assert!(!Gates::claim_path(root, phase, Stage::Code, &gate).exists());
+        let found = events_of_kind(root, "resume_found_unapplied_answer");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0]["stage"], "code");
+        assert_eq!(found[0]["gate_id"], gate.as_str());
+        assert_eq!(found[0]["approved"], true);
     }
 
     /// D-06 (V-17): an answer whose waiter was killed before it consumed the answer
