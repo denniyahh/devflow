@@ -722,15 +722,36 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
     // See CR-01: an answer for this phase+stage must not outlive the run. An unused
     // one is set aside, never deleted. D-03: a superseded supervisor ends nothing, so its
     // refusal goes up instead of the rest of the abort.
-    if let Err(err) = close_gate(project_root, state.phase, state.stage)
-        && is_not_owner(&err)
-    {
-        return Err(err);
+    // A supervisor's stderr is `/dev/null`, so each failure is an event too.
+    if let Err(err) = close_gate(project_root, state.phase, state.stage) {
+        if is_not_owner(&err) {
+            return Err(err);
+        }
+        eprintln!(
+            "warning: phase {} abort could not close its {} gate: {err}",
+            state.phase, state.stage
+        );
+        events::emit(
+            project_root,
+            state.phase,
+            "abort_gate_not_closed",
+            serde_json::json!({ "stage": state.stage.to_string(), "error": err.to_string() }),
+        );
     }
-    if let Err(err) = clear_run_state(project_root, state.phase)
-        && is_not_owner(&err)
-    {
-        return Err(err);
+    if let Err(err) = clear_run_state(project_root, state.phase) {
+        if is_not_owner(&err) {
+            return Err(err);
+        }
+        events::emit(
+            project_root,
+            state.phase,
+            "abort_state_not_cleared",
+            serde_json::json!({ "error": err.to_string() }),
+        );
+        return Err(CliError::Message(format!(
+            "phase {} abort could not remove its state, so the run is not reported finished: {err}",
+            state.phase
+        )));
     }
     println!("workflow aborted for phase {}: {reason}", state.phase);
     // 23b: an abort also ends the workflow — deregister the same as the
@@ -1587,6 +1608,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An `abort` whose state cannot be removed says so, on the event a supervisor's
+    /// dead stderr cannot carry, and does not report the workflow aborted. The state path
+    /// is a directory so the removal fails whichever process runs this.
+    #[test]
+    fn abort_reports_a_state_it_could_not_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5310);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        std::fs::create_dir_all(workflow::state_path(root, phase).join("blocked")).unwrap();
+
+        let err = abort(root, &state, "test").expect_err("the state is still there");
+
+        assert!(err.to_string().contains("could not remove"), "{err}");
+        assert_eq!(events_named(root, "abort_state_not_cleared").len(), 1);
+        assert_eq!(events_named(root, "workflow_aborted").len(), 0);
+    }
+
+    /// An `abort` whose gate cannot be closed says so and still removes the state, since
+    /// the leftover answer cannot decide a later gate (D-05). Control: the abort finishes.
+    #[test]
+    fn abort_reports_a_gate_it_could_not_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5311);
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+        Gates::open_gate(root, phase, state.stage, "g").unwrap();
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(root.join(format!(".devflow/.gates-{}.lock", phase.padded())))
+            .unwrap();
+        lock.lock().unwrap();
+
+        abort(root, &state, "test").unwrap();
+
+        assert_eq!(events_named(root, "abort_gate_not_closed").len(), 1);
+        assert_eq!(events_named(root, "workflow_aborted").len(), 1);
+        assert!(!workflow::state_path(root, phase).exists());
     }
 
     /// Regression test for CR-01: `abort()` must clean up the gate's
