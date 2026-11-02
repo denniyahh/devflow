@@ -863,6 +863,22 @@ fn create_run_state(
     })
 }
 
+/// Copy a state file that does not load aside before a reservation replaces it, since a
+/// refused `start` then removes what the reservation wrote. A copy that cannot be made
+/// refuses the launch. Its name does not read as a state ([`workflow::list_states`]).
+fn keep_unloadable_state(state_file: &Path, kept: &Path) -> Result<(), CliError> {
+    std::fs::copy(state_file, kept)
+        .map(|_| ())
+        .map_err(|error| {
+            CliError::Message(format!(
+                "could not keep a copy of the state file {} at {}, which does not load, so it was \
+             not replaced: {error}",
+                state_file.display(),
+                kept.display()
+            ))
+        })
+}
+
 /// A launch's reservation, made at the top of `start` and `resume`.
 pub(crate) struct Reserved {
     /// The launch id and held liveness lock the supervisor will take over.
@@ -898,6 +914,11 @@ pub(crate) fn reserve_launch(
             ))
         })?;
     let pending = reservation.pending_record();
+    let kept_unloadable_path = project_root.join(".devflow").join(format!(
+        "unloadable-state-{}-{}.json",
+        phase.padded(),
+        reservation.launch_id()
+    ));
     let written = workflow::update_state_with(project_root, phase, |existing| {
         refuse_launch_over_a_live_run(project_root, phase, verb, &existing, cache_dir)?;
         if fresh.is_some() && matches!(existing, workflow::Existing::Unloadable(_)) {
@@ -913,7 +934,10 @@ pub(crate) fn reserve_launch(
         let (mut next, created, replaced) = match (existing, fresh) {
             (workflow::Existing::Loaded(state), _) => (state, false, false),
             (workflow::Existing::Missing, Some(fresh)) => (fresh.clone(), true, false),
-            (workflow::Existing::Unloadable(_), Some(fresh)) => (fresh.clone(), true, true),
+            (workflow::Existing::Unloadable(_), Some(fresh)) => {
+                keep_unloadable_state(&state_file, &kept_unloadable_path)?;
+                (fresh.clone(), true, true)
+            }
             (workflow::Existing::Missing, None) => {
                 return Err(workflow::WorkflowError::MissingState(state_file).into());
             }
@@ -927,7 +951,7 @@ pub(crate) fn reserve_launch(
         let outcome = ReserveOutcome {
             state: next.clone(),
             created,
-            replaced: replaced.then_some(state_file),
+            replaced: replaced.then(|| (state_file, kept_unloadable_path.clone())),
             abandoned: abandoned.map(|abandoned| abandoned.launch_id),
         };
         Ok::<_, CliError>((Some(next), outcome))
@@ -939,10 +963,12 @@ pub(crate) fn reserve_launch(
             return Err(err);
         }
     };
-    if let Some(path) = outcome.replaced {
+    if let Some((path, kept)) = outcome.replaced {
         println!(
-            "note: replaced the state file {}, which did not load, with this launch's reservation",
-            path.display()
+            "note: replaced the state file {}, which did not load, with this launch's \
+             reservation; its bytes are kept at {}",
+            path.display(),
+            kept.display()
         );
     }
     if let Some(launch_id) = outcome.abandoned {
@@ -1006,8 +1032,9 @@ fn refuse_unloadable_state_beside_a_live_lock(
 struct ReserveOutcome {
     state: State,
     created: bool,
-    /// The state file a reservation replaced because it did not load.
-    replaced: Option<PathBuf>,
+    /// The state file a reservation replaced because it did not load, and the copy of
+    /// its bytes.
+    replaced: Option<(PathBuf, PathBuf)>,
     /// The launch id of the abandoned reservation this one replaced.
     abandoned: Option<String>,
 }
@@ -16168,6 +16195,55 @@ mod tests {
                 .iter()
                 .any(|finding| finding.repair.as_deref() == Some(resume_verb.as_str())),
             "control: a prepared run names resume"
+        );
+    }
+
+    /// A `start` refused during preparation, over a state file that does not load, leaves
+    /// that file's bytes on disk. Nothing else keeps them: its reservation replaced the file,
+    /// and giving the reservation back removes what it wrote.
+    #[test]
+    fn a_start_refused_during_preparation_keeps_an_unloadable_states_bytes() {
+        const NAME: &str =
+            "commands::tests::a_start_refused_during_preparation_keeps_an_unloadable_states_bytes";
+        const BYTES: &[u8] = b"{ damaged by hand";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            // No `claude` on this PATH, so `ensure_agent_binary` refuses the start.
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5308);
+        let state_file = workflow::state_path(root, phase);
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(&state_file, BYTES).unwrap();
+
+        let err = start_for_test(root, phase).expect_err("no agent binary resolves");
+        assert!(err.contains("not found"), "{err}");
+
+        let kept: Vec<Vec<u8>> = std::fs::read_dir(state_file.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("unloadable")
+            })
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![BYTES.to_vec()],
+            "the bytes survive under one name"
+        );
+        assert_eq!(
+            workflow::list_states(root).len(),
+            0,
+            "the copy is not a state"
         );
     }
 
