@@ -659,7 +659,11 @@ pub fn while_owner<T, E: From<WorkflowError>>(
     launch_id: &str,
     f: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    let _ = (project_root, phase, launch_id);
+    let _lock = lock_for_write(project_root, phase, None)?;
+    let state = load_state(project_root, phase)?;
+    if let Some(refusal) = not_owner(&state, phase, launch_id) {
+        return Err(refusal.into());
+    }
     f()
 }
 
@@ -722,7 +726,8 @@ pub fn state_file_phases(project_root: &Path) -> Vec<PhaseId> {
 /// Takes the write lock, so a removal never interleaves with an update. This blocks
 /// while the lock is held, for the same callers as [`update_state`].
 pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<bool, WorkflowError> {
-    let (removed, result) = clear_state_with_partial_result_impl(project_root, phase, None, false);
+    let (removed, result) =
+        clear_state_with_partial_result_impl(project_root, phase, None, false, None);
     result.map(|()| removed)
 }
 
@@ -744,8 +749,9 @@ pub fn clear_state_if_owned(
     phase: PhaseId,
     launch_id: &str,
 ) -> Result<bool, WorkflowError> {
-    let _ = launch_id;
-    clear_state(project_root, phase)
+    let (removed, result) =
+        clear_state_with_partial_result_impl(project_root, phase, None, false, Some(launch_id));
+    result.map(|()| removed)
 }
 
 /// [`clear_state`] for the verbs whose job is to diagnose a wedge, as
@@ -757,7 +763,7 @@ pub fn clear_state_within(
     wait: Duration,
 ) -> Result<bool, WorkflowError> {
     let (removed, result) =
-        clear_state_with_partial_result_impl(project_root, phase, Some(wait), false);
+        clear_state_with_partial_result_impl(project_root, phase, Some(wait), false, None);
     result.map(|()| removed)
 }
 
@@ -767,7 +773,7 @@ pub(crate) fn clear_state_with_partial_result(
     project_root: &Path,
     phase: PhaseId,
 ) -> (bool, Result<(), WorkflowError>) {
-    clear_state_with_partial_result_impl(project_root, phase, None, true)
+    clear_state_with_partial_result_impl(project_root, phase, None, true, None)
 }
 
 fn clear_state_with_partial_result_impl(
@@ -775,6 +781,7 @@ fn clear_state_with_partial_result_impl(
     phase: PhaseId,
     wait: Option<Duration>,
     report_temp_removal_failure: bool,
+    owner: Option<&str>,
 ) -> (bool, Result<(), WorkflowError>) {
     // Nothing to remove, so no lock file to leave behind in a project DevFlow has
     // not touched.
@@ -785,6 +792,14 @@ fn clear_state_with_partial_result_impl(
         Ok(lock) => lock,
         Err(error) => return (false, Err(error)),
     };
+    if let Some(launch_id) = owner {
+        let refusal = load_state(project_root, phase)
+            .map(|state| not_owner(&state, phase, launch_id))
+            .unwrap_or_else(Some);
+        if let Some(refusal) = refusal {
+            return (false, Err(refusal));
+        }
+    }
     let path = state_path(project_root, phase);
     let mut removed = false;
     if path.exists() {

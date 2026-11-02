@@ -1816,17 +1816,32 @@ fn await_promotion(
     wait: Duration,
     quit: &AtomicBool,
 ) -> Option<Promotion> {
-    let _ = (wait, quit);
-    match crate::workflow::load_state(project_root, phase) {
-        Ok(state) => Some(match crate::workflow::ownership(&state, launch_id) {
-            crate::workflow::Ownership::Recorded => Promotion::Recorded,
-            crate::workflow::Ownership::Superseded { recorded } => {
-                Promotion::Superseded { recorded }
+    let deadline = std::time::Instant::now() + wait;
+    while !quit.load(Ordering::Acquire) {
+        let expired = std::time::Instant::now() >= deadline;
+        match crate::workflow::load_state(project_root, phase) {
+            Ok(state) => match crate::workflow::ownership(&state, launch_id) {
+                crate::workflow::Ownership::Recorded => return Some(Promotion::Recorded),
+                crate::workflow::Ownership::Superseded { recorded } => {
+                    return Some(Promotion::Superseded { recorded });
+                }
+                crate::workflow::Ownership::PendingOnly if expired => {
+                    return Some(Promotion::OrphanedPending);
+                }
+                crate::workflow::Ownership::PendingOnly => {}
+            },
+            Err(crate::workflow::WorkflowError::MissingState(_)) => {
+                return Some(Promotion::Superseded { recorded: None });
             }
-            crate::workflow::Ownership::PendingOnly => Promotion::OrphanedPending,
-        }),
-        Err(_) => Some(Promotion::Superseded { recorded: None }),
+            Err(err) if expired => {
+                warn!("launch {launch_id}: the state still does not load at the deadline: {err}");
+                return Some(Promotion::Superseded { recorded: None });
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(PROMOTION_POLL);
     }
+    None
 }
 
 /// Take over the liveness descriptor `spec` names, if it names one.
