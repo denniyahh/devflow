@@ -1063,7 +1063,7 @@ already is), so committed evidence shows which turn carried which rule.
 
 **Defect:** a supervisor's safe points read its stop token, not the state's `stopped` field. With `stopped = true` written through `update_state` beside a real supervisor parked at a failed Define gate, approving the gate launched the stage again, so an agent ran under a state that reads `stopped`.
 
-**Reach:** only a hand edit. The production writers were read, not exercised: each runs in the process that owns the run, and `devflow stop`'s write refuses a launch it did not end. A new writer would reach it.
+**Reach:** a hand edit, or `devflow stop` beside a foreground holder when its gate abort is published unconfirmed (the gate closed first, then the gate lock stayed held past its 5 s wait): `stop` does not signal the holder there (R2-04) and records `stopped`. The same race beside a supervisor no longer reaches it: `stop` goes on to the socket arm (50.1 WR-03). The other production writers were read, not exercised: each runs in the process that owns the run, and `devflow stop`'s write refuses a launch it did not end. A new writer would reach it.
 
 **Fix shape (not tested):** have a safe point also read the state's `stopped` field.
 

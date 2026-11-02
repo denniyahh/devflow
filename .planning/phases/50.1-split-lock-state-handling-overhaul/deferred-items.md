@@ -88,6 +88,7 @@
   **Reach:** by reading, `devflow stop` does not produce this against a live waiter: arm 1 answers the gate with an abort, and the socket and holder arms set the token or the holder's flag. A flag written by hand, or by a path added later, would. No fix is proposed here.
   **Why deferred:** 50.1-24's reporting covers the token path only (see its SUMMARY). This needs a ruling on whether a safe point should also read the state.
   **Settled (orchestrator, wave 18):** no change in this phase, moved to backlog 999.172. Every production writer of `stopped` was read: each runs in the process that owns the run, or refuses a launch it did not end (`unaddressed_launch_refusal`). So only a hand edit reaches it.
+  **Corrected (50.1 code review, WR-03):** that reading was wrong. `stop` counted a published but unconfirmed gate abort as addressing the recorded launch, so it could record `stopped` beside a supervisor it had not ended. `stop` now goes on to the socket arm there. A foreground holder in the same race is still not signalled (R2-04), so that path and a hand edit are what reach it; see 999.172.
 
 - `stop` over a live pid in the agent pid file cannot record `stopped` until that pid ends (found during 50.1-24, by plan)
   status: open, by plan; OPERATIONS now names the case and both ways out (50.1-25, 7b4c9a8 and 98221ec). `stop`'s own line still does not name removing the file.

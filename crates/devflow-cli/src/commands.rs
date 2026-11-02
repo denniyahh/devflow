@@ -2720,8 +2720,9 @@ fn reap_stray_candidates(
 
 /// The gate [`stop_via_gate`] answered, and the launch the state named as that run's
 /// supervisor when it read the gate as current. `stop` keeps the launch id in its list of
-/// launches it addressed.
-type AnsweredGate = (Stage, GateId, Option<String>);
+/// launches it addressed. The flag says the abort was published but its gate may have
+/// closed first, so no waiter may ever act on it.
+type AnsweredGate = (Stage, GateId, Option<String>, bool);
 
 /// End a running phase cleanly (23c, D-04, D-06): the one teardown verb, at
 /// every point of a run, that never claims a stop it did not perform.
@@ -2758,8 +2759,18 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
     // The launches this stop ended, answered, cleared or found not live, and only those:
     // no state read seeds it, so a launch none of the arms addressed blocks the mark.
     let mut known_launches = Vec::new();
-    if let Some((_, _, run_launch)) = stop_via_gate(project_root, phase)? {
-        known_launches.extend(run_launch);
+    if let Some((_, _, run_launch, unconfirmed)) = stop_via_gate(project_root, phase)? {
+        if unconfirmed {
+            // Only the socket: signalling a foreground holder here would be a second
+            // action on top of the published abort (R2-04). The launch counts as addressed
+            // only if this arm addresses it.
+            note_socket_stop(
+                stop_via_socket(project_root, phase, cache_dir)?,
+                &mut known_launches,
+            );
+        } else {
+            known_launches.extend(run_launch);
+        }
         return persist_stopped_state(project_root, phase, false, &known_launches);
     }
     let socket_stop = stop_via_socket(project_root, phase, cache_dir)?;
@@ -3863,7 +3874,7 @@ fn stop_reap_observed_gate(
                 path.display(),
                 response_pickup_message(gate.stage, waiter)
             );
-            Ok(Some((gate.stage, observed, run_launch)))
+            Ok(Some((gate.stage, observed, run_launch, false)))
         }
         // A human, `--yes-ship`, or `devflow gate sweep` answered this gate
         // between our scan and this reap. Read its action: an approval or
@@ -3894,16 +3905,16 @@ fn stop_reap_observed_gate(
             );
             Ok(None)
         }
-        // The abort is out, so this stop has acted: one `stop`, one action (R2-04). If the
-        // gate had in fact closed, the persisted `stopped` flag halts the run at its next
-        // safe point.
+        // The abort is out, so the holder arm stays out of it: one `stop`, one action
+        // (R2-04). If the gate had in fact closed, nothing reads the persisted `stopped` flag
+        // at a safe point (999.172), so the caller still shuts a supervisor down.
         Err(err @ GateError::PublishedUnconfirmed { .. }) => {
             println!(
                 "stop: phase {phase}'s {} gate (gate {observed}): the abort was published, but \
                  stop could not confirm the gate was still open — {err}",
                 gate.stage
             );
-            Ok(Some((gate.stage, observed, run_launch)))
+            Ok(Some((gate.stage, observed, run_launch, true)))
         }
         Err(err) => Err(err.into()),
     }
@@ -3940,7 +3951,7 @@ fn stop_with_existing_response(
             println!(
                 "stop: phase {phase} {stage} already has an abort response awaiting its registered waiter; stop did not write it"
             );
-            Ok(Some((stage, observed.clone(), run_launch)))
+            Ok(Some((stage, observed.clone(), run_launch, false)))
         }
         GateAction::Abort(_) => {
             println!(
@@ -7779,7 +7790,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             live_abort,
-            Some((stage, live.clone(), Some("launch-a".to_string())))
+            Some((stage, live.clone(), Some("launch-a".to_string()), false))
         );
         registration.finish();
     }
@@ -7929,7 +7940,7 @@ mod tests {
         let answered = stop_reap_observed_gate(root, phase, &entry).unwrap();
         assert_eq!(
             answered,
-            Some((stage, gate.clone(), None)),
+            Some((stage, gate.clone(), None, false)),
             "a live abort is the requested stop"
         );
         let AnswerRead::Bound(kept) = Gates::read_answer(root, phase, stage, &gate) else {
@@ -9163,6 +9174,39 @@ mod tests {
             Gates::read_answer(root, phase, stage, &opened.gate_id),
             AnswerRead::Bound(answer) if !answer.response.approved
         ));
+        registration.finish();
+    }
+
+    /// An unconfirmed abort may have reached no waiter, so `stop` still shuts a recorded
+    /// supervisor down through its socket rather than record `stopped` beside it.
+    #[test]
+    fn stop_shuts_the_supervisor_down_after_a_published_but_unconfirmed_abort() {
+        const LAUNCH: &str = "aaaa0000aaaa5306";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5306), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let socket = root.join("a.sock");
+        save_state_naming(root, phase, &socket, LAUNCH);
+        let supervisor = ScriptedSupervisor::serve(&socket, LAUNCH, phase, "agent_running", |_| {
+            stopped_and_gone()
+        });
+        let (_, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hook_root, hook_parked) = (root.to_path_buf(), parked.clone());
+
+        with_answer_before_publish(
+            move || {
+                *hook_parked.borrow_mut() = Some(hold_gate_lock(&hook_root, phase));
+            },
+            || stop_in(root, phase, Some(cache.path())),
+        )
+        .unwrap();
+
+        assert_eq!(supervisor.shutdowns(), 1, "the socket arm ran");
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+        drop(parked.borrow_mut().take());
         registration.finish();
     }
 
