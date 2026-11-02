@@ -904,7 +904,7 @@ struct ReserveOutcome {
 /// sweeps one left behind. Only the path this project's launch id derives to, and only
 /// while nothing holds it, because the path was read from a state file. An unheld hold
 /// file can never read live again, so removing it races no holder.
-fn remove_abandoned_liveness_file(project_root: &Path, abandoned: &PendingSupervisor) {
+pub(crate) fn remove_abandoned_liveness_file(project_root: &Path, abandoned: &PendingSupervisor) {
     let path = &abandoned.liveness_path;
     if liveness::launch_liveness_path(project_root, &abandoned.launch_id).as_ref() != Some(path)
         || !matches!(liveness::probe(path), Ok(liveness::Held::Abandoned))

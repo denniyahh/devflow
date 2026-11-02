@@ -1620,8 +1620,8 @@ const LAUNCH_RECORD_WAIT: Duration = Duration::from_secs(15);
 /// `start` and `resume` no longer hold the long lock that ordered the two (D-08), so
 /// wait (bounded by `wait`) while the state names `launch_id` only as pending. A
 /// launcher that died never promotes, and the advance goes on when the wait expires.
-/// A launch with no reservation (a stage handoff) does not wait: its launcher holds
-/// the advance lock across the publish. 50.1-19 replaces this with the promotion watch.
+/// A stage handoff's launch waits too: its launcher records it as pending before it
+/// spawns it (D-01). 50.1-19 replaces this with the promotion watch.
 fn wait_while_launch_is_pending(
     project_root: &Path,
     phase: PhaseId,
@@ -2042,15 +2042,30 @@ fn promote_pending(state: &mut State) {
 /// `publish_record` has set one, its stop. It only ever sets `stopped`: a `stop`
 /// another writer landed while this launch ran is on disk and is not this launcher's
 /// to clear.
-fn save_publish_fields(published: &State) -> Result<(), workflow::WorkflowError> {
+///
+/// The promotion happens only while the state still names this launch (D-01): a
+/// reservation another writer cleared or replaced refuses the save, and
+/// [`publish_record`] then shuts this supervisor down through its socket. `publish_record`'s
+/// second save, for its stop, finds the launch already recorded.
+fn save_publish_fields(published: &State) -> Result<(), CliError> {
+    let launch_id = published.supervisor.as_ref().map(|r| r.launch_id.as_str());
     workflow::update_state(&published.project_root, published.phase, |s| {
+        let pending_id = s.pending_supervisor.as_ref().map(|p| p.launch_id.as_str());
+        let recorded_id = s.supervisor.as_ref().map(|r| r.launch_id.as_str());
+        if launch_id.is_none() || (pending_id != launch_id && recorded_id != launch_id) {
+            return Err(CliError::Message(format!(
+                "phase {}'s state no longer names launch {} as pending",
+                s.phase,
+                launch_id.unwrap_or("<none>")
+            )));
+        }
         s.supervisor = published.supervisor.clone();
         promote_pending(s);
         if published.stopped {
             s.stopped = true;
             s.stop_reason = published.stop_reason.clone();
         }
-        Ok::<(), workflow::WorkflowError>(())
+        Ok::<(), CliError>(())
     })
     .map(|_| ())
 }
@@ -2217,9 +2232,16 @@ fn spawn_next_supervisor(
             if let Some(held) = held {
                 held.discard();
             }
-            monitor::Reservation::new(&ctx, state).map_err(spawn_failed)?
+            let reservation = monitor::Reservation::new(&ctx, state).map_err(spawn_failed)?;
+            if let Err(err) = commit_pending_record(state, &reservation) {
+                reservation.discard();
+                return Err(err);
+            }
+            reservation
         }
     };
+    #[cfg(test)]
+    test_hold("after_pending_save");
     let published =
         match monitor::spawn_monitor(state, program, args, extra_env, launch, &ctx, &reservation) {
             Ok(published) => published,
@@ -2244,6 +2266,79 @@ fn spawn_next_supervisor(
         ctx,
         launch_label,
     }))
+}
+
+/// Record a launch that no `start` or `resume` reserved, a stage handoff above all, as
+/// pending before it is spawned (D-01), so the state names every supervisor that might
+/// be live for the phase, whatever happens to this launcher after the spawn (crash-table
+/// row C4, T-50-91).
+///
+/// A record already there is replaced when its lock is not held, and its file removed
+/// when it reads abandoned. A held one is a live launch this launcher knows nothing of,
+/// so this launch stops, naming both ids: `start` and `resume` are kept off a live
+/// supervisor by their guard, and a hand-run `advance` and `devflow ship`'s loop-back by
+/// theirs (50.1-29). Until 50.1-19, this also refuses a supervisor whose own promotion
+/// never came and whose bounded wait expired ([`wait_while_launch_is_pending`]): it holds
+/// the lock its own record names.
+///
+/// On `Err` this launch wrote nothing, so the caller's copy stops naming any pending
+/// record: [`record_failed_launch`] clears the record its copy names, and a record on
+/// disk here is another launch's.
+fn commit_pending_record(
+    state: &mut State,
+    reservation: &monitor::Reservation,
+) -> Result<(), CliError> {
+    use devflow_core::liveness::{self, Held};
+    let pending = reservation.pending_record();
+    let (mut refused_over, mut cleared) = (None, None);
+    let written = workflow::update_state(&state.project_root, state.phase, |s| {
+        if let Some(existing) = &s.pending_supervisor
+            && !matches!(
+                liveness::probe(&existing.liveness_path),
+                Ok(Held::Abandoned | Held::Missing)
+            )
+        {
+            refused_over = Some(existing.launch_id.clone());
+            return Err(CliError::Message(format!(
+                "phase {}: launch {} was not spawned: the state names launch {} as pending and \
+                 its liveness lock is held; run `devflow stop --phase {}` to end it",
+                s.phase,
+                reservation.launch_id(),
+                existing.launch_id,
+                s.phase
+            )));
+        }
+        if let Some(replaced) = s.pending_supervisor.replace(pending) {
+            crate::commands::remove_abandoned_liveness_file(&s.project_root, &replaced);
+            cleared = Some(replaced.launch_id);
+        }
+        Ok(())
+    });
+    match written {
+        Ok((committed, ())) => {
+            *state = committed;
+            if let Some(launch_id) = cleared {
+                println!("cleared an abandoned launch reservation {launch_id}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            state.pending_supervisor = None;
+            if let Some(pending_id) = refused_over {
+                events::emit(
+                    &state.project_root,
+                    state.phase,
+                    "launch_refused_over_live_pending",
+                    serde_json::json!({
+                        "stage": state.stage.to_string(),
+                        "launch_id": reservation.launch_id(),
+                        "pending_launch_id": pending_id,
+                    }),
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Whether `state` still names `reservation` as its pending supervisor.
@@ -9734,6 +9829,134 @@ mod tests {
         );
     }
 
+    /// D-01's prohibition: the publish promotes only a launch the state still names. A
+    /// save for a launch whose reservation was cleared, or replaced by another's, writes
+    /// nothing. Controls: the launch it names is promoted, and the second save, for a
+    /// stop, finds it recorded.
+    #[test]
+    fn the_publish_save_refuses_a_launch_the_state_no_longer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1703);
+        let prior = fabricated_prior_record(root);
+        let launch_id = "aaaa0000aaaa1703";
+        let mut launcher = state_with_pending(root, phase, "bbbb0000bbbb1703");
+        launcher.supervisor = Some(SupervisorRecord::new(
+            root.join("pending.sock"),
+            launch_id.to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        ));
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.supervisor = Some(prior.clone());
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+
+        let refused_replaced = save_publish_fields(&launcher);
+        let after_replaced = workflow::load_state(root, phase).unwrap();
+        assert!(refused_replaced.is_err(), "another launch's reservation");
+        assert_eq!(after_replaced.supervisor.as_ref(), Some(&prior));
+
+        workflow::update_state(root, phase, |on_disk| {
+            on_disk.pending_supervisor = None;
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        let refused_cleared = save_publish_fields(&launcher);
+        let after_cleared = workflow::load_state(root, phase).unwrap();
+        assert!(refused_cleared.is_err(), "a cleared reservation");
+        assert_eq!(after_cleared.supervisor.as_ref(), Some(&prior));
+
+        state_with_pending(root, phase, launch_id);
+        save_publish_fields(&launcher).expect("control: the launch it names");
+        let promoted = workflow::load_state(root, phase).unwrap();
+        assert_eq!(promoted.supervisor, launcher.supervisor);
+        assert_eq!(promoted.pending_supervisor, None, "promoted");
+
+        launcher.stopped = true;
+        save_publish_fields(&launcher).expect("control: the stop's save finds it recorded");
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+    }
+
+    /// A launch context a reservation can be taken from: nothing here spawns.
+    fn reservation_only_context(cache: &Path) -> monitor::LaunchContext {
+        monitor::LaunchContext::new(
+            cache.to_path_buf(),
+            monitor::MonitorExec::Subcommand {
+                exe: PathBuf::from("/nonexistent/devflow"),
+            },
+        )
+    }
+
+    /// A pending record whose liveness lock is held stops the launch, naming both launch
+    /// ids and changing no state, and the failure path that follows keeps the record.
+    /// Control: the same record with its lock released is replaced and its file removed.
+    #[test]
+    fn a_launch_over_a_live_pending_record_is_refused_and_keeps_it() {
+        use devflow_core::liveness;
+        const LIVE: &str = "aaaa0000aaaa1704";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1704);
+        let cache = tempfile::tempdir().unwrap();
+        let ctx = reservation_only_context(cache.path());
+        let path = liveness::launch_liveness_path(root, LIVE).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let held = liveness::Hold::take(&path).unwrap();
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+            LIVE.to_string(),
+            root.join("live.sock"),
+            path.clone(),
+        ));
+        workflow::save_state(&state).unwrap();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+
+        let reservation = monitor::Reservation::new(&ctx, &state).unwrap();
+        let text = commit_pending_record(&mut state, &reservation)
+            .expect_err("a live pending record stops the launch")
+            .to_string();
+        for id in [LIVE, reservation.launch_id()] {
+            assert!(text.contains(id), "the refusal names {id}: {text}");
+        }
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "a refused launch writes no state"
+        );
+        record_failed_launch(&mut state).unwrap();
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .map(|pending| pending.launch_id)
+                .as_deref(),
+            Some(LIVE),
+            "the failure path keeps the record of the launch that is live"
+        );
+        let refused = events_named(root, "launch_refused_over_live_pending");
+        assert_eq!(refused.len(), 1, "the refusal is on the record");
+        assert_eq!(refused[0]["pending_launch_id"], LIVE);
+        reservation.discard();
+
+        drop(held);
+        let reservation = monitor::Reservation::new(&ctx, &state).unwrap();
+        commit_pending_record(&mut state, &reservation).expect("control: an abandoned one");
+        assert_eq!(
+            workflow::load_state(root, phase)
+                .unwrap()
+                .pending_supervisor
+                .map(|pending| pending.launch_id)
+                .as_deref(),
+            Some(reservation.launch_id()),
+            "control: this launch's record replaced it"
+        );
+        assert!(!path.exists(), "control: the abandoned file is removed");
+        reservation.discard();
+    }
+
     // ---- 50-23: every launch failure path has a defined end state ----
 
     /// A previous stage's supervisor record whose socket does not exist and
@@ -11014,6 +11237,11 @@ mod tests {
             on_disk.stopped = true;
             on_disk.stop_reason = Some(CONCURRENT_STOP.to_string());
             on_disk.gate_notify_cmd = Some(": edited".to_string());
+            on_disk.pending_supervisor = Some(devflow_core::state::PendingSupervisor::new(
+                fabricated_prior_record(root).launch_id,
+                root.join("pending.sock"),
+                root.join("pending.live"),
+            ));
             Ok::<(), workflow::WorkflowError>(())
         })
         .unwrap();
