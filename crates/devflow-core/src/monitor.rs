@@ -1616,6 +1616,11 @@ const PROMOTION_POLL: Duration = Duration::from_millis(20);
 /// agent runs.
 const RECORDED_READ_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long consecutive reads must find a recorded launch's state file absent before the
+/// watch believes it is gone. Something that renames the file away and back during a save
+/// reads as absent for a moment, and a false verdict would end a healthy agent.
+const STATE_GONE_CONFIRM_WAIT: Duration = Duration::from_secs(3);
+
 /// The least time between two warnings that a recorded launch's state does not confirm it.
 const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1661,8 +1666,9 @@ const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 ///    at the deadline. A verdict reached after the agent exited signals nothing.
 ///    After `Recorded` the watch keeps reading, every [`RECORDED_READ_INTERVAL`],
 ///    until the agent's exit is observed, and that ends it with `Recorded`. A state
-///    that names another launch or none, or is gone, makes the verdict `Superseded` and
-///    ends the group the same way (SUPV-04). A state that does not load, or names this
+///    that names another launch or none, or stays gone for
+///    [`STATE_GONE_CONFIRM_WAIT`] of consecutive reads, makes the verdict `Superseded`
+///    and ends the group the same way (SUPV-04). A state that does not load, or names this
 ///    launch only as pending, ends nothing: neither says another launch owns the run, and
 ///    a false verdict would kill a healthy agent, so the watch warns at most every
 ///    [`RECORDED_WARN_INTERVAL`] and keeps reading. If the agent exits meanwhile, the
@@ -1910,7 +1916,8 @@ fn await_promotion(
 
 /// Keep reading the state of a launch it recorded, until the agent's exit has been
 /// observed or the watch is told to quit: `Recorded`, unless a read finds this launch
-/// definitely superseded first (see [`run_supervised_stage`]). It wakes every
+/// definitely superseded first, or the state stays absent for
+/// [`STATE_GONE_CONFIRM_WAIT`] (see [`run_supervised_stage`]). It wakes every
 /// [`PROMOTION_POLL`] so the agent's exit never waits for a state read.
 fn watch_recorded(
     project_root: &Path,
@@ -1921,13 +1928,18 @@ fn watch_recorded(
 ) -> Promotion {
     let mut next_read = std::time::Instant::now() + RECORDED_READ_INTERVAL;
     let mut last_warned = None;
+    let mut absent_since = None;
     while !quit.load(Ordering::Acquire)
         && token.phase() == crate::supervisor::runtime::OwnerPhase::AgentRunning
     {
         let now = std::time::Instant::now();
         if now >= next_read {
             next_read = now + RECORDED_READ_INTERVAL;
-            let doubt = match crate::workflow::load_state(project_root, phase) {
+            let loaded = crate::workflow::load_state(project_root, phase);
+            if !matches!(loaded, Err(crate::workflow::WorkflowError::MissingState(_))) {
+                absent_since = None;
+            }
+            let doubt = match loaded {
                 Ok(state) => match crate::workflow::ownership(&state, launch_id) {
                     crate::workflow::Ownership::Recorded => None,
                     crate::workflow::Ownership::Superseded { recorded } => {
@@ -1938,7 +1950,11 @@ fn watch_recorded(
                     }
                 },
                 Err(crate::workflow::WorkflowError::MissingState(_)) => {
-                    return Promotion::Superseded { recorded: None };
+                    let since = *absent_since.get_or_insert(now);
+                    if now.duration_since(since) >= STATE_GONE_CONFIRM_WAIT {
+                        return Promotion::Superseded { recorded: None };
+                    }
+                    Some("the state file is absent".to_string())
                 }
                 Err(err) => Some(format!("the state does not load: {err}")),
             };

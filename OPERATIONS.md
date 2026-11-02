@@ -156,7 +156,7 @@ own stop. It ends its agent's group if the agent still runs and logs
 `supervisor_superseded`, whose `agent_group` field says `ended` or
 `already_exited`. A promoted supervisor keeps reading the state once a second
 until its agent exits, so editing the state to name another launch or none, or
-deleting it, ends a running agent. A state that does not load, or names the
+deleting it for more than 3 s, ends a running agent. A state that does not load, or names the
 launch only as pending, ends nothing: the supervisor logs a warning at most once
 a minute, and its agent keeps running.
 
