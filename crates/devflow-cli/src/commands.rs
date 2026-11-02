@@ -3085,15 +3085,11 @@ fn shutdown_one_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<
         Ok(supervisor::ShutdownOutcome::Stopped {
             exit_code,
             advance_suppressed,
+            group_signalled,
         }) => {
-            let advance = if advance_suppressed {
-                "advance suppressed"
-            } else {
-                "advance not suppressed"
-            };
             println!(
-                "stop: stopped {subject} through its supervisor (agent group ended, exit code \
-                 {exit_code}, {advance})"
+                "{}",
+                stopped_line(subject, exit_code, advance_suppressed, group_signalled)
             );
             return Ok(());
         }
@@ -3141,6 +3137,25 @@ fn stop_stale_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<()
     let socket = supervisor::SocketPath::new(entry.socket_path.clone())
         .map_err(|error| stale_refusal(subject, &entry.socket_path, &error.to_string()))?;
     run_backstop(subject, &socket, sidecar, None, None)
+}
+
+/// `stop`'s line for a stop its supervisor confirmed. It claims a group ended only when the
+/// supervisor signalled one.
+fn stopped_line(
+    subject: &str,
+    exit_code: i32,
+    advance_suppressed: bool,
+    _group_signalled: bool,
+) -> String {
+    let advance = if advance_suppressed {
+        "advance suppressed"
+    } else {
+        "advance not suppressed"
+    };
+    format!(
+        "stop: stopped {subject} through its supervisor (agent group ended, exit code \
+         {exit_code}, {advance})"
+    )
 }
 
 /// How long `stop` waits for a supervisor's final shutdown line: the
@@ -3403,15 +3418,16 @@ fn shutdown_supervisor(
         Ok(supervisor::ShutdownOutcome::Stopped {
             exit_code,
             advance_suppressed,
+            group_signalled,
         }) => {
-            let advance = if advance_suppressed {
-                "advance suppressed"
-            } else {
-                "advance not suppressed"
-            };
             println!(
-                "stop: stopped phase {phase} through its supervisor (agent group ended, exit \
-                 code {exit_code}, {advance})"
+                "{}",
+                stopped_line(
+                    &format!("phase {phase}"),
+                    exit_code,
+                    advance_suppressed,
+                    group_signalled
+                )
             );
             return Ok(ShutdownResult::Ended);
         }
@@ -13625,8 +13641,26 @@ mod tests {
 
     const HANDED_OFF_LINE: &str = r#"{"ok":false,"error":"handed_off"}"#;
     const ACCEPTED_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"agent_running"}"#;
-    const STOPPED_LINE: &str =
-        r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true}"#;
+    const STOPPED_LINE: &str = r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":true}"#;
+
+    /// D-16 / D-13 item 6: the success line says what the supervisor did. A safe-point
+    /// stop signalled nothing and says so; only a signalled group is "ended".
+    #[test]
+    fn the_stop_line_names_the_safe_point_when_no_agent_group_was_signalled() {
+        let safe_point = stopped_line("phase 7", 143, true, false);
+        assert_eq!(
+            safe_point,
+            "stop: stopped phase 7 through its supervisor (honoured at an advance safe point; \
+             nothing was signalled; exit code 143)"
+        );
+        assert!(!safe_point.contains("agent group ended"), "{safe_point}");
+        let signalled = stopped_line("launch abc", 143, true, true);
+        assert_eq!(
+            signalled,
+            "stop: stopped launch abc through its supervisor (agent group ended, exit code 143, \
+             advance suppressed)"
+        );
+    }
 
     /// Crash row C13 (V-57): the state names supervisor A; A answers the
     /// shutdown by saving the state naming B (N+1's record is saved before N

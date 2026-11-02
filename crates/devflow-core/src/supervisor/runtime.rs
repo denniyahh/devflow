@@ -669,6 +669,7 @@ impl Supervisor {
             Reply::Stopped(ShutdownStopped {
                 exit_code: STOPPED_EXIT_CODE,
                 advance_suppressed: true,
+                group_signalled: false,
             })
         } else {
             Reply::Error("handed_off".to_string())
@@ -890,6 +891,7 @@ impl Control {
                 Reply::Stopped(ShutdownStopped {
                     exit_code: STOPPED_EXIT_CODE,
                     advance_suppressed: true,
+                    group_signalled: false,
                 }),
             ],
             StopAction::AlreadyFinished => &[Reply::Error("already_finished".to_string())],
@@ -1183,7 +1185,8 @@ mod tests {
             answer.as_ref().ok(),
             Some(&ShutdownOutcome::Stopped {
                 exit_code: 143,
-                advance_suppressed: true
+                advance_suppressed: true,
+                group_signalled: true
             }),
             "a socket shutdown must report the stop, got {answer:?}"
         );
@@ -1693,7 +1696,8 @@ mod tests {
             answer.as_ref().ok(),
             Some(&ShutdownOutcome::Stopped {
                 exit_code: 143,
-                advance_suppressed: true
+                advance_suppressed: true,
+                group_signalled: true
             }),
             "the stop is reported, got {answer:?}"
         );
@@ -1869,6 +1873,7 @@ mod tests {
         let stopped = ShutdownOutcome::Stopped {
             exit_code: 143,
             advance_suppressed: true,
+            group_signalled: false,
         };
 
         // Taken while the CLI advances, then stopped at a safe point: the
@@ -1923,6 +1928,101 @@ mod tests {
         assert!(!supervisor.token().stop_requested());
         supervisor.finish();
         assert!(matches!(probe(&path), Ok(Liveness::Gone)));
+    }
+
+    /// What a parked shutdown caller hears: once its stop is taken, `end` ends the run, then
+    /// the supervisor finishes.
+    fn final_answer(
+        supervisor: Supervisor,
+        path: &Path,
+        end: impl FnOnce(&Supervisor),
+    ) -> Option<ShutdownOutcome> {
+        let caller = {
+            let path = path.to_path_buf();
+            std::thread::spawn(move || request_shutdown(&path, CHILD_WAIT).ok())
+        };
+        assert!(
+            wait_until(CHILD_WAIT, || supervisor.token().stop_requested()),
+            "the request is taken"
+        );
+        end(&supervisor);
+        supervisor.finish();
+        caller.join().expect("caller")
+    }
+
+    /// D-16 / D-13 item 6: the final reply says whether the agent's group was signalled.
+    /// A stop taken while the CLI advances and honoured at a safe point signalled nothing;
+    /// a stop taken while the agent runs signalled its group, and the agent dies of it.
+    #[test]
+    fn a_safe_point_stop_reply_says_no_group_was_signalled() {
+        let cache = short_cache();
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        supervisor.token().enter(OwnerPhase::Advancing);
+        let answer = final_answer(supervisor, &path, |supervisor| {
+            assert_eq!(supervisor.token().safe_point(), SafePoint::StopHere);
+        });
+        assert_eq!(
+            answer,
+            Some(ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true,
+                group_signalled: false,
+            }),
+            "a safe-point stop signals nothing"
+        );
+
+        let (mut agent, _group, pgid) = unrelated_group();
+        let socket = SocketPath::for_launch(
+            cache.path(),
+            Path::new("/project/runtime"),
+            PhaseId::new(50),
+            &new_launch_id(),
+        )
+        .expect("socket path fits sun_path");
+        let mut sidecar = test_sidecar(&socket, std::process::id());
+        sidecar.agent_pgid = pgid;
+        let path = socket.as_path().to_path_buf();
+        let supervisor = Supervisor::serve(socket, sidecar).expect("serve the socket");
+        let answer = final_answer(supervisor, &path, |supervisor| {
+            assert_eq!(
+                supervisor
+                    .wait_agent(agent.child())
+                    .expect("wait the agent"),
+                AgentOutcome::Stopped
+            );
+        });
+        assert_eq!(
+            answer,
+            Some(ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true,
+                group_signalled: true,
+            }),
+            "a stop taken while the agent runs signals its group"
+        );
+    }
+
+    /// A stop in `AgentRunning` whose group signal was refused (the pgid is `0`) ended no
+    /// group, so its reply does not say one was signalled.
+    #[test]
+    fn a_refused_group_signal_is_not_reported_as_signalled() {
+        let cache = short_cache();
+        let (supervisor, path) = in_process_supervisor(cache.path());
+        let answer = final_answer(supervisor, &path, |supervisor| {
+            let token = supervisor.token();
+            assert_eq!(
+                token.observe_exit(|_| Ok(0)).expect("observe the exit"),
+                AgentOutcome::Stopped
+            );
+        });
+        assert_eq!(
+            answer,
+            Some(ShutdownOutcome::Stopped {
+                exit_code: 143,
+                advance_suppressed: true,
+                group_signalled: false,
+            })
+        );
     }
 
     // ---- 50-23 (R6-E): the stopped-outcome test hold stays test-only ----

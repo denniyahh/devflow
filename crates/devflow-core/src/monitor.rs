@@ -7996,7 +7996,8 @@ exit 0
             stopped,
             Ok(crate::supervisor::ShutdownOutcome::Stopped {
                 exit_code: 143,
-                advance_suppressed: true
+                advance_suppressed: true,
+                group_signalled: true
             })
         ) {
             panic!(
