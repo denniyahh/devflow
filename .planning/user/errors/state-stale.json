@@ -1,5 +1,5 @@
 {
-  "stale_since_commit": "2cb8cc9",
-  "summaries_landed": [".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-17-SUMMARY.md"],
+  "stale_since_commit": "d1ee045",
+  "summaries_landed": [".planning/phases/50.1-split-lock-state-handling-overhaul/50.1-19-SUMMARY.md"],
   "state_status_at_detection": "executing"
 }

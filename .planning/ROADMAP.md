@@ -522,7 +522,7 @@ caveat); fsync of the file and its directory. See the 999.130 entry for evidence
   6. The eight open 999.166 items are each fixed with a failing-first test, or accepted with a reason. One full
      Phase 49-rig run reaches Ship on the 50.1 binary, plus the Phase 50 fault arm.
 **Depends on:** Phase 50
-**Plans:** 17/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
+**Plans:** 19/30 plans executed (22 waves); 50.1-27 is the operator checkpoint for the live attempt; 50.1-29 (D-17, added at
 plan-check round 1) runs in wave 14, before 50.1-20; 50.1-30 (split out of 50.1-20 at the round-2 replan's plan-check)
 runs in wave 19
 
@@ -581,8 +581,8 @@ runs in wave 19
 
 **Wave 13**
 
-- [ ] 50.1-18-PLAN.md *(depends on 50.1-17)* — `status`/`stop`/`doctor` over a pending supervisor (V-07, V-08, V-09)
-- [ ] 50.1-19-PLAN.md *(depends on 50.1-17)* — ownership fence, promotion wait, orphan self-end, no advance lock (V-23, V-24, V-27)
+- [x] 50.1-18-PLAN.md *(depends on 50.1-17)* — `status`/`stop`/`doctor` over a pending supervisor (V-07, V-08, V-09)
+- [x] 50.1-19-PLAN.md *(depends on 50.1-17)* — ownership fence, promotion wait, orphan self-end, no advance lock (V-23, V-24, V-27)
 
 **Wave 14**
 
@@ -802,7 +802,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 48 | 20/20 | In Progress|  |
 | 49 | 12/12 | In Progress|  |
 | 50 | 29/29 | Complete | 2026-10-21 |
-| 50.1 | 17/30 | In Progress | — |
+| 50.1 | 19/30 | In Progress | — |
 | 51 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -1040,11 +1040,13 @@ core runs at `06c39fe` and 0 of 60 run alone; the base commit was not measured. 
 `ESRCH`, from a status read after the reap, as still running. The two ingredients were measured; the sequence is
 inferred, not traced. Whether this also explains 999.151 was not checked.
 
-**Fix shape (not tested):** treat `ESRCH` as gone in `running_per_status`. Detail in Phase 50.1's `deferred-items.md`.
+**Fixed:** Phase 50.1 commit `0268976`, for `ESRCH` and also `X (dead)`, which was the larger part. Measured flips went from 2185 in 4000 rounds to 0 in 12000. Detail in Phase 50.1's `deferred-items.md`.
 
 ### Phase 999.151: `probe_rejects_a_setpgid_pipe_holder_before_parent_exit` Fails Intermittently in the Full Suite (BACKLOG)
 
 **Found:** 2026-10-09, Phase 49 regression gate. **Not reproduced on demand.**
+
+**Update 2026-11-01:** the failing assertion is an `agent_running` call right after a reap, the path 999.171 fixed in Phase 50.1 (`0268976`). Likely the same cause, not replayed. Close once more full-suite runs stay clean.
 
 **Defect:** `agents::opencode::tests::probe_rejects_a_setpgid_pipe_holder_before_parent_exit` failed once in five
 full-workspace `cargo test` runs on `feature/phase-49` with the panic "the attempted group-escape process must be
