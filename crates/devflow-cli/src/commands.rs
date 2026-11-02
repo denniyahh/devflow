@@ -2785,6 +2785,10 @@ fn stop_pending_launch(
                     deadline = None;
                     known_launches.push(pending.launch_id.clone());
                 }
+                ShutdownResult::AcceptedPending => {
+                    known_launches.push(pending.launch_id.clone());
+                    return Ok(Some(PendingStop::SupervisorEnded));
+                }
                 ShutdownResult::Relocate => {}
                 ShutdownResult::HandedOff => {
                     handed_off += 1;
@@ -3093,6 +3097,10 @@ fn shutdown_one_launch(subject: &str, entry: &supervisor::SweepEntry) -> Result<
             );
             return Ok(());
         }
+        Ok(supervisor::ShutdownOutcome::AcceptedPending { owner }) => {
+            println!("{}", accepted_pending_line(subject, &owner));
+            return Ok(());
+        }
         Ok(supervisor::ShutdownOutcome::HandedOff) => {
             println!("stop: {subject} already handed off to its successor; nothing stopped");
             return Ok(());
@@ -3163,6 +3171,11 @@ pub(crate) fn stopped_line(
         "stop: stopped {subject} through its supervisor (agent group ended, exit code \
          {exit_code}, {advance})"
     )
+}
+
+/// `stop`'s line for a stop the supervisor accepted and has not confirmed yet (D-13 item 1).
+fn accepted_pending_line(_subject: &str, _owner: &str) -> String {
+    String::new()
 }
 
 /// How long `stop` waits for a supervisor's final shutdown line: the
@@ -3373,7 +3386,7 @@ fn stop_via_socket(
                 true
             }
             Ok(supervisor::Liveness::Alive(_)) => match shutdown_supervisor(phase, &located)? {
-                ShutdownResult::Ended => true,
+                ShutdownResult::Ended | ShutdownResult::AcceptedPending => true,
                 ShutdownResult::Relocate => false,
                 ShutdownResult::HandedOff => {
                     handed_off += 1;
@@ -3402,6 +3415,9 @@ fn stop_via_socket(
 enum ShutdownResult {
     /// The supervisor (or, after it died, the backstop) ended the run.
     Ended,
+    /// The supervisor accepted the stop and will honour it at its next safe point; it has
+    /// not confirmed it yet. Asking again would only wait again.
+    AcceptedPending,
     /// The supervisor had handed the run to its successor.
     HandedOff,
     /// The socket went away under the request: locate the run again.
@@ -3437,6 +3453,13 @@ fn shutdown_supervisor(
                 )
             );
             return Ok(ShutdownResult::Ended);
+        }
+        Ok(supervisor::ShutdownOutcome::AcceptedPending { owner }) => {
+            println!(
+                "{}",
+                accepted_pending_line(&format!("phase {phase}"), &owner)
+            );
+            return Ok(ShutdownResult::AcceptedPending);
         }
         Ok(supervisor::ShutdownOutcome::HandedOff) => return Ok(ShutdownResult::HandedOff),
         Ok(supervisor::ShutdownOutcome::Refused(reason)) => {
@@ -13575,6 +13598,7 @@ mod tests {
             let (thread_log, thread_done, path) = (log.clone(), done.clone(), socket.to_path_buf());
             let thread = std::thread::spawn(move || {
                 let mut shutdowns = 0;
+                let mut parked = Vec::new();
                 while !thread_done.load(Ordering::SeqCst) {
                     let Some(mut stream) =
                         accept_within(&listener, std::time::Duration::from_millis(50))
@@ -13593,6 +13617,16 @@ mod tests {
                     let script = on_shutdown(shutdowns);
                     for line in &script.lines {
                         let _ = writeln!(stream, "{line}");
+                    }
+                    // A supervisor with a stop pending keeps the connection for its final
+                    // line, so a script that ends on `accepted` does too.
+                    if script
+                        .lines
+                        .last()
+                        .is_some_and(|line| line.contains("\"accepted\":true"))
+                    {
+                        parked.push(stream);
+                        continue;
                     }
                     if script.unlink_after {
                         let _ = std::fs::remove_file(&path);
@@ -13647,6 +13681,7 @@ mod tests {
     }
 
     const HANDED_OFF_LINE: &str = r#"{"ok":false,"error":"handed_off"}"#;
+    const ACCEPTED_ADVANCING_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"advancing"}"#;
     const ACCEPTED_LINE: &str = r#"{"ok":true,"accepted":true,"owner":"agent_running"}"#;
     const STOPPED_LINE: &str = r#"{"ok":true,"stopped":true,"exit_code":143,"advance_suppressed":true,"group_signalled":true}"#;
 
@@ -13667,6 +13702,132 @@ mod tests {
             "stop: stopped launch abc through its supervisor (agent group ended, exit code 143, \
              advance suppressed)"
         );
+    }
+
+    /// D-13 item 1: a supervisor that accepted the stop and has not sent its final line
+    /// within `stop`'s wait will still honour it. `stop` says so, records `stopped` as for a
+    /// confirmed stop, and does not report a failure.
+    #[test]
+    fn stop_reports_an_accepted_stop_it_could_not_confirm_as_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1420);
+        let (base, sock) = stop_socket_dir();
+        let socket = sock.join("pending.sock");
+        save_state_naming(&root, phase, &socket, "launch-pending");
+        let supervisor =
+            ScriptedSupervisor::serve(&socket, "launch-pending", phase, "advancing", |_| {
+                ShutdownScript {
+                    lines: vec![ACCEPTED_ADVANCING_LINE.to_string()],
+                    unlink_after: false,
+                }
+            });
+
+        let started = std::time::Instant::now();
+        let result = stop_in(&root, phase, Some(base.path()));
+
+        assert!(result.is_ok(), "an accepted stop is no failure: {result:?}");
+        assert!(
+            started.elapsed() >= shutdown_final_timeout(),
+            "stop gave the final line its whole wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(supervisor.shutdowns(), 1, "one stop, one request");
+        let state = workflow::load_state(&root, phase).unwrap();
+        assert!(state.stopped, "recorded as for a confirmed stop");
+        assert!(
+            state
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("devflow stop")),
+            "{:?}",
+            state.stop_reason
+        );
+
+        let line = accepted_pending_line(&format!("phase {phase}"), "advancing");
+        for fragment in [
+            "accepted the stop",
+            "advancing",
+            "next safe point",
+            "`devflow status`",
+        ] {
+            assert!(line.contains(fragment), "missing {fragment:?}: {line}");
+        }
+        assert!(!line.contains("nothing was signalled"), "{line}");
+    }
+
+    /// A process of its own that is killed and reaped on every exit path.
+    struct OwnGroupSleep(std::process::Child);
+
+    impl OwnGroupSleep {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn the agent stand-in"),
+            )
+        }
+    }
+
+    impl Drop for OwnGroupSleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// D-19, `stop`'s half: a GONE socket, no pending record and no holder, with the phase's
+    /// agent still running. `stop` names it and the manual kill, signals nothing and writes
+    /// nothing. Control: once the agent is dead, today's path records `stopped`.
+    #[test]
+    fn stop_names_an_orphaned_agent_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(1421);
+        let (base, sock) = stop_socket_dir();
+        let mut agent = OwnGroupSleep::spawn();
+        let pid = agent.0.id();
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.clone());
+        state.supervisor = Some(SupervisorRecord::new(
+            sock.join("missing.sock"),
+            "launch-gone".to_string(),
+            pid,
+            agent::process_start_time(pid).expect("the agent's start time"),
+            supervisor::boot_id().expect("this host has a boot id"),
+        ));
+        workflow::save_state(&state).unwrap();
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+
+        let error = stop_in(&root, phase, Some(base.path()))
+            .expect_err("stop must not report a stop beside a live agent")
+            .to_string();
+
+        for fragment in [
+            pid.to_string(),
+            format!("kill -TERM -- -{pid}"),
+            "999.170".to_string(),
+        ] {
+            assert!(error.contains(&fragment), "missing {fragment:?}: {error}");
+        }
+        assert!(!error.contains("nothing is running"), "{error}");
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+        assert!(
+            matches!(agent.0.try_wait(), Ok(None)),
+            "the agent is not signalled"
+        );
+
+        agent.0.kill().unwrap();
+        agent.0.wait().unwrap();
+        stop_in(&root, phase, Some(base.path())).expect("control: nothing runs now");
+        assert!(workflow::load_state(&root, phase).unwrap().stopped);
     }
 
     /// Crash row C13 (V-57): the state names supervisor A; A answers the
