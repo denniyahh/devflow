@@ -93,3 +93,19 @@
   status: open, by plan; OPERATIONS now names the case and both ways out (50.1-25, 7b4c9a8 and 98221ec). `stop`'s own line still does not name removing the file.
   **What:** D-19's no-holder branch uses 50.1-18's `live_phase_agent`, whose second source is the agent pid file. A pid reused by an unrelated process satisfies it, so `stop` exits non-zero with the `ps` check, and keeps doing so while that process lives. The launch guard already refuses `start` and `resume` on the same predicate. The operator's way out is to end the process or remove the pid file; the line does not name the second.
   **Why deferred:** the plan specifies this source, and wording of 50.1-18's shared line is not this plan's to change. 50.1-25's docs should name the case.
+
+- Six defects from the external review before the paid live run (found by external review, each trace confirmed against source)
+  status: all six fixed; the limits below stay open
+  **Fixed:**
+  1. `workflow_shipped` was emitted after the state was deleted, so a kill between them read as not shipped: 8214c47.
+  2. `start` deleted the state when its supervisor had not confirmed a stop, which the error's `devflow stop --launch` relies on: 3872a85. No other `launch_stage` caller clears state.
+  3. The supervisor socket connect had no deadline: ea9bfce. Nonblocking connect retried on `EAGAIN` up to `protocol::IO_TIMEOUT`, surfaced as `ProbeError::Connect`.
+  4. A foreground claim could race `recover --clean`: 22f0c9b. The claim passes once through the state write lock, bounded by `WRITE_LOCK_REPAIR_WAIT`.
+  5. A Ship retry repeated the version bump: 8c1dd3d. 44 changed production lines, comments excluded, slightly over the 40 asked for, with no state or format change.
+  6. `start` over a state that does not load could launch beside an unpublished supervisor: 407380d. Reachable without `--force`.
+  **Limits, not fixed:**
+  - Finding 5: a retry in a later process still starts the batch over, so it can still bump twice. A hook skipped on retry is not rerun if the operator undid its work while resolving the failure.
+  - Finding 6: the liveness file names no phase, so another phase's live supervisor also refuses a `start` over an unloadable state. The refusal names `recover --clean --phase N`, which does not look at launch locks, so a `start` after it is not guarded.
+  - Finding 2: the reservation is given back before the probe so the launcher's own lock cannot read live. No test reaches a launch that fails while the reservation is still held.
+  - Finding 3: one probe can still take about `IO_TIMEOUT` for the connect plus `IO_TIMEOUT` for the reply, for each of its connects. The 10 s repair-wait sum was not recomputed for a slow connect followed by a silent reply on both sockets.
+  - Finding 4's test stands in for the recovery with a write-lock closure, because `clear_state_if` and the recover test hooks are private to core.
