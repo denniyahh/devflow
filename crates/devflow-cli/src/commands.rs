@@ -827,12 +827,23 @@ pub(crate) fn run_never_prepared(state: &State) -> bool {
     state.stage == Stage::Define && !state.verification_baseline_captured
 }
 
-/// The `start` that prepares what [`run_never_prepared`] says is missing.
+/// The `start` that prepares what [`run_never_prepared`] says is missing. A worktree already
+/// at the phase's path makes a plain `start` refuse, so that case names `--force`, with what
+/// it costs after a `#` so the line still pastes into a shell.
 fn restart_verb(state: &State) -> String {
-    format!(
+    let verb = format!(
         "devflow start --phase {} --agent {} --mode {}",
         state.phase, state.agent, state.mode
-    )
+    );
+    let worktree_path = worktree::phase_path(&state.project_root, state.phase);
+    if worktree_path.exists() {
+        format!(
+            "{verb} --force  # recreates {} from the base, discarding what is in it",
+            worktree_path.display()
+        )
+    } else {
+        verb
+    }
 }
 
 /// `resume`'s and a hand-run `advance`'s refusal of a run [`run_never_prepared`] names.
@@ -843,8 +854,8 @@ pub(crate) fn refuse_unprepared_run(state: &State) -> Result<(), CliError> {
         return Ok(());
     }
     Err(CliError::Message(format!(
-        "phase {phase}: its `devflow start` never finished preparing the run, so it has no \
-         worktree and nothing to continue; run `{verb}`",
+        "phase {phase}: its `devflow start` never finished preparing the run, so there is \
+         nothing to continue; run `{verb}`",
         phase = state.phase,
         verb = restart_verb(state),
     )))
@@ -16194,7 +16205,12 @@ mod tests {
     /// The state a `start` leaves when it is killed during preparation: its real
     /// reservation, with the lock released as a dead process's is.
     fn state_of_a_start_killed_during_preparation(root: &Path, phase: PhaseId) -> State {
-        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state_of_a_start_killed_in_mode(root, phase, Mode::Auto)
+    }
+
+    /// [`state_of_a_start_killed_during_preparation`] for a start in `mode`.
+    fn state_of_a_start_killed_in_mode(root: &Path, phase: PhaseId, mode: Mode) -> State {
+        let fresh = State::new(phase, AgentKind::Claude, mode, root.to_path_buf());
         let cache = tempfile::tempdir().unwrap();
         let reserved = reserve_launch(
             root,
@@ -16264,6 +16280,92 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    /// A real `start` of what a killed one's refusal names, over `root`: a worktree start
+    /// in Supervise mode with a stub agent, which returns once it has launched.
+    fn start_as_refusal_names(root: &Path, phase: PhaseId, force: bool) -> Result<(), String> {
+        start(
+            root,
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            force,
+            true,
+            false,
+            None,
+            false,
+            true,
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    /// With no worktree, the refusal names a plain `start`, and that start launches.
+    #[test]
+    fn a_killed_start_with_no_worktree_names_a_plain_start_that_launches() {
+        const NAME: &str =
+            "commands::tests::a_killed_start_with_no_worktree_names_a_plain_start_that_launches";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5304));
+        init_start_repo(root, phase);
+        let killed = state_of_a_start_killed_in_mode(root, phase, Mode::Supervise);
+
+        let err = refuse_unprepared_run(&killed).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "run `devflow start --phase {phase} --agent claude --mode supervise`"
+            )),
+            "{err}"
+        );
+
+        let result = start_as_refusal_names(root, phase, false);
+        let launched = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&launched);
+        result.expect("the start the refusal names launches");
+    }
+
+    /// With a worktree already there, a plain `start` refuses, so the refusal and the hints
+    /// name `--force` and say what it discards, and that start launches.
+    #[test]
+    fn a_killed_start_with_a_worktree_names_a_force_start_that_launches() {
+        const NAME: &str =
+            "commands::tests::a_killed_start_with_a_worktree_names_a_force_start_that_launches";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(5305));
+        init_start_repo(root, phase);
+        let killed = state_of_a_start_killed_in_mode(root, phase, Mode::Supervise);
+        let worktree_path = ensure_phase_worktree(root, phase, false, DEVELOP).unwrap();
+
+        let err = refuse_unprepared_run(&killed).unwrap_err().to_string();
+        let verb = format!("devflow start --phase {phase} --agent claude --mode supervise --force");
+        assert!(err.contains(&format!("run `{verb}")), "{err}");
+        assert!(err.contains("discard"), "{err}");
+        assert!(err.contains(&*worktree_path.to_string_lossy()), "{err}");
+        assert!(!err.contains("no worktree"), "{err}");
+        let hints = recovery_hints(&killed, &PhaseLiveness::NotLaunched);
+        assert!(hints[0].starts_with(&verb), "{hints:?}");
+
+        let refused = start_as_refusal_names(root, phase, false).unwrap_err();
+        assert!(refused.contains("use --force"), "{refused}");
+
+        let result = start_as_refusal_names(root, phase, true);
+        let launched = workflow::load_state(root, phase).unwrap();
+        let _reap = crate::test_support::ReapMonitorOnDrop::after_launch(&launched);
+        result.expect("the start the refusal names launches");
     }
 
     /// `status` and `doctor` name `start`, never `resume`, for a `start` killed during
