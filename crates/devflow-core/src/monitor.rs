@@ -1595,7 +1595,8 @@ pub struct StageRun {
     /// The launch's liveness lock, when this process adopted one. The caller
     /// keeps it until its last act.
     pub liveness: Option<crate::liveness::Hold>,
-    /// The promotion watch's verdict. `None` when no watch ran
+    /// The promotion watch's verdict: its last, so `Superseded` when a launch recorded
+    /// first was superseded while its agent ran. `None` when no watch ran
     /// ([`StageSpec::promotion_wait`]), or a stop ended it before it had one.
     pub promotion: Option<Promotion>,
     /// What ending the agent's group did, when the promotion watch's verdict led it to
@@ -1607,8 +1608,16 @@ pub struct StageRun {
 /// `setpgid` to become visible before it declares a mismatch.
 const PGID_SETTLE_WAIT: Duration = Duration::from_millis(100);
 
-/// How often the promotion watch reads the state.
+/// How often the promotion watch reads the state, and looks for its agent's exit.
 const PROMOTION_POLL: Duration = Duration::from_millis(20);
+
+/// How often the watch reads the state once it records this launch. Slower than
+/// [`PROMOTION_POLL`] because each read loads the whole state file, for as long as the
+/// agent runs.
+const RECORDED_READ_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The least time between two warnings that a recorded launch's state does not confirm it.
+const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Supervise one stage's agent under an addressed [`Supervisor`], in either
 /// supervision shape, and return once the agent has exited.
@@ -1650,12 +1659,18 @@ const PROMOTION_POLL: Duration = Duration::from_millis(20);
 ///    the agent's own group, R-13); the agent then exits as a stop. The deadline
 ///    therefore runs from serving: an orphan whose agent never exits ends that agent
 ///    at the deadline. A verdict reached after the agent exited signals nothing.
-///    After `Recorded` the watch stops reading, so a
-///    supersession that lands while the agent runs is seen only at this
-///    supervisor's next guarded side effect after the agent exits, which writes
-///    nothing (R2-10). Until then that agent keeps running. Every launch route
-///    refuses over a live supervisor, so only an operator escape hatch or a hand
-///    edit reaches this.
+///    After `Recorded` the watch keeps reading, every [`RECORDED_READ_INTERVAL`],
+///    until the agent's exit is observed, and that ends it with `Recorded`. A state
+///    that names another launch or none, or is gone, makes the verdict `Superseded` and
+///    ends the group the same way (SUPV-04). A state that does not load, or names this
+///    launch only as pending, ends nothing: neither says another launch owns the run, and
+///    a false verdict would kill a healthy agent, so the watch warns at most every
+///    [`RECORDED_WARN_INTERVAL`] and keeps reading. If the agent exits meanwhile, the
+///    ownership fence still refuses this supervisor's next guarded side effect. No
+///    healthy path changes the record while its agent runs: the supervisor's own advance
+///    writes it only after the agent has exited, and every launch route, a hand-run
+///    `devflow advance` and `devflow ship` refuse over a live supervisor. So only an
+///    operator's hand edit or a misread liveness probe reaches this.
 /// 6. [`Supervisor::wait_agent`], then the exit file: the agent's code for
 ///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`]. For
 ///    either outcome the stream threads are then waited for at most
@@ -1663,7 +1678,8 @@ const PROMOTION_POLL: Duration = Duration::from_millis(20);
 ///    unfinished threads are detached (nothing is signalled), and the bound
 ///    is recorded as a `stream_wait_bounded` event.
 /// 7. Wait for the watch's verdict, for [`StageRun::promotion`]. It ends by its
-///    deadline at the latest. A stop ends the wait early: the run is over, and a
+///    deadline at the latest, and a watch past `Recorded` has ended at the agent's exit.
+///    A stop ends the wait early: the run is over, and a
 ///    stopped supervisor must not sit out the deadline before it answers. On every
 ///    early return the watch is ended first, before the agent is reaped outside
 ///    [`Supervisor::wait_agent`], so it can never act on a reaped leader's number
@@ -1769,8 +1785,8 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
 }
 
 /// The thread that decides a supervisor's [`Promotion`], beside its agent (R-12), and
-/// ends the agent's group on a verdict other than [`Promotion::Recorded`]. Dropping it
-/// tells the thread to quit and joins it.
+/// ends the agent's group on a verdict other than [`Promotion::Recorded`], including a
+/// later one while the agent runs. Dropping it tells the thread to quit and joins it.
 struct PromotionWatch {
     quit: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<PromotionEnd>>,
@@ -1800,6 +1816,16 @@ impl PromotionWatch {
             .spawn(move || {
                 let promotion =
                     await_promotion(&project_root, phase, &launch_id, wait, &thread_quit);
+                let promotion = match promotion {
+                    Some(Promotion::Recorded) => Some(watch_recorded(
+                        &project_root,
+                        phase,
+                        &launch_id,
+                        &token,
+                        &thread_quit,
+                    )),
+                    other => other,
+                };
                 // The leader is unreaped while the agent runs, so this reaches only its
                 // group (R-13). A verdict reached after the agent exited signals nothing.
                 let group_end = match promotion {
@@ -1817,6 +1843,8 @@ impl PromotionWatch {
     }
 
     /// The watch's result once it has one. A stop tells a watch without a verdict to quit.
+    /// A watch past `Recorded` has already ended, or ends within one [`PROMOTION_POLL`]: it
+    /// ends at the exit [`Supervisor::wait_agent`] observed before this is called.
     fn finish(mut self, token: &crate::supervisor::runtime::StopToken) -> PromotionEnd {
         let Some(thread) = self.thread.take() else {
             return (None, None);
@@ -1878,6 +1906,61 @@ fn await_promotion(
         std::thread::sleep(PROMOTION_POLL);
     }
     None
+}
+
+/// Keep reading the state of a launch it recorded, until the agent's exit has been
+/// observed or the watch is told to quit: `Recorded`, unless a read finds this launch
+/// definitely superseded first (see [`run_supervised_stage`]). It wakes every
+/// [`PROMOTION_POLL`] so the agent's exit never waits for a state read.
+fn watch_recorded(
+    project_root: &Path,
+    phase: PhaseId,
+    launch_id: &str,
+    token: &crate::supervisor::runtime::StopToken,
+    quit: &AtomicBool,
+) -> Promotion {
+    let mut next_read = std::time::Instant::now() + RECORDED_READ_INTERVAL;
+    let mut last_warned = None;
+    while !quit.load(Ordering::Acquire)
+        && token.phase() == crate::supervisor::runtime::OwnerPhase::AgentRunning
+    {
+        let now = std::time::Instant::now();
+        if now >= next_read {
+            next_read = now + RECORDED_READ_INTERVAL;
+            let doubt = match crate::workflow::load_state(project_root, phase) {
+                Ok(state) => match crate::workflow::ownership(&state, launch_id) {
+                    crate::workflow::Ownership::Recorded => None,
+                    crate::workflow::Ownership::Superseded { recorded } => {
+                        return Promotion::Superseded { recorded };
+                    }
+                    crate::workflow::Ownership::PendingOnly => {
+                        Some("the state names it only as pending".to_string())
+                    }
+                },
+                Err(crate::workflow::WorkflowError::MissingState(_)) => {
+                    return Promotion::Superseded { recorded: None };
+                }
+                Err(err) => Some(format!("the state does not load: {err}")),
+            };
+            if let Some(doubt) = doubt
+                && warn_is_due(&mut last_warned, now)
+            {
+                warn!("launch {launch_id}: {doubt}; its agent keeps running");
+            }
+        }
+        std::thread::sleep(PROMOTION_POLL);
+    }
+    Promotion::Recorded
+}
+
+/// Whether a warning may go out at `now`, at most one every [`RECORDED_WARN_INTERVAL`].
+/// Records it in `last_warned` when it may.
+fn warn_is_due(last_warned: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = last_warned.is_none_or(|last| now.duration_since(last) >= RECORDED_WARN_INTERVAL);
+    if due {
+        *last_warned = Some(now);
+    }
+    due
 }
 
 /// Take over the liveness descriptor `spec` names, if it names one.
@@ -3020,6 +3103,29 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(gate)),
         )
+    }
+
+    /// One warning for a state that stays in doubt, then none until the interval has passed.
+    #[test]
+    fn a_doubtful_state_warns_at_most_once_an_interval() {
+        let start = std::time::Instant::now();
+        let mut last_warned = None;
+        assert!(warn_is_due(&mut last_warned, start), "the first warns");
+        assert!(
+            !warn_is_due(&mut last_warned, start + RECORDED_WARN_INTERVAL / 2),
+            "inside the interval it does not"
+        );
+        assert!(
+            warn_is_due(&mut last_warned, start + RECORDED_WARN_INTERVAL),
+            "at the interval it warns again"
+        );
+        assert!(
+            !warn_is_due(
+                &mut last_warned,
+                start + RECORDED_WARN_INTERVAL + Duration::from_secs(1)
+            ),
+            "the interval runs from the last warning"
+        );
     }
 
     /// A state naming `recorded` as supervisor and `pending` as pending.
@@ -6652,6 +6758,62 @@ exit 0
         spec.liveness_fd = Some(liveness_fd);
         let result = run_supervised_stage(spec);
         (result, ran.exists())
+    }
+
+    const NEVER_SUPERSEDED_TEST: &str =
+        "monitor::tests::a_never_superseded_supervisor_reports_recorded_and_returns_promptly";
+
+    /// The most `run_supervised_stage` may take past the exit file it writes at the agent's
+    /// exit. Well under the wait a full read interval would add for this agent's run.
+    const PROMPT_FINISH_BOUND: Duration = Duration::from_millis(500);
+
+    /// A promoted supervisor that nothing supersedes reports `Recorded`, signals nothing and
+    /// lets its agent end by itself. The agent runs past one read of the slower poll and
+    /// ends well before the next, so waiting for that read would take most of a second.
+    #[test]
+    fn a_never_superseded_supervisor_reports_recorded_and_returns_promptly() {
+        if !crate::test_support::in_child_test(NEVER_SUPERSEDED_TEST) {
+            run_in_own_process(NEVER_SUPERSEDED_TEST);
+            return;
+        }
+        const OURS: &str = "aaaa0000aaaa1937";
+        let fixture = StageFixture::new();
+        promotion_state(&fixture.root, STAGE_PHASE, Some(OURS), None);
+        let socket = SocketPath::for_launch(fixture.cache.path(), &fixture.root, STAGE_PHASE, OURS)
+            .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            fixture.root.clone(),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            OURS.to_string(),
+        );
+        spec.args = vec!["-c".to_string(), "exec sleep 1.2".to_string()];
+        spec.promotion_wait = Some(Duration::from_secs(60));
+
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        let returned = std::time::SystemTime::now();
+
+        let exit_file = crate::agent_result::exit_code_path(&fixture.root, STAGE_PHASE);
+        let exited = std::fs::metadata(&exit_file)
+            .and_then(|meta| meta.modified())
+            .expect("the exit file exists");
+        let past_exit = returned.duration_since(exited).unwrap_or_default();
+        assert!(
+            past_exit < PROMPT_FINISH_BOUND,
+            "returned {past_exit:?} after the agent's exit"
+        );
+        assert!(
+            matches!(run.outcome, AgentOutcome::Completed(0)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(run.promotion, Some(Promotion::Recorded));
+        assert!(run.agent_group_end.is_none(), "{:?}", run.agent_group_end);
+        run.supervisor.finish();
     }
 
     const CLOSED_FD_TEST: &str = "monitor::tests::a_liveness_descriptor_that_cannot_be_adopted_ends_the_stage_before_any_agent";

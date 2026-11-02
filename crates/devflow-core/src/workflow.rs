@@ -264,7 +264,9 @@ fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> 
 pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, WorkflowError> {
     let path = state_path(project_root, phase);
     debug!("loading state from {}", path.display());
-    if !path.exists() {
+    // `try_exists`, not `exists`: a path that cannot be examined is an I/O failure. Read as
+    // a missing state, it would end a healthy agent through the promotion watch.
+    if !path.try_exists()? {
         return Err(WorkflowError::MissingState(path));
     }
     let contents = std::fs::read_to_string(&path)?;
