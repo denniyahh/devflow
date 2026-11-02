@@ -112,3 +112,8 @@
   - Finding 6: the liveness file names no phase, so another phase's live supervisor also refuses a `start` over an unloadable state. The refusal names `recover --clean --phase N`, which does not look at launch locks, so a `start` after it is not guarded. A FIFO planted at `.devflow/supervisor-*.live` can block the new guard's probe; accepted, because it needs a hand-planted file in the user's own directory and every existing probe has the same exposure.
   - Finding 3: one probe can still take about `IO_TIMEOUT` for the connect plus `IO_TIMEOUT` for the reply, for each of its connects. The 10 s repair-wait sum was not recomputed for a slow connect followed by a silent reply on both sockets.
   - Finding 4's test stands in for the recovery with a write-lock closure, because `clear_state_if` and the recover test hooks are private to core.
+
+- `stop` has no way to end a supervisor that holds its liveness lock with its socket gone (found during the review fix round, WR-04)
+  status: open
+  **What:** since f929a30, `stop` refuses such a supervisor without recording `stopped`, and `status`, `doctor` and the launch guard name the process holding the lock. No DevFlow verb ends it: the operator ends that pid by hand, and then `stop` or `resume` goes through. The only known trigger is something outside DevFlow deleting the socket file.
+  **Why deferred:** signalling a pid read from a liveness file is a design decision. `stop` signals only a foreground holder confirmed by start time today (D-06, D-19), and a supervisor has no such record path.
