@@ -1677,19 +1677,23 @@ const RECORDED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 ///    writes it only after the agent has exited, and every launch route, a hand-run
 ///    `devflow advance` and `devflow ship` refuse over a live supervisor. So only an
 ///    operator's hand edit or a misread liveness probe reaches this.
-/// 6. [`Supervisor::wait_agent`], then the exit file: the agent's code for
-///    [`AgentOutcome::Completed`], `143` for [`AgentOutcome::Stopped`]. For
-///    either outcome the stream threads are then waited for at most
-///    [`READER_DRAIN_WAIT`]; at the bound the capture is closed, the
-///    unfinished threads are detached (nothing is signalled), and the bound
-///    is recorded as a `stream_wait_bounded` event.
-/// 7. Wait for the watch's verdict, for [`StageRun::promotion`]. It ends by its
-///    deadline at the latest, and a watch past `Recorded` has ended at the agent's exit.
-///    A stop ends the wait early: the run is over, and a
+/// 6. [`Supervisor::wait_agent`], then wait for the watch's verdict, for
+///    [`StageRun::promotion`]. It ends by its deadline at the latest, and a watch past
+///    `Recorded` has ended at the agent's exit, after one last read that can only find it
+///    superseded. A stop ends the wait early: the run is over, and a
 ///    stopped supervisor must not sit out the deadline before it answers. On every
 ///    early return the watch is ended first, before the agent is reaped outside
 ///    [`Supervisor::wait_agent`], so it can never act on a reaped leader's number
 ///    (R-13).
+/// 7. The exit file: the agent's code for [`AgentOutcome::Completed`], `143` for
+///    [`AgentOutcome::Stopped`], and no write at all on a `Superseded` or
+///    `OrphanedPending` verdict (D-03). The file then says nothing about this launch, so
+///    `devflow logs --follow` waits for the next run's. A takeover after the last read is
+///    not seen here, and the ownership fence refuses what comes next. For
+///    either outcome the stream threads are then waited for at most
+///    [`READER_DRAIN_WAIT`]; at the bound the capture is closed, the
+///    unfinished threads are detached (nothing is signalled), and the bound
+///    is recorded as a `stream_wait_bounded` event.
 ///
 /// The caller owns [`Supervisor::hand_off`] and [`Supervisor::finish`], and
 /// advances only on [`AgentOutcome::Completed`] with [`Promotion::Recorded`] when a
@@ -1766,7 +1770,17 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         AgentOutcome::Completed(code) => code,
         AgentOutcome::Stopped => crate::supervisor::runtime::STOPPED_EXIT_CODE,
     };
-    std::fs::write(&exit_file, format!("{code}\n"))?;
+    // The verdict comes first: a supervisor the state does not record leaves the file to
+    // whichever run does (D-03).
+    let (promotion, agent_group_end) = watch
+        .map(|watch| watch.finish(&supervisor.token()))
+        .unwrap_or_default();
+    if !matches!(
+        promotion,
+        Some(Promotion::Superseded { .. } | Promotion::OrphanedPending)
+    ) {
+        std::fs::write(&exit_file, format!("{code}\n"))?;
+    }
     if let Some(threads) = threads {
         // Test-only (50-26): park here, after the exit file and before the
         // stream threads are waited for. Compiled out of release builds.
@@ -1778,9 +1792,6 @@ pub fn run_supervised_stage(spec: StageSpec) -> Result<StageRun, MonitorError> {
         "supervised {} agent {pid} ended: {outcome:?}",
         spec.io.label()
     );
-    let (promotion, agent_group_end) = watch
-        .map(|watch| watch.finish(&supervisor.token()))
-        .unwrap_or_default();
     Ok(StageRun {
         outcome,
         supervisor,
@@ -1965,6 +1976,13 @@ fn watch_recorded(
             }
         }
         std::thread::sleep(PROMOTION_POLL);
+    }
+    if !quit.load(Ordering::Acquire)
+        && let Ok(state) = crate::workflow::load_state(project_root, phase)
+        && let crate::workflow::Ownership::Superseded { recorded } =
+            crate::workflow::ownership(&state, launch_id)
+    {
+        return Promotion::Superseded { recorded };
     }
     Promotion::Recorded
 }
@@ -6829,6 +6847,153 @@ exit 0
         );
         assert_eq!(run.promotion, Some(Promotion::Recorded));
         assert!(run.agent_group_end.is_none(), "{:?}", run.agent_group_end);
+        run.supervisor.finish();
+    }
+
+    /// Run a stage for the launch [`SUPERSEDED_OURS`] in its own process's fixture, which
+    /// `setup` prepares, with `script` as its agent. Returns the run and the fixture.
+    fn supervise_for_exit_file(
+        setup: impl FnOnce(&Path),
+        script: impl FnOnce(&Path) -> String,
+    ) -> (StageRun, StageFixture) {
+        let fixture = StageFixture::new();
+        setup(&fixture.root);
+        let socket = SocketPath::for_launch(
+            fixture.cache.path(),
+            &fixture.root,
+            STAGE_PHASE,
+            SUPERSEDED_OURS,
+        )
+        .expect("socket path fits sun_path");
+        let mut spec = StageSpec::new(
+            fixture.root.clone(),
+            STAGE_PHASE,
+            AgentKind::Codex,
+            "/bin/sh".to_string(),
+            StageIo::Capture,
+            socket,
+            SUPERSEDED_OURS.to_string(),
+        );
+        spec.args = vec!["-c".to_string(), script(&fixture.root)];
+        spec.promotion_wait = Some(Duration::from_secs(60));
+        let run = run_supervised_stage(spec)
+            .unwrap_or_else(|err| panic!("run_supervised_stage failed: {err}"));
+        (run, fixture)
+    }
+
+    const SUPERSEDED_OURS: &str = "aaaa0000aaaa1939";
+    const SUPERSEDED_BY: &str = "bbbb0000bbbb1939";
+
+    fn superseded_by_the_other_launch() -> Promotion {
+        Promotion::Superseded {
+            recorded: Some(SUPERSEDED_BY.to_string()),
+        }
+    }
+
+    const EXIT_FILE_KEPT_TEST: &str =
+        "monitor::tests::a_supervisor_superseded_while_its_agent_runs_leaves_the_exit_file";
+
+    /// D-03: the exit file belongs to the run that superseded this one, so ending the
+    /// agent leaves it byte for byte. `a_never_superseded_supervisor_reports_recorded_and_returns_promptly`
+    /// is the control: a recorded supervisor writes it.
+    #[test]
+    fn a_supervisor_superseded_while_its_agent_runs_leaves_the_exit_file() {
+        if !crate::test_support::in_child_test(EXIT_FILE_KEPT_TEST) {
+            run_in_own_process(EXIT_FILE_KEPT_TEST);
+            return;
+        }
+        let (run, fixture) = supervise_for_exit_file(
+            |root| {
+                promotion_state(root, STAGE_PHASE, Some(SUPERSEDED_BY), None);
+                let exit_file = crate::agent_result::exit_code_path(root, STAGE_PHASE);
+                std::fs::create_dir_all(exit_file.parent().unwrap()).unwrap();
+                std::fs::write(exit_file, "7\n").unwrap();
+            },
+            |_| "exec sleep 30".to_string(),
+        );
+        assert_eq!(run.promotion, Some(superseded_by_the_other_launch()));
+        assert_eq!(
+            std::fs::read_to_string(crate::agent_result::exit_code_path(
+                &fixture.root,
+                STAGE_PHASE
+            ))
+            .unwrap(),
+            "7\n",
+            "the successor's exit file is untouched"
+        );
+        run.supervisor.finish();
+    }
+
+    const NO_EXIT_FILE_PENDING_TEST: &str =
+        "monitor::tests::a_supervisor_superseded_after_its_agent_exited_writes_no_exit_file";
+
+    /// An agent that exits while its launch is only pending has no verdict yet. A takeover
+    /// that lands before the verdict still leaves no exit file behind.
+    #[test]
+    fn a_supervisor_superseded_after_its_agent_exited_writes_no_exit_file() {
+        if !crate::test_support::in_child_test(NO_EXIT_FILE_PENDING_TEST) {
+            run_in_own_process(NO_EXIT_FILE_PENDING_TEST);
+            return;
+        }
+        let takeover = std::sync::Mutex::new(None);
+        let (run, fixture) = supervise_for_exit_file(
+            |root| {
+                promotion_state(root, STAGE_PHASE, None, Some(SUPERSEDED_OURS));
+                let root = root.to_path_buf();
+                *takeover.lock().unwrap() = Some(std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(800));
+                    promotion_state(&root, STAGE_PHASE, Some(SUPERSEDED_BY), None);
+                }));
+            },
+            |_| "exit 0".to_string(),
+        );
+        takeover.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(
+            matches!(run.outcome, AgentOutcome::Completed(0)),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(run.promotion, Some(superseded_by_the_other_launch()));
+        assert!(
+            !crate::agent_result::exit_code_path(&fixture.root, STAGE_PHASE).exists(),
+            "no exit file for a superseded launch"
+        );
+        run.supervisor.finish();
+    }
+
+    const FINAL_READ_TEST: &str =
+        "monitor::tests::a_takeover_just_before_a_recorded_agents_exit_writes_no_exit_file";
+
+    /// A takeover between the watch's once-a-second reads and the agent's exit: the agent
+    /// itself moves the state naming another launch into place as its last act, after the
+    /// watch's first read, so only a read at the exit can see it.
+    #[test]
+    fn a_takeover_just_before_a_recorded_agents_exit_writes_no_exit_file() {
+        if !crate::test_support::in_child_test(FINAL_READ_TEST) {
+            run_in_own_process(FINAL_READ_TEST);
+            return;
+        }
+        let (run, fixture) = supervise_for_exit_file(
+            |root| {
+                let state = crate::workflow::state_path(root, STAGE_PHASE);
+                promotion_state(root, STAGE_PHASE, Some(SUPERSEDED_BY), None);
+                std::fs::rename(&state, root.join("takeover.json")).unwrap();
+                promotion_state(root, STAGE_PHASE, Some(SUPERSEDED_OURS), None);
+            },
+            |root| {
+                let state = crate::workflow::state_path(root, STAGE_PHASE);
+                format!(
+                    "sleep 1.2; exec mv '{}' '{}'",
+                    root.join("takeover.json").display(),
+                    state.display()
+                )
+            },
+        );
+        assert_eq!(run.promotion, Some(superseded_by_the_other_launch()));
+        assert!(
+            !crate::agent_result::exit_code_path(&fixture.root, STAGE_PHASE).exists(),
+            "no exit file for a superseded launch"
+        );
         run.supervisor.finish();
     }
 

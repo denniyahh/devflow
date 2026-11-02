@@ -1564,7 +1564,17 @@ pub(crate) fn run_monitor(invocation: &MonitorInvocation, advance: bool) -> Resu
 
     let run = monitor::run_supervised_stage(spec)
         .map_err(|err| CliError::Message(format!("stage supervisor failed: {err}")))?;
-    drop(auto_chain_guard);
+    // D-03: another launch owns the run, and so the flag: its supervisor set it for its own
+    // agent. With no other owner (no record, or a promotion that never came) nothing else
+    // would clear it before the next launch's repair, so this supervisor still does.
+    if matches!(
+        run.promotion,
+        Some(monitor::Promotion::Superseded { recorded: Some(_) })
+    ) {
+        std::mem::forget(auto_chain_guard);
+    } else {
+        drop(auto_chain_guard);
+    }
 
     // D-03, D-15: a supervisor the state does not record never advances, writes no state
     // and records no stop, however its agent ended. An orphan never promotes itself.
@@ -12338,6 +12348,15 @@ mod tests {
         );
     }
 
+    /// Whether the pending launch's agent has exited. Its exit file cannot say: a supervisor
+    /// writes that only once it has a verdict.
+    fn pending_agent_gone(pending: &devflow_core::state::PendingSupervisor) -> bool {
+        let sidecar =
+            devflow_core::supervisor::read_sidecar(&pending.socket_path.with_extension("json"))
+                .expect("the pending launch's sidecar");
+        devflow_core::test_support::live_group_members(sidecar.agent_pgid).is_empty()
+    }
+
     /// V-24 (D-15, Pitfall 5): N+1's agent exits while N is held before the publish
     /// save, so its supervisor's id is only pending. Its promotion watch reads that as
     /// wait, and once the test releases N (within `PROMOTION_WAIT`) N+1 is recorded and
@@ -12359,9 +12378,8 @@ mod tests {
             .state()
             .pending_supervisor
             .expect("at the hold the state names N+1 as pending");
-        let exit_file = devflow_core::agent_result::exit_code_path(&run.root, run.phase);
         assert!(
-            poll_until(Duration::from_secs(3), || exit_file.exists()),
+            poll_until(Duration::from_secs(3), || pending_agent_gone(&pending)),
             "N+1's agent exits while N is held; events:\n{}",
             run.events()
         );
@@ -13029,9 +13047,8 @@ mod tests {
             .state()
             .pending_supervisor
             .expect("the state names N+1 as pending");
-        let exit_file = devflow_core::agent_result::exit_code_path(&run.root, run.phase);
         assert!(
-            poll_until(Duration::from_secs(3), || exit_file.exists()),
+            poll_until(Duration::from_secs(3), || pending_agent_gone(&pending)),
             "precondition: N+1's agent has exited"
         );
         let started = std::time::Instant::now();
@@ -13354,6 +13371,32 @@ mod tests {
         assert_agent_outlives_the_reads(&run, pgid);
 
         assert_run_finishes_normally(&run);
+    }
+
+    /// `git clean -fdx` under `--no-worktree` takes `.devflow`, with the state and the event
+    /// log. The supervisor ends the agent and still leaves its event, in a log it recreates,
+    /// because its stderr is `/dev/null` and nothing else would say why the agent ended.
+    #[test]
+    fn a_removed_devflow_dir_ends_the_agent_and_leaves_a_record() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_removed_devflow_dir_ends_the_agent_and_leaves_a_record";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_record_save"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1939));
+        let (ours, socket, pgid) = promoted_next(&run);
+        let state_file = workflow::state_path(&run.root, run.phase);
+
+        std::fs::remove_dir_all(state_file.parent().unwrap()).unwrap();
+
+        assert_group_ended_and_supervisor_gone_within(&run, &socket, pgid, STATE_GONE_END_BOUND);
+        let events = events_named(&run.root, "supervisor_superseded");
+        assert_eq!(events.len(), 1, "one event: {}", run.events());
+        assert_eq!(events[0]["ours"], ours.as_str(), "{}", events[0]);
+        assert_eq!(events[0]["agent_group"], "ended", "{}", events[0]);
+        assert!(!state_file.exists(), "no state write");
     }
 
     /// A state that does not parse after the promotion says nothing about who owns the run,
