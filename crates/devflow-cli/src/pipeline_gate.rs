@@ -22,8 +22,8 @@
 use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::{
-    ADVANCE_STOP_REASON, GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded,
-    fenced, is_not_owner, launch_stage,
+    GateWaitEnd, clear_run_state, close_gate, commit, ensure_still_recorded, fenced, is_not_owner,
+    launch_stage,
 };
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{
@@ -253,12 +253,14 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     // after the Ship gate was answered is honoured before the merge, version
     // bump, tag and push. The consumed approval is cleared with it, so a
     // resumed run asks again. Outside a supervisor's advance (the foreground
-    // `ship_override`) no stop token is engaged and this proceeds.
+    // `ship_override`) no stop token is engaged, and the holder's stop flag decides
+    // (D-18). Once this has passed, the pass runs every hook to the end.
     if crate::pipeline_launch::stop_requested_at_safe_point() {
         let _ = close_gate(project_root, state.phase, Stage::Ship);
         crate::pipeline_launch::record_advance_stop(state, 6)?;
         return Err(CliError::Message(format!(
-            "finalization did not run: {ADVANCE_STOP_REASON}"
+            "finalization did not run: {}",
+            crate::pipeline_launch::safe_point_stop_reason()
         )));
     }
     loop {
@@ -566,7 +568,8 @@ pub(crate) fn run_gate_with_timeout(
             registration.finish();
             crate::pipeline_launch::record_advance_stop(state, 5)?;
             return Err(CliError::Message(format!(
-                "the gate for stage {stage} was not auto-answered: {ADVANCE_STOP_REASON}"
+                "the gate for stage {stage} was not auto-answered: {}",
+                crate::pipeline_launch::safe_point_stop_reason()
             )));
         }
         let answered = fenced(project_root, state.phase, || {
@@ -667,7 +670,8 @@ pub(crate) fn run_gate_with_timeout(
             registration.finish();
             crate::pipeline_launch::record_advance_stop(state, 4)?;
             Err(CliError::Message(format!(
-                "the gate wait for stage {stage} ended: {ADVANCE_STOP_REASON}"
+                "the gate wait for stage {stage} ended: {}",
+                crate::pipeline_launch::safe_point_stop_reason()
             )))
         }
         GateWaitEnd::TimedOut => {

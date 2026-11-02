@@ -1016,8 +1016,8 @@ thread_local! {
     /// Set only while [`StopTokenGuard`] is alive. Thread-local, not a
     /// process-global static, so parallel in-crate tests never share it; an
     /// advance run by anything other than a supervisor (the hidden
-    /// `devflow advance`, a test calling `advance_with` directly) sees `None`
-    /// and every safe point proceeds.
+    /// `devflow advance`, a test calling `advance_with` directly) sees `None`,
+    /// and its safe points read the holder's stop flag instead (D-18).
     static ENGAGED_ADVANCE: std::cell::RefCell<Option<EngagedAdvance>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1203,13 +1203,12 @@ fn commit_notify_env(state: &mut State) -> Result<(), CliError> {
     commit(state, |s| s.gate_notify_cmd = resolved)
 }
 
-/// An advance safe point (50-13, R-2): when the engaged supervisor's stop
-/// has been requested, record the stop in `state` and return `true`, so the
-/// caller returns at once without launching anything (the supervisor's
-/// `finish` answers a parked caller `stopped`). `false` with no stop requested, or outside a
-/// supervisor's advance.
+/// An advance safe point (50-13, R-2): when a stop has been requested
+/// ([`stop_requested_at_safe_point`]), record the stop in `state` and return `true`, so
+/// the caller returns at once without launching anything (a supervisor's `finish` answers
+/// a parked caller `stopped`). `false` with no stop requested.
 fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliError> {
-    if with_stop_token(StopToken::safe_point) != Some(SafePoint::StopHere) {
+    if !stop_requested_at_safe_point() {
         return Ok(false);
     }
     record_advance_stop(state, safe_point)?;
@@ -1219,9 +1218,17 @@ fn stopped_at_safe_point(state: &mut State, safe_point: u8) -> Result<bool, CliE
 /// The test half of an advance safe point, for a caller that must clear
 /// something before it calls [`record_advance_stop`]: `true` when the
 /// engaged supervisor's stop has been requested (the run is then marked
-/// ended as a stop), `false` with none or outside a supervisor's advance.
+/// ended as a stop), or, outside a supervisor's advance, when this foreground holder
+/// caught a stop signal (D-18). `false` with neither.
 pub(crate) fn stop_requested_at_safe_point() -> bool {
-    with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere)
+    with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) || holder_stop_requested()
+}
+
+/// Whether this thread runs outside a supervisor's advance in a process whose D-18
+/// handler caught a stop signal. A supervisor's own token always decides inside its
+/// advance.
+fn holder_stop_requested() -> bool {
+    with_stop_token(|_| ()).is_none() && devflow_core::liveness::holder_stop_signal().is_some()
 }
 
 /// The reason a stop at a safe point on this thread records: [`ADVANCE_STOP_REASON`]
@@ -1331,7 +1338,7 @@ pub(crate) enum GateWaitEnd {
 /// `GateWait` for the wait and `Advancing` again after it, and the wait is cancelled
 /// by the supervisor's stop token, so a SIGTERM/SIGINT or socket stop ends it within
 /// about a second as [`GateWaitEnd::Stopped`]. Anywhere else (the hidden `devflow
-/// advance`, a foreground gate) nothing cancels it.
+/// advance`, a foreground gate) the holder's stop flag cancels it the same way (D-18).
 ///
 /// # Errors
 /// A file in this gate's slot that does not bind to it could not be set aside, because
@@ -1348,9 +1355,18 @@ pub(crate) fn wait_for_gate_response(
     if let Some(token) = &token {
         token.enter(OwnerPhase::GateWait);
     }
-    let outcome = await_bound_answer(project_root, phase, stage, gate_id, timeout_secs, || {
-        token.as_ref().is_some_and(StopToken::stop_requested)
-    });
+    let outcome =
+        await_bound_answer(
+            project_root,
+            phase,
+            stage,
+            gate_id,
+            timeout_secs,
+            || match &token {
+                Some(token) => token.stop_requested(),
+                None => devflow_core::liveness::holder_stop_signal().is_some(),
+            },
+        );
     if let Some(token) = &token {
         token.enter(OwnerPhase::Advancing);
     }
@@ -2490,7 +2506,7 @@ fn spawn_next_supervisor(
     // Safe point 3 (50-13): the next supervisor answered its ping but is not
     // published. On a stop, shut it down through its socket and never save
     // its record; the state keeps this run's record, marked stopped.
-    if with_stop_token(StopToken::safe_point) == Some(SafePoint::StopHere) {
+    if stop_requested_at_safe_point() {
         end_unpublished(state, &published.record, reservation)?;
         return Ok(None);
     }
