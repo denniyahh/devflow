@@ -1437,7 +1437,11 @@ fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> S
 /// recorded socket, never a pid, and a live pending supervisor is named by its own
 /// socket. `status` speaks only about the operator's own project, so it names the
 /// socket path (doctor does not, T-18-01). An abandoned reservation gets a note.
-fn status_supervisor_lines(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+fn status_supervisor_lines(
+    project_root: &Path,
+    state: &State,
+    liveness: &PhaseLiveness,
+) -> Vec<String> {
     let pending = state.pending_supervisor.as_ref();
     let live_pending = matches!(liveness, PhaseLiveness::LaunchPending { .. });
     let socket = pending
@@ -1453,15 +1457,62 @@ fn status_supervisor_lines(state: &State, liveness: &PhaseLiveness) -> Vec<Strin
             pending.launch_id
         ));
     }
+    match workflow::write_lock_status(project_root, state.phase) {
+        Ok(status) => lines.extend(write_lock_line(&status)),
+        Err(error) => lines.push(format!("  state write lock: could not be read ({error})")),
+    }
     lines
 }
 
-/// `status`'s repair lines for a phase.
-fn status_hint_lines(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
-    recovery_hints(state, liveness)
+/// `status`'s repair lines for a phase. The live agent is looked up only when no
+/// supervisor of the phase is live (D-19).
+fn status_hint_lines(project_root: &Path, state: &State, liveness: &PhaseLiveness) -> Vec<String> {
+    let live_agent = no_supervisor_live(liveness)
+        .then(|| live_phase_agent(project_root, state))
+        .flatten();
+    status_hints(state, liveness, live_agent.as_ref())
         .into_iter()
         .map(|hint| format!("    → {hint}"))
         .collect()
+}
+
+/// Whether `liveness` says no supervisor of the phase is live: the states D-19 names.
+fn no_supervisor_live(liveness: &PhaseLiveness) -> bool {
+    matches!(
+        liveness,
+        PhaseLiveness::Gone | PhaseLiveness::GoneWhileActive | PhaseLiveness::NotLaunched
+    )
+}
+
+/// A phase's agent still running with no live supervisor (D-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveAgent {
+    /// The agent's pid, which leads its own process group.
+    pub(crate) pid: u32,
+    /// Whether the recorded start time confirms it is this phase's agent. An
+    /// unconfirmed pid comes only from the agent pid file and may have been reused.
+    pub(crate) confirmed: bool,
+}
+
+pub(crate) fn live_phase_agent(_project_root: &Path, _state: &State) -> Option<LiveAgent> {
+    None
+}
+
+#[allow(dead_code, reason = "a scaffold the next commit wires up")]
+pub(crate) fn orphaned_agent_line(_phase: PhaseId, _agent: &LiveAgent) -> String {
+    String::new()
+}
+
+fn status_hints(
+    state: &State,
+    liveness: &PhaseLiveness,
+    _live_agent: Option<&LiveAgent>,
+) -> Vec<String> {
+    recovery_hints(state, liveness)
+}
+
+pub(crate) fn write_lock_line(_status: &workflow::WriteLockStatus) -> Option<String> {
+    None
 }
 
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
@@ -1520,7 +1571,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                 None => println!("  agent_pid: none"),
             }
             let phase_liveness = probe_phase(state);
-            for line in status_supervisor_lines(state, &phase_liveness) {
+            for line in status_supervisor_lines(project_root, state, &phase_liveness) {
                 println!("{line}");
             }
             let phase_summary = last_events.remove(&state.phase);
@@ -1531,7 +1582,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
                     phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
-            for line in status_hint_lines(state, &phase_liveness) {
+            for line in status_hint_lines(project_root, state, &phase_liveness) {
                 println!("{line}");
             }
             if let Some(summary) = phase_summary {
@@ -5550,6 +5601,7 @@ impl Severity {
 /// The read-only facts `doctor` gathers for one active phase before
 /// reconciling them. Collected by `collect_phase_facts` (all I/O); consumed
 /// with zero I/O by `reconcile_phase`.
+#[allow(dead_code, reason = "a scaffold the next commit wires up")]
 pub(crate) struct PhaseFacts {
     pub(crate) phase: PhaseId,
     pub(crate) stage: Stage,
@@ -5580,6 +5632,15 @@ pub(crate) struct PhaseFacts {
     /// marker instead of reporting a `Problem` (review: Codex HIGH — the
     /// doctor gap is bigger than `check_dead_agent` alone).
     pub(crate) stopped: bool,
+    /// The pending launch's id and liveness, from `state.pending_supervisor`. The
+    /// liveness is `LaunchPending` while it lives and a GONE state once abandoned.
+    pub(crate) pending: Option<(String, PhaseLiveness)>,
+    /// The phase's agent, when no supervisor is live and it still runs (D-19).
+    pub(crate) live_agent: Option<LiveAgent>,
+    /// The state write lock, read once without waiting (R-03).
+    pub(crate) write_lock: workflow::WriteLockStatus,
+    /// Why [`PhaseFacts::write_lock`] could not be read; it then reads free.
+    pub(crate) write_lock_error: Option<String>,
 }
 
 /// One diagnostic finding for a phase, with a copy-pasteable repair command
@@ -5803,6 +5864,10 @@ fn build_phase_facts(
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let supervisor = probe_phase(&state);
+    let (write_lock, write_lock_error) = match workflow::write_lock_status(project_root, phase) {
+        Ok(status) => (status, None),
+        Err(error) => (workflow::WriteLockStatus::Free, Some(error.to_string())),
+    };
     let supervisor_launch_id = state
         .supervisor
         .as_ref()
@@ -5837,6 +5902,10 @@ fn build_phase_facts(
         open_gate_stages,
         feature_branch_exists,
         stopped,
+        pending: None,
+        live_agent: None,
+        write_lock,
+        write_lock_error,
     }
 }
 
@@ -10467,6 +10536,10 @@ mod tests {
                 open_gate_stages: Vec::new(),
                 feature_branch_exists: true,
                 stopped: false,
+                pending: None,
+                live_agent: None,
+                write_lock: workflow::WriteLockStatus::Free,
+                write_lock_error: None,
             }
         }
 
@@ -13951,8 +14024,9 @@ mod tests {
     /// The lines `status` prints about `state`'s supervisor and its repair.
     fn rendered_status(state: &State) -> String {
         let phase_liveness = probe_phase(state);
-        let mut lines = status_supervisor_lines(state, &phase_liveness);
-        lines.extend(status_hint_lines(state, &phase_liveness));
+        let root = &state.project_root;
+        let mut lines = status_supervisor_lines(root, state, &phase_liveness);
+        lines.extend(status_hint_lines(root, state, &phase_liveness));
         lines.join("\n")
     }
 
@@ -14228,6 +14302,258 @@ mod tests {
             "the promoted launch's socket is addressed"
         );
         assert!(workflow::load_state(&root, phase).unwrap().stopped);
+    }
+
+    /// The one phase's facts `doctor` would gather for `state`.
+    fn facts_for(root: &Path, state: &State) -> PhaseFacts {
+        build_phase_facts(
+            root,
+            state.clone(),
+            &mut std::collections::HashMap::new(),
+            &[],
+        )
+    }
+
+    /// `doctor` names a live pending launch and its repair, in text and `--json`, and
+    /// never `resume`, including over a recorded STALE socket (whose own repair is
+    /// `stop && resume`); released, the finding is the abandoned note.
+    #[test]
+    fn doctor_reports_a_pending_launch_and_names_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5187);
+        let stop_verb = format!("devflow stop --phase {phase}");
+        let mut state = state_with_pending(root, phase, true);
+        let hold = hold_pending(&state);
+
+        let assert_names_stop_only = |state: &State, case: &str| {
+            let facts = facts_for(root, state);
+            let findings = reconcile_phase(&facts);
+            let finding = findings
+                .iter()
+                .find(|finding| finding.detail.contains(PENDING_LAUNCH))
+                .unwrap_or_else(|| panic!("{case}: no finding names the launch"));
+            assert_eq!(
+                finding.repair.as_deref(),
+                Some(stop_verb.as_str()),
+                "{case}"
+            );
+            for finding in &findings {
+                let repair = finding.repair.as_deref().unwrap_or_default();
+                assert!(!repair.contains("devflow resume"), "{case}: {repair}");
+            }
+            let body = render_reconciliation_json(std::slice::from_ref(&facts));
+            let pending = &body[0]["supervisor"]["pending"];
+            assert_eq!(pending["launch_id"], PENDING_LAUNCH, "{case}: {body}");
+            assert_eq!(pending["liveness"], "launch_pending", "{case}: {body}");
+        };
+        assert_names_stop_only(&state, "a GONE record");
+
+        let stale = root.join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        state.supervisor.as_mut().unwrap().socket_path = stale;
+        assert_names_stop_only(&state, "a STALE record");
+
+        drop(hold);
+        let facts = facts_for(root, &state);
+        let findings = reconcile_phase(&facts);
+        let note = findings
+            .iter()
+            .find(|finding| finding.detail.contains(PENDING_LAUNCH))
+            .expect("the abandoned reservation is noted");
+        assert!(note.detail.contains("abandoned"), "{}", note.detail);
+
+        state.pending_supervisor = None;
+        let body = render_reconciliation_json(std::slice::from_ref(&facts_for(root, &state)));
+        assert!(body[0]["supervisor"]["pending"].is_null(), "{body}");
+    }
+
+    /// Ends and reaps the fixture's stand-in agent if an assertion fails first.
+    struct StandInAgent(std::process::Child);
+
+    impl StandInAgent {
+        /// A `sleep` leading its own process group, as an agent does.
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn the stand-in agent");
+            Self(child)
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn kill_and_reap(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl Drop for StandInAgent {
+        fn drop(&mut self) {
+            self.kill_and_reap();
+        }
+    }
+
+    /// D-19: no supervisor is live and the agent still runs, so `status` and `doctor`
+    /// name its pid and the manual kill, not a `resume` the launch guard would refuse.
+    /// Control: with the agent dead, they suggest `resume` again. Nothing under test
+    /// signals the agent: it is alive until the test ends it.
+    #[test]
+    fn status_and_doctor_name_an_orphaned_agent_not_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5188);
+        let mut agent = StandInAgent::spawn();
+        let pid = agent.pid();
+        let kill_line = format!("kill -TERM -- -{pid}");
+        let resume = format!("devflow resume --phase {phase}");
+
+        let mut confirmed = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        confirmed.supervisor = Some(SupervisorRecord::new(
+            root.join("gone.sock"),
+            "aaaa0000aaaa5188".to_string(),
+            pid,
+            agent::process_start_time(pid).expect("the agent's start time"),
+            supervisor::boot_id().expect("a readable boot id"),
+        ));
+        assert_eq!(probe_phase(&confirmed), PhaseLiveness::GoneWhileActive);
+        let live = live_phase_agent(root, &confirmed);
+        assert_eq!(
+            live,
+            Some(LiveAgent {
+                pid,
+                confirmed: true
+            }),
+            "confirmed"
+        );
+        let hints = status_hints(&confirmed, &probe_phase(&confirmed), live.as_ref());
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains(&format!("pid {pid}")), "{hints:?}");
+        assert!(hints[0].contains(&kill_line), "{hints:?}");
+        assert!(hints[0].contains("999.170"), "{hints:?}");
+        assert!(!hints[0].contains("devflow resume"), "{hints:?}");
+        let finding = check_supervisor(&facts_for(root, &confirmed)).expect("a finding");
+        assert_eq!(finding.repair.as_ref(), Some(&hints[0]), "doctor's repair");
+
+        let unrecorded = State::new(phase, AgentKind::Claude, Mode::Supervise, root.into());
+        let pid_file = agent_result::agent_pid_path(root, phase);
+        std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+        std::fs::write(&pid_file, pid.to_string()).unwrap();
+        assert_eq!(probe_phase(&unrecorded), PhaseLiveness::NotLaunched);
+        let live = live_phase_agent(root, &unrecorded);
+        assert_eq!(
+            live,
+            Some(LiveAgent {
+                pid,
+                confirmed: false
+            }),
+            "unconfirmed"
+        );
+        let hints = status_hints(&unrecorded, &probe_phase(&unrecorded), live.as_ref());
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(
+            hints[0].contains(&format!("ps -o pid,pgid,lstart,args -p {pid}")),
+            "{hints:?}"
+        );
+        assert!(hints[0].contains(&kill_line), "{hints:?}");
+        assert!(!hints[0].contains("devflow resume"), "{hints:?}");
+        let finding = check_supervisor(&facts_for(root, &unrecorded)).expect("a finding");
+        assert_eq!(finding.severity, Severity::Problem);
+        assert!(
+            finding.detail.contains(&format!("pid {pid}")),
+            "{}",
+            finding.detail
+        );
+        assert_eq!(finding.repair.as_ref(), Some(&hints[0]), "doctor's repair");
+
+        assert!(agent::agent_running(pid), "nothing under test signalled it");
+        agent.kill_and_reap();
+        assert_eq!(live_phase_agent(root, &confirmed), None, "control: dead");
+        assert_eq!(live_phase_agent(root, &unrecorded), None, "control: dead");
+        assert_eq!(
+            status_hints(&confirmed, &probe_phase(&confirmed), None),
+            vec![resume.clone()],
+            "control"
+        );
+        let finding = check_supervisor(&facts_for(root, &confirmed)).expect("a finding");
+        assert_eq!(finding.repair.as_ref(), Some(&resume), "control");
+    }
+
+    /// R-03: `status` and `doctor` read the write lock without waiting and name a held
+    /// one, in wording that tells the operator how to judge a single reading. Control:
+    /// once it is released, neither says anything.
+    #[test]
+    fn status_and_doctor_name_a_held_state_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5189);
+        let state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+        workflow::save_state(&state).unwrap();
+        let (holding, wait_holding) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                workflow::update_state(&root, phase, |_| {
+                    holding.send(()).unwrap();
+                    let _ = wait_release.recv_timeout(std::time::Duration::from_secs(30));
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            })
+        };
+        wait_holding.recv().unwrap();
+        let pid = std::process::id();
+
+        let line = write_lock_line(&workflow::write_lock_status(&root, phase).unwrap())
+            .expect("a held lock is named");
+        for expected in [
+            format!("pid {pid}"),
+            "up to about 5 s".to_string(),
+            "about 9 s while".to_string(),
+            "past 10 s".to_string(),
+        ] {
+            assert!(line.contains(&expected), "missing {expected:?}: {line}");
+        }
+        assert!(!line.contains("takes milliseconds;"), "{line}");
+        let rendered = rendered_status(&state);
+        assert!(rendered.contains(&line), "status prints it: {rendered}");
+        let held = reconcile_phase(&facts_for(&root, &state));
+        let finding = held
+            .iter()
+            .find(|finding| finding.detail.contains("state write lock"))
+            .expect("doctor names a held lock");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert!(
+            finding.detail.contains(&format!("pid {pid}")),
+            "{}",
+            finding.detail
+        );
+        assert!(finding.detail.contains("past 10 s"), "{}", finding.detail);
+
+        drop(release);
+        holder.join().unwrap();
+        assert_eq!(
+            write_lock_line(&workflow::write_lock_status(&root, phase).unwrap()),
+            None,
+            "control: released"
+        );
+        assert!(
+            !rendered_status(&state).contains("state write lock"),
+            "control"
+        );
+        let free = reconcile_phase(&facts_for(&root, &state));
+        assert!(
+            !free
+                .iter()
+                .any(|finding| finding.detail.contains("state write lock")),
+            "control: released"
+        );
     }
 
     /// Criterion 2 at a gate nothing waits on: `stop`'s own line names no `resume` while
