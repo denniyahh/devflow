@@ -1387,6 +1387,8 @@ Plans:
 
 ### Phase 999.166: Supervisor Residuals From the Phase 50 Code Review (BACKLOG)
 
+**Folded into Phase 50.1 (2026-10-24).** Landed by: item 1 and item 6, 50.1-24; item 2, 50.1-21; item 4 and item 7's core half, 50.1-08; item 5 and item 9, 50.1-02; item 7 and item 8, 50.1-22. Item 3 was fixed in Phase 50.
+
 **Found:** 2026-10-20, Phase 50's end-of-phase `/gsd-code-review` (standard depth, 53 files; report
 `.planning/phases/50-addressable-monitor-liveness/50-REVIEW.md`, ledger `50-REVIEW-DISPOSITION.md`). Each item was
 found by reading the code at `889ecea`, not reproduced. The operator chose on 2026-10-21 to fix the review's one
@@ -1919,6 +1921,8 @@ directly, then delete `ENV_MUTEX`.
 ### Phase 999.130: Split-Lock State-Handling Overhaul (BACKLOG)
 
 **Promoted 2026-10-10 to Phase 50.1** (operator decision, `50-CONTEXT.md` D-11). This entry stays as the evidence record; the work is tracked there.
+
+**Folded into Phase 50.1 (2026-10-24).** Landed by: the `flock` around every state write and the `update_state` API, 50.1-04, 50.1-10 and 50.1-11; the launcher-to-monitor ownership handoff, 50.1-05, 50.1-07, 50.1-16, 50.1-17 and 50.1-19; gate-waiter registration, 50.1-06, 50.1-08, 50.1-13, 50.1-14, 50.1-15 and 50.1-20; fsync of the file and its directory, 50.1-01.
 
 **Found:** Phase 48 discussion (`48-CONTEXT.md` `<deferred>`), filed 2026-09-22 on the operator's
 decision. Phase 48 made state writes survivable with unique temp files, first-answer-wins gate
