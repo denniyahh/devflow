@@ -1382,7 +1382,9 @@ fn probe_phase(state: &State) -> PhaseLiveness {
 /// advance — widening that predicate risks suggesting `advance` where
 /// nothing proves it is right, per 21-CONTEXT.md's Review Incorporation); a
 /// failed probe names the socket to inspect. A live pending supervisor names only
-/// `devflow stop` (criterion 2). Empty for ALIVE, a stopped GONE and NotLaunched.
+/// `devflow stop` (criterion 2). A stopped phase names `devflow resume`, since nothing
+/// else continues it; a phase that never launched and is not stopped names nothing, and
+/// neither does ALIVE.
 fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
     let phase = state.phase;
     match liveness {
@@ -1407,6 +1409,9 @@ fn recovery_hints(state: &State, liveness: &PhaseLiveness) -> Vec<String> {
             vec![format!(
                 "the probe failed ({why}); inspect the socket at {socket}"
             )]
+        }
+        PhaseLiveness::Gone | PhaseLiveness::NotLaunched if state.stopped => {
+            vec![format!("devflow resume --phase {phase}")]
         }
         PhaseLiveness::Alive { .. } | PhaseLiveness::Gone | PhaseLiveness::NotLaunched => {
             Vec::new()
@@ -2090,7 +2095,18 @@ fn waiter_holder_status(
 
 /// Operator recovery for a gate with no confirmed consumer. Ship is special:
 /// its answer remains the input to the explicit `devflow ship` workflow.
-fn stop_no_waiter_repair(_project_root: &Path, phase: PhaseId, stage: Stage) -> String {
+/// [`no_waiter_repair`] for `stop`'s own lines. `stop` goes on to the supervisor's socket,
+/// and while a supervisor of the phase is live a `resume` would refuse (criterion 2).
+fn stop_no_waiter_repair(project_root: &Path, phase: PhaseId, stage: Stage) -> String {
+    let supervisor_live = workflow::load_state(project_root, phase).is_ok_and(|state| {
+        matches!(
+            probe_phase(&state),
+            PhaseLiveness::Alive { .. } | PhaseLiveness::LaunchPending { .. }
+        )
+    });
+    if supervisor_live && stage != Stage::Ship {
+        return format!("Stopping phase {phase}'s live supervisor through its socket instead.");
+    }
     no_waiter_repair(phase, stage)
 }
 
@@ -2543,6 +2559,10 @@ type AnsweredGate = (Stage, lock::HolderStatus, Option<(u32, Option<u64>)>);
 ///    identity-confirmed per-phase lock holder get signalled
 ///    ([`stop_via_lock`]).
 ///
+/// A pending supervisor comes after the recorded one, whose own safe point 3 ends an
+/// unpublished successor: only its socket reaches it ([`stop_pending_launch`]), and an
+/// abandoned reservation is cleared with a report.
+///
 /// No pid read from state is ever signalled. `stopped` is recorded only for
 /// a stop performed or confirmed not live, and never into a state file that
 /// does not load.
@@ -2557,23 +2577,166 @@ fn stop_in(project_root: &Path, phase: PhaseId, cache_dir: Option<&Path>) -> Res
     if gate_answered {
         return persist_stopped_state(project_root, phase, gate_holder, false);
     }
-    match stop_via_socket(project_root, phase, cache_dir)? {
-        SocketStop::NoLiveSocket => {
-            let signal_sent = stop_via_lock(project_root, phase)?;
-            persist_stopped_state(project_root, phase, None, signal_sent)
-        }
-        // The supervisor may still be releasing the per-phase lock as it
-        // exits, so wait it out like a signalled holder.
-        SocketStop::Ended => persist_stopped_state(project_root, phase, None, true),
+    let mut ended = match stop_via_socket(project_root, phase, cache_dir)? {
+        SocketStop::NoLiveSocket => false,
+        SocketStop::Ended => true,
         SocketStop::EndedStateUnloadable(state_file) => {
             println!(
                 "stop: phase {phase}'s state file {} does not load, so `stopped` was not \
                  recorded — repair or remove it before `devflow resume --phase {phase}`",
                 state_file.display()
             );
-            Ok(())
+            return Ok(());
+        }
+    };
+    if let Some(pending_ended) = stop_pending_launch(project_root, phase)? {
+        ended |= pending_ended;
+        // A launch promoted while `stop` waited on it is the recorded supervisor now.
+        ended |= !matches!(
+            stop_via_socket(project_root, phase, cache_dir)?,
+            SocketStop::NoLiveSocket
+        );
+    }
+    // A supervisor may still be releasing the per-phase lock as it exits, so wait it
+    // out like a signalled holder.
+    let signal_sent = ended || stop_via_lock(project_root, phase)?;
+    persist_stopped_state(project_root, phase, None, signal_sent)
+}
+
+/// How long `stop` waits for a live pending supervisor to publish its socket: the
+/// supervisor's own publish wait (10 s, `PUBLISH_WAIT`, private to `devflow_core::monitor`)
+/// and a margin, so it outlasts a launch that is going to publish.
+const PENDING_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How often `stop` looks again during [`PENDING_PUBLISH_WAIT`].
+const PENDING_PUBLISH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The pending half of [`stop`] (D-02), on a fresh read each pass: a socket that answers
+/// gets a `shutdown`; a held liveness lock with no answering socket is waited for
+/// (`Live`, never signalled, Phase 50 D-05/D-06); a STALE socket no lock vouches for goes
+/// to the backstop; with neither left, the reservation is abandoned and cleared. A live
+/// lock beats a STALE socket because the backstop is for a supervisor that is gone.
+///
+/// `Ok(None)` when the state names no pending launch, else whether a supervisor was
+/// ended. The caller looks at the recorded socket again, since the record can end by
+/// promotion.
+fn stop_pending_launch(project_root: &Path, phase: PhaseId) -> Result<Option<bool>, CliError> {
+    let mut outcome = None;
+    let mut ended = false;
+    let mut handed_off = 0;
+    let mut deadline = None;
+    loop {
+        let Some(pending) = workflow::load_state(project_root, phase)
+            .ok()
+            .and_then(|state| state.pending_supervisor)
+        else {
+            return Ok(outcome);
+        };
+        outcome = Some(ended);
+        let located = LocatedSocket {
+            socket: pending.socket_path.clone(),
+            record: None,
+            unloadable_state: None,
+            pending_recorded: true,
+        };
+        let socket = supervisor::probe(&located.socket)
+            .map_err(|error| probe_refusal(phase, &located.socket, &error))?;
+        let held = liveness::probe(&pending.liveness_path).map_err(|error| {
+            CliError::Message(format!(
+                "stop: could not read launch {}'s liveness lock ({error}); nothing was signalled \
+                 or recorded",
+                pending.launch_id
+            ))
+        })?;
+        match (socket, held) {
+            (supervisor::Liveness::Alive(_), _) => match shutdown_supervisor(phase, &located)? {
+                ShutdownResult::Ended => {
+                    ended = true;
+                    deadline = None;
+                }
+                ShutdownResult::Relocate => {}
+                ShutdownResult::HandedOff => {
+                    handed_off += 1;
+                    if handed_off >= MAX_SHUTDOWN_REQUESTS {
+                        return Err(CliError::Message(format!(
+                            "stop: launch {} answered `handed_off` to {handed_off} shutdown \
+                             requests; nothing was recorded — run `devflow status` and `devflow \
+                             stop --phase {phase}` again",
+                            pending.launch_id
+                        )));
+                    }
+                    std::thread::sleep(PENDING_PUBLISH_POLL);
+                }
+            },
+            // The live-pending branch. 50.1-29 extends its expiry with the holder arm.
+            (_, liveness::Held::Live) => {
+                let until = *deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + PENDING_PUBLISH_WAIT);
+                if std::time::Instant::now() >= until {
+                    return if ended {
+                        Ok(Some(true))
+                    } else {
+                        Err(pending_not_published(phase, &pending.launch_id))
+                    };
+                }
+                std::thread::sleep(PENDING_PUBLISH_POLL);
+            }
+            (supervisor::Liveness::Stale, _) => {
+                stop_stale_socket(phase, &located)?;
+                ended = true;
+            }
+            (supervisor::Liveness::Gone, _) => {
+                clear_abandoned_reservation(project_root, phase, &pending)?;
+                return Ok(Some(ended));
+            }
         }
     }
+}
+
+/// `stop`'s refusal over a live pending lock with no socket by the end of the wait.
+fn pending_not_published(phase: PhaseId, launch_id: &str) -> CliError {
+    CliError::Message(format!(
+        "stop: launch {launch_id} for phase {phase} is reserved by a live process and has not \
+         published a supervisor; nothing was signalled or recorded — run `devflow stop --phase \
+         {phase}` again"
+    ))
+}
+
+/// Clear a reservation nothing holds, if the fresh read still names it, then remove its
+/// liveness file and say so. R-03: `stop` is a repair verb, so a held write lock ends it
+/// within the bound, naming the holder, with nothing cleared.
+fn clear_abandoned_reservation(
+    project_root: &Path,
+    phase: PhaseId,
+    pending: &PendingSupervisor,
+) -> Result<(), CliError> {
+    let cleared = workflow::update_state_with_within(
+        project_root,
+        phase,
+        workflow::WRITE_LOCK_REPAIR_WAIT,
+        |existing| {
+            let workflow::Existing::Loaded(mut state) = existing else {
+                return Ok::<_, CliError>((None, false));
+            };
+            let names_it = state
+                .pending_supervisor
+                .as_ref()
+                .is_some_and(|fresh| fresh.launch_id == pending.launch_id);
+            if !names_it {
+                return Ok((None, false));
+            }
+            state.pending_supervisor = None;
+            Ok((Some(state), true))
+        },
+    )?;
+    if cleared {
+        remove_abandoned_liveness_file(project_root, pending);
+        println!(
+            "stop: cleared the abandoned launch reservation {} (no process held it)",
+            pending.launch_id
+        );
+    }
+    Ok(())
 }
 
 /// `devflow stop --phase N --launch <id>` (D-06): tear down only the
@@ -2830,6 +2993,9 @@ struct LocatedSocket {
     /// The state file, when it exists but does not load and the socket came
     /// from its sidecar.
     unloadable_state: Option<PathBuf>,
+    /// Whether the state names a pending launch. Until that is dealt with, no line
+    /// about this socket may call the phase resumable (criterion 2).
+    pending_recorded: bool,
 }
 
 /// Find the socket for a bare `stop`: the loaded state's `supervisor` record;
@@ -2848,19 +3014,21 @@ fn locate_phase_socket(
     phase: PhaseId,
     cache_dir: Option<&Path>,
 ) -> Result<Option<LocatedSocket>, CliError> {
-    let unloadable_state = match workflow::load_state(project_root, phase) {
-        Ok(state) => match state.supervisor {
-            Some(record) => {
+    let (unloadable_state, pending_recorded) = match workflow::load_state(project_root, phase) {
+        Ok(state) => {
+            let pending_recorded = state.pending_supervisor.is_some();
+            if let Some(record) = state.supervisor {
                 return Ok(Some(LocatedSocket {
                     socket: record.socket_path.clone(),
                     record: Some(record),
                     unloadable_state: None,
+                    pending_recorded,
                 }));
             }
-            None => None,
-        },
-        Err(workflow::WorkflowError::MissingState(_)) => None,
-        Err(_) => Some(workflow::state_path(project_root, phase)),
+            (None, pending_recorded)
+        }
+        Err(workflow::WorkflowError::MissingState(_)) => (None, false),
+        Err(_) => (Some(workflow::state_path(project_root, phase)), false),
     };
     let Some(cache_dir) = cache_dir else {
         return Ok(None);
@@ -2878,6 +3046,7 @@ fn locate_phase_socket(
             socket: entry.socket_path.clone(),
             record: None,
             unloadable_state,
+            pending_recorded,
         })),
         several => Err(several_sockets_refusal(
             phase,
@@ -3111,7 +3280,7 @@ fn stop_stale_socket(phase: PhaseId, located: &LocatedSocket) -> Result<(), CliE
         &socket,
         &sidecar,
         located.record.as_ref(),
-        Some(phase),
+        (!located.pending_recorded).then_some(phase),
     )
 }
 
@@ -9498,7 +9667,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_hints_empty_for_alive_stopped_and_unlaunched() {
+    fn recovery_hints_empty_for_alive_and_unlaunched() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
             PhaseId::new(7),
@@ -9511,12 +9680,39 @@ mod tests {
             launch: "stream".to_string(),
         };
 
-        for liveness in [alive, PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+        for liveness in [alive, PhaseLiveness::NotLaunched] {
             assert!(
                 recovery_hints(&state, &liveness).is_empty(),
                 "{liveness:?} needs no repair"
             );
         }
+    }
+
+    /// Once `stop` has ended a run nothing else continues it, so `status` names `resume`,
+    /// with or without a record. A stopped phase whose supervisor still answers does not.
+    #[test]
+    fn recovery_hints_names_resume_for_a_stopped_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.stopped = true;
+
+        for liveness in [PhaseLiveness::Gone, PhaseLiveness::NotLaunched] {
+            assert_eq!(
+                recovery_hints(&state, &liveness),
+                vec!["devflow resume --phase 7".to_string()],
+                "{liveness:?}"
+            );
+        }
+        let alive = PhaseLiveness::Alive {
+            owner: "agent_running".to_string(),
+            launch: "stream".to_string(),
+        };
+        assert!(recovery_hints(&state, &alive).is_empty(), "control");
     }
 
     /// 21a / 999.30 IN-01: the shared one-pass event summary's
@@ -13904,8 +14100,8 @@ mod tests {
             .to_string();
 
         assert!(
-            started.elapsed() >= std::time::Duration::from_secs(15),
-            "the wait is bounded by core's publish wait plus a margin: {:?}",
+            started.elapsed() >= PENDING_PUBLISH_WAIT,
+            "stop gives the supervisor the whole wait: {:?}",
             started.elapsed()
         );
         assert!(error.contains(PENDING_LAUNCH), "{error}");
