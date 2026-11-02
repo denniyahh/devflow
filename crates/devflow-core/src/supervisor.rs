@@ -325,6 +325,8 @@ pub enum ProbeError {
 /// 3. A refused connect is `Stale`. Every other connect error is
 ///    [`ProbeError::Connect`], NotFound included: a socket removed between
 ///    the stat and the connect is reported, never guessed to be `Gone`.
+///    A connect still waiting after [`protocol::IO_TIMEOUT`], on a listener
+///    whose backlog is full (a stopped supervisor), is one of those errors.
 /// 4. A connect is not proof of life (a listen backlog accepts it with
 ///    nobody serving): only a valid ping reply makes it `Alive`.
 /// 5. A ping whose connection is closed under it (a reset or a broken pipe)
@@ -341,7 +343,7 @@ pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
         if !own_socket_at(path)? {
             return Ok(Liveness::Gone);
         }
-        let stream = match UnixStream::connect(path) {
+        let stream = match connect_within(path, protocol::IO_TIMEOUT) {
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
                 return Ok(Liveness::Stale);
             }
@@ -352,6 +354,74 @@ pub fn probe(path: &Path) -> Result<Liveness, ProbeError> {
             Ok(reply) => return Ok(Liveness::Alive(reply)),
             Err(error) if error.closed && !connected_again => connected_again = true,
             Err(error) => return Err(ProbeError::NoReply(error.message)),
+        }
+    }
+}
+
+/// How often [`connect_within`] retries while a listener's backlog is full.
+const CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// [`UnixStream::connect`], except that a listener whose backlog stays full yields an
+/// [`io::ErrorKind::TimedOut`] after `limit` instead of waiting for as long as the listener
+/// lives. A nonblocking connect fails `EAGAIN` there and is retried. A helper thread around
+/// the blocking connect would be shorter, but it stays blocked, with its socket, after the
+/// timeout, and this runs in long-lived supervisors. The stream comes back blocking.
+fn connect_within(path: &Path, limit: std::time::Duration) -> io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    // Refuses a path too long or with a NUL in it, as `UnixStream::connect` does.
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: all zeroes is a valid `sockaddr_un`, a plain C struct.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: no pointers; the result is checked before it is used.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created by `socket` and nothing else owns it.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: a flag set on a descriptor `stream` owns.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        // SAFETY: `address` is live and initialized, and `length` covers its family, the
+        // path and the path's NUL, which `from_pathname` above showed fit in `sun_path`.
+        let connected = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&raw const address).cast(),
+                length as libc::socklen_t,
+            )
+        };
+        if connected == 0 {
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock if std::time::Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the backlog stayed full for {limit:?}"),
+                ));
+            }
+            io::ErrorKind::WouldBlock => std::thread::sleep(CONNECT_RETRY),
+            _ => return Err(error),
         }
     }
 }
@@ -748,7 +818,7 @@ pub fn request_shutdown(
             format!("no socket at {}", path.display()),
         )));
     }
-    let stream = UnixStream::connect(path).map_err(ProbeError::Connect)?;
+    let stream = connect_within(path, protocol::IO_TIMEOUT).map_err(ProbeError::Connect)?;
     let timeout_error =
         |error: io::Error| ProbeError::NoReply(format!("could not set socket timeouts: {error}"));
     stream
@@ -941,6 +1011,83 @@ mod tests {
         match probe(path) {
             Ok(Liveness::Alive(reply)) => assert_eq!(reply.launch_id, launch_id),
             other => panic!("expected Alive with launch id {launch_id}, got {other:?}"),
+        }
+    }
+
+    /// A listener that never accepts, whose backlog is full: the next connect would wait
+    /// for room for as long as the listener lives. Linux lets `backlog + 1` connections
+    /// wait, so one is enough at a backlog of 0.
+    #[cfg(target_os = "linux")]
+    fn listener_with_a_full_backlog(path: &Path) -> (UnixListener, UnixStream) {
+        use std::os::fd::AsRawFd as _;
+        let listener = UnixListener::bind(path).unwrap();
+        // SAFETY: a plain listen on a socket this function owns.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let waiting = UnixStream::connect(path).unwrap();
+        (listener, waiting)
+    }
+
+    /// Run `call` on a thread, so a call that never returns fails the test on the bound
+    /// rather than hanging it. Returns what it returned and how long it took.
+    #[cfg(target_os = "linux")]
+    fn within_connect_bound<T: Send + 'static>(
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> (T, std::time::Duration) {
+        let bound = protocol::IO_TIMEOUT + std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(call());
+        });
+        let returned = receiver
+            .recv_timeout(bound)
+            .unwrap_or_else(|_| panic!("the call did not return within {bound:?}"));
+        (returned, started.elapsed())
+    }
+
+    /// A full backlog is what a SIGSTOPped supervisor shows, and it means "cannot tell":
+    /// neither GONE nor STALE, and not a wait that outlives the caller's write lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_of_a_full_backlog_is_a_connect_error_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        let (listener, waiting) = listener_with_a_full_backlog(&path);
+        let target = path.clone();
+        let (outcome, took) = within_connect_bound(move || probe(&target));
+        match outcome {
+            Err(ProbeError::Connect(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            }
+            other => panic!("expected a timed-out connect, got {other:?}"),
+        }
+        assert!(took >= protocol::IO_TIMEOUT, "it gave up early: {took:?}");
+
+        // Control: room in the same backlog, and the connect goes through to no reply.
+        let _accepted = listener.accept().unwrap();
+        drop(waiting);
+        let (outcome, _) = within_connect_bound(move || probe(&path));
+        assert!(
+            matches!(outcome, Err(ProbeError::NoReply(_))),
+            "with room, the connect succeeds: {outcome:?}"
+        );
+    }
+
+    /// `stop` meets the same full backlog through its shutdown request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn request_shutdown_to_a_full_backlog_is_a_connect_error_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        let (_listener, _waiting) = listener_with_a_full_backlog(&path);
+        let (outcome, _) = within_connect_bound(move || {
+            request_shutdown(&path, std::time::Duration::from_secs(1))
+        });
+        match outcome {
+            Err(ProbeError::Connect(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            }
+            other => panic!("expected a timed-out connect, got {other:?}"),
         }
     }
 
