@@ -305,7 +305,7 @@ fn advance_wedge_arm_killed_advance_leaves_a_code_gate_that_reject_reports_hones
         .args(["recover", "--clean", "--phase", &phase.to_string()])
         .arg(root)
         .output()
-        .expect("recover lock-free wedge");
+        .expect("recover the wedge");
     assert!(
         recovery.status.success(),
         "recover --clean failed: {}",

@@ -26,7 +26,8 @@ pub enum RecoverError {
     /// State loading failed.
     #[error("{0}")]
     Workflow(#[from] WorkflowError),
-    /// Phase-lock acquisition failed.
+    /// A lock error. Nothing in this module returns it since `recover` stopped taking a
+    /// per-phase lock; it stays as a public variant until a release may remove it.
     #[error("{0}")]
     Lock(#[from] crate::lock::LockError),
     /// Gate cleanup failed.
@@ -81,23 +82,24 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 /// Clean up stale or abandoned workflow state.
 ///
 /// 14-CR-01: only STALE phases are swept — a phase whose agent is still
-/// running, or whose state is simply fresh, is kept (with a warning naming
-/// the explicit `--phase` escape hatch), so cleaning one dead phase under
-/// `devflow parallel` can never orphan a healthy sibling. Also removes lock
-/// files whose holder is dead (the sweep lives in
+/// running, whose state is simply fresh, or whose supervisor, pending supervisor,
+/// gate waiter or foreground holder may be live is kept (with a warning naming the
+/// repair), so cleaning one dead phase under `devflow parallel` can never orphan a
+/// healthy sibling. Also removes lock files whose holder is dead (the sweep lives in
 /// [`crate::lock::remove_stale_locks`], which refuses to delete a live
-/// holder's lock), gate files whose phase has no state file, and
-/// cron-instruction records for phases that no longer have state —
-/// self-describing "auto-re-run this phase" records that must not survive an
-/// operator-driven reset. Returns warnings for anything kept or that could
-/// not be removed.
+/// holder's lock), gate files whose phase has no state file, cron-instruction
+/// records for phases that no longer have state — self-describing "auto-re-run
+/// this phase" records that must not survive an operator-driven reset — and the
+/// liveness files and hold temps crashes left. Returns warnings for anything kept or
+/// that could not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
     clean_report(project_root).map(|report| report.warnings)
 }
 
 /// What [`clean_report`] did: the phases whose state it cleared, the
-/// stateless phases whose orphaned gate files or cron records it removed,
-/// and warnings for anything it kept or could not remove.
+/// stateless phases whose orphaned gate files or cron records it removed, the
+/// abandoned markers it removed, the set-aside answers it left, and warnings for
+/// anything it kept or could not remove.
 #[derive(Debug, Default)]
 pub struct CleanReport {
     /// Phases whose persisted state was cleared.
@@ -150,11 +152,76 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
         }
     }
     sweep_orphan_cron_records(project_root, &mut report);
+    sweep_abandoned_markers(project_root, &mut report);
     report.quarantined = crate::gates::Gates::quarantined(project_root)
         .into_iter()
         .map(|answer| answer.path)
         .collect();
     Ok(report)
+}
+
+/// Remove what crashes leave behind (R-06): an unheld `supervisor-*.live` under
+/// `.devflow/`, an unheld `*.waiter` in the gates directory, and in both an orphan hold
+/// temp. There is no age bound. An `Abandoned` hold never reads `Live` again, and a hold's
+/// final name is published only once its temp is locked, so none is visible unheld while
+/// its creator lives. Removing a `Live` hold is never safe, so a probe that cannot answer
+/// keeps the file.
+///
+/// The names match exactly, so `.holder-NN`, `.state-NN.lock`, `.gates-NN.lock` (never
+/// removed, or two lockers could hold different inodes) and `*.quarantined.json` (D-05)
+/// can never be swept.
+fn sweep_abandoned_markers(project_root: &Path, report: &mut CleanReport) {
+    let devflow = workflow::devflow_dir(project_root);
+    let gates = crate::gates::Gates::dir(project_root);
+    remove_abandoned_holds(
+        &devflow,
+        |name| name.starts_with("supervisor-") && name.ends_with(".live"),
+        report,
+    );
+    remove_abandoned_holds(
+        &gates,
+        |name| name.ends_with(crate::gates::WAITER_SUFFIX),
+        report,
+    );
+    for dir in [&devflow, &gates] {
+        match crate::liveness::remove_orphan_hold_temps(dir) {
+            Ok(removed) => report.markers_removed.extend(removed),
+            Err(err) => report.fail(format!(
+                "could not sweep the hold temps of {}: {err}",
+                dir.display()
+            )),
+        }
+    }
+}
+
+/// Remove each file in `dir` named as `is_hold` says whose lock nothing holds.
+fn remove_abandoned_holds(dir: &Path, is_hold: impl Fn(&str) -> bool, report: &mut CleanReport) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            return report.fail(format!("could not list {}: {err}", dir.display()));
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(&is_hold) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = crate::liveness::probe(&path).and_then(|held| match held {
+            crate::liveness::Held::Abandoned => crate::durable::remove_durably(&path),
+            crate::liveness::Held::Live | crate::liveness::Held::Missing => Ok(false),
+        });
+        match removed {
+            Ok(true) => report.markers_removed.push(path),
+            Ok(false) => {}
+            Err(err) => report.fail(format!(
+                "kept {} — could not check or remove it: {err}",
+                path.display()
+            )),
+        }
+    }
 }
 
 /// Drop cron records only for phases without surviving state, so a kept phase's pending
@@ -1487,7 +1554,7 @@ mod tests {
     /// R-4: the stale-state sweep must report an orphaned state temp it
     /// cannot remove, while retaining the record of the state it did clear.
     #[test]
-    fn clean_report_flags_an_unremovable_state_temp_for_a_lock_free_stale_phase() {
+    fn clean_report_flags_an_unremovable_state_temp_for_a_stale_phase() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(64);
@@ -1502,7 +1569,7 @@ mod tests {
         let temp = workflow::devflow_dir(root).join(".state-64.json.1.0.tmp");
         std::fs::create_dir_all(&temp).unwrap();
 
-        let report = clean_report(root).expect("clean lock-free stale phase");
+        let report = clean_report(root).expect("clean a stale phase");
 
         assert!(
             !state_path.exists(),
