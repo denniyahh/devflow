@@ -309,6 +309,64 @@ fn resume_prints_the_answer_it_set_aside() {
     );
 }
 
+/// D-05, at the boundary an operator reads: the real `status`, `doctor` and `doctor --json`
+/// each name a set-aside answer, and the control run before it names none.
+#[test]
+fn status_and_doctor_name_a_set_aside_answer_on_stdout() {
+    let home = common::HermeticHome::new();
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let phase = PhaseId::new(94);
+    init_repo(root, phase);
+    let run = |args: &[&str]| {
+        let output = common::hermetic_devflow(&home)
+            .args(args)
+            .arg(root)
+            .current_dir(root)
+            .output()
+            .expect("run devflow");
+        assert!(
+            output.status.success(),
+            "devflow {args:?}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    for args in [&["status"][..], &["doctor"][..]] {
+        let stdout = run(args);
+        assert!(
+            !stdout.contains("set-aside gate answers"),
+            "control: nothing to report in {args:?}: {stdout}"
+        );
+    }
+
+    plant_code_gate(root, phase);
+    Gates::close(root, phase, Stage::Code).expect("set the planted answer aside");
+    let set_aside = Gates::quarantined(root);
+    assert_eq!(set_aside.len(), 1, "{set_aside:?}");
+    let full = set_aside[0].path.display().to_string();
+    let relative = set_aside[0]
+        .path
+        .strip_prefix(root)
+        .unwrap()
+        .display()
+        .to_string();
+
+    let status = run(&["status"]);
+    assert!(status.contains("set-aside gate answers:"), "{status}");
+    assert!(status.contains(&full), "{status}");
+    let doctor = run(&["doctor"]);
+    assert!(doctor.contains("set-aside gate answers:"), "{doctor}");
+    assert!(doctor.contains(&relative), "{doctor}");
+    let body: serde_json::Value = serde_json::from_str(&run(&["doctor", "--json"])).unwrap();
+    let listed = body["set_aside_gate_answers"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{body}");
+    assert!(
+        listed[0]["detail"].as_str().unwrap().contains(&relative),
+        "{body}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 48-19 (criterion 2, D-01, D-02): `start` must not overwrite a live run.
 //
