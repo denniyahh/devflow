@@ -7932,6 +7932,269 @@ mod tests {
         );
     }
 
+    /// A process recorded in a per-phase lock file, as no waiter records itself any more.
+    fn plant_live_lock_record(root: &Path, phase: PhaseId) {
+        let pid = std::process::id();
+        let start = agent::process_start_time(pid).unwrap();
+        let path = root
+            .join(".devflow")
+            .join(format!("lock-{}", phase.padded()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("{pid}\n{start}")).unwrap();
+    }
+
+    /// D-04: a registered waiter's gate is answered with no lock file anywhere, and with
+    /// none registered it is refused even beside a live lock record. A Ship answer is
+    /// still stored for `devflow ship`.
+    #[test]
+    fn gate_respond_answers_a_registered_waiter_and_refuses_when_none_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let (registered, stage) = (PhaseId::new(5001), Stage::Code);
+        let (opened, registration) = Gates::open_registered(root, registered, stage, "g").unwrap();
+        gate_respond(root, registered, Some(stage), true, None, None)
+            .expect("a registered waiter's gate is answered");
+        assert!(
+            matches!(
+                Gates::read_answer(root, registered, stage, &opened.gate_id),
+                AnswerRead::Bound(answer) if answer.response.approved
+            ),
+            "the answer binds to the observed gate"
+        );
+        assert!(
+            !root
+                .join(".devflow")
+                .join(format!("lock-{}", registered.padded()))
+                .exists(),
+            "no lock file played any part"
+        );
+        registration.finish();
+
+        let beside_a_lock = PhaseId::new(5003);
+        Gates::open_gate(root, beside_a_lock, stage, "g").unwrap();
+        plant_live_lock_record(root, beside_a_lock);
+        let refused = gate_respond(root, beside_a_lock, Some(stage), true, None, None)
+            .expect_err("a live lock record is no waiter")
+            .to_string();
+        assert!(refused.contains("no registered waiter"), "{refused}");
+        assert!(gate_answer_files(root, beside_a_lock, stage).is_empty());
+
+        let released = PhaseId::new(5002);
+        let (_, registration) = Gates::open_registered(root, released, stage, "g").unwrap();
+        registration.finish();
+        let refused = gate_respond(root, released, Some(stage), true, None, None)
+            .expect_err("a finished registration is no waiter")
+            .to_string();
+        assert!(refused.contains("no registered waiter"), "{refused}");
+        assert!(refused.contains("no response was written"), "{refused}");
+        assert!(gate_answer_files(root, released, stage).is_empty());
+
+        let ship = PhaseId::new(5004);
+        let gate = Gates::open_gate(root, ship, Stage::Ship, "g")
+            .unwrap()
+            .gate_id;
+        gate_respond(root, ship, Some(Stage::Ship), true, None, None)
+            .expect("a Ship answer is stored for `devflow ship`");
+        assert!(matches!(
+            Gates::read_answer(root, ship, Stage::Ship, &gate),
+            AnswerRead::Bound(answer) if answer.response.approved
+        ));
+        assert!(no_waiter_repair(ship, Stage::Ship).contains("devflow ship --phase 5004"));
+    }
+
+    /// Hold `phase`'s gate lock through a separate open, as a suspended writer would.
+    fn hold_gate_lock(root: &Path, phase: PhaseId) -> std::fs::File {
+        let path = root
+            .join(".devflow")
+            .join(format!(".gates-{}.lock", phase.padded()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.lock().unwrap();
+        file
+    }
+
+    /// Whether `child` ends within `within`, reaping it if it does.
+    fn child_exits_within(child: &mut std::process::Child, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.try_wait().unwrap().is_some()
+    }
+
+    /// A `sleep` child that is killed and reaped when this drops, on a failed assertion too.
+    struct SleepingChild {
+        child: std::process::Child,
+        start: u64,
+    }
+
+    impl SleepingChild {
+        fn spawn() -> Self {
+            let (child, start) = sleep_child_with_start();
+            Self { child, start }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn is_live(&self) -> bool {
+            devflow_core::test_support::process_is_live(self.pid())
+        }
+    }
+
+    impl Drop for SleepingChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// `GateLockTimeout`: a gate writer gives up within the bound and writes nothing,
+    /// and is never told there is no waiter. `stop` goes on to the arms that reach the
+    /// run without the gate. Control: with the lock free, the same answer lands.
+    #[test]
+    fn a_gate_writer_gives_up_on_a_held_gate_lock_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let stage = Stage::Code;
+
+        let phase = PhaseId::new(5005);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let gate_lock = hold_gate_lock(root, phase);
+        let started = std::time::Instant::now();
+        let error = gate_respond(
+            root,
+            phase,
+            Some(stage),
+            true,
+            None,
+            Some(opened.gate_id.to_string()),
+        )
+        .expect_err("a held gate lock ends the writer");
+        let took = started.elapsed();
+        assert!(
+            took >= devflow_core::gates::GATE_LOCK_WAIT,
+            "gave up after {took:?}"
+        );
+        assert!(
+            took < devflow_core::gates::GATE_LOCK_WAIT + std::time::Duration::from_secs(2),
+            "waited {took:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            matches!(error, CliError::Gate(GateError::GateLockTimeout { .. })),
+            "{message}"
+        );
+        assert!(message.contains(".gates-"), "{message}");
+        assert!(message.contains("nothing was changed"), "{message}");
+        assert!(gate_answer_files(root, phase, stage).is_empty());
+
+        let stopping = PhaseId::new(5006);
+        state_pending_at(root, stopping, stage);
+        let (_, stop_registration) = Gates::open_registered(root, stopping, stage, "g").unwrap();
+        let stop_gate_lock = hold_gate_lock(root, stopping);
+        let mut holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, stopping, holder.pid(), Some(holder.start));
+        let cache = tempfile::tempdir().unwrap();
+        let stopped = stop_in(root, stopping, Some(cache.path()));
+        assert!(
+            child_exits_within(&mut holder.child, agent::TERMINATE_VERIFY_WAIT),
+            "stop reaches the holder past a gate it could not answer: {stopped:?}"
+        );
+        assert!(stopped.is_err(), "the test's hold outlives its child");
+        assert!(
+            gate_answer_files(root, stopping, stage).is_empty(),
+            "stop wrote no answer under the held lock"
+        );
+        stop_registration.finish();
+        drop(stop_gate_lock);
+
+        drop(gate_lock);
+        gate_respond(
+            root,
+            phase,
+            Some(stage),
+            true,
+            None,
+            Some(opened.gate_id.to_string()),
+        )
+        .expect("with the lock free the same answer lands");
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::Bound(_)
+        ));
+        registration.finish();
+    }
+
+    /// R2-04: one `stop`, one action. An abort published with its re-check timed out is
+    /// answered: `stop` goes on to record the stop and never reaches the holder.
+    #[test]
+    fn stop_treats_a_published_but_unconfirmed_abort_as_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(5007), Stage::Code);
+        state_pending_at(root, phase, stage);
+        let (opened, registration) = Gates::open_registered(root, phase, stage, "g").unwrap();
+        let holder = SleepingChild::spawn();
+        let _hold = hold_phase_with_record(root, phase, holder.pid(), Some(holder.start));
+        let cache = tempfile::tempdir().unwrap();
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        let started = std::time::Instant::now();
+        let hook_root = root.to_path_buf();
+        let hook_parked = parked.clone();
+        let stopped = with_answer_before_publish(
+            move || {
+                *hook_parked.borrow_mut() = Some(hold_gate_lock(&hook_root, phase));
+            },
+            || stop_in(root, phase, Some(cache.path())),
+        );
+        let took = started.elapsed();
+
+        stopped.expect("a published abort is the requested stop");
+        assert!(
+            took >= devflow_core::gates::GATE_LOCK_WAIT,
+            "the re-check waited for the lock: {took:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(holder.is_live(), "the holder arm never ran");
+        assert!(workflow::load_state(root, phase).unwrap().stopped);
+        drop(parked.borrow_mut().take());
+        assert!(matches!(
+            Gates::read_answer(root, phase, stage, &opened.gate_id),
+            AnswerRead::Bound(answer) if !answer.response.approved
+        ));
+        registration.finish();
+    }
+
+    /// D-04: only the registration counts. A live lock record alone reads not live.
+    #[test]
+    fn a_waiter_is_live_only_by_its_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(4904), Stage::Code);
+        let gate = Gates::open_gate(root, phase, stage, "g").unwrap().gate_id;
+        assert!(!waiter_is_live(root, phase, stage, &gate), "nothing at all");
+
+        let registration = Gates::register_waiter(root, phase, stage, &gate).unwrap();
+        assert!(waiter_is_live(root, phase, stage, &gate), "registration");
+        registration.finish();
+        assert!(!waiter_is_live(root, phase, stage, &gate), "finished");
+
+        plant_live_lock_record(root, phase);
+        assert!(!waiter_is_live(root, phase, stage, &gate), "a lock record");
+    }
+
     /// The lock half is why this test plants a `lock-NN`: that half is its subject,
     /// and 50.1-20 deletes both.
     #[test]
