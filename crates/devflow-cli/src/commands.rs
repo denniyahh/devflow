@@ -28,7 +28,7 @@ use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{
     AnswerRead, GateAction, GateError, GateFile, GateId, GateResponse, Gates, OpenGate,
-    WaiterStatus, is_gate_id,
+    QuarantinedAnswer, WaiterStatus, is_gate_id,
 };
 use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
@@ -5858,7 +5858,6 @@ fn check_sync_done(project_root: &Path) -> Check {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Severity {
     Ok,
-    #[cfg_attr(not(test), allow(dead_code))]
     Info,
     Warn,
     Problem,
@@ -5920,8 +5919,9 @@ pub(crate) struct PhaseFacts {
 }
 
 /// One diagnostic finding for a phase, with a copy-pasteable repair command
-/// when one exists. Never carries a filesystem path or username (T-18-01) —
-/// only phase numbers, stage names, and pids identify the disagreement.
+/// when one exists. Never carries an absolute filesystem path or username
+/// (T-18-01): phase numbers, stage names and pids identify the disagreement, and
+/// a set-aside answer names its file from the project root (D-05).
 pub(crate) struct PhaseFinding {
     pub(crate) phase: PhaseId,
     pub(crate) severity: Severity,
@@ -6368,27 +6368,92 @@ fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     }]
 }
 
-/// RED stub.
+/// The heading `status` and `doctor` print over set-aside answers (D-05).
+const SET_ASIDE_ANSWERS_HEADING: &str = "set-aside gate answers:";
+
+/// One info finding per set-aside answer (D-05). The path is relative to the project
+/// root: a finding never carries a username (T-18-01), and `doctor` already says which
+/// project it reads.
 fn set_aside_answer_findings(
-    _project_root: &Path,
-    _answers: &[devflow_core::gates::QuarantinedAnswer],
+    project_root: &Path,
+    answers: &[QuarantinedAnswer],
 ) -> Vec<PhaseFinding> {
-    Vec::new()
+    answers
+        .iter()
+        .map(|answer| {
+            let relative = answer
+                .path
+                .strip_prefix(project_root)
+                .unwrap_or(&answer.path)
+                .display();
+            PhaseFinding {
+                phase: answer.phase,
+                severity: Severity::Info,
+                detail: format!(
+                    "phase {}: an unused answer for the {} gate (gate {}) was set aside: {relative}",
+                    answer.phase, answer.stage, answer.label
+                ),
+                repair: Some(
+                    "inspect it; answer the live gate with `devflow gate approve|reject`"
+                        .to_string(),
+                ),
+            }
+        })
+        .collect()
 }
 
-/// RED stub.
-fn render_set_aside_findings_text(_findings: &[PhaseFinding]) -> String {
-    String::new()
+/// `doctor`'s set-aside section: nothing when there are none.
+fn render_set_aside_findings_text(findings: &[PhaseFinding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n{SET_ASIDE_ANSWERS_HEADING}\n");
+    for finding in findings {
+        out.push_str(&format!("  {}\n", finding.detail));
+        if let Some(repair) = &finding.repair {
+            out.push_str(&format!("    repair: {repair}\n"));
+        }
+    }
+    out
 }
 
-/// RED stub.
-fn render_set_aside_findings_json(_findings: &[PhaseFinding]) -> serde_json::Value {
-    serde_json::Value::Array(Vec::new())
+/// `doctor --json`'s `"set_aside_gate_answers"` array.
+fn render_set_aside_findings_json(findings: &[PhaseFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|finding| {
+                serde_json::json!({
+                    "phase": finding.phase,
+                    "severity": finding.severity.label(),
+                    "detail": finding.detail,
+                    "repair": finding.repair,
+                })
+            })
+            .collect(),
+    )
 }
 
-/// RED stub.
-fn render_set_aside_answers(_answers: &[devflow_core::gates::QuarantinedAnswer]) -> Option<String> {
-    None
+/// `status`'s block of set-aside answers, one group per phase (D-05), or `None` when there
+/// are none. [`Gates::quarantined`] sorts by path, which keeps each phase's answers
+/// together. `status` speaks only about the operator's own project, so it names full paths.
+fn render_set_aside_answers(answers: &[QuarantinedAnswer]) -> Option<String> {
+    if answers.is_empty() {
+        return None;
+    }
+    let mut block = SET_ASIDE_ANSWERS_HEADING.to_string();
+    for group in answers.chunk_by(|a, b| a.phase == b.phase) {
+        block.push_str(&format!("\n  phase {}:", group[0].phase));
+        for answer in group {
+            block.push_str(&format!(
+                "\n    {} gate (gate {}): {}",
+                answer.stage,
+                answer.label,
+                answer.path.display()
+            ));
+        }
+    }
+    Some(block)
 }
 
 /// Build `doctor`'s per-phase reconciliation section (after the existing
