@@ -177,6 +177,8 @@ pub fn clean_report(project_root: &Path) -> Result<CleanReport, RecoverError> {
 /// Clear one listed phase if it is stale and its lock is free.
 fn sweep_phase(project_root: &Path, state: &State, report: &mut CleanReport) {
     let phase = state.phase;
+    #[cfg(test)]
+    recover_test_hook(RecoverPoint::SweepListed, phase);
     if agent_pid_for(state).is_some_and(crate::agent::agent_running) {
         report.warnings.push(format!(
             "kept phase {phase} — its agent is still running (clear explicitly with --phase {phase})"
@@ -238,6 +240,8 @@ fn sweep_orphan_gates(project_root: &Path, report: &mut CleanReport) {
         if workflow::state_path(project_root, phase).exists() {
             continue;
         }
+        #[cfg(test)]
+        recover_test_hook(RecoverPoint::OrphanGatesListed, phase);
         let what = "the orphan gate files of phase";
         let Some(_guard) = lock_for_sweep(project_root, phase, what, report) else {
             continue;
@@ -295,16 +299,68 @@ fn remove_gate_files(
     project_root: &Path,
     phase: PhaseId,
 ) -> (bool, Result<(), crate::gates::GateError>) {
-    let mut removed = false;
-    for stage in STAGES {
-        let (report, result) =
-            crate::gates::Gates::close_with_partial_result(project_root, phase, stage);
-        removed |= report.removed || !report.quarantined.is_empty();
-        if let Err(error) = result {
-            return (removed, Err(error));
-        }
+    let (reports, result) =
+        crate::gates::Gates::close_phase_with_partial_result(project_root, phase);
+    let removed = reports
+        .iter()
+        .any(|(_, report)| report.removed || !report.quarantined.is_empty());
+    (removed, result)
+}
+
+/// How many socket probes one decision makes: `phase_may_be_live` probes the recorded
+/// and the pending socket, and nothing else in a decision probes a socket.
+#[cfg_attr(not(test), allow(dead_code))]
+const SOCKET_PROBES_PER_DECISION: u32 = 2;
+
+/// [`crate::supervisor::probe`], counted in a test build.
+#[allow(dead_code)]
+fn probe_socket(path: &Path) -> Result<crate::supervisor::Liveness, crate::supervisor::ProbeError> {
+    #[cfg(test)]
+    SOCKET_PROBES.with(|count| count.set(count.get() + 1));
+    crate::supervisor::probe(path)
+}
+
+/// The longest one decision can hold the write lock for, from its waits alone.
+#[cfg_attr(not(test), allow(dead_code))]
+fn decision_worst_case(
+    io_timeout: Duration,
+    gate_lock_wait: Duration,
+    socket_probes: u32,
+    gate_waits: u32,
+) -> Duration {
+    io_timeout * socket_probes + gate_lock_wait * gate_waits
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many socket probes this thread has made through [`probe_socket`].
+    static SOCKET_PROBES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// What [`recover_test_hook`] runs on this thread.
+    static RECOVER_HOOK: std::cell::RefCell<Option<RecoverHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type RecoverHook = Box<dyn FnMut(RecoverPoint, PhaseId)>;
+
+/// The named points between a sweep's listing and its locked decision.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverPoint {
+    /// `clean_report` listed a phase's state and has not decided it.
+    SweepListed,
+    /// `clean_report` listed a phase's gate files and has not decided them.
+    OrphanGatesListed,
+}
+
+/// Run the hook this thread installed, with its slot free so the hook may run anything.
+#[cfg(test)]
+fn recover_test_hook(point: RecoverPoint, phase: PhaseId) {
+    let hook = RECOVER_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        hook(point, phase);
+        RECOVER_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
     }
-    (removed, Ok(()))
 }
 
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
@@ -317,15 +373,6 @@ fn remove_gate_files(
 pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
     clean_phase_report(project_root, phase).map(|report| report.warnings)
 }
-
-/// Every stage whose gate files a phase can leave behind.
-const STAGES: [crate::stage::Stage; 5] = [
-    crate::stage::Stage::Define,
-    crate::stage::Stage::Plan,
-    crate::stage::Stage::Code,
-    crate::stage::Stage::Validate,
-    crate::stage::Stage::Ship,
-];
 
 /// What [`clean_phase_report`] did for one phase.
 #[derive(Debug, Default)]
@@ -756,12 +803,11 @@ mod tests {
         );
     }
 
-    /// A monitor waiting at a gate holds the per-phase lock after its agent
-    /// has exited, so an old run looks stale by agent pid alone. The implicit
-    /// sweep must take the lock like `clean_phase`, and keep the phase when it
-    /// cannot. `clean_clears_stale_phase_state` is the unlocked control.
+    /// A waiter blocked on a gate has outlived its agent, so an old run looks stale by
+    /// agent pid alone. The sweep keeps a phase whose gate has a registered waiter, with
+    /// the gate files it is blocked on. `clean_clears_stale_phase_state` is the control.
     #[test]
-    fn clean_keeps_a_stale_phase_whose_lock_is_held() {
+    fn clean_keeps_a_stale_phase_whose_gate_has_a_registered_waiter() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(4);
@@ -774,12 +820,9 @@ mod tests {
         .unwrap();
         let state_path = workflow::state_path(root, phase);
         let state_before = std::fs::read(&state_path).unwrap();
-        // The gate files a waiting monitor is blocked on: the sweep must not
-        // clean them either, so the lock has to be taken before gate cleanup
-        // as well as before the state delete.
-        let gate = Gates::open_gate(root, phase, Stage::Code, "waiting")
-            .unwrap()
-            .gate_id;
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Code, "waiting").unwrap();
+        let gate = opened.gate_id;
         let answer = Gates::answer(
             root,
             phase,
@@ -802,37 +845,29 @@ mod tests {
             .iter()
             .map(|path| std::fs::read(path).unwrap())
             .collect();
-        let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
-        let lock_path = crate::lock::lock_path(root, phase);
-        let lock_before = std::fs::read(&lock_path).unwrap();
 
         let warnings = clean(root).expect("clean");
 
         assert_eq!(
             std::fs::read(&state_path).ok(),
             Some(state_before),
-            "a stale phase whose lock is held must keep its state byte-identical"
+            "a stale phase with a registered waiter must keep its state byte-identical"
         );
         for (path, before) in gate_paths.iter().zip(gates_before) {
             assert_eq!(
                 std::fs::read(path).ok(),
                 Some(before),
-                "a stale phase whose lock is held must keep {} byte-identical",
+                "a stale phase with a registered waiter must keep {} byte-identical",
                 path.display()
             );
         }
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains(&format!("kept phase {phase}")) && w.contains("lock")),
-            "the kept phase must be reported with its lock as the reason: {warnings:?}"
+                .any(|w| w.contains(&format!("kept phase {phase}")) && w.contains("waiter")),
+            "the kept phase must be reported with its waiter as the reason: {warnings:?}"
         );
-        assert_eq!(
-            std::fs::read(&lock_path).ok(),
-            Some(lock_before),
-            "the sweep must leave the holder's lock file untouched"
-        );
-        drop(guard);
+        drop(registration);
     }
 
     /// Phase 50 D-20: neither clean touches a `state.json` left by an old binary,
@@ -1199,7 +1234,7 @@ mod tests {
     /// WR-02 (48-REVIEW.md): gate files whose phase has no state file — left by
     /// a pre-`854bbce` sweep, or by `abort` for another stage — were never
     /// reached, because the sweep only cleaned gates inside its per-state loop.
-    /// `clean_keeps_the_orphan_gate_files_of_a_locked_phase` is the control.
+    /// `clean_keeps_the_orphan_gate_files_of_a_registered_waiter` is the control.
     #[test]
     fn clean_removes_the_gate_files_of_a_phase_with_no_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -1242,29 +1277,29 @@ mod tests {
         assert!(Gates::list_open(root).is_empty());
     }
 
-    /// Control: an orphan gate whose phase lock is held is left alone, like a
-    /// locked phase's state.
+    /// Control: an orphan gate whose waiter is registered is left alone, like the gate
+    /// of a phase with a state.
     #[test]
-    fn clean_keeps_the_orphan_gate_files_of_a_locked_phase() {
+    fn clean_keeps_the_orphan_gate_files_of_a_registered_waiter() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(10);
-        Gates::write_gate(root, phase, Stage::Code, "held").unwrap();
-        let guard = crate::lock::acquire(root, phase).expect("hold phase lock");
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Code, "held").unwrap();
 
         let warnings = clean(root).expect("clean");
 
         assert!(
-            Gates::gate_path(root, phase, Stage::Code).exists(),
-            "an orphan gate under a held lock must be kept"
+            opened.path.exists(),
+            "an orphan gate with a registered waiter must be kept"
         );
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains(&format!("phase {phase}")) && w.contains("lock")),
-            "the kept orphan gate must be reported with its lock as the reason: {warnings:?}"
+                .any(|w| w.contains(&format!("phase {phase}")) && w.contains("waiter")),
+            "the kept orphan gate must be reported with its waiter as the reason: {warnings:?}"
         );
-        drop(guard);
+        drop(registration);
     }
 
     /// A state file that cannot be parsed is skipped by `list_states`, so its
@@ -1576,5 +1611,478 @@ mod tests {
         assert_eq!(set_aside.len(), 1, "{set_aside:?}");
         assert_eq!(set_aside[0].label, gate.as_str());
         assert_eq!(std::fs::read(&set_aside[0].path).unwrap(), body);
+    }
+
+    /// Run `body` with `hook` installed for this thread.
+    fn with_recover_hook<R>(
+        hook: impl FnMut(RecoverPoint, PhaseId) + 'static,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                RECOVER_HOOK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        RECOVER_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let _clear = ClearOnDrop;
+        body()
+    }
+
+    /// A socket answering pings as a live supervisor does, until dropped, when its file
+    /// goes too: a probe then reads GONE.
+    struct TestSupervisor {
+        // Under /tmp: a socket path has to fit `sun_path`.
+        dir: tempfile::TempDir,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestSupervisor {
+        fn start() -> Self {
+            use crate::supervisor::protocol::{PingReply, Reply, read_request, write_reply};
+            let dir = tempfile::Builder::new()
+                .prefix("dfr")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(dir.path().join("s")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let server = std::thread::spawn(move || {
+                while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    if read_request(&stream).is_ok() {
+                        let reply = PingReply {
+                            launch_id: "aaaa0000aaaa2101".to_string(),
+                            phase: "2101".to_string(),
+                            stage: "code".to_string(),
+                            launch: "stream".to_string(),
+                            owner: "advancing".to_string(),
+                            agent_pid: 1,
+                            agent_pgid: 1,
+                            agent_start_time: 0,
+                            boot_id: None,
+                            supervisor_pid: std::process::id(),
+                        };
+                        let _ = write_reply(&stream, &Reply::Ping(reply));
+                    }
+                }
+            });
+            Self {
+                dir,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn socket(&self) -> std::path::PathBuf {
+            self.dir.path().join("s")
+        }
+    }
+
+    impl Drop for TestSupervisor {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            let _ = std::fs::remove_file(self.socket());
+        }
+    }
+
+    fn supervisor_record(socket: std::path::PathBuf) -> crate::state::SupervisorRecord {
+        crate::state::SupervisorRecord::new(
+            socket,
+            "aaaa0000aaaa2101".to_string(),
+            4_294_967_000,
+            1,
+            String::new(),
+        )
+    }
+
+    /// A reservation whose socket does not exist, with its liveness file named for the
+    /// caller to hold or not.
+    fn pending_record(root: &Path, id: &str) -> crate::state::PendingSupervisor {
+        crate::state::PendingSupervisor::new(
+            id.to_string(),
+            root.join("no-such.sock"),
+            root.join(format!(".devflow/supervisor-{id}.live")),
+        )
+    }
+
+    /// Save a stale state (old, its agent pid dead) after `edit` has changed it.
+    fn save_stale(root: &Path, phase: PhaseId, edit: impl FnOnce(&mut State)) {
+        let mut state =
+            state_aged_phase(root, phase, STALE_THRESHOLD.as_secs() + 60, Some(DEAD_PID));
+        edit(&mut state);
+        workflow::save_state(&state).unwrap();
+    }
+
+    /// Sweep until `phase`'s state goes. A just-released flock can read held while
+    /// another test's fork is between its fork and its exec, so a control that clears a
+    /// phase right after a release polls, with a bound.
+    fn sweep_until_cleared(root: &Path, phase: PhaseId) -> CleanReport {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let report = clean_report(root).expect("clean");
+            if !workflow::state_path(root, phase).exists() {
+                return report;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "phase {phase} was never cleared: {:?}",
+                report.warnings
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 999.166 item 2: with the agent gone and the run old, only the recorded socket
+    /// says the supervisor lives, between its agent's exit and its advance.
+    #[test]
+    fn clean_without_a_phase_keeps_a_phase_whose_supervisor_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2101);
+        let supervisor = TestSupervisor::start();
+        let socket = supervisor.socket();
+        save_stale(root, phase, |state| {
+            state.supervisor = Some(supervisor_record(socket.clone()));
+        });
+        let gate = Gates::write_gate(root, phase, Stage::Code, "left open").unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let (state_before, gate_before) = (
+            std::fs::read(&state_path).unwrap(),
+            std::fs::read(&gate).unwrap(),
+        );
+
+        let report = clean_report(root).expect("clean");
+
+        assert_eq!(
+            std::fs::read(&state_path).ok(),
+            Some(state_before),
+            "a live supervisor's state must be byte-identical"
+        );
+        assert_eq!(std::fs::read(&gate).ok(), Some(gate_before));
+        assert!(report.cleared.is_empty(), "{:?}", report.cleared);
+        let socket_text = socket.display().to_string();
+        assert!(
+            report.warnings.iter().any(|w| w.contains(&socket_text)
+                && w.contains(&format!("devflow stop --phase {phase}"))),
+            "the warning names the socket and the repair: {:?}",
+            report.warnings
+        );
+
+        // Control: its supervisor shut down, the socket is GONE and the sweep clears.
+        drop(supervisor);
+        let report = clean_report(root).expect("clean");
+        assert_eq!(report.cleared, vec![phase], "{:?}", report.warnings);
+        assert!(!state_path.exists());
+        assert!(!gate.exists());
+    }
+
+    /// 50.1-16's refusal over a live pending supervisor had no test; each of a held
+    /// reservation and a held registration is enough on its own, with its own reason.
+    #[test]
+    fn clean_keeps_a_phase_with_a_live_pending_supervisor_or_a_registered_waiter() {
+        // A held pending liveness lock, with no socket yet.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2102);
+        let pending = pending_record(root, "aaaa0000aaaa2102");
+        let liveness_path = pending.liveness_path.clone();
+        save_stale(root, phase, |state| {
+            state.pending_supervisor = Some(pending)
+        });
+        let hold = crate::liveness::Hold::take(&liveness_path).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let report = clean_report(root).expect("clean");
+
+        assert_eq!(
+            std::fs::read(&state_path).ok(),
+            Some(before),
+            "the phase's state must be byte-identical"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("pending supervisor")
+                    && w.contains(&liveness_path.display().to_string())
+                    && w.contains(&format!("devflow stop --phase {phase}"))),
+            "{:?}",
+            report.warnings
+        );
+        drop(hold);
+        sweep_until_cleared(root, phase);
+
+        // A held gate registration alone.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2103);
+        save_stale(root, phase, |_| {});
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Plan, "waiting").unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let report = clean_report(root).expect("clean");
+
+        assert_eq!(
+            std::fs::read(&state_path).ok(),
+            Some(before),
+            "the phase's state must be byte-identical"
+        );
+        assert!(opened.path.exists(), "the waited-on gate file stays");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("registered gate waiter")
+                    && w.contains(&format!("devflow stop --phase {phase}"))),
+            "{:?}",
+            report.warnings
+        );
+        drop(registration);
+        sweep_until_cleared(root, phase);
+        assert!(!opened.path.exists());
+    }
+
+    /// D-17: a foreground `start`, `resume`, `devflow ship` or hand-run `advance` is
+    /// what the long lock used to cover.
+    #[test]
+    fn clean_keeps_a_phase_whose_foreground_holder_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2104);
+        save_stale(root, phase, |_| {});
+        let hold = crate::liveness::claim_phase_holder(root, phase).unwrap();
+        let state_path = workflow::state_path(root, phase);
+        let before = std::fs::read(&state_path).unwrap();
+
+        let report = clean_report(root).expect("clean");
+
+        assert_eq!(
+            std::fs::read(&state_path).ok(),
+            Some(before),
+            "the phase's state must be byte-identical"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("foreground holder")
+                    && w.contains(&format!("pid {}", std::process::id()))
+                    && w.contains(&format!("devflow stop --phase {phase}"))),
+            "{:?}",
+            report.warnings
+        );
+
+        // Control: with the hold gone the phase clears, and the holder file stays (a
+        // removed one would let two claimers lock different inodes).
+        drop(hold);
+        sweep_until_cleared(root, phase);
+        assert!(crate::liveness::phase_holder_path(root, phase).exists());
+    }
+
+    /// R2-03: what one write-lock hold can wait for, counted on both paths and then
+    /// summed on the shipped constants.
+    ///
+    /// Not measured, stated from `supervisor::probe`'s contract (its doc, step 5): a
+    /// socket probe can read twice only when its first connection closed under it and a
+    /// still-serving listener took the fresh connect, and its result is then `Alive` or
+    /// `NoReply`, both of which keep the phase and end the decision before any gate wait.
+    /// So the path that reaches the gate wait spends at most one `IO_TIMEOUT` per probe.
+    /// Not established at all: fsync-bound file operations on a slow disk (the 1 s left
+    /// under the bound), or a `recover` process that is itself SIGSTOPped.
+    #[test]
+    fn a_recover_decisions_worst_case_stays_under_the_repair_wait() {
+        let phase_with_every_gate = |root: &Path, phase: PhaseId| {
+            save_stale(root, phase, |state| {
+                state.supervisor = Some(supervisor_record(root.join("gone.sock")));
+                state.pending_supervisor = Some(pending_record(root, "aaaa0000aaaa2105"));
+            });
+            for stage in crate::gates::STAGES {
+                Gates::write_gate(root, phase, stage, "left open").unwrap();
+            }
+        };
+        let counts = || {
+            (
+                SOCKET_PROBES.with(std::cell::Cell::get),
+                crate::gates::gate_lock_acquisitions(),
+            )
+        };
+        let phase = PhaseId::new(2105);
+
+        let dir = tempfile::tempdir().unwrap();
+        phase_with_every_gate(dir.path(), phase);
+        let before = counts();
+        let report = clean_report(dir.path()).expect("clean");
+        let after = counts();
+        assert_eq!(report.cleared, vec![phase], "{:?}", report.warnings);
+        assert_eq!(
+            after.0 - before.0,
+            SOCKET_PROBES_PER_DECISION,
+            "sweep probes"
+        );
+        assert_eq!(after.1 - before.1, 1, "sweep gate-lock acquisitions");
+
+        let dir = tempfile::tempdir().unwrap();
+        phase_with_every_gate(dir.path(), phase);
+        let before = counts();
+        clean_phase_report(dir.path(), phase).expect("explicit clean");
+        let after = counts();
+        assert!(!workflow::state_path(dir.path(), phase).exists());
+        assert_eq!(
+            after.0 - before.0,
+            SOCKET_PROBES_PER_DECISION,
+            "explicit probes"
+        );
+        assert_eq!(after.1 - before.1, 1, "explicit gate-lock acquisitions");
+
+        let (io, gate, repair) = (
+            crate::supervisor::protocol::IO_TIMEOUT,
+            crate::gates::GATE_LOCK_WAIT,
+            workflow::WRITE_LOCK_REPAIR_WAIT,
+        );
+        let worst = decision_worst_case(io, gate, SOCKET_PROBES_PER_DECISION, 1);
+        assert!(
+            worst < repair,
+            "{SOCKET_PROBES_PER_DECISION} x {io:?} + {gate:?} = {worst:?}, not below {repair:?}"
+        );
+        // Control: one gate wait per stage, the shape before this, does not fit.
+        let per_stage = decision_worst_case(
+            io,
+            gate,
+            SOCKET_PROBES_PER_DECISION,
+            crate::gates::STAGES.len() as u32,
+        );
+        assert!(per_stage >= repair, "{per_stage:?} must not fit {repair:?}");
+    }
+
+    /// R-07: run A is stale when the sweep lists it, and run B has replaced it by the
+    /// time the sweep decides. The decision must read B. Q is the control: the same
+    /// sweep, nothing happening in the gap, removes its stale run and gate file.
+    #[test]
+    fn clean_keeps_a_run_that_reserved_after_the_sweep_listed_its_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (replaced, control) = (PhaseId::new(2110), PhaseId::new(2111));
+        for phase in [replaced, control] {
+            save_stale(&root, phase, |_| {});
+            Gates::write_gate(&root, phase, Stage::Code, "run A").unwrap();
+        }
+        let gate = Gates::gate_path(&root, replaced, Stage::Code);
+        // Kept alive to the end of the test: B's reservation and registration.
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hook_root, hook_held, hook_run_b) = (root.clone(), held.clone(), run_b.clone());
+        let mut fired = false;
+
+        let report = with_recover_hook(
+            move |point, phase| {
+                if point != RecoverPoint::SweepListed || phase != replaced || fired {
+                    return;
+                }
+                fired = true;
+                let root = hook_root.as_path();
+                let pending = pending_record(root, "bbbb0000bbbb2110");
+                let hold = crate::liveness::Hold::take(&pending.liveness_path).unwrap();
+                workflow::update_state_with(root, phase, |_| {
+                    let mut run_b = state_aged_phase(root, phase, 0, None);
+                    run_b.pending_supervisor = Some(pending);
+                    Ok::<_, WorkflowError>((Some(run_b), ()))
+                })
+                .unwrap();
+                let (opened, registration) =
+                    Gates::open_registered(root, phase, Stage::Code, "run B").unwrap();
+                *hook_run_b.borrow_mut() = Some((
+                    std::fs::read(workflow::state_path(root, phase)).unwrap(),
+                    std::fs::read(&opened.path).unwrap(),
+                    Gates::waiter_path(root, phase, Stage::Code, &opened.gate_id),
+                ));
+                hook_held.borrow_mut().push((hold, registration));
+            },
+            || clean_report(&root).expect("clean"),
+        );
+
+        let (state_b, gate_b, waiter) = run_b.borrow_mut().take().expect("the hook ran");
+        assert_eq!(report.cleared, vec![control], "{:?}", report.warnings);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("kept phase {replaced}"))),
+            "{:?}",
+            report.warnings
+        );
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, replaced)).ok(),
+            Some(state_b),
+            "run B's state must be byte-identical to what it reserved"
+        );
+        assert_eq!(std::fs::read(&gate).ok(), Some(gate_b), "run B's gate file");
+        assert!(waiter.exists(), "run B's registration stays");
+        assert!(!workflow::state_path(&root, control).exists());
+        assert!(!Gates::gate_path(&root, control, Stage::Code).exists());
+    }
+
+    /// R-07, the orphan path: P's gate files have no state when listed; a run starts
+    /// before the decision. Q's orphan gate files, with nothing in the gap, go.
+    #[test]
+    fn clean_keeps_the_gate_files_of_a_run_that_started_after_the_orphan_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (started, control) = (PhaseId::new(2112), PhaseId::new(2113));
+        let orphan = Gates::write_gate(&root, started, Stage::Code, "orphan").unwrap();
+        let control_gate = Gates::write_gate(&root, control, Stage::Code, "orphan").unwrap();
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let run_b = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hook_root, hook_held, hook_run_b) = (root.clone(), held.clone(), run_b.clone());
+        let mut fired = false;
+
+        let report = with_recover_hook(
+            move |point, phase| {
+                if point != RecoverPoint::OrphanGatesListed || phase != started || fired {
+                    return;
+                }
+                fired = true;
+                let root = hook_root.as_path();
+                workflow::update_state_with(root, phase, |_| {
+                    let run_b = state_aged_phase(root, phase, 0, None);
+                    Ok::<_, WorkflowError>((Some(run_b), ()))
+                })
+                .unwrap();
+                let (opened, registration) =
+                    Gates::open_registered(root, phase, Stage::Define, "run B").unwrap();
+                *hook_run_b.borrow_mut() = Some((
+                    std::fs::read(workflow::state_path(root, phase)).unwrap(),
+                    opened.path,
+                ));
+                hook_held.borrow_mut().push(registration);
+            },
+            || clean_report(&root).expect("clean"),
+        );
+
+        let (state_b, gate_b) = run_b.borrow_mut().take().expect("the hook ran");
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, started)).ok(),
+            Some(state_b),
+            "run B's state is byte-identical"
+        );
+        assert!(gate_b.exists(), "run B's gate file stays");
+        assert!(
+            orphan.exists(),
+            "the phase's earlier gate file stays with it"
+        );
+        assert_eq!(report.orphan_gates_cleared, vec![control]);
+        assert!(!control_gate.exists());
     }
 }

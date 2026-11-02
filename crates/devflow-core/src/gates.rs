@@ -681,23 +681,67 @@ impl Gates {
         Self::close_with_partial_result_with(project_root, phase, stage, &mut |_| {})
     }
 
-    /// The gate file goes last (R2-05), so a crash inside a close leaves it and every
-    /// pair not yet removed for the next close to report: a pair is reported twice at
-    /// worst, never zero times.
+    /// Close every stage's gate of `phase` under one gate-lock acquisition, in
+    /// [`STAGES`] order, stopping at the first error. Returns the report of each stage
+    /// reached, the failing one included, beside that error.
+    ///
+    /// For a caller about to discard a whole phase. Holding the lock across five stages
+    /// is still only file operations, and it is one [`GATE_LOCK_WAIT`] at most where five
+    /// [`close`](Self::close) calls could be five.
+    pub fn close_phase(
+        project_root: &Path,
+        phase: PhaseId,
+    ) -> (Vec<(Stage, CloseReport)>, Result<(), GateError>) {
+        Self::close_phase_with_partial_result(project_root, phase)
+    }
+
+    /// [`close_phase`](Self::close_phase) for recovery's write-lock decision, whose one
+    /// gate wait is what keeps the decision under
+    /// [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`] (R2-03).
+    pub(crate) fn close_phase_with_partial_result(
+        project_root: &Path,
+        phase: PhaseId,
+    ) -> (Vec<(Stage, CloseReport)>, Result<(), GateError>) {
+        let mut reports = Vec::new();
+        for stage in STAGES {
+            let (report, result) = Self::close_with_partial_result(project_root, phase, stage);
+            reports.push((stage, report));
+            if let Err(error) = result {
+                return (reports, Err(error));
+            }
+        }
+        (reports, Ok(()))
+    }
+
+    /// Take the gate lock and close one stage. Nothing to close without a gates
+    /// directory, so that takes no lock.
     fn close_with_partial_result_with(
         project_root: &Path,
         phase: PhaseId,
         stage: Stage,
         hook: &mut dyn FnMut(DisposalStep),
     ) -> (CloseReport, Result<(), GateError>) {
-        let mut report = CloseReport::default();
         if !Self::dir(project_root).is_dir() {
-            return (report, Ok(()));
+            return (CloseReport::default(), Ok(()));
         }
-        let _lock = match gate_lock(project_root, phase) {
+        let lock = match gate_lock(project_root, phase) {
             Ok(lock) => lock,
-            Err(error) => return (report, Err(error)),
+            Err(error) => return (CloseReport::default(), Err(error)),
         };
+        Self::close_stage_locked(project_root, phase, stage, &lock, hook)
+    }
+
+    /// One stage's close, under the caller's gate lock. The gate file goes last (R2-05),
+    /// so a crash inside a close leaves it and every pair not yet removed for the next
+    /// close to report: a pair is reported twice at worst, never zero times.
+    fn close_stage_locked(
+        project_root: &Path,
+        phase: PhaseId,
+        stage: Stage,
+        _lock: &GateLock,
+        hook: &mut dyn FnMut(DisposalStep),
+    ) -> (CloseReport, Result<(), GateError>) {
+        let mut report = CloseReport::default();
         let (quarantined, claimed, disposal) =
             Self::set_aside_stage_answers(project_root, phase, stage, hook);
         report.quarantined = quarantined.into_iter().map(|moved| moved.to).collect();
@@ -870,6 +914,35 @@ impl Gates {
     /// existing hold name, so the probe and the removal cannot race a waiter. A live
     /// one is never removed here: only its owner does that, through
     /// [`WaiterRegistration::finish`] (R-06).
+    /// Every waiter registration file of `phase`, live or not. No directory lists as
+    /// no files.
+    ///
+    /// # Errors
+    /// The gates directory exists and could not be read.
+    #[allow(dead_code)]
+    pub(crate) fn waiter_files(
+        project_root: &Path,
+        phase: PhaseId,
+    ) -> std::io::Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(Self::dir(project_root)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let prefix = format!("{}-", phase.padded());
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(WAITER_SUFFIX) {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
     fn remove_abandoned_waiters(
         project_root: &Path,
         phase: PhaseId,
@@ -1664,6 +1737,19 @@ struct GateLock {
     _file: std::fs::File,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many gate locks this thread has taken.
+    static GATE_LOCK_ACQUISITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many gate locks this thread has taken, so a test can count the waits one
+/// operation can spend.
+#[cfg(test)]
+pub(crate) fn gate_lock_acquisitions() -> usize {
+    GATE_LOCK_ACQUISITIONS.with(std::cell::Cell::get)
+}
+
 /// Take the phase's gate lock, `.devflow/.gates-NN.lock`, waiting at most
 /// [`GATE_LOCK_WAIT`].
 ///
@@ -1685,7 +1771,11 @@ fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError>
     let started = std::time::Instant::now();
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(GateLock { _file: file }),
+            Ok(()) => {
+                #[cfg(test)]
+                GATE_LOCK_ACQUISITIONS.with(|count| count.set(count.get() + 1));
+                return Ok(GateLock { _file: file });
+            }
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             Err(std::fs::TryLockError::WouldBlock) => {}
         }
@@ -1701,7 +1791,15 @@ fn gate_lock(project_root: &Path, phase: PhaseId) -> Result<GateLock, GateError>
 }
 
 /// The suffix of a waiter registration's file name.
-const WAITER_SUFFIX: &str = ".waiter";
+pub(crate) const WAITER_SUFFIX: &str = ".waiter";
+/// Every stage whose gate files a phase can leave behind.
+pub(crate) const STAGES: [Stage; 5] = [
+    Stage::Define,
+    Stage::Plan,
+    Stage::Code,
+    Stage::Validate,
+    Stage::Ship,
+];
 /// An answer body that is not JSON, or lacks what an answer needs.
 const REASON_UNPARSABLE: &str = "unparsable";
 /// An answer body with no gate id.
@@ -2940,6 +3038,99 @@ mod tests {
         let moved = Gates::set_aside_unbound(dir.path(), phase, stage, &gate).unwrap();
         assert!(moved.is_some(), "the control: a free lock moves the body");
         assert!(!slot.exists());
+    }
+
+    /// A gate file and one unconsumed answer at each stage of `phase`; the paths of
+    /// both, for byte comparison.
+    fn every_stage_answered(root: &Path, phase: PhaseId) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for stage in STAGES {
+            let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap();
+            let answer = Gates::answer(root, phase, stage, &gate.gate_id, &approved()).unwrap();
+            files.extend([gate.path, answer]);
+        }
+        files
+    }
+
+    /// R2-03: a phase's close spends one gate wait, not one per stage, because it runs
+    /// inside recovery's hold of the state write lock.
+    #[test]
+    fn closing_every_stage_of_a_phase_takes_the_gate_lock_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2101);
+        every_stage_answered(root, phase);
+
+        let before = gate_lock_acquisitions();
+        let (reports, result) = Gates::close_phase_with_partial_result(root, phase);
+        let taken = gate_lock_acquisitions() - before;
+
+        result.unwrap();
+        assert_eq!(taken, 1, "one gate lock for the whole phase");
+        assert_eq!(
+            reports.iter().map(|(stage, _)| *stage).collect::<Vec<_>>(),
+            STAGES
+        );
+        for (stage, report) in &reports {
+            assert!(report.removed, "{stage}: its gate file is removed");
+            assert_eq!(
+                report.quarantined.len(),
+                1,
+                "{stage}: its answer goes aside"
+            );
+            assert!(!Gates::gate_path(root, phase, *stage).exists(), "{stage}");
+        }
+
+        // Control: the counter counts, one per stage for the per-stage shape.
+        let per_stage = PhaseId::new(2102);
+        every_stage_answered(root, per_stage);
+        let before = gate_lock_acquisitions();
+        for stage in STAGES {
+            let (_, result) = Gates::close_with_partial_result(root, per_stage, stage);
+            result.unwrap();
+        }
+        assert_eq!(gate_lock_acquisitions() - before, STAGES.len());
+
+        // A held gate lock costs one wait, not one per stage, and changes nothing.
+        let held = PhaseId::new(2103);
+        let files = every_stage_answered(root, held);
+        let bytes: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+        let _holder = hold_gate_lock(root, held);
+        let started = std::time::Instant::now();
+        let (reports, result) = Gates::close_phase_with_partial_result(root, held);
+        let took = started.elapsed();
+        assert!(
+            matches!(result, Err(GateError::GateLockTimeout { .. })),
+            "{result:?}"
+        );
+        assert!(took >= GATE_LOCK_WAIT, "gave up after {took:?}");
+        assert!(
+            took < GATE_LOCK_WAIT + Duration::from_secs(2),
+            "one wait, not one per stage: {took:?}"
+        );
+        assert!(
+            reports
+                .iter()
+                .all(|(_, report)| *report == CloseReport::default()),
+            "{reports:?}"
+        );
+        let after: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+        assert_eq!(after, bytes);
+    }
+
+    /// R2-03: nothing to close, so a project with no gates directory takes no lock and
+    /// creates no lock file.
+    #[test]
+    fn closing_a_phase_without_a_gates_directory_takes_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = gate_lock_acquisitions();
+
+        let (reports, result) = Gates::close_phase(dir.path(), PhaseId::new(2104));
+
+        result.unwrap();
+        assert!(reports.is_empty());
+        assert_eq!(gate_lock_acquisitions(), before);
+        assert!(!dir.path().join(".devflow").exists());
     }
 
     /// R2-04: after the publish, "nothing was changed" would be false.
