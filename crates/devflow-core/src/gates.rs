@@ -175,10 +175,12 @@ pub enum GateError {
     },
 }
 
-/// How long a gate operation waits for the phase's gate lock before giving up.
-/// It sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a fenced side
-/// effect stuck behind a stopped gate-lock holder releases the state write lock
-/// before a repair verb's bounded wait gives up.
+/// How long one acquisition waits for the phase's gate lock before giving up. It
+/// sits below [`crate::workflow::WRITE_LOCK_REPAIR_WAIT`], so a fenced side effect
+/// with one wait, stuck behind a stopped gate-lock holder, releases the state write
+/// lock before a repair verb's bounded wait gives up. [`Gates::answer`] acquires
+/// twice, around its publish: a holder that stalls both reaches the repair wait,
+/// and the repair verb then names the write lock's holder and writes nothing.
 pub const GATE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// A gate's identity: 16 lowercase hex digits, fresh for every gate opened and
@@ -3291,13 +3293,42 @@ mod tests {
         drop(holder);
     }
 
-    /// D-08 operator ruling (2026-10-26): the bound stays below the repair verbs'.
+    /// D-08 operator ruling (2026-10-26): one wait stays below the repair verbs' bound.
+    /// A fenced answer can make two: see the next test.
     #[test]
     fn the_gate_lock_wait_stays_below_the_write_lock_repair_wait() {
         let repair = crate::workflow::WRITE_LOCK_REPAIR_WAIT;
         assert!(
             GATE_LOCK_WAIT < repair,
             "GATE_LOCK_WAIT {GATE_LOCK_WAIT:?} must stay below WRITE_LOCK_REPAIR_WAIT {repair:?}"
+        );
+    }
+
+    /// A fenced answer holds the write lock across both of its gate-lock acquisitions,
+    /// so a holder stalling both uses up the repair verbs' whole bound. The docs on
+    /// `GATE_LOCK_WAIT` and `workflow::while_owner` say so. Counted on the real path, and
+    /// a third acquisition or a constant change that makes the sum fit fails here.
+    #[test]
+    fn a_fenced_answers_two_gate_waits_reach_the_write_lock_repair_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, stage) = (PhaseId::new(2102), Stage::Ship);
+        let gate = Gates::open_gate(root, phase, stage, "ctx").unwrap().gate_id;
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("test".into()),
+        };
+
+        let before = gate_lock_acquisitions();
+        Gates::answer(root, phase, stage, &gate, &response).unwrap();
+        let taken = u32::try_from(gate_lock_acquisitions() - before).unwrap();
+
+        assert_eq!(taken, 2, "one before the publish and one after it");
+        let repair = crate::workflow::WRITE_LOCK_REPAIR_WAIT;
+        assert!(
+            GATE_LOCK_WAIT * taken >= repair,
+            "{taken} x {GATE_LOCK_WAIT:?} fits {repair:?}: the docs saying it does not are stale"
         );
     }
 
