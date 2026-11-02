@@ -2968,9 +2968,13 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
             format!("an answer for the {stage} gate (gate {gate_id}: {decision}{note})")
         }
     };
+    let ship_caution = if stage == Stage::Ship {
+        "; a merge, version bump or tag may already have run, so check them before answering again"
+    } else {
+        ""
+    };
     format!(
-        "resume: {subject} was claimed but never applied — its consumer ended before recording \
-         it; the rerun asks again"
+        "resume: {subject} was claimed, with no record that it was applied{ship_caution}; the rerun asks again"
     )
 }
 
@@ -2979,8 +2983,10 @@ fn unapplied_answer_line(stage: Stage, claimed: &ClaimedAnswer) -> String {
 /// quarantined file's own label.
 ///
 /// `at_current_stage` is whether the run's state names this stage. A claimed pair there is
-/// an answer whose consumer ended before acting on it, whatever `gate_pending` reads: the
-/// consumer writes `gate_pending = false` before its caller acts (R2-05). A claimed pair at
+/// usually an answer whose consumer ended before acting on it, whatever `gate_pending` reads:
+/// the consumer writes `gate_pending = false` before its caller acts (R2-05). It can also
+/// have been acted on with the gate left open (an `--until` stop, a kill during Ship
+/// finalization, a close that failed), so the line says only what is known. A claimed pair at
 /// any other stage is the leftover of an answer the run acted on and moved past, so it gets
 /// no line here; `Gates::close` has logged its removal either way.
 fn resume_gate_lines(
@@ -4758,10 +4764,20 @@ mod tests {
         assert_eq!(
             resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, true),
             vec![
-                "resume: an answer for the code gate (gate G1: approved) was claimed but never \
-                 applied — its consumer ended before recording it; the rerun asks again"
+                "resume: an answer for the code gate (gate G1: approved) was claimed, with no \
+                 record that it was applied; the rerun asks again"
                     .to_string()
             ]
+        );
+        assert_eq!(
+            resume_gate_lines(phase, Stage::Ship, Some("G1"), &approved, true),
+            vec![
+                "resume: an answer for the ship gate (gate G1: approved) was claimed, with no \
+                 record that it was applied; a merge, version bump or tag may already have run, \
+                 so check them before answering again; the rerun asks again"
+                    .to_string()
+            ],
+            "a kill during Ship finalization leaves a claim after its merge may have run"
         );
         assert_eq!(
             resume_gate_lines(phase, Stage::Code, Some("G1"), &approved, false),
@@ -4775,9 +4791,7 @@ mod tests {
         assert_eq!(
             resume_gate_lines(phase, Stage::Code, None, &rejected, true),
             vec![
-                "resume: an answer for the code gate (gate G1: rejected, note \"fix it\") was \
-                 claimed but never applied — its consumer ended before recording it; the rerun \
-                 asks again"
+                "resume: an answer for the code gate (gate G1: rejected, note \"fix it\") was claimed, with no record that it was applied; the rerun asks again"
                     .to_string()
             ],
             "the claimed entry names itself, whatever the gate file said"
@@ -4785,8 +4799,7 @@ mod tests {
         assert_eq!(
             resume_gate_lines(phase, Stage::Code, None, &claimed(None), true),
             vec![
-                "resume: an answer of unknown content for the code gate (gate G1) was claimed but \
-                 never applied — its consumer ended before recording it; the rerun asks again"
+                "resume: an answer of unknown content for the code gate (gate G1) was claimed, with no record that it was applied; the rerun asks again"
                     .to_string()
             ]
         );
