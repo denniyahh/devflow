@@ -2090,6 +2090,10 @@ fn waiter_holder_status(
 
 /// Operator recovery for a gate with no confirmed consumer. Ship is special:
 /// its answer remains the input to the explicit `devflow ship` workflow.
+fn stop_no_waiter_repair(_project_root: &Path, phase: PhaseId, stage: Stage) -> String {
+    no_waiter_repair(phase, stage)
+}
+
 fn no_waiter_repair(phase: PhaseId, stage: Stage) -> String {
     match stage {
         Stage::Ship => {
@@ -3242,7 +3246,7 @@ fn stop_reap_observed_gate(
             println!(
                 "stop: phase {phase} {} has a gate file with no valid gate id; no response was written. {}",
                 gate.stage,
-                no_waiter_repair(phase, gate.stage)
+                stop_no_waiter_repair(project_root, phase, gate.stage)
             );
             return Ok((false, None));
         }
@@ -3262,7 +3266,7 @@ fn stop_reap_observed_gate(
         println!(
             "stop: phase {phase} {} has a stale gate request; no response was written. {}",
             gate.stage,
-            no_waiter_repair(phase, gate.stage)
+            stop_no_waiter_repair(project_root, phase, gate.stage)
         );
         return Ok((false, None));
     }
@@ -3275,7 +3279,7 @@ fn stop_reap_observed_gate(
         println!(
             "stop: phase {phase} {} has no confirmed live waiter; no response was written. {}",
             gate.stage,
-            no_waiter_repair(phase, gate.stage)
+            stop_no_waiter_repair(project_root, phase, gate.stage)
         );
         return Ok((
             false,
@@ -3375,7 +3379,7 @@ fn stop_with_existing_response(
         GateAction::Abort(_) => {
             println!(
                 "stop: phase {phase} {stage} already has an abort response, but no confirmed live holder will act; stop did not write it. {}",
-                no_waiter_repair(phase, stage)
+                stop_no_waiter_repair(project_root, phase, stage)
             );
             Ok((false, None))
         }
@@ -13815,5 +13819,171 @@ mod tests {
             assert!(rendered.contains(PENDING_LAUNCH), "{case}: {rendered}");
             assert!(rendered.contains("abandoned"), "{case}: {rendered}");
         }
+    }
+
+    /// V-09: `stop` over an abandoned reservation clears it, removes its liveness file
+    /// and says what it cleared, whether the file is unheld or already gone.
+    #[test]
+    fn stop_clears_an_abandoned_reservation_and_says_so() {
+        const NAME: &str = "commands::tests::stop_clears_an_abandoned_reservation_and_says_so";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::agent_free_git_only_path_dir();
+            for case in ["unheld", "missing"] {
+                let output = crate::test_support::run_hermetic_test_in_child(
+                    NAME,
+                    path_dir.path(),
+                    &[
+                        (RESERVE_CASE_ENV, std::ffi::OsStr::new(case)),
+                        // libtest would otherwise swallow the line this test is about.
+                        ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
+                    ],
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{case}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let line = format!(
+                    "stop: cleared the abandoned launch reservation {PENDING_LAUNCH} (no process \
+                     held it)"
+                );
+                assert!(stdout.contains(&line), "{case}: {stdout}");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5182);
+        let state = state_with_pending(root, phase, false);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        if std::env::var(RESERVE_CASE_ENV).unwrap() == "unheld" {
+            drop(hold_pending(&state));
+            assert!(
+                liveness_path.exists(),
+                "precondition: the unheld file is there"
+            );
+        }
+
+        let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
+        stop_in(root, phase, cache.as_deref()).unwrap();
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.pending_supervisor, None, "the reservation is cleared");
+        assert!(after.stopped, "the phase is marked stopped as today");
+        assert!(!liveness_path.exists(), "its liveness file is removed");
+    }
+
+    /// `stop` never claims a stop it did not perform: a pending lock held with no socket
+    /// ever appearing ends it non-zero after the bounded wait, naming the launch, with
+    /// nothing written and the lock's file left alone.
+    #[test]
+    fn stop_waits_for_an_unpublished_pending_supervisor_then_reports_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5183);
+        let state = state_with_pending(root, phase, false);
+        let _hold = hold_pending(&state);
+        let liveness_path = state
+            .pending_supervisor
+            .as_ref()
+            .unwrap()
+            .liveness_path
+            .clone();
+        let before = std::fs::read(workflow::state_path(root, phase)).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = stop_in(root, phase, Some(cache.path()))
+            .expect_err("stop must not claim a stop it did not perform")
+            .to_string();
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(15),
+            "the wait is bounded by core's publish wait plus a margin: {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains(PENDING_LAUNCH), "{error}");
+        assert!(
+            error.contains("nothing was signalled or recorded"),
+            "{error}"
+        );
+        assert!(!error.contains("devflow resume"), "{error}");
+        assert_eq!(
+            std::fs::read(workflow::state_path(root, phase)).unwrap(),
+            before,
+            "nothing is written"
+        );
+        assert!(liveness_path.exists(), "a held lock's file stays");
+    }
+
+    /// R-03: clearing an abandoned reservation gives up on a held write lock within the
+    /// bound, naming the holder and clearing nothing.
+    #[test]
+    fn stop_gives_up_clearing_a_reservation_under_a_held_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5184);
+        let state = state_with_pending(&root, phase, false);
+        drop(hold_pending(&state));
+        let before = std::fs::read(workflow::state_path(&root, phase)).unwrap();
+        let (holding, wait_holding) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                workflow::update_state(&root, phase, |_| {
+                    holding.send(()).unwrap();
+                    // Bounded, so a `stop` that blocks on the lock fails below, not hangs.
+                    let _ = wait_release.recv_timeout(std::time::Duration::from_secs(20));
+                    Ok::<(), workflow::WorkflowError>(())
+                })
+                .unwrap();
+            })
+        };
+        wait_holding.recv().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let started = std::time::Instant::now();
+        let result = stop_in(&root, phase, Some(cache.path()));
+        let elapsed = started.elapsed();
+        drop(release);
+        holder.join().unwrap();
+
+        let error = result
+            .expect_err("a held write lock must end stop")
+            .to_string();
+        assert!(error.contains(&std::process::id().to_string()), "{error}");
+        assert!(
+            elapsed < workflow::WRITE_LOCK_REPAIR_WAIT + std::time::Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert_eq!(
+            std::fs::read(workflow::state_path(&root, phase)).unwrap(),
+            before,
+            "nothing is cleared"
+        );
+    }
+
+    /// Criterion 2 at a gate nothing waits on: `stop`'s own line names no `resume` while
+    /// a pending supervisor lives, and names it again once that supervisor is gone.
+    #[test]
+    fn stop_names_no_resume_at_a_waiterless_gate_while_a_supervisor_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5185);
+        let state = state_with_pending(root, phase, false);
+        let hold = hold_pending(&state);
+        let live = stop_no_waiter_repair(root, phase, Stage::Code);
+        assert!(!live.contains("devflow resume"), "{live}");
+        drop(hold);
+        let gone = stop_no_waiter_repair(root, phase, Stage::Code);
+        assert_eq!(gone, no_waiter_repair(phase, Stage::Code), "control");
+        assert!(gone.contains("devflow resume"), "control: {gone}");
     }
 }
