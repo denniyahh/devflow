@@ -1,5 +1,16 @@
 ## Deferred Items
 
+- A `devflow stop` that signals a `devflow parallel` would also stop the phases it launches later (found during 50.1-29)
+  status: open
+  **What:** `install_holder_stop_handler`'s flag is process-wide and never cleared, and `parallel` runs `start` for each phase in one process, so after one signal every later `start` in that process stops at safe point 2.
+  **Measured:** nothing. This is from reading `parallel.rs` and `stop_requested_at_safe_point`, not from a run.
+  **Why deferred:** D-18 specifies one flag per process, and changing it is outside 50.1-29. The result is over-stopping, recorded in each phase's state, and `devflow resume` continues them.
+
+- `stop`'s not-marked message can name the wrong pid if the holder changes during its wait (found during 50.1-29)
+  status: open
+  **What:** `holder_still_running` reads the pid from the record after the wait. If the signalled holder exits and another foreground process claims within `TERMINATE_VERIFY_WAIT`, the message calls the new pid signalled.
+  **Why deferred:** the message is the only effect, nothing is signalled or written, and it needs two foreground commands racing inside 3 s. `signal_sent` is a bool by plan.
+
 - `liveness::tests::a_probe_in_flight_neither_reads_live_nor_fails_a_take` can fail under `cargo test` (found during 50.1-12)
   status: open
   **What:** one `scripts/check.sh all` at `d6003e2` failed it at `liveness.rs:805`: `take the exclusive lock: "WouldBlock"`, right after the test dropped its own shared-lock handles.
