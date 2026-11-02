@@ -3022,6 +3022,134 @@ mod tests {
         )
     }
 
+    /// A state naming `recorded` as supervisor and `pending` as pending.
+    fn promotion_state(root: &Path, phase: PhaseId, recorded: Option<&str>, pending: Option<&str>) {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.supervisor = recorded.map(|id| {
+            crate::state::SupervisorRecord::new(
+                root.join("r.sock"),
+                id.to_string(),
+                4_294_967_000,
+                1,
+                String::new(),
+            )
+        });
+        state.pending_supervisor = pending.map(|id| {
+            crate::state::PendingSupervisor::new(
+                id.to_string(),
+                root.join("p.sock"),
+                root.join("p.live"),
+            )
+        });
+        crate::workflow::save_state(&state).unwrap();
+    }
+
+    /// The verdicts the state gives at once: its own record, another launch's record or
+    /// reservation (a reservation that is not this launch's is no reason to wait), and a
+    /// state that is gone. None waits out the long wait this passes.
+    #[test]
+    fn the_promotion_watch_decides_at_once_unless_only_pending() {
+        const OURS: &str = "aaaa0000aaaa1912";
+        const LONG: Duration = Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(1912));
+        let quit = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+
+        let verdict = || await_promotion(root, phase, OURS, LONG, &quit);
+        assert_eq!(
+            verdict(),
+            Some(Promotion::Superseded { recorded: None }),
+            "a state that is gone names no launch"
+        );
+        promotion_state(root, phase, Some(OURS), None);
+        assert_eq!(verdict(), Some(Promotion::Recorded));
+        promotion_state(root, phase, Some("x"), None);
+        assert_eq!(
+            verdict(),
+            Some(Promotion::Superseded {
+                recorded: Some("x".to_string())
+            })
+        );
+        promotion_state(root, phase, None, Some("y"));
+        assert_eq!(
+            verdict(),
+            Some(Promotion::Superseded { recorded: None }),
+            "another launch's reservation"
+        );
+        assert!(started.elapsed() < LONG / 2, "none of them waited");
+    }
+
+    /// Only pending is a wait (D-15, Pitfall 5): the promotion ends it with `Recorded`,
+    /// an expired deadline with `OrphanedPending` and no earlier, and a quit with no
+    /// verdict.
+    #[test]
+    fn the_promotion_watch_waits_while_only_pending() {
+        const OURS: &str = "aaaa0000aaaa1913";
+        const SHORT: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(1913));
+        promotion_state(root, phase, Some("n"), Some(OURS));
+
+        let quit = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            await_promotion(root, phase, OURS, SHORT, &quit),
+            Some(Promotion::OrphanedPending)
+        );
+        assert!(started.elapsed() >= SHORT, "it waited out its deadline");
+
+        let running = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watch = scope
+                .spawn(|| await_promotion(root, phase, OURS, Duration::from_secs(60), &running));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!watch.is_finished(), "only pending is a wait");
+            promotion_state(root, phase, Some(OURS), None);
+            assert_eq!(watch.join().unwrap(), Some(Promotion::Recorded));
+        });
+
+        promotion_state(root, phase, Some("n"), Some(OURS));
+        let quit = AtomicBool::new(true);
+        assert_eq!(
+            await_promotion(root, phase, OURS, Duration::from_secs(60), &quit),
+            None,
+            "told to quit, it has no verdict"
+        );
+    }
+
+    /// A state that does not load is retried, because a repair may be under way, and
+    /// still failing at the deadline ends as `Superseded`: no readable state names this
+    /// launch. A state that loads again in time gets its real verdict.
+    #[test]
+    fn the_promotion_watch_retries_an_unreadable_state_until_its_deadline() {
+        const OURS: &str = "aaaa0000aaaa1914";
+        const SHORT: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let (root, phase) = (dir.path(), PhaseId::new(1914));
+        promotion_state(root, phase, Some(OURS), None);
+        let path = crate::workflow::state_path(root, phase);
+        let good = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let quit = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            await_promotion(root, phase, OURS, SHORT, &quit),
+            Some(Promotion::Superseded { recorded: None })
+        );
+        assert!(started.elapsed() >= SHORT, "it retried until the deadline");
+
+        let running = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watch = scope
+                .spawn(|| await_promotion(root, phase, OURS, Duration::from_secs(60), &running));
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(&path, &good).unwrap();
+            assert_eq!(watch.join().unwrap(), Some(Promotion::Recorded));
+        });
+    }
+
     /// T-50-26: the test-only monitor entry cannot exist in a release build,
     /// because its variant is compiled only under `test-support`.
     #[test]

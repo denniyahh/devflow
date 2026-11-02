@@ -264,6 +264,19 @@ impl Fixture {
             &launch_id,
         )
         .expect("the hermetic socket path fits sun_path");
+        // The state must record this launch, as a launcher's publish does: this monitor
+        // has no launcher to promote it (D-15).
+        devflow_core::workflow::update_state(&self.root, self.phase, |state| {
+            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                socket.as_path().to_path_buf(),
+                launch_id.clone(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<(), devflow_core::workflow::WorkflowError>(())
+        })
+        .unwrap();
         let child = common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
@@ -448,6 +461,15 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
             Duration::from_millis(20),
         );
     }
+
+    // The killed monitor's record is only this fixture's way to let it serve (D-15). It
+    // would make `resume` refuse over the STALE socket, which is not what this test is
+    // about, so it goes before the resume.
+    devflow_core::workflow::update_state(&fixture.root, fixture.phase, |state| {
+        state.supervisor = None;
+        Ok::<(), devflow_core::workflow::WorkflowError>(())
+    })
+    .unwrap();
 
     let output = fixture.run_resume(path_dir.path());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
