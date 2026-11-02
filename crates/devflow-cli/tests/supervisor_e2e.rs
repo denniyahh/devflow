@@ -995,7 +995,6 @@ impl HeldStdoutRun {
         state.stage = devflow_core::stage::Stage::Code;
         state.stop_until = Some(devflow_core::stage::Stage::Code);
         state.stopped = false;
-        devflow_core::workflow::save_state(&state).unwrap();
 
         let aux_path = aux.path().to_path_buf();
         let record = aux_path.join("holder");
@@ -1025,6 +1024,16 @@ impl HeldStdoutRun {
         let socket =
             supervisor::SocketPath::for_launch(&home.cache_dir(), &root, phase, &launch_id)
                 .expect("the hermetic socket path fits sun_path");
+        // The state must record this launch, as a launcher's publish does: the monitor
+        // started directly has no launcher to promote it (D-15).
+        state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+            socket.as_path().to_path_buf(),
+            launch_id.clone(),
+            4_294_967_000,
+            1,
+            String::new(),
+        ));
+        devflow_core::workflow::save_state(&state).unwrap();
         let mut command = common::hermetic_devflow(&home);
         command
             .arg("__monitor")

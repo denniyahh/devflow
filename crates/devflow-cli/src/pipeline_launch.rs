@@ -3443,7 +3443,6 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use devflow_core::gates::Gates;
-    use devflow_core::lock;
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
     use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
@@ -9166,13 +9165,6 @@ mod tests {
                 }),
                 "N's socket is gone after the stop"
             );
-            assert!(
-                poll_until(Duration::from_secs(5), || matches!(
-                    lock::holder_status(&run.root, run.phase),
-                    lock::HolderStatus::NoHolder
-                )),
-                "the per-phase lock is released"
-            );
             let state = run.state();
             assert!(state.stopped, "state.stopped after a stop at safe point 2");
             assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
@@ -9241,13 +9233,12 @@ mod tests {
         held_advance_before_spawn(PhaseId::new(1304), false);
     }
 
-    /// R-2, safe point 3 (T-50-54): a stop taken while N holds the lock
-    /// between N+1's ping and its publish shuts N+1 down through its socket
-    /// and does not publish it. The state keeps N's record and is stopped with
-    /// N's safe-point reason; no agent of N+1 survives; and N answers
-    /// `stopped` in under `TERMINATE_VERIFY_WAIT + 3 s`, below both bounded
-    /// waits a lock deadlock would sit out (N's final timeout and N+1's lock
-    /// wait), so a stopped N+1 that waited on N's lock fails the timing.
+    /// R-2, safe point 3 (T-50-54): a stop taken between N+1's ping and its
+    /// publish shuts N+1 down through its socket and does not publish it. The
+    /// state keeps N's record and is stopped with N's safe-point reason; no
+    /// agent of N+1 survives; and N answers `stopped` in under
+    /// `TERMINATE_VERIFY_WAIT + 3 s`, below N's final timeout, so a stopped N+1
+    /// that sat out its promotion wait instead of ending fails the timing.
     #[test]
     fn a_stop_between_the_next_spawn_and_its_publish_shuts_the_next_supervisor_down() {
         const NAME: &str = "pipeline_launch::tests::a_stop_between_the_next_spawn_and_its_publish_shuts_the_next_supervisor_down";
@@ -9282,7 +9273,7 @@ mod tests {
         let bound = devflow_core::agent::TERMINATE_VERIFY_WAIT + Duration::from_secs(3);
         assert!(
             took < bound,
-            "N's stop took {took:?}, not under {bound:?}: a lock deadlock between N and N+1"
+            "N's stop took {took:?}, not under {bound:?}: N+1 did not end when asked"
         );
         assert!(
             poll_until(HANDOFF_STEP_WAIT, || {
@@ -9448,6 +9439,12 @@ mod tests {
         assert_eq!(unsafe { libc::kill(signed, signal) }, 0, "signal {pid}");
     }
 
+    /// Whether `gate`'s waiter registration no longer reads live.
+    fn registration_ended(root: &Path, phase: PhaseId, stage: Stage, gate: &GateId) -> bool {
+        Gates::waiter_status(root, phase, stage, gate)
+            .is_ok_and(|status| status != devflow_core::gates::WaiterStatus::Live)
+    }
+
     /// Launch a gate fixture and return once N is parked at its Define gate:
     /// the gate file exists and N holds its registration (its owner phase is the
     /// control's assertion, not a precondition here).
@@ -9476,8 +9473,8 @@ mod tests {
     }
 
     /// V-15 (R-2, T-50-33): SIGTERM to a supervisor parked at a gate aborts
-    /// the wait (safe point 4): within 5 s the lock has no holder, the state
-    /// is stopped with the safe-point reason, the socket is gone and no next
+    /// the wait (safe point 4): within 5 s the gate's registration no longer reads
+    /// live, the state is stopped with the safe-point reason, the socket is gone and no next
     /// stage was launched.
     #[test]
     fn a_signal_during_a_gate_wait_aborts_and_releases_the_lock() {
@@ -9489,17 +9486,16 @@ mod tests {
         }
         let _guard = env_lock();
         let run = launch_parked_at_gate(PhaseId::new(1310));
+        let gate = gate_id_at(&run.root, run.phase, Stage::Define);
         signal_supervisor(&run, libc::SIGTERM);
         let ended = poll_until(Duration::from_secs(5), || {
-            matches!(
-                lock::holder_status(&run.root, run.phase),
-                lock::HolderStatus::NoHolder
-            ) && devflow_core::supervisor::probe(&run.n.socket_path)
-                .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            registration_ended(&run.root, run.phase, Stage::Define, &gate)
+                && devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
         });
         assert!(
             ended,
-            "within 5 s of SIGTERM the lock is released and the socket gone: {}",
+            "within 5 s of SIGTERM the registration ends and the socket is gone: {}",
             run.events()
         );
         let state = run.state();
@@ -9516,9 +9512,9 @@ mod tests {
         assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
     }
 
-    /// The V-15 control: with no signal the gate wait holds (lock held, N in
+    /// The V-15 control: with no signal the gate wait holds (registration live, N in
     /// `gate_wait`) after 3 s, and answering the gate lets it proceed: an
-    /// abort answer releases the lock and ends the supervisor.
+    /// abort answer ends the registration and the supervisor.
     #[test]
     fn without_a_signal_the_gate_wait_holds_until_answered() {
         const NAME: &str =
@@ -9529,13 +9525,11 @@ mod tests {
         }
         let _guard = env_lock();
         let run = launch_parked_at_gate(PhaseId::new(1311));
+        let gate = gate_id_at(&run.root, run.phase, Stage::Define);
         std::thread::sleep(Duration::from_secs(3));
         assert!(
-            matches!(
-                lock::holder_status(&run.root, run.phase),
-                lock::HolderStatus::Live { .. }
-            ),
-            "control: still parked with the lock held after 3 s"
+            !registration_ended(&run.root, run.phase, Stage::Define, &gate),
+            "control: still parked with its registration live after 3 s"
         );
         assert!(
             matches!(
@@ -9557,11 +9551,9 @@ mod tests {
         )
         .unwrap();
         let ended = poll_until(HANDOFF_STEP_WAIT, || {
-            matches!(
-                lock::holder_status(&run.root, run.phase),
-                lock::HolderStatus::NoHolder
-            ) && devflow_core::supervisor::probe(&run.n.socket_path)
-                .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            registration_ended(&run.root, run.phase, Stage::Define, &gate)
+                && devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
         });
         assert!(
             ended,
@@ -10730,6 +10722,10 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let ctx = launch_context().expect("the parent passes DEVFLOW_CACHE_DIR");
             let reservation = monitor::Reservation::new(&ctx, &state).expect("reserve the launch");
+            // A launcher names its launch before it spawns it (D-01). A supervisor the
+            // state names nowhere reads as superseded and ends at once (D-03).
+            state.pending_supervisor = Some(reservation.pending_record());
+            workflow::save_state(&state).unwrap();
             let published = monitor::spawn_monitor(
                 &state,
                 "claude",
@@ -11436,15 +11432,10 @@ mod tests {
             "N+1 exits"
         );
         assert!(
-            poll_until(Duration::from_secs(5), || {
-                !liveness_files(&run.root)
-                    .iter()
-                    .any(|name| name.contains(&pending.launch_id))
-                    || !matches!(
-                        devflow_core::liveness::probe(&pending.liveness_path),
-                        Ok(devflow_core::liveness::Held::Live)
-                    )
-            }),
+            poll_until(Duration::from_secs(5), || !matches!(
+                devflow_core::liveness::probe(&pending.liveness_path),
+                Ok(devflow_core::liveness::Held::Live)
+            )),
             "N+1's lock is released"
         );
         assert_not_live(&pending);

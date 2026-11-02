@@ -73,12 +73,23 @@ fn spawn_gated_advance(home: &common::HermeticHome, root: &Path, phase: PhaseId)
         .spawn()
         .expect("spawn foreground advance");
     wait_for(
-        || devflow_core::lock::holder(root, phase).is_some(),
-        "advance lock",
-    );
-    wait_for(
         || Gates::gate_path(root, phase, Stage::Code).exists(),
         "Code gate",
+    );
+    let gate = GateId::parse(
+        &Gates::list_open(root)
+            .into_iter()
+            .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+            .expect("the advance's Code gate is listed")
+            .gate_id,
+    )
+    .expect("the advance's gate has a gate id");
+    wait_for(
+        || {
+            Gates::waiter_status(root, phase, Stage::Code, &gate)
+                .is_ok_and(|status| status == WaiterStatus::Live)
+        },
+        "the advance's registration at its Code gate",
     );
     child
 }
