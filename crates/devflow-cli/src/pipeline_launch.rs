@@ -10479,6 +10479,119 @@ mod tests {
         assert_eq!(stopped[0]["safe_point"], 4, "{}", stopped[0]);
     }
 
+    /// Park N at its Define gate, approve the gate, and wait for N to reach the configured
+    /// hold with its claim published. Returns the run and the gate's id.
+    fn parked_at_a_hold_with_the_gate_claimed(phase: PhaseId) -> (HandoffRun, GateId) {
+        let run = launch_parked_at_gate(phase);
+        let gate = gate_id_at(&run.root, phase, Stage::Define);
+        answer_open_gate(&run.root, phase, Stage::Define, &gate_response(true, None)).unwrap();
+        run.wait_held();
+        assert!(
+            Gates::claim_path(&run.root, phase, Stage::Define, &gate).exists(),
+            "precondition: the claim is published: {}",
+            run.events()
+        );
+        (run, gate)
+    }
+
+    /// SIGKILL N and wait until its socket reads STALE: it died with nothing cleaned up.
+    fn kill_supervisor_until_stale(run: &HandoffRun) {
+        signal_supervisor(run, libc::SIGKILL);
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&run.n.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Stale)
+            }),
+            "N's socket reads STALE after SIGKILL: {}",
+            run.events()
+        );
+    }
+
+    /// What a kill-point fixture requires of `resume`: it reports the approval it found
+    /// claimed at Define, keeps no file for that gate, sets nothing aside for it (the
+    /// answer was claimed, not unused), and reruns the stage.
+    fn assert_resume_reported_the_claimed_approval(run: &HandoffRun, gate: &GateId) {
+        let found = events_named(&run.root, "resume_found_unapplied_answer");
+        assert_eq!(found.len(), 1, "{}", run.events());
+        assert_eq!(found[0]["stage"], "define", "{}", found[0]);
+        assert_eq!(found[0]["gate_id"], gate.as_str(), "{}", found[0]);
+        assert_eq!(found[0]["approved"], true, "{}", found[0]);
+        assert!(!Gates::gate_path(&run.root, run.phase, Stage::Define).exists());
+        assert!(!Gates::answer_path(&run.root, run.phase, Stage::Define, gate).exists());
+        assert!(!Gates::claim_path(&run.root, run.phase, Stage::Define, gate).exists());
+        let quarantined = Gates::quarantined(&run.root);
+        assert!(
+            quarantined
+                .iter()
+                .all(|answer| answer.label != gate.as_str()),
+            "a claimed answer is not an unused one: {quarantined:?}"
+        );
+        assert!(!run.state().gate_pending);
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            2,
+            "the rerun launched: {}",
+            run.events()
+        );
+    }
+
+    /// R-02's crash window: the supervisor claimed the answer and died before it recorded
+    /// anything, so the state still reads `gate_pending`. Without `resume`'s line the
+    /// operator would meet a new gate for a question they answered.
+    #[test]
+    fn resume_reports_an_answer_claimed_but_never_applied() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_reports_an_answer_claimed_but_never_applied";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_claim"), FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let (run, gate) = parked_at_a_hold_with_the_gate_claimed(PhaseId::new(1312));
+        let state = run.state();
+        assert!(state.gate_pending, "precondition: nothing recorded yet");
+        assert_eq!(state.stage, Stage::Define);
+        kill_supervisor_until_stale(&run);
+
+        resume(&run.root, run.phase, None, false).unwrap();
+
+        assert_resume_reported_the_claimed_approval(&run, &gate);
+        let removed = events_named(&run.root, "gate_claimed_answer_removed");
+        assert_eq!(removed.len(), 1, "{}", run.events());
+        assert_eq!(removed[0]["gate_id"], gate.as_str(), "{}", removed[0]);
+    }
+
+    /// R2-05's crash window: the supervisor recorded `gate_pending = false` and died before
+    /// the retry was dispatched. The flag alone would call this answer spent.
+    #[test]
+    fn resume_reports_an_answer_committed_but_never_acted_on() {
+        const NAME: &str =
+            "pipeline_launch::tests::resume_reports_an_answer_committed_but_never_acted_on";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("after_commit"), FAILED_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let (run, gate) = parked_at_a_hold_with_the_gate_claimed(PhaseId::new(1313));
+        let state = run.state();
+        assert!(
+            !state.gate_pending,
+            "precondition: the decision is recorded"
+        );
+        assert_eq!(state.stage, Stage::Define, "precondition: not yet acted on");
+        assert_eq!(
+            stage_launched_count(&run.root, run.phase),
+            1,
+            "precondition: the retry was not dispatched: {}",
+            run.events()
+        );
+        kill_supervisor_until_stale(&run);
+
+        resume(&run.root, run.phase, None, false).unwrap();
+
+        assert_resume_reported_the_claimed_approval(&run, &gate);
+    }
+
     /// The V-15 control: with no signal the gate wait holds (registration live, N in
     /// `gate_wait`) after 3 s, and answering the gate lets it proceed: an
     /// abort answer ends the registration and the supervisor.
