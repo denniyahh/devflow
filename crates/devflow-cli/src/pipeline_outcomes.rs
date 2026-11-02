@@ -1045,7 +1045,9 @@ pub(crate) fn run_checkout_hooks(
 
 /// How far a batch got, kept in memory across the retry passes of one finalization: the
 /// hooks that succeeded, and what `VersionBump` handed forward. A retry that reran them
-/// would cut a second release. A retry in a later process starts over.
+/// would cut a second release. `Merge` always reruns: it detects an up-to-date branch, and
+/// a repair committed for the retry must land. A repair merged after the tag is cut is not
+/// in the tagged commit. A retry in a later process starts over.
 #[derive(Debug, Default)]
 pub(crate) struct BatchProgress {
     completed: usize,
@@ -1120,14 +1122,17 @@ pub(crate) fn run_checkout_hooks_from(
         shipped_version: progress.shipped_version.clone(),
         shipped_changelog_body: progress.shipped_changelog_body.clone(),
     };
-    for hook in &batch[progress.completed..] {
+    for (index, hook) in batch.iter().enumerate() {
+        if index < progress.completed && *hook != hooks::Hook::Merge {
+            continue;
+        }
         let outcome = hook.run(&mut ctx);
         if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
             all_succeeded = false;
         }
         if all_succeeded {
-            progress.completed += 1;
+            progress.completed = progress.completed.max(index + 1);
         }
         progress.shipped_version.clone_from(&ctx.shipped_version);
         progress
