@@ -3621,8 +3621,8 @@ fn stop_via_socket(
     )))
 }
 
-/// How long `stop` lets a GONE socket's supervisor release its liveness lock: it unlinks
-/// its socket before it exits, and a shutdown just sent can land in that gap.
+/// How long `stop` and the launch guards let a GONE socket's supervisor release its liveness
+/// lock: it unlinks its socket before it exits, and a shutdown just sent can land in that gap.
 const STOP_LOCK_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Refuse to count a launch as gone while it still holds its liveness lock. `stop` has no
@@ -4783,11 +4783,19 @@ fn recorded_live_socket(record: &SupervisorRecord) -> Option<LiveSocket> {
 }
 
 /// The live supervisor `record` names when its GONE socket cannot say so: it holds its
-/// launch's liveness file for its whole life. `None` when nothing holds that file. A probe
-/// that fails is live (fail closed, T-50-40).
+/// launch's liveness file for its whole life. It unlinks its socket before it exits, so a
+/// release within [`STOP_LOCK_RELEASE_WAIT`] is one exiting. `None` when nothing holds that
+/// file. A probe that fails is live (fail closed, T-50-40).
 fn held_without_socket(project_root: &Path, record: &SupervisorRecord) -> Option<LiveSocket> {
     let path = liveness::launch_liveness_path(project_root, &record.launch_id)?;
-    let holder = held_liveness_holder(&path)?;
+    let deadline = std::time::Instant::now() + STOP_LOCK_RELEASE_WAIT;
+    let holder = loop {
+        let holder = held_liveness_holder(&path)?;
+        if std::time::Instant::now() >= deadline {
+            break holder;
+        }
+        std::thread::sleep(PENDING_PUBLISH_POLL);
+    };
     Some(LiveSocket {
         socket: record.socket_path.clone(),
         launch_id: record.launch_id.clone(),
@@ -16031,6 +16039,26 @@ mod tests {
         drop(hold);
         wait_until_unheld(&path);
         refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None).unwrap();
+    }
+
+    /// A supervisor unlinks its socket before it exits, so a lock released a moment later
+    /// is one exiting, not a live run: the guard waits it out rather than refuse.
+    #[test]
+    fn a_launch_waits_out_a_supervisor_exiting_with_its_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5305);
+        let (state, hold) = state_with_a_held_lock_and_no_socket(root, phase);
+        let existing = workflow::Existing::Loaded(state);
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(hold);
+        });
+        let guarded =
+            refuse_launch_over_a_live_run(root, phase, LaunchVerb::Resume, &existing, None);
+        releaser.join().unwrap();
+        guarded.expect("a lock released within the wait is not a live supervisor");
     }
 
     /// `stop` does not record `stopped` and exit 0 beside a supervisor whose socket is
