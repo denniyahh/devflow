@@ -3149,6 +3149,7 @@ fn resume_loaded(
     agent: Option<AgentKind>,
     legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
+    crate::commands::refuse_unprepared_run(&state)?;
     // CR-03 (49-REVIEW.md): an exported (or emptied) notify command reaches
     // the chain this resume launches through the state file.
     commit_notify_env(&mut state)?;
@@ -3333,6 +3334,9 @@ pub(crate) fn advance_command(
     // After the claim, so no `start` or `resume` can reserve until this advance returns,
     // and its own launch meets no live pending record.
     crate::commands::refuse_advance_over_a_live_supervisor(project_root, phase)?;
+    if let Ok(state) = workflow::load_state(project_root, phase) {
+        crate::commands::refuse_unprepared_run(&state)?;
+    }
     #[cfg(test)]
     launch_test_hold("holder_claimed");
     advance_for_stage(project_root, Some(phase), stage)
@@ -5127,6 +5131,7 @@ mod tests {
         // phase was NOT stopped by the cap — this is the rate-limit/infra
         // recovery shape, not the "cap already fired" shape.
         state.stop_until = Some(Stage::Plan);
+        state.verification_baseline_captured = true;
         state.stopped = false;
         state.stop_reason = None;
         // Not because this test wants legacy behaviour, but because its
@@ -5200,6 +5205,7 @@ mod tests {
             root.to_path_buf(),
         );
         state.stop_until = None;
+        state.verification_baseline_captured = true;
         state.stopped = false;
         state.stop_reason = None;
         // Not because this test wants legacy behaviour, but because its
@@ -5330,6 +5336,7 @@ mod tests {
         let phase = PhaseId::new(76);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Define;
+        state.verification_baseline_captured = true;
         workflow::save_state(&state).unwrap();
         let state_path = workflow::state_path(root, phase);
         let before = std::fs::read(&state_path).unwrap();
@@ -9191,6 +9198,7 @@ mod tests {
             )
             .unwrap();
             let mut state = State::new(phase, AgentKind::Claude, Mode::Supervise, root.clone());
+            state.verification_baseline_captured = true;
             state.legacy_claude_launch = true;
             state.stop_until = Some(Stage::Plan);
             configure(&root, &mut state);
