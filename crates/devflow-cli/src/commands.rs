@@ -8199,6 +8199,99 @@ mod tests {
         assert!(check_open_gate_without_waiter(&released[0]).is_some());
     }
 
+    /// The `gate_waiter` of every `doctor --json` entry for the states under `root`.
+    /// A missing key panics here, so it can never read as a `null`.
+    fn doctor_json_gate_waiters(root: &Path) -> Vec<serde_json::Value> {
+        let body = render_reconciliation_json(&collect_phase_facts(root));
+        let waiters: Vec<serde_json::Value> = body
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("gate_waiter")
+                    .unwrap_or_else(|| panic!("an entry has no gate_waiter: {entry}"))
+                    .clone()
+            })
+            .collect();
+        assert!(!waiters.is_empty(), "a saved state must produce an entry");
+        waiters
+    }
+
+    /// R2-01: every entry names the open gate and its registration, and with no gate
+    /// open both ids are `null`. `finish` removes the registration file, so the
+    /// released read finds it missing, with no wait on a lock's release.
+    #[test]
+    fn doctor_json_reports_the_open_gates_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5016);
+        state_pending_at(root, phase, Stage::Define);
+        let (opened, registration) =
+            Gates::open_registered(root, phase, Stage::Define, "g").unwrap();
+        let gate_id = opened.gate_id.as_str();
+
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({"stage": "define", "gate_id": gate_id, "status": "live"})
+            );
+        }
+
+        registration.finish();
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({"stage": "define", "gate_id": gate_id, "status": "absent"})
+            );
+        }
+
+        let no_gate = tempfile::tempdir().unwrap();
+        state_pending_at(no_gate.path(), phase, Stage::Define);
+        for waiter in doctor_json_gate_waiters(no_gate.path()) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({"stage": null, "gate_id": null, "status": "absent"})
+            );
+        }
+    }
+
+    /// With several gates open, the status describes the gate named beside it: the one
+    /// with a live registration, and once none has one, the first the findings name.
+    #[test]
+    fn doctor_json_names_the_live_gate_among_several_open_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5017);
+        state_pending_at(root, phase, Stage::Validate);
+        let unwaited = Gates::open_gate(root, phase, Stage::Code, "no waiter").unwrap();
+        let (waited, registration) =
+            Gates::open_registered(root, phase, Stage::Validate, "waiter").unwrap();
+
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({
+                    "stage": "validate",
+                    "gate_id": waited.gate_id.as_str(),
+                    "status": "live",
+                })
+            );
+        }
+
+        registration.finish();
+        for waiter in doctor_json_gate_waiters(root) {
+            assert_eq!(
+                waiter,
+                serde_json::json!({
+                    "stage": "code",
+                    "gate_id": unwaited.gate_id.as_str(),
+                    "status": "absent",
+                })
+            );
+        }
+    }
+
     /// T-50.1-70: each of the three held files protects its holder from the stray reaper,
     /// and an unheld one protects nothing.
     #[test]
@@ -11336,6 +11429,9 @@ mod tests {
         /// The launch id every fixture's supervisor record carries.
         const SUPERVISOR_LAUNCH_ID: &str = "0123456789abcdef";
 
+        /// A path a damaged gate file could name where its gate id belongs.
+        const PATH_AS_GATE_ID: &str = "/home/someone/.devflow/gates/x";
+
         /// Every string anywhere inside `value`.
         fn strings_in(value: &serde_json::Value, out: &mut Vec<String>) {
             match value {
@@ -11446,6 +11542,7 @@ mod tests {
         /// in the reconciliation section holds a path.
         #[test]
         fn doctor_json_reports_supervisor_liveness_without_paths() {
+            let gate_id = GateId::new().to_string();
             let record = devflow_core::state::SupervisorRecord::new(
                 PathBuf::from("/home/someone/.cache/devflow/sock/x.sock"),
                 SUPERVISOR_LAUNCH_ID.to_string(),
@@ -11471,6 +11568,17 @@ mod tests {
                     pending: Some((SUPERVISOR_LAUNCH_ID.to_string(), pending)),
                     ..agreeing_facts(PhaseId::new(28))
                 },
+                PhaseFacts {
+                    waiter: WaiterStatus::Live,
+                    waiter_gate: Some((Stage::Define, gate_id.clone())),
+                    open_gate_stages: vec![Stage::Define],
+                    ..agreeing_facts(PhaseId::new(29))
+                },
+                PhaseFacts {
+                    waiter_gate: Some((Stage::Define, PATH_AS_GATE_ID.to_string())),
+                    open_gate_stages: vec![Stage::Define],
+                    ..agreeing_facts(PhaseId::new(30))
+                },
             ];
             let body = render_reconciliation_json(&facts);
             let entries = body.as_array().expect("an array");
@@ -11490,9 +11598,58 @@ mod tests {
             strings_in(&body, &mut strings);
             assert!(!strings.is_empty(), "the scan must see strings: {body}");
             assert!(
+                strings.contains(&gate_id),
+                "the scan must read a gate id, not only nulls: {strings:?}"
+            );
+            assert!(
                 strings.iter().all(|text| !text.contains('/')),
                 "no string in the reconciliation section may hold a path: {strings:?}"
             );
+        }
+
+        /// A gate file's id is unchecked, so one that is no gate id reads `null`: the
+        /// JSON cannot carry a path in it (T-50.1-156). The stage still names the gate.
+        #[test]
+        fn doctor_json_gives_a_refused_gate_id_as_null() {
+            let facts = vec![PhaseFacts {
+                waiter_gate: Some((Stage::Define, PATH_AS_GATE_ID.to_string())),
+                open_gate_stages: vec![Stage::Define],
+                ..agreeing_facts(PhaseId::new(31))
+            }];
+            let body = render_reconciliation_json(&facts);
+            let entries = body.as_array().expect("an array");
+            assert!(!entries.is_empty(), "{body}");
+            for entry in entries {
+                assert_eq!(
+                    entry["gate_waiter"],
+                    serde_json::json!({"stage": "define", "gate_id": null, "status": "absent"}),
+                    "{body}"
+                );
+            }
+        }
+
+        /// A phase with several findings repeats one `gate_waiter`, so a consumer that
+        /// reads any entry for the phase reads the phase's fact.
+        #[test]
+        fn doctor_json_repeats_the_gate_waiter_on_every_finding_of_a_phase() {
+            let gate_id = GateId::new().to_string();
+            let facts = vec![PhaseFacts {
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                waiter_gate: Some((Stage::Code, gate_id.clone())),
+                open_gate_stages: vec![Stage::Code],
+                ..agreeing_facts(PhaseId::new(32))
+            }];
+            let body = render_reconciliation_json(&facts);
+            let entries = body.as_array().expect("an array");
+            assert!(entries.len() >= 2, "needs several findings: {body}");
+            for entry in entries {
+                assert_eq!(
+                    entry["gate_waiter"],
+                    serde_json::json!({"stage": "code", "gate_id": gate_id, "status": "absent"}),
+                    "{body}"
+                );
+            }
         }
 
         /// A short cache dir directly under `/tmp`, so every socket path
