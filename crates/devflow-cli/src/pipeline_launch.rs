@@ -9957,6 +9957,223 @@ mod tests {
         reservation.discard();
     }
 
+    /// Names which run of `a_next_stage_spawn_that_fails_clears_its_pending_record` a
+    /// child is. Not a DevFlow setting.
+    const PENDING_SPAWN_CASE_ENV: &str = "P50_1_17_SPAWN_CASE";
+
+    /// The `.devflow/supervisor-*.live` files under `root`.
+    fn liveness_files(root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root.join(".devflow")) else {
+            return Vec::new();
+        };
+        entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("supervisor-") && name.ends_with(".live"))
+            .collect()
+    }
+
+    /// A next-stage spawn that fails leaves no reservation, on either side of the
+    /// pending save: `socket_path` fails before it (the over-long cache dir of
+    /// `a_failed_monitor_spawn_clears_the_supervisor_record`), and `no_publish` after it
+    /// (the socket directory is a file, so the spawned supervisor exits unpublished).
+    #[test]
+    fn a_next_stage_spawn_that_fails_clears_its_pending_record() {
+        const NAME: &str =
+            "pipeline_launch::tests::a_next_stage_spawn_that_fails_clears_its_pending_record";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            for case in ["socket_path", "no_publish"] {
+                let path_dir = go_waiting_claude_dir();
+                let short = crate::test_support::hermetic_cache_dir();
+                let cache = if case == "socket_path" {
+                    let long = short.path().join("c".repeat(80));
+                    std::fs::create_dir_all(&long).unwrap();
+                    long
+                } else {
+                    let sock = devflow_core::registry::socket_dir_in(short.path());
+                    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+                    std::fs::write(sock, "not a directory").unwrap();
+                    short.path().to_path_buf()
+                };
+                let env: Vec<(&str, &std::ffi::OsStr)> = vec![
+                    ("DEVFLOW_CACHE_DIR", cache.as_os_str()),
+                    (PENDING_SPAWN_CASE_ENV, std::ffi::OsStr::new(case)),
+                ];
+                let output =
+                    devflow_core::test_support::run_test_in_child(NAME, path_dir.path(), &env);
+                devflow_core::test_support::assert_child_ran_exactly_one_passing_test(
+                    &output, NAME,
+                );
+            }
+            return;
+        }
+        let _guard = env_lock();
+        let case = std::env::var(PENDING_SPAWN_CASE_ENV).expect("the parent names the case");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(1706);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.legacy_claude_launch = true;
+        state.supervisor = Some(fabricated_prior_record(root));
+        workflow::save_state(&state).unwrap();
+
+        let result = launch_stage(&mut state, None, None);
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+        let text = result
+            .expect_err("this fixture's next-stage spawn fails")
+            .to_string();
+        let names_its_failure = match case.as_str() {
+            "socket_path" => text.contains("sun_path"),
+            _ => text.contains("before publishing"),
+        };
+        assert!(names_its_failure, "{case}: the error names it: {text}");
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(state.pending_supervisor, None, "{case}: in memory");
+        assert_eq!(reloaded.pending_supervisor, None, "{case}: on disk");
+        assert_eq!(reloaded.supervisor, None, "{case}: the prior record too");
+        assert_eq!(
+            liveness_files(root),
+            Vec::<String>::new(),
+            "{case}: no liveness file for the launch that failed"
+        );
+    }
+
+    /// S(N) killed after its pending save and before the spawn: nothing else holds the
+    /// lock, so the reservation reads abandoned, and a following `resume` proceeds,
+    /// clears it and says so.
+    #[test]
+    fn a_launcher_killed_after_its_pending_save_leaves_an_abandoned_reservation() {
+        use devflow_core::liveness;
+        const NAME: &str = "pipeline_launch::tests::\
+                            a_launcher_killed_after_its_pending_save_leaves_an_abandoned_reservation";
+        const ABANDONED_MARKER: &str = "reservation under test: ";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = handoff_claude_dir(SUCCESS_MARKER);
+            let hold_dir = tempfile::Builder::new()
+                .prefix("dfh")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let hold = std::ffi::OsString::from(format!(
+                "after_pending_save:{}",
+                hold_dir.path().join("release").display()
+            ));
+            let output = run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[
+                    (TEST_MONITOR_FULL_ENV, std::ffi::OsStr::new("1")),
+                    ("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("120")),
+                    (HOLD_ENV, hold.as_os_str()),
+                    // libtest would otherwise swallow the line this test is about.
+                    ("RUST_TEST_NOCAPTURE", std::ffi::OsStr::new("1")),
+                ],
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let id = stdout
+                .lines()
+                .find_map(|line| line.split(ABANDONED_MARKER).nth(1))
+                .expect("the child names its reservation");
+            let line = format!("cleared an abandoned launch reservation {id}");
+            assert!(stdout.contains(&line), "missing {line:?}: {stdout}");
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1705));
+        run.go();
+        run.wait_held();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the pending save precedes this hold");
+        println!("{ABANDONED_MARKER}{}", pending.launch_id);
+        assert_eq!(
+            run.other_sockets(),
+            Vec::<PathBuf>::new(),
+            "N+1 is not spawned yet"
+        );
+        kill_stage_n(&run);
+        assert!(
+            poll_until(Duration::from_secs(5), || {
+                liveness::probe(&pending.liveness_path)
+                    .is_ok_and(|h| h == liveness::Held::Abandoned)
+            }),
+            "nothing else holds the dead launcher's lock"
+        );
+
+        let result = resume(&run.root, run.phase, None, true);
+        let after = run.state();
+        let _reap = ReapMonitorOnDrop::after_launch(&after);
+        result.expect("an abandoned reservation blocks nothing");
+        let recorded = after.supervisor.expect("the resume's launch is recorded");
+        assert_ne!(recorded.launch_id, pending.launch_id);
+        assert_ne!(recorded.launch_id, run.n.launch_id);
+        assert_eq!(
+            after.pending_supervisor, None,
+            "the resume's own is promoted"
+        );
+        assert!(
+            !pending.liveness_path.exists(),
+            "the abandoned file is removed"
+        );
+    }
+
+    /// A stop at safe point 3 ends the unpublished N+1 through its socket and clears
+    /// its pending record, so the state names only what may still be live.
+    #[test]
+    fn a_stop_at_safe_point_3_clears_the_unpublished_next_pending_record() {
+        const NAME: &str = "pipeline_launch::tests::\
+                            a_stop_at_safe_point_3_clears_the_unpublished_next_pending_record";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            run_handoff_child(NAME, Some("before_publish"), SUCCESS_MARKER);
+            return;
+        }
+        let _guard = env_lock();
+        let run = HandoffRun::launch(PhaseId::new(1707));
+        run.go();
+        run.wait_held();
+        let pending = run
+            .state()
+            .pending_supervisor
+            .expect("the state names N+1 before safe point 3");
+
+        let (_, last) = shutdown_accepted_then(
+            &run.n.socket_path,
+            || run.release(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(last["stopped"], true, "N answers stopped: {last}");
+        assert!(
+            poll_until(HANDOFF_STEP_WAIT, || {
+                devflow_core::supervisor::probe(&pending.socket_path)
+                    .is_ok_and(|liveness| liveness == devflow_core::supervisor::Liveness::Gone)
+            }),
+            "N+1 was shut down through its socket"
+        );
+        let state = run.state();
+        assert_eq!(state.pending_supervisor, None, "its record is cleared");
+        assert!(state.stopped, "state.stopped after a stop at safe point 3");
+        assert_eq!(state.stop_reason.as_deref(), Some(ADVANCE_STOP_REASON));
+        assert_eq!(
+            state.supervisor.as_ref().map(|r| r.launch_id.as_str()),
+            Some(run.n.launch_id.as_str()),
+            "N+1 was never published"
+        );
+        assert!(
+            poll_until(Duration::from_secs(5), || !pending.liveness_path.exists()),
+            "no liveness file is left for N+1"
+        );
+    }
+
     // ---- 50-23: every launch failure path has a defined end state ----
 
     /// A previous stage's supervisor record whose socket does not exist and
