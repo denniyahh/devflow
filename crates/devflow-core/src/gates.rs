@@ -1198,7 +1198,7 @@ impl Gates {
         Self::require_open(project_root, phase, stage, gate)?;
         let path = Self::claim_path(project_root, phase, stage, gate);
         let ack = serde_json::to_string_pretty(&GateAck { received: true })?;
-        match crate::durable::publish_exclusive_durably(&path, ack.as_bytes())? {
+        match crate::durable::publish_exclusive_durably_or_withdraw(&path, ack.as_bytes())? {
             crate::durable::Publication::Published => Ok(Claim::Claimed),
             crate::durable::Publication::AlreadyExists => Ok(Claim::AlreadyConsumed),
         }
@@ -2088,6 +2088,36 @@ mod tests {
         let path = Gates::claim_path(dir.path(), phase, stage, &gate);
         let ack: GateAck = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(ack.received);
+    }
+
+    /// A claim whose ack link landed but whose directory fsync failed is an error that
+    /// published nothing: the ack is withdrawn, so the caller's "nothing was consumed"
+    /// is true and a retry can still claim. Control: the retry with no fault claims.
+    #[test]
+    fn a_claim_whose_directory_fsync_fails_leaves_no_ack_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phase, stage) = (PhaseId::new(12), Stage::Ship);
+        let gate = Gates::open_gate(dir.path(), phase, stage, "ctx")
+            .unwrap()
+            .gate_id;
+        let path = Gates::claim_path(dir.path(), phase, stage, &gate);
+
+        crate::durable::fail_next_dir_fsync_of(path.parent().unwrap());
+        let error = Gates::claim(dir.path(), phase, stage, &gate).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory fsync failure"),
+            "the claim must fail on the injected fault: {error}"
+        );
+        assert!(!path.exists(), "a failed claim must leave no ack behind");
+
+        assert_eq!(
+            Gates::claim(dir.path(), phase, stage, &gate).unwrap(),
+            Claim::Claimed,
+            "control: with no fault the same gate's answer can still be claimed"
+        );
+        assert!(path.exists());
     }
 
     #[test]
