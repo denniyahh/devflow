@@ -6,7 +6,9 @@
 //! - replace ([`replace_durably`]): fsync a temp file, rename it over the target,
 //!   fsync the directory;
 //! - exclusive publish ([`publish_exclusive_durably`]): fsync a temp file, hard-link
-//!   it to the target, fsync the directory, never falling back to `rename`;
+//!   it to the target, fsync the directory, never falling back to `rename`
+//!   ([`publish_exclusive_durably_or_withdraw`] also unlinks it again on a later
+//!   failure, for a target only lock holders act on);
 //! - remove ([`remove_durably`]): unlink, then fsync the directory.
 //!
 //! The advisory coordination files of Phase 50.1 (`supervisor-<id>.live`,
@@ -30,6 +32,16 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Fsync a directory, making a create, rename or unlink inside it durable.
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_FSYNC_OF.with(|fail| {
+        let hit = fail.borrow().as_deref() == Some(dir);
+        if hit {
+            fail.borrow_mut().take();
+        }
+        hit
+    }) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
     File::open(dir)?.sync_all()?;
     #[cfg(test)]
     record(Synced::Dir(dir.to_path_buf()));
@@ -106,6 +118,32 @@ pub(crate) fn publish_exclusive_durably(
     if publication == Publication::Published {
         fsync_dir(parent_of(path))?;
         cleanup?;
+    }
+    Ok(publication)
+}
+
+/// [`publish_exclusive_durably`], except that an error after the link landed (the
+/// directory fsync or the temp removal failed) withdraws the link before returning,
+/// so an `Err` always means nothing is published at `path`.
+///
+/// Only for a target whose every publisher and reader that acts on it holds one lock
+/// the caller holds now, so no one can see the link before it is withdrawn: a gate's
+/// claim ack under the gate lock. An answer is read without that lock, so it does not
+/// qualify. The withdrawal is itself not known durable when the directory cannot be
+/// synced.
+pub(crate) fn publish_exclusive_durably_or_withdraw(
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<Publication> {
+    let tmp = write_synced_temp(path, contents)?;
+    let publication = publication_of(std::fs::hard_link(&tmp, path));
+    let cleanup = std::fs::remove_file(&tmp);
+    let publication = publication?;
+    if publication == Publication::Published
+        && let Err(error) = fsync_dir(parent_of(path)).and(cleanup)
+    {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
     }
     Ok(publication)
 }
@@ -255,6 +293,18 @@ pub(crate) enum Synced {
 #[cfg(test)]
 thread_local! {
     static SYNCED: std::cell::RefCell<Vec<Synced>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_DIR_FSYNC_OF: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make this thread's next [`fsync_dir`] of `dir` fail once, as a dying disk's `EIO`
+/// would. Other directories sync as usual.
+#[cfg(test)]
+pub(crate) fn fail_next_dir_fsync_of(dir: &Path) {
+    FAIL_DIR_FSYNC_OF.with(|fail| *fail.borrow_mut() = Some(dir.to_path_buf()));
 }
 
 #[cfg(test)]
