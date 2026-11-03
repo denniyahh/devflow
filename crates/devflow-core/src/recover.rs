@@ -469,6 +469,115 @@ fn phase_may_be_live(project_root: &Path, state: &State) -> Option<String> {
     phase_activity_may_be_live(project_root, state.phase)
 }
 
+/// A held launch liveness file (`.devflow/supervisor-<id>.live`) that no other phase's
+/// loadable state records, so it may be a phase's supervisor before it publishes (D-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnrecordedLiveLaunch {
+    /// The launch id from the file's name.
+    pub launch_id: String,
+    /// The file.
+    pub path: std::path::PathBuf,
+    /// The holder's pid from the file's record, when it reads.
+    pub holder_pid: Option<u32>,
+}
+
+impl UnrecordedLiveLaunch {
+    /// One line naming the launch, its holder and how to inspect it.
+    pub fn describe(&self) -> String {
+        match self.holder_pid {
+            Some(pid) => format!(
+                "launch {}'s liveness lock {} is held by pid {pid} and no other phase's state \
+                 records it, so it may be this phase's supervisor before it publishes (inspect \
+                 it with `ps -o pid,lstart,args -p {pid}`)",
+                self.launch_id,
+                self.path.display()
+            ),
+            None => format!(
+                "launch {}'s liveness lock {} is held and no other phase's state records it, so \
+                 it may be this phase's supervisor before it publishes",
+                self.launch_id,
+                self.path.display()
+            ),
+        }
+    }
+}
+
+/// Every [`UnrecordedLiveLaunch`] in `project_root` but `own_launch_id`, for a `phase`
+/// whose own state is missing or does not load and so cannot name its launch.
+///
+/// A launch the state of another phase records, as its supervisor or its pending
+/// launch, is that phase's. One no loadable state records is counted, whoever it
+/// belongs to: a state that does not load cannot clear it, and a launcher between its
+/// reservation and its record shows here for that moment. A lock that cannot be probed
+/// counts as held.
+///
+/// # Errors
+/// `.devflow/` exists but cannot be listed.
+pub fn unrecorded_live_launches(
+    project_root: &Path,
+    phase: PhaseId,
+    own_launch_id: Option<&str>,
+) -> std::io::Result<Vec<UnrecordedLiveLaunch>> {
+    let dir = project_root.join(".devflow");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let recorded: Vec<String> = workflow::list_states(project_root)
+        .into_iter()
+        .filter(|state| state.phase != phase)
+        .flat_map(|state| {
+            let supervisor = state.supervisor.map(|record| record.launch_id);
+            let pending = state.pending_supervisor.map(|pending| pending.launch_id);
+            supervisor.into_iter().chain(pending)
+        })
+        .collect();
+    let mut live = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(launch_id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("supervisor-"))
+            .and_then(|name| name.strip_suffix(".live"))
+            .filter(|id| Some(*id) != own_launch_id && !recorded.iter().any(|r| r == id))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        if matches!(
+            crate::liveness::probe(&path),
+            Ok(crate::liveness::Held::Abandoned | crate::liveness::Held::Missing)
+        ) {
+            continue;
+        }
+        let holder_pid = crate::liveness::live_holder(&path)
+            .ok()
+            .flatten()
+            .map(|(pid, _)| pid);
+        live.push(UnrecordedLiveLaunch {
+            launch_id: launch_id.to_string(),
+            path,
+            holder_pid,
+        });
+    }
+    live.sort_by(|a, b| a.launch_id.cmp(&b.launch_id));
+    Ok(live)
+}
+
+/// Why a phase with no loadable state may still be live through a launch no state
+/// records, or `None`.
+fn unrecorded_launch_may_be_live(project_root: &Path, phase: PhaseId) -> Option<String> {
+    match unrecorded_live_launches(project_root, phase, None) {
+        Ok(live) => live.first().map(UnrecordedLiveLaunch::describe),
+        Err(error) => Some(format!(
+            "its launch liveness files could not be listed ({error})"
+        )),
+    }
+}
+
 /// The part of [`phase_may_be_live`] that needs no state: a registered gate waiter, or
 /// D-17's foreground holder.
 fn phase_activity_may_be_live(project_root: &Path, phase: PhaseId) -> Option<String> {
@@ -706,7 +815,8 @@ pub fn clean_phase_report(
 
 /// The explicit clean's decision: whether to clear the state, having removed the gate
 /// files if so. A phase with no state, or one that does not parse, still has its
-/// leftovers removed, unless a waiter or foreground holder may be live.
+/// leftovers removed, unless a waiter, a foreground holder or a launch no other phase's
+/// state records may be live.
 fn explicit_decision(
     project_root: &Path,
     phase: PhaseId,
@@ -717,6 +827,7 @@ fn explicit_decision(
         workflow::Existing::Loaded(fresh) => phase_may_be_live(project_root, fresh),
         workflow::Existing::Missing | workflow::Existing::Unloadable(_) => {
             phase_activity_may_be_live(project_root, phase)
+                .or_else(|| unrecorded_launch_may_be_live(project_root, phase))
         }
     };
     if let Some(reason) = live {
@@ -2539,6 +2650,65 @@ mod tests {
         assert!(opened.path.exists(), "a waited-on gate file stays");
         assert!(report.removal_failed, "{:?}", report.warnings);
         drop(registration);
+    }
+
+    /// A supervisor that has not published shows only through its held liveness file, and
+    /// a state that does not load names no launch: an explicit clean must keep that state,
+    /// or a later `start` over the missing state launches a second supervisor beside it.
+    /// Controls: the same lock recorded by another phase's state, or released, keeps nothing.
+    #[test]
+    fn explicit_clean_keeps_an_unloadable_state_beside_an_unrecorded_live_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2126);
+        let state_path = workflow::state_path(root, phase);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let write_unloadable = || std::fs::write(&state_path, "{\"stage\":").unwrap();
+        write_unloadable();
+        let launch_id = crate::supervisor::new_launch_id();
+        let lock = crate::liveness::launch_liveness_path(root, &launch_id).unwrap();
+        let hold = crate::liveness::Hold::take(&lock).unwrap();
+
+        let report = clean_phase_report(root, phase).expect("a keep is reported, not an error");
+
+        assert_eq!(
+            std::fs::read_to_string(&state_path).ok().as_deref(),
+            Some("{\"stage\":"),
+            "an unrecorded live launch keeps the unloadable state"
+        );
+        assert!(report.removal_failed, "{:?}", report.warnings);
+        let pid = std::process::id().to_string();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains(&launch_id) && w.contains(&pid)),
+            "the keep names the launch and its holder pid: {:?}",
+            report.warnings
+        );
+
+        let other = PhaseId::new(2127);
+        let mut recorder = state_aged_phase(root, other, 0, None);
+        recorder.pending_supervisor = Some(crate::state::PendingSupervisor::new(
+            launch_id.clone(),
+            root.join("unused.sock"),
+            lock.clone(),
+        ));
+        workflow::save_state(&recorder).unwrap();
+        clean_phase_report(root, phase).expect("explicit clean");
+        assert!(
+            !state_path.exists(),
+            "control: a live launch another phase records keeps nothing"
+        );
+        workflow::clear_state(root, other).unwrap();
+
+        write_unloadable();
+        drop(hold);
+        clean_phase_report(root, phase).expect("explicit clean");
+        assert!(
+            !state_path.exists(),
+            "control: a released lock keeps nothing"
+        );
     }
 
     /// R-03: a repair verb never hangs on a holder of the write lock, and says who it is.
