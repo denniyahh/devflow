@@ -154,7 +154,8 @@ listed this way for a moment.
 promotion never came within its 15 s wait, writes no state or exit file and cannot
 record its own stop. When the state records another launch it also leaves
 `workflow._auto_chain_active` to that launch; otherwise it clears the flag as usual.
-`devflow logs --follow` ends on an exit file, so with no next run it keeps following
+`devflow logs --follow` ends on an exit file, or once the phase has no state file
+(including one gone before it started); while the state stays, it keeps following
 until Ctrl-C. It ends its agent's group if the agent still runs and logs
 `supervisor_superseded`, whose `agent_group` field says `ended` or
 `already_exited`. A promoted supervisor keeps reading the state once a second

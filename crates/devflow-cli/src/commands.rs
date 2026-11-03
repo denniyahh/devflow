@@ -4406,11 +4406,9 @@ pub(crate) fn logs(
     // can always Ctrl-C sooner.)
     let exit_path = agent_result::exit_code_path(project_root, phase);
     let state_path = workflow::state_path(project_root, phase);
-    let mut saw_state = false;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let state_exists = state_path.exists();
-        saw_state |= state_exists;
         // 14-CR-03: a stage transition archives and recreates the capture
         // file (launch_stage → archive_phase_files), so a shrunken file
         // means the next stage started — reset to the top instead of
@@ -4428,8 +4426,10 @@ pub(crate) fn logs(
             return Ok(());
         }
         // A supervisor whose state vanished writes no exit file (D-03) and has no
-        // successor, so none will come.
-        if saw_state && !state_exists && base == offset && new_offset == offset {
+        // successor, so none will come. A state that was gone before the first poll is
+        // the same case: every launch saves its state before it spawns (D-01), so there
+        // is no run still to start here.
+        if !state_exists && base == offset && new_offset == offset {
             eprintln!("== phase {phase}'s state is gone and no exit code was recorded ==");
             return Ok(());
         }
@@ -16056,6 +16056,31 @@ mod tests {
         receiver
             .recv_timeout(WAIT)
             .expect("the follower ends once the state is gone")
+            .unwrap();
+    }
+
+    /// A follower started after the state is already gone, with no exit file, has no run
+    /// to wait for and must end too: no state is ever observed, so nothing may hinge on
+    /// having seen one. Control: the test above keeps following while the state exists.
+    #[test]
+    fn logs_follow_ends_when_no_state_exists_from_the_start_and_no_exit_file_will_come() {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = PhaseId::new(5307);
+        let capture = agent_result::stdout_path(&root, phase);
+        std::fs::create_dir_all(capture.parent().unwrap()).unwrap();
+        std::fs::write(&capture, "earlier output\n").unwrap();
+        assert!(!workflow::state_path(&root, phase).exists());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let follower_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(logs(&follower_root, Some(phase), true, false));
+        });
+        receiver
+            .recv_timeout(WAIT)
+            .expect("the follower ends when there was never a state to follow")
             .unwrap();
     }
 
