@@ -30,26 +30,755 @@
 # (`pub const MAIN: &str = "main";` / `pub const DEVELOP: &str = "develop";`)
 # at plan time, not re-read live by this script.
 #
-# Usage: scripts/scratch-dogfood-repo.sh [destination]
+# The default mode's output is also the Phase 49 negative arm's fixture
+# (D-14/D-25), so it must stay byte-identical: `--selftest` pins its tree hash.
+#
+# `--live-payload` (Phase 49, D-20): the disposable project for the
+# milestone's live unattended run — again a SYNTHETIC single-task phase, for
+# the same reason as above. Same destination guard and repo-local identity,
+# plus repo-local commit/tag signing off. Topology (D-06, R-5): `main` carries
+# the payload; `integration` forks from it, adds `devflow.toml`
+# (`base_branch = "integration"`, and `capture_retention = 64` so the
+# auto-decide resume's captures survive, R-7) and is left checked out.
+# `.planning/config.json` is written in serde-pretty form with the chain flag
+# present and false. Every commit is a non-breaking `chore:` and nothing is
+# tagged, so the payload cannot classify as a MAJOR bump (D-21, R-8). DevFlow
+# runs no tests at Validate; it drives /gsd-validate-phase over the payload's
+# own test (R-9), which plan 49-06 adds with the phase directory. Nothing is
+# launched and nothing is pushed.
+#
+# Pretty-form bridge: jq --indent 2 reproduces DevFlow's REAL_SHAPE fixture;
+# the Rust writer test pins that fixture's round trip. The payload uses only
+# objects, strings and booleans. Special-character string escaping absent
+# from both fixtures is not covered; the payload has no such strings.
+#
+# WHAT `--check` DOES NOT ESTABLISH: it proves the layout and config values
+# above and the installed GSD's hook resolution, read-only. It does NOT prove
+# DevFlow's live preflight, agent behavior, gate recovery or Ship completion.
+#
+# Usage:
+#   scripts/scratch-dogfood-repo.sh [destination]
+#   scripts/scratch-dogfood-repo.sh --live-payload [--gsd-tools <path>] [destination]
+#   scripts/scratch-dogfood-repo.sh --check <destination>
+#   scripts/scratch-dogfood-repo.sh --selftest
 #   destination defaults to $TMPDIR (or /tmp)/devflow-dogfood-scratch-$$
-#   if omitted. Never a sibling `.worktrees/` entry of this repo.
+#   if omitted. Never inside this checkout or a sibling `.worktrees/` entry.
+#   --gsd-tools defaults to $HOME/.claude/gsd-core/bin/gsd-tools.cjs.
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
-DEST="${1:-${TMPDIR:-/tmp}/devflow-dogfood-scratch-$$}"
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+MODE=default
+DEST=""
+HAVE_DEST=false
+CHECK_DEST=""
+GSD_TOOLS="$HOME/.claude/gsd-core/bin/gsd-tools.cjs"
+
+set_mode() {
+    [ "$MODE" = default ] || [ "$MODE" = "$1" ] || die "conflicting modes: --$MODE and --$1"
+    MODE="$1"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --live-payload) set_mode live-payload ;;
+        --check)
+            set_mode check
+            shift
+            [ $# -gt 0 ] || die "--check needs a path"
+            CHECK_DEST="$1"
+            ;;
+        --selftest) set_mode selftest ;;
+        --gsd-tools)
+            shift
+            [ $# -gt 0 ] || die "--gsd-tools needs a path"
+            GSD_TOOLS="$1"
+            ;;
+        -h | --help)
+            sed -n '/^# Usage:/,/^#$/p' "$SELF"
+            exit 0
+            ;;
+        -*) die "unknown option: $1" ;;
+        *)
+            [ "$HAVE_DEST" = false ] || die "unexpected second destination: $1"
+            DEST="$1"
+            HAVE_DEST=true
+            ;;
+    esac
+    shift
+done
+
+case "$MODE" in
+    check | selftest)
+        [ "$HAVE_DEST" = false ] || die "--$MODE takes no positional destination (got: $DEST)"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# --selftest: runs this script as a child against scratch destinations and
+# asserts both directions. Case line `  ok   <name>` or `  FAIL <name> — <why>`,
+# last line `SELFTEST passed=<P> failed=<F>`, exit 0 only if F=0 and P>0.
+# Every control first proves its own precondition, and refusals are asserted
+# on their text, never only on the exit code.
+# ---------------------------------------------------------------------------
+ST_TMP=""
+N_PASS=0
+N_FAIL=0
+
+case_ok() {
+    printf '  ok   %s\n' "$1"
+    N_PASS=$((N_PASS + 1))
+}
+
+case_fail() {
+    printf '  FAIL %s — %s\n' "$1" "$2"
+    N_FAIL=$((N_FAIL + 1))
+}
+
+# st_count <fixed-string> <file>: occurrences, 0 when none (rg -c prints nothing).
+st_count() {
+    local count
+    count="$(rg --count-matches -F -e "$1" -- "$2" || true)"
+    printf '%s\n' "${count:-0}"
+}
+
+st_live_topology() {
+    local name="live payload: integration checked out with devflow.toml"
+    local lp="$ST_TMP/lp" rc=0 head
+    bash "$SELF" --live-payload "$lp" >"$ST_TMP/lp.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case_fail "$name" "--live-payload exited $rc: $(tail -n 1 "$ST_TMP/lp.log")"
+        return
+    fi
+    head="$(git -C "$lp" symbolic-ref -q HEAD 2>/dev/null || true)"
+    if [ "$head" != refs/heads/integration ]; then
+        case_fail "$name" "HEAD is '${head:-unreadable}', want refs/heads/integration"
+        return
+    fi
+    if ! git -C "$lp" show-ref --verify -q refs/heads/main; then
+        case_fail "$name" "refs/heads/main is missing"
+        return
+    fi
+    # Spelled independently of the scaffold's heredoc, so a typo there fails here.
+    printf 'base_branch = "integration"\ncapture_retention = 64\n' >"$ST_TMP/want.toml"
+    if ! git -C "$lp" show integration:devflow.toml >"$ST_TMP/got.toml" 2>/dev/null ||
+        ! cmp -s "$ST_TMP/want.toml" "$ST_TMP/got.toml"; then
+        case_fail "$name" "integration:devflow.toml is absent or differs from the two expected lines"
+        return
+    fi
+    if git -C "$lp" cat-file -e main:devflow.toml 2>/dev/null; then
+        case_fail "$name" "devflow.toml is committed on main; it belongs on integration only"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_live_check_passes() {
+    local name="live payload: check passes"
+    local rc=0 last
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$ST_TMP/lp" >"$ST_TMP/check.out" 2>&1 || rc=$?
+    last="$(tail -n 1 "$ST_TMP/check.out")"
+    if [ "$rc" -ne 0 ]; then
+        case_fail "$name" "--check exited $rc, last line '${last:-<empty>}'"
+        return
+    fi
+    if ! printf '%s\n' "$last" | rg -q '^CHECK passed=[1-9][0-9]* failed=0$'; then
+        case_fail "$name" "last line is '${last:-<empty>}', want CHECK passed=<P≥1> failed=0"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_control_compact_config() {
+    local name="control: check refuses a compact config.json"
+    local copy="$ST_TMP/compact" cfg rc=0
+    if [ ! -d "$ST_TMP/lp/.git" ]; then
+        case_fail "$name" "precondition: no live payload at $ST_TMP/lp to copy"
+        return
+    fi
+    cp -a "$ST_TMP/lp" "$copy"
+    cfg="$copy/.planning/config.json"
+    if ! { jq -c . "$cfg" >"$ST_TMP/compact.json" && mv "$ST_TMP/compact.json" "$cfg" &&
+        git -C "$copy" commit -q -am "chore: compact config for the control"; }; then
+        case_fail "$name" "precondition: could not commit a compact config.json in the copy"
+        return
+    fi
+    if cmp -s <(jq --indent 2 . "$cfg") "$cfg"; then
+        case_fail "$name" "precondition: the copy's config.json still equals jq --indent 2 of itself"
+        return
+    fi
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$copy" >"$ST_TMP/compact.out" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "--check accepted a compact config.json (exit 0)"
+        return
+    fi
+    if [ "$(st_count '  FAIL config.json is in pretty form' "$ST_TMP/compact.out")" -ne 1 ]; then
+        case_fail "$name" "exit $rc but no FAIL line naming 'config.json is in pretty form'"
+        return
+    fi
+    # Only the form differs, so only the form check may fail.
+    if [ "$(st_count '  FAIL ' "$ST_TMP/compact.out")" -ne 1 ]; then
+        case_fail "$name" "more than one check failed; the control no longer isolates the form"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_control_head_on_main() {
+    local name="control: check refuses HEAD on main"
+    local copy="$ST_TMP/onmain" head rc=0
+    if [ ! -d "$ST_TMP/lp/.git" ]; then
+        case_fail "$name" "precondition: no live payload at $ST_TMP/lp to copy"
+        return
+    fi
+    cp -a "$ST_TMP/lp" "$copy"
+    git -C "$copy" checkout -q main
+    head="$(git -C "$copy" symbolic-ref -q HEAD 2>/dev/null || true)"
+    if [ "$head" != refs/heads/main ]; then
+        case_fail "$name" "precondition: HEAD is '${head:-unreadable}', want refs/heads/main"
+        return
+    fi
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$copy" >"$ST_TMP/onmain.out" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "--check accepted HEAD on main (exit 0)"
+        return
+    fi
+    if [ "$(st_count '  FAIL head is integration' "$ST_TMP/onmain.out")" -ne 1 ]; then
+        case_fail "$name" "exit $rc but no FAIL line naming 'head is integration'"
+        return
+    fi
+    case_ok "$name"
+}
+
+# The negative arm's fixture (D-14/D-25) is pinned by content: tree hashes
+# carry no timestamps, so they are deterministic where commit SHAs are not.
+# Measured at bc73b1b and re-measured at aaad4b9; one appended byte to
+# config.json gives 8ffe954e… instead.
+DEFAULT_TREE=f6120b337cb9b37d658c6111b7ac14694338dc56
+
+st_default_tree() {
+    local name="default mode: tree hash unchanged"
+    local dflt="$ST_TMP/dflt" rc=0 dev main_tree
+    bash "$SELF" "$dflt" >"$ST_TMP/dflt.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case_fail "$name" "default scaffold exited $rc: $(tail -n 1 "$ST_TMP/dflt.log")"
+        return
+    fi
+    dev="$(git -C "$dflt" rev-parse -q --verify 'develop^{tree}' 2>/dev/null || echo ABSENT)"
+    main_tree="$(git -C "$dflt" rev-parse -q --verify 'main^{tree}' 2>/dev/null || echo ABSENT)"
+    if [ "$dev" != "$DEFAULT_TREE" ] || [ "$main_tree" != "$DEFAULT_TREE" ]; then
+        case_fail "$name" "develop^{tree}=$dev main^{tree}=$main_tree, want $DEFAULT_TREE"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_default_branches() {
+    local name="default mode: develop checked out with only main and develop"
+    local dflt="$ST_TMP/dflt" head refs
+    if [ ! -d "$dflt/.git" ]; then
+        case_fail "$name" "precondition: no default scaffold at $dflt"
+        return
+    fi
+    head="$(git -C "$dflt" symbolic-ref -q HEAD 2>/dev/null || true)"
+    refs="$(git -C "$dflt" for-each-ref --format='%(refname)' refs/heads | tr '\n' ' ')"
+    if [ "$head" != refs/heads/develop ]; then
+        case_fail "$name" "HEAD is '${head:-unreadable}', want refs/heads/develop"
+        return
+    fi
+    if [ "$refs" != "refs/heads/develop refs/heads/main " ]; then
+        case_fail "$name" "local branches are '$refs', want exactly develop and main"
+        return
+    fi
+    case_ok "$name"
+}
+
+# st_guard_probe <name> <root>: scaffolding <root>/.p49-guard-probe-<pid> must
+# be refused for the right reason and leave nothing behind. If the guard fails
+# to refuse, remove exactly the probe path it created, and only after proving
+# it is that path: directly under <root>, carrying the probe name, and absent
+# before this case ran.
+st_guard_probe() {
+    local name="$1" root="$2"
+    local probe_name=".p49-guard-probe-$$"
+    local probe="$root/$probe_name" rc=0
+    if [ -z "$root" ] || [ ! -d "$root" ]; then
+        case_fail "$name" "precondition: root '$root' is not a directory"
+        return
+    fi
+    if [ -e "$probe" ]; then
+        case_fail "$name" "precondition: probe path already exists: $probe"
+        return
+    fi
+    bash "$SELF" "$probe" >"$ST_TMP/probe.out" 2>"$ST_TMP/probe.err" || rc=$?
+    if [ -e "$probe" ]; then
+        if [ "$(dirname -- "$probe")" = "$root" ] && [ "$(basename -- "$probe")" = "$probe_name" ]; then
+            rm -rf -- "$probe"
+        fi
+        case_fail "$name" "the scaffold was not refused (exit $rc) and created $probe; removed it"
+        return
+    fi
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "exit 0 without creating the probe; the refusal did not happen"
+        return
+    fi
+    if [ "$(st_count 'refusing to scaffold inside this checkout' "$ST_TMP/probe.err")" -lt 1 ]; then
+        case_fail "$name" "exit $rc but stderr lacks 'refusing to scaffold inside this checkout'"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_control_existing_dest() {
+    local name="control: refuses an existing destination"
+    local existing="$ST_TMP/existing" rc=0
+    mkdir "$existing"
+    if [ -n "$(find "$existing" -mindepth 1 -print -quit)" ]; then
+        case_fail "$name" "precondition: $existing is not empty"
+        return
+    fi
+    bash "$SELF" "$existing" >"$ST_TMP/existing.out" 2>"$ST_TMP/existing.err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "an existing destination was accepted (exit 0)"
+        return
+    fi
+    if [ "$(st_count 'destination already exists' "$ST_TMP/existing.err")" -lt 1 ]; then
+        case_fail "$name" "exit $rc but stderr lacks 'destination already exists'"
+        return
+    fi
+    if [ -n "$(find "$existing" -mindepth 1 -print -quit)" ]; then
+        case_fail "$name" "refused, but $existing is no longer empty"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_control_unknown_option() {
+    local name="control: unknown option refused"
+    local rc=0
+    bash "$SELF" --no-such-flag >"$ST_TMP/unknown.out" 2>"$ST_TMP/unknown.err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case_fail "$name" "--no-such-flag was accepted (exit 0)"
+        return
+    fi
+    if [ "$(st_count 'unknown option: --no-such-flag' "$ST_TMP/unknown.err")" -ne 1 ]; then
+        case_fail "$name" "exit $rc but stderr lacks 'unknown option: --no-such-flag'"
+        return
+    fi
+    case_ok "$name"
+}
+
+st_payload_tests() {
+    local plan="$ST_TMP/lp/.planning/phases/01-retry-budget/01-01-PLAN.md"
+    local copy="$ST_TMP/reference" line rc=0
+    line="$(rg -m1 '^<task ' "$plan" 2>/dev/null || true)"
+    if [ "$line" = '<task type="checkpoint:decision" gate="blocking-human">' ]; then
+        case_ok "live payload: plan opens with the blocking-human decision task"
+    else
+        case_fail "live payload: plan opens with the blocking-human decision task" "first task absent or wrong"
+    fi
+    mkdir "$copy"
+    git -C "$ST_TMP/lp" archive HEAD | tar -xf - -C "$copy"
+    (cd "$copy" && python3 -B -m unittest discover -s tests -v) >"$ST_TMP/red.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && rg -q "No module named 'probe'" "$ST_TMP/red.log"; then
+        case_ok "live payload: RED test fails before the implementation"
+    else
+        case_fail "live payload: RED test fails before the implementation" "missing-module failure absent"
+    fi
+    mkdir "$copy/probe"
+    touch "$copy/probe/__init__.py"
+    printf 'DEFAULT_RETRY_BUDGET_SECS = 120\ndef deadline_after(start_secs):\n    return start_secs + DEFAULT_RETRY_BUDGET_SECS\n' >"$copy/probe/budget.py"
+    rc=0
+    (cd "$copy" && python3 -B -m unittest discover -s tests -v) >"$ST_TMP/green.log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && rg -q '^Ran 2 tests' "$ST_TMP/green.log" && rg -qx 'OK' "$ST_TMP/green.log"; then
+        case_ok "live payload: test passes with a reference implementation"
+    else
+        case_fail "live payload: test passes with a reference implementation" "two passing tests absent"
+    fi
+    sed -i 's/ = 120/ = 60/' "$copy/probe/budget.py"
+    rc=0
+    (cd "$copy" && python3 -B -m unittest discover -s tests -v) >"$ST_TMP/invalid.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && rg -q 'AssertionError: 60 not found' "$ST_TMP/invalid.log"; then
+        case_ok "control: test fails with a budget outside the offered set"
+    else
+        case_fail "control: test fails with a budget outside the offered set" "invalid-budget assertion absent"
+    fi
+}
+
+# A missing/malformed hook list must fail rather than read as zero hooks.
+hook_count() {
+    local dest="$1" point="$2" caps="$3" json
+    [ -f "$GSD_TOOLS" ] || return 1
+    json="$(cd "$dest" && timeout 20 node "$GSD_TOOLS" loop render-hooks "$point" --raw)" || return 1
+    printf '%s\n' "$json" | jq -er --argjson caps "$caps" '
+        if (.activeHooks | type) != "array" or
+            any(.activeHooks[]; (.capId | type) != "string") then
+            error("activeHooks/capId absent or malformed")
+        else [.activeHooks[] | .capId as $id | select($caps | index($id))] | length end'
+}
+
+st_hook_controls() {
+    local copy="$ST_TMP/hooks" security nyquist wave rc=0
+    security="$(hook_count "$ST_TMP/lp" ship:pre '["security"]')" || rc=1
+    nyquist="$(hook_count "$ST_TMP/lp" verify:post '["nyquist"]')" || rc=1
+    wave="$(hook_count "$ST_TMP/lp" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$security" -eq 0 ] && [ "$nyquist" -gt 0 ] && [ "$wave" -eq 0 ]; then
+        case_ok "live payload: GSD resolves the gates as configured"
+    else
+        case_fail "live payload: GSD resolves the gates as configured" "probe failed or unexpected hook counts"
+    fi
+    cp -a "$ST_TMP/lp" "$copy"
+    printf '{"workflow": {}}\n' >"$copy/.planning/config.json"
+    rc=0
+    security="$(hook_count "$copy" ship:pre '["security"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$security" -gt 0 ]; then
+        case_ok "control: bare config activates the security ship gate"
+    else
+        case_fail "control: bare config activates the security ship gate" "security hook not observed"
+    fi
+    # Independently exercise the wave probe's opposite result too.
+    rc=0
+    wave="$(hook_count "$copy" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$wave" -gt 0 ]; then
+        case_ok "control: bare config activates the ui or drift wave gate"
+    else
+        case_fail "control: bare config activates the ui or drift wave gate" "wave hooks not observed"
+    fi
+    jq '.workflow.nyquist_validation = false' "$ST_TMP/lp/.planning/config.json" >"$copy/.planning/config.json"
+    rc=0
+    nyquist="$(hook_count "$copy" verify:post '["nyquist"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$nyquist" -eq 0 ]; then
+        case_ok "control: nyquist off removes the nyquist hook"
+    else
+        case_fail "control: nyquist off removes the nyquist hook" "nyquist hook still present or probe failed"
+    fi
+}
+
+st_check_mutation() {
+    local kind="$1" check="$2" name="$3" copy="$ST_TMP/mutation-$1" rc=0
+    if [ "$kind" = ancestor ]; then
+        mkdir "$ST_TMP/cargo-parent"
+        touch "$ST_TMP/cargo-parent/Cargo.toml"
+        copy="$ST_TMP/cargo-parent/payload"
+    fi
+    cp -a "$ST_TMP/lp" "$copy"
+    case "$kind" in
+        breaking) git -C "$copy" commit -q --allow-empty -m 'feat!: drop the old helper' ;;
+        footer) git -C "$copy" commit -q --allow-empty -m 'feat: adjust helper' -m 'BREAKING CHANGE: remove helper' ;;
+        external)
+            sed -i '/^type: execute/a external_verify: true' "$copy/.planning/phases/01-retry-budget/01-01-PLAN.md"
+            git -C "$copy" commit -q -am 'chore: add external verification control'
+            ;;
+        tag) git -C "$copy" tag v0.1.0 ;;
+        indent)
+            jq --indent 4 . "$copy/.planning/config.json" >"$ST_TMP/four.json"
+            mv "$ST_TMP/four.json" "$copy/.planning/config.json"
+            git -C "$copy" commit -q -am 'chore: reindent config control'
+            ;;
+        ancestor) [ -f "$ST_TMP/cargo-parent/Cargo.toml" ] || die 'ancestor control absent' ;;
+        *) die "unknown mutation: $kind" ;;
+    esac
+    bash "$SELF" --gsd-tools "$GSD_TOOLS" --check "$copy" >"$ST_TMP/$kind.out" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ "$(st_count "  FAIL $check" "$ST_TMP/$kind.out")" -eq 1 ] &&
+        [ "$(st_count '  FAIL ' "$ST_TMP/$kind.out")" -eq 1 ]; then
+        case_ok "$name"
+    else
+        case_fail "$name" "mutation not refused solely for $check (exit $rc)"
+    fi
+}
+
+extract_real_shape() {
+    awk '
+        /const REAL_SHAPE: &str = r#"/ {sub(/^.*r#"/, ""); active=1}
+        active && /^"#;/ {found=1; exit}
+        active {print}
+        END {if (!found) exit 1}
+    ' "$REPO_ROOT/crates/devflow-core/src/gsd_config.rs"
+}
+
+st_config_bridge() {
+    local fixture="$ST_TMP/real-shape.json" cfg="$ST_TMP/lp/.planning/config.json" count rc=0
+    extract_real_shape >"$fixture" || rc=1
+    if [ "$rc" -eq 0 ] && [ -s "$fixture" ] && cmp -s "$fixture" <(jq --indent 2 . "$fixture"); then
+        case_ok "bridge: jq renders REAL_SHAPE byte-identically"
+    else
+        case_fail "bridge: jq renders REAL_SHAPE byte-identically" "REAL_SHAPE ABSENT or rendering differs"
+    fi
+    rc=0
+    count="$(jq -er '[paths(type == "number" or type == "array")] | length' "$cfg")" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        case_ok "live payload: config.json has no arrays or numbers"
+    else
+        case_fail "live payload: config.json has no arrays or numbers" "unsupported config shape"
+    fi
+    st_check_mutation indent "config.json is in pretty form" "control: a four-space config fails the pretty-form check"
+}
+
+run_selftest() {
+    # Hermetic: the host checkout's git environment and global/system config
+    # (signing, hooks, excludes) may not leak into the scratch repositories.
+    local -a git_local_env_vars
+    mapfile -t git_local_env_vars < <(git rev-parse --local-env-vars)
+    unset "${git_local_env_vars[@]}"
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    ST_TMP="$(mktemp -d)"
+    trap 'rm -rf "$ST_TMP"' EXIT
+
+    st_live_topology
+    st_live_check_passes
+    st_control_compact_config
+    st_control_head_on_main
+    st_default_tree
+    st_default_branches
+    st_guard_probe "control: refuses a destination inside this checkout" "$REPO_ROOT"
+    # The main checkout, computed here independently of the guard's own
+    # variables: the parent of the absolute common git dir. From a linked
+    # worktree it differs from $REPO_ROOT, which is the gap this control covers.
+    st_guard_probe "control: refuses a destination inside the main checkout" \
+        "$(dirname -- "$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)")"
+    st_control_existing_dest
+    st_control_unknown_option
+    st_payload_tests
+    st_hook_controls
+    st_config_bridge
+    st_check_mutation breaking "no breaking commit on integration" "control: check refuses a breaking commit"
+    st_check_mutation external "no plan declares external_verify" "control: check refuses an external_verify line"
+    st_check_mutation ancestor "no ancestor Cargo.toml" "control: check refuses an ancestor Cargo.toml"
+    st_check_mutation footer "no breaking commit on integration" "control: check refuses a breaking footer"
+    st_check_mutation tag "no tags" "control: check refuses a tag"
+
+    echo "SELFTEST passed=$N_PASS failed=$N_FAIL"
+    [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# --check <dest>: read-only verification of a --live-payload scaffold. One
+# named line per check, `CHECK passed=<P> failed=<F>` last, exit 0 only if
+# F=0 and P>0. `git --no-optional-locks` keeps `status` from rewriting the
+# index, so the destination is not modified.
+# ---------------------------------------------------------------------------
+check_ref_heads() {
+    local dest="$1" missing="" branch
+    for branch in main integration; do
+        git -C "$dest" show-ref --verify -q "refs/heads/$branch" 2>/dev/null || missing="$missing $branch"
+    done
+    if [ -z "$missing" ]; then
+        case_ok "main and integration exist"
+    else
+        case_fail "main and integration exist" "missing local branch(es):$missing"
+    fi
+}
+
+# check_exact_line <name> <file> <line>: the file holds a line exactly <line>.
+check_exact_line() {
+    if rg -qxF -e "$3" -- "$2" 2>/dev/null; then
+        case_ok "$1"
+    else
+        case_fail "$1" "no line exactly '$3' in $2"
+    fi
+}
+
+check_config() {
+    local cfg="$1" keys
+    # Order: workflow._auto_chain_active, workflow.auto_mode,
+    # workflow.security_enforcement, workflow.nyquist_validation,
+    # workflow.verifier, workflow.use_worktrees, git.base_branch,
+    # git.branching_strategy. `getpath` yields null for an absent key, so
+    # absent never reads as false.
+    local want='[false,false,false,true,true,false,"main","none"]'
+    if [ ! -f "$cfg" ]; then
+        case_fail "config.json is in pretty form" "$cfg is missing"
+        case_fail "config.json keys resolve as required" "$cfg is missing"
+        return
+    fi
+    if cmp -s <(jq --indent 2 . "$cfg" 2>/dev/null) "$cfg"; then
+        case_ok "config.json is in pretty form"
+    else
+        case_fail "config.json is in pretty form" "bytes differ from jq --indent 2 of the file (or it is not JSON)"
+    fi
+    keys="$(jq -c '[getpath(["workflow","_auto_chain_active"]), getpath(["workflow","auto_mode"]),
+        getpath(["workflow","security_enforcement"]), getpath(["workflow","nyquist_validation"]),
+        getpath(["workflow","verifier"]), getpath(["workflow","use_worktrees"]),
+        getpath(["git","base_branch"]), getpath(["git","branching_strategy"])]' "$cfg" 2>/dev/null ||
+        echo UNREADABLE)"
+    if [ "$keys" = "$want" ]; then
+        case_ok "config.json keys resolve as required"
+    else
+        case_fail "config.json keys resolve as required" "got $keys, want $want"
+    fi
+    if jq -e '[paths(type == "number" or type == "array")] | length == 0' "$cfg" >/dev/null 2>&1; then
+        case_ok "config.json has no arrays or numbers"
+    else
+        case_fail "config.json has no arrays or numbers" "unsupported shape or unreadable JSON"
+    fi
+}
+
+check_payload() {
+    local dest="$1" plan="$1/.planning/phases/01-retry-budget/01-01-PLAN.md" line tmp rc=0
+    if [ -f "$plan" ]; then
+        case_ok "phase directory holds the payload plan"
+    else
+        case_fail "phase directory holds the payload plan" "payload plan absent"
+    fi
+    line="$(rg -m1 '^<task ' "$plan" 2>/dev/null || true)"
+    if [ "$line" = '<task type="checkpoint:decision" gate="blocking-human">' ]; then
+        case_ok "plan opens with the blocking-human decision task"
+    else
+        case_fail "plan opens with the blocking-human decision task" "first task absent or wrong"
+    fi
+    tmp="$(mktemp -d)"
+    if git -C "$dest" archive -o "$tmp/payload.tar" HEAD && tar -xf "$tmp/payload.tar" -C "$tmp"; then
+        (cd "$tmp" && python3 -B -m unittest discover -s tests -v) >"$tmp/test.log" 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ] && rg -q "No module named 'probe'" "$tmp/test.log"; then
+            case_ok "RED test fails before the implementation"
+        else
+            case_fail "RED test fails before the implementation" "missing-module test failure absent"
+        fi
+    else
+        case_fail "RED test fails before the implementation" "cannot archive payload"
+    fi
+    rm -rf -- "$tmp"
+}
+
+check_prelaunch() {
+    local dest="$1" phase="$1/.planning/phases/01-retry-budget" tmp ancestor count rc message broken=false
+    # shellcheck disable=SC2016 # Markdown command backticks are literal data.
+    check_exact_line "validation map covers BUDGET-01" "$phase/01-VALIDATION.md" \
+        '| 01-01-02 | 01 | 1 | BUDGET-01 | — | N/A | unit | `python3 -m unittest discover -s tests -v` | ✅ | ⬜ pending |'
+    tmp="$(mktemp -d)"
+    if [ ! -f "$phase/01-01-PLAN.md" ]; then
+        case_fail "no plan declares external_verify" "payload plan absent"
+    else
+        rc=0
+        rg -n 'external_verify' "$dest/.planning/phases" -g '*PLAN.md' >"$tmp/external" 2>"$tmp/external.err" || rc=$?
+        if [ "$rc" -eq 1 ]; then
+            case_ok "no plan declares external_verify"
+        else
+            case_fail "no plan declares external_verify" "declaration found or scan failed (exit $rc)"
+        fi
+    fi
+    if git -C "$dest" log --no-merges integration --format='%B%x00' >"$tmp/commits"; then
+        while IFS= read -r -d '' message; do
+            # Git adds record-separating newlines after each NUL.
+            while [[ "$message" = $'\n'* ]]; do message="${message#$'\n'}"; done
+            if printf '%s\n' "${message%%$'\n'*}" | rg -q '^[a-z]+(\([^)]*\))?!:' ||
+                printf '%s\n' "$message" | rg -q '^BREAKING[ -]CHANGE:'; then
+                broken=true
+            fi
+        done <"$tmp/commits"
+        if [ "$broken" = false ] && [ -s "$tmp/commits" ]; then
+            case_ok "no breaking commit on integration"
+        else
+            case_fail "no breaking commit on integration" "marker found or empty history"
+        fi
+    else
+        case_fail "no breaking commit on integration" "history unreadable"
+    fi
+    if git -C "$dest" tag --list >"$tmp/tags" && [ ! -s "$tmp/tags" ]; then
+        case_ok "no tags"
+    else
+        case_fail "no tags" "tag present or tag list unreadable"
+    fi
+    ancestor="$(realpath -e -- "$dest")" || ancestor=""
+    broken=false
+    if [ -z "$ancestor" ]; then broken=true; fi
+    while [ -n "$ancestor" ]; do
+        if [ -e "$ancestor/Cargo.toml" ]; then broken=true; fi
+        [ "$ancestor" != / ] || break
+        ancestor="$(dirname -- "$ancestor")"
+    done
+    if [ "$broken" = false ]; then
+        case_ok "no ancestor Cargo.toml"
+    else
+        case_fail "no ancestor Cargo.toml" "Cargo.toml present or destination unreadable"
+    fi
+    rc=0
+    count="$(hook_count "$dest" ship:pre '["security"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        case_ok "gsd: ship:pre has no security gate"
+    else
+        case_fail "gsd: ship:pre has no security gate" "security hook present or probe unreadable"
+    fi
+    rc=0
+    count="$(hook_count "$dest" verify:post '["nyquist"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -gt 0 ]; then
+        case_ok "gsd: verify:post runs nyquist"
+    else
+        case_fail "gsd: verify:post runs nyquist" "nyquist hook absent or probe unreadable"
+    fi
+    rc=0
+    count="$(hook_count "$dest" execute:wave:post '["ui","drift"]')" || rc=1
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        case_ok "gsd: execute:wave:post has no ui or drift gate"
+    else
+        case_fail "gsd: execute:wave:post has no ui or drift gate" "wave gate present or probe unreadable"
+    fi
+    rm -rf -- "$tmp"
+}
+
+run_check() {
+    local dest="$1" head status
+    head="$(git -C "$dest" symbolic-ref -q HEAD 2>/dev/null || true)"
+    if [ "$head" = refs/heads/integration ]; then
+        case_ok "head is integration"
+    else
+        case_fail "head is integration" "HEAD is '${head:-detached or unreadable}'"
+    fi
+    if ! status="$(git --no-optional-locks -C "$dest" status --porcelain 2>&1)"; then
+        case_fail "working tree clean" "git status failed: ${status%%$'\n'*}"
+    elif [ -n "$status" ]; then
+        case_fail "working tree clean" "dirty, first entry: ${status%%$'\n'*}"
+    else
+        case_ok "working tree clean"
+    fi
+    check_ref_heads "$dest"
+    check_exact_line "devflow.toml sets base_branch integration" "$dest/devflow.toml" 'base_branch = "integration"'
+    check_exact_line "devflow.toml sets capture_retention 64" "$dest/devflow.toml" 'capture_retention = 64'
+    check_config "$dest/.planning/config.json"
+    check_exact_line "roadmap has the phase 1 heading" "$dest/.planning/ROADMAP.md" '### Phase 1: Retry budget constant'
+    check_payload "$dest"
+    check_prelaunch "$dest"
+    echo "CHECK passed=$N_PASS failed=$N_FAIL"
+    [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]
+}
+
+case "$MODE" in
+    selftest)
+        run_selftest
+        exit 0
+        ;;
+    check)
+        run_check "$CHECK_DEST"
+        exit 0
+        ;;
+esac
+
+DEST="${DEST:-${TMPDIR:-/tmp}/devflow-dogfood-scratch-$$}"
 
 # T-23-01 (Tampering, high, mitigate): refuse any destination inside this
-# checkout — resolve both to absolute paths and compare prefixes.
+# checkout — resolve both to absolute paths and compare prefixes. Widened as in
+# `unattended-drill.sh` (T-49-02-01): in a linked worktree `--show-toplevel` is
+# the worktree, not the primary checkout, and a scaffold landing in the primary
+# checkout is the 999.37 class of accident even when this runs from a worktree.
+GIT_COMMON_DIR="$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)"
+MAIN_CHECKOUT="$(dirname "$GIT_COMMON_DIR")"
 DEST_ABS="$(realpath -m -- "$DEST")"
-if [ "$DEST_ABS" = "$REPO_ROOT" ] || case "$DEST_ABS" in "$REPO_ROOT"/*) true ;; *) false ;; esac; then
-    echo "ERROR: refusing to scaffold inside this checkout ($REPO_ROOT)." >&2
-    echo "       Requested destination: $DEST_ABS" >&2
-    echo "       Pick a destination outside the checkout (e.g. under \$TMPDIR or ~)." >&2
-    exit 1
-fi
+for forbidden in "$REPO_ROOT" "$MAIN_CHECKOUT"; do
+    if [ "$DEST_ABS" = "$forbidden" ] || case "$DEST_ABS" in "$forbidden"/*) true ;; *) false ;; esac; then
+        echo "ERROR: refusing to scaffold inside this checkout ($forbidden)." >&2
+        echo "       Requested destination: $DEST_ABS" >&2
+        echo "       Pick a destination outside the checkout (e.g. under \$TMPDIR or ~)." >&2
+        exit 1
+    fi
+done
 
 if [ -e "$DEST_ABS" ]; then
     echo "ERROR: destination already exists: $DEST_ABS" >&2
@@ -69,6 +798,341 @@ git -C "$DEST_ABS" symbolic-ref HEAD refs/heads/main
 # --global, and no GIT_* env export (999.37 class).
 git -C "$DEST_ABS" config user.name "DevFlow Probe"
 git -C "$DEST_ABS" config user.email "devflow-probe@localhost"
+
+# ---------------------------------------------------------------------------
+# --live-payload (Phase 49). Diverges from the default mode here, after the
+# shared init/identity block; the default mode below is untouched.
+# ---------------------------------------------------------------------------
+scaffold_live_payload() {
+    # RESEARCH Pitfall 7: the operator's global config signs commits and tags,
+    # and the headless monitor's merge and CHANGELOG commits cannot answer a
+    # signing prompt. Repo-local and this mode only (T-23-02).
+    git -C "$DEST_ABS" config commit.gpgsign false
+    git -C "$DEST_ABS" config tag.gpgsign false
+
+    mkdir -p "$DEST_ABS/.planning/phases/01-retry-budget" "$DEST_ABS/tests"
+
+    cat > "$DEST_ABS/.planning/PROJECT.md" <<'EOF'
+# Retry Budget Probe
+
+## What This Is
+
+A small, disposable Python project with one module, `probe.budget`. It exists for one run and is deleted afterwards.
+
+## Core Value
+
+The module's retry budget is a deliberate choice among offered values, and its deadline helper is tested.
+
+## Requirements
+
+### Active
+
+- BUDGET-01: choose the default retry budget and implement the deadline helper.
+EOF
+
+    cat > "$DEST_ABS/.planning/REQUIREMENTS.md" <<'EOF'
+# Requirements
+
+## v1 Requirements
+
+- [ ] **BUDGET-01**: `probe.budget` defines `DEFAULT_RETRY_BUDGET_SECS`, chosen from 30, 120 or 300, and
+  `deadline_after(start_secs)` returns `start_secs + DEFAULT_RETRY_BUDGET_SECS`.
+
+## Traceability
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| BUDGET-01 | Phase 1 | Pending |
+EOF
+
+    cat > "$DEST_ABS/.planning/STATE.md" <<'EOF'
+---
+gsd_state_version: 1.0
+current_phase: 1
+current_phase_name: Retry budget constant
+status: planned
+---
+
+# Retry Budget Probe — Project State
+
+## Current Position
+
+Phase: 1
+Plan: 01-01
+Status: Planned
+EOF
+
+    cat > "$DEST_ABS/tests/test_budget.py" <<'EOF'
+import unittest
+
+from probe.budget import DEFAULT_RETRY_BUDGET_SECS, deadline_after
+
+OFFERED_BUDGETS = (30, 120, 300)
+
+
+class RetryBudgetTest(unittest.TestCase):
+    def test_budget_is_one_of_the_offered_values(self) -> None:
+        self.assertIsInstance(DEFAULT_RETRY_BUDGET_SECS, int)
+        self.assertIn(DEFAULT_RETRY_BUDGET_SECS, OFFERED_BUDGETS)
+
+    def test_deadline_adds_the_budget_to_the_start(self) -> None:
+        self.assertEqual(deadline_after(10.0), 10.0 + DEFAULT_RETRY_BUDGET_SECS)
+
+
+if __name__ == "__main__":
+    unittest.main()
+EOF
+
+    cat > "$DEST_ABS/.planning/phases/01-retry-budget/01-01-PLAN.md" <<'EOF'
+---
+phase: 01-retry-budget
+plan: 01
+type: execute
+wave: 1
+depends_on: []
+files_modified:
+  - probe/__init__.py
+  - probe/budget.py
+autonomous: false
+requirements: [BUDGET-01]
+
+must_haves:
+  truths:
+    - "`python3 -m unittest discover -s tests -v` passes"
+    - "`probe.budget.DEFAULT_RETRY_BUDGET_SECS` is one of 30, 120 or 300"
+  artifacts:
+    - path: probe/budget.py
+      provides: "DEFAULT_RETRY_BUDGET_SECS and deadline_after"
+---
+
+<objective>
+Choose the probe's default retry budget from three offered values, then implement `probe/budget.py` so the existing
+test in `tests/test_budget.py` passes.
+</objective>
+
+<tasks>
+
+<task type="checkpoint:decision" gate="blocking-human">
+  <name>Task 1: Choose the default retry budget</name>
+  <decision>Which value should `probe.budget.DEFAULT_RETRY_BUDGET_SECS` hold, in seconds?</decision>
+  <context>
+The probe retries calls to an upstream service until the budget runs out. The upstream's documented failover
+completes within 90 seconds; a budget shorter than that turns every failover into a hard failure. The on-call pager
+escalates a stalled job after 4 minutes, so a budget longer than 240 seconds lets a dead upstream page someone before
+the probe reports its own failure. A longer budget also holds a worker slot for longer.
+  </context>
+  <options>
+    <option id="budget-30">
+      <name>30 seconds</name>
+      <pros>Fails fast and frees worker slots quickly.</pros>
+      <cons>Shorter than the 90-second failover window, so every failover becomes a hard failure.</cons>
+    </option>
+    <option id="budget-120">
+      <name>120 seconds</name>
+      <pros>Covers the 90-second failover window and reports before the 4-minute page.</pros>
+      <cons>Holds a worker slot for up to two minutes per stalled call.</cons>
+    </option>
+    <option id="budget-300">
+      <name>300 seconds</name>
+      <pros>Survives even a slow failover with margin.</pros>
+      <cons>Longer than the 4-minute pager threshold, so a dead upstream pages someone first.</cons>
+    </option>
+  </options>
+  <resume-signal>Select: budget-30, budget-120, or budget-300</resume-signal>
+</task>
+
+<task type="auto">
+  <name>Task 2: Implement probe/budget.py with the chosen budget</name>
+  <files>probe/__init__.py, probe/budget.py</files>
+  <action>
+Create an empty `probe/__init__.py`. Create `probe/budget.py` defining `DEFAULT_RETRY_BUDGET_SECS: int` set to the
+value chosen in Task 1, and `deadline_after(start_secs: float) -> float` returning
+`start_secs + DEFAULT_RETRY_BUDGET_SECS`. Do not edit `tests/test_budget.py`.
+  </action>
+  <verify>
+    <automated>python3 -m unittest discover -s tests -v</automated>
+  </verify>
+  <acceptance_criteria>
+    - `python3 -m unittest discover -s tests -v` exits 0 and reports `Ran 2 tests` and `OK`
+    - `DEFAULT_RETRY_BUDGET_SECS` equals the option chosen in Task 1
+  </acceptance_criteria>
+  <done>The module holds the chosen budget and the existing test passes.</done>
+</task>
+
+</tasks>
+
+<verification>
+`python3 -m unittest discover -s tests -v` passes.
+</verification>
+
+<success_criteria>
+- `DEFAULT_RETRY_BUDGET_SECS` is one of 30, 120 or 300 and `deadline_after` adds it to a start time.
+</success_criteria>
+
+<output>
+Create `.planning/phases/01-retry-budget/01-01-SUMMARY.md` when done.
+</output>
+EOF
+
+
+    cat > "$DEST_ABS/.gitignore" <<'EOF'
+.devflow/
+.worktrees/
+__pycache__/
+*.pyc
+EOF
+
+    # Written in serde_json::to_string_pretty's exact rendering with a trailing
+    # newline, and with `_auto_chain_active` present and false, so DevFlow's
+    # Code-stage chain-flag set/clear round trip leaves no tracked diff for
+    # /gsd-ship to trip on (RESEARCH Pitfall 3, gsd_config.rs:133-178).
+    # Non-default keys, one reason each:
+    # `auto_mode` false: the ephemeral chain flag stays the only auto-approval path.
+    # `security_enforcement` false: removes GSD's blocking `ship:pre` gate.
+    # `verifier` true: keeps VERIFICATION.md, which /gsd-ship requires.
+    # `nyquist_validation` true: keeps the Validate stage doing real work.
+    # `ui_phase`/`ui_safety_gate`/`ui_review`/`schema_drift_gate` false: remove default-active wave gates.
+    # `use_worktrees` false: no nested executor worktrees inside DevFlow's phase worktree.
+    # `git.branching_strategy` none: GSD stays on the branch DevFlow created.
+    # `git.base_branch` main: fixes GSD's PR base instead of reading origin/HEAD (R-5).
+    cat > "$DEST_ABS/.planning/config.json" <<'EOF'
+{
+  "commit_docs": true,
+  "parallelization": false,
+  "workflow": {
+    "auto_mode": false,
+    "_auto_chain_active": false,
+    "verifier": true,
+    "nyquist_validation": true,
+    "security_enforcement": false,
+    "ui_phase": false,
+    "ui_safety_gate": false,
+    "ui_review": false,
+    "schema_drift_gate": false,
+    "code_review": true,
+    "tdd_mode": false,
+    "use_worktrees": false,
+    "research": false,
+    "plan_check": false
+  },
+  "git": {
+    "branching_strategy": "none",
+    "base_branch": "main"
+  }
+}
+EOF
+
+    cat > "$DEST_ABS/.planning/ROADMAP.md" <<'EOF'
+# Roadmap
+
+### Phase 1: Retry budget constant
+
+**Goal**: The probe module defines a default retry budget chosen from three offered values, and a helper that
+computes a retry deadline from a start time.
+**Requirements**: BUDGET-01
+**Success Criteria** (what must be TRUE):
+
+  1. `python3 -m unittest discover -s tests -v` passes.
+  2. `probe.budget.DEFAULT_RETRY_BUDGET_SECS` is one of 30, 120 or 300.
+
+**Plans**: 1 plan
+
+- [ ] 01-01-PLAN.md — choose the retry budget, then implement the module the existing test exercises
+EOF
+
+    cat > "$DEST_ABS/.planning/phases/01-retry-budget/01-VALIDATION.md" <<'EOF_VALIDATION'
+---
+phase: "01"
+slug: "retry-budget"
+status: draft
+nyquist_compliant: false
+wave_0_complete: true
+created: "2026-09-28"
+---
+
+# Phase 01 — Validation Strategy
+
+> Per-phase validation contract for feedback sampling during execution.
+
+---
+
+## Test Infrastructure
+
+| Property | Value |
+|----------|-------|
+| **Framework** | unittest (Python 3 standard library) |
+| **Config file** | none |
+| **Quick run command** | `python3 -m unittest discover -s tests -v` |
+| **Full suite command** | `python3 -m unittest discover -s tests -v` |
+| **Estimated runtime** | ~1 second |
+
+---
+
+## Sampling Rate
+
+- **After every task commit:** Run `python3 -m unittest discover -s tests -v`
+- **After every plan wave:** Run `python3 -m unittest discover -s tests -v`
+- **Before `/gsd-verify-work`:** Full suite must be green
+- **Max feedback latency:** 1 second
+
+---
+
+## Per-Task Verification Map
+
+| Task ID | Plan | Wave | Requirement | ANCHOR | TIER | Test Type | Automated Command | File Exists | Status |
+|---------|------|------|-------------|--------|------|-----------|-------------------|-------------|--------|
+| 01-01-02 | 01 | 1 | BUDGET-01 | — | N/A | unit | `python3 -m unittest discover -s tests -v` | ✅ | ⬜ pending |
+
+---
+
+## Wave 0 Requirements
+
+Existing infrastructure covers all phase requirements.
+
+---
+
+## Manual-Only Verifications
+
+All phase behaviors have automated verification.
+
+---
+
+## Validation Sign-Off
+
+- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
+- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
+- [ ] Wave 0 covers all MISSING references
+- [ ] No watch-mode flags
+- [ ] Feedback latency < 1s
+- [ ] `nyquist_compliant: true` set in frontmatter
+
+**Approval:** pending
+EOF_VALIDATION
+
+    # R-8: non-breaking `chore:` messages and no tags, so the MAJOR-bump
+    # classifier has nothing to fire on (D-21).
+    git -C "$DEST_ABS" add -A
+    git -C "$DEST_ABS" commit -q -m "chore: scaffold devflow live-run payload"
+    git -C "$DEST_ABS" checkout -q -b integration
+
+    cat > "$DEST_ABS/devflow.toml" <<'EOF'
+base_branch = "integration"
+capture_retention = 64
+EOF
+
+    git -C "$DEST_ABS" add devflow.toml
+    git -C "$DEST_ABS" commit -q -m "chore: configure devflow base branch"
+
+    # `integration` stays checked out: DevFlow reads devflow.toml from the
+    # launch checkout's working tree (RESEARCH Pitfall 5).
+    echo "Scaffolded devflow live-run payload: $DEST_ABS"
+    echo "next: create the private repository and push main then integration (runbook)"
+}
+
+if [ "$MODE" = live-payload ]; then
+    scaffold_live_payload
+    exit 0
+fi
 
 mkdir -p "$DEST_ABS/.planning/phases/01-add-probe-marker"
 

@@ -1,0 +1,26 @@
+# Dependabot version updates.
+#
+# Only the GitHub Actions the workflows use are kept current here, as one
+# grouped weekly PR against `develop` (git flow: nothing lands on `main`
+# except through a release). Cargo dependencies get no version-update PRs:
+# each PR runs the full pinned-container CI, and advisories are already
+# caught by `cargo deny` (ci.yml's `Dependency checks` job and the weekly
+# .github/workflows/scheduled-deps.yml).
+#
+# The pinned devcontainer image is deliberately not managed here: it is
+# repeated in .devcontainer/devcontainer.json, ci.yml and scheduled-deps.yml,
+# which tests/ci_parity_guards.rs requires to match, so a bump in one file
+# alone would fail CI. Bump it by hand in all of them at once.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"

@@ -1,6 +1,10 @@
 # Build artifacts
 /target
 site/
+# graphify knowledge-graph output: regenerable, never committed to develop/main.
+# `graphify-out/*` rather than `graphify-out/` so a branch that tracks a snapshot
+# can still re-include files with `!` (a directory-level ignore cannot be negated).
+graphify-out/*
 
 # IDE
 .idea/
@@ -66,14 +70,28 @@ skills-lock.json
 .devflow/phase-*-stderr.log
 .devflow/phase-*-exit
 .devflow/phase-*-agent-pid
+.devflow/phase-*-monitor-stop
 .devflow/last-ship*.json
 .devflow/cron-instructions*.json
 .devflow/events.jsonl
 .devflow/gates/
 .devflow/history/
 
+# Per-checkout DevFlow configuration (`base_branch` and other `devflow.toml`
+# keys). It names a checkout's own trunk, so develop never carries one; a
+# personal workspace branch may track its own (backlog 999.110).
+devflow.toml
+
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
 .worktrees/
 
 # Bytecode cache
 __pycache__/
+
+# insta snapshot scratch (47-CONTEXT.md D-14). `*.snap.new` is what insta writes
+# beside a baseline when a snapshot is missing or mismatches under its local
+# default mode — transient, never reviewed, never committed. `*.snap` itself
+# stays TRACKED on purpose: the committed baseline IS the reviewable artifact,
+# so every prompt wording change must appear in the PR diff. Never widen this
+# rule to cover the baselines.
+*.snap.new

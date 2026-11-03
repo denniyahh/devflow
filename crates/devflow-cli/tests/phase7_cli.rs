@@ -1,3 +1,5 @@
+mod common;
+
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::workflow::load_state;
@@ -10,10 +12,6 @@ use std::time::Duration;
 struct FakeBin {
     _dir: tempfile::TempDir,
     path: PathBuf,
-}
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -93,8 +91,8 @@ fn path_with_fake_bin(fake_bin: &Path) -> String {
     format!("{}:{}", fake_bin.display(), existing.to_string_lossy())
 }
 
-fn run_devflow(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    run_devflow_inner(root, fake_bin, args, false)
+fn run_devflow(home: &common::HermeticHome, root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
+    run_devflow_inner(home, root, fake_bin, args, false)
 }
 
 /// [`run_devflow`] with D-11's legacy-launch opt-out forced on for the spawned
@@ -123,12 +121,23 @@ fn run_devflow(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
 /// coverage rather than stabilising it; see
 /// `parallel_creates_two_worktrees_and_spawns_two_monitors`, which deliberately
 /// does not use this helper.
-fn run_devflow_legacy_launch(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    run_devflow_inner(root, fake_bin, args, true)
+fn run_devflow_legacy_launch(
+    home: &common::HermeticHome,
+    root: &Path,
+    fake_bin: &Path,
+    args: &[&str],
+) -> Output {
+    run_devflow_inner(home, root, fake_bin, args, true)
 }
 
-fn run_devflow_inner(root: &Path, fake_bin: &Path, args: &[&str], legacy_launch: bool) -> Output {
-    let mut command = Command::new(devflow_bin());
+fn run_devflow_inner(
+    home: &common::HermeticHome,
+    root: &Path,
+    fake_bin: &Path,
+    args: &[&str],
+    legacy_launch: bool,
+) -> Output {
+    let mut command = common::hermetic_devflow(home);
     command
         .args(args)
         .arg(root)
@@ -266,6 +275,7 @@ fn seed_feature_branch(root: &Path, phase: PhaseId) {
 
 #[test]
 fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -324,6 +334,7 @@ esac
     // test's subject is two worktrees and two monitors, which is
     // mode-independent; the agent diversity is the point and is preserved.
     let output = run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -336,6 +347,8 @@ esac
             "supervise",
         ],
     );
+    let _reaper7 = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
+    let _reaper8 = common::LaunchedRunReaper::new(root, PhaseId::new(8), Vec::new());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("phase 7"));
     assert!(stdout.contains("phase 8"));
@@ -382,6 +395,7 @@ esac
 
 #[test]
 fn start_defaults_to_worktree() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -397,6 +411,7 @@ fn start_defaults_to_worktree() {
     // puts the phase, not which transport its agent is launched over. See
     // `run_devflow_legacy_launch`.
     run_devflow_legacy_launch(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -412,6 +427,7 @@ fn start_defaults_to_worktree() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(11), Vec::new());
 
     // start returns before the detached monitor finishes; wait for the
     // worktree directory like the other integration tests do.
@@ -441,6 +457,7 @@ fn start_defaults_to_worktree() {
 /// phase's worktree, which always starts at ahead=0, behind=0.
 #[test]
 fn start_worktree_mode_ignores_main_checkout_divergence() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -473,6 +490,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     // divergence check's scope, not the launch transport. See
     // `run_devflow_legacy_launch`.
     run_devflow_legacy_launch(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -488,6 +506,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(13), Vec::new());
 
     wait_for(&root.join(".worktrees/phase-13"));
     assert!(root.join(".worktrees/phase-13").is_dir());
@@ -500,6 +519,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
 
 #[test]
 fn start_no_worktree_uses_feature_branch() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -512,6 +532,7 @@ fn start_no_worktree_uses_feature_branch() {
     // `--no-worktree` keeps the phase on its feature branch, not which
     // transport its agent is launched over. See `run_devflow_legacy_launch`.
     run_devflow_legacy_launch(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -528,6 +549,7 @@ fn start_no_worktree_uses_feature_branch() {
             "--no-worktree",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(12), Vec::new());
 
     // start returns before the detached monitor finishes; wait for the
     // agent pid file that the monitor writes on the feature-branch path.
@@ -555,6 +577,7 @@ fn start_no_worktree_uses_feature_branch() {
 /// case this plan adds.
 #[test]
 fn start_until_plan_halts_cleanly() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -569,6 +592,7 @@ fn start_until_plan_halts_cleanly() {
     // into `state.legacy_claude_launch` by `start`, so the detached monitor
     // that launches Plan reads it back. See `run_devflow_legacy_launch`.
     run_devflow_legacy_launch(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -586,6 +610,7 @@ fn start_until_plan_halts_cleanly() {
             "plan",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(44), Vec::new());
 
     let state = wait_for_stopped(root, PhaseId::new(44));
     assert_eq!(
@@ -596,14 +621,14 @@ fn start_until_plan_halts_cleanly() {
     );
     assert!(state.stopped, "stop marker must be set");
     assert_eq!(
-        state.monitor_pid, None,
-        "the stop path must clear monitor_pid so no monitor is left behind"
+        state.supervisor, None,
+        "the stop path must clear the supervisor record so no monitor is left behind"
     );
     assert!(
         state.stop_reason.is_some(),
         "a human-readable stop_reason must be recorded"
     );
-    // The stop path cleared monitor_pid; the guard still binds (no-op) so
+    // The stop path cleared the supervisor record; the guard still binds (no-op) so
     // every monitor-spawning test in this file follows the same teardown
     // shape (41-02 Task 1 systematic pass).
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -615,6 +640,7 @@ fn start_until_plan_halts_cleanly() {
 /// any stage runs, not silently accepted as if it intercepted anything.
 #[test]
 fn start_until_ship_is_rejected() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -623,7 +649,7 @@ fn start_until_ship_is_rejected() {
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start", "--phase", "45", "--agent", "claude", "--mode", "auto", "--until", "ship",
         ])
@@ -653,6 +679,7 @@ fn start_until_ship_is_rejected() {
 /// `start` is ever dispatched.
 #[test]
 fn start_until_unknown_stage_is_rejected_by_clap() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -661,7 +688,7 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start", "--phase", "46", "--agent", "claude", "--mode", "auto", "--until", "bogus",
         ])
@@ -688,12 +715,13 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
 /// `--until` had not been passed.
 #[test]
 fn start_dry_run_annotates_until_stage() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[]);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start",
             "--phase",
@@ -738,12 +766,13 @@ fn start_dry_run_annotates_until_stage() {
 /// annotation — the full pipeline runs to Ship.
 #[test]
 fn start_dry_run_without_until_has_no_stop_annotation() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[]);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start",
             "--phase",
@@ -770,6 +799,7 @@ fn start_dry_run_without_until_has_no_stop_annotation() {
 
 #[test]
 fn status_prints_cron_hint_when_cron_instructions_exist() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -781,7 +811,7 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     devflow_core::ship::write_cron_instructions(root, &instructions).unwrap();
     let fake_bin = fake_bin_dir(&[]);
 
-    let output = run_devflow(root, &fake_bin.path, &["status"]);
+    let output = run_devflow(&home, root, &fake_bin.path, &["status"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // D-10 (44-03) replaced the old `--from-devflow <root>` invocation with a
@@ -804,6 +834,7 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
 
 #[test]
 fn reference_and_cleanup_worktree_cli_flow() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -835,13 +866,14 @@ esac
     )]);
 
     // reference — creates static snapshot
-    let out = run_devflow(root, &fake_bin.path, &["reference"]);
+    let out = run_devflow(&home, root, &fake_bin.path, &["reference"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("reference worktree"));
     assert!(root.join(".worktrees/reference").is_dir());
 
     // start --worktree — creates phase worktree
     let out = run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -855,6 +887,7 @@ esac
             "--worktree",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(8), Vec::new());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("phase 8"));
     assert!(
@@ -863,7 +896,7 @@ esac
     );
 
     // status — lists active worktrees
-    let out = run_devflow(root, &fake_bin.path, &["status"]);
+    let out = run_devflow(&home, root, &fake_bin.path, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(".worktrees/reference"),
@@ -902,6 +935,7 @@ esac
     let _reap = MonitorReapGuard::after_launch(&settled);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -917,7 +951,7 @@ esac
     wait_for_state_cleared(root, PhaseId::new(8));
 
     // cleanup — removes worktrees
-    let out = run_devflow(root, &fake_bin.path, &["cleanup", "--force"]);
+    let out = run_devflow(&home, root, &fake_bin.path, &["cleanup", "--force"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("removed"));
 
@@ -932,6 +966,7 @@ esac
 /// monitor is created.
 #[test]
 fn start_codex_without_context_fails_preflight() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -939,7 +974,7 @@ fn start_codex_without_context_fails_preflight() {
     // (14-CR-05) passes and the CONTEXT.md artifact check must fire next.
     let fake_bin = fake_bin_dir(&[("codex", "#!/bin/sh\nexit 0\n")]);
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start", "--phase", "42", "--agent", "codex", "--mode", "auto",
         ])
@@ -970,14 +1005,15 @@ fn start_codex_without_context_fails_preflight() {
 
 /// 20b instance 1 (D-06, review: Codex HIGH fail-closed-on-live-agent):
 /// `cleanup --force` must refuse to remove a worktree whose agent pid is
-/// genuinely alive, even when the persisted `State` carries `monitor_pid =
-/// None` — a classification `liveness()` reports as `Unknown`, NOT `Healthy`.
+/// genuinely alive, even when the persisted `State` carries no supervisor
+/// record — a run with no addressable monitor, NOT a healthy one.
 /// A guard that only refuses on `Healthy`/`BetweenStages` would still delete
 /// this worktree out from under a live agent. Against unmodified `cleanup`
 /// (no liveness check at all today) this test FAILS: cleanup removes the
 /// worktree unconditionally and exits 0.
 #[test]
 fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -996,7 +1032,7 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
     fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-    // Persist a State with monitor_pid = None (Unknown liveness) and
+    // Persist a State with no supervisor record (no addressable monitor) and
     // worktree_path pointing at the created worktree (the worktree->phase
     // join key, review: Codex MEDIUM).
     let mut state = devflow_core::state::State::new(
@@ -1009,7 +1045,7 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
@@ -1020,16 +1056,18 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
     assert!(
         !output.status.success(),
         "cleanup --force must refuse to remove a live agent's worktree even \
-         under Unknown liveness (monitor_pid = None)"
+         with no supervisor record"
     );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // 50-14: `stop` ends a live run; `resume` refuses while one is live.
     assert!(
-        combined.contains("devflow resume"),
-        "refusal must name `devflow resume` as the unblocking action, got:\n{combined}"
+        combined.contains("run `devflow stop --phase 8`") && !combined.contains("devflow resume"),
+        "refusal must name `devflow stop --phase 8` (not `devflow resume`) as the \
+         unblocking action, got:\n{combined}"
     );
     assert!(
         wt_path.is_dir(),
@@ -1044,6 +1082,7 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
 /// classification alone.
 #[test]
 fn cleanup_force_refuses_on_dead_monitor_live_agent() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1061,8 +1100,8 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
     fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
     fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-    // Persist a State with a DEAD monitor pid (`liveness()` classifies this
-    // Stuck, since monitor_alive is false), plus worktree_path.
+    // Persist a State whose supervisor record names a socket that does not
+    // exist (a dead monitor: the probe reads GONE), plus worktree_path.
     let mut state = devflow_core::state::State::new(
         phase,
         devflow_core::state::AgentKind::Claude,
@@ -1070,11 +1109,17 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
         root.to_path_buf(),
     );
     state.worktree_path = Some(wt_path.clone());
-    state.monitor_pid = Some(0x7FFF_FFFE); // essentially never a live pid
+    state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+        root.join("dead-monitor-never-bound.sock"),
+        "deadmonitor00000".to_string(),
+        0x7FFF_FFFE, // essentially never a live process group
+        1,
+        String::new(),
+    ));
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
@@ -1092,9 +1137,11 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // 50-14: `stop` ends a live run; `resume` refuses while one is live.
     assert!(
-        combined.contains("devflow resume"),
-        "refusal must name `devflow resume` as the unblocking action, got:\n{combined}"
+        combined.contains("run `devflow stop --phase 9`") && !combined.contains("devflow resume"),
+        "refusal must name `devflow stop --phase 9` (not `devflow resume`) as the \
+         unblocking action, got:\n{combined}"
     );
     assert!(
         wt_path.is_dir(),
@@ -1103,7 +1150,7 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
 }
 
 /// CR-02 (phase 20 review): a phase halted via `devflow start --until
-/// <stage>` clears `monitor_pid` and its agent has already exited by
+/// <stage>` clears the supervisor record and its agent has already exited by
 /// design — `Liveness::Unknown` with `agent_alive == false` sails straight
 /// through the live-agent refusal, so an ordinary `devflow cleanup` (no
 /// `--force`) must not delete the worktree of a phase the operator parked
@@ -1112,6 +1159,7 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
 /// same phase; `cleanup` must recognize `state.stopped` too.
 #[test]
 fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1125,7 +1173,7 @@ fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
     // No agent pid file (the stage's agent has already exited normally) and
-    // monitor_pid = None (cleared by the --until stop path) — Unknown
+    // no supervisor record (cleared by the --until stop path) — Unknown
     // liveness, agent_alive == false. Only `state.stopped` distinguishes
     // this from a genuinely dead, safe-to-remove phase.
     let mut state = devflow_core::state::State::new(
@@ -1140,7 +1188,7 @@ fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["cleanup"])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
@@ -1173,6 +1221,7 @@ fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
 /// still be able to discard a stopped phase's worktree.
 #[test]
 fn cleanup_force_removes_worktree_for_until_stopped_phase() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1197,7 +1246,7 @@ fn cleanup_force_removes_worktree_for_until_stopped_phase() {
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
@@ -1220,6 +1269,7 @@ fn cleanup_force_removes_worktree_for_until_stopped_phase() {
 /// the second run finds the worktree already gone and does not error.
 #[test]
 fn cleanup_is_idempotent_when_worktree_already_removed() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1232,8 +1282,9 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         .join(format!("phase-{padded}", padded = phase.padded()));
     devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
 
-    // Dead agent, dead monitor (Stuck liveness) — a genuinely dead phase,
-    // safe for cleanup to proceed.
+    // Dead agent, dead monitor (a supervisor record whose socket does not
+    // exist, so the probe reads GONE) — a genuinely dead phase, safe for
+    // cleanup to proceed.
     let mut state = devflow_core::state::State::new(
         phase,
         devflow_core::state::AgentKind::Claude,
@@ -1241,11 +1292,17 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
         root.to_path_buf(),
     );
     state.worktree_path = Some(wt_path.clone());
-    state.monitor_pid = Some(0x7FFF_FFFE);
+    state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+        root.join("dead-monitor-never-bound.sock"),
+        "deadmonitor00000".to_string(),
+        0x7FFF_FFFE,
+        1,
+        String::new(),
+    ));
     devflow_core::workflow::save_state(&state).unwrap();
 
     let fake_bin = fake_bin_dir(&[]);
-    let first = Command::new(devflow_bin())
+    let first = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
@@ -1259,7 +1316,7 @@ fn cleanup_is_idempotent_when_worktree_already_removed() {
     );
     assert!(!wt_path.is_dir(), "worktree must be removed on first run");
 
-    let second = Command::new(devflow_bin())
+    let second = common::hermetic_devflow(&home)
         .args(["cleanup", "--force"])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
@@ -1296,7 +1353,7 @@ fn pi_stub(launch: &str) -> String {
 /// Wait until a phase's chain settles in a state the tests can reap from:
 /// either the never-silent gate fired (`gate_pending`) or the machine
 /// stopped (`--until` / completion). Returns that state — whose
-/// `monitor_pid` is the LAST monitor the chain spawned, the one a
+/// `supervisor` record names the LAST monitor the chain spawned, the one a
 /// `MonitorReapGuard` must capture (a guard bound to an early state read
 /// reaps an already-exited pid and leaks the gate-waiting monitor, HYG-01).
 fn wait_for_settled(root: &Path, phase: PhaseId) -> devflow_core::state::State {
@@ -1330,12 +1387,14 @@ fn wait_for_gate(root: &Path, phase: PhaseId) -> devflow_core::state::State {
 /// `Failed` and gates instead of advancing to Code.
 #[test]
 fn pi_marker_less_run_does_not_advance() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 0\n"))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1348,6 +1407,7 @@ fn pi_marker_less_run_does_not_advance() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -1363,12 +1423,14 @@ fn pi_marker_less_run_does_not_advance() {
 /// not Success, so the pipeline gates instead of advancing.
 #[test]
 fn pi_nonzero_exit_does_not_advance() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("printf 'fake pi, no marker\\n'\nexit 1\n"))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1381,6 +1443,7 @@ fn pi_nonzero_exit_does_not_advance() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -1397,12 +1460,14 @@ fn pi_nonzero_exit_does_not_advance() {
 /// the monitor reaps it and gates (never a silent advance).
 #[test]
 fn pi_hung_process_is_detected_not_left_running() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1415,6 +1480,7 @@ fn pi_hung_process_is_detected_not_left_running() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let pid_path = root.join(".devflow/phase-07-agent-pid");
     let pid = wait_for_pid(&pid_path);
@@ -1524,10 +1590,23 @@ enum StubMode {
 /// of the binary crate's `ReapMonitorOnDrop`, built on the PUBLIC
 /// `devflow_core::agent` surface (integration tests cannot reach
 /// `devflow-cli`'s test_support). TERM->KILL escalation with VERIFIED death,
-/// keyed to `state.monitor_pid`, bound strictly after the final
+/// keyed to the pid of the supervisor `state.supervisor` records (read from
+/// its socket by [`live_supervisor_pid`]), bound strictly after the final
 /// `&mut State` use. 41-02 Task 1 turns this into the systematic pass.
 struct MonitorReapGuard {
     pid: Option<u32>,
+}
+
+/// The pid of the supervisor `state` records, from its socket's ping reply.
+/// The state carries no monitor pid (50-22); before that field went, it held
+/// this same pid. `None` when the state has no record or its socket does not
+/// answer as alive: nothing is left for a guard to reap.
+fn live_supervisor_pid(state: &devflow_core::state::State) -> Option<u32> {
+    let record = state.supervisor.as_ref()?;
+    match devflow_core::supervisor::probe(&record.socket_path) {
+        Ok(devflow_core::supervisor::Liveness::Alive(reply)) => Some(reply.supervisor_pid),
+        _ => None,
+    }
 }
 
 impl MonitorReapGuard {
@@ -1535,15 +1614,15 @@ impl MonitorReapGuard {
         // Register the pid THIS guard is responsible for (the settled-state
         // monitor it will reap), and mark a guard in flight for the audit's
         // ordering barrier. `state` must be the SETTLED state
-        // (`wait_for_settled` / `wait_for_gate`), whose `monitor_pid` is the
-        // chain's LAST monitor — the one that would leak if not reaped.
-        if let Some(pid) = state.monitor_pid {
+        // (`wait_for_settled` / `wait_for_gate`), whose supervisor record
+        // names the chain's LAST monitor — the one that would leak if not
+        // reaped.
+        let pid = live_supervisor_pid(state);
+        if let Some(pid) = pid {
             registry().lock().unwrap().insert(pid);
             ACTIVE_GUARDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        Self {
-            pid: state.monitor_pid,
-        }
+        Self { pid }
     }
 }
 
@@ -1589,12 +1668,14 @@ impl Drop for MonitorReapGuard {
 /// no commits, so it gates instead of advancing to Code.
 #[test]
 fn marker_less_antigravity_never_advances() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::Quiet))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1607,6 +1688,7 @@ fn marker_less_antigravity_never_advances() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_gate(root, PhaseId::new(7));
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -1625,12 +1707,14 @@ fn marker_less_antigravity_never_advances() {
 /// stopped, NOT gated.
 #[test]
 fn antigravity_parses_devflow_result_from_stream() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::MarkerStream))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1645,6 +1729,7 @@ fn antigravity_parses_devflow_result_from_stream() {
             "plan",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_stopped(root, PhaseId::new(7));
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -1664,12 +1749,14 @@ fn antigravity_parses_devflow_result_from_stream() {
 /// advances a commit-gated stage, only the marker does (ANTG-03).
 #[test]
 fn antigravity_init_without_marker_gates_at_plan() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("agy", &antigravity_stub(StubMode::InitOnly))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1682,6 +1769,7 @@ fn antigravity_init_without_marker_gates_at_plan() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_gate(root, PhaseId::new(7));
     let _reap = MonitorReapGuard::after_launch(&state);
@@ -1704,8 +1792,17 @@ fn antigravity_init_without_marker_gates_at_plan() {
 /// or seen its monitor exit naturally), the registry must DRAIN. Polls
 /// bounded so a slow legitimate test does not flake; a genuinely leaked
 /// monitor keeps the registry non-empty and the audit panics naming the pid.
+///
+/// The audit reads process-wide counters the other tests in this binary bump,
+/// so it only means something when they share its process, as under
+/// `cargo test` (what `scripts/check.sh` runs). cargo-nextest runs every test
+/// in its own process and sets `NEXTEST`, where `REAPED` is always 0 and the
+/// audit could only time out; there it returns without asserting.
 #[test]
 fn suite_reap_audit() {
+    if std::env::var_os("NEXTEST").is_some() {
+        return;
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     // Ordering barrier: wait for a SUSTAINED clean state, not a single empty
     // poll. A clean state means: no guard in flight (ACTIVE_GUARDS == 0), at
@@ -1755,6 +1852,7 @@ fn suite_reap_audit() {
 /// normal guard.
 #[test]
 fn unguarded_monitor_is_detected_by_the_registry() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1763,6 +1861,7 @@ fn unguarded_monitor_is_detected_by_the_registry() {
     let fake_bin = fake_bin_dir(&[("pi", &pi_stub("exec sleep 30\n"))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1775,11 +1874,11 @@ fn unguarded_monitor_is_detected_by_the_registry() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = load_state(root, PhaseId::new(7)).expect("load state");
-    let pid = state
-        .monitor_pid
-        .expect("a launched stage must record a monitor pid");
+    let pid = live_supervisor_pid(&state)
+        .expect("a launched stage must record a supervisor that answers its socket");
     assert!(
         devflow_core::agent::agent_running(pid),
         "premise: with no guard the monitor stays alive — nothing reaps it"
@@ -1822,6 +1921,7 @@ fi
 /// commit-gated stage. Define advances on exit 0; Plan gates.
 #[test]
 fn hermes_marker_less_run_does_not_advance() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1831,6 +1931,7 @@ fn hermes_marker_less_run_does_not_advance() {
     )]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1843,6 +1944,7 @@ fn hermes_marker_less_run_does_not_advance() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -1857,6 +1959,7 @@ fn hermes_marker_less_run_does_not_advance() {
 /// HRMS-03: a Hermes run that exits non-zero must not advance its stage.
 #[test]
 fn hermes_nonzero_exit_does_not_advance() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
@@ -1866,6 +1969,7 @@ fn hermes_nonzero_exit_does_not_advance() {
     )]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1878,6 +1982,7 @@ fn hermes_nonzero_exit_does_not_advance() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let state = wait_for_gate(root, PhaseId::new(7));
     assert_eq!(
@@ -1893,12 +1998,14 @@ fn hermes_nonzero_exit_does_not_advance() {
 /// does not falsely advance, and gates when killed.
 #[test]
 fn hermes_hung_process_is_detected_not_left_running() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
     let fake_bin = fake_bin_dir(&[("hermes", &hermes_stub("exec sleep 30\n"))]);
 
     run_devflow(
+        &home,
         root,
         &fake_bin.path,
         &[
@@ -1911,6 +2018,7 @@ fn hermes_hung_process_is_detected_not_left_running() {
             "supervise",
         ],
     );
+    let _reaper = common::LaunchedRunReaper::new(root, PhaseId::new(7), Vec::new());
 
     let pid_path = root.join(".devflow/phase-07-agent-pid");
     let pid = wait_for_pid(&pid_path);

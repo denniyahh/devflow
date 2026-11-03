@@ -14,18 +14,93 @@
 //! rather than inside any one cluster.
 
 use devflow_core::agents;
+use devflow_core::gates::{GateFile, GateId, GateResponse, Gates};
 use devflow_core::phase_id::PhaseId;
-use devflow_core::state::State;
+use devflow_core::stage::Stage;
+use devflow_core::state::{State, SupervisorRecord};
+use devflow_core::workflow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Run `handler` on another thread until it opens `stage`'s gate, read the state on
+/// disk at that moment, then answer the gate with an abort and wait for `handler`.
+///
+/// An abort clears the state file, so a handler that gates cannot show what it
+/// committed any other way: the state is read while the handler is held at its gate.
+pub(crate) fn state_on_disk_at_gate(
+    root: &Path,
+    phase: PhaseId,
+    stage: Stage,
+    handler: impl FnOnce() + Send,
+) -> State {
+    const GATE_OPENS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(handler);
+        let started = std::time::Instant::now();
+        while !Gates::gate_path(root, phase, stage).exists() {
+            assert!(
+                !waiter.is_finished(),
+                "the handler returned without opening the {stage} gate"
+            );
+            assert!(
+                started.elapsed() < GATE_OPENS_WITHIN,
+                "the {stage} gate did not open within {GATE_OPENS_WITHIN:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+        let on_disk = workflow::load_state(root, phase).unwrap();
+        devflow_core::test_support::answer_open_gate(
+            root,
+            phase,
+            stage,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        waiter.join().unwrap();
+        on_disk
+    })
+}
+
+/// The id the stage's gate file names right now, as a test reads the gate it sees.
+pub(crate) fn live_gate_id(root: &Path, phase: PhaseId, stage: Stage) -> GateId {
+    let gate: GateFile =
+        serde_json::from_slice(&std::fs::read(Gates::gate_path(root, phase, stage)).unwrap())
+            .unwrap();
+    GateId::parse(&gate.gate_id).unwrap()
+}
+
+/// The ack and claim files of a stage, in either layout: the unkeyed
+/// `NN-{stage}.ack.json` and each keyed `NN-{stage}.{id}.ack.json`, sorted.
+pub(crate) fn gate_claim_files(root: &Path, phase: PhaseId, stage: Stage) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(Gates::dir(root)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-{stage}.", phase.padded());
+    let mut files: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("read a gates directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest == "ack.json" || rest.ends_with(".ack.json"))
+        })
+        .collect();
+    files.sort();
+    files
+}
 
 /// Serializes tests that mutate process-global env vars (`set_var`/
 /// `remove_var` are process-wide and `cargo test` runs in parallel by
 /// default) so they don't race each other.
 ///
-/// **D-04 invariant, stated explicitly: every env var is guarded by
-/// exactly one mutex, and no var is touched under two.** This invariant currently
-/// holds only by accident across three independent statics — this one, and
+/// **D-04 invariant, stated explicitly: every remaining process-global env
+/// var is guarded by exactly one mutex, and no var is touched under two.** This
+/// invariant currently holds only by accident across three independent statics — this one, and
 /// two more in `devflow-core` (`gates.rs:348`, `config.rs:174`). Those two
 /// are safe today only because `devflow-core` and `devflow-cli` compile
 /// into different test binaries, so their env mutations can never race each
@@ -33,14 +108,15 @@ use std::sync::Mutex;
 /// invariant across that crate boundary — it is true today only because no
 /// env var is currently guarded by more than one of the three statics.
 ///
-/// This mutex currently guards five variables: `PATH`,
+/// `PATH` is no longer process-global in this crate's tests: child fixtures
+/// supply a directory-only value through `run_test_in_child`. This mutex
+/// currently guards the four deferred process-global variables
 /// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`,
-/// `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` (WR-02,
-/// phase 20 review). A future author adding a sixth mutated variable to
+/// `DEVFLOW_GATE_NOTIFY_CMD`, and `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
+/// (WR-02, phase 20 review). A future author adding another mutated variable to
 /// this crate's tests is joining this set — guard it here, not with a new
 /// mutex (D-02: per-module mutexes were rejected on measured evidence that
-/// `PATH` alone is mutated 36 times across 12 lock regions spanning at
-/// least three future target clusters).
+/// one process-global variable can span multiple future target clusters).
 ///
 /// One static suffices for the whole `devflow` binary crate after the
 /// `main.rs` split (19c–19f): every D-05 target module stays inside this
@@ -53,11 +129,9 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// Acquire [`ENV_MUTEX`], recovering the guard if a previous holder panicked.
 ///
 /// **This is the intended entry point; do not call `ENV_MUTEX.lock().unwrap()`
-/// directly.** [`NeutralPath`]'s doc comment already describes the cascade this
-/// exists to stop, in the paragraph beginning "What the trailing-statement
-/// shape costs" — one legible failing assertion becomes a `PoisonError` panic
-/// in every subsequent env-mutating test in the binary. That paragraph
-/// documents the amplification; this function is what prevents it. Measured on
+/// directly.** A failing assertion can otherwise become a `PoisonError` panic
+/// in every subsequent env-mutating test in the binary. This function prevents
+/// that amplification. Measured on
 /// this suite: a single induced `assert!(false)` under the lock reported **25
 /// failures (24 of them `PoisonError`)** through `.lock().unwrap()`, and
 /// **exactly 1** through this accessor.
@@ -69,8 +143,6 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// is restored on the unwinding path by an RAII guard rather than by a trailing
 /// statement:
 ///
-/// - [`NeutralPath`] restores (or removes) `PATH` in its `Drop`, and holds the
-///   neutral `TempDir` so `PATH` never transiently names a deleted directory.
 /// - [`ReapMonitorOnDrop`] reaps the detached monitor wrapper in its `Drop`,
 ///   with a `std::thread::panicking()` interlock so it cannot double-panic into
 ///   an `abort()` during the very unwind it is cleaning up after.
@@ -80,18 +152,16 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// restored. That is the whole argument, and it is conditional:
 ///
 /// **Without those guards this accessor WOULD be unsound.** It is stated
-/// plainly because the failure is silent — a future author who replaces a
-/// `NeutralPath` binding with a trailing `set_var("PATH", original)`, or drops a
+/// plainly because the failure is silent — a future author who replaces
+/// unwind-safe cleanup with a trailing restoration call, or drops a
 /// `ReapMonitorOnDrop` in favour of a trailing `reap_spawned_monitor` call, will
-/// see no compiler error and no failing test. They will instead have converted
-/// this function from "tolerates poison because cleanup already happened" into
-/// "silently hands the next test a `PATH` naming a deleted directory". If you
-/// are removing an unwind-safe guard, you are changing this function's premise;
-/// re-read [`NeutralPath`] before you do.
+/// see no compiler error and no failing test. They will instead hand the next
+/// test half-restored process-global state. If you are removing an unwind-safe
+/// guard, you are changing this function's premise.
 ///
 /// Directly mutated env vars inside a lock region are still the caller's
 /// responsibility to restore — this accessor does not make an unguarded
-/// `set_var` safe, any more than [`NeutralPath`] makes one safe on its own.
+/// `set_var` safe on its own.
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_MUTEX
         .lock()
@@ -199,7 +269,7 @@ pub(crate) fn commit_on_feature_branch(root: &Path, phase: PhaseId, label: &str)
 /// (`mode::MAX_PREFLIGHT_RETRIES`) bounds the recursion regardless, so
 /// an unconditionally-failing preflight now terminates in a logged
 /// `abort` instead of blocking forever on a second gate's
-/// `poll_response`.
+/// `Gates::await_answer`.
 pub(crate) struct AlwaysFailAdapter;
 
 impl agents::AgentDriver for AlwaysFailAdapter {
@@ -228,7 +298,7 @@ impl agents::AgentDriver for AlwaysFailAdapter {
 /// pass. An adapter that fails unconditionally would make a recursive
 /// `launch_stage` retry fail its OWN preflight check too, recursing into
 /// a second gate this test never seeds a response for — blocking on
-/// `poll_response` instead of asserting.
+/// `Gates::await_answer` instead of asserting.
 pub(crate) struct FailOnceAdapter {
     failed_once: std::cell::Cell<bool>,
 }
@@ -325,102 +395,168 @@ pub(crate) fn agent_free_git_only_path_dir() -> tempfile::TempDir {
 /// **The caller must already hold [`ENV_MUTEX`].** `set_var` is process-wide
 /// and `cargo test` runs in parallel; this guard makes the restore
 /// unconditional, it does not make the mutation safe on its own.
-pub(crate) struct NeutralPath {
-    _dir: tempfile::TempDir,
-    original: Option<std::ffi::OsString>,
-}
-
-impl NeutralPath {
-    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
-    /// process-global state at the moment of the call.
-    pub(crate) fn install() -> Self {
-        let dir = agent_free_git_only_path_dir();
-        let original = std::env::var_os("PATH");
-        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
-        // no other test thread is reading or writing PATH concurrently.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        Self {
-            _dir: dir,
-            original,
-        }
-    }
-}
-
-impl Drop for NeutralPath {
-    fn drop(&mut self) {
-        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
-        // for at least as long as this guard's own scope.
-        unsafe {
-            match &self.original {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-}
-
-/// RAII guard that REPLACES `PATH` with a deliberately EMPTY directory, so
-/// `git` — and every other binary — cannot be resolved at all for the scope
-/// it is bound in (35-01, criteria 1 and 6).
+/// Name of the environment variable that puts a re-executed test binary into
+/// CHILD mode: present means this process was spawned by
+/// [`run_test_without_git`], and its value is the fixture root the parent
+/// built before emptying the child's `PATH`.
 ///
-/// **Why empty rather than a failing shim (F-1).** The two consumers of
-/// [`devflow_core::agent_result::phase_commit_count`] must distinguish "the
-/// git child could not be executed" from "git ran and reported zero". Only
-/// the first is a measurement failure, and only an UNRESOLVABLE binary
-/// produces it: `Command::output()` returns `Err(NotFound)` when the program
-/// cannot be spawned, whereas a shim that runs and exits non-zero returns
-/// `Ok(status)` — a real observation. A test built on a failing shim would
-/// exercise the already-correct `Some(0)` path while appearing to cover the
-/// `None` one, which is precisely the proxy measurement this phase exists to
-/// remove.
+/// One shared name rather than one constant per test: each child runs exactly
+/// one test (`--exact`), so there is nothing to disambiguate. A hand-exported
+/// value puts a test into child mode with no parent and no emptied `PATH` —
+/// documented rather than defended against, since a test that takes the inner
+/// branch without the hostile `PATH` fails loudly rather than passing
+/// vacuously.
+pub(crate) const CHILD_NO_GIT_ROOT: &str = "DEVFLOW_CHILD_NO_GIT_ROOT";
+
+/// `Some(root)` when this process is the CHILD half of a
+/// [`run_test_without_git`] pair, `None` when it is the parent.
 ///
-/// Structurally a sibling of [`NeutralPath`]: same field shape, same
-/// `install()`-not-`new()` naming, same `Drop`-restores-on-every-exit-path
-/// reasoning (WR-05), and the same `TempDir`-outlives-the-`PATH`-that-names-it
-/// ordering. It differs in exactly one respect — the directory it points
-/// `PATH` at is empty, where [`NeutralPath`]'s still holds a real `git`.
-///
-/// **The caller must already hold [`ENV_MUTEX`]** (via [`env_lock`]).
-/// `set_var` is process-wide and `cargo test` runs in parallel; this guard
-/// makes the restore unconditional, it does not make the mutation safe on its
-/// own. Hold it over exactly the one call under test and nothing more: this
-/// is the first guard in the workspace that makes `git` unresolvable
-/// process-wide, so any sibling test shelling out to `git` inside the guarded
-/// window fails spuriously.
-pub(crate) struct NoGitPath {
-    _dir: tempfile::TempDir,
-    original: Option<std::ffi::OsString>,
+/// Reading this BEFORE any re-exec is what makes recursion impossible: the
+/// child takes its inner branch and returns long before it could reach the
+/// spawn in the outer branch.
+pub(crate) fn child_no_git_root() -> Option<PathBuf> {
+    std::env::var_os(CHILD_NO_GIT_ROOT).map(PathBuf::from)
 }
 
-impl NoGitPath {
-    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
-    /// process-global state at the moment of the call.
-    pub(crate) fn install() -> Self {
-        // Deliberately empty — see the type's doc comment. Nothing is written
-        // into this directory, by design.
-        let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var_os("PATH");
-        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
-        // no other test thread is reading or writing PATH concurrently.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        Self {
-            _dir: dir,
-            original,
-        }
-    }
+/// Re-executes THIS test binary for exactly one test, with `PATH` pointing at
+/// an empty directory — so `git`, and every other binary, is unresolvable for
+/// the duration of that one test, **inside a child process where the emptied
+/// `PATH` is invisible to every sibling test in the parent**.
+///
+/// This replaces the former process-global empty-`PATH` experiment (46-06,
+/// review finding C-01). Every test thread in the same binary used to see the
+/// emptied `PATH`, which is why `d525f9a` added `env_lock()` to 47 siblings
+/// and still missed tests that reach `git` only through a helper. Moving the
+/// window into a child removes the hazard instead of serialising around it.
+///
+/// Three details are load-bearing:
+///
+/// - `PATH` and the child-mode variable are set **on the `Command` only**.
+///   `std::env::set_var` is unsound under a threaded test runner (`unsafe`
+///   since Rust 2024) and is precisely what this helper exists to stop doing.
+/// - `PATH` is set to an EMPTY DIRECTORY, not removed. Some resolvers fall
+///   back to a built-in default path when `PATH` is absent, which would leave
+///   `git` resolvable and quietly change the experiment.
+/// - the `TempDir` is held in a local binding across the whole `.output()`
+///   call. Dropping it earlier would delete the directory `PATH` names while
+///   the child is still running.
+///
+/// No `--nocapture`: the child's libtest summary line is what
+/// [`assert_child_ran_exactly_one_passing_test`] parses, and `--nocapture`
+/// interleaves the test's own output with it.
+pub(crate) fn run_test_without_git(test_name: &str, root: &Path) -> std::process::Output {
+    // Deliberately empty. Nothing is written into it, by design.
+    let empty = tempfile::tempdir().unwrap();
+    // 50-10 (D-07): a launch inside this child registers here, never under
+    // the developer's real HOME.
+    let cache = hermetic_cache_dir();
+    let exe = std::env::current_exe().expect("current_exe for child test re-invocation");
+    let output = std::process::Command::new(&exe)
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .env("PATH", empty.path())
+        .env(CHILD_NO_GIT_ROOT, root)
+        .env("DEVFLOW_CACHE_DIR", cache.path())
+        .output()
+        .expect("spawn child test process with an empty PATH");
+    // Explicit, not incidental: both directories must outlive the child.
+    drop(empty);
+    drop(cache);
+    output
 }
 
-impl Drop for NoGitPath {
-    fn drop(&mut self) {
-        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
-        // for at least as long as this guard's own scope.
-        unsafe {
-            match &self.original {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
+/// A parent-owned DevFlow cache dir for one child test process (50-10, D-07):
+/// short and under `/tmp`, so 50-11's socket paths inside it stay under the
+/// 107-byte `sun_path` limit.
+pub(crate) fn hermetic_cache_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("dfu")
+        .tempdir_in("/tmp")
+        .expect("create a hermetic DevFlow cache dir under /tmp")
+}
+
+/// [`devflow_core::test_support::run_test_in_child`] with a fresh
+/// [`hermetic_cache_dir`] passed as the child's `DEVFLOW_CACHE_DIR` (50-10,
+/// D-07). Every in-crate test that may launch a stage runs its child through
+/// this, so the launch registers (and, from 50-11, binds its socket) inside
+/// that dir and never under the developer's real HOME. The cache dir lives
+/// until the child has exited. A `DEVFLOW_CACHE_DIR` in `extra_env` wins.
+pub(crate) fn run_hermetic_test_in_child(
+    test_name: &str,
+    path_dir: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let cache = hermetic_cache_dir();
+    let mut env: Vec<(&str, &std::ffi::OsStr)> =
+        vec![("DEVFLOW_CACHE_DIR", cache.path().as_os_str())];
+    env.extend_from_slice(extra_env);
+    let output = devflow_core::test_support::run_test_in_child(test_name, path_dir, &env);
+    drop(cache);
+    output
+}
+
+/// Asserts that a [`run_test_without_git`] child actually RAN the one test it
+/// was asked to run, and that the test passed.
+///
+/// Four assertions, because each catches a vacuity the others do not:
+///
+/// - `status.success()` alone is satisfied by a run that executed nothing at
+///   all — a libtest filter matching no test exits 0. This repo has already
+///   paid for that: `cargo test --exact <name>` is a false green on a
+///   misspelled name.
+/// - `test {name} ... ok` proves this specific test ran and passed, rather
+///   than some other test the filter happened to match.
+/// - `1 passed` proves exactly one did. A misspelled filter yields
+///   `0 passed`, which the line above would not catch on its own if the name
+///   were also absent from the summary.
+/// - a NON-ZERO `filtered out` count proves the binary contained other tests
+///   that the filter excluded. A count of zero is consistent with a binary
+///   holding only this one test, in which case the filter proved nothing.
+///
+/// The child's full stdout and stderr are printed in every failure message:
+/// libtest captured the child's output, so a child failure is otherwise
+/// invisible from the parent.
+pub(crate) fn assert_child_ran_exactly_one_passing_test(
+    out: &std::process::Output,
+    test_name: &str,
+) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let context = format!(
+        "\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}\
+         \n--- end child output ---"
+    );
+
+    assert!(
+        out.status.success(),
+        "child test process must exit 0; status {status:?}{context}",
+        status = out.status
+    );
+    assert!(
+        stdout.contains(&format!("test {test_name} ... ok")),
+        "child stdout must carry `test {test_name} ... ok` — without it the \
+         child may have run some other test, or none{context}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "child must report exactly `1 passed`{context}"
+    );
+
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    let filtered_out: u64 = words
+        .windows(3)
+        .find(|w| w[1] == "filtered" && w[2].starts_with("out"))
+        .and_then(|w| w[0].parse().ok())
+        .unwrap_or_else(|| {
+            panic!("child stdout must carry a parseable `N filtered out` count{context}")
+        });
+    assert!(
+        filtered_out > 0,
+        "child must report a NON-ZERO `filtered out` count — zero is \
+         consistent with a binary containing only this test, in which case \
+         the filter proved nothing; got {filtered_out}{context}"
+    );
 }
 
 /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
@@ -455,29 +591,24 @@ pub(crate) fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir
     dir
 }
 
-pub(crate) fn stub_agent_binary(name: &str) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(name);
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
-    dir
-}
-
-/// Prefix `PATH` with `stub_dir`, keeping the rest of `original` intact
-/// so `sh`/`git` still resolve normally — only the stubbed binary name
-/// is shadowed (it is found first).
-pub(crate) fn prepend_path(
-    stub_dir: &tempfile::TempDir,
-    original: &Option<std::ffi::OsString>,
-) -> std::ffi::OsString {
-    let mut dirs = vec![stub_dir.path().to_path_buf()];
-    if let Some(original) = original {
-        dirs.extend(std::env::split_paths(original));
-    }
-    std::env::join_paths(dirs).unwrap()
+/// A `claude` stand-in that answers `--version`, then waits for `go` in
+/// its working directory (the project root) and exits 0, with `sleep`
+/// linked beside it so the wait works under the replaced PATH.
+pub(crate) fn go_waiting_claude_dir() -> tempfile::TempDir {
+    let path_dir = agent_free_dir_with_agent_stub("claude");
+    std::fs::write(
+        path_dir.path().join("claude"),
+        "#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; esac\n\
+         while [ ! -e go ]; do sleep 0.05; done\nexit 0\n",
+    )
+    .unwrap();
+    let real_sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .expect("sleep must exist to run this test");
+    std::os::unix::fs::symlink(real_sleep, path_dir.path().join("sleep")).unwrap();
+    path_dir
 }
 
 /// Count `stage_launched` events recorded for `phase` across the WHOLE
@@ -495,28 +626,60 @@ pub(crate) fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
         .count()
 }
 
-/// The single reap mechanism: escalate through `terminate_and_verify`
-/// (bounded TERM-then-KILL — 999.44 measured 15 of 15 orphaned monitor
-/// wrappers surviving a bare `SIGTERM` against this exact process shape, so
-/// an unescalated signal would leave the leak in place while appearing to
-/// fix it), then return a VERIFIED liveness answer.
+/// How long a reaper waits for a supervisor's final shutdown line.
+const REAP_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The single reap mechanism (D-07): end a launched run through its
+/// supervisor's socket, then return a VERIFIED answer about its agent group.
+///
+/// 1. `supervisor::request_shutdown` on the recorded socket, bounded by
+///    [`REAP_SHUTDOWN_WAIT`]. A supervisor that answers ends its agent group
+///    itself.
+/// 2. If the recorded agent group's leader is still the process the record
+///    names (`agent::is_same_process` against its start time), SIGKILL the
+///    whole group. This covers a socket that does not answer (a SIGKILLed
+///    supervisor, or a record whose socket never existed); the identity
+///    check keeps a recycled pid from ever being signalled.
+/// 3. Poll until the leader is gone (a zombie counts as gone) or
+///    `agent::TERMINATE_VERIFY_WAIT` passes.
 ///
 /// Asserts nothing and panics on no path — the caller decides what a `false`
-/// means. This matters because one of its two callers
-/// ([`ReapMonitorOnDrop::drop`]) may run during a stack unwind, where a
-/// panic would call `abort()` and kill the whole test binary instead of
-/// merely failing the one test in flight.
-fn reap_monitor_pid(pid: u32) -> bool {
-    devflow_core::agent::terminate_and_verify(
-        pid,
-        devflow_core::agent::TERMINATE_VERIFY_WAIT,
-        devflow_core::agent::TERMINATE_VERIFY_POLL,
-    );
-    !devflow_core::agent::agent_running(pid)
+/// means. This matters because one of its callers ([`ReapMonitorOnDrop::drop`])
+/// may run during a stack unwind, where a panic would call `abort()` and kill
+/// the whole test binary instead of merely failing the one test in flight.
+fn reap_supervised_run(record: &SupervisorRecord) -> bool {
+    let _ = devflow_core::supervisor::request_shutdown(&record.socket_path, REAP_SHUTDOWN_WAIT);
+    let leader = record.agent_pgid;
+    let alive = || {
+        devflow_core::agent::agent_running(leader)
+            && devflow_core::agent::is_same_process(leader, record.agent_start_time)
+    };
+    if alive() {
+        signal_group(leader, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + devflow_core::agent::TERMINATE_VERIFY_WAIT;
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(devflow_core::agent::TERMINATE_VERIFY_POLL);
+    }
+    !alive()
 }
 
-/// Reap the detached monitor wrapper a real `launch_stage_inner` call just
-/// spawned, verifying its death rather than assuming it (WR-03, 999.46).
+/// Send `signal` to process group `pgid`. Refuses pgid 0 or 1, a value that
+/// does not fit `pid_t`, and this process's own group.
+fn signal_group(pgid: u32, signal: libc::c_int) {
+    let Ok(signed) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    if signed > 1 && signed != unsafe { libc::getpgrp() } {
+        // SAFETY: `signed > 1` and not our own group: this names one process
+        // group whose leader the caller has just identity-checked.
+        unsafe { libc::kill(-signed, signal) };
+    }
+}
+
+/// Reap the supervised run a real `launch_stage_inner` call just launched,
+/// verifying its agent group's end rather than assuming it (WR-03, 999.46).
 ///
 /// This plain-call form runs ONLY if every preceding statement in its caller
 /// returned normally — a panic anywhere between the launch and this call
@@ -528,61 +691,47 @@ fn reap_monitor_pid(pid: u32) -> bool {
 /// `tests::trailing_reap_call_is_skipped_when_a_later_assertion_panics`,
 /// which exists precisely to demonstrate this failure mode.
 ///
-/// Any test that drives a real `launch_stage_inner` causes it to spawn a
-/// detached monitor wrapper (`monitor::spawn_monitor`) that is DESIGNED to
-/// outlive the call that spawned it — that is exactly what lets a real
-/// `devflow start` invocation return while the monitor keeps watching the
-/// agent. A test that drives the same call path gets the same detached
-/// wrapper, and since nothing else in a test's lifetime ever signals it, the
-/// TEST is the only thing that ever could — so the test owns reaping it.
+/// Any test that drives a real `launch_stage_inner` causes it to start a
+/// detached supervisor that is DESIGNED to outlive the call that started it;
+/// the TEST is the only thing that ever could end it, so the test owns
+/// reaping it.
 ///
-/// The pid to reap comes from `state.monitor_pid` on the same `&mut State`
-/// the caller handed to `launch_stage_inner` — the only on-disk-free handle a
-/// test has on what it just caused to exist (`pipeline_launch.rs` writes the
-/// spawned pid there immediately after `monitor::spawn_monitor` returns).
-/// This function never scans `/proc`, never guesses, and never signals a pid
-/// it did not read from that same handle.
+/// The handle comes from `state.supervisor` on the same `&State` the caller
+/// handed to the launch (`spawn_agent_and_record` records the ping-confirmed
+/// record there). This function never scans `/proc`, never guesses, and
+/// signals only the group that record names, after its identity check.
 ///
-/// Must be called BEFORE the caller's `TempDir` guard drops — reaping after
-/// the project root has already been deleted is 999.44's reproduction shape
-/// with extra steps, not a fix for it.
-///
-/// Tolerates `state.monitor_pid == None` by returning quietly, with no
-/// `unwrap`, no `expect` and no panic: an early-failing `launch_stage_inner`
-/// clears the field before any fallible step (`pipeline_launch.rs:70`), and a
-/// teardown helper that panics on that path would mask the launch's own
-/// failure rather than merely fail to clean up after it.
+/// Must be called BEFORE the caller's `TempDir` guard drops. Tolerates a
+/// state with no supervisor record by returning quietly: an early-failing
+/// launch never recorded one, and a teardown helper that panics on that path
+/// would mask the launch's own failure.
 pub(crate) fn reap_spawned_monitor(state: &State) {
-    let Some(pid) = state.monitor_pid else {
+    let Some(record) = state.supervisor.as_ref() else {
         return;
     };
     assert!(
-        reap_monitor_pid(pid),
-        "monitor wrapper pid {pid}, spawned by this test's own launch_stage_inner call, must be \
-         verified dead after reaping — not merely assumed dead"
+        reap_supervised_run(record),
+        "agent group {}, launched by this test's own launch_stage_inner call, must be \
+         verified gone after reaping through {} — not merely assumed gone",
+        record.agent_pgid,
+        record.socket_path.display()
     );
 }
 
-/// RAII guard that reaps a spawned monitor wrapper on EVERY exit path of the
-/// scope it is bound in — including a path on which a later assertion
-/// panics. This is the fix for G-25-2 / WINDOWS.md item 3: a plain trailing
-/// call to [`reap_spawned_monitor`] only runs on the success path, since Rust
+/// RAII guard that reaps a launched run on EVERY exit path of the scope it
+/// is bound in — including a path on which a later assertion panics. This is
+/// the fix for G-25-2 / WINDOWS.md item 3: a plain trailing call to
+/// [`reap_spawned_monitor`] only runs on the success path, since Rust
 /// abandons the rest of a function's statements the instant a panic begins
 /// unwinding, so it is the language's own `Drop` guarantee — not a call
 /// ordering convention — that makes the reap unconditional.
 pub(crate) struct ReapMonitorOnDrop {
-    pid: Option<u32>,
+    record: Option<SupervisorRecord>,
 }
 
 impl ReapMonitorOnDrop {
-    /// Capture `state.monitor_pid` BY VALUE, not `&'a State`.
-    ///
-    /// By value: at every call site this guard is bound strictly AFTER the
-    /// test's final `&mut state` use, so a borrow would not conflict with
-    /// anything at that point — but a `&'a State` guard would still tie the
-    /// guard's lifetime to the `State` binding's own scope, which is exactly
-    /// the kind of incidental coupling a teardown guard should not have. A
-    /// bare `Option<u32>` keeps the guard independent of `State` entirely.
+    /// Capture `state.supervisor` BY VALUE, not `&'a State`, so the guard
+    /// stays independent of the `State` binding's own scope.
     ///
     /// Named `after_launch`, not `new`: bound before the launch call
     /// returns, it captures `None` and silently does nothing — the
@@ -590,17 +739,17 @@ impl ReapMonitorOnDrop {
     /// rather than leaving it to a doc comment alone.
     pub(crate) fn after_launch(state: &State) -> Self {
         Self {
-            pid: state.monitor_pid,
+            record: state.supervisor.clone(),
         }
     }
 }
 
 impl Drop for ReapMonitorOnDrop {
     fn drop(&mut self) {
-        let Some(pid) = self.pid else {
+        let Some(record) = self.record.as_ref() else {
             return;
         };
-        if !reap_monitor_pid(pid) {
+        if !reap_supervised_run(record) {
             // The check below is the double-panic interlock — the ONLY
             // thing standing between "an assertion failed" and "the whole
             // test binary aborted". A `Drop` that panics while an unwind is
@@ -621,17 +770,97 @@ impl Drop for ReapMonitorOnDrop {
                 use std::io::Write as _;
                 let _ = writeln!(
                     std::io::stderr(),
-                    "ReapMonitorOnDrop: monitor wrapper pid {pid} still alive after reap \
-                     during an unwind — not re-panicking because a panic is already in flight"
+                    "ReapMonitorOnDrop: agent group {} still alive after reap \
+                     during an unwind — not re-panicking because a panic is already in flight",
+                    record.agent_pgid
                 );
             } else {
                 panic!(
-                    "monitor wrapper pid {pid}, spawned by this test's own launch call, must be \
-                     verified dead after reaping — not merely assumed dead"
+                    "agent group {}, launched by this test's own launch call, must be \
+                     verified gone after reaping through {} — not merely assumed gone",
+                    record.agent_pgid,
+                    record.socket_path.display()
                 );
             }
         }
     }
+}
+
+/// Parse the `__monitor` argv a [`MonitorExec::HarnessEntry`] re-exec put in
+/// [`MONITOR_ARGV_ENV`] and run it as `main` dispatches `__monitor`, with or
+/// without the advance tail. Returns without doing anything when the variable
+/// is absent, so a run of ignored tests that reaches an entry is a no-op.
+///
+/// [`MonitorExec::HarnessEntry`]: devflow_core::monitor::MonitorExec::HarnessEntry
+/// [`MONITOR_ARGV_ENV`]: devflow_core::monitor::MONITOR_ARGV_ENV
+fn run_monitor_harness_entry(advance: bool) {
+    use clap::Parser as _;
+    let Some(encoded) = std::env::var_os(devflow_core::monitor::MONITOR_ARGV_ENV) else {
+        return;
+    };
+    let encoded = encoded
+        .into_string()
+        .expect("the monitor argv must be UTF-8 JSON");
+    let after_subcommand: Vec<String> =
+        serde_json::from_str(&encoded).expect("the monitor argv must be a JSON array of strings");
+    let argv = ["devflow", "__monitor"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(after_subcommand);
+    let cli = crate::Cli::try_parse_from(argv).expect("the monitor argv must parse as __monitor");
+    let crate::Command::Monitor {
+        project,
+        phase,
+        stage,
+        workdir,
+        agent,
+        launch,
+        socket,
+        launch_id,
+        liveness_fd,
+        keep_env,
+        prompt_file,
+        idle_timeout_secs,
+        argv,
+    } = cli.command
+    else {
+        panic!("the monitor argv parsed as a command other than __monitor");
+    };
+    let invocation = crate::pipeline_launch::MonitorInvocation {
+        project_root: crate::project_root(project).expect("monitor project root"),
+        phase,
+        stage,
+        workdir,
+        agent,
+        launch,
+        socket,
+        launch_id,
+        liveness_fd,
+        keep_env,
+        prompt_file,
+        idle_timeout_secs,
+        argv,
+    };
+    crate::pipeline_launch::run_monitor(&invocation, advance)
+        .expect("the harness-entry monitor must supervise its agent");
+}
+
+/// The test build's full monitor entry (50-10): `run_monitor` exactly as the
+/// `__monitor` subcommand runs it, advance tail included. Selected by
+/// `pipeline_launch::launch_context` when `DEVFLOW_TEST_MONITOR_FULL=1`.
+#[test]
+#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
+fn monitor_entry_full() {
+    run_monitor_harness_entry(true);
+}
+
+/// The test build's default monitor entry (50-10): `run_monitor`'s
+/// supervision without its advance tail, so an in-crate launch supervises its
+/// fake agent and leaves the stage machine where the test put it.
+#[test]
+#[ignore = "monitor re-exec entry; run only by spawn_monitor under cfg(test)"]
+fn monitor_entry_supervise_only() {
+    run_monitor_harness_entry(false);
 }
 
 #[cfg(test)]
@@ -642,66 +871,98 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::process::Command;
 
-    /// NC-1 (35-VALIDATION.md), and the reason it is load-bearing rather than
-    /// ceremony: criteria 1 and 6 both assert on behaviour that occurs ONLY
-    /// when `git` cannot be executed. If [`NoGitPath`] silently failed to take
-    /// effect — wrong `PATH` ordering, a guard dropped early, an absolute-path
-    /// `git` invocation — every downstream assertion would still run and every
-    /// one of them would pass for the wrong reason. This test is the only
-    /// thing standing between that and a green suite over an unfixed defect,
-    /// which is why it must pass before any criterion-1 or criterion-6 result
-    /// is believed.
+    /// NC-1 (35-VALIDATION.md), relocated into a CHILD PROCESS by 46-06
+    /// (review finding C-01), and the reason it is load-bearing rather than
+    /// ceremony: several tests assert on behaviour that occurs ONLY when
+    /// `git` cannot be executed. If the mechanism that hides `git` silently
+    /// failed to take effect — wrong `PATH` ordering, a child that never ran,
+    /// an absolute-path `git` invocation — every downstream assertion would
+    /// still run and every one of them would pass for the wrong reason. This
+    /// test is the only thing standing between that and a green suite over an
+    /// unfixed defect, which is why it must pass before any result that
+    /// depends on unrunnable `git` is believed.
     ///
-    /// The control is inside the test: the pre-guard call must succeed and the
-    /// post-drop call must succeed, so a guard that did nothing at all cannot
-    /// produce a green result here — all three observations would agree, and
-    /// the middle assertion would fail.
+    /// **Named for the property, not the former mechanism.** The deleted
+    /// guard's name remains only in git history, so the source-tree scan for
+    /// it stays a true zero.
+    ///
+    /// **The proof is in BOTH directions, and one direction alone is not a
+    /// measurement.** The child asserts `git` does NOT resolve; the parent
+    /// asserts it DOES, both before the child is spawned and after it
+    /// returns. A child that failed to spawn `git` for some unrelated reason,
+    /// or a helper that ran nothing at all, would look identical from the
+    /// failing side — and a parent whose own `PATH` had been mutated would
+    /// look identical from the passing side.
+    ///
+    /// **`ErrorKind::NotFound` specifically, not merely `is_err()`.**
+    /// `Command::output()` returns `Err(NotFound)` when the program cannot be
+    /// SPAWNED, whereas a `git` that runs and exits non-zero returns
+    /// `Ok(status)`. Accepting any error kind would accept a guard that
+    /// blocked `git` for the wrong reason.
     ///
     /// `git` is invoked through `devflow_core::test_support::git_command`, the
     /// same PATH-resolved constructor production code uses (`git.rs`'s
     /// `git_command` -> `hermetic_command` -> `Command::new("git")`), so this
     /// measures the harness against the real spawn path rather than an
     /// approximation of it.
+    ///
+    /// Takes `env_lock()` although it mutates nothing: the PARENT half resolves
+    /// `git` through the process `PATH` twice and asserts that `PATH` is
+    /// byte-identical across the child run, while sibling tests still replace
+    /// `PATH` under `ENV_MUTEX` (999.38). Without the lock a sibling's stub
+    /// directory can land between those reads and fail this test for a reason
+    /// unrelated to the harness, as a full `check.sh test` run did on 2026-09-11.
     #[test]
-    fn no_git_path_makes_git_unresolvable_and_restores_it() {
-        let _guard = env_lock();
+    fn an_empty_path_child_cannot_resolve_git_while_the_parent_still_can() {
+        const NAME: &str = "test_support::tests::\
+                            an_empty_path_child_cannot_resolve_git_while_the_parent_still_can";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, set by the parent on
+            // this process's `Command` only.
+            let err = devflow_core::test_support::git_command(&root)
+                .arg("--version")
+                .output()
+                .expect_err("the child's empty PATH must make `git` unresolvable");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::NotFound,
+                "the spawn must fail because the binary cannot be FOUND — any \
+                 other kind means `git` was blocked for the wrong reason"
+            );
+            return;
+        }
+
+        // PARENT half.
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path_before = std::env::var_os("PATH");
 
-        let before = devflow_core::test_support::git_command(dir.path())
-            .arg("--version")
-            .output();
         assert!(
-            before.is_ok(),
-            "control: `git` must be resolvable BEFORE the guard is installed, \
-             otherwise the middle assertion below proves nothing"
-        );
-
-        let during = {
-            let _no_git = NoGitPath::install();
             devflow_core::test_support::git_command(dir.path())
                 .arg("--version")
                 .output()
-        };
-        let err = during.expect_err("NoGitPath must make `git` unresolvable");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::NotFound,
-            "the spawn must fail because the binary cannot be found — any other \
-             error kind means the guard blocked git for the wrong reason"
+                .is_ok(),
+            "control: `git` must be resolvable in the parent BEFORE the child \
+             is spawned, otherwise the child's failure proves nothing"
         );
 
-        let after = devflow_core::test_support::git_command(dir.path())
-            .arg("--version")
-            .output();
+        let out = run_test_without_git(NAME, dir.path());
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
+
         assert!(
-            after.is_ok(),
-            "control: `git` must be resolvable again once the guard has dropped"
+            devflow_core::test_support::git_command(dir.path())
+                .arg("--version")
+                .output()
+                .is_ok(),
+            "control: `git` must still be resolvable in the parent AFTER the \
+             child returns — the whole point of the child is that the parent's \
+             own PATH is never touched"
         );
         assert_eq!(
             std::env::var_os("PATH"),
             path_before,
-            "PATH must be byte-identical to its pre-guard value after the guard drops"
+            "the parent's PATH must be byte-identical across the child run"
         );
     }
 
@@ -722,9 +983,13 @@ mod tests {
 
     impl ChildGuard {
         fn spawn() -> Self {
+            use std::os::unix::process::CommandExt as _;
+            // Its own process group, as a launched agent is (R-3), so the
+            // reapers' identity-confirmed group fallback has a real subject.
             Self(
                 Command::new("sleep")
                     .arg("300")
+                    .process_group(0)
                     .spawn()
                     .expect("sleep must be spawnable to run this test"),
             )
@@ -742,9 +1007,11 @@ mod tests {
         }
     }
 
-    /// A `State` whose only relevant field is `monitor_pid`. No I/O occurs —
-    /// the project root is never read, since nothing in the reap path
-    /// touches disk.
+    /// A `State` whose only relevant field is `supervisor`: a record whose
+    /// socket does not exist, naming `pid` (its own group leader) with its
+    /// real start time, so the reapers' shutdown finds nothing to ask and
+    /// they reach the identity-confirmed group fallback. No I/O occurs
+    /// beyond reading `pid`'s start time and boot id.
     fn state_holding(pid: u32) -> State {
         let mut state = State::new(
             PhaseId::new(0),
@@ -752,7 +1019,13 @@ mod tests {
             Mode::Auto,
             PathBuf::from("/nonexistent"),
         );
-        state.monitor_pid = Some(pid);
+        state.supervisor = Some(SupervisorRecord::new(
+            PathBuf::from("/nonexistent/reap-fixture.sock"),
+            "reapfixture00000".to_string(),
+            pid,
+            devflow_core::agent::process_start_time(pid).expect("the subject's start time"),
+            devflow_core::supervisor::boot_id().unwrap_or_default(),
+        ));
         state
     }
 

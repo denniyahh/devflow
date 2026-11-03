@@ -35,15 +35,31 @@ Two things this hook does that are load-bearing:
   hooks directory wholesale, so without that shim the command above would
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
+- `pre-commit` runs its own secret scan, `gitleaks git --pre-commit --staged
+  --redact`, on every commit, so **install
+  [gitleaks](https://github.com/gitleaks/gitleaks#installing)** before
+  setting `core.hooksPath`: without it on `PATH` the hook refuses the commit
+  rather than skip the scan. A finding refuses the commit with the secret
+  redacted; a false positive goes in `.gitleaksignore` by fingerprint.
 - [`scripts/hooks/commit-msg`](scripts/hooks/commit-msg) enforces Conventional
   Commit formats (`feat:`, `fix:`, `chore:`, etc.) on every commit subject and
   warns if the subject exceeds 72 characters, keeping git history and automated
-  changelog generation clean.
-- [`scripts/hooks/post-commit`](scripts/hooks/post-commit) warns when a commit
-  lands a plan `*-SUMMARY.md` while `.planning/STATE.md`'s authored prose still
-  describes an earlier wave. It only warns — it never edits a tracked file, so
-  it cannot break a plan's `git diff --name-only` scope fence. It delegates to a
-  prior `post-commit` the same way. Silent on commits that land no summary.
+  changelog generation clean. It also rejects a subject ending in a period.
+- `pre-commit` also refuses a `crates/**` commit made outside the active
+  phase's worktree (`scripts/lint-phase-worktree.sh`; set
+  `DEVFLOW_ALLOW_OFF_WORKTREE=1` when that is intended). It does nothing
+  without a `.planning/STATE.md`. `scripts/phase-worktree.sh <N>` creates the
+  worktree from your workspace branch.
+- `pre-push` also runs `scripts/check-workspace-divergence.sh` in a checkout
+  that carries `.workspace-divergence` (Workflow B): every difference from
+  `develop` must be declared there, and every hook and top-level script must be
+  committed executable.
+- `pre-commit` and `pre-push` each run any executables in
+  `scripts/hooks/pre-commit.d/` and `scripts/hooks/pre-push.d/`, in name order,
+  with the hook's arguments; the first failure fails the hook. `develop` ships
+  none. A personal workspace branch adds its own checks there as new files
+  instead of editing the shared hooks (see Workflow B). A `pre-push` drop-in
+  gets no stdin, because the hook has already read the ref list.
 
 ### Repository git policy
 
@@ -198,22 +214,46 @@ If you use AI agent harnesses (Claude Code, Codex, Antigravity, Hermes), custom 
 4. Submit a PR against `develop`.
 
 #### Workflow B: AI-Driven & Agent Workspace Contributions
-1. Keep your primary orchestrator/agent checkout on your personal workspace branch (`workspace/<handle>`).
-2. When creating code to submit upstream, develop inside a clean worktree branched from `develop`:
-   ```bash
-   git worktree add .worktrees/my-feature -b feature/my-feature develop
-   # or with tracked alias: git feature-start my-feature
-   ```
-3. Commit only source, test, and documentation changes in the feature worktree.
-4. Submit the PR from `feature/my-feature` into `develop`.
-5. After your PR is merged, sync upstream changes into your workspace branch without deleting your tracked personal artifacts:
+1. Keep your primary orchestrator/agent checkout on your personal workspace branch (`workspace/<handle>`). Ensure it is up to date:
    ```bash
    git checkout workspace/<handle>
-   git workspace-sync
-   # or run: ./scripts/sync-workspace.sh
-   git commit -m "chore: sync upstream develop into workspace"
+   ./scripts/sync-workspace.sh
+   ```
+2. Fork your feature worktree directly from `workspace/<handle>` using `workspace/<feature>` (e.g. `workspace/my-feature` or `workspace/<handle>-my-feature`) so agent harnesses, `.planning/`, and skills remain available without triggering hook rejections (avoid nested slashes like `workspace/<handle>/<feature>` due to Git ref D/F conflicts with the base branch):
+   ```bash
+   git worktree add .worktrees/my-feature -b workspace/my-feature workspace/<handle>
+   cd .worktrees/my-feature
+   ```
+3. Implement changes, run agent planning and verification, and commit code and planning artifacts freely.
+4. When ready to submit upstream, extract a clean, review-ready PR branch:
+   ```bash
+   ./scripts/cut-pr-branch.sh
+   # Cuts a pristine feature/my-feature branch off origin/develop,
+   # cherry-picks code commits, and strips personal/planning artifacts.
+   ```
+   On a DevFlow phase branch (`feature/phase-N`) it runs in phase mode: it replays the commits scoped to that phase (`feat(N-07): ...`), wherever they were committed, onto `feature/phase-N-pr`. It ends with a fidelity report; review any path it lists as differing from your branch.
+5. Test, push, and submit the clean PR:
+   ```bash
+   git checkout feature/my-feature
+   ./scripts/check-in-container.sh
+   git push -u origin feature/my-feature
+   gh pr create --base develop --head feature/my-feature
+   ```
+6. After your PR is merged upstream:
+   ```bash
+   # In your base checkout:
+   git checkout workspace/<handle>
+   # 1. Archive planning notes and verification records from the feature
+   git merge workspace/my-feature -m "chore: archive my-feature planning records"
+   # 2. Sync latest code from develop
+   ./scripts/sync-workspace.sh
+   # 3. Clean up the feature worktree and branch
+   git worktree remove .worktrees/my-feature
+   git branch -d workspace/my-feature
    git push origin workspace/<handle>
    ```
+
+   **Keeping the two tiers apart.** The workspace branch adds files; it does not edit files that `develop` also carries, except the ones it declares. Declare workspace-only paths and deliberately modified shared files in a committed, workspace-only `.workspace-divergence` file, one per line (`only <path>` or `modified <path>`). `cut-pr-branch.sh` never replays an `only` path. Put workspace-only hook checks in `scripts/hooks/pre-commit.d/` or `scripts/hooks/pre-push.d/` rather than editing the shared hooks. A per-checkout `devflow.toml` (for example `base_branch`) is ignored on `develop`; a workspace branch that tracks `.planning/` may track its own.
 
 ## Project Structure
 

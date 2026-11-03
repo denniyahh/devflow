@@ -25,7 +25,7 @@ stateDiagram-v2
 ## Persisted State
 
 State lives at `.devflow/state-NN.json`; an old single `.devflow/state.json`
-is migrated when read. The file records the current stage, phase, selected
+is not read. The file records the current stage, phase, selected
 agent, mode, gate status, start time, project root, and optional worktree.
 
 `auto` gates at Ship and on unexpected failures. `supervise` adds a Validate

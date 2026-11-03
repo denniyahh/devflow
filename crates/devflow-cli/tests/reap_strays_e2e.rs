@@ -43,15 +43,16 @@
 //! `gate_sweep_e2e.rs` document — the one CLI-level assertion this file
 //! does make (`devflow stop` reporting the deleted root as unreachable) is
 //! driven via the real compiled binary, exactly like those files.
+//!
+//! That one `devflow` child is built by `common::hermetic_devflow`, so it
+//! never reads or writes the operator's real `~/.cache/devflow` (999.141).
+
+mod common;
 
 use devflow_core::agent;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Poll `predicate` until it's true, panicking with `what` if `timeout_secs`
 /// elapses first — mirrors `stop_e2e.rs`'s `wait_for`.
@@ -125,6 +126,7 @@ fn spawn_monitor_wrapper_fixture(cwd: &Path) -> std::process::Child {
 /// discovery) and clear it with verified death.
 #[test]
 fn reap_clears_a_process_whose_root_was_deleted_which_devflow_stop_cannot_see() {
+    let home = common::HermeticHome::new();
     let (outer, root) = nested_root_fixture();
     let mut child = spawn_monitor_wrapper_fixture(&root);
     let pid = child.id();
@@ -159,7 +161,7 @@ fn reap_clears_a_process_whose_root_was_deleted_which_devflow_stop_cannot_see() 
     // deleted path, so it reports the process as unreachable -- neither
     // clearing it nor pretending the machine is otherwise clean by
     // signalling something else.
-    let stop_output = Command::new(devflow_bin())
+    let stop_output = common::hermetic_devflow(&home)
         .args(["stop", "--phase", "900", "--root"])
         .arg(&root)
         .output()

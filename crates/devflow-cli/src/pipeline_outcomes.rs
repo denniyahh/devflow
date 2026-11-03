@@ -19,8 +19,8 @@ use crate::pipeline_gate::{
     LoopBackReason, abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout,
     transition,
 };
-use crate::pipeline_launch::launch_stage;
-use devflow_core::gates::{GateAction, GateResponse, Gates};
+use crate::pipeline_launch::{close_gate, commit, launch_stage};
+use devflow_core::gates::{GateAction, GateResponse};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
 use devflow_core::phase_id::PhaseId;
@@ -30,7 +30,7 @@ use devflow_core::state::State;
 use devflow_core::{
     agent_result,
     agent_result::{AgentStatus, Verdict},
-    events, lock, workflow,
+    events, lock,
 };
 use std::path::{Path, PathBuf};
 
@@ -47,8 +47,9 @@ pub(crate) fn handle_infra_outcome(
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    state.infra_failures = state.infra_failures.saturating_add(1);
-    workflow::save_state(state)?;
+    commit(state, |s| {
+        s.infra_failures = s.infra_failures.saturating_add(1)
+    })?;
     gate_or_abort_infra(project_root, state, stage, reason)
 }
 
@@ -93,12 +94,12 @@ pub(crate) fn handle_rate_limited_outcome(
     reason: Option<String>,
 ) -> Result<(), CliError> {
     let retry_after = retry_after_from_reason(reason.as_deref());
-    let projected_infra_failures = state.infra_failures.saturating_add(1);
-    if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
-        return handle_infra_outcome(project_root, state, stage, reason);
+    commit(state, |s| {
+        s.infra_failures = s.infra_failures.saturating_add(1)
+    })?;
+    if state.infra_failures >= mode::MAX_INFRA_FAILURES {
+        return gate_or_abort_infra(project_root, state, stage, reason);
     }
-    state.infra_failures = projected_infra_failures;
-    workflow::save_state(state)?;
 
     let instructions =
         devflow_core::ship::build_single_agent_cron_instructions(project_root, phase, &retry_after);
@@ -368,9 +369,9 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
         // treated as stale. Without this, one rewrite would mark the artifact
         // fresh for the rest of the run.
         //
-        // F-11: this update does NOT reach disk through the `save_state`
-        // earlier in `handle_validate_outcome` — that one runs before this
-        // point. It is persisted a few statements later, by the `save_state`
+        // F-11: this update does NOT reach disk through the `commit`s
+        // earlier in `handle_validate_outcome` — those run before this
+        // point. It is persisted a few statements later, by the `commit`
         // inside `prepare_loop_back_to_code`, reached via the
         // `loop_back_to_code` call on the next line at every call site. A
         // process killed in that interval loses the update, and the
@@ -381,7 +382,7 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
         //
         // The window is ACCEPTED, not closed. It spans a handful of statements
         // with no blocking wait in it (the gate wait precedes this mutation),
-        // and the only alternative is a second `save_state` on every single
+        // and the only alternative is a second write on every single
         // loop-back — doubling the persistence cost of the common path to
         // defend an interval a kill can barely land in. Do not add one.
         // WR-06: both halves of the observation advance together, or the next
@@ -594,62 +595,68 @@ pub(crate) fn handle_validate_outcome(
         // resets it — a commit count cannot clear it, which is the whole
         // point: the Code stage's fix command is a GSD command that commits
         // `.planning/` artifacts on cycles that changed no source.
-        state.phase_validate_failures = state.phase_validate_failures.saturating_add(1);
-        match agent_result::phase_commit_count(
+        //
+        // Measured before the commit: it runs git, which a write-lock closure
+        // must not do.
+        let measured_commit_count = agent_result::phase_commit_count(
             project_root,
             &devflow_core::config::git_flow_for_project(project_root),
             state.phase,
-        ) {
-            Some(current) => {
-                if mode::consecutive_failures_made_progress(
-                    state.last_validate_failure_commit_count,
-                    current,
-                ) {
-                    // New commits landed since the last recorded failure —
-                    // this failure is the first of a new streak, not a
-                    // continuation. Set to 1, not 0: the gate context rendered
-                    // below interpolates the counter into a message naming how
-                    // many times validation has failed, and zeroing it would
-                    // make that message read zero on a real failure.
-                    state.consecutive_failures = 1;
-                } else {
-                    // Now that the counter genuinely accumulates (18d), an
-                    // unbounded loop could otherwise overflow it and wrap to
-                    // 0, silently restoring the unreachable-ceiling bug in a
-                    // slower form.
-                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        );
+        commit(state, |s| {
+            s.phase_validate_failures = s.phase_validate_failures.saturating_add(1);
+            match measured_commit_count {
+                Some(current) => {
+                    if mode::consecutive_failures_made_progress(
+                        s.last_validate_failure_commit_count,
+                        current,
+                    ) {
+                        // New commits landed since the last recorded failure —
+                        // this failure is the first of a new streak, not a
+                        // continuation. Set to 1, not 0: the gate context rendered
+                        // below interpolates the counter into a message naming how
+                        // many times validation has failed, and zeroing it would
+                        // make that message read zero on a real failure.
+                        s.consecutive_failures = 1;
+                    } else {
+                        // Now that the counter genuinely accumulates (18d), an
+                        // unbounded loop could otherwise overflow it and wrap to
+                        // 0, silently restoring the unreachable-ceiling bug in a
+                        // slower form.
+                        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+                    }
+                    // The baseline advances on every recorded failure whose count
+                    // was actually MEASURED, regardless of which branch ran above
+                    // — updating it only on the progress branch would let a stale
+                    // low baseline report progress forever.
+                    s.last_validate_failure_commit_count = Some(current);
                 }
-                // The baseline advances on every recorded failure whose count
-                // was actually MEASURED, regardless of which branch ran above
-                // — updating it only on the progress branch would let a stale
-                // low baseline report progress forever.
-                state.last_validate_failure_commit_count = Some(current);
+                // 999.77 / A-04: the count could not be measured. Treat the cycle
+                // as not-progress — an absent measurement is not evidence that
+                // work landed — and, crucially, do NOT touch the baseline. Writing
+                // a forged zero here is the defect: the next successful
+                // measurement would then compare a real count against that zero,
+                // read it as forward progress, and hand back one free reset of the
+                // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
+                // means the next real measurement compares against the last real
+                // observation.
+                //
+                // `mode::consecutive_failures_made_progress` is deliberately not
+                // called on this arm and its signature is deliberately not widened
+                // — there is no count to compare.
+                None => {
+                    s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+                }
             }
-            // 999.77 / A-04: the count could not be measured. Treat the cycle
-            // as not-progress — an absent measurement is not evidence that
-            // work landed — and, crucially, do NOT touch the baseline. Writing
-            // a forged zero here is the defect: the next successful
-            // measurement would then compare a real count against that zero,
-            // read it as forward progress, and hand back one free reset of the
-            // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
-            // means the next real measurement compares against the last real
-            // observation.
-            //
-            // `mode::consecutive_failures_made_progress` is deliberately not
-            // called on this arm and its signature is deliberately not widened
-            // — there is no count to compare.
-            None => {
-                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            }
-        }
-        workflow::save_state(state)?;
+        })?;
         // 35.2: stamp the nonce on every Validate failure so the
         // loop-back cycle below sees it. launch_stage_inner stamps on
         // the launch path; this stamps on the already-running path
         // where launch_stage_inner already ran for THIS dispatch.
-        state.verification_run_nonce =
-            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
-        workflow::save_state(state)?;
+        commit(state, |s| {
+            s.verification_run_nonce =
+                Some(s.verification_run_nonce.unwrap_or(0).saturating_add(1));
+        })?;
     }
 
     // F-6: read ONCE, and used for both the message's ceiling clause and the
@@ -733,13 +740,16 @@ pub(crate) fn handle_validate_outcome(
             // aborting is destructive and irreversible relative to gating and
             // would kill a phase that may be one cycle from converging.
             GateAction::Advance => {
-                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
                 transition(project_root, state, Stage::Ship)
             }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
+                // Reset first: its `commit` replaces `state`, so it must not run
+                // between this selection and the loop-back write that carries the
+                // observation the selection recorded in `state`.
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate)?;
                 let fix = select_loop_back_fix(&evidence_root, state.phase, state);
-                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
                 loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
             // No reset on abort: the phase is ending and `abort` clears its
@@ -771,8 +781,8 @@ pub(crate) fn handle_validate_outcome(
 /// The caller must never pass "a gate fired" here. Supervise gates on every
 /// Validate, so that would clear the total at every failure and the bound
 /// would never accumulate at all — an unbounded loop wearing a gate on every
-/// cycle. The persisting write is the caller's: both arms that call this go on
-/// to `transition` or `loop_back_to_code`, each of which saves state.
+/// cycle. The reset commits itself (D-08): `transition` and `loop_back_to_code`,
+/// which both arms go on to, write only their own fields.
 ///
 /// # Why the reset announces itself (WR-03, WR-04, 35-REVIEW)
 ///
@@ -785,18 +795,20 @@ pub(crate) fn handle_validate_outcome(
 ///
 /// So the pre-reset total is reported here, at the moment it is spent, on both
 /// channels. The alternative the review proposed — moving the reset after
-/// `loop_back_to_code` and adding a `save_state` — is NOT taken, and the reason
+/// `loop_back_to_code` and adding a write — is NOT taken, and the reason
 /// is specific: `loop_back_to_code` reaches `run_preflight`, which can `abort()`
 /// (clearing the phase's state file) and return `Ok(false)`, so a following
-/// `save_state` would resurrect the state file of an aborted phase as a phantom
-/// active run. Reporting rather than reordering keeps the existing single
-/// persisting write.
-fn reset_phase_failures_at_ceiling(project_root: &Path, state: &mut State, ceiling_gate: bool) {
+/// write would land on an aborted phase. The reset stays ahead of that call.
+fn reset_phase_failures_at_ceiling(
+    project_root: &Path,
+    state: &mut State,
+    ceiling_gate: bool,
+) -> Result<(), CliError> {
     if !ceiling_gate {
-        return;
+        return Ok(());
     }
     let spent = state.phase_validate_failures;
-    state.phase_validate_failures = 0;
+    commit(state, |s| s.phase_validate_failures = 0)?;
     events::emit(
         project_root,
         state.phase,
@@ -811,6 +823,7 @@ fn reset_phase_failures_at_ceiling(project_root: &Path, state: &mut State, ceili
          ceiling {} reached and answered by a human — the count restarts at zero",
         mode::MAX_PHASE_VALIDATE_FAILURES
     );
+    Ok(())
 }
 
 /// IN-02: map "was there a commit baseline when this Validate failure was
@@ -912,9 +925,8 @@ pub(crate) fn handle_stage_failure(
     );
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
-            // CR-01: clean up the stale gate/response/ack before retrying so
-            // the retry cannot silently consume the prior response.
-            let _ = Gates::cleanup(project_root, state.phase, stage);
+            // CR-01: close the gate before retrying; its answer is spent.
+            let _ = close_gate(project_root, state.phase, stage);
             state.gate_pending = false;
             launch_stage(state, None, Some(stage))
         }
@@ -923,7 +935,7 @@ pub(crate) fn handle_stage_failure(
             // target before planning exists for a Define/Plan failure
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
-            let _ = Gates::cleanup(project_root, state.phase, stage);
+            let _ = close_gate(project_root, state.phase, stage);
             launch_stage(state, None, Some(stage))
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -1022,6 +1034,36 @@ pub(crate) fn run_checkout_hooks(
     batch: &[hooks::Hook],
     stage: Stage,
 ) -> bool {
+    run_checkout_hooks_from(
+        project_root,
+        state,
+        batch,
+        stage,
+        &mut BatchProgress::default(),
+    )
+}
+
+/// How far a batch got, kept in memory across the retry passes of one finalization: the
+/// hooks that succeeded, and what `VersionBump` handed forward. A retry that reran them
+/// would cut a second release. `Merge` always reruns: it detects an up-to-date branch, and
+/// a repair committed for the retry must land. A repair merged after the tag is cut is not
+/// in the tagged commit. A retry in a later process starts over.
+#[derive(Debug, Default)]
+pub(crate) struct BatchProgress {
+    completed: usize,
+    shipped_version: Option<String>,
+    shipped_changelog_body: Option<String>,
+}
+
+/// [`run_checkout_hooks`], skipping the hooks `progress` has done and recording those it
+/// finishes.
+pub(crate) fn run_checkout_hooks_from(
+    project_root: &Path,
+    state: &State,
+    batch: &[hooks::Hook],
+    stage: Stage,
+    progress: &mut BatchProgress,
+) -> bool {
     if batch.is_empty() {
         return true;
     }
@@ -1077,15 +1119,25 @@ pub(crate) fn run_checkout_hooks(
         project_root: hook_root.clone(),
         stage,
         git_flow: git_flow.clone(),
-        shipped_version: None,
-        shipped_changelog_body: None,
+        shipped_version: progress.shipped_version.clone(),
+        shipped_changelog_body: progress.shipped_changelog_body.clone(),
     };
-    for hook in batch {
+    for (index, hook) in batch.iter().enumerate() {
+        if index < progress.completed && *hook != hooks::Hook::Merge {
+            continue;
+        }
         let outcome = hook.run(&mut ctx);
         if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
             all_succeeded = false;
         }
+        if all_succeeded {
+            progress.completed = progress.completed.max(index + 1);
+        }
+        progress.shipped_version.clone_from(&ctx.shipped_version);
+        progress
+            .shipped_changelog_body
+            .clone_from(&ctx.shipped_changelog_body);
         events::emit(
             project_root,
             state.phase,
@@ -1108,6 +1160,7 @@ pub(crate) fn run_checkout_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use devflow_core::gates::Gates;
     // Test-only: production code resolves its branch model from the
     // project (45-01), so the defaults survive here as fixture input only.
     use crate::pipeline_gate::prepare_loop_back_to_code;
@@ -1118,6 +1171,8 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::prompt;
     use devflow_core::state::AgentKind;
+    use devflow_core::test_support::{answer_open_gate, gate_answer_files, preanswer_gate};
+    use devflow_core::workflow;
 
     /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
     /// must be SKIPPED — never run unserialized against the shared checkout
@@ -1131,6 +1186,11 @@ mod tests {
     /// affects a concurrent test if it is actually contended, which none are
     /// (no other test holds the project lock).
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -1280,12 +1340,11 @@ mod tests {
     /// only thing that differs is `State::base_branch`.
     #[test]
     fn checkout_hooks_merge_into_the_persisted_base_not_the_ambient_default() {
-        // This test shells out to `git`, and sibling tests in this binary
-        // blank process-global `PATH` via `NeutralPath::install`, whose
-        // documented precondition is that the caller holds `ENV_MUTEX`.
-        // Without taking the same lock, a concurrent `NeutralPath` window
-        // makes every `git` spawn here fail with `NotFound` — a real,
-        // observed flake, not a theoretical one.
+        // This test shells out to `git`. Sibling fixtures now supply an empty
+        // PATH only on their child `Command`, so this parent cannot observe a
+        // concurrent PATH change. The retained shared lock follows the
+        // one-mutex-per-variable rule while other process-global mutations are
+        // still deferred.
         let _env = crate::test_support::env_lock();
 
         // Returns the branch the phase work actually landed on.
@@ -1390,13 +1449,15 @@ mod tests {
         // Pre-write a rejected response whose note says "abort" so
         // `GateAction::from_response` resolves to `Abort` rather than a
         // loop-back-to-Code.
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
@@ -1411,6 +1472,85 @@ mod tests {
         );
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// A Validate failure at the threshold, ready for `handle_validate_outcome` to
+    /// open the Validate gate.
+    fn state_one_failure_from_the_validate_gate(root: &Path, phase: PhaseId) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        state.last_validate_failure_commit_count = Some(0);
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// The pre-answer seam through the real waiter (`run_gate` and its poll, no
+    /// supervisor): the answer written before the gate opens decides that gate, and
+    /// no answer outlives it. Control in the same run: a pre-answer for another
+    /// stage decides nothing, so that gate times out with the pre-answer still
+    /// waiting. Runs in a child so the short gate timeout never touches this process.
+    #[test]
+    fn a_preanswered_gate_is_decided_by_its_preanswer_through_the_real_waiter() {
+        const NAME: &str = "pipeline_outcomes::tests::a_preanswered_gate_is_decided_by_its_preanswer_through_the_real_waiter";
+        const ABORT_NOTE: &str = "abort: decided by the pre-answer";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[("DEVFLOW_GATE_TIMEOUT_SECS", std::ffi::OsStr::new("1"))],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+        let abort = devflow_core::gates::GateResponse {
+            approved: false,
+            note: Some(ABORT_NOTE.to_string()),
+            responded_by: Some("test".to_string()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let decided = PhaseId::new(4701);
+        let mut state = state_one_failure_from_the_validate_gate(root, decided);
+        preanswer_gate(root, decided, Stage::Validate, &abort);
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
+
+        let err = workflow::load_state(root, decided).unwrap_err();
+        assert!(
+            matches!(err, workflow::WorkflowError::MissingState(_)),
+            "the abort must clear the state, got {err:?}"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, decided).unwrap();
+        assert_eq!(last["event"], "workflow_aborted", "{last}");
+        assert_eq!(last["reason"], ABORT_NOTE, "{last}");
+        assert!(
+            gate_answer_files(root, decided, Stage::Validate).is_empty(),
+            "no answer may outlive the gate it decided"
+        );
+        assert!(
+            !Gates::preanswer_path(root, decided, Stage::Validate).exists(),
+            "the gate that opened must have taken the pre-answer"
+        );
+
+        let undecided = PhaseId::new(4702);
+        let mut state = state_one_failure_from_the_validate_gate(root, undecided);
+        preanswer_gate(root, undecided, Stage::Code, &abort);
+        let waited = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed)
+            .expect_err("a pre-answer for Code must not decide the Validate gate");
+        assert!(
+            waited.to_string().contains("timed out"),
+            "the Validate gate must wait until its timeout, got: {waited}"
+        );
+        assert!(
+            Gates::preanswer_path(root, undecided, Stage::Code).exists(),
+            "the Code pre-answer must still be waiting for a Code gate"
+        );
+        assert!(
+            workflow::load_state(root, undecided).is_ok(),
+            "the Code pre-answer must not have aborted the run"
+        );
     }
 
     /// Seed a Validate-stage DEVFLOW_RESULT marker (with the given verdict
@@ -1429,6 +1569,17 @@ mod tests {
         consecutive_failures: u32,
         verdict_json: Option<&str>,
     ) -> String {
+        // 999.80 / T-48-08-01, FIRST statement: this helper writes an abort
+        // fixture, and a magic substring in a JSON note is the only thing
+        // keeping the gate it drives off `launch_stage`. Reword that note or
+        // change the response parser and the gate resolves as LoopBack
+        // instead, which spawns whatever `claude` the developer has on PATH.
+        // Refusing outside a child makes the protection structural rather
+        // than a property of the fixture's text.
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "drive_validate_advance_and_read_gate_context must run inside a child test with an agent-free PATH (999.80)"
+        );
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = consecutive_failures;
@@ -1448,7 +1599,6 @@ mod tests {
         std::fs::write(agent_result::stdout_path(root, phase), marker).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Validate);
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
         let mut context = String::new();
 
         std::thread::scope(|scope| {
@@ -1471,10 +1621,14 @@ mod tests {
 
             context = std::fs::read_to_string(&gate_path).unwrap();
 
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -1488,6 +1642,17 @@ mod tests {
     /// `handle_validate_outcome`'s failure path (gate/loop), never Ship.
     #[test]
     fn validate_gaps_does_not_advance_to_ship() {
+        // Converted with the helper it calls:
+        // `drive_validate_advance_and_read_gate_context` now refuses to run
+        // outside a child (999.80).
+        const NAME: &str = "pipeline_outcomes::tests::validate_gaps_does_not_advance_to_ship";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
@@ -1508,6 +1673,17 @@ mod tests {
     /// closes the marker-less/verdict-less Validate → Ship false-advance.
     #[test]
     fn validate_missing_verdict_does_not_advance() {
+        // Converted with the helper it calls:
+        // `drive_validate_advance_and_read_gate_context` now refuses to run
+        // outside a child (999.80).
+        const NAME: &str = "pipeline_outcomes::tests::validate_missing_verdict_does_not_advance";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
@@ -1530,6 +1706,17 @@ mod tests {
     /// `transition`/`launch_stage` spawn.
     #[test]
     fn validate_pass_advances() {
+        // Converted with the helper it calls:
+        // `drive_validate_advance_and_read_gate_context` now refuses to run
+        // outside a child (999.80).
+        const NAME: &str = "pipeline_outcomes::tests::validate_pass_advances";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
@@ -1556,7 +1743,13 @@ mod tests {
     /// mutation survives regardless of the launch outcome.
     #[test]
     fn external_verify_agreement_advances_to_ship() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::external_verify_agreement_advances_to_ship";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1573,32 +1766,36 @@ mod tests {
             summary: None,
             verdict: Some(Verdict::Pass),
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert_eq!(outcome, ValidateOutcome::Passed);
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let _ = handle_validate_outcome(root, &mut state, outcome);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert_eq!(state.stage, Stage::Ship);
         assert_eq!(
             state.consecutive_failures, 0,
             "an agreeing outcome must never touch the failure counter"
         );
+    }
+
+    /// The negative control for every `CHILD_TEST_ENV` assertion added by this
+    /// plan (D-10).
+    ///
+    /// Counting guarded functions proves only that the keyword is present; it
+    /// cannot show the guard FIRES. This calls a guarded helper directly in
+    /// the parent — where the developer's real `PATH` is live — and requires
+    /// the panic. `expected` is a substring of the helper's own assertion
+    /// message, so it cannot be satisfied by an unrelated panic on the way.
+    #[test]
+    #[should_panic(expected = "must run inside a child test")]
+    fn abort_fixture_helper_refuses_to_run_outside_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately called from the PARENT, with no child marker set. The
+        // arguments are irrelevant: the assertion is this helper's first
+        // statement, so it panics before touching any of them.
+        let _ = drive_validate_advance_and_read_gate_context(dir.path(), PhaseId::new(1), 0, None);
     }
 
     /// D-18e's disagreement arm: the probe passes but the agent reports
@@ -1610,6 +1807,15 @@ mod tests {
     /// ever launched.
     #[test]
     fn external_verify_disagreement_gates_immediately() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::external_verify_disagreement_gates_immediately";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(91);
@@ -1625,17 +1831,20 @@ mod tests {
             summary: None,
             verdict: Some(Verdict::Gaps),
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, outcome).unwrap();
 
@@ -1654,6 +1863,14 @@ mod tests {
     /// — `consecutive_failures` must stay 0.
     #[test]
     fn external_verify_no_verdict_gates_immediately() {
+        const NAME: &str = "pipeline_outcomes::tests::external_verify_no_verdict_gates_immediately";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(92);
@@ -1669,17 +1886,20 @@ mod tests {
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, outcome).unwrap();
 
@@ -1720,6 +1940,7 @@ mod tests {
                 summary: None,
                 verdict: Some(Verdict::Pass),
                 decided_by_layer: Some(0),
+                checkpoint: None,
             };
             assert_eq!(
                 classify_validate_outcome(&result),
@@ -1771,6 +1992,7 @@ mod tests {
             summary: None,
             verdict,
             decided_by_layer: if layer0 { Some(0) } else { Some(1) },
+            checkpoint: None,
         }
     }
 
@@ -1941,6 +2163,15 @@ mod tests {
     /// an otherwise pure test for no additional coverage.
     #[test]
     fn grafted_failure_shape_gates_instead_of_shipping() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::grafted_failure_shape_gates_instead_of_shipping";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         // The POST-graft-fix shape.
         let post_fix =
             classify_validate_outcome(&classifier_fixture(true, AgentStatus::Success, None));
@@ -1979,13 +2210,15 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, post_fix).unwrap();
 
@@ -2009,6 +2242,14 @@ mod tests {
     /// the never-silent gate resolves immediately without a spawn thread.
     #[test]
     fn resource_killed_on_code_bumps_infra_failures_not_consecutive_failures() {
+        const NAME: &str = "pipeline_outcomes::tests::resource_killed_on_code_bumps_infra_failures_not_consecutive_failures";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(73);
@@ -2020,13 +2261,15 @@ mod tests {
         state.consecutive_failures = 1;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         advance(root, Some(phase)).unwrap();
 
@@ -2048,6 +2291,14 @@ mod tests {
     /// on-disk state file and gate artifacts).
     #[test]
     fn resource_killed_on_validate_bumps_infra_not_consecutive_failures() {
+        const NAME: &str = "pipeline_outcomes::tests::resource_killed_on_validate_bumps_infra_not_consecutive_failures";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(74);
@@ -2056,13 +2307,15 @@ mod tests {
         state.consecutive_failures = 2;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_infra_outcome(
             root,
@@ -2118,12 +2371,12 @@ mod tests {
     ///
     /// A gate response is re-seeded at the top of every loop iteration (not
     /// just once before the loop) so it survives `prepare_loop_back_to_code`'s
-    /// `Gates::cleanup(.., Stage::Validate)` — which fires on every ordinary
+    /// `Gates::close(.., Stage::Validate)` — which fires on every ordinary
     /// loop-back cycle once `state.stage` is `Validate` and would otherwise
-    /// delete a response written only once up front before the final,
+    /// remove a response written only once up front before the final,
     /// gate-triggering cycle ever gets to read it. With it re-seeded every
     /// iteration, the forced gate on the final cycle resolves immediately via
-    /// `Gates::poll_response` finding an already-written file, instead of
+    /// the gate wait finding an already-written file, instead of
     /// waiting out the (default 7-day) gate timeout. PATH is neutralized
     /// under `ENV_MUTEX` so neither `handle_validate_outcome`'s loop-back nor
     /// `transition()`'s own `launch_stage` call risk spawning a real agent
@@ -2131,7 +2384,14 @@ mod tests {
     /// approach.
     #[test]
     fn consecutive_failures_reaches_ceiling_across_cycles() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::consecutive_failures_reaches_ceiling_across_cycles";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2140,33 +2400,19 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
-        }
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
         }
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
@@ -2206,7 +2452,14 @@ mod tests {
     /// closes.
     #[test]
     fn healthy_multi_wave_progress_does_not_reach_the_ceiling() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::healthy_multi_wave_progress_does_not_reach_the_ceiling";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2217,37 +2470,23 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         for i in 0..(mode::MAX_CONSECUTIVE_FAILURES + 1) {
             // A real new commit BEFORE the failure is recorded, on every
             // cycle — the count observed at each failure strictly exceeds
             // the previously recorded baseline.
             commit_on_feature_branch(root, phase, &format!("wave-{i}"));
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
-        }
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
         }
 
         assert_eq!(
@@ -2284,7 +2523,13 @@ mod tests {
     /// change would not be controlling for anything.
     #[test]
     fn repeated_failure_without_new_commits_still_reaches_the_ceiling() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::repeated_failure_without_new_commits_still_reaches_the_ceiling";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2298,33 +2543,19 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
-        }
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
         }
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
@@ -2361,24 +2592,70 @@ mod tests {
     /// a real, non-zero value throughout, so a green result here cannot be
     /// explained by the branch changing underneath the test.
     ///
-    /// **`NoGitPath` for cycle 1, `NeutralPath` for cycle 2.** Cycle 1 needs
-    /// `git` to be UNRESOLVABLE — only a spawn that fails makes `.output()`
-    /// return `Err`, which is the sole could-not-measure condition (F-1); a
-    /// shim that ran and exited non-zero would be a real observation and would
-    /// exercise the already-correct `Some(0)` path (NC-4). Cycle 2 needs a
-    /// real `git` but still no resolvable agent CLI, which is exactly what
-    /// `NeutralPath`'s git-only `PATH` provides.
+    /// **A child for cycle 1, a command-local git-only PATH for cycle 2.**
+    /// Cycle 1 needs `git` to be UNRESOLVABLE — only a spawn that fails makes
+    /// `.output()` return `Err`, which is the sole could-not-measure condition
+    /// (F-1); a shim that ran and exited non-zero would be a real observation
+    /// and would exercise the already-correct `Some(0)` path (NC-4). The
+    /// child owns that empty `PATH`, so no sibling test can observe it. Cycle
+    /// 2 needs a real `git` but still no resolvable agent CLI, which is exactly
+    /// what a child `Command` with a git-only PATH provides without exposing it
+    /// to sibling tests.
     ///
-    /// **What this does NOT establish.** The run boundary. `State::new` zeroes
-    /// both `consecutive_failures` and the baseline on every `devflow start
-    /// --force`, and nothing here shows the streak surviving a restart.
+    /// **What this does NOT establish.** A forced-run boundary. `State::new`
+    /// zeroes both `consecutive_failures` and the baseline on every `devflow
+    /// start --force`; the save/load control below covers the child boundary,
+    /// not an entirely new run.
     #[test]
     fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            validate_failure_with_unmeasurable_count_accumulates_the_streak";
+        // Named once and referenced, never written as a literal inside the
+        // `var_os(...)` call — matching every other child-test root var in
+        // this crate. `doc_check::source_read_env_vars` flags a `DEVFLOW_*`
+        // name only when it appears as a string literal directly inside
+        // `std::env::var`/`var_os`/`env_value`, and then requires it to be in
+        // the scoped operator docs or `doc-check-allowlist.toml`. This is a
+        // test fixture root, not an operator-facing knob, so it belongs in
+        // neither. Inlining this constant back into the call below re-breaks
+        // `doc_check::source_devflow_env_vars_and_subcommands_are_documented`.
+        const ROOT_ENV: &str = "DEVFLOW_TEST_AGENT_FREE_ROOT";
+        let phase = PhaseId::new(89);
+
+        if devflow_core::test_support::in_child_test(NAME) {
+            let root = std::env::var_os(ROOT_ENV)
+                .map(std::path::PathBuf::from)
+                .expect("agent-free child receives the fixture root");
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            let _ = handle_validate_outcome(&root, &mut state, ValidateOutcome::Failed);
+            workflow::save_state(&state).unwrap();
+            return;
+        }
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD: run exactly the first cycle under an empty PATH, then
+            // persist its state for the parent to exercise the real cycle.
+            let mut state = workflow::load_state(&root, phase).unwrap();
+            let _ = handle_validate_outcome(&root, &mut state, ValidateOutcome::Failed);
+
+            assert_eq!(
+                state.last_validate_failure_commit_count,
+                Some(1),
+                "a cycle whose commit count could NOT be measured must leave the baseline \
+                 byte-identical to the last real observation — overwriting it with a forged \
+                 zero is 999.77 itself"
+            );
+            assert_eq!(
+                state.consecutive_failures, 2,
+                "an unmeasurable count is not evidence of forward progress, so the streak \
+                 must continue rather than restart"
+            );
+            workflow::save_state(&state).unwrap();
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = PhaseId::new(89);
         init_repo(root);
         // One real commit on the feature branch, and no further commits for
         // the rest of this test: the REAL count is a stable, non-zero 1.
@@ -2399,23 +2676,27 @@ mod tests {
         state.consecutive_failures = 1;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         let seed_gate_response = || {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
         };
         seed_gate_response();
 
-        // CYCLE 1 — the measurement fails. The guard wraps exactly this call
-        // and nothing else.
-        {
-            let _no_git = NoGitPath::install();
-            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-        }
+        // CYCLE 1 — the measurement fails in a child whose PATH cannot affect
+        // this test or any sibling. The child persists the resulting state.
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
+
+        // The re-assertion is the round-trip control: the child passing is not
+        // enough if either field is dropped or defaulted while it is saved.
+        let mut state = workflow::load_state(root, phase).unwrap();
 
         assert_eq!(
             state.last_validate_failure_commit_count,
@@ -2434,13 +2715,18 @@ mod tests {
         // gate; restore both so cycle 2 is the same shape as cycle 1.
         state.stage = Stage::Validate;
         seed_gate_response();
+        workflow::save_state(&state).unwrap();
 
         // CYCLE 2 — `git` runs again and reports the same real count as
         // before. Nothing was committed in between, so this is not progress.
-        {
-            let _neutral = NeutralPath::install();
-            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-        }
+        let path_dir = agent_free_git_only_path_dir();
+        let out = crate::test_support::run_hermetic_test_in_child(
+            NAME,
+            path_dir.path(),
+            &[(ROOT_ENV, root.as_os_str())],
+        );
+        devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+        let state = workflow::load_state(root, phase).unwrap();
 
         assert_ne!(
             state.consecutive_failures, 1,
@@ -2503,7 +2789,13 @@ mod tests {
     ///      paused for a human, not aborted, and its work is not discarded.
     #[test]
     fn phase_validate_failure_ceiling_gates_despite_trivial_commit_progress() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::phase_validate_failure_ceiling_gates_despite_trivial_commit_progress";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2514,23 +2806,18 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         for cycle in 1..=mode::MAX_PHASE_VALIDATE_FAILURES {
             // One trivial commit per cycle — the whole premise of 999.78.
             commit_on_feature_branch(root, phase, &format!("trivial-{cycle}"));
             // Re-seeded every iteration: `prepare_loop_back_to_code` cleans up
             // the Validate gate on every ordinary loop-back, which deletes a
             // response written only once up front.
-            std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+            );
             state.stage = Stage::Validate;
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
@@ -2550,14 +2837,6 @@ mod tests {
                     last_gate_context(root, phase).is_none(),
                     "cycle {cycle}: no gate may fire below the per-phase ceiling"
                 );
-            }
-        }
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
             }
         }
 
@@ -2595,7 +2874,14 @@ mod tests {
     /// itself and not a proxy for it.
     #[test]
     fn validate_gate_message_leads_with_the_per_phase_total() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::validate_gate_message_leads_with_the_per_phase_total";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2611,33 +2897,20 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let mut first_gate_context = String::new();
         for cycle in 1..=5 {
             commit_on_feature_branch(root, phase, &format!("trivial-{cycle}"));
-            std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+            );
             state.stage = Stage::Validate;
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             if cycle == 1 {
                 first_gate_context = last_gate_context(root, phase)
                     .expect("Supervise gates on every Validate failure");
-            }
-        }
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
             }
         }
 
@@ -2684,7 +2957,23 @@ mod tests {
     /// never produced.
     #[test]
     fn ceiling_clause_appears_only_at_the_ceiling_even_in_supervise_mode() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::ceiling_clause_appears_only_at_the_ceiling_even_in_supervise_mode";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let real_sh = std::env::var_os("PATH")
+                .and_then(|paths| {
+                    std::env::split_paths(&paths).find_map(|dir| {
+                        let candidate = dir.join("sh");
+                        candidate.is_file().then_some(candidate)
+                    })
+                })
+                .expect("sh must be resolvable on the parent PATH");
+            std::os::unix::fs::symlink(real_sh, path_dir.path().join("sh"))
+                .expect("add sh to the isolated child PATH");
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2700,23 +2989,19 @@ mod tests {
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         let ceiling_clause = format!(
             "The per-phase ceiling of {} is reached",
             mode::MAX_PHASE_VALIDATE_FAILURES
         );
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         // BELOW the ceiling. This gates — Supervise always does — so the
         // message exists to be inspected.
-        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let below = last_gate_context(root, phase).expect("Supervise gates on every Validate");
 
@@ -2724,17 +3009,15 @@ mod tests {
         // ceiling exactly.
         state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         state.stage = Stage::Validate;
-        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
+        workflow::save_state(&state).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let at = last_gate_context(root, phase).expect("the ceiling failure must also gate");
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(
             !below.contains(&ceiling_clause),
@@ -2759,7 +3042,14 @@ mod tests {
     /// implementation that emitted that string unconditionally.
     #[test]
     fn loop_back_reason_is_distinct_when_no_commit_baseline_exists() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::loop_back_reason_is_distinct_when_no_commit_baseline_exists";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2773,13 +3063,6 @@ mod tests {
             "the first half's premise: no baseline recorded for this phase"
         );
         workflow::save_state(&state).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
 
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         let without_baseline =
@@ -2801,14 +3084,6 @@ mod tests {
                 .as_str()
                 .expect("the loop_back event must carry a reason")
                 .to_string();
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert_ne!(
             without_baseline, with_baseline,
@@ -2835,18 +3110,17 @@ mod tests {
     /// occurrence.
     #[test]
     fn phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
 
         // HALF ONE — at the ceiling. One more recorded failure takes the total
         // to exactly MAX, the gate fires, and the operator loops back.
@@ -2860,9 +3134,12 @@ mod tests {
         at_ceiling.stage = Stage::Validate;
         at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         workflow::save_state(&at_ceiling).unwrap();
-        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
-        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
-        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            at_ceiling_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
 
         // HALF TWO — below the ceiling, everything else identical. Supervise
@@ -2877,18 +3154,13 @@ mod tests {
         below.stage = Stage::Validate;
         below.phase_validate_failures = 2;
         workflow::save_state(&below).unwrap();
-        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
-        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
-        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            below_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(
             last_gate_context(root, below_phase).is_some(),
@@ -2932,18 +3204,18 @@ mod tests {
     /// gate with a real message that must NOT carry the clause.
     #[test]
     fn a_passing_validate_at_the_ceiling_explains_why_it_gated() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::a_passing_validate_at_the_ceiling_explains_why_it_gated";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
 
         // AUTO, at the ceiling, and the Validate PASSED. Nothing here is a
         // failure: the budget is spent from earlier cycles and no increment
@@ -2958,9 +3230,12 @@ mod tests {
         auto.stage = Stage::Validate;
         auto.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES;
         workflow::save_state(&auto).unwrap();
-        let auto_response = Gates::response_path(root, auto_phase, Stage::Validate);
-        std::fs::create_dir_all(auto_response.parent().unwrap()).unwrap();
-        std::fs::write(&auto_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            auto_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut auto, ValidateOutcome::Passed);
 
         // CONTROL — SUPERVISE, below the ceiling, also a pass. Gates (Supervise
@@ -2976,18 +3251,13 @@ mod tests {
         supervise.stage = Stage::Validate;
         supervise.phase_validate_failures = 2;
         workflow::save_state(&supervise).unwrap();
-        let supervise_response = Gates::response_path(root, supervise_phase, Stage::Validate);
-        std::fs::create_dir_all(supervise_response.parent().unwrap()).unwrap();
-        std::fs::write(&supervise_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            supervise_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut supervise, ValidateOutcome::Passed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let auto_context = last_gate_context(root, auto_phase)
             .expect("premise: an exhausted budget gates even in Auto, even on a pass");
@@ -3028,18 +3298,17 @@ mod tests {
     /// control would prove only that a gate which never fired stayed silent.
     #[test]
     fn the_ceiling_reset_records_the_total_it_spent() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::the_ceiling_reset_records_the_total_it_spent";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
 
         // AT the ceiling: this failure takes the total to exactly MAX.
         let at_ceiling_phase = PhaseId::new(91);
@@ -3052,9 +3321,12 @@ mod tests {
         at_ceiling.stage = Stage::Validate;
         at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
         workflow::save_state(&at_ceiling).unwrap();
-        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
-        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
-        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            at_ceiling_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
 
         // NEGATIVE CONTROL — below the ceiling, everything else identical.
@@ -3068,18 +3340,13 @@ mod tests {
         below.stage = Stage::Validate;
         below.phase_validate_failures = 2;
         workflow::save_state(&below).unwrap();
-        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
-        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
-        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        preanswer_gate(
+            root,
+            below_phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
         let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         assert!(
             last_gate_context(root, below_phase).is_some(),
@@ -3124,7 +3391,13 @@ mod tests {
     /// saturated, `0` if it wrapped.
     #[test]
     fn phase_validate_failures_increment_saturates() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::phase_validate_failures_increment_saturates";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3136,26 +3409,14 @@ mod tests {
         state.phase_validate_failures = u32::MAX;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(&response_path, LOOP_BACK_RESPONSE).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
 
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let context = last_gate_context(root, phase)
             .expect("a total at u32::MAX is past the ceiling, so this must gate");
@@ -3184,28 +3445,59 @@ mod tests {
     ///
     /// # Why this test lives in `devflow-cli` rather than beside its subject
     ///
-    /// **`NoGitPath` is unavoidable here**, unlike the Layer 3 tests which use
-    /// an unspawnable working directory: `evaluate_layer2` reads its exit file
-    /// from `project_root`, so a non-existent root would make the exit read
-    /// fail and return `Ok(None)` for the WRONG reason — an unreadable exit
-    /// file rather than an unmeasurable count — and the test would pass
-    /// against the unfixed code. The root must EXIST and `git` must still be
-    /// unresolvable, and only a `PATH` guard delivers that combination.
+    /// **An unresolvable `git` is unavoidable here**, unlike the Layer 3 tests
+    /// which use an unspawnable working directory: `evaluate_layer2` reads its
+    /// exit file from `project_root`, so a non-existent root would make the
+    /// exit read fail and return `Ok(None)` for the WRONG reason — an
+    /// unreadable exit file rather than an unmeasurable count — and the test
+    /// would pass against the unfixed code. The root must EXIST and `git` must
+    /// still be unresolvable, and only an emptied `PATH` delivers that
+    /// combination.
     ///
-    /// A process-global `PATH` guard is not viable in `devflow-core`'s test
-    /// binary. That crate shells out to `git` from eight modules running in
-    /// parallel, and its tests call production code that spawns `git`
-    /// directly, so no fixture-helper lock can cover them — measured at 1-5
-    /// unrelated failures per run, and still 1 in 8 runs after that module's
-    /// own `git()` helper took a lock. `devflow-cli`'s binary routes every
-    /// `PATH` mutation through the single [`env_lock`] its `git`-touching
-    /// tests already hold, which is why the guard is safe here.
+    /// That emptied `PATH` lives in a CHILD process
+    /// ([`run_test_without_git`], 46-06/46-07, review finding C-01), not in
+    /// this one. A process-global emptied `PATH` made every sibling test that
+    /// shelled out to `git` inside the window fail spuriously; a child's
+    /// `PATH` is invisible to the parent, so there is nothing left to
+    /// serialise and this test holds no [`env_lock`]. The fixture is built in
+    /// the parent — it needs no `git`, but a parent-side failure is far easier
+    /// to attribute than one buried in captured child output.
     ///
     /// `evaluate_layer2` is `pub`, so this drives exactly the same function
     /// with exactly the same inputs; only the binary it runs in differs.
     #[test]
     fn evaluate_layer2_unrunnable_git_falls_through_to_layer3() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_layer2_unrunnable_git_falls_through_to_layer3";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so `git` cannot be
+            // SPAWNED at all — the sole could-not-measure condition — and the
+            // fixture is the one the parent built, reached through the shared
+            // root rather than recreated here.
+            let result = agent_result::evaluate_layer2(
+                &root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap();
+
+            assert!(
+                result.is_none(),
+                "an unmeasurable commit count must fall through to Layer 3, got: {result:?}"
+            );
+            // Asserted separately and explicitly, so a future change that
+            // returns some other non-`Failed` classification from this layer
+            // still has to confront this test rather than slipping past an
+            // `is_none()` check.
+            assert_ne!(
+                result.as_ref().map(|r| r.status),
+                Some(devflow_core::agent_result::AgentStatus::Failed),
+                "Layer 2 must never classify an unmeasurable count as absent work"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3218,29 +3510,8 @@ mod tests {
             "the exit file must be readable, or Layer 2 returns Ok(None) for the wrong reason"
         );
 
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(
-                root,
-                PhaseId::new(4),
-                &GitFlowConfig::default(),
-                Stage::Code,
-            )
-            .unwrap()
-        };
-
-        assert!(
-            result.is_none(),
-            "an unmeasurable commit count must fall through to Layer 3, got: {result:?}"
-        );
-        // Asserted separately and explicitly, so a future change that returns
-        // some other non-`Failed` classification from this layer still has to
-        // confront this test rather than slipping past an `is_none()` check.
-        assert_ne!(
-            result.as_ref().map(|r| r.status),
-            Some(devflow_core::agent_result::AgentStatus::Failed),
-            "Layer 2 must never classify an unmeasurable count as absent work"
-        );
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// **CR-01 (35-REVIEW), the direction whose absence let the defect ship.**
@@ -3257,8 +3528,8 @@ mod tests {
     /// # This test and its predecessor are one measurement, not two
     ///
     /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3` directly above
-    /// is this test's NC-4 negative control and vice versa. They install the
-    /// **same** `NoGitPath` guard against the **same** fixture shape and
+    /// is this test's NC-4 negative control and vice versa. They cross the
+    /// **same** child-process boundary against the **same** fixture shape and
     /// differ in exactly one byte of input — the exit code written to
     /// `phase-NN-exit`. One must return `None`; the other must return
     /// `ResourceKilled`. A suite asserting only the fall-through cannot tell
@@ -3274,7 +3545,42 @@ mod tests {
     /// becomes unreachable.
     #[test]
     fn evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so the commit count is
+            // unmeasurable while the exit file the parent wrote is still
+            // readable.
+            let result = agent_result::evaluate_layer2(
+                &root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap();
+
+            let result = result.expect(
+                "exit 137 is classified from the exit code alone — an unmeasurable commit \
+                 count must not discard the verdict and fall to a layer that cannot produce it",
+            );
+            assert_eq!(
+                result.status,
+                AgentStatus::ResourceKilled,
+                "Layer 2 is the only classifier for 137; losing it here loses it everywhere"
+            );
+            assert_eq!(result.exit_code, Some(137));
+            assert_eq!(
+                result.commits, None,
+                "'could not tell' must not be recorded as a measured zero"
+            );
+            assert_eq!(
+                devflow_core::outcome_policy::decide_action(Stage::Code, result.status),
+                devflow_core::outcome_policy::Action::GateInfra,
+                "an OOM-killed agent must route to the infra gate, NOT into the Validate loop"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3283,37 +3589,13 @@ mod tests {
         // unrunnable is the only difference from a healthy run.
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "137").unwrap();
+        assert!(
+            agent_result::exit_code_path(root, PhaseId::new(4)).exists(),
+            "the exit file must be readable, or the 137 verdict has no input to come from"
+        );
 
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(
-                root,
-                PhaseId::new(4),
-                &GitFlowConfig::default(),
-                Stage::Code,
-            )
-            .unwrap()
-        };
-
-        let result = result.expect(
-            "exit 137 is classified from the exit code alone — an unmeasurable commit \
-             count must not discard the verdict and fall to a layer that cannot produce it",
-        );
-        assert_eq!(
-            result.status,
-            AgentStatus::ResourceKilled,
-            "Layer 2 is the only classifier for 137; losing it here loses it everywhere"
-        );
-        assert_eq!(result.exit_code, Some(137));
-        assert_eq!(
-            result.commits, None,
-            "'could not tell' must not be recorded as a measured zero"
-        );
-        assert_eq!(
-            devflow_core::outcome_policy::decide_action(Stage::Code, result.status),
-            devflow_core::outcome_policy::Action::GateInfra,
-            "an OOM-killed agent must route to the infra gate, NOT into the Validate loop"
-        );
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// CR-01's second, independent harm, in the same shape: a NON-commit-gated
@@ -3323,41 +3605,52 @@ mod tests {
     /// dispatches a cleanly-exited Validate agent as `ValidateOutcome::Failed`.
     ///
     /// The negative control is
-    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3`: same guard,
+    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3`: same
+    /// child-process boundary,
     /// same exit code 0, and the ONLY difference is the stage — `Code` (commit
     /// gated, must fall through) versus `Validate` (not gated, must succeed).
     /// If both stages produced the same answer, the stage scoping would be
     /// doing nothing and neither test would mean anything.
     #[test]
     fn evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage";
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so the count is
+            // unmeasurable — which a stage that never consults it must ignore.
+            let result = agent_result::evaluate_layer2(
+                &root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Validate,
+            )
+            .unwrap();
+
+            let result = result.expect(
+                "a stage that is not commit-gated never read the count, so an unmeasurable \
+                 count cannot change its answer",
+            );
+            assert_eq!(result.status, AgentStatus::Success);
+            assert_eq!(result.commits, None);
+            assert_eq!(
+                devflow_core::outcome_policy::decide_action(Stage::Validate, result.status),
+                devflow_core::outcome_policy::Action::Advance
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "0").unwrap();
-
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(
-                root,
-                PhaseId::new(4),
-                &GitFlowConfig::default(),
-                Stage::Validate,
-            )
-            .unwrap()
-        };
-
-        let result = result.expect(
-            "a stage that is not commit-gated never read the count, so an unmeasurable \
-             count cannot change its answer",
+        assert!(
+            agent_result::exit_code_path(root, PhaseId::new(4)).exists(),
+            "the exit file must be readable, or the Success verdict has no input to come from"
         );
-        assert_eq!(result.status, AgentStatus::Success);
-        assert_eq!(result.commits, None);
-        assert_eq!(
-            devflow_core::outcome_policy::decide_action(Stage::Validate, result.status),
-            devflow_core::outcome_policy::Action::Advance
-        );
+
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// **HARDEN-07 / criterion 6 as an OUTCOME rather than a property of one
@@ -3386,54 +3679,68 @@ mod tests {
     /// operator-facing reason — not what the run does next.
     #[test]
     fn evaluate_agent_result_with_unrunnable_git_does_not_report_failed() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::\
+                            evaluate_agent_result_with_unrunnable_git_does_not_report_failed";
+        let phase = PhaseId::new(96);
+
+        if let Some(root) = child_no_git_root() {
+            // CHILD half: `PATH` is an empty directory, so the cascade runs
+            // against a real repo it cannot measure. `State` is pure in-memory
+            // construction, so it is rebuilt here rather than carried across
+            // the boundary.
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Code;
+
+            let result =
+                agent_result::evaluate_agent_result(&root, &state, &GitFlowConfig::default())
+                    .unwrap();
+
+            assert_ne!(
+                result.status,
+                devflow_core::agent_result::AgentStatus::Failed,
+                "END TO END: exit 0 + Stage::Code + an unrunnable git must not report Failed. \
+                 This is the criterion-6 outcome, and a passing evaluate_layer2 unit test does \
+                 not establish it"
+            );
+            assert_eq!(
+                result.status,
+                devflow_core::agent_result::AgentStatus::Unknown,
+                "asserted positively too, so a future non-Failed value still confronts this test"
+            );
+            assert_eq!(
+                result.decided_by_layer,
+                Some(3),
+                "the cascade must genuinely traverse Layer 2's fall-through into Layer 3 — \
+                 any other layer means this passed for the wrong reason"
+            );
+            assert_eq!(
+                result.commits, None,
+                "'could not tell' must not be recorded as a measured zero"
+            );
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = PhaseId::new(96);
-        // A real repo with the feature branch present. Built BEFORE the guard
-        // goes on, because building it shells out to git.
+        // A real repo with the feature branch present. Built in the PARENT,
+        // because building it shells out to git — the ordering constraint the
+        // old in-process guard expressed as "before the guard goes on" is now
+        // the process boundary itself.
         init_repo(root);
         commit_on_feature_branch(root, phase, "seed");
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, phase), "0").unwrap();
         // No stdout capture, so Layer 1 declines and the cascade reaches
-        // Layer 2 at all.
+        // Layer 2 at all. Read in the parent: it needs no `git`, and a
+        // parent-side failure is easier to attribute than one buried in
+        // captured child output.
         assert!(
             !agent_result::stdout_path(root, phase).exists(),
             "Layer 1 must decline, or this test never reaches the cascade under study"
         );
 
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
-
-        let result = {
-            let _no_git = NoGitPath::install();
-            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
-        };
-
-        assert_ne!(
-            result.status,
-            devflow_core::agent_result::AgentStatus::Failed,
-            "END TO END: exit 0 + Stage::Code + an unrunnable git must not report Failed. \
-             This is the criterion-6 outcome, and a passing evaluate_layer2 unit test does \
-             not establish it"
-        );
-        assert_eq!(
-            result.status,
-            devflow_core::agent_result::AgentStatus::Unknown,
-            "asserted positively too, so a future non-Failed value still confronts this test"
-        );
-        assert_eq!(
-            result.decided_by_layer,
-            Some(3),
-            "the cascade must genuinely traverse Layer 2's fall-through into Layer 3 — \
-             any other layer means this passed for the wrong reason"
-        );
-        assert_eq!(
-            result.commits, None,
-            "'could not tell' must not be recorded as a measured zero"
-        );
+        let out = run_test_without_git(NAME, root);
+        assert_child_ran_exactly_one_passing_test(&out, NAME);
     }
 
     /// The companion opposite-result case for
@@ -3453,7 +3760,13 @@ mod tests {
     /// exactly one input, whether `git` could run.
     #[test]
     fn evaluate_agent_result_with_real_git_and_empty_branch_still_reports_failed() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::evaluate_agent_result_with_real_git_and_empty_branch_still_reports_failed";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3481,12 +3794,8 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
 
-        // `NeutralPath`, not the raw environment: real `git` must resolve so
-        // the count is genuinely measured, while no real agent CLI can.
-        let result = {
-            let _neutral = NeutralPath::install();
-            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
-        };
+        let result =
+            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap();
 
         assert_eq!(
             result.status,
@@ -3506,7 +3815,14 @@ mod tests {
     /// the one the Phase 29 dogfood actually hit.
     #[test]
     fn mid_arc_loop_back_issues_plain_execute_command() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::mid_arc_loop_back_issues_plain_execute_command";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3518,26 +3834,11 @@ mod tests {
         // Deliberately no `.planning/phases/{phase:02}-*/{phase:02}-VERIFICATION.md`
         // — this is the mid-arc precondition.
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         // The launch fails by design under a neutralized PATH (no real agent
         // CLI can spawn) — the `loop_back` event is emitted before that, so
         // the resulting `Err` is discarded, matching the established shape
         // in `consecutive_failures_reaches_ceiling_across_cycles`.
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -3555,7 +3856,14 @@ mod tests {
     /// test is meaningful without the other.
     #[test]
     fn genuine_gaps_loop_back_still_issues_gaps_only() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::genuine_gaps_loop_back_still_issues_gaps_only";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3581,22 +3889,7 @@ mod tests {
         )
         .unwrap();
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -3628,7 +3921,14 @@ mod tests {
     /// above (the `--no-worktree` case), never a replacement for it.
     #[test]
     fn worktree_mode_genuine_gaps_loop_back_issues_gaps_only() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::worktree_mode_genuine_gaps_loop_back_issues_gaps_only";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3665,14 +3965,7 @@ mod tests {
         )
         .unwrap();
 
-        // WR-05: RAII, so a panic inside the region restores PATH by `Drop`
-        // rather than by a trailing statement the unwind would skip. Scoped so
-        // the restore still happens before the assertions below, exactly as
-        // the trailing-statement form did.
-        {
-            let _path_guard = NeutralPath::install();
-            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-        }
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
         // Read the event from `root`, not the worktree: `events::emit` is
         // called with `project_root`, and `state.rs`'s own doc comment says
@@ -3705,7 +3998,14 @@ mod tests {
     /// function hid.
     #[test]
     fn worktree_mode_mid_arc_loop_back_issues_plain_execute() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::worktree_mode_mid_arc_loop_back_issues_plain_execute";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir_a = tempfile::tempdir().unwrap();
         let root_a = dir_a.path();
@@ -3722,13 +4022,7 @@ mod tests {
         // deliberately none under the bare root either — this is the mid-arc
         // precondition expressed in worktree mode, not an oversight.
 
-        // WR-05: RAII PATH neutralization. This drive reaches
-        // `loop_back_to_code` -> `launch_stage`, so it must never be able to
-        // resolve a real agent CLI.
-        {
-            let _path_guard = NeutralPath::install();
-            let _ = handle_validate_outcome(root_a, &mut state_a, ValidateOutcome::Failed);
-        }
+        let _ = handle_validate_outcome(root_a, &mut state_a, ValidateOutcome::Failed);
 
         let last_a =
             devflow_core::events::last_event_of_kind_for_phase(root_a, phase_a, "loop_back")
@@ -3761,7 +4055,13 @@ mod tests {
     /// two roots.
     #[test]
     fn worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
@@ -3787,12 +4087,7 @@ mod tests {
         )
         .unwrap();
 
-        // WR-05: RAII PATH neutralization — same reason as scenario A, this
-        // drive also reaches `loop_back_to_code` -> `launch_stage`.
-        {
-            let _path_guard = NeutralPath::install();
-            let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
-        }
+        let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
 
         let last_b =
             devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
@@ -3823,7 +4118,14 @@ mod tests {
     /// Only the paired test detects that. One direction alone is not acceptance.
     #[test]
     fn stale_verification_artifact_dispatches_full_execute() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::stale_verification_artifact_dispatches_full_execute";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3857,10 +4159,7 @@ mod tests {
         state.last_verification_fingerprint = baseline;
         workflow::save_state(&state).unwrap();
 
-        {
-            let _path_guard = NeutralPath::install();
-            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-        }
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -3897,7 +4196,14 @@ mod tests {
     /// nothing about multi-process behaviour on its own.
     #[test]
     fn verification_written_this_run_dispatches_gaps_only() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::verification_written_this_run_dispatches_gaps_only";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         // ---- sub-case 1: content differs from the run-start baseline ----
         let dir = tempfile::tempdir().unwrap();
@@ -3944,10 +4250,7 @@ mod tests {
              comparison below is against an in-memory value the real pipeline never sees"
         );
 
-        {
-            let _path_guard = NeutralPath::install();
-            let _ = handle_validate_outcome(root, &mut reloaded, ValidateOutcome::Failed);
-        }
+        let _ = handle_validate_outcome(root, &mut reloaded, ValidateOutcome::Failed);
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -4003,10 +4306,7 @@ mod tests {
         )
         .unwrap();
 
-        {
-            let _path_guard = NeutralPath::install();
-            let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
-        }
+        let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
 
         let last_b =
             devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
@@ -4157,7 +4457,14 @@ mod tests {
     /// it silently reverts what Phase 33 built.
     #[test]
     fn an_uncaptured_baseline_does_not_claim_an_inherited_artifact() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::an_uncaptured_baseline_does_not_claim_an_inherited_artifact";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         /// Drive one Validate failure against a phase whose artifact already
         /// exists, and report the dispatched fix.
@@ -4178,10 +4485,7 @@ mod tests {
             )
             .unwrap();
 
-            {
-                let _path_guard = NeutralPath::install();
-                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-            }
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
             devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
                 .expect("loop_back event must be recorded")["fix"]
@@ -4256,7 +4560,14 @@ mod tests {
     /// that rule is the 999.79 stall.
     #[test]
     fn an_idempotent_rewrite_is_authored_not_inherited() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::an_idempotent_rewrite_is_authored_not_inherited";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         /// Seed a phase whose artifact already exists and whose baseline
         /// records it, optionally rewriting it with identical bytes afterwards.
@@ -4308,10 +4619,7 @@ mod tests {
             state.verification_run_nonce = Some(1);
             workflow::save_state(&state).unwrap();
 
-            {
-                let _path_guard = NeutralPath::install();
-                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-            }
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
 
             devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
                 .expect("loop_back event must be recorded")["fix"]
@@ -4349,7 +4657,14 @@ mod tests {
     /// launch, so its `Err` is discarded.
     #[test]
     fn ambiguous_gate_loop_back_respects_the_mid_arc_check() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::ambiguous_gate_loop_back_respects_the_mid_arc_check";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -4360,34 +4675,21 @@ mod tests {
 
         // No {phase:02}-VERIFICATION.md — mid-arc precondition.
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-        )
-        .unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let _ = handle_validate_outcome(
             root,
             &mut state,
             ValidateOutcome::Ambiguous("test disagreement".to_string()),
         );
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -4414,7 +4716,14 @@ mod tests {
     /// `FullExecute`, so this test passed vacuously on the wrong arm.
     #[test]
     fn failure_gate_loop_back_respects_the_mid_arc_check() {
-        let _guard = env_lock();
+        const NAME: &str =
+            "pipeline_outcomes::tests::failure_gate_loop_back_respects_the_mid_arc_check";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -4431,30 +4740,17 @@ mod tests {
 
         // No {phase:02}-VERIFICATION.md — mid-arc precondition.
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-        )
-        .unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -4480,7 +4776,13 @@ mod tests {
     /// under `ENV_MUTEX`, same as above.
     #[test]
     fn ship_loop_back_still_issues_gaps_only_when_verification_absent() {
-        let _guard = env_lock();
+        const NAME: &str = "pipeline_outcomes::tests::ship_loop_back_still_issues_gaps_only_when_verification_absent";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -4496,30 +4798,17 @@ mod tests {
         // No {phase:02}-VERIFICATION.md — same mid-arc precondition that
         // flips the two Validate arms above.
 
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
-        )
-        .unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Ship,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let _ = handle_ship_outcome(root, &mut state);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
@@ -4541,6 +4830,14 @@ mod tests {
     /// that, before 18d, ran forever.
     #[test]
     fn external_verify_cycles_reach_ceiling_without_unbounded_loop() {
+        const NAME: &str =
+            "pipeline_outcomes::tests::external_verify_cycles_reach_ceiling_without_unbounded_loop";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // Arm A: an Ambiguous outcome gates on cycle one, never touching
@@ -4556,6 +4853,13 @@ mod tests {
     /// future refactor from quietly routing ambiguity back through the
     /// counter-based auto-loop.
     fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: PhaseId) {
+        // 999.80 / T-48-08-01, FIRST statement — see
+        // `drive_validate_advance_and_read_gate_context` for why this is
+        // structural rather than a property of the fixture text.
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "arm_a_ambiguous_outcome_gates_on_cycle_one must run inside a child test with an agent-free PATH (999.80)"
+        );
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -4568,17 +4872,20 @@ mod tests {
             summary: None,
             verdict: Some(Verdict::Gaps),
             decided_by_layer: Some(0),
+            checkpoint: None,
         };
         let outcome = classify_validate_outcome(&result);
         assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, outcome).unwrap();
 
@@ -4595,39 +4902,32 @@ mod tests {
     /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
     /// own `launch_stage` risk spawning a real agent CLI.
     fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: PhaseId) {
+        // 999.80 / T-48-08-01, FIRST statement — see
+        // `drive_validate_advance_and_read_gate_context` for why this is
+        // structural rather than a property of the fixture text.
+        assert!(
+            std::env::var_os(devflow_core::test_support::CHILD_TEST_ENV).is_some(),
+            "arm_b_genuine_failures_reach_the_ceiling must run inside a child test with an agent-free PATH (999.80)"
+        );
         let _guard = env_lock();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
         for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-            )
-            .unwrap();
+            preanswer_gate(
+                root,
+                phase,
+                Stage::Validate,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
+            );
             let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
-        }
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
         }
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
@@ -4649,6 +4949,14 @@ mod tests {
     /// `run_gate`'s poll doesn't wait out the timeout.
     #[test]
     fn consecutive_failures_increment_saturates() {
+        const NAME: &str = "pipeline_outcomes::tests::consecutive_failures_increment_saturates";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(82);
@@ -4661,13 +4969,15 @@ mod tests {
         state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
-        let response_path = Gates::response_path(root, phase, Stage::Validate);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
@@ -4758,6 +5068,14 @@ mod tests {
     /// (WR-11/D-15), and must never invent a schedule.
     #[test]
     fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
+        const NAME: &str = "pipeline_outcomes::tests::rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = PhaseId::new(81);
@@ -4767,13 +5085,15 @@ mod tests {
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         // Pre-seed an Abort response so `run_gate`'s poll resolves immediately.
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         handle_rate_limited_outcome(
             root,
@@ -4885,6 +5205,14 @@ mod tests {
     /// (Abort resolves via `abort()`, which never calls `launch_stage`).
     #[test]
     fn ship_agent_failed_fires_gate() {
+        const NAME: &str = "pipeline_outcomes::tests::ship_agent_failed_fires_gate";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -4894,7 +5222,6 @@ mod tests {
         workflow::save_state(&state).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -4916,10 +5243,14 @@ mod tests {
 
             // Unblock the poll with an Abort response so the spawned thread
             // finishes (abort() cleans up on its own; no monitor spawned).
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Ship,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -5060,8 +5391,8 @@ mod tests {
             "the pre-authorized gate must let the run reach a completed Ship without a human"
         );
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        assert!(gate_answer_files(root, phase, Stage::Ship).is_empty());
+        assert!(gate_claim_files(root, phase, Stage::Ship).is_empty());
 
         // Exactly one gate_fired for this phase+stage — the retry-gate reopen
         // path (a second gate_fired) must never have run.
@@ -5099,6 +5430,14 @@ mod tests {
     /// human exactly as before this flag existed.
     #[test]
     fn handle_ship_outcome_without_yes_ship_writes_gate_but_no_response() {
+        const NAME: &str = "pipeline_outcomes::tests::handle_ship_outcome_without_yes_ship_writes_gate_but_no_response";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -5109,7 +5448,6 @@ mod tests {
         workflow::save_state(&state).unwrap();
 
         let gate_path = Gates::gate_path(root, phase, Stage::Ship);
-        let response_path = Gates::response_path(root, phase, Stage::Ship);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -5129,15 +5467,19 @@ mod tests {
             // happened if it were ever going to — it must not.
             std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(
-                !response_path.exists(),
+                gate_answer_files(root, phase, Stage::Ship).is_empty(),
                 "with yes_ship unset, no response may ever be auto-written — the run must wait for a human"
             );
 
             // Unblock the poll so the spawned thread finishes.
-            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &response_path,
-                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            answer_open_gate(
+                root,
+                phase,
+                Stage::Ship,
+                &serde_json::from_str(
+                    r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+                )
+                .unwrap(),
             )
             .unwrap();
         });
@@ -5147,12 +5489,70 @@ mod tests {
     /// hook — with `DEVFLOW_NON_SILENT_GATE=1` since Auto mode would not
     /// normally gate a Code failure (unexpected/never-silent gate). The
     /// notify sentinel is a side effect distinct from the gate file itself,
-    /// so it survives even though `Gates::cleanup` removes the gate/
-    /// response/ack once the gate resolves. This test sets
+    /// so it survives even though `Gates::close` removes the gate/
+    /// answer/claim once the gate resolves. This test sets
     /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
     #[test]
+    // D-09 (48-09): mutates `DEVFLOW_GATE_NOTIFY_CMD` process-wide.
+    // Deferred deliberately, not overlooked: THIS process reads the value, so
+    // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+    // race and the value is restored on every exit path, unwinding included.
+    #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
     fn non_validate_failure_fires_gate_and_hook() {
+        const NAME: &str = "pipeline_outcomes::tests::non_validate_failure_fires_gate_and_hook";
+        // Read through a const, never as a literal inside the `var_os` call:
+        // `doc_check::source_read_env_vars` flags a `DEVFLOW_*` name only when
+        // it appears as a literal there, and would then demand this test
+        // fixture appear in the operator docs (see the 48-04 fix in c7d5971).
+        const TOUCH_ENV: &str = "DEVFLOW_TEST_TOUCH_BIN";
+
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            // This test needs TWO things the git-only PATH does not carry,
+            // and they are needed for different reasons.
+            //
+            // `sh`, on the child's PATH: `gates::run_notify_command` executes
+            // the operator's hook as `Command::new("sh").arg("-c")`, so with
+            // no resolvable `sh` the spawn fails fail-soft (a `warn!`) and the
+            // sentinel silently never appears — the hook would look "not
+            // fired" for a reason that has nothing to do with the behaviour
+            // under test.
+            //
+            // `touch`, as an ABSOLUTE path handed to the child: the hook's own
+            // command string is looked up against the child's PATH, so passing
+            // the resolved binary avoids widening that PATH a second time.
+            //
+            // Neither weakens the 999.80 guarantee. What must stay
+            // unreachable is `claude`/`codex`/`opencode`; a shell and
+            // coreutils cannot be mistaken for an agent by `launch_stage`.
+            let resolve = |program: &str| {
+                std::env::var_os("PATH")
+                    .and_then(|paths| {
+                        std::env::split_paths(&paths).find_map(|dir| {
+                            let candidate = dir.join(program);
+                            candidate.is_file().then_some(candidate)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{program} must be resolvable on PATH to run this test")
+                    })
+            };
+            std::os::unix::fs::symlink(resolve("sh"), path_dir.path().join("sh")).unwrap();
+            let touch = resolve("touch");
+            let out = crate::test_support::run_hermetic_test_in_child(
+                NAME,
+                path_dir.path(),
+                &[(TOUCH_ENV, touch.as_os_str())],
+            );
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let _guard = env_lock();
+
+        let touch = std::path::PathBuf::from(
+            std::env::var_os(TOUCH_ENV).expect("child test must receive an absolute touch path"),
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -5172,7 +5572,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "DEVFLOW_GATE_NOTIFY_CMD",
-                format!("touch {}", sentinel.display()),
+                format!("{} {}", touch.display(), sentinel.display()),
             );
         }
 
@@ -5193,13 +5593,15 @@ mod tests {
         // Pre-write an Abort response so the call resolves without spawning
         // a monitor (the notify hook already fired by the time `run_gate`
         // starts polling, so this doesn't affect what we're asserting).
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &serde_json::from_str(
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap(),
+        );
 
         let result =
             handle_stage_failure(root, &mut state, Stage::Code, Some("build failed".into()));
@@ -5216,13 +5618,20 @@ mod tests {
         );
     }
 
-    /// CR-01 regression: after a stage failure's gate resolves via Advance
-    /// and the retry (also a stage failure) fires a fresh gate, the SECOND
-    /// gate's poll must not instantly resolve from the FIRST gate's
-    /// already-consumed response/ack — `handle_stage_failure` must clean
-    /// those up before the retry launches.
+    /// CR-01 regression: after a stage failure's gate resolves and the phase reaches
+    /// the same gate again, the SECOND gate's wait must not resolve from the FIRST
+    /// gate's consumed answer: the first gate's answer and claim are gone, and the
+    /// second gate has its own id.
     #[test]
     fn stage_failure_retry_cleans_stale_response() {
+        const NAME: &str = "pipeline_outcomes::tests::stage_failure_retry_cleans_stale_response";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -5231,33 +5640,47 @@ mod tests {
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
 
-        // Pre-write an Abort response so the first failure resolves
-        // immediately without spawning a monitor.
-        let response_path = Gates::response_path(root, phase, Stage::Code);
-        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &response_path,
-            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
-        )
-        .unwrap();
+        // Pre-answer an abort so the first failure resolves immediately without
+        // spawning a monitor.
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Code,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        );
 
         handle_stage_failure(root, &mut state, Stage::Code, Some("first failure".into())).unwrap();
 
-        // abort() must have cleaned up the gate/response/ack for Code.
+        // abort() must have removed the gate and the answer it consumed.
         assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
-        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
-        assert!(!Gates::ack_path(root, phase, Stage::Code).exists());
+        assert_eq!(
+            gate_answer_files(root, phase, Stage::Code),
+            Vec::<std::path::PathBuf>::new(),
+            "no answer may outlive the gate it decided"
+        );
+        assert_eq!(
+            crate::test_support::gate_claim_files(root, phase, Stage::Code),
+            Vec::<std::path::PathBuf>::new()
+        );
 
-        // Simulate the phase reaching the same gate again later (e.g. a
-        // fresh retry after abort would normally clear state, but re-fire
-        // here directly to prove the CR-01 stale-response reuse regression
-        // is closed): write a fresh gate but no new response.
-        Gates::write_gate(root, phase, Stage::Code, "re-fired gate").unwrap();
+        // The phase reaching the same gate again waits for a fresh decision.
+        let refired = Gates::open_gate(root, phase, Stage::Code, "re-fired gate").unwrap();
         let started = std::time::Instant::now();
-        let got = Gates::poll_response(root, phase, Stage::Code, 1);
+        let end = crate::pipeline_launch::wait_for_gate_response(
+            root,
+            phase,
+            Stage::Code,
+            &refired.gate_id,
+            1,
+        )
+        .unwrap();
         assert!(
-            got.is_none(),
-            "poll_response must not instantly resolve from a stale response after cleanup"
+            matches!(end, crate::pipeline_launch::GateWaitEnd::TimedOut),
+            "the re-fired gate must wait for its own answer: {end:?}"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
@@ -5346,6 +5769,189 @@ mod tests {
             select_loop_back_fix(&worktree, phase, &mut state),
             FixType::FullExecute,
             "Direction B: nonce absent → FullExecute"
+        );
+    }
+
+    /// A loop-back answered at the ceiling gate persists both the budget reset and the
+    /// verification observation. Each is a write of its own or part of one: an
+    /// ordering that replaced the caller's copy between recording the observation and
+    /// writing it would lose it, and the next cycle would read an unchanged artifact
+    /// as fresh (F-11).
+    #[test]
+    fn a_ceiling_loop_back_persists_the_reset_and_the_verification_observation() {
+        const NAME: &str = "pipeline_outcomes::tests::a_ceiling_loop_back_persists_the_reset_and_the_verification_observation";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = agent_free_git_only_path_dir();
+            let out = crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&out, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = PhaseId::new(97);
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+            "verdict: gaps — written by this run\n",
+        )
+        .unwrap();
+        let observed = agent_result::phase_verification_fingerprint(&worktree, phase);
+        assert!(
+            observed.is_some(),
+            "premise: the artifact has a fingerprint"
+        );
+
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        state.stage = Stage::Validate;
+        state.worktree_path = Some(worktree);
+        state.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
+        workflow::save_state(&state).unwrap();
+        preanswer_gate(
+            root,
+            phase,
+            Stage::Validate,
+            &serde_json::from_str(LOOP_BACK_RESPONSE).unwrap(),
+        );
+
+        // The launch this ends in fails on the agent-free PATH, which is not this
+        // test's subject.
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        let after = workflow::load_state(root, phase).unwrap();
+        assert_eq!(after.stage, Stage::Code, "premise: the run looped back");
+        assert_eq!(after.phase_validate_failures, 0, "the reset is on disk");
+        assert_eq!(
+            after.last_verification_fingerprint, observed,
+            "the observation is on disk"
+        );
+    }
+
+    /// A state saved as `seed` left it, and the stale copy a handler's caller loaded
+    /// before `other_writer` changed the file.
+    fn stale_copy_after(
+        root: &Path,
+        seed: impl FnOnce(&mut State),
+        other_writer: impl FnOnce(&mut State),
+    ) -> (PhaseId, State) {
+        let phase = PhaseId::new(90);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.gate_notify_cmd = Some("true".to_string());
+        seed(&mut state);
+        workflow::save_state(&state).unwrap();
+        let stale = workflow::load_state(root, phase).unwrap();
+        workflow::update_state(root, phase, |state| {
+            other_writer(state);
+            Ok::<(), workflow::WorkflowError>(())
+        })
+        .unwrap();
+        (phase, stale)
+    }
+
+    /// D-08: a Validate failure advances the counters on disk, not the caller's copy,
+    /// and leaves the field another writer changed. The temp directory has no feature
+    /// branch, which measures as zero commits, so the streak accumulates only against
+    /// the on-disk baseline of zero; the stale copy's absent baseline would reset it.
+    /// `Supervise` gates every Validate, which holds the handler at its gate while
+    /// the file is read.
+    #[test]
+    fn a_validate_failure_commits_its_counters_and_keeps_a_concurrent_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, mut stale) = stale_copy_after(
+            root,
+            |state| {
+                state.mode = Mode::Supervise;
+                state.stage = Stage::Validate;
+                state.yes_ship = true;
+                state.consecutive_failures = 1;
+                state.phase_validate_failures = 1;
+            },
+            |state| {
+                state.yes_ship = false;
+                state.consecutive_failures = 2;
+                state.phase_validate_failures = 2;
+                state.last_validate_failure_commit_count = Some(0);
+                state.verification_run_nonce = Some(7);
+            },
+        );
+
+        let on_disk = state_on_disk_at_gate(root, phase, Stage::Validate, || {
+            handle_validate_outcome(root, &mut stale, ValidateOutcome::Failed).unwrap();
+        });
+
+        assert!(!on_disk.yes_ship, "the concurrent revoke survives");
+        assert_eq!(on_disk.consecutive_failures, 3);
+        assert_eq!(on_disk.phase_validate_failures, 3);
+        assert_eq!(on_disk.verification_run_nonce, Some(8));
+    }
+
+    /// D-08: an infra outcome increments the counter on disk, not the caller's copy.
+    #[test]
+    fn an_infra_outcome_increments_the_on_disk_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, mut stale) = stale_copy_after(
+            root,
+            |state| {
+                state.stage = Stage::Code;
+                state.infra_failures = 1;
+            },
+            |state| state.infra_failures = 2,
+        );
+
+        let on_disk = state_on_disk_at_gate(root, phase, Stage::Code, || {
+            handle_infra_outcome(root, &mut stale, Stage::Code, Some("killed".into())).unwrap();
+        });
+
+        assert_eq!(on_disk.infra_failures, 3);
+    }
+
+    /// The infra ceiling is read from the committed counter: a stale copy below it
+    /// does not schedule another auto-resume once the counter on disk has reached it.
+    #[test]
+    fn a_rate_limit_reads_the_infra_ceiling_from_the_committed_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (phase, mut stale) = stale_copy_after(
+            root,
+            |state| {
+                state.stage = Stage::Code;
+                state.infra_failures = 1;
+            },
+            |state| state.infra_failures = mode::MAX_INFRA_FAILURES - 1,
+        );
+
+        handle_rate_limited_outcome(
+            root,
+            &mut stale,
+            phase,
+            Stage::Code,
+            Some("rate limited until 2026-06-18T15:45:30Z".into()),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                workflow::load_state(root, phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "the ceiling on disk must abort, clearing state"
+        );
+        assert!(
+            devflow_core::ship::load_cron_instructions(root, phase).is_err(),
+            "no auto-resume is scheduled at the ceiling"
         );
     }
 }

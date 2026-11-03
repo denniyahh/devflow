@@ -32,8 +32,8 @@ environment variables, not config file fields:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written (e.g. an `ntfy.sh`/desktop-notification call) |
-| `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3 days) | How long a monitor stays alive holding the phase lock while parked at a gate. Not a deadline for answering — the gate file never expires; past the timeout the answer needs a `devflow resume` to be picked up |
+| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written (e.g. an `ntfy.sh`/desktop-notification call). Saved per run by `start`/`resume`/`advance`; empty turns it off for the run (see OPERATIONS.md) |
+| `DEVFLOW_GATE_TIMEOUT_SECS` | 259200 (3 days) | How long a supervisor waits at a gate, registered as its waiter and holding no lock. Not a deadline for answering — the gate file never expires. Past the timeout the run ends at that gate, and `devflow resume` reruns the stage and asks again, setting any unused answer aside |
 | `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 259200 (3 days) | Age threshold `devflow gate sweep` uses to call a gate abandoned. Held equal to `DEVFLOW_GATE_TIMEOUT_SECS`, never shorter |
 | `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`'s multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | How long to wait on the shared-checkout lock before skipping the hook batch rather than running it unserialized |

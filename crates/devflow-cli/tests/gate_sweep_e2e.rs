@@ -9,18 +9,16 @@
 //! `release_check.rs`) — this drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
-use devflow_core::gates::{GateAction, GateFile, Gates};
+mod common;
+
+use devflow_core::gates::{AwaitOutcome, GateAction, GateFile, GateId, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::test_support::gate_answer_files;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Hermetic `git` invocation for fixture setup (999.37) — never a bare
 /// `Command::new("git")`.
@@ -74,7 +72,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, timeout_secs: u64, what: &str) 
 /// `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` (test-only, read here — never by
 /// production code): how long this test's patience with the spawned child
 /// extends before the bounded wait below panics instead of hanging CI
-/// indefinitely. Defaults comfortably above `Gates::poll_response`'s 60s
+/// indefinitely. Defaults comfortably above `Gates::await_answer`'s 60s
 /// backoff cap; tighten via the env var in CI if 90s is too generous.
 fn e2e_child_timeout() -> Duration {
     let secs: u64 = std::env::var("DEVFLOW_E2E_CHILD_TIMEOUT_SECS")
@@ -107,15 +105,19 @@ fn wait_for_child_exit(
         }
         if start.elapsed() >= deadline {
             let pid = child.id();
-            let lock_present = devflow_core::lock::holder(root, phase).is_some();
+            let open_gate_waiter = Gates::list_open(root)
+                .into_iter()
+                .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+                .and_then(|gate| GateId::parse(&gate.gate_id).ok())
+                .map(|gate| Gates::waiter_status(root, phase, Stage::Code, &gate));
             let gate_present = Gates::gate_path(root, phase, Stage::Code).exists();
-            let response_present = Gates::response_path(root, phase, Stage::Code).exists();
+            let response_present = !gate_answer_files(root, phase, Stage::Code).is_empty();
             // Reap before panicking — see doc comment above for why this
             // stays bounded without ever signalling the child.
             let _ = child.wait();
             panic!(
                 "devflow advance (pid {pid}) did not exit within {deadline:?}; \
-                 on disk: lock_present={lock_present} gate_present={gate_present} \
+                 on disk: open_gate_waiter={open_gate_waiter:?} gate_present={gate_present} \
                  response_present={response_present}"
             );
         }
@@ -132,17 +134,12 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let gate = GateFile {
-        phase,
-        stage,
-        context: "abandoned run".to_string(),
-        timestamp: now.saturating_sub(age_secs).to_string(),
-    };
-    std::fs::write(
-        Gates::gate_path(root, phase, stage),
-        serde_json::to_string_pretty(&gate).unwrap(),
-    )
-    .unwrap();
+    let path = Gates::gate_path(root, phase, stage);
+    let mut gate: GateFile =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    gate.context = "abandoned run".to_string();
+    gate.timestamp = now.saturating_sub(age_secs).to_string();
+    std::fs::write(path, serde_json::to_string_pretty(&gate).unwrap()).unwrap();
 }
 
 /// An age past any plausible `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` default.
@@ -157,23 +154,32 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
 const AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// The plan's core claim: a gate older than the default threshold is answered
-/// with a rejection, and a real `Gates::poll_response` thread — the exact
+/// with a rejection, and a real `Gates::await_answer` thread — the exact
 /// live-poller seam `run_gate_with_timeout` blocks on in production — picks
 /// it up and resolves to `GateAction::Abort`.
 #[test]
 fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(91);
     let stage = Stage::Ship;
 
-    Gates::write_gate(root, phase, stage, "approve merge?").unwrap();
+    // Registered before the gate file exists, as every production gate wait is, and held
+    // by the poller while it awaits, so the sweep can never see the gate before its waiter.
+    let (opened, registration) =
+        Gates::open_registered(root, phase, stage, "approve merge?").unwrap();
+    let gate = opened.gate_id;
     backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
     std::thread::scope(|scope| {
-        let poller = scope.spawn(move || Gates::poll_response(root, phase, stage, 30));
+        let waiter = scope.spawn(move || {
+            let outcome = Gates::await_answer(root, phase, stage, &gate, 30, || false);
+            registration.finish();
+            outcome
+        });
 
-        let output = Command::new(devflow_bin())
+        let output = common::hermetic_devflow(&home)
             .args(["gate", "sweep", "--root"])
             .arg(root)
             .output()
@@ -185,10 +191,13 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let response = poller
-            .join()
-            .expect("poller thread")
-            .expect("a live Gates::poll_response must observe the sweep's response within 30s");
+        let outcome = waiter.join().expect("waiter thread");
+        let AwaitOutcome::Answered(answer) = outcome else {
+            panic!(
+                "a live Gates::await_answer must observe the sweep's answer within 30s: {outcome:?}"
+            );
+        };
+        let response = answer.response;
         assert!(
             !response.approved,
             "a reap must never write an approval (T-23-41)"
@@ -201,29 +210,38 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
 }
 
 /// The fail-safe counterpart: a gate younger than the threshold is left
-/// completely untouched by an invoked sweep — no response file, no state
-/// change.
+/// completely untouched by an invoked sweep, even with a live waiter the sweep
+/// would otherwise answer. The second sweep is the control: with the age limit
+/// at zero the same gate is reaped, so the first sweep's silence came from the
+/// age and from nothing else.
 #[test]
 fn sweep_leaves_a_fresh_gate_untouched() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(92);
     let stage = Stage::Validate;
 
-    // Freshly written — `unix_now()`'s age is ~0s, well under the 6h default.
-    Gates::write_gate(root, phase, stage, "review gaps").unwrap();
+    // Freshly written, so its age is about 0 s, and the registration stays held: only
+    // the age filter stands between this gate and a reap.
+    let (_, registration) = Gates::open_registered(root, phase, stage, "review gaps").unwrap();
 
-    let output = Command::new(devflow_bin())
-        .args(["gate", "sweep", "--root"])
-        .arg(root)
-        .output()
-        .expect("run devflow gate sweep");
-    assert!(
-        output.status.success(),
-        "devflow gate sweep failed\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let sweep = |extra: &[&str]| {
+        let output = common::hermetic_devflow(&home)
+            .args(["gate", "sweep", "--root"])
+            .arg(root)
+            .args(extra)
+            .output()
+            .expect("run devflow gate sweep");
+        assert!(
+            output.status.success(),
+            "devflow gate sweep failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    sweep(&[]);
 
     let open = Gates::list_open(root);
     assert_eq!(
@@ -234,16 +252,25 @@ fn sweep_leaves_a_fresh_gate_untouched() {
     assert_eq!(open[0].phase, phase);
     assert_eq!(open[0].stage, stage);
     assert!(
-        !Gates::response_path(root, phase, stage).exists(),
+        gate_answer_files(root, phase, stage).is_empty(),
         "a fresh gate must get no response file at all"
     );
+
+    sweep(&["--max-age-secs", "0"]);
+    assert_eq!(
+        gate_answer_files(root, phase, stage).len(),
+        1,
+        "the control: with no age limit the same gate and waiter are reaped"
+    );
+    registration.finish();
 }
 
 /// CLI discoverability: `--max-age-secs` and `--dry-run` must be documented
 /// in the subcommand's own `--help`.
 #[test]
 fn sweep_help_documents_max_age_and_dry_run() {
-    let output = Command::new(devflow_bin())
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
         .args(["gate", "sweep", "--help"])
         .output()
         .expect("run devflow gate sweep --help");
@@ -261,7 +288,7 @@ fn sweep_help_documents_max_age_and_dry_run() {
 
 /// Task 3's strongest proof: a **real, separate `devflow advance` process**
 /// parked on a gate is ended by a file write, unwinds through its own
-/// `abort()` path, releases its per-phase lock, and leaves an audit record —
+/// `abort()` path, finishes its gate registration, and leaves an audit record —
 /// the orphan class `23-ORPHAN-FORENSICS.md` documented, now remedied
 /// without `kill(1)`.
 ///
@@ -272,6 +299,7 @@ fn sweep_help_documents_max_age_and_dry_run() {
 /// OS process via `Command::new`, not driven in-process on a thread.
 #[test]
 fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
+    let home = common::HermeticHome::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let phase = PhaseId::new(95);
@@ -289,47 +317,52 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     // block for `gate_timeout_secs()`'s multi-day production default.
     // Set per-`Command` via `.env(...)`, not via a process-global env
     // mutation (999.37) — so this cannot race any other test.
-    let mut child = Command::new(devflow_bin())
+    let mut child = common::hermetic_devflow(&home)
         .args(["advance", "--phase", &phase.to_string()])
         .arg(root)
         .env("DEVFLOW_GATE_TIMEOUT_SECS", "15")
         .spawn()
         .expect("spawn devflow advance");
 
-    // Wait for the child to acquire the per-phase lock (proves it is
-    // genuinely inside `advance()`, holding it across the gate wait) and to
-    // write the Code gate (proves it reached `run_gate_with_timeout` and is
-    // now polling for a response) — the two on-disk facts the plan's
-    // objective names as the "live poller" evidence.
-    wait_for(
-        || devflow_core::lock::holder(root, phase).is_some(),
-        10,
-        "the child to acquire .devflow/lock-95",
-    );
+    // Wait for the child to write the Code gate (proves it reached
+    // `run_gate_with_timeout`) and for that gate's waiter registration to read
+    // live (proves it is now waiting for a response): the two on-disk facts that
+    // are the "live poller" evidence.
     let gate_path = Gates::gate_path(root, phase, Stage::Code);
     wait_for(
         || gate_path.exists(),
         10,
         "the child to write the Code gate",
     );
-    assert!(
-        devflow_core::lock::holder(root, phase).is_some(),
-        "lock must still be held once the gate is written — this is the \
-         proof that a live poller is genuinely blocking on it"
+    let listed = Gates::list_open(root)
+        .into_iter()
+        .find(|gate| gate.phase == phase && gate.stage == Stage::Code)
+        .expect("the child's Code gate is listed");
+    let gate_id = GateId::parse(&listed.gate_id).expect("the child's gate has a gate id");
+    wait_for(
+        || {
+            Gates::waiter_status(root, phase, Stage::Code, &gate_id)
+                .is_ok_and(|status| status == devflow_core::gates::WaiterStatus::Live)
+        },
+        10,
+        "the child's registration at the Code gate",
     );
-
-    // The reap itself: the same `Gates::reap` primitive Task 1/2's tests
-    // exercise against a thread-based live poller. This test's job is to
-    // prove the OTHER end of that same write — a real, separate process
-    // consuming it.
-    Gates::reap(
-        root,
-        phase,
-        Stage::Code,
-        "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
-        "devflow-reap",
-    )
-    .expect("reap the aged Code gate");
+    // The reap itself: the real `devflow gate sweep`, with the age limit at zero because
+    // this gate is seconds old. Its own age and waiter checks are on this path. Whether it
+    // reports "reaped" depends on a race it tolerates (the child can consume the answer and
+    // close the gate before the sweep's re-check), so the proof is what the child records
+    // below, not the sweep's line.
+    let swept = common::hermetic_devflow(&home)
+        .args(["gate", "sweep", "--max-age-secs", "0", "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow gate sweep");
+    assert!(
+        swept.status.success(),
+        "devflow gate sweep failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&swept.stdout),
+        String::from_utf8_lossy(&swept.stderr)
+    );
 
     let status = wait_for_child_exit(&mut child, root, phase, e2e_child_timeout());
 
@@ -338,13 +371,20 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
         "devflow advance must exit cleanly once its own abort() path runs, got {status:?}"
     );
     assert!(
-        devflow_core::lock::holder(root, phase).is_none(),
-        "LockGuard's Drop must have released the per-phase lock — proof the \
-         process unwound cleanly through its own code, not by being \
-         terminated from outside"
+        !Gates::waiter_path(root, phase, Stage::Code, &gate_id).exists(),
+        "the waiter must have finished its registration, removing the file: proof the \
+         process unwound cleanly through its own code, since one ended from outside \
+         leaves it in place"
     );
 
     let events = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+    assert!(
+        events
+            .lines()
+            .any(|line| line.contains("\"gate_resolved\"") && line.contains("devflow-reap")),
+        "the target process must have resolved its gate on the sweep's own answer\n\
+         events:\n{events}"
+    );
     assert!(
         events
             .lines()
@@ -354,9 +394,227 @@ fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     );
 
     // The negative that separates this plan from a reaper that terminates
-    // processes: neither the sweep's write path (`Gates::reap`, exercised
-    // above) nor this test itself ever sent the child a signal. Checked
+    // processes: neither the sweep run above nor this test itself ever sent
+    // the child a signal. Checked
     // mechanically by this file's own acceptance grep for signalling call
     // forms (must be zero), not asserted at runtime — there is no API
     // surface here that could send one.
+}
+
+// ---------------------------------------------------------------------------
+// 50-03 (999.141, T-50-05): the machine-wide stray pass stays dry-run in every
+// suite on the hermetic builder.
+//
+// `gate sweep --reap-strays` scans the whole machine's `/proc` and reaps every
+// DevFlow-shaped process the caller owns, sparing only the ones the registry
+// knows about. On `common::hermetic_devflow` the registry holds nothing but
+// the test's own roots, so a real (non-dry-run) pass from a test would treat
+// every live run on the developer's machine as a stray. This scan refuses one.
+// ---------------------------------------------------------------------------
+
+/// The `"--reap-strays"` argument literal, quotes included. Spelled through
+/// `concat!` split inside the token so this file's own source never holds it.
+const REAP_STRAYS_LITERAL: &str = concat!("\"--reap-", "strays\"");
+
+/// The `"--dry-run"` argument literal, quotes included, spelled the same way.
+const DRY_RUN_LITERAL: &str = concat!("\"--dry-", "run\"");
+
+/// `src` with every `//` comment (line, doc and trailing) removed. A `//`
+/// inside a string, raw string or char literal is not a comment. A local copy
+/// of `test_home_isolation.rs`'s scanner: integration test binaries cannot
+/// share private helpers, and `common/mod.rs` holds no scan code.
+fn code_only(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut index = 0;
+    while index < chars.len() {
+        index = match chars[index] {
+            '/' if chars.get(index + 1) == Some(&'/') => skip_to_line_end(&chars, index),
+            '"' => copy_string(&chars, index, &mut out),
+            'r' if raw_string_hashes(&chars, index).is_some() => {
+                copy_raw_string(&chars, index, &mut out)
+            }
+            '\'' => copy_char_or_lifetime(&chars, index, &mut out),
+            other => {
+                out.push(other);
+                index + 1
+            }
+        };
+    }
+    out
+}
+
+fn skip_to_line_end(chars: &[char], mut index: usize) -> usize {
+    while index < chars.len() && chars[index] != '\n' {
+        index += 1;
+    }
+    index
+}
+
+/// Copies a `"…"` literal starting at `start`, honouring `\` escapes.
+fn copy_string(chars: &[char], start: usize, out: &mut String) -> usize {
+    out.push('"');
+    let mut index = start + 1;
+    while index < chars.len() {
+        out.push(chars[index]);
+        match chars[index] {
+            '\\' if index + 1 < chars.len() => {
+                out.push(chars[index + 1]);
+                index += 2;
+            }
+            '"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The `#` count of a raw string (`r"`, `r#"`, `br"`…) starting at the `r` at
+/// `index`, or `None` when that `r` is part of an identifier or not followed
+/// by `#*"`.
+fn raw_string_hashes(chars: &[char], index: usize) -> Option<usize> {
+    let before = index.checked_sub(1).map(|i| chars[i]);
+    let prefix_ok = match before {
+        None => true,
+        Some('b') => index < 2 || !is_ident_char(chars[index - 2]),
+        Some(c) => !is_ident_char(c),
+    };
+    if !prefix_ok {
+        return None;
+    }
+    let hashes = chars[index + 1..].iter().take_while(|&&c| c == '#').count();
+    (chars.get(index + 1 + hashes) == Some(&'"')).then_some(hashes)
+}
+
+fn copy_raw_string(chars: &[char], start: usize, out: &mut String) -> usize {
+    let hashes = raw_string_hashes(chars, start).expect("caller checked the raw-string opener");
+    let body = start + 2 + hashes;
+    out.extend(&chars[start..body]);
+    let mut index = body;
+    while index < chars.len() {
+        let closes = chars[index] == '"'
+            && chars[index + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|&&c| c == '#')
+                .count()
+                == hashes;
+        if closes {
+            out.extend(&chars[index..=index + hashes]);
+            return index + hashes + 1;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    index
+}
+
+/// Copies a char literal (`'x'`, `'\''`, `'\u{1F600}'`) or, for a lifetime
+/// or label, only its quote.
+fn copy_char_or_lifetime(chars: &[char], start: usize, out: &mut String) -> usize {
+    let end = if chars.get(start + 1) == Some(&'\\') {
+        chars
+            .get(start + 2..)
+            .unwrap_or_default()
+            .iter()
+            .position(|&c| c == '\'')
+            .map(|offset| start + 2 + offset)
+    } else if chars.get(start + 2) == Some(&'\'') {
+        Some(start + 2)
+    } else {
+        None
+    };
+    match end {
+        Some(end) => {
+            out.extend(&chars[start..=end]);
+            end + 1
+        }
+        None => {
+            out.push('\'');
+            start + 1
+        }
+    }
+}
+
+/// The `;`-separated statements of comment-stripped `code` that pass
+/// `"--reap-strays"` without `"--dry-run"`, trimmed. A test that adds
+/// `--dry-run` in a separate statement is flagged too: the conservative
+/// direction.
+fn real_reap_strays_statements(code: &str) -> Vec<String> {
+    code.split(';')
+        .filter(|statement| {
+            statement.contains(REAP_STRAYS_LITERAL) && !statement.contains(DRY_RUN_LITERAL)
+        })
+        .map(|statement| statement.trim().to_string())
+        .collect()
+}
+
+#[test]
+fn no_suite_on_the_common_builder_runs_a_real_reap_strays_pass() {
+    // (1) Planted controls: a real pass is flagged, a dry-run pass and a
+    // commented-out real pass are not.
+    let planted = concat!(
+        "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
+        "strays\"]).output();"
+    );
+    assert_eq!(
+        real_reap_strays_statements(&code_only(planted)).len(),
+        1,
+        "a planted real --reap-strays pass must be flagged"
+    );
+    let planted_dry_run = concat!(
+        "let out = common::hermetic_devflow(&home).args([\"gate\", \"sweep\", \"--reap-",
+        "strays\", \"--dry-",
+        "run\"]).output();"
+    );
+    assert_eq!(
+        real_reap_strays_statements(&code_only(planted_dry_run)),
+        Vec::<String>::new(),
+        "a planted --reap-strays pass with --dry-run must pass"
+    );
+    let commented = format!("// {planted}\n");
+    assert_eq!(
+        real_reap_strays_statements(&code_only(&commented)),
+        Vec::<String>::new(),
+        "a commented-out real --reap-strays pass must pass"
+    );
+
+    // (2) Every suite directly under `tests/` that declares `mod common;`;
+    // this file always does.
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut paths: Vec<_> = std::fs::read_dir(&tests_dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", tests_dir.display()))
+        .map(|entry| entry.expect("read tests dir entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    paths.sort();
+    let mut scanned = 0;
+    let mut offenders = Vec::new();
+    for path in paths {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let code = code_only(&source);
+        if !code.lines().any(|line| line.trim() == "mod common;") {
+            continue;
+        }
+        scanned += 1;
+        for statement in real_reap_strays_statements(&code) {
+            offenders.push(format!("{}: {statement}", path.display()));
+        }
+    }
+    assert!(
+        scanned > 0,
+        "no suite under {} declares `mod common;`, so the scan checked nothing",
+        tests_dir.display()
+    );
+    assert!(
+        offenders.is_empty(),
+        "a suite on the hermetic builder runs a real (non-dry-run) --reap-strays pass, \
+         whose safety set would shrink to the test's own roots:\n{}",
+        offenders.join("\n")
+    );
 }

@@ -1,0 +1,39 @@
+# NEGATIVE CONTROL: agy's demonstrated bypass (46-REVIEWS.md C-02).
+#
+# Byte-identical to valid.yml except the pinned suite invocation is commented
+# out. Against the pre-46-04 guard this still reported `1 passed`, because a
+# whole-file `contains` search found the pin token inside the comment.
+name: Fixture CI
+
+on:
+  push:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/check.sh test
+
+  sequential:
+    name: Sequential 2-CPU check
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the CPU pin from its single definition site
+        run: |
+          set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          echo "CPUS=$CPUS" >> "$GITHUB_ENV"
+      - name: Run the full check suite under the CPU pin
+        run: |
+          set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          cpu_pin_prefix
+          # "${CPU_PIN[@]}" scripts/check.sh all

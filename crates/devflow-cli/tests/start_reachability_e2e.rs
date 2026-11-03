@@ -10,14 +10,12 @@
 //! stderr, and filesystem effects — never on `preflight.rs`/`commands.rs`
 //! source text (test-signal-rejection pattern 4).
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
+use std::process::Output;
 
 /// Hermetic git invocation pinned to `root` (999.37) — never a bare
 /// `Command::new("git")`.
@@ -115,12 +113,13 @@ fn path_with_fake_bin(fake_bin: &Path) -> String {
 
 #[test]
 fn start_refuses_a_phase_promoted_only_on_the_working_branch_and_scaffolds_nothing() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo_with_phase_24_promoted_only_on_feature_branch(root);
     let fake_bin = fake_bin_dir();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start", "--phase", "24", "--agent", "claude", "--mode", "auto",
         ])
@@ -185,12 +184,13 @@ fn start_refuses_a_phase_promoted_only_on_the_working_branch_and_scaffolds_nothi
 /// branch is created.
 #[test]
 fn start_refuses_before_creating_the_feature_branch_in_no_worktree_mode() {
+    let home = common::HermeticHome::new();
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo_with_phase_24_promoted_only_on_feature_branch(root);
     let fake_bin = fake_bin_dir();
 
-    let output = Command::new(devflow_bin())
+    let output = common::hermetic_devflow(&home)
         .args([
             "start",
             "--phase",

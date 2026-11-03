@@ -27,7 +27,9 @@ is deliberately *not*:
   `_auto_chain_active` key is ever written, and only that one key.
 
 Checkpoints marked `blocking-human`, and `checkpoint:human-action` tasks, are
-never auto-approved by any mode. A phase whose plans declare one is refused
+never auto-approved by any mode. The exception is an agent DevFlow resumed
+specifically to resolve a `blocking-human` gate after a human has approved the
+parked preflight gate. A phase whose plans declare one is otherwise refused
 before it starts — see the next section.
 
 ## Before you start: what the preflight checks
@@ -53,17 +55,20 @@ malformed. Fix the file, or run in supervise mode.
 
 ### 2. The Code stage would launch on the pipe-owning arm
 
-The guard that bounds the flag's lifetime lives inside DevFlow's pipe-owning
-monitor, and only the Claude launch path starts one. So two launch shapes are
-refused in auto mode:
+Every stage runs under the same DevFlow supervisor process, in one of two
+launch shapes. The guard that bounds the flag's lifetime is engaged only by a
+supervisor on the stream shape, which Claude and Antigravity `stream-json`
+launches use; a supervisor on the capture shape never engages it, so a Code
+stage launched that way would have nothing bounding the flag. So two
+capture-shape launches are refused in auto mode:
 
-- **A non-Claude agent.** `--agent codex` and `--agent opencode` cannot run
-  `--mode auto`. This is a real capability removal introduced with this
-  feature; those agents still work in supervise mode.
+- **A non-Claude agent.** `--agent codex` and `--agent opencode` launch on the
+  capture shape and cannot run `--mode auto`. This is a real capability
+  removal introduced with this feature; those agents still work in supervise
+  mode. (Antigravity launches on the stream shape and is allowed.)
 - **The legacy launch opt-out.** `--legacy-claude-launch` (or
-  `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) selects a detached shell monitor with no
-  process to bound the flag's lifetime. It is now mutually exclusive with
-  `--mode auto`.
+  `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) moves Claude onto the capture shape, which
+  never engages the guard. It is now mutually exclusive with `--mode auto`.
 
 The recovery for either is the same: drop the flag that caused it, or run in
 supervise mode.
@@ -82,22 +87,24 @@ are expected — their absence is `[COULD NOT BE DETERMINED]`, and that refuses.
 A refusal here means replanning the phase without the human-only marker, or
 running in supervise mode and answering it yourself.
 
-### A refusal is final
+### A parked refusal can be approved
 
-There is no `--force-unattended` flag and no environment variable that turns a
-refusal into a warning. Your options are to fix the condition or to run in
-supervise mode.
+A refusal for a human-only checkpoint parks the run at a gate. If an operator
+approves that gate, `GateAction::Advance` calls `launch_stage_inner` directly
+and skips the just-adjudicated check. The run stays in its existing mode, so it
+continues unattended afterwards and can reach the resume injection.
 
-**Both external review lanes objected to that, on record, and the decision
-stands.** The objection is real and worth stating so you know it was heard: a
-preflight that false-positives makes unattended runs impossible with no
-in-product recovery, and one reviewer characterised that as a
-denial-of-service. The counter-argument that carried is DevFlow's standing
-principle — advance as far as the rules permit and stop at the first hard gate,
-never route around one — plus the asymmetry that adding an override later is
-easy while removing one after operators have built habits around it is not. If
-the preflight's own reliability turns out to be a problem in practice, that is
-grounds to reopen the decision, not to work around it.
+The cost is deliberate: approving the parked gate accepts continuing without
+re-running the condition that refused the launch. Use that recovery only when
+you, as the operator, accept that responsibility.
+
+**Both external review lanes raised the tradeoff, and their concern remains on
+record.** They warned that a false-positive preflight can block an unattended
+run. The accurate counterpoint is narrower than the old claim: DevFlow has a
+human-approved recovery through the parked gate, rather than an unattended
+opt-out. That preserves the standing principle — advance as far as the rules
+permit and stop at the first hard gate — while making the operator's explicit
+approval, and its cost, visible.
 
 ### If your planning artifacts do not live on `develop`
 
@@ -195,17 +202,20 @@ stage is a no-op.
 
 ### 2. A legacy-arm or non-Claude Code stage gets no chain-flag guard at all
 
-There is no guard on those launch shapes, because the legacy arm is a detached
-shell script with no process whose lifetime could bound the flag.
+There is no guard on those launch shapes, because they run on the capture
+shape, and a supervisor on the capture shape does not engage the chain-flag
+guard.
 
-**Cause.** The guard is bound inside the pipe-owning monitor, and only the
-Claude stream launch path starts one.
+**Cause.** The guard is engaged only by a supervisor on the stream shape,
+which only the Claude and Antigravity `stream-json` launch paths use; `codex`,
+`opencode` and the legacy opt-out launch on the capture shape.
 
 **Fix owner: DevFlow, and as of this release the failure is loud rather than
 silent.** Condition 2 of the preflight now *refuses* this combination in auto
 mode instead of letting the run start and stall later. That is an improvement
-in legibility, not a removal of the limitation: `--mode auto` remains
-Claude-only, and remains incompatible with the legacy launch opt-out.
+in legibility, not a removal of the limitation: `--mode auto` remains limited
+to Claude and Antigravity, and remains incompatible with the legacy launch
+opt-out.
 
 ### 3. GSD orchestrator may block auto-approval of `gate="blocking"` checkpoints
 

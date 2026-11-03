@@ -8,15 +8,15 @@
 //! by `devflow-core`'s `config::tests::env_overrides_file_yes_ship`, and the
 //! binary here runs as a separate process so this suite stays out of the
 //! `ENV_MUTEX`-guarded unit-test convention.
+//!
+//! Every `devflow` child is built by `common::hermetic_devflow`, so it never
+//! reads or writes the operator's real `~/.cache/devflow` (999.141).
+
+mod common;
 
 use devflow_core::phase_id::PhaseId;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 fn git(root: &Path, args: &[&str]) {
     let output = devflow_core::test_support::git_command(root)
@@ -66,7 +66,9 @@ fn run_dry_run(root: &Path, phase: PhaseId, extra_args: &[&str]) -> String {
     ];
     args.extend(extra_args.iter().map(|s| s.to_string()));
 
-    let output = Command::new(devflow_bin())
+    // `--dry-run` launches nothing, so the home only has to outlive `output()`.
+    let home = common::HermeticHome::new();
+    let output = common::hermetic_devflow(&home)
         .args(&args)
         .arg(root)
         .current_dir(root)

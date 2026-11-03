@@ -20,6 +20,8 @@
 //! scaffolding below is copied from `auto_chain_flag_e2e.rs` rather than
 //! shared. Keep the two in step.
 
+mod common;
+
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
@@ -31,10 +33,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
 
 /// Hermetic git invocation pinned to `root` (999.37) — never a bare
 /// `Command::new("git")`.
@@ -205,6 +203,9 @@ struct Fixture {
     script: PathBuf,
     child_pid_file: PathBuf,
     reaper: Reaper,
+    /// Every `devflow` child's `HOME` and cache. Declared last so it drops
+    /// after `reaper` has reaped the monitor.
+    home: common::HermeticHome,
 }
 
 impl Fixture {
@@ -245,6 +246,7 @@ impl Fixture {
             script,
             child_pid_file,
             reaper: Reaper::default(),
+            home: common::HermeticHome::new(),
         }
     }
 
@@ -252,7 +254,30 @@ impl Fixture {
     /// sleeper, as a child of this test process so it can be signalled
     /// directly.
     fn spawn_monitor(&self) -> Child {
-        let child = Command::new(devflow_bin())
+        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
+        // under the hermetic cache dir this file's child process gets.
+        let launch_id = devflow_core::supervisor::new_launch_id();
+        let socket = devflow_core::supervisor::SocketPath::for_launch(
+            &self.home.cache_dir(),
+            &self.root,
+            self.phase,
+            &launch_id,
+        )
+        .expect("the hermetic socket path fits sun_path");
+        // The state must record this launch, as a launcher's publish does: this monitor
+        // has no launcher to promote it (D-15).
+        devflow_core::workflow::update_state(&self.root, self.phase, |state| {
+            state.supervisor = Some(devflow_core::state::SupervisorRecord::new(
+                socket.as_path().to_path_buf(),
+                launch_id.clone(),
+                4_294_967_000,
+                1,
+                String::new(),
+            ));
+            Ok::<(), devflow_core::workflow::WorkflowError>(())
+        })
+        .unwrap();
+        let child = common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
             .arg(&self.root)
@@ -268,6 +293,12 @@ impl Fixture {
             .arg("120")
             .arg("--agent")
             .arg("claude")
+            .arg("--launch")
+            .arg("stream")
+            .arg("--launch-id")
+            .arg(&launch_id)
+            .arg("--socket")
+            .arg(socket.as_path())
             .arg("--")
             .arg("sh")
             .arg(&self.script)
@@ -298,7 +329,7 @@ impl Fixture {
     /// process outlives the test binary" criterion forbids. See the SUMMARY for
     /// what this does NOT establish.
     fn run_resume(&self, git_only_path: &Path) -> Output {
-        Command::new(devflow_bin())
+        common::hermetic_devflow(&self.home)
             .arg("resume")
             .arg("--phase")
             .arg(self.phase.to_string())
@@ -379,6 +410,7 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
     let path_dir = git_only_path();
 
     let mut monitor = fixture.spawn_monitor();
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
 
     // The fixture must actually engage the guard before anything downstream
     // means anything. A timeout here is "the fixture never set the flag", which
@@ -390,6 +422,12 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
         "the supervised Code-stage launch to set workflow._auto_chain_active — \
          without this the fixture never engaged the guard and nothing below can \
          be concluded",
+    );
+    wait_for(
+        || fixture.child_pid().is_some(),
+        Duration::from_secs(30),
+        "the monitor to spawn the sleeper after setting the chain flag — resume now refuses \
+         over a live recorded agent, so the orphan must be known and terminated before resume",
     );
     let child_pid = fixture.child_pid();
 
@@ -423,6 +461,15 @@ fn auto_chain_flag_survives_sigkill_and_is_repaired_on_the_next_start() {
             Duration::from_millis(20),
         );
     }
+
+    // The killed monitor's record is only this fixture's way to let it serve (D-15). It
+    // would make `resume` refuse over the STALE socket, which is not what this test is
+    // about, so it goes before the resume.
+    devflow_core::workflow::update_state(&fixture.root, fixture.phase, |state| {
+        state.supervisor = None;
+        Ok::<(), devflow_core::workflow::WorkflowError>(())
+    })
+    .unwrap();
 
     let output = fixture.run_resume(path_dir.path());
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

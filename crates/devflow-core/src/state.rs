@@ -24,8 +24,9 @@ use crate::stage::Stage;
 /// state files written by older binaries still load.
 ///
 /// This exists because `State` accumulates a field roughly every phase that
-/// adds a run-scoped concept (`worktree_path`, `monitor_pid`, `stop_until`,
-/// `yes_ship`, and — in phase 28 — `session_id` and `checkpoint_resumes`).
+/// adds a run-scoped concept (`worktree_path`, `stop_until`, `yes_ship`, in
+/// phase 28 `session_id` and `checkpoint_resumes`, and in phase 50
+/// `supervisor`).
 /// Without `non_exhaustive`, each of those additions is a semver-breaking
 /// change for any consumer that used a struct literal, which would force a
 /// major bump for what is really an internal bookkeeping change. Paying that
@@ -279,13 +280,25 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
-    /// PID of the detached monitor process that owns the agent for the
-    /// current stage, recorded by `launch_stage` at spawn time. `None` means
-    /// no monitor has been spawned for this state yet, OR the state was
-    /// written by a binary predating this field — in both cases the
-    /// liveness probe reports Unknown, never Stuck.
+    /// The published, ping-confirmed address of the supervisor that owns the
+    /// current stage (D-04): its socket path, launch id, and the agent
+    /// identity the stale-socket backstop validates. Written by the launcher,
+    /// under the write lock ([`crate::workflow::update_state`]), in one save that
+    /// replaces the previous record; it is never cleared ahead of that save.
+    /// `None` means no supervisor has been published for this state, OR the state
+    /// was written by a binary predating this field. The socket path is the only handle a
+    /// liveness question starts from: it is passed to
+    /// [`crate::supervisor::probe`] as recorded, never re-derived.
     #[serde(default)]
-    pub monitor_pid: Option<u32>,
+    pub supervisor: Option<SupervisorRecord>,
+    /// The launch that has reserved this phase and has not published yet. It is
+    /// separate from [`State::supervisor`] because both may be live at a stage
+    /// handoff (D-01). A launcher writes it under the write lock
+    /// ([`crate::workflow::update_state_with`]) before it spawns, and promotes it to
+    /// `supervisor` after the publish. `None` means none is pending, which is also
+    /// what a state file predating this field reads as.
+    #[serde(default)]
+    pub pending_supervisor: Option<PendingSupervisor>,
     /// The Claude session id captured from the most recent captured stdout
     /// envelope for this phase's current stage (D-04, 28-02), read via
     /// [`crate::agent_result::session_id_from_capture`]. `None` means EITHER
@@ -393,6 +406,193 @@ pub struct State {
     /// `.devflow/state-NN.json` or start a new run.
     #[serde(default)]
     pub legacy_claude_launch: bool,
+    /// Provenance for the human-only checkpoint set DevFlow last checked at
+    /// this phase's Code preflight (D-07, CHKPT-02 / 999.126).
+    ///
+    /// Agents write plan files during Code. Without this record, a
+    /// `blocking-human` checkpoint ADDED after preflight reaches the resume
+    /// decision's auto-decide route and no human ever sees it — the agent
+    /// self-routes into its own unattended approval.
+    ///
+    /// The three variants are three different facts and are deliberately not
+    /// collapsed into an `Option`:
+    ///
+    /// - [`CheckpointApproval::Unrecorded`] — the serde default, so a state
+    ///   file written by a binary predating this field loads here. Nobody ever
+    ///   recorded a set, so nothing is approved and every human-only
+    ///   checkpoint parks at the re-scan gate. It is NEVER written by a Code
+    ///   evaluation: an upgraded run whose first Code evaluation predates this
+    ///   binary must gate at its loop-back or relaunched evaluation too, which
+    ///   a permissive default would silently skip.
+    /// - [`CheckpointApproval::Pending`] — set by [`State::new`], so it exists
+    ///   only for state this binary created. It means "a Code evaluation of
+    ///   this run may record the set". It approves nothing on its own.
+    /// - [`CheckpointApproval::Recorded`] — the set a Code preflight (or, per
+    ///   plan 48-15, a human gate approval) actually saw. `Recorded(vec![])`
+    ///   round-trips distinct from `Unrecorded`: it means "we looked, and this
+    ///   phase declared no human-only checkpoint", which is the fact that
+    ///   makes a later addition detectable.
+    ///
+    /// Persisted rather than held in memory for the reason [`Self::yes_ship`]
+    /// gives: the resume decision that compares against this set runs in the
+    /// detached monitor's own separate `devflow advance` process, long after
+    /// the process that recorded it has exited.
+    #[serde(default)]
+    pub checkpoint_approval: CheckpointApproval,
+    /// Operator-configured gate notify hook command: the one place a run's
+    /// command lives. `devflow start`, `resume` and `advance` apply
+    /// `DEVFLOW_GATE_NOTIFY_CMD` to it (unset keeps, empty clears, set
+    /// replaces; [`crate::gates::persisted_notify_cmd_after_env`]); never
+    /// [`State::new`], so constructing a state never reads the environment.
+    /// The detached monitor chain does not carry the variable and reads this
+    /// field at each gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_notify_cmd: Option<String>,
+}
+
+/// The persisted handle on a launch's supervisor ([`State::supervisor`]).
+///
+/// The socket path is where [`crate::supervisor::probe`] asks; the launch id,
+/// agent process group, agent start time and boot id are what the
+/// stale-socket backstop checks before it may act, so a record from another
+/// launch or another boot never authorizes a signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SupervisorRecord {
+    /// The published socket, `cache_dir/sock/<stem>.sock`.
+    pub socket_path: PathBuf,
+    /// The per-launch id, also the last segment of the socket's file name.
+    pub launch_id: String,
+    /// The agent's process group id.
+    pub agent_pgid: u32,
+    /// The agent's start time in clock ticks since boot.
+    pub agent_start_time: u64,
+    /// The kernel boot id at launch.
+    pub boot_id: String,
+}
+
+impl SupervisorRecord {
+    /// Build a record; the only way other crates can, since the struct is
+    /// `#[non_exhaustive]`.
+    pub fn new(
+        socket_path: PathBuf,
+        launch_id: String,
+        agent_pgid: u32,
+        agent_start_time: u64,
+        boot_id: String,
+    ) -> Self {
+        Self {
+            socket_path,
+            launch_id,
+            agent_pgid,
+            agent_start_time,
+            boot_id,
+        }
+    }
+}
+
+/// A launch's reservation ([`State::pending_supervisor`]). Its socket and liveness
+/// paths are probed as recorded, never re-derived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PendingSupervisor {
+    /// The per-launch id.
+    pub launch_id: String,
+    /// The socket this launch's supervisor will publish.
+    pub socket_path: PathBuf,
+    /// The liveness file this launch's supervisor holds.
+    pub liveness_path: PathBuf,
+}
+
+impl PendingSupervisor {
+    /// Build a reservation; the only way other crates can, since the struct is
+    /// `#[non_exhaustive]`.
+    pub fn new(launch_id: String, socket_path: PathBuf, liveness_path: PathBuf) -> Self {
+        Self {
+            launch_id,
+            socket_path,
+            liveness_path,
+        }
+    }
+}
+
+/// One human-only checkpoint recorded as seen for this run.
+///
+/// Stores the declaration's own text rather than a hash: a hash would make
+/// the record unreadable in `.devflow/state-NN.json` and unexplainable in a
+/// gate message, and 48-RESEARCH rejected pulling in a hashing crate for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedCheckpoint {
+    /// The plan file name only, matching
+    /// [`crate::verify::CheckpointDeclaration::plan_file`] so a record
+    /// compares identically from a worktree or the project root.
+    pub plan_file: String,
+    /// The normalized task element, byte-for-byte as
+    /// [`crate::verify::CheckpointDeclaration::element`] produces it — so a
+    /// whitespace-only trailing edit is not a change and any other body edit
+    /// is.
+    pub element: String,
+}
+
+/// Whether, and with what, this run has recorded its human-only checkpoint
+/// set. See [`State::checkpoint_approval`] for what each variant means and
+/// why they are not an `Option`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointApproval {
+    /// No set was ever recorded — the serde default for older state files.
+    #[default]
+    Unrecorded,
+    /// This binary created the state; a Code evaluation may record the set.
+    Pending,
+    /// The set a Code evaluation saw. An empty vector is a real observation.
+    Recorded(Vec<ApprovedCheckpoint>),
+}
+
+impl CheckpointApproval {
+    /// Every human-only declaration in `current` that this approval does not
+    /// already account for.
+    ///
+    /// The comparison is a MULTISET difference keyed by
+    /// `(plan_file, element)`, not a set difference and not order-sensitive:
+    /// two plans may legitimately declare byte-identical task elements, and
+    /// recording one of them must leave the other unapproved. Each recorded
+    /// entry is therefore consumed by at most one current declaration.
+    ///
+    /// [`CheckpointApproval::Unrecorded`] and [`CheckpointApproval::Pending`]
+    /// match nothing, so every human-only declaration comes back unapproved.
+    /// Declarations that are neither `blocking_human` nor `human_action` are
+    /// not human-only and are never returned.
+    pub fn unapproved<'a>(
+        &self,
+        current: &'a [crate::verify::CheckpointDeclaration],
+    ) -> Vec<&'a crate::verify::CheckpointDeclaration> {
+        let mut unmatched: Vec<(&str, &str)> = match self {
+            CheckpointApproval::Recorded(approved) => approved
+                .iter()
+                .map(|entry| (entry.plan_file.as_str(), entry.element.as_str()))
+                .collect(),
+            CheckpointApproval::Unrecorded | CheckpointApproval::Pending => Vec::new(),
+        };
+        current
+            .iter()
+            .filter(|declaration| declaration.blocking_human || declaration.human_action)
+            .filter(|declaration| {
+                let found = unmatched.iter().position(|(plan_file, element)| {
+                    *plan_file == declaration.plan_file && *element == declaration.element
+                });
+                match found {
+                    // Consume the record so a second identical declaration
+                    // cannot be approved by the same single entry.
+                    Some(index) => {
+                        unmatched.swap_remove(index);
+                        false
+                    }
+                    None => true,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Supported coding agents.
@@ -469,7 +669,8 @@ impl State {
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
-            monitor_pid: None,
+            supervisor: None,
+            pending_supervisor: None,
             session_id: None,
             checkpoint_resumes: 0,
             stop_until: None,
@@ -479,6 +680,12 @@ impl State {
             base_branch: None,
             canary: None,
             legacy_claude_launch: false,
+            // Pending, not Unrecorded: this state was created by a binary
+            // that knows how to record the set, so its Code evaluation is
+            // allowed to. Only a state file from an older binary may read
+            // Unrecorded (see the field's doc comment).
+            checkpoint_approval: CheckpointApproval::Pending,
+            gate_notify_cmd: None,
         }
     }
 }
@@ -546,7 +753,7 @@ mod tests {
         assert_eq!(state.preflight_retries, 0);
         assert_eq!(state.phase_validate_failures, 0);
         assert!(!state.started_at.is_empty());
-        assert_eq!(state.monitor_pid, None);
+        assert_eq!(state.supervisor, None);
         assert_eq!(state.stop_until, None);
         assert!(!state.stopped);
         assert_eq!(state.stop_reason, None);
@@ -567,6 +774,174 @@ mod tests {
         assert_eq!(back.agent, AgentKind::Codex);
         assert_eq!(back.stage, Stage::Define);
         assert_eq!(back.mode, Mode::Supervise);
+    }
+
+    /// D-07: the three `CheckpointApproval` variants are three distinct facts
+    /// across the process boundary. A state file from a binary predating the
+    /// field must read `Unrecorded` (approves nothing), state this binary
+    /// created must read `Pending`, and `Recorded(vec![])` — "we looked, and
+    /// there were none" — must survive a round trip WITHOUT collapsing into
+    /// `Unrecorded`, because that distinction is what makes a checkpoint added
+    /// later detectable at all.
+    /// 28-01's precedent, kept here too: the gate value is assembled from a
+    /// const rather than written as a bare source literal, so no source file
+    /// outside `verify.rs` contains the string the checkpoint scanner matches.
+    const HUMAN_GATE_VALUE_FOR_TEST: &str = "blocking-human";
+    const PLAIN_GATE_VALUE_FOR_TEST: &str = "blocking";
+
+    #[test]
+    fn checkpoint_approval_defaults_to_unrecorded_for_old_state_files() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert_eq!(
+            state.checkpoint_approval,
+            CheckpointApproval::Pending,
+            "State::new must yield Pending, not Unrecorded"
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("checkpoint_approval"),
+            "new state must persist its checkpoint-approval provenance"
+        );
+
+        // A state file written before this field existed.
+        let absent_json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded_absent: State = serde_json::from_str(absent_json).unwrap();
+        assert_eq!(
+            loaded_absent.checkpoint_approval,
+            CheckpointApproval::Unrecorded,
+            "a serde-absent value must default to Unrecorded, which approves nothing"
+        );
+
+        // An empty recorded set is an observation, not an absence.
+        state.checkpoint_approval = CheckpointApproval::Recorded(Vec::new());
+        let empty_json = serde_json::to_string(&state).unwrap();
+        let loaded_empty: State = serde_json::from_str(&empty_json).unwrap();
+        assert_eq!(
+            loaded_empty.checkpoint_approval,
+            CheckpointApproval::Recorded(Vec::new()),
+            "Recorded(vec![]) must round-trip distinct from Unrecorded"
+        );
+        assert_ne!(
+            loaded_empty.checkpoint_approval,
+            CheckpointApproval::Unrecorded,
+            "Recorded(vec![]) collapsing into Unrecorded would hide every later addition"
+        );
+
+        // A populated set round-trips its element text verbatim.
+        state.checkpoint_approval = CheckpointApproval::Recorded(vec![ApprovedCheckpoint {
+            plan_file: "48-07-PLAN.md".to_string(),
+            element: format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">\n  body\n</task>"),
+        }]);
+        let full_json = serde_json::to_string(&state).unwrap();
+        let loaded_full: State = serde_json::from_str(&full_json).unwrap();
+        assert_eq!(loaded_full.checkpoint_approval, state.checkpoint_approval);
+    }
+
+    /// The comparison `unapproved` implements is a multiset difference keyed
+    /// by `(plan_file, element)`. Order must not matter, a single recorded
+    /// entry must not approve two identical declarations, and neither
+    /// `Unrecorded` nor `Pending` may approve anything.
+    #[test]
+    fn unapproved_checkpoints_is_an_order_insensitive_multiset_difference() {
+        use crate::verify::CheckpointDeclaration;
+
+        let declare = |plan_file: &str, element: &str| CheckpointDeclaration {
+            plan_file: plan_file.to_string(),
+            element: element.to_string(),
+            blocking_human: true,
+            human_action: false,
+        };
+        let record = |plan_file: &str, element: &str| ApprovedCheckpoint {
+            plan_file: plan_file.to_string(),
+            element: element.to_string(),
+        };
+
+        let first = declare(
+            "a-PLAN.md",
+            &format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">one</task>"),
+        );
+        let second = declare(
+            "b-PLAN.md",
+            &format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">two</task>"),
+        );
+
+        // Order swapped between the record and the scan -> nothing unapproved.
+        let swapped = CheckpointApproval::Recorded(vec![
+            record(&second.plan_file, &second.element),
+            record(&first.plan_file, &first.element),
+        ]);
+        assert!(
+            swapped
+                .unapproved(&[first.clone(), second.clone()])
+                .is_empty(),
+            "declaration order must not affect the comparison"
+        );
+
+        // Byte-identical elements in two DIFFERENT plans count separately:
+        // recording one must leave the other unapproved.
+        let shared = &format!("<task gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">same body</task>");
+        let in_a = declare("a-PLAN.md", shared);
+        let in_b = declare("b-PLAN.md", shared);
+        let one_recorded = CheckpointApproval::Recorded(vec![record("a-PLAN.md", shared)]);
+        let both_plans = [in_a.clone(), in_b.clone()];
+        let leftover = one_recorded.unapproved(&both_plans);
+        assert_eq!(
+            leftover,
+            vec![&in_b],
+            "one recorded entry must not approve two declarations"
+        );
+
+        // Duplicates WITHIN one plan are also consumed one-for-one.
+        let twice_in_a = vec![in_a.clone(), in_a.clone()];
+        assert_eq!(
+            one_recorded.unapproved(&twice_in_a).len(),
+            1,
+            "a single record must approve only one of two identical declarations"
+        );
+
+        // Recorded(vec![]) with nothing current -> nothing unapproved.
+        let empty = CheckpointApproval::Recorded(Vec::new());
+        assert!(empty.unapproved(&[]).is_empty());
+        // ...but it approves nothing that IS current.
+        assert_eq!(empty.unapproved(std::slice::from_ref(&first)), vec![&first]);
+
+        // Neither Unrecorded nor Pending approves anything.
+        assert_eq!(
+            CheckpointApproval::Unrecorded.unapproved(std::slice::from_ref(&first)),
+            vec![&first]
+        );
+        assert_eq!(
+            CheckpointApproval::Pending.unapproved(std::slice::from_ref(&first)),
+            vec![&first]
+        );
+
+        // Negative control: a declaration that is neither blocking_human nor
+        // human_action is not human-only and is never returned, so an empty
+        // result above cannot be an artifact of the filter matching nothing.
+        let ordinary = CheckpointDeclaration {
+            plan_file: "c-PLAN.md".to_string(),
+            element: format!("<task gate=\"{PLAIN_GATE_VALUE_FOR_TEST}\">auto-approvable</task>"),
+            blocking_human: false,
+            human_action: false,
+        };
+        assert!(
+            CheckpointApproval::Unrecorded
+                .unapproved(&[ordinary])
+                .is_empty(),
+            "only human-only declarations may be returned"
+        );
     }
 
     #[test]
@@ -878,48 +1253,127 @@ mod tests {
         assert_eq!(loaded_absent.preflight_retries, 0);
     }
 
-    /// `monitor_pid` round-trips through serde as an exact `u32` (18b).
+    /// The persisted JSON carries the `supervisor` record and no key for the
+    /// monitor pid field 50-16 removed (R-9): the socket record is the only
+    /// liveness source a state file holds. The removed key is built from
+    /// pieces so this file holds no quoted copy of it (T-50-43).
     #[test]
-    fn monitor_pid_round_trips_through_serde() {
+    fn persisted_state_carries_the_supervisor_and_no_monitor_pid_key() {
         let mut state = State::new(
             PhaseId::new(1),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/repo"),
         );
-        state.monitor_pid = Some(4242);
+        let record = SupervisorRecord::new(
+            PathBuf::from("/c/sock/0123456789abcdef-1-00000000000000ab.sock"),
+            "00000000000000ab".to_string(),
+            4242,
+            123_456,
+            "boot-id".to_string(),
+        );
+        state.supervisor = Some(record.clone());
         let json = serde_json::to_string(&state).unwrap();
         assert!(
-            json.contains("monitor_pid"),
-            "monitor_pid must appear in persisted JSON"
+            json.contains("\"supervisor\""),
+            "the supervisor key must appear in persisted JSON"
+        );
+        let removed_key = ["\"", concat!("monitor", "_pid"), "\""].concat();
+        assert!(
+            !json.contains(&removed_key),
+            "the removed monitor pid key must not appear in persisted JSON: {json}"
         );
         let loaded: State = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            loaded.monitor_pid,
-            Some(4242),
-            "monitor_pid must round-trip through serde"
+            loaded.supervisor,
+            Some(record),
+            "the supervisor record must round-trip through serde"
         );
     }
 
-    /// A serde-absent `monitor_pid` (state written by a pre-18b binary) must
-    /// deserialize to `None`, not `Some(0)` — a `Some(0)` default would let a
-    /// pre-18b state file render as a monitor at pid 0.
+    /// `supervisor` survives a real save and load, and a state file without
+    /// the key (an older binary's) loads with `None` (D-04, 50-06).
     #[test]
-    fn monitor_pid_absent_from_json_defaults_to_none() {
-        let json = r#"{
+    fn supervisor_record_round_trips_and_absent_reads_as_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let phase = PhaseId::new(50);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(state.supervisor, None, "a new state has no supervisor");
+        let record = SupervisorRecord::new(
+            PathBuf::from("/c/sock/0123456789abcdef-50-00000000000000ab.sock"),
+            "00000000000000ab".to_string(),
+            4242,
+            123_456,
+            "boot-id".to_string(),
+        );
+        state.supervisor = Some(record.clone());
+        crate::workflow::save_state(&state).expect("save the state");
+        let loaded = crate::workflow::load_state(dir.path(), phase).expect("load the state");
+        assert_eq!(
+            loaded.supervisor,
+            Some(record),
+            "the supervisor record must survive a save and load"
+        );
+
+        let absent = r#"{
             "stage": "code",
-            "phase": 1,
+            "phase": 50,
             "agent": "claude",
             "mode": "auto",
             "started_at": "0",
             "project_root": "/repo"
         }"#;
-        let loaded: State = serde_json::from_str(json).unwrap();
-        assert_eq!(loaded.monitor_pid, None);
+        let loaded: State = serde_json::from_str(absent).expect("an older state file loads");
+        assert_eq!(loaded.supervisor, None, "an absent key reads as None");
+    }
+
+    #[test]
+    fn a_state_without_a_pending_supervisor_parses_and_one_round_trips() {
+        let absent = r#"{
+            "stage": "code",
+            "phase": 50,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(absent).expect("an older state file loads");
+        assert_eq!(
+            loaded.pending_supervisor, None,
+            "an absent key reads as None"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(50);
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(state.pending_supervisor, None, "a new state has none");
+        let pending = PendingSupervisor::new(
+            "00000000000000ab".to_string(),
+            PathBuf::from("/c/sock/0123456789abcdef-50-00000000000000ab.sock"),
+            PathBuf::from("/c/supervisor-00000000000000ab.live"),
+        );
+        state.pending_supervisor = Some(pending.clone());
+        crate::workflow::save_state(&state).expect("save the state");
+        let loaded = crate::workflow::load_state(dir.path(), phase).expect("load the state");
+        assert_eq!(
+            loaded.pending_supervisor,
+            Some(pending),
+            "all three fields must survive a save and load"
+        );
     }
 
     /// `session_id` round-trips through serde as an exact `Option<String>`
-    /// (D-04, 28-02) — mirrors the `monitor_pid` pair above.
+    /// (D-04, 28-02) — mirrors the `supervisor` round-trip above.
     #[test]
     fn session_id_round_trips_through_serde() {
         let mut state = State::new(
@@ -999,7 +1453,7 @@ mod tests {
 
     /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`
     /// — its own key appears in the persisted JSON, and a fresh deserialize
-    /// recovers the value set, mirroring the `monitor_pid` pair above.
+    /// recovers the value set, mirroring the `supervisor` round-trip above.
     #[test]
     fn yes_ship_round_trips_through_serde() {
         let mut state = State::new(
@@ -1056,6 +1510,34 @@ mod tests {
         let legacy: State = serde_json::from_str(&without)
             .expect("a state predating base_branch must still deserialize");
         assert_eq!(legacy.base_branch, None);
+    }
+
+    /// WR-02 (49-REVIEW.md): `gate_notify_cmd` round-trips, a state written
+    /// before the field existed loads as `None`, and an unset value is not
+    /// written at all.
+    #[test]
+    fn gate_notify_cmd_round_trips_and_tolerates_states_predating_the_field() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert_eq!(
+            state.gate_notify_cmd, None,
+            "State::new must not capture a command"
+        );
+        let unset = serde_json::to_string(&state).unwrap();
+        assert!(!unset.contains("gate_notify_cmd"));
+        let legacy: State =
+            serde_json::from_str(&unset).expect("a state without gate_notify_cmd must deserialize");
+        assert_eq!(legacy.gate_notify_cmd, None);
+
+        state.gate_notify_cmd = Some("notify-send gate".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"gate_notify_cmd\":\"notify-send gate\""));
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.gate_notify_cmd.as_deref(), Some("notify-send gate"));
     }
 
     /// A serde-absent `yes_ship` (state written by a pre-23-09 binary) must

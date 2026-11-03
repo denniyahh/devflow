@@ -5,8 +5,8 @@
 //! answers "what is DevFlow doing across every project on this machine?"
 //! without shelling out to `ps` and `find` (see `23-ORPHAN-FORENSICS.md`).
 //! This module is that answer: a `(project_root, phase)` pair is registered
-//! on the same code path that already writes `state.monitor_pid`, so a
-//! running phase cannot be missing from the registry.
+//! on the launch path, so a running phase cannot be missing from the
+//! registry.
 //!
 //! **Storage shape (23-03 revision, cross-AI review BLOCKER 4):** one file
 //! per `(project_root, phase)` under a `roots/` subdirectory of the cache
@@ -67,6 +67,14 @@ pub fn roots_dir_in(cache_dir: &Path) -> PathBuf {
     cache_dir.join("roots")
 }
 
+/// The `sock/` subdirectory of a cache dir, where each launch's supervisor
+/// socket and its sidecar live (see [`crate::supervisor`]). The socket path is
+/// persisted in state when a launch is recorded and is never re-derived at
+/// probe time.
+pub fn socket_dir_in(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("sock")
+}
+
 /// The deterministic per-registration entry file path for `(project_root,
 /// phase)`. The digest is only a filename disambiguator — the authoritative
 /// `project_root` lives inside the file itself, and `load_roots_in` reads it
@@ -85,7 +93,7 @@ pub fn entry_path_in(cache_dir: &Path, project_root: &Path, phase: PhaseId) -> P
 /// DefaultHasher` is deliberately not used here: its output is explicitly
 /// not guaranteed stable across Rust releases, and an unstable filename
 /// would orphan every existing entry on a toolchain bump.
-fn path_digest(path: &Path) -> u64 {
+pub(crate) fn path_digest(path: &Path) -> u64 {
     use std::os::unix::ffi::OsStrExt;
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;

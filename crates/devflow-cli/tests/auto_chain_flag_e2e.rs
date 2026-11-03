@@ -13,6 +13,12 @@
 //! the guard scoped to the wrong stack frame — that is RESEARCH Pitfall 2, and
 //! it is the entire reason this is an end-to-end test rather than a unit test
 //! of the writer.
+//!
+//! Every `devflow` child is built by `common::hermetic_devflow`, so the
+//! monitor's registry entries land in the fixture's own tempdir `HOME`, never
+//! in the operator's real `~/.cache/devflow` (999.141).
+
+mod common;
 
 use devflow_core::mode::Mode;
 use devflow_core::phase_id::PhaseId;
@@ -22,11 +28,7 @@ use devflow_core::workflow::save_state;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn devflow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_devflow")
-}
+use std::process::Output;
 
 /// Hermetic git invocation pinned to `root` (999.37) — never a bare
 /// `Command::new("git")`.
@@ -137,6 +139,14 @@ fn write_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, perms).unwrap();
 }
 
+/// Which launch, if any, the state records when a monitor starts.
+#[derive(Clone, Copy)]
+enum RecordedLaunch {
+    Ours,
+    Other(&'static str),
+    Nobody,
+}
+
 struct Fixture {
     _repo: tempfile::TempDir,
     _aux: tempfile::TempDir,
@@ -146,6 +156,9 @@ struct Fixture {
     observation: PathBuf,
     prompt_file: PathBuf,
     script: PathBuf,
+    /// Every `devflow` child's `HOME` and cache. Declared last so it drops
+    /// after the rest of the fixture.
+    home: common::HermeticHome,
 }
 
 impl Fixture {
@@ -191,12 +204,49 @@ impl Fixture {
             observation,
             prompt_file,
             script,
+            home: common::HermeticHome::new(),
         }
     }
 
-    /// Run the REAL binary's hidden `__monitor` subcommand over `argv`.
+    /// Run the REAL binary's hidden `__monitor` subcommand over `argv`, with the state
+    /// recording this launch.
     fn run_monitor(&self, argv: &[&str]) -> Output {
-        Command::new(devflow_bin())
+        self.run_monitor_recording(argv, RecordedLaunch::Ours)
+    }
+
+    /// Run the monitor with the state's record as `recorded` says.
+    fn run_monitor_recording(&self, argv: &[&str], recorded: RecordedLaunch) -> Output {
+        // The 3.x `__monitor` argv (50-11): a per-launch id and a socket
+        // under the hermetic cache dir this file's child process gets.
+        let launch_id = devflow_core::supervisor::new_launch_id();
+        let socket = devflow_core::supervisor::SocketPath::for_launch(
+            &self.home.cache_dir(),
+            &self.root,
+            self.phase,
+            &launch_id,
+        )
+        .expect("the hermetic socket path fits sun_path");
+        // The state must record this launch, as a launcher's publish does: this monitor
+        // has no launcher to promote it (D-15).
+        devflow_core::workflow::update_state(&self.root, self.phase, |state| {
+            state.supervisor = match recorded {
+                RecordedLaunch::Ours => Some(launch_id.clone()),
+                RecordedLaunch::Other(other) => Some(other.to_string()),
+                RecordedLaunch::Nobody => None,
+            }
+            .map(|recorded_id| {
+                devflow_core::state::SupervisorRecord::new(
+                    socket.as_path().to_path_buf(),
+                    recorded_id,
+                    4_294_967_000,
+                    1,
+                    String::new(),
+                )
+            });
+            Ok::<(), devflow_core::workflow::WorkflowError>(())
+        })
+        .unwrap();
+        common::hermetic_devflow(&self.home)
             .arg("__monitor")
             .arg("--project")
             .arg(&self.root)
@@ -210,6 +260,12 @@ impl Fixture {
             .arg("30")
             .arg("--agent")
             .arg("claude")
+            .arg("--launch")
+            .arg("stream")
+            .arg("--launch-id")
+            .arg(&launch_id)
+            .arg("--socket")
+            .arg(socket.as_path())
             .arg("--")
             .args(argv)
             .output()
@@ -239,6 +295,49 @@ impl Fixture {
     }
 }
 
+/// D-03: the state records another launch, so that run owns the flag. This supervisor ends
+/// its agent and leaves the flag as it stands. Its own engage set it `true` here, and
+/// `auto_mode_code_stage_child_observes_the_flag_set` is the control: a recorded supervisor
+/// clears the same value.
+#[test]
+fn a_superseded_supervisor_leaves_the_flag_to_the_run_that_superseded_it() {
+    let fixture = Fixture::new(Mode::Auto, false);
+
+    let output = fixture.run_monitor_recording(
+        &["sh", "-c", "sleep 30"],
+        RecordedLaunch::Other("bbbb0000bbbb0077"),
+    );
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(
+        fixture.flag_now(),
+        "true",
+        "restoring the flag could change the run that superseded this one"
+    );
+    assert!(
+        !devflow_core::agent_result::exit_code_path(&fixture.root, fixture.phase).exists(),
+        "a superseded supervisor writes no exit file"
+    );
+}
+
+/// A state that records no launch has no run to disturb, and nothing else would clear the
+/// flag before the next launch, so the supervisor still clears it. It writes no exit file.
+#[test]
+fn a_supervisor_the_state_records_nobody_for_still_clears_the_flag() {
+    let fixture = Fixture::new(Mode::Auto, false);
+
+    let output = fixture.run_monitor_recording(&["sh", "-c", "sleep 30"], RecordedLaunch::Nobody);
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
+    assert!(output.status.success(), "{output:?}");
+
+    assert_eq!(fixture.flag_now(), "false");
+    assert!(
+        !devflow_core::agent_result::exit_code_path(&fixture.root, fixture.phase).exists(),
+        "a supervisor the state does not record writes no exit file"
+    );
+}
+
 /// The positive arm. The child — a real process supervised by a real
 /// `devflow __monitor` — reports having seen the chain flag SET while it ran,
 /// and the flag is clear again once that monitor process returns.
@@ -247,6 +346,10 @@ fn auto_mode_code_stage_child_observes_the_flag_set() {
     let fixture = Fixture::new(Mode::Auto, false);
 
     let output = fixture.run_observer();
+    // The foreground monitor halts at the Code boundary (`stop_until`), so
+    // it should launch nothing. If that halt ever regresses, the next stage's
+    // detached monitor and agent are reaped here instead of outliving the test.
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
     assert!(
         output.status.success(),
         "monitor exited {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -287,6 +390,10 @@ fn supervise_mode_code_stage_child_observes_the_flag_clear() {
     let before = fs::read(&fixture.config).unwrap();
 
     let output = fixture.run_observer();
+    // The foreground monitor halts at the Code boundary (`stop_until`), so
+    // it should launch nothing. If that halt ever regresses, the next stage's
+    // detached monitor and agent are reaped here instead of outliving the test.
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
     assert!(
         output.status.success(),
         "monitor exited {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -311,7 +418,7 @@ fn supervise_mode_code_stage_child_observes_the_flag_clear() {
 }
 
 /// The in-process half of criterion 2: the flag is cleared even when the run
-/// dies before `advance` is ever reached — `run_pipe_owning_monitor`'s
+/// dies before `advance` is ever reached — `run_supervised_stage`'s
 /// early-return `Err` path, driven here by a child program that cannot be
 /// spawned at all. (`35.1-02` owns the kill half.)
 ///
@@ -323,6 +430,10 @@ fn guard_clears_the_flag_when_the_supervised_child_fails() {
     let fixture = Fixture::new(Mode::Auto, true);
 
     let output = fixture.run_monitor(&["definitely-not-a-real-program-35-1-01"]);
+    // The foreground monitor halts at the Code boundary (`stop_until`), so
+    // it should launch nothing. If that halt ever regresses, the next stage's
+    // detached monitor and agent are reaped here instead of outliving the test.
+    let _run_reaper = common::LaunchedRunReaper::new(&fixture.root, fixture.phase, Vec::new());
     assert!(
         !output.status.success(),
         "a child that cannot be spawned must fail the monitor, not pass silently"

@@ -496,6 +496,11 @@ mod tests {
     struct EnvOverride(&'static str);
 
     impl EnvOverride {
+        // D-09 (48-09): mutates a process-global variable process-wide.
+        // Deferred deliberately, not overlooked: THIS process reads the value, so
+        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+        // race and the value is restored on every exit path, unwinding included.
+        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
         fn set(key: &'static str, value: &str) -> Self {
             // SAFETY: Tests that mutate this process-global variable are
             // serialized by ENV_MUTEX and the guard removes it on drop.
@@ -512,6 +517,11 @@ mod tests {
         /// the zero-regression control pass or fail for reasons unrelated to
         /// the code. Drop removes the variable, which is the correct final
         /// state for a test process that never legitimately owns one.
+        // D-09 (48-09): mutates a process-global variable process-wide.
+        // Deferred deliberately, not overlooked: THIS process reads the value, so
+        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+        // race and the value is restored on every exit path, unwinding included.
+        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
         fn clear(key: &'static str) -> Self {
             // SAFETY: See EnvOverride::set; the same mutex guard is held.
             unsafe { std::env::remove_var(key) };
@@ -520,6 +530,11 @@ mod tests {
     }
 
     impl Drop for EnvOverride {
+        // D-09 (48-09): mutates a process-global variable process-wide.
+        // Deferred deliberately, not overlooked: THIS process reads the value, so
+        // per-`Command` scoping would not reach the reader. ENV_MUTEX bounds the
+        // race and the value is restored on every exit path, unwinding included.
+        #[expect(clippy::disallowed_methods, reason = "test-only; ENV_MUTEX-guarded")]
         fn drop(&mut self) {
             // SAFETY: See EnvOverride::set; the same mutex guard is still held.
             unsafe { std::env::remove_var(self.0) };

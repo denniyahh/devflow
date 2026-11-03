@@ -139,13 +139,225 @@ pub use crate::git::{
     ALSO_REDIRECTING_GIT_VARS, REPO_LOCAL_GIT_VARS, git_command, hermetic_command,
 };
 
-// ## Why there is no absent-`git` (`NoGitPath`) harness in THIS crate
+/// Environment marker for a test process that was re-invoked by
+/// [`run_test_in_child`]. Its value is the exact module-qualified test name.
+pub const CHILD_TEST_ENV: &str = "DEVFLOW_CHILD_TEST";
+
+/// Returns whether this process is the child half for `test_name`.
+pub fn in_child_test(test_name: &str) -> bool {
+    std::env::var_os(CHILD_TEST_ENV).is_some_and(|value| value == std::ffi::OsStr::new(test_name))
+}
+
+/// The pids of the live members of process group `pgid`: every `/proc/<pid>`
+/// whose group is `pgid` and whose state is not `Z`.
+///
+/// A zombie has exited and only waits to be reaped, and an orphan is reaped
+/// by PID 1. A GitHub Actions job container's PID 1 is `tail -f /dev/null`,
+/// which never reaps, so there a killed agent's orphaned children stay
+/// zombies for the life of the job and `kill(-pgid, 0)` keeps reporting the
+/// group. "Is the group gone?" must ask this, never `kill(-pgid, 0)`. It is
+/// the rule `supervisor::backstop`'s census applies.
+pub fn live_group_members(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            crate::agent::process_stat_fields(pid)
+                .is_some_and(|stat| i64::from(stat.pgrp) == i64::from(pgid) && stat.state != 'Z')
+        })
+        .collect()
+}
+
+/// Whether `pid` is a live process: `/proc/<pid>` exists and is not a
+/// zombie. See [`live_group_members`] for why a zombie never counts.
+pub fn process_is_live(pid: u32) -> bool {
+    crate::agent::process_stat_fields(pid).is_some_and(|stat| stat.state != 'Z')
+}
+
+/// Re-invokes this test binary for exactly `test_name` with a child-local
+/// `PATH` and environment. The caller owns `path_dir` for the duration of the
+/// child invocation.
+pub fn run_test_in_child(
+    test_name: &str,
+    path_dir: &std::path::Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    child_test_command(test_name, path_dir, extra_env)
+        .output()
+        .expect("spawn child test process with an isolated PATH")
+}
+
+/// [`run_test_in_child`], but spawned rather than waited for: the caller gets
+/// the running [`std::process::Child`] (stdout and stderr piped) and owns it,
+/// so it can act on the child while it runs and must wait on it afterwards.
+pub fn spawn_test_in_child(
+    test_name: &str,
+    path_dir: &std::path::Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Child {
+    child_test_command(test_name, path_dir, extra_env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child test process with an isolated PATH")
+}
+
+/// The command both child-test helpers run: this test binary, filtered to
+/// exactly `test_name`, with a child-local `PATH` and environment.
+fn child_test_command(
+    test_name: &str,
+    path_dir: &std::path::Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Command {
+    assert!(
+        path_dir.is_dir(),
+        "child test PATH must be an existing directory: {}",
+        path_dir.display()
+    );
+
+    let exe = std::env::current_exe().expect("current_exe for child test re-invocation");
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg(test_name)
+        .arg("--exact")
+        .arg("--test-threads=1")
+        .env("PATH", path_dir)
+        .env(CHILD_TEST_ENV, test_name);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command
+}
+
+/// Asserts that a child test process ran precisely its requested test and did
+/// not turn an unmatched `--exact` filter into a vacuous green result.
+pub fn assert_child_ran_exactly_one_passing_test(output: &std::process::Output, test_name: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}\n--- end child output ---"
+    );
+
+    assert!(
+        output.status.success(),
+        "child test process must exit 0; status {status:?}{context}",
+        status = output.status
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "child must report exactly `1 passed`{context}"
+    );
+    let test_prefix = format!("test {test_name} ...");
+    let result_summary = "test result: ok. 1 passed;";
+    let test_completed = stdout.contains(&format!("{test_prefix} ok"))
+        || stdout.contains(&format!("\nok\n\n{result_summary}"));
+    assert!(
+        stdout.contains(&test_prefix) && test_completed && stdout.contains(result_summary),
+        "child stdout must show the requested test and its successful one-test result — test output may appear between `{test_prefix}` and libtest's `ok`, but the child may not run another test or none{context}"
+    );
+
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    let filtered_out: u64 = words
+        .windows(3)
+        .find(|words| words[1] == "filtered" && words[2].starts_with("out"))
+        .and_then(|words| words[0].parse().ok())
+        .unwrap_or_else(|| {
+            panic!("child stdout must carry a parseable `N filtered out` count{context}")
+        });
+    assert!(
+        filtered_out > 0,
+        "child must report a NON-ZERO `filtered out` count — zero is consistent with a binary containing only this test, in which case the filter proved nothing; got {filtered_out}{context}"
+    );
+}
+
+/// The answer files of a stage: keyed `.response.json` files and the legacy
+/// unkeyed response, sorted. Not quarantine, gate, claim or waiter files.
+pub fn gate_answer_files(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(crate::gates::Gates::dir(root)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-{stage}.", phase.padded());
+    let mut files: Vec<std::path::PathBuf> = entries
+        .map(|entry| entry.expect("read a gates directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest == "response.json" || rest.ends_with(".response.json"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Answer a gate that has not opened yet: the next gate opened at this stage gets
+/// `response` as its answer. Only for tests whose subject is what an answer leads
+/// to, never for the binding itself.
+pub fn preanswer_gate(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+    response: &crate::gates::GateResponse,
+) {
+    crate::workflow::ensure_devflow_dir(&crate::gates::Gates::dir(root))
+        .expect("create the gates directory");
+    let body = serde_json::to_string_pretty(response).expect("serialize the response");
+    let path = crate::gates::Gates::preanswer_path(root, phase, stage);
+    crate::durable::replace_durably(&path, body.as_bytes()).expect("write the pre-answer");
+}
+
+/// Answer the gate the gate file names, as a human answering the gate they see.
+///
+/// # Errors
+/// [`crate::gates::GateError::NoOpenGate`] with no gate file, or whatever
+/// [`crate::gates::Gates::answer`] returns.
+pub fn answer_open_gate(
+    root: &std::path::Path,
+    phase: crate::phase_id::PhaseId,
+    stage: crate::stage::Stage,
+    response: &crate::gates::GateResponse,
+) -> Result<std::path::PathBuf, crate::gates::GateError> {
+    let Some(live) = crate::gates::Gates::current_gate_id(root, phase, stage)? else {
+        return Err(crate::gates::GateError::NoOpenGate { phase, stage });
+    };
+    let gate = crate::gates::GateId::parse(&live)?;
+    crate::gates::Gates::answer(root, phase, stage, &gate, response)
+}
+
+/// Run `body` with `hook` installed for this thread, to run once inside the first
+/// answer `body` publishes, after its id check and before its publish. That is the
+/// only point at which a gate can close under a writer's publish, so a CLI test of how
+/// a writer reports `GateClosedAfterPublish` installs it here; a hook run before
+/// `Gates::answer` yields `GateIdMismatch` instead. No gate lock is held when it runs,
+/// so it may close and open gates. A hook `body` never reached is dropped unrun.
+pub fn with_answer_before_publish<R>(hook: impl FnOnce() + 'static, body: impl FnOnce() -> R) -> R {
+    /// Clears the slot however `body` ends, so a later answer on this thread runs
+    /// no hook.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            crate::gates::set_answer_publish_hook(None);
+        }
+    }
+    crate::gates::set_answer_publish_hook(Some(Box::new(hook)));
+    let _clear = ClearOnDrop;
+    body()
+}
+
+// ## Why there is no in-process absent-`git` harness in THIS crate
 //
-// 35-01 planned one `NoGitPath` guard per crate, so that criterion 6's tests
+// 35-01 planned one empty-`PATH` guard per crate, so that criterion 6's tests
 // could force `git` to be unresolvable and drive `phase_commit_count`'s
-// could-not-measure branch from inside `devflow-core`. **That guard was built
-// here, measured, and removed.** It is recorded rather than silently omitted,
-// because the next author to need a failing `git` will otherwise rebuild it.
+// could-not-measure branch from inside `devflow-core`. **That process-global
+// guard was built here, measured, and removed.** It is recorded rather than
+// silently omitted, because the next author to need a failing `git` will
+// otherwise rebuild it.
 //
 // A `PATH`-replacing guard mutates process-global state, and `cargo test` runs
 // this crate's whole suite as threads in ONE process. `devflow-core` shells out
@@ -179,16 +391,236 @@ pub use crate::git::{
 //
 // **When that is not enough**, because the code under test must also READ a
 // file from `project_root` (`evaluate_layer2` reads its exit file there, so a
-// non-existent root would fail for the wrong reason), the test belongs in
-// `devflow-cli`'s binary, where every `PATH` mutation goes through one
-// `ENV_MUTEX` that its `git`-touching tests already hold. Criterion 6's
-// layer-level and cascade-level tests live in
+// non-existent root would fail for the wrong reason), use the child-process
+// pattern in `devflow-cli`: the parent builds the fixture, one re-executed
+// child gets an empty `PATH`, and the parent verifies the child ran. The empty
+// `PATH` is then process-local rather than something an `ENV_MUTEX` merely
+// serializes. A future core-crate test needing this shape should copy that
+// approach. Criterion 6's layer-level and cascade-level tests live in
 // `devflow-cli/src/pipeline_outcomes.rs` for exactly this reason; they call the
 // same `pub` functions, so only the binary differs.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gates::{AnswerRead, GateError, GateFile, GateId, GateResponse, Gates};
+    use crate::phase_id::PhaseId;
+    use crate::stage::Stage;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const PHASE: PhaseId = PhaseId::new(7);
+    const STAGE: Stage = Stage::Code;
+
+    fn approved() -> GateResponse {
+        GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        }
+    }
+
+    fn live_gate(root: &std::path::Path) -> GateId {
+        let body = std::fs::read_to_string(Gates::gate_path(root, PHASE, STAGE)).unwrap();
+        GateId::parse(&serde_json::from_str::<GateFile>(&body).unwrap().gate_id).unwrap()
+    }
+
+    fn close_and_open(root: &std::path::Path) {
+        Gates::close(root, PHASE, STAGE).unwrap();
+        Gates::open_gate(root, PHASE, STAGE, "next").unwrap();
+    }
+
+    #[test]
+    fn with_answer_before_publish_runs_between_the_check_and_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Gates::open_gate(dir.path(), PHASE, STAGE, "first")
+            .unwrap()
+            .gate_id;
+        let root = dir.path().to_path_buf();
+        let runs = Rc::new(Cell::new(0));
+        let hook_runs = runs.clone();
+
+        let refused = with_answer_before_publish(
+            move || {
+                hook_runs.set(hook_runs.get() + 1);
+                close_and_open(&root);
+            },
+            || Gates::answer(dir.path(), PHASE, STAGE, &first, &approved()),
+        );
+
+        assert!(
+            matches!(
+                &refused,
+                Err(GateError::GateClosedAfterPublish { observed, .. }) if observed == first.as_str()
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(runs.get(), 1);
+        assert_eq!(
+            Gates::read_answer(dir.path(), PHASE, STAGE, &live_gate(dir.path())),
+            AnswerRead::None,
+            "a late answer never decides the next gate"
+        );
+
+        // The control: run just before `answer`, the same step fails its id check,
+        // so the hook above ran after that check.
+        let before = tempfile::tempdir().unwrap();
+        let observed = Gates::open_gate(before.path(), PHASE, STAGE, "first")
+            .unwrap()
+            .gate_id;
+        close_and_open(before.path());
+        let refused = Gates::answer(before.path(), PHASE, STAGE, &observed, &approved());
+        assert!(
+            matches!(&refused, Err(GateError::GateIdMismatch { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn with_answer_before_publish_runs_its_hook_once_and_never_after_its_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
+            .unwrap()
+            .gate_id;
+        let runs = Rc::new(Cell::new(0));
+        let counted = |runs: &Rc<Cell<i32>>| {
+            let runs = runs.clone();
+            move || runs.set(runs.get() + 1)
+        };
+
+        with_answer_before_publish(counted(&runs), || ());
+        Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
+        assert_eq!(runs.get(), 0, "an answer after the body runs no hook");
+
+        with_answer_before_publish(counted(&runs), || {
+            let again = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved());
+            assert!(matches!(again, Err(GateError::AlreadyResponded { .. })));
+            let once_more = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved());
+            assert!(matches!(once_more, Err(GateError::AlreadyResponded { .. })));
+        });
+        assert_eq!(runs.get(), 1, "the hook runs once");
+    }
+
+    /// `stop` publishes through `reap_answer`, so the hook runs there too (R2-04).
+    #[test]
+    fn with_answer_before_publish_also_runs_inside_reap_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
+            .unwrap()
+            .gate_id;
+        let runs = Rc::new(Cell::new(0));
+        let hook_runs = runs.clone();
+
+        with_answer_before_publish(
+            move || hook_runs.set(hook_runs.get() + 1),
+            || Gates::reap_answer(dir.path(), PHASE, STAGE, &gate, "abort", "stop").unwrap(),
+        );
+
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn gate_answer_files_lists_keyed_and_legacy_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gates::open_gate(dir.path(), PHASE, STAGE, "ctx")
+            .unwrap()
+            .gate_id;
+        let keyed = Gates::answer(dir.path(), PHASE, STAGE, &gate, &approved()).unwrap();
+        let legacy = Gates::dir(dir.path()).join("07-code.response.json");
+        std::fs::write(&legacy, "{}").unwrap();
+        Gates::claim(dir.path(), PHASE, STAGE, &gate).unwrap();
+        let _registration = Gates::register_waiter(dir.path(), PHASE, STAGE, &gate).unwrap();
+        let gates_dir = Gates::dir(dir.path());
+        std::fs::write(gates_dir.join("07-code.noid.1.2.0.quarantined.json"), "{}").unwrap();
+        std::fs::write(gates_dir.join("07-validate.response.json"), "{}").unwrap();
+
+        let mut expected = vec![keyed, legacy];
+        expected.sort();
+        assert_eq!(gate_answer_files(dir.path(), PHASE, STAGE), expected);
+    }
+
+    #[test]
+    fn answer_open_gate_answers_the_live_gate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = answer_open_gate(dir.path(), PHASE, STAGE, &approved());
+        assert!(
+            matches!(&refused, Err(GateError::NoOpenGate { .. })),
+            "{refused:?}"
+        );
+
+        Gates::write_gate(dir.path(), PHASE, STAGE, "ctx").unwrap();
+        let live = live_gate(dir.path());
+        let path = answer_open_gate(dir.path(), PHASE, STAGE, &approved()).unwrap();
+
+        assert_eq!(path, Gates::answer_path(dir.path(), PHASE, STAGE, &live));
+        assert!(matches!(
+            Gates::read_answer(dir.path(), PHASE, STAGE, &live),
+            AnswerRead::Bound(answer) if answer.response == approved()
+        ));
+    }
+
+    #[test]
+    fn child_with_an_empty_path_dir_cannot_spawn_git_while_the_parent_can() {
+        const NAME: &str = "test_support::tests::child_with_an_empty_path_dir_cannot_spawn_git_while_the_parent_can";
+
+        if in_child_test(NAME) {
+            let err = std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .expect_err("an empty child PATH must not resolve git");
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            return;
+        }
+
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("the parent PATH must resolve git for this control");
+        let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
+        let output = run_test_in_child(NAME, empty_dir.path(), &[]);
+        assert_child_ran_exactly_one_passing_test(&output, NAME);
+    }
+
+    #[test]
+    fn child_guard_accepts_output_emitted_by_the_passing_child() {
+        const NAME: &str =
+            "test_support::tests::child_guard_accepts_output_emitted_by_the_passing_child";
+
+        if in_child_test(NAME) {
+            println!("child emits output before libtest writes the final status");
+            return;
+        }
+
+        let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
+        let output = run_test_in_child(NAME, empty_dir.path(), &[]);
+        assert_child_ran_exactly_one_passing_test(&output, NAME);
+    }
+
+    #[test]
+    #[should_panic(expected = "child must report exactly `1 passed`")]
+    fn child_guard_rejects_a_name_that_matches_no_test() {
+        let empty_dir = tempfile::tempdir().expect("create empty PATH directory");
+        let output = run_test_in_child(
+            "test_support::tests::this_module_qualified_test_does_not_exist",
+            empty_dir.path(),
+            &[],
+        );
+        assert_child_ran_exactly_one_passing_test(
+            &output,
+            "test_support::tests::this_module_qualified_test_does_not_exist",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "child test PATH must be an existing directory")]
+    fn run_test_in_child_refuses_a_path_that_is_not_a_directory() {
+        let missing = std::path::Path::new("this-path-must-not-exist-for-child-test");
+        run_test_in_child(
+            "test_support::tests::run_test_in_child_refuses_a_path_that_is_not_a_directory",
+            missing,
+            &[],
+        );
+    }
 
     /// Positive case (25-11/999.47, the whole point of the barrier): a real
     /// child whose argv[0] basename is known and differs from this test
@@ -310,5 +742,45 @@ mod tests {
             "a self-match on unchanged cmdline must never report exec-visible, even though \
              argv[0]'s basename matches by construction"
         );
+    }
+
+    /// An unreaped zombie is not a live group member, though `kill(-pgid, 0)`
+    /// still finds its group: the case a non-reaping PID 1 leaves behind.
+    /// Control: the same process counts while it runs.
+    #[test]
+    fn a_zombie_is_not_a_live_group_member() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(live_group_members(pid), vec![pid], "control: it runs");
+        assert!(process_is_live(pid), "control: it runs");
+
+        child.kill().expect("SIGKILL the sleeper");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_live(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "it is a zombie, not gone: nothing has reaped it"
+        );
+        let signed = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: signal 0 only checks for existence; `signed` is our child's
+        // own group, never 0, 1 or ours.
+        assert_eq!(
+            unsafe { libc::kill(-signed, 0) },
+            0,
+            "kill(-pgid, 0) still reports the zombie's group"
+        );
+        assert!(
+            live_group_members(pid).is_empty(),
+            "a zombie is not a member"
+        );
+        assert!(!process_is_live(pid), "a zombie is not live");
+        child.wait().expect("reap the sleeper");
     }
 }

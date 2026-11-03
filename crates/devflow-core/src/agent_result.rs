@@ -40,6 +40,48 @@ pub struct AgentResult {
     /// fixture literals that don't route through the real cascade.
     #[serde(default)]
     pub decided_by_layer: Option<u8>,
+    /// The checkpoint the agent declares it stopped at, as written in its
+    /// `DEVFLOW_RESULT` marker (`"checkpoint": "blocking-human"`). Only a
+    /// failed result naming [`HUMAN_GATE_VALUE`] counts; see
+    /// [`AgentResult::declares_blocking_human_checkpoint`].
+    ///
+    /// This replaces reading the checkpoint out of the free-text `reason`
+    /// (49-REVIEW CR-01), which matched ordinary failures that mentioned a
+    /// gate. Deserialized leniently via [`deserialize_checkpoint_lenient`]: a
+    /// non-string value becomes `None` rather than failing the whole parse, so
+    /// a malformed field can never drop a valid `status` to Layer 2. Dropped at
+    /// parse time unless the marker's own status is `failed`
+    /// ([`parse_marker_lines`]), and never serialized when absent.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub checkpoint: Option<String>,
+}
+
+impl AgentResult {
+    /// Whether the agent declared that it stopped at a `blocking-human`
+    /// checkpoint: a failed result whose `checkpoint` field names
+    /// [`HUMAN_GATE_VALUE`] (ASCII case-insensitive, like the `Gate:` value
+    /// match). A successful result never counts, whatever it declares.
+    pub fn declares_blocking_human_checkpoint(&self) -> bool {
+        self.status == AgentStatus::Failed
+            && self
+                .checkpoint
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(HUMAN_GATE_VALUE))
+    }
+}
+
+/// Lenient deserializer for [`AgentResult::checkpoint`]: a string is kept, and
+/// anything else (number, bool, object, null) becomes `None`.
+fn deserialize_checkpoint_lenient<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| v.as_str().map(str::to_string)))
 }
 
 /// Agent completion status determined by DevFlow.
@@ -584,6 +626,7 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
         summary: None,
         verdict: None,
         decided_by_layer: Some(1),
+        checkpoint: None,
     })
 }
 
@@ -603,14 +646,14 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
 ///
 /// The VALUE is what this constant holds. The surrounding markdown — bold
 /// label, and a **code span around the value** — is handled by
-/// [`text_reports_human_gate`]'s trim set, not by this constant.
+/// [`line_reports_human_gate`]'s trim set, not by this constant.
 ///
 /// The code span is the part RESEARCH.md did not predict. Its § "Architecture
 /// Patterns / Pattern 2" derived the literal by reading the *emitting* source
 /// (`gsd-executor.md:356`, `execute-phase.md:1053`) and predicted a bare
 /// `**Gate:** blocking-human`. The real relay renders the value as a code
 /// span, which defeated the original matcher entirely — see
-/// [`text_reports_human_gate`] for that failure and its fix. Lesson worth
+/// [`line_reports_human_gate`] for that failure and its fix. Lesson worth
 /// keeping: the emitting source told us the value, not the rendering.
 const HUMAN_GATE_VALUE: &str = "blocking-human";
 
@@ -628,17 +671,29 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// unconditionally recorded by the `checkpoint_auto_decided` audit event
 /// (plan 28-03) — it can never silently authorize anything.
 ///
-/// Searches BOTH the raw stdout text and — when the stdout is a Claude JSON
-/// result envelope — the unescaped inner `result` text obtained via
-/// [`extract_json_result_text`], because the `Gate:` line typically crosses
-/// into the capture escaped inside that envelope (RESEARCH § "Common
-/// Pitfalls / Pitfall 2": two indirections, subagent emission → orchestrator
-/// relay → DevFlow's captured top-level stdout). Matching is
+/// Searches BOTH the raw capture, through [`capture_reports_human_gate`], and —
+/// when the stdout is one Claude JSON result envelope, even pretty-printed — the
+/// unescaped inner `result` text obtained via [`extract_json_result_text`],
+/// because the `Gate:` line typically crosses into the capture escaped inside
+/// that envelope (RESEARCH § "Common Pitfalls / Pitfall 2": two indirections,
+/// subagent emission → orchestrator relay → DevFlow's captured top-level
+/// stdout). Matching is
 /// case-insensitive on the `Gate` LABEL and tolerates surrounding markdown
 /// emphasis (`*`) and whitespace, but the VALUE comparison is exact — this
 /// deliberately does NOT widen into a general "does this look like a
 /// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
 /// is one declared field label with one enumerated value.
+///
+/// **The latest stated outcome wins** (operator decision 2026-10-10). A
+/// `DEVFLOW_RESULT` marker and a `Gate:` declaration line both state an
+/// outcome; the first found reading back from the end decides
+/// ([`latest_stated_outcome`]). A marker that declares
+/// `"checkpoint": "blocking-human"` is a checkpoint, any other marker is not,
+/// and a `Gate:` line counts only with no marker after it. The pipeline also
+/// reads the declared field from the stage's evaluated result
+/// ([`AgentResult::declares_blocking_human_checkpoint`]). A marker's free-text
+/// `reason` is never read as a checkpoint: a substring heuristic over it
+/// matched ordinary failures and was removed (49-REVIEW CR-01).
 ///
 /// **A Claude `stream-json` capture takes a separate branch** and is answered
 /// by [`claude_stream_reports_human_gate`] ALONE — it never consults raw stdout.
@@ -663,20 +718,86 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
     if classify(&capture) == CaptureKind::ClaudeStream {
         return claude_stream_reports_human_gate(&capture.events);
     }
-    if text_reports_human_gate(stdout) {
-        return true;
+    if let Some(inner) = extract_json_result_text(stdout) {
+        return latest_stated_outcome(&inner) == StatedOutcome::Checkpoint;
     }
-    extract_json_result_text(stdout)
-        .as_deref()
-        .is_some_and(text_reports_human_gate)
+    capture_reports_human_gate(stdout)
 }
 
-/// Core matcher shared by both search targets (raw stdout and the unescaped
-/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans for
-/// a case-insensitive `gate` label, tolerating surrounding markdown emphasis
-/// (`*`), code-span backticks (`` ` ``), and whitespace up to the following
-/// `:`, then compares the VALUE token immediately after the colon exactly
-/// against [`HUMAN_GATE_VALUE`].
+/// The raw-capture reader behind [`blocking_human_checkpoint_reported`]'s
+/// non-stream path. A physical line that parses as a JSON object or array has
+/// its string values decoded and matched, so agent text escaped inside an
+/// envelope or a JSON-lines event is read with its real line breaks. Every
+/// other line is matched as it is.
+///
+/// This replaces splitting the whole capture on the two characters `\n`, which
+/// turned a literal backslash-n in agent-authored text (a code sample, a diff
+/// hunk) into a line break and read `let s = "\n**Gate:** ...";` as a
+/// declaration (final external review, 2026-09-12). Escaped text is decoded
+/// only where it really is a JSON string, and only once, so a JSON string that
+/// itself quotes an escaped sample stays a sample.
+fn capture_reports_human_gate(stdout: &str) -> bool {
+    for line in stdout.lines().rev() {
+        let outcome = match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(value) if value.is_object() || value.is_array() => {
+                json_strings_stated_outcome(&value)
+            }
+            _ => latest_stated_outcome(line),
+        };
+        match outcome {
+            StatedOutcome::Checkpoint => return true,
+            StatedOutcome::Other => return false,
+            StatedOutcome::Silent => {}
+        }
+    }
+    false
+}
+
+/// The stated outcome of a decoded JSON document: each string value is read
+/// with [`latest_stated_outcome`]. An array is ordered, so its elements are
+/// read newest first and the first that states an outcome decides, like the
+/// lines of a text. An object's fields have no order a reader can rely on, so
+/// when they disagree the safe outcome wins: any ordinary outcome makes the
+/// object [`StatedOutcome::Other`], and only otherwise does a checkpoint make
+/// it [`StatedOutcome::Checkpoint`].
+///
+/// This replaces matching only `Gate:` lines inside the strings, which skipped
+/// a later ordinary-failure marker and let an earlier gate line win (round-3
+/// external review of the CR-01 fix, 2026-10-10).
+fn json_strings_stated_outcome(value: &serde_json::Value) -> StatedOutcome {
+    let combine = |left: StatedOutcome, right: StatedOutcome| match (left, right) {
+        (StatedOutcome::Other, _) | (_, StatedOutcome::Other) => StatedOutcome::Other,
+        (StatedOutcome::Checkpoint, _) | (_, StatedOutcome::Checkpoint) => {
+            StatedOutcome::Checkpoint
+        }
+        _ => StatedOutcome::Silent,
+    };
+    match value {
+        serde_json::Value::String(text) => latest_stated_outcome(text),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .rev()
+            .map(json_strings_stated_outcome)
+            .find(|outcome| *outcome != StatedOutcome::Silent)
+            .unwrap_or(StatedOutcome::Silent),
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .map(json_strings_stated_outcome)
+            .fold(StatedOutcome::Silent, combine),
+        _ => StatedOutcome::Silent,
+    }
+}
+
+/// Core matcher over one line of text already in its final form: a physical
+/// line of a non-JSON capture, or a line of a decoded JSON string
+/// ([`capture_reports_human_gate`]) or of an envelope's unescaped `result`
+/// ([`blocking_human_checkpoint_reported`]), each reached through
+/// [`latest_stated_outcome`]. It never decodes escapes itself. Matches only
+/// a line whose first word, after any list, ordinal or blockquote markup
+/// ([`strip_leading_markup`]), is a case-insensitive `gate` label, tolerating
+/// surrounding markdown emphasis (`*`), code-span backticks (`` ` ``), and
+/// whitespace up to the following `:`, then compares the VALUE token
+/// immediately after the colon exactly against [`HUMAN_GATE_VALUE`].
 ///
 /// The backtick tolerance is not speculative — it is the single reason this
 /// matcher failed against the first real checkpoint ever observed. The live
@@ -690,26 +811,79 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 ///
 /// Note the closing backtick needs no handling: `take_while` already stops
 /// at it, since a backtick is neither alphanumeric nor `-`.
-fn text_reports_human_gate(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let mut search_from = 0;
-    while let Some(rel_idx) = lower[search_from..].find("gate") {
-        let idx = search_from + rel_idx;
-        let after_label = &lower[idx + "gate".len()..];
-        let after_label = after_label.trim_start_matches(['*', ' ', '`']);
-        if let Some(rest) = after_label.strip_prefix(':') {
-            let value_region = rest.trim_start_matches(['*', ' ', '`']);
-            let value_token: String = value_region
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect();
-            if value_token == HUMAN_GATE_VALUE {
-                return true;
-            }
+fn line_reports_human_gate(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let line = strip_leading_markup(&lower);
+    let Some(after_label) = line.strip_prefix("gate") else {
+        return false;
+    };
+    let after_label = after_label.trim_start_matches(['*', ' ', '`']);
+    if let Some(rest) = after_label.strip_prefix(':') {
+        let value_region = rest.trim_start_matches(['*', ' ', '\t', '`']);
+        let value_token: String = value_region
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if value_token == HUMAN_GATE_VALUE {
+            return true;
         }
-        search_from = idx + "gate".len();
     }
     false
+}
+
+/// What a piece of agent text last said about how the stage ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatedOutcome {
+    /// The latest statement is a blocking-human checkpoint: a marker that
+    /// declares it, or a `Gate:` declaration line with no marker after it.
+    Checkpoint,
+    /// The latest statement is a marker that declares no checkpoint.
+    Other,
+    /// Nothing in the text states an outcome.
+    Silent,
+}
+
+/// The latest stated outcome in `text`, read line by line from the end
+/// (operator decision 2026-10-10: the latest step wins). A `DEVFLOW_RESULT`
+/// marker states an outcome, and so does a `Gate:` declaration line; the first
+/// one found, counting back from the end, decides. Unlike
+/// [`parse_marker_lines`] this reads the whole text: a long tail after a later
+/// marker must not hide it and let an earlier gate win.
+fn latest_stated_outcome(text: &str) -> StatedOutcome {
+    for line in text.lines().rev() {
+        if let Some(result) = marker_from_line(line) {
+            return if result.declares_blocking_human_checkpoint() {
+                StatedOutcome::Checkpoint
+            } else {
+                StatedOutcome::Other
+            };
+        }
+        if line_reports_human_gate(line) {
+            return StatedOutcome::Checkpoint;
+        }
+    }
+    StatedOutcome::Silent
+}
+
+/// Strip the markdown a relayed declaration line can carry before its label:
+/// indentation, blockquote markers (`>`), a list bullet (`-`, `+`, `*`) or an
+/// ordinal (`1.`, `2)`), emphasis (`*`) and code-span backticks.
+///
+/// An external review (2026-09-12) found that the line-anchored matcher
+/// otherwise missed `- **Gate:** ...` and `> **Gate:** ...`, both of which the
+/// earlier substring scan matched. Only markup is stripped, never words, so
+/// prose such as `- Resolved gate: blocking-human` still does not start with
+/// the label.
+fn strip_leading_markup(line: &str) -> &str {
+    let is_markup = |c: char| c.is_whitespace() || matches!(c, '>' | '-' | '+' | '*' | '`');
+    let rest = line.trim_start_matches(is_markup);
+    let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    match after_digits.strip_prefix(['.', ')']) {
+        Some(after_ordinal) if after_digits.len() < rest.len() => {
+            after_ordinal.trim_start_matches(is_markup)
+        }
+        _ => rest,
+    }
 }
 
 /// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
@@ -824,6 +998,7 @@ pub(crate) fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
             summary: None,
             verdict: None,
             decided_by_layer: Some(1),
+            checkpoint: None,
         };
         if let Some(m) = marker.as_ref() {
             result.exit_code = m.exit_code;
@@ -981,6 +1156,7 @@ pub(crate) fn parse_opencode_event_result(stdout: &str) -> Option<AgentResult> {
                 summary: None,
                 verdict: None,
                 decided_by_layer: Some(1),
+                checkpoint: None,
             })
         }
         (None, Some((_, result))) => Some(normalise_stream_marker_provenance(result)),
@@ -1412,8 +1588,8 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 
 /// Whether any AGENT-AUTHORED text in a Claude stream capture declares a
 /// human-blocking gate. The stream-capture half of
-/// [`blocking_human_checkpoint_reported`]; the pure matcher it delegates to,
-/// [`text_reports_human_gate`], is unchanged.
+/// [`blocking_human_checkpoint_reported`]; each eligible text is read with
+/// [`latest_stated_outcome`].
 ///
 /// **Why this exists (review constraint 3).** Scanning raw stdout is safe under
 /// the single-document envelope, because the only place gate text can appear
@@ -1452,15 +1628,22 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 ///    fail independently, so a future widening of the type filter cannot
 ///    silently inherit subagent content.
 ///
-/// **ALL eligible `result` events are scanned, not only the last.** This
-/// deliberately diverges from [`last_top_level_result`]'s last-result-wins
-/// verdict semantics, and the two conventions must not be "harmonised": a
-/// verdict is a single final answer, whereas this asks whether a gate was
-/// reported ANYWHERE in the stage's output. A gate declared in turn N followed
-/// by task-notification wake-up turns N+1/N+2 — the exact turn shape the v3
-/// capture archives — would be silently dropped by last-result-only, losing a
-/// human authorization request to the generic gate. That is the
-/// opposite-direction harm, and the worse of the two.
+/// **Eligible `result` events are read newest first, and the latest stated
+/// outcome wins** (operator decision 2026-10-10). The first event, counting
+/// back from the end, that either declares the gate or carries a
+/// `DEVFLOW_RESULT` marker decides: a declaration means a checkpoint, a marker
+/// without one means the stage ended on that outcome instead. Within a
+/// message the same rule applies line by line: a marker after a declaration
+/// outranks it, and a declaration after a marker outranks the marker. Events
+/// with neither, such as task-notification wake-up
+/// turns, are skipped, so a gate declared in turn N followed by silent turns
+/// N+1/N+2 (the turn shape the v3 capture archives) is still reported, which
+/// is what the earlier scan-everything rule existed to protect.
+///
+/// What this replaces: scanning every event with `.any` let an earlier
+/// declaration outrank a later, ordinary failure, so a stage that failed for an
+/// unrelated reason was resumed and told to decide the human's gate (external
+/// review of the CR-01 fix, 2026-10-09).
 ///
 /// Text is read with a direct [`serde_json::Value::get`] chain. Never route
 /// this through [`json_scan`]/[`json_find_key`]: a recursive traversal descends
@@ -1472,12 +1655,20 @@ pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> boo
 /// the eligible text: this runs on every `devflow advance` over a capture that
 /// grows for the whole stage, and there is no reason to allocate a copy of it.
 fn claude_stream_reports_human_gate(events: &[serde_json::Value]) -> bool {
-    events
+    for text in events
         .iter()
+        .rev()
         .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("result"))
         .filter(|event| is_top_level(event))
         .filter_map(|event| event.get("result").and_then(serde_json::Value::as_str))
-        .any(text_reports_human_gate)
+    {
+        match latest_stated_outcome(text) {
+            StatedOutcome::Checkpoint => return true,
+            StatedOutcome::Other => return false,
+            StatedOutcome::Silent => {}
+        }
+    }
+    false
 }
 
 /// The `rate_limit_info.status` values that mean the CLI DENIED the request.
@@ -1626,6 +1817,7 @@ fn claude_stream_envelope_failure(result_event: &serde_json::Value) -> Option<Ag
         summary: None,
         verdict: None,
         decided_by_layer: Some(1),
+        checkpoint: None,
     })
 }
 
@@ -1834,6 +2026,7 @@ fn antigravity_stream_envelope_failure(result_event: &serde_json::Value) -> Opti
                 summary: None,
                 verdict: None,
                 decided_by_layer: Some(1),
+                checkpoint: None,
             });
         }
     }
@@ -1846,6 +2039,7 @@ fn antigravity_stream_envelope_failure(result_event: &serde_json::Value) -> Opti
         summary: None,
         verdict: None,
         decided_by_layer: Some(1),
+        checkpoint: None,
     })
 }
 
@@ -1974,6 +2168,7 @@ fn indeterminate_capture_failure() -> AgentResult {
         summary: None,
         verdict: None,
         decided_by_layer: Some(1),
+        checkpoint: None,
     }
 }
 
@@ -2015,7 +2210,6 @@ fn normalise_stream_marker_provenance(mut result: AgentResult) -> AgentResult {
 ///   accepted only ALL-upper or ALL-lower.
 fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     const TAIL_BUDGET_CHARS: usize = 4000;
-    const PREFIX: &str = "DEVFLOW_RESULT:";
 
     let mut budget_used = 0usize;
     for line in stdout.lines().rev() {
@@ -2027,20 +2221,34 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
         }
         budget_used += line.chars().count() + 1;
 
-        let line = strip_corruption_padding(line);
-        let Some(head) = line.get(..PREFIX.len()) else {
-            continue;
-        };
-        if !head.eq_ignore_ascii_case(PREFIX) {
-            continue;
-        }
-
-        let json_str = line[PREFIX.len()..].trim();
-        if let Ok(result) = serde_json::from_str::<AgentResult>(json_str) {
+        if let Some(result) = marker_from_line(line) {
             return Some(result);
         }
     }
     None
+}
+
+/// Parse one physical line as a `DEVFLOW_RESULT` marker: edge-stripped,
+/// case-insensitive prefix, JSON body. The one place agent JSON becomes an
+/// [`AgentResult`].
+fn marker_from_line(line: &str) -> Option<AgentResult> {
+    const PREFIX: &str = "DEVFLOW_RESULT:";
+
+    let line = strip_corruption_padding(line);
+    let head = line.get(..PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let json_str = line[PREFIX.len()..].trim();
+    let mut result = serde_json::from_str::<AgentResult>(json_str).ok()?;
+    // A declaration belongs to the failure the agent reported. Dropped here so
+    // no later status rewrite (the exit-code reconcile turns a reported success
+    // into a failure with `..result`) can carry it onto a failure the agent
+    // never declared.
+    if result.status != AgentStatus::Failed {
+        result.checkpoint = None;
+    }
+    Some(result)
 }
 
 /// One commit the agent made before its stream went silent (D-07, 31-02).
@@ -2226,6 +2434,7 @@ fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
         summary: None,
         verdict: None,
         decided_by_layer: Some(1),
+        checkpoint: None,
     }
 }
 
@@ -2288,6 +2497,7 @@ fn rate_limited_result(retry: String) -> AgentResult {
         summary: None,
         verdict: None,
         decided_by_layer: Some(1),
+        checkpoint: None,
     }
 }
 
@@ -2518,6 +2728,7 @@ pub fn evaluate_layer2(
         summary: None,
         verdict: None,
         decided_by_layer: Some(2),
+        checkpoint: None,
     }))
 }
 
@@ -2604,6 +2815,7 @@ pub fn evaluate_layer3(
         summary: None,
         verdict: None,
         decided_by_layer: Some(3),
+        checkpoint: None,
     })
 }
 
@@ -2660,6 +2872,7 @@ fn evaluate_layer0(
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         });
     }
     let Some(approved_commands) = approved_commands else {
@@ -2674,6 +2887,7 @@ fn evaluate_layer0(
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         });
     };
     if commands != approved_commands {
@@ -2685,6 +2899,7 @@ fn evaluate_layer0(
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         });
     }
     match commands
@@ -2699,6 +2914,7 @@ fn evaluate_layer0(
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         }),
         // Every declared, approved probe passed — affirmative completion
         // evidence on its own (D-05 gap 2), even with zero commits.
@@ -2712,6 +2928,7 @@ fn evaluate_layer0(
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
+            checkpoint: None,
         }),
     }
 }
@@ -3016,6 +3233,18 @@ pub fn exit_code_path(project_root: &Path, phase: PhaseId) -> PathBuf {
 /// Path to the file where the monitor records the launched agent's PID.
 pub fn agent_pid_path(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{}-agent-pid", phase.padded()))
+}
+
+/// Path to the Legacy `sh` monitor's stop marker for a phase.
+///
+/// The monitor's TERM/INT trap creates this file BEFORE it signals the
+/// agent, and the backgrounded agent child checks for it just before its
+/// `exec`. A TERM that the child loses (dash discards one that lands before
+/// its post-fork trap reset) is therefore always followed by a check that
+/// sees the marker, so the agent never starts unsupervised. `spawn_monitor`
+/// removes a stale marker before every Legacy launch.
+pub fn stop_marker_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-monitor-stop", phase.padded()))
 }
 
 /// Path to the file holding the stage prompt handed to the pipe-owning
@@ -3443,6 +3672,7 @@ mod tests {
     use crate::agents::AgentDriver;
     use crate::config::GitFlowConfig;
     use crate::mode::Mode;
+    use crate::prompt::{FixType, StageIntent};
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
 
@@ -3615,6 +3845,140 @@ mod tests {
     fn parse_json_envelope_without_marker_returns_none() {
         let stdout = r#"{"result":"did some work but forgot the marker","session_id":"x"}"#;
         assert!(parse_devflow_result(stdout).is_none());
+    }
+
+    #[test]
+    fn decision_reasoning_above_the_result_line_parses_to_that_result() {
+        let phase = PhaseId::new(47);
+        let resume_prompt = crate::prompt::checkpoint_auto_decide_prompt(phase);
+        let fix_prompt = crate::prompt::render_claude_style(&StageIntent::Code {
+            phase,
+            fix: Some(FixType::FullExecute),
+        });
+        for prompt in [&resume_prompt, &fix_prompt] {
+            assert!(prompt.ends_with(crate::prompt::COMPLETION_PROTOCOL));
+            let prompt = prompt.to_ascii_lowercase();
+            assert!(prompt.contains("record"));
+            assert!(prompt.contains("reasoning"));
+        }
+
+        let protocol = crate::prompt::COMPLETION_PROTOCOL;
+        assert!(
+            protocol.contains("the LAST line of your FINAL message must be exactly:"),
+            "COMPLETION_PROTOCOL must describe the DEVFLOW_RESULT as the LAST line"
+        );
+        assert!(protocol.contains("goes above the DEVFLOW_RESULT line"));
+        assert!(protocol.contains("Output nothing after it."));
+        assert!(!protocol.contains("When all work is done, your FINAL message must be exactly:"));
+
+        let success_lines = protocol
+            .lines()
+            .filter(|line| line.starts_with("DEVFLOW_RESULT:") && line.contains("success"))
+            .collect::<Vec<_>>();
+        assert_eq!(success_lines.len(), 1);
+        let success_line = success_lines[0];
+
+        let mut decision_record = String::from(
+            "Decision record\n\nOptions considered: continue, retry, or stop for a human decision.\n",
+        );
+        for choice in 1..=60 {
+            decision_record.push_str(&format!(
+                "Option {choice}: I considered the evidence available at this stage, the reversible \
+                 next action, the impact on the unattended run, and the reason this choice does or \
+                 does not preserve the operator's intent without silently widening authorization.\n"
+            ));
+        }
+        decision_record.push_str(
+            "Chosen option: continue, because the recorded evidence supports it and the decision remains auditable.\n",
+        );
+        assert!(decision_record.lines().count() >= 60);
+        assert!(decision_record.len() > 5_000);
+        assert!(!decision_record.contains("**Gate:**"));
+
+        let status_for = |capture: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(stdout_path(dir.path(), phase), capture).unwrap();
+            evaluate_layer1(dir.path(), phase).map(|result| result.status)
+        };
+
+        let above = format!("{decision_record}\n{success_line}");
+        assert_eq!(status_for(&above), Some(AgentStatus::Success));
+
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "num_turns": 1,
+            "result": above,
+            "session_id": "decision-record",
+        })
+        .to_string();
+        assert_eq!(status_for(&envelope), Some(AgentStatus::Success));
+
+        let escaped = serde_json::to_string(&above).unwrap();
+        let escaped = &escaped[1..escaped.len() - 1];
+        let stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped);
+        assert_eq!(status_for(&stream), Some(AgentStatus::Success));
+        let last_event: serde_json::Value =
+            serde_json::from_str(stream.lines().rev().find(|line| !line.is_empty()).unwrap())
+                .unwrap();
+        assert!(event_is_top_level_result_marker(&last_event));
+
+        // This control makes the positive assertions discriminate rather than
+        // merely proving that the fixture itself contains a success marker.
+        let after = format!("{success_line}\n{decision_record}");
+        assert_eq!(status_for(&after), None);
+        let escaped_after = serde_json::to_string(&after).unwrap();
+        let escaped_after = &escaped_after[1..escaped_after.len() - 1];
+        let after_stream = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, escaped_after);
+        assert_eq!(status_for(&after_stream), None);
+
+        // The parser permits short trailing text within TAIL_BUDGET_CHARS;
+        // only the long control above measures the prompt contract's tail.
+        let short_after = format!("{decision_record}\n{success_line}\nDone.");
+        assert_eq!(status_for(&short_after), Some(AgentStatus::Success));
+    }
+
+    #[test]
+    fn resume_prompt_does_not_read_as_a_blocking_human_checkpoint() {
+        let resume = crate::prompt::checkpoint_auto_decide_prompt(PhaseId::new(47));
+        assert!(resume.ends_with(crate::prompt::COMPLETION_PROTOCOL));
+
+        let envelope = |text: &str| {
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "num_turns": 1,
+                "result": text,
+                "session_id": "resumed-session",
+            })
+            .to_string()
+        };
+        let declaration = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** decision\n**Gate:** `{HUMAN_GATE_VALUE}`\n**Plan:** 30-05\n"
+        );
+        let labelled = format!("{resume}\n{declaration}");
+        assert!(labelled.lines().any(line_reports_human_gate));
+        assert!(blocking_human_checkpoint_reported(&envelope(&labelled)));
+
+        assert!(
+            resume.contains("gate-declaration line"),
+            "the resume prompt must tell the agent not to copy the gate-declaration line"
+        );
+        assert!(!resume.lines().any(line_reports_human_gate));
+        assert!(!blocking_human_checkpoint_reported(&envelope(&resume)));
+
+        let prose = "Resolved gate: blocking-human using the recorded evidence.";
+        assert!(
+            !prose.lines().any(line_reports_human_gate),
+            "only a Gate-labeled line may report a checkpoint"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&envelope(prose)),
+            "free-form reasoning about a resolved gate must not request another resume"
+        );
     }
 
     #[test]
@@ -3826,6 +4190,84 @@ mod tests {
         assert!(blocking_human_checkpoint_reported(&stdout));
     }
 
+    /// A relayed checkpoint can carry list or blockquote markup before its label
+    /// (external review, 2026-09-12). The line-anchored matcher must see through
+    /// that markup, while prose that merely mentions a gate inside a list item or
+    /// a quote must still not match.
+    #[test]
+    fn blocking_human_checkpoint_reported_sees_through_list_and_quote_markup() {
+        for prefix in ["- ", "+ ", "* ", "1. ", "12) ", "> ", "> - ", "  - "] {
+            let stdout = format!("{prefix}**Gate:** `{HUMAN_GATE_VALUE}`\n");
+            assert!(
+                blocking_human_checkpoint_reported(&stdout),
+                "a declaration behind {prefix:?} must be recognised"
+            );
+        }
+        for prose in [
+            "- Resolved gate: blocking-human using the recorded evidence.",
+            "> Note: the gate: blocking-human was answered.",
+            "1. The gate: blocking-human is already resolved.",
+        ] {
+            assert!(
+                !blocking_human_checkpoint_reported(prose),
+                "list or quote markup must not turn prose into a declaration: {prose:?}"
+            );
+        }
+    }
+
+    /// A literal backslash-n inside agent-authored text, such as a code sample or
+    /// a diff hunk, is not a line break (final external review, 2026-09-12). The
+    /// raw scan used to split every capture on the two characters `\n`, so a code
+    /// sample like `let s = "\n**Gate:** ...";` read as a declaration. Escaped
+    /// text may be decoded only where it really is a JSON string. Each case pairs
+    /// the false positive with a control carrying a real line break, which must
+    /// still match.
+    #[test]
+    fn literal_backslash_n_in_agent_text_is_not_a_line_break() {
+        let gate = format!("**Gate:** `{HUMAN_GATE_VALUE}`");
+        let code_sample = format!(r#"let s = "\n{gate}";"#);
+        let real_break = format!("let s = \"\n{gate}\";");
+
+        assert!(
+            !blocking_human_checkpoint_reported(&code_sample),
+            "plain text: {code_sample:?}"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&real_break),
+            "plain-text control"
+        );
+
+        let envelope =
+            |text: &str| serde_json::json!({"type": "result", "result": text}).to_string();
+        assert!(
+            !blocking_human_checkpoint_reported(&envelope(&code_sample)),
+            "single-document envelope"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&envelope(&real_break)),
+            "single-document envelope control"
+        );
+
+        let json_lines = |text: &str| {
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"type": "thread.started", "thread_id": "t1"}),
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": text}
+                })
+            )
+        };
+        assert!(
+            !blocking_human_checkpoint_reported(&json_lines(&code_sample)),
+            "JSON-lines capture"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&json_lines(&real_break)),
+            "JSON-lines capture control"
+        );
+    }
+
     /// REGRESSION — the rendering a real headless run actually produces.
     ///
     /// Transcribed verbatim from `.devflow/phase-91-stdout` of the live A1
@@ -3833,7 +4275,7 @@ mod tests {
     /// through DevFlow's own monitor). The value arrives as a markdown CODE
     /// SPAN, not the bare token RESEARCH.md predicted.
     ///
-    /// Before the backtick was added to `text_reports_human_gate`'s trim set
+    /// Before the backtick was added to the gate matcher's trim set
     /// this returned `false`: the leading backtick survived the trim, so the
     /// value `take_while` terminated at once and yielded an empty token. A
     /// real checkpoint was therefore never recognized, and the run fell
@@ -3879,6 +4321,187 @@ mod tests {
         assert!(!blocking_human_checkpoint_reported(stdout));
     }
 
+    /// 49-REVIEW CR-01: a failed marker's free-text `reason` is never read as a
+    /// checkpoint, whatever it says. The first row is Live Attempt 1's real
+    /// reason (2026-10-07), which the reverted prose heuristic matched; the next
+    /// three are the review's false positives, including a reason that matched
+    /// only through "investi*gate*". A checkpoint is declared in the marker's
+    /// `checkpoint` field instead (see the `declared_checkpoint_*` tests).
+    #[test]
+    fn blocking_human_checkpoint_reported_ignores_marker_reason_prose() {
+        let reasons = [
+            "Phase 01 plan 01-01 halted at Task 1, a blocking-human decision checkpoint (choose DEFAULT_RETRY_BUDGET_SECS: budget-30/120/300).",
+            "Resolved the blocking-human gate by choosing budget-120; cargo test then failed",
+            "no blocking-human checkpoint was reached; tests failed",
+            "verification failed: SUMMARY does not record the blocking-human decision; investigate",
+        ];
+        for reason in reasons {
+            let inner = format!(
+                "Phase 1 stopped.\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"{reason}\"}}"
+            );
+            let escaped_inner = inner.replace('\n', "\\n").replace('"', "\\\"");
+            let stream = format!(
+                "{}\n{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"{escaped_inner}\",\"session_id\":\"sess-p49-a1\"}}\n",
+                V3_INIT_EVENT
+            );
+            assert!(
+                !blocking_human_checkpoint_reported(&stream),
+                "a marker reason must not read as a checkpoint in a stream capture: {reason}"
+            );
+            assert!(
+                !blocking_human_checkpoint_reported(&inner),
+                "a marker reason must not read as a checkpoint in plain text: {reason}"
+            );
+        }
+    }
+
+    /// The declared form: a failed marker whose `checkpoint` field names
+    /// `blocking-human`, matched without regard to ASCII case.
+    #[test]
+    fn declared_checkpoint_is_read_from_the_marker_field() {
+        for value in ["blocking-human", "BLOCKING-HUMAN"] {
+            let stdout = format!(
+                "DEVFLOW_RESULT: {{\"status\": \"failed\", \"checkpoint\": \"{value}\", \"reason\": \"Task 1 needs a decision\"}}\n"
+            );
+            let result = parse_devflow_result(&stdout).expect("marker parses");
+            assert_eq!(result.checkpoint.as_deref(), Some(value));
+            assert!(
+                result.declares_blocking_human_checkpoint(),
+                "failed + checkpoint {value} must declare the checkpoint"
+            );
+        }
+    }
+
+    /// Every other combination declares nothing: a success that names the
+    /// checkpoint, a failure naming a different checkpoint, a failure with no
+    /// field, and a failure whose reason (not field) names it.
+    #[test]
+    fn declared_checkpoint_requires_a_failed_status_and_the_exact_value() {
+        let cases = [
+            r#"{"status": "success", "checkpoint": "blocking-human"}"#,
+            r#"{"status": "failed", "checkpoint": "blocking"}"#,
+            r#"{"status": "failed", "checkpoint": "human-verify"}"#,
+            r#"{"status": "failed", "checkpoint": " blocking-human"}"#,
+            r#"{"status": "failed", "reason": "blocking-human checkpoint"}"#,
+        ];
+        for marker in cases {
+            let result = parse_devflow_result(&format!("DEVFLOW_RESULT: {marker}\n"))
+                .expect("marker parses");
+            assert!(
+                !result.declares_blocking_human_checkpoint(),
+                "must not declare a checkpoint: {marker}"
+            );
+        }
+    }
+
+    /// A success marker never carries a declaration forward. The exit-code
+    /// reconcile rewrites a reported success to a failure with `..result`, so a
+    /// `checkpoint` kept on the success would become a failed, declaring result
+    /// that the agent never reported (external review 2026-10-09).
+    #[test]
+    fn declared_checkpoint_on_a_success_marker_does_not_survive_the_exit_code_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(root, phase), "1").unwrap();
+
+        let marker = r#"DEVFLOW_RESULT: {"status": "success", "checkpoint": "blocking-human"}"#;
+        let parsed = parse_devflow_result(marker).expect("marker parses");
+        assert_eq!(
+            parsed.checkpoint, None,
+            "a success marker keeps no checkpoint"
+        );
+
+        let reconciled = reconcile_stream_success_against_exit_code(root, phase, parsed);
+        assert_eq!(
+            reconciled.status,
+            AgentStatus::Failed,
+            "exit 1 rewrites success"
+        );
+        assert!(!reconciled.declares_blocking_human_checkpoint());
+    }
+
+    /// A malformed `checkpoint` value is dropped, never the whole marker: the
+    /// `status` must survive so the stage is still decided by Layer 1.
+    #[test]
+    fn declared_checkpoint_non_string_value_keeps_the_status() {
+        for value in ["1", "true", "{}", "[\"blocking-human\"]", "null"] {
+            let stdout =
+                format!("DEVFLOW_RESULT: {{\"status\": \"failed\", \"checkpoint\": {value}}}\n");
+            let result = parse_devflow_result(&stdout)
+                .unwrap_or_else(|| panic!("marker with checkpoint {value} must still parse"));
+            assert_eq!(result.status, AgentStatus::Failed);
+            assert_eq!(
+                result.checkpoint, None,
+                "checkpoint {value} must become None"
+            );
+            assert!(!result.declares_blocking_human_checkpoint());
+        }
+    }
+
+    /// The declaration counts only on the stage's final marker. An earlier
+    /// marker that declared the checkpoint, followed by a later one that does
+    /// not, declares nothing; the reverse order declares it.
+    #[test]
+    fn declared_checkpoint_counts_only_on_the_final_marker() {
+        let declared = r#"DEVFLOW_RESULT: {"status": "failed", "checkpoint": "blocking-human"}"#;
+        let ordinary = r#"DEVFLOW_RESULT: {"status": "failed", "reason": "tests failed"}"#;
+
+        let superseded = format!("{declared}\nmore work\n{ordinary}\n");
+        assert!(
+            !parse_devflow_result(&superseded)
+                .expect("parses")
+                .declares_blocking_human_checkpoint()
+        );
+        let last = format!("{ordinary}\nmore work\n{declared}\n");
+        assert!(
+            parse_devflow_result(&last)
+                .expect("parses")
+                .declares_blocking_human_checkpoint()
+        );
+    }
+
+    /// Same rule in a Claude stream capture: only the last top-level `result`
+    /// event decides. A declaration in an earlier turn is superseded.
+    #[test]
+    fn declared_checkpoint_in_a_stream_counts_only_on_the_last_result() {
+        let result_event = |marker: &str| {
+            let inner = format!("Stopped.\n\nDEVFLOW_RESULT: {marker}");
+            let escaped = inner.replace('\n', "\\n").replace('"', "\\\"");
+            format!(
+                "{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"{escaped}\",\"session_id\":\"sess-dc\"}}"
+            )
+        };
+        let declared = result_event(r#"{"status": "failed", "checkpoint": "blocking-human"}"#);
+        let ordinary = result_event(r#"{"status": "failed", "reason": "tests failed"}"#);
+
+        let superseded = format!("{V3_INIT_EVENT}\n{declared}\n{ordinary}\n");
+        let result = parse_claude_event_result(&superseded).expect("stream parses");
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(!result.declares_blocking_human_checkpoint());
+
+        let last = format!("{V3_INIT_EVENT}\n{ordinary}\n{declared}\n");
+        let result = parse_claude_event_result(&last).expect("stream parses");
+        assert!(result.declares_blocking_human_checkpoint());
+    }
+
+    /// Negative control: a failed marker without a blocking-human checkpoint
+    /// reason must NOT report a human gate.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_ordinary_marker_failure() {
+        let stdout = "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}\n";
+        assert!(!blocking_human_checkpoint_reported(stdout));
+
+        let plain_gate = "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"halted at Task 1, a blocking checkpoint\"}\n";
+        assert!(!blocking_human_checkpoint_reported(plain_gate));
+
+        let success = format!(
+            "DEVFLOW_RESULT: {{\"status\": \"success\", \"reason\": \"handled {HUMAN_GATE_VALUE} checkpoint\"}}\n"
+        );
+        assert!(!blocking_human_checkpoint_reported(&success));
+    }
+
     #[test]
     fn checkpoint_reported_in_capture_missing_file_returns_false() {
         let dir = tempfile::tempdir().unwrap();
@@ -3909,10 +4532,13 @@ mod tests {
     // they record which capture line each envelope came from and that every
     // gate payload is synthetic.
     //
-    // Each negative asserts a NEGATIVE CONTROL first: `text_reports_human_gate`
-    // must still match the raw capture. Without it a negative would also pass
-    // against a fixture that simply contains no gate text, and would keep
-    // passing if someone deleted the gate line from the fixture.
+    // Each negative asserts a NEGATIVE CONTROL first: `capture_reports_human_gate`,
+    // the raw-capture reader the stream branch replaces, must still report the
+    // capture. Without it a negative would also pass against a fixture that
+    // simply contains no gate text, and would keep passing if someone deleted the
+    // gate line from the fixture. Presence is not the same claim: the reader is
+    // line-anchored, so gate text it cannot match would let every negative pass
+    // with the stream branch removed.
 
     /// **REGRESSION — review constraint 3, the prompt-echo false positive.**
     ///
@@ -3933,7 +4559,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -3961,7 +4587,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -3992,7 +4618,7 @@ mod tests {
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
         assert!(
-            text_reports_human_gate(&capture),
+            capture_reports_human_gate(&capture),
             "negative control: the raw capture must still contain matchable \
              gate text, or this test asserts nothing"
         );
@@ -4019,11 +4645,12 @@ mod tests {
         );
     }
 
-    /// **T-30-27.** Detection asks whether a gate fired ANYWHERE in the stage,
-    /// so it deliberately does NOT inherit plan 30-01's last-result-wins
-    /// verdict semantics. A gate declared in turn 1 followed by
-    /// task-notification wake-up turns — the exact turn shape the v3 capture
-    /// archives — must not be dropped in favour of the later, silent results.
+    /// **T-30-27.** A gate declared in turn 1 followed by task-notification
+    /// wake-up turns that state no outcome (the exact turn shape the v3
+    /// capture archives) must not be dropped in favour of the later, silent
+    /// results. Silent turns are skipped; only a later stated outcome
+    /// supersedes the declaration (see the `..._later_result_reports_a_plain_failure`
+    /// test).
     ///
     /// Losing a checkpoint report is the opposite-direction harm from the false
     /// positive this plan closes, and the worse of the two: it silently drops a
@@ -4033,9 +4660,180 @@ mod tests {
         let capture = v3_stream_capture(&gate_declaration_text(), NO_MARKER, NO_MARKER);
         assert!(
             blocking_human_checkpoint_reported(&capture),
-            "detection must scan every top-level `result` event, not only the \
-             last one"
+            "silent later turns must not drop an earlier gate declaration"
         );
+    }
+
+    /// The latest outcome wins (operator decision 2026-10-10, after the
+    /// external review of the CR-01 fix). A gate declared in turn 1, followed
+    /// by a later result that reports a plain failure, is that failure: the
+    /// agent's later word supersedes its earlier note, so the run stops at the
+    /// ordinary gate instead of resuming the agent to decide for the human.
+    /// Asserted through the on-disk reader the pipeline calls, too.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_a_later_result_reports_a_plain_failure() {
+        let capture = v3_stream_capture(&gate_declaration_text(), MARKER_FAILED, NO_MARKER);
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "a later plain-failure result must supersede an earlier gate declaration"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let phase = PhaseId::new(1);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(stdout_path(dir.path(), phase), &capture).unwrap();
+        assert!(!checkpoint_reported_in_capture(dir.path(), phase));
+    }
+
+    /// The reverse order: a gate declared after the last stated failure is the
+    /// latest word, so it counts.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_a_gate_follows_the_last_failure() {
+        let capture = v3_stream_capture(MARKER_FAILED, &gate_declaration_text(), NO_MARKER);
+        assert!(blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// Within one message the order of lines decides too. The protocol puts
+    /// the marker on the last line, so a `Gate:` line followed by a plain
+    /// failure marker is that failure; the gate counts only when nothing states
+    /// an outcome after it (operator decision 2026-10-10, second review round).
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_a_plain_marker_follows_the_gate_in_one_message()
+     {
+        let same_message = format!("{}{MARKER_FAILED}", gate_declaration_text());
+        let capture = v3_stream_capture(NO_MARKER, &same_message, NO_MARKER);
+        assert!(!blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A message that ends on the gate, after any marker, reports the gate.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_the_gate_follows_the_marker_in_one_message() {
+        let same_message = format!("{MARKER_FAILED}\\n{}", gate_declaration_text());
+        let capture = v3_stream_capture(NO_MARKER, &same_message, NO_MARKER);
+        assert!(blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A declared checkpoint followed by silent wake-up turns is still the
+    /// latest stated outcome, the same protection T-30-27 gives a `Gate:` line.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_for_a_declared_marker_before_silent_turns() {
+        let declared = r#"Stopped.\nDEVFLOW_RESULT: {\"status\":\"failed\",\"checkpoint\":\"blocking-human\"}"#;
+        let capture = v3_stream_capture(declared, NO_MARKER, NO_MARKER);
+        assert!(blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// A later plain failure supersedes an earlier gate however much text
+    /// follows its marker. The stage-verdict parser reads only a 4000-character
+    /// tail; the outcome scan must not, or a long later turn reads as silent
+    /// and the earlier gate wins again.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_a_later_failure_is_followed_by_long_text() {
+        let long_tail = "a".repeat(5000);
+        let later = format!("{MARKER_FAILED}\\n{long_tail}");
+        let capture = v3_stream_capture(&gate_declaration_text(), NO_MARKER, &later);
+        assert!(!blocking_human_checkpoint_reported(&capture));
+    }
+
+    /// The same latest-outcome rule for a plain-text capture: a gate line
+    /// before a plain failure marker is that failure, and a marker that
+    /// declares the checkpoint is reported without any gate line.
+    #[test]
+    fn blocking_human_checkpoint_reported_reads_a_plain_capture_newest_first() {
+        let gate_then_failure = "**Gate:** `blocking-human`\nDEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}\n";
+        assert!(!blocking_human_checkpoint_reported(gate_then_failure));
+        let declared = "Stopped.\nDEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\"}\n";
+        assert!(blocking_human_checkpoint_reported(declared));
+        let failure_then_gate =
+            "DEVFLOW_RESULT: {\"status\": \"failed\"}\n**Gate:** `blocking-human`\n";
+        assert!(blocking_human_checkpoint_reported(failure_then_gate));
+    }
+
+    /// Round-3 review: a JSON line in a capture that is not classified as a
+    /// Claude stream (two noise lines demote it to plain text) must follow
+    /// the same rule. Only `Gate:` lines were matched inside its strings, so
+    /// an earlier gate outranked a later ordinary failure.
+    #[test]
+    fn blocking_human_checkpoint_reported_reads_json_lines_by_the_same_rule() {
+        let result_line = |text: &str| {
+            serde_json::json!({"type": "result", "result": text, "session_id": "current"})
+                .to_string()
+        };
+        let init = r#"{"type":"system","subtype":"init","session_id":"current"}"#;
+        let noisy = |text: &str| format!("{init}\nprogress-1\nprogress-2\n{}\n", result_line(text));
+        let gate = "**Gate:** `blocking-human`";
+        let plain_failure =
+            "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}";
+        let declared =
+            "DEVFLOW_RESULT: {\"status\": \"failed\", \"checkpoint\": \"blocking-human\"}";
+
+        // Round-4 review: the fixture must really take the raw-capture path,
+        // or the stream reader answers these and the JSON path goes untested.
+        assert!(
+            classify(&ParsedCapture::parse(&noisy(gate))) != CaptureKind::ClaudeStream,
+            "the noisy fixture must not be read as a Claude stream"
+        );
+        assert!(!blocking_human_checkpoint_reported(&noisy(&format!(
+            "{gate}\n{plain_failure}"
+        ))));
+        assert!(
+            blocking_human_checkpoint_reported(&noisy(gate)),
+            "control: a gate alone still counts"
+        );
+        assert!(blocking_human_checkpoint_reported(&noisy(declared)));
+
+        let plain_gate_then_json_failure = format!(
+            "[info] claude starting\n{gate}\n{}\n",
+            result_line(plain_failure)
+        );
+        assert!(!blocking_human_checkpoint_reported(
+            &plain_gate_then_json_failure
+        ));
+        let plain_gate_then_silent_json = format!("[info] claude starting\n{gate}\n{init}\n");
+        assert!(blocking_human_checkpoint_reported(
+            &plain_gate_then_silent_json
+        ));
+
+        for fields in [
+            serde_json::json!({"a": gate, "b": plain_failure}),
+            serde_json::json!({"a": plain_failure, "b": gate}),
+        ] {
+            assert!(
+                !blocking_human_checkpoint_reported(&format!("noise\n{fields}\n")),
+                "an object's fields have no order, so the ordinary outcome wins: {fields}"
+            );
+        }
+
+        let blocks = |first: &str, second: &str| {
+            let content = serde_json::json!({"content": [{"text": first}, {"text": second}]});
+            format!("noise\n{content}\n")
+        };
+        assert!(
+            blocking_human_checkpoint_reported(&blocks(plain_failure, gate)),
+            "an array is ordered, so a later gate block wins"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&blocks(gate, plain_failure)),
+            "an array is ordered, so a later failure block wins"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&blocks(gate, "Silent tail.")),
+            "a silent later block is skipped"
+        );
+    }
+
+    /// R5: an absent checkpoint is not written when a result is serialized,
+    /// and a present one is.
+    #[test]
+    fn checkpoint_is_serialized_only_when_present() {
+        let none = parse_devflow_result(r#"DEVFLOW_RESULT: {"status": "failed"}"#).unwrap();
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("checkpoint").is_none(), "{json}");
+        let some = parse_devflow_result(
+            r#"DEVFLOW_RESULT: {"status": "failed", "checkpoint": "blocking-human"}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&some).unwrap();
+        assert_eq!(json["checkpoint"], "blocking-human");
     }
 
     /// The overcorrection guard: an echo and a genuine declaration can coexist
@@ -4169,7 +4967,10 @@ mod tests {
     /// suppressing real gates.
     #[test]
     fn non_stream_captures_still_use_the_raw_scan_after_widening() {
-        let plain = format!("Some narration.\n{}\n", gate_declaration_text());
+        let plain = format!(
+            "Some narration.\n{}\n",
+            gate_declaration_text().replace("\\n", "\n")
+        );
         assert!(
             blocking_human_checkpoint_reported(&plain),
             "plain text must still be raw-scanned"
@@ -4378,7 +5179,7 @@ mod tests {
     /// shipped in `06675da`.
     #[test]
     fn one_stray_json_line_does_not_suppress_a_plain_text_gate() {
-        let gate = gate_declaration_text();
+        let gate = gate_declaration_text().replace("\\n", "\n");
 
         assert!(
             blocking_human_checkpoint_reported(&gate),
@@ -5496,14 +6297,20 @@ mod tests {
 
     /// Text that merely DOCUMENTS a gate rendering — the shape a plan file, a
     /// GSD reference document, or an agent narrating its next task carries.
-    /// Same code-span rendering as a real declaration, which is precisely why a
-    /// substring scan cannot tell the two apart and the EVENT must decide.
+    /// Same line-leading code-span rendering as a real declaration, which is
+    /// precisely why a text scan cannot tell the two apart and the EVENT must
+    /// decide.
     ///
-    /// Single line, no double quotes, so it drops into a JSON string field
-    /// without further escaping.
+    /// The label must start its own line. `capture_reports_human_gate` decodes
+    /// the event's JSON strings and matches only a line-leading label, so a
+    /// mid-line rendering matches nothing, and every negative built on it would
+    /// pass with the stream branch removed.
+    ///
+    /// The line break is a JSON-escaped `\n` and there are no double quotes, so
+    /// it drops into a JSON string field without further escaping.
     fn gate_documenting_text() -> String {
         format!(
-            "The next task is declared **Gate:** `{HUMAN_GATE_VALUE}` in the plan, so the executor must stop rather than auto-select."
+            "The next task is declared in the plan, so the executor must stop rather than auto-select:\\n**Gate:** `{HUMAN_GATE_VALUE}`"
         )
     }
 
@@ -7864,16 +8671,17 @@ mod tests {
     /// observation, so it would exercise the case above while appearing to
     /// cover this one (F-1).
     ///
-    /// **Why an unspawnable working directory rather than `NoGitPath` here —
-    /// F-1b's recorded fallback, taken on measured evidence.** `NoGitPath`
-    /// makes `git` unresolvable *process-wide*, and `devflow-core`'s tests
-    /// shell out to `git` from eight modules that all compile into ONE
-    /// parallel test binary. Installing it here failed 1-5 unrelated sibling
-    /// tests per run, nondeterministically, depending on which of them
-    /// happened to invoke `git` inside the guarded window. Serializing them
-    /// would mean every present and future `git`-touching test in the crate
-    /// opting into the same mutex — discipline, not structure, and silently
-    /// reopened by the next test that forgets.
+    /// **Why an unspawnable working directory rather than an in-process
+    /// empty-`PATH` experiment here — F-1b's recorded fallback, taken on
+    /// measured evidence.** An in-process empty `PATH` makes `git`
+    /// unresolvable *process-wide*, and `devflow-core`'s tests shell out to
+    /// `git` from eight modules that all compile into ONE parallel test
+    /// binary. Installing it here failed 1-5 unrelated sibling tests per run,
+    /// nondeterministically, depending on which of them happened to invoke
+    /// `git` inside the guarded window. Serializing them would mean every
+    /// present and future `git`-touching test in the crate opting into the
+    /// same mutex — discipline, not structure, and silently reopened by the
+    /// next test that forgets.
     ///
     /// `hermetic_command` sets `cmd.current_dir(dir)`, so a directory that
     /// does not exist makes the spawn itself fail and `.output()` return
@@ -7881,10 +8689,10 @@ mod tests {
     /// and therefore no effect on any other test. `phase_commit_count` cannot
     /// tell the two causes apart: it sees only `Err`.
     ///
-    /// This route is also independent of the PATH-resolution property C5
-    /// flags as a latent fragility of `NoGitPath` (a future refactor to an
-    /// absolute `git` path would disarm that guard silently; it would not
-    /// disarm this).
+    /// The process-global fragility was resolved elsewhere by moving the
+    /// empty-`PATH` window into a child process. This route remains the right
+    /// alternative here: it is independent of PATH resolution, so a future
+    /// refactor to an absolute `git` path would not disarm it.
     #[test]
     fn phase_commit_count_reports_none_when_git_cannot_run() {
         let dir = tempfile::tempdir().unwrap();

@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.12.0"
+version = "3.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/denniyahh/devflow"
@@ -17,7 +17,7 @@ keywords = ["cli", "workflow", "automation", "git", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-devflow-core = { path = "crates/devflow-core", version = "2.12.0" }
+devflow-core = { path = "crates/devflow-core", version = "3.0.0" }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is load-bearing, not a preference: `devflow_core::gsd_config`
 # round-trips the operator's `.planning/config.json` through `serde_json::Value`
@@ -30,3 +30,18 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# `insta` backs the prompt-text snapshot drift guard (47-CONTEXT.md D-14/D-15):
+# a wording change in a policy-carrying prompt must surface as a reviewable
+# `.snap` diff instead of drifting unnoticed. Dev-dependency only. It creates an
+# obligation in `scripts/check.sh`: `run_test` must keep running cargo test under
+# `env -u INSTA_FORCE_UPDATE INSTA_UPDATE=no`, because either variable left to the
+# environment re-blesses a drifted baseline and exits 0 (47-RESEARCH.md § A-3).
+# Default features kept on purpose: `colors` is what makes the failure a readable
+# diff, which is the whole point of D-14.
+insta = "1"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+

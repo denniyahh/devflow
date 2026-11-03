@@ -1,0 +1,28 @@
+# NEGATIVE CONTROL: the suite runs, unpinned.
+#
+# The source line is present, so this fixture isolates rule (b) — a bare
+# `scripts/check.sh all` does not start with the pin token. This is the
+# regression the whole `Sequential 2-CPU check` job exists to prevent: without
+# the pin the job is just a fourth unpinned runner.
+name: Fixture CI
+
+on:
+  push:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  sequential:
+    name: Sequential 2-CPU check
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the CPU pin from its single definition site
+        run: |
+          set -euo pipefail
+          . scripts/lib/ci-cpus.sh
+          echo "CPUS=$CPUS" >> "$GITHUB_ENV"
+      - run: scripts/check.sh all
