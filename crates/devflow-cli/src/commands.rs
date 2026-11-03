@@ -946,11 +946,12 @@ pub(crate) fn reserve_launch(
     ));
     let written = workflow::update_state_with(project_root, phase, |existing| {
         refuse_launch_over_a_live_run(project_root, phase, verb, &existing, cache_dir)?;
-        if fresh.is_some() && matches!(existing, workflow::Existing::Unloadable(_)) {
-            refuse_unloadable_state_beside_a_live_lock(
+        if fresh.is_some() {
+            refuse_stateless_launch_beside_a_live_lock(
                 project_root,
                 phase,
                 reservation.launch_id(),
+                &existing,
             )?;
         }
         #[cfg(test)]
@@ -1008,49 +1009,40 @@ pub(crate) fn reserve_launch(
     })
 }
 
-/// A state that does not load names no pending launch, and a supervisor that has not
-/// published shows in no socket sweep, so replacing the state could launch a second one
-/// beside it. Only its held liveness lock shows. That file names no phase, so another
-/// phase's live supervisor refuses this too: fail closed, with the repair named. A lock
-/// that cannot be read counts as held (T-50-40).
-fn refuse_unloadable_state_beside_a_live_lock(
+/// A state that is missing or does not load names no pending launch, and a supervisor
+/// that has not published shows in no socket sweep, so creating or replacing the state
+/// could launch a second one beside it. Only its held liveness lock shows. That file
+/// names no phase, so a lock another phase's loadable state records is that phase's;
+/// any other held lock refuses: fail closed, naming its holder. A lock that cannot be
+/// probed counts as held (T-50-40).
+fn refuse_stateless_launch_beside_a_live_lock(
     project_root: &Path,
     phase: PhaseId,
     own_launch_id: &str,
+    existing: &workflow::Existing,
 ) -> Result<(), CliError> {
-    let dir = project_root.join(".devflow");
-    let unlisted = |error: std::io::Error| {
-        CliError::Message(format!(
-            "phase {phase}: its state file does not load, and {} could not be listed for live \
-             launches ({error}); nothing was launched",
-            dir.display()
-        ))
+    let condition = match existing {
+        workflow::Existing::Loaded(_) => return Ok(()),
+        workflow::Existing::Missing => "is missing",
+        workflow::Existing::Unloadable(_) => "does not load",
     };
-    for entry in std::fs::read_dir(&dir).map_err(unlisted)? {
-        let entry = entry.map_err(unlisted)?;
-        let name = entry.file_name();
-        let Some(launch_id) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("supervisor-"))
-            .and_then(|name| name.strip_suffix(".live"))
-            .filter(|launch_id| *launch_id != own_launch_id)
-        else {
-            continue;
-        };
-        if !matches!(
-            liveness::probe(&entry.path()),
-            Ok(liveness::Held::Abandoned | liveness::Held::Missing)
-        ) {
-            return Err(CliError::Message(format!(
-                "phase {phase}: its state file does not load, so it cannot say whose launch \
-                 {launch_id} is, and that launch's liveness lock is held: it may be this phase's \
-                 supervisor before it publishes. Nothing was launched. Retry once it has \
-                 published; if it is another phase's, run `devflow recover --clean --phase \
-                 {phase}` first"
-            )));
-        }
+    let live = recover::unrecorded_live_launches(project_root, phase, Some(own_launch_id))
+        .map_err(|error| {
+            CliError::Message(format!(
+                "phase {phase}: its state file {condition}, and {} could not be listed for live \
+                 launches ({error}); nothing was launched",
+                project_root.join(".devflow").display()
+            ))
+        })?;
+    match live.first() {
+        None => Ok(()),
+        Some(launch) => Err(CliError::Message(format!(
+            "phase {phase}: its state file {condition}, so it cannot name its launch, and {}. \
+             Nothing was launched. Retry once it has published or exited; `devflow stop` never \
+             signals an unpublished launch, so if it stays, end that process yourself",
+            launch.describe()
+        ))),
     }
-    Ok(())
 }
 
 /// What [`reserve_launch`]'s write-lock closure hands back to print and return.
@@ -3065,7 +3057,7 @@ fn stop_pending_launcher(
         Ok(liveness::Held::Abandoned | liveness::Held::Missing)
     );
     if unheld || !stop_via_holder(project_root, phase)? {
-        return Err(pending_not_published(phase, &pending.launch_id));
+        return Err(pending_not_published(phase, pending));
     }
     let launch_id = &pending.launch_id;
     if !wait_for_holder_release(project_root, phase) {
@@ -3099,12 +3091,29 @@ fn stop_pending_launcher(
     Ok(PendingStop::LauncherSignalled)
 }
 
-/// `stop`'s refusal over a live pending lock with no socket by the end of the wait.
-fn pending_not_published(phase: PhaseId, launch_id: &str) -> CliError {
+/// `stop`'s refusal over a live pending lock with no socket by the end of the wait and
+/// no foreground launcher to reach. `stop` never signals an unpublished launch, so
+/// running it again repeats this while the holder lives: name the holder, from the
+/// lock's record, and the manual route instead.
+fn pending_not_published(phase: PhaseId, pending: &PendingSupervisor) -> CliError {
+    let launch_id = &pending.launch_id;
+    let lock = pending.liveness_path.display();
+    let holder = match liveness::live_holder(&pending.liveness_path) {
+        Ok(Some((pid, _))) => format!(
+            "pid {pid} holds its liveness lock {lock}; inspect it with `ps -o pid,lstart,args -p \
+             {pid}` and, if it is a stuck `devflow __monitor`, end it yourself, then run \
+             `devflow stop --phase {phase}` again to clear the reservation"
+        ),
+        _ => format!(
+            "its liveness lock {lock} is held, by a process its record does not name; end that \
+             process yourself, then run `devflow stop --phase {phase}` again to clear the \
+             reservation"
+        ),
+    };
     CliError::Message(format!(
         "stop: launch {launch_id} for phase {phase} is reserved by a live process and has not \
-         published a supervisor; nothing was signalled or recorded — run `devflow stop --phase \
-         {phase}` again"
+         published a supervisor, and no foreground launcher holds the phase; nothing was \
+         signalled or recorded, because `stop` never signals an unpublished launch. {holder}"
     ))
 }
 
@@ -15651,6 +15660,71 @@ mod tests {
         );
     }
 
+    fn reserve_over_a_missing_state(root: &Path, phase: PhaseId) -> Result<(), String> {
+        assert!(!workflow::state_path(root, phase).exists());
+        let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let cache_dir = registry::cache_dir();
+        reserve_launch(
+            root,
+            phase,
+            LaunchVerb::Start,
+            Some(&fresh),
+            cache_dir.as_deref(),
+        )
+        .map(|reserved| reserved.reservation.discard())
+        .map_err(|err| err.to_string())
+    }
+
+    /// A `recover --clean` that removed a state beside an unpublished supervisor leaves
+    /// that supervisor's held lock as the only sign of it. A `start` over the missing
+    /// state must refuse, naming the holder, rather than launch a second one. Control:
+    /// the same lock recorded by another phase's state is that phase's and refuses nothing.
+    #[test]
+    fn a_start_refuses_a_missing_state_beside_an_unrecorded_live_lock() {
+        const NAME: &str =
+            "commands::tests::a_start_refuses_a_missing_state_beside_an_unrecorded_live_lock";
+        if !devflow_core::test_support::in_child_test(NAME) {
+            let path_dir = crate::test_support::go_waiting_claude_dir();
+            let output =
+                crate::test_support::run_hermetic_test_in_child(NAME, path_dir.path(), &[]);
+            devflow_core::test_support::assert_child_ran_exactly_one_passing_test(&output, NAME);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(5037);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let launch_id = supervisor::new_launch_id();
+        let lock = liveness::launch_liveness_path(root, &launch_id).unwrap();
+        let _unpublished = liveness::Hold::take(&lock).unwrap();
+
+        let error = reserve_over_a_missing_state(root, phase)
+            .expect_err("a live lock no state records refuses the start");
+
+        assert!(error.contains(&launch_id), "{error}");
+        assert!(
+            error.contains(&format!("pid {}", std::process::id())),
+            "the refusal names the holder: {error}"
+        );
+        assert!(!error.contains("recover --clean"), "{error}");
+        assert!(!workflow::state_path(root, phase).exists(), "nothing saved");
+
+        let mut recorder = State::new(
+            PhaseId::new(5038),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        recorder.pending_supervisor = Some(PendingSupervisor::new(
+            launch_id.clone(),
+            root.join("unused.sock"),
+            lock.clone(),
+        ));
+        workflow::save_state(&recorder).unwrap();
+        reserve_over_a_missing_state(root, phase)
+            .expect("control: a live lock another phase records refuses nothing");
+    }
+
     /// The control: with no live lock, or only a released one, a `start` still replaces a
     /// state file that does not load, the repair the reservation's note names.
     #[test]
@@ -15819,13 +15893,13 @@ mod tests {
         assert!(refused.contains(&failed.launch_id), "{refused}");
     }
 
-    /// With the socket and sidecar gone the stopped supervisor is still there and nothing
-    /// can find it, and the same second `start` goes through: the refusal above comes
-    /// from the sweep, not from the supervisor or anything else the failed start left.
+    /// With the socket and sidecar gone the sweep has nothing to find, but the stopped
+    /// supervisor still holds its liveness lock, which no state records: the same second
+    /// `start` refuses through that lock, naming the supervisor's pid, instead of
+    /// launching a second supervisor beside it.
     #[test]
-    fn a_second_start_launches_when_the_sweep_has_nothing_to_find() {
-        const NAME: &str =
-            "commands::tests::a_second_start_launches_when_the_sweep_has_nothing_to_find";
+    fn a_second_start_refuses_through_the_held_lock_when_the_sweep_has_nothing_to_find() {
+        const NAME: &str = "commands::tests::a_second_start_refuses_through_the_held_lock_when_the_sweep_has_nothing_to_find";
         if parent_of_a_failed_publish_child(NAME) {
             return;
         }
@@ -15840,7 +15914,17 @@ mod tests {
             .ok()
             .map(|state| crate::test_support::ReapMonitorOnDrop::after_launch(&state));
 
-        second.expect("nothing to find, so nothing refuses");
+        let refused = second.expect_err("a second supervisor was launched beside the first");
+        assert!(refused.contains(&failed.launch_id), "{refused}");
+        assert!(
+            refused.contains(&format!("held by pid {}", failed.supervisor_pid)),
+            "the refusal comes from the held lock and names its holder: {refused}"
+        );
+        // SAFETY: names the agent group and supervisor this test's own start launched.
+        unsafe {
+            libc::kill(-failed.agent_pgid, libc::SIGKILL);
+            libc::kill(failed.supervisor_pid, libc::SIGKILL);
+        }
     }
 
     /// The sidecar alone is not what the sweep needs: the socket's name still attributes it
@@ -16872,6 +16956,10 @@ mod tests {
                 .unwrap_or(0)
         };
         let fresh = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // A saved state, so neither launcher meets the stateless check for a lock no
+        // state records, which would refuse the control's second launcher too: the lock
+        // must be the only thing that can tell the two cases apart.
+        workflow::save_state(&fresh).unwrap();
         let cache = std::env::var_os("DEVFLOW_CACHE_DIR").map(PathBuf::from);
         let reserve = || {
             reserve_launch(
@@ -17378,6 +17466,13 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("devflow resume"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "pid {} holds its liveness lock",
+                std::process::id()
+            )),
+            "a repeat of stop cannot end it, so the holder is named: {error}"
+        );
         assert_eq!(
             std::fs::read(workflow::state_path(root, phase)).unwrap(),
             before,
