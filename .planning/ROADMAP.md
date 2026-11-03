@@ -1031,6 +1031,30 @@ of the repository. DECN-03's recency record therefore rests on uncommitted evide
 **Fix shape (not decided):** archive the prompt a launch sent beside each `<stamp>-stdout` capture (as the `-exit` file
 already is), so committed evidence shows which turn carried which rule.
 
+### Phase 999.180: An Approved Validate Gate Is Not Closed Before Ship (BACKLOG)
+
+**Found:** 2026-11-03, Phase 50.1's external review round 4 (Antigravity); checked by reading the code, not reproduced. Already in `ee6ec79`.
+
+**Defect:** a Validate gate approved through to Ship, on an ambiguous outcome or at the failure ceiling, goes straight to `transition` without `close_gate` (`pipeline_outcomes.rs` `GateAction::Advance => transition(.., Stage::Ship)`, both arms), unlike the failure gate in `handle_stage_failure`. Its gate, answer and ack files stay until finalization closes the phase. Not checked: whether `status` or `doctor` shows it as open meanwhile.
+
+**Fix shape (not tested):** close the Validate gate in both arms before the transition, as `handle_stage_failure` does; test that no Validate gate file remains once Ship launches.
+
+### Phase 999.179: A Launch Whose Successor Already Ended Still Reports "launched" (BACKLOG)
+
+**Found:** 2026-11-03, Phase 50.1's external review round 4 (Antigravity); checked by reading the code. Already in `ee6ec79`.
+
+**Defect:** when `publish_record` returns `SuccessorAlreadyEnded`, having saved the run `stopped`, `spawn_agent_and_record` falls through to the `stage_launched` event and the "stage X → launched … supervisor pid" line for a supervisor that is gone (`pipeline_launch.rs`, the `PublishOutcome::SuccessorAlreadyEnded => {}` arm). The state is right; an event consumer counting `stage_launched` overcounts by one, and the printed line is false.
+
+**Fix shape (not tested):** return early from that arm with a line saying the next supervisor ended before its record was saved; extend `a_stop_sent_straight_to_the_next_supervisor_before_its_record_is_saved_is_recorded` to assert no `stage_launched` event and no "launched" line.
+
+### Phase 999.178: A `yes_ship` Revoke Written During the Ship Advance Is Ignored (BACKLOG)
+
+**Found:** 2026-11-03, Phase 50.1's external review round 4 (Codex); checked by reading the code, not reproduced. Already in `ee6ec79`.
+
+**Defect:** `handle_ship_outcome` builds the `--yes-ship` approval from the in-memory `state.yes_ship`, last refreshed when the advance loaded state after the Ship agent exited (`pipeline_outcomes.rs`, `state.yes_ship.then(..)`). `run_gate_with_timeout` re-reads state at its first commit but writes the approval it was handed without checking the flag again, and safe point 6 checks only for a stop. So a revoke written between that load and the answer write (agent-result evaluation, `gate_fired`, the notify subprocess: milliseconds to seconds) is kept on disk but does not stop the auto-approval. A revoke written while the Ship agent still runs is honoured. No decision accepts the gap: CONTEXT's "a hand edit that completed before a write's re-read survives" promises only that the field persists.
+
+**Fix shape (not tested):** decide `auto_response` from the state the gate's first commit re-reads, not the caller's copy; test with the `held_yes_ship_advance` hold, flipping the flag after the advance's load and asserting no auto-answer and no `merge_result`, with the flip-before-load case as the control.
+
 ### Phase 999.177: `gate approve` Can Report a Failure for an Approval That Was Applied (BACKLOG)
 
 **Found:** 2026-11-02, Phase 50.1's verifier; first seen in a test during the review fixes.
