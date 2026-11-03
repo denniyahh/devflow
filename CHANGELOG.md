@@ -1,5 +1,62 @@
 # Changelog
 
+## 3.0.0 — 2026-11-03
+
+Split-lock state handling (Phase 50.1). Every state write is serialised and durable, a gate answer can
+decide only the gate it was written for, and a live supervisor is no longer joined by a second one, including
+one whose record was never saved. This replaces the single per-phase lock held across gate waits.
+
+### Changed — breaking
+
+`devflow-core` is a published library, and `cargo semver-checks` against 2.12.0 reports 7 major breaks:
+
+- the per-phase lock is gone: `lock::acquire`, `lock::holder` and `lock::holder_identity` are removed, as are
+  `State.monitor_pid` and `RecoveryStatus.lock_held`, `workflow::remove_corrupt_legacy_state` and
+  `monitor::run_pipe_owning_monitor`; `monitor::spawn_monitor` takes 7 parameters instead of 5
+- the gate response and ack API is replaced by one keyed on a gate id: `Gates::respond`, `poll_response`,
+  `ack`, `response_path`, `ack_path`, `reap` and `cleanup` are removed (see `Gates::answer`, `claim`, `close`
+  and `await_answer`); `OpenGate` and `GateFile` gain `gate_id`, `RecoveryStatus` gains `live` and
+  `AgentResult` gains `checkpoint`, which breaks exhaustive struct literals
+- `GateError` gains `InvalidGateId`, `GateIdMismatch`, `GateClosedAfterPublish`, `GateLockTimeout` and
+  `PublishedUnconfirmed`; `RecoverError`, `WorkflowError` and `MonitorError` become `#[non_exhaustive]`
+- a gate answer must carry the id of the gate it decides. An answer with no id, or another gate's id, is set
+  aside, not consumed, and a rerun of a stage asks again instead of reusing an earlier answer
+- no migration from 2.x: a 2.x `state.json` is not migrated, and 3.x makes no promise that it will load
+
+### Added
+
+- state files are written under a short `flock` and are durable (the file and its directory are synced);
+  a supervisor holds a liveness lock for its whole life, and a launch records a pending supervisor before it
+  spawns one
+- a supervisor the state no longer records, or whose promotion never came, writes nothing and ends its
+  agent's process group while the agent still runs
+- `devflow stop` reaches a pending launch, names an orphaned agent and its manual kill, and never lands inside
+  a `devflow ship` finalization; `devflow doctor` and `status` name the repair for a held lock with no socket
+- `recover --clean` and `start` refuse beside a held launch lock that no other phase's state records,
+  naming its holder; `stop` over an unpublished launch with no foreground launcher names the holder and the
+  manual route
+
+### Fixed
+
+- `agent_running` reported a just-reaped process as running (a race with an exit)
+- `logs --follow` hung when its state was already gone, or removed before the first poll
+- a gate claim whose directory sync failed reported "nothing was consumed" while the claim stayed on disk
+- a finalization retry resumes at the hook that failed, so a `VersionBump` that succeeded is not repeated
+  within one process (after a restart it still can: backlog 999.173)
+- further defects found by four rounds of external review (Codex and Antigravity), each fixed with a test
+  that was seen failing first
+
+### Known gaps
+
+- a headless run can still stop short of Ship: a Validate gap gate and an auto-decided checkpoint can need
+  an operator (backlog 999.175, 999.176)
+- `devflow gate approve` can exit 1 for an approval that was applied (backlog 999.177); a `yes_ship` revoke
+  written during the Ship advance is ignored (999.178); a launch whose successor already ended still prints
+  "launched" (999.179); an approved Validate gate is not closed before Ship (999.180); a Ship retry after a restart can
+  bump the version twice (999.173)
+- the live run to Ship ran on an earlier build of this code; the maintainer accepted it for the final build
+  (the fault-injection check passes on the final build)
+
 ## 2.12.0 — 2026-09-02
 
 Unattended auto-mode hardening (Phase 45). Makes `--mode auto` launchable and safe out of the box:
